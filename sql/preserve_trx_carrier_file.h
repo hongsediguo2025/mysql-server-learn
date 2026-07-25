@@ -133,6 +133,15 @@ class Local_file_preserved_trx_carrier final
       uint64_t warmcopy_epoch,
       const Preserved_trx_external_blob_descriptor &descriptor,
       uint64_t max_bytes, Preserved_trx_external_blob *blob) override;
+  Preserved_trx_carrier_status snapshot_active_warm_external_blob_prefix(
+      const std::string &source_warmcopy_id,
+      const std::string &destination_warmcopy_id,
+      const std::string &blob_name, uint64_t warmcopy_epoch,
+      const Preserved_trx_external_blob_descriptor &prefix_descriptor) override;
+  Preserved_trx_carrier_status read_active_warm_external_blob_range(
+      const std::string &warmcopy_id, const std::string &blob_name,
+      uint64_t warmcopy_epoch, uint64_t offset, uint64_t length,
+      uint64_t max_bytes, std::string *payload) override;
   Preserved_trx_carrier_status remove_warm_external_blob(
       const std::string &warmcopy_id, const std::string &blob_name) override;
   Preserved_trx_carrier_status remove_warm_external_blobs(

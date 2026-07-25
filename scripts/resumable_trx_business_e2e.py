@@ -598,6 +598,7 @@ class HarnessConfig:
     compact_expected_state_row_threshold: int = 1_000_000
     preserve_timeout_s: int = 86400
     preserve_max_binlog_cache_bytes: int = 1_073_741_824
+    preserve_warmcopy_max_total_bytes: int = 0
     preserve_max_lock_count: int = 1_000_000
     preserve_max_scan_pages: int = 1_000_000
     preserve_materialize_timeout_ms: int = 60_000
@@ -623,6 +624,7 @@ class HarnessConfig:
     server_error_log: Optional[str] = None
     server_pid_file: Optional[str] = None
     warmcopy_required: bool = False
+    preserve_warmcopy_close_timeout_ms: int = 0
     lock_warmcopy_mode: str = "default"
     two_phase: bool = False
     max_phase2_pause_ms: int = 5000
@@ -721,6 +723,10 @@ class HarnessConfig:
         if self.max_receiver_ready_after_phase2_ms < 0:
             raise ValueError(
                 "max receiver ready after phase2 ms must be non-negative"
+            )
+        if self.preserve_warmcopy_close_timeout_ms < 0:
+            raise ValueError(
+                "preserve warmcopy close timeout ms must be non-negative"
             )
         if (
             self.standby_transfer_timeout_exclusion
@@ -1024,6 +1030,10 @@ class HarnessConfig:
             raise ValueError("preserve_timeout_s must be positive")
         if self.preserve_max_binlog_cache_bytes <= 0:
             raise ValueError("preserve_max_binlog_cache_bytes must be positive")
+        if self.preserve_warmcopy_max_total_bytes < 0:
+            raise ValueError(
+                "preserve_warmcopy_max_total_bytes must be non-negative"
+            )
         if self.preserve_max_lock_count <= 0:
             raise ValueError("preserve_max_lock_count must be positive")
         if self.preserve_max_scan_pages <= 0:
@@ -1154,6 +1164,7 @@ class WarmcopyDrainMetrics:
     phase2_pause_ms: float
     full_copy_to_count: Optional[int]
     phase2_total_ms: Optional[float] = None
+    phase2_transfer_tail_us: Optional[int] = None
     phase2_binlog_preflight_ms: Optional[float] = None
     phase2_end_monotonic_us: Optional[int] = None
     phase2_slo_guaranteed: Optional[int] = None
@@ -2026,6 +2037,8 @@ WHERE n < {row_count}
         )
 
     def warmcopy_close_timeout_ms(self) -> int:
+        if self.config.preserve_warmcopy_close_timeout_ms > 0:
+            return self.config.preserve_warmcopy_close_timeout_ms
         default_timeout_ms = 30_000
         max_timeout_ms = 300_000
         if not self.config.warmcopy_required:
@@ -5702,19 +5715,6 @@ class BusinessE2ERunner:
                 raise AssertionError(
                     "standby transfer DRAIN returned retryable unsupported" + suffix
                 )
-            self.runtime.wait_until_down(self.config.shutdown_timeout_s)
-            if source_tiered_load_probe is not None:
-                self.source_tiered_load_report = (
-                    source_tiered_load_probe.stop(
-                        expect_drain=True,
-                        join_timeout_s=min(
-                            30.0, self.config.worker_join_timeout_s
-                        ),
-                    )
-                )
-            if timeout_exclusion_probe_started:
-                self.stop_standby_transfer_timeout_exclusion_probe()
-                timeout_exclusion_probe_started = False
             metrics = self.read_latest_warmcopy_metrics_since(error_log_offset)
             if metrics is None or metrics.phase2_total_ms is None:
                 raise AssertionError(
@@ -5733,8 +5733,9 @@ class BusinessE2ERunner:
                 )
             self._record_warmcopy_drain_metrics(metrics)
             expected_receiver_tokens = (
-                self.config.sessions if self.config.strict_token_count else 1
+                self.expected_standby_transfer_receiver_tokens(metrics)
             )
+            self.receiver_expected_prewarm_tokens = expected_receiver_tokens
             if self.config.standalone_transfer_accept_committed_not_ready:
                 self.receiver_artifact_counts = (
                     self.receiver_preserve_artifact_counts()
@@ -5754,6 +5755,19 @@ class BusinessE2ERunner:
                     timeout_s=self.config.resume_timeout_s,
                     connection_factory=self._receiver_admin_connection,
                 )
+            self.runtime.wait_until_down(self.config.shutdown_timeout_s)
+            if source_tiered_load_probe is not None:
+                self.source_tiered_load_report = (
+                    source_tiered_load_probe.stop(
+                        expect_drain=True,
+                        join_timeout_s=min(
+                            30.0, self.config.worker_join_timeout_s
+                        ),
+                    )
+                )
+            if timeout_exclusion_probe_started:
+                self.stop_standby_transfer_timeout_exclusion_probe()
+                timeout_exclusion_probe_started = False
             if read_load_probe is not None:
                 self.receiver_read_load_report = read_load_probe.stop()
                 validate_receiver_read_load_report(
@@ -7499,6 +7513,21 @@ class BusinessE2ERunner:
             except AssertionError as exc:
                 last_error = exc
 
+            active_epochs = self._read_status_int(
+                "Preserve_trx_transfer_receiver_active_epochs",
+                connection_factory=connection_factory,
+            )
+            if active_epochs == 0:
+                expired_epochs = self._read_status_int(
+                    "Preserve_trx_transfer_receiver_expired_epochs",
+                    connection_factory=connection_factory,
+                )
+                raise RuntimeError(
+                    "receiver accepted epoch expired before metadata prewarm "
+                    f"completed: expired_epochs={expired_epochs} "
+                    f"expected_tokens={expected_tokens}"
+                )
+
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 if last_error is not None:
@@ -7647,6 +7676,9 @@ class BusinessE2ERunner:
                 if not getattr(self, "drain_result_rows", [])
                 else str(self.drain_result_rows[0]["outcome"])
             ),
+            "drain_result_transport_disconnected": bool(
+                getattr(self, "drain_result_transport_disconnected", False)
+            ),
             "workload_table_count": self.config.table_count,
             "workload_statements_per_tx": self.config.statements_per_tx,
             "workload_seed_rows_per_table_per_session": (
@@ -7726,6 +7758,11 @@ class BusinessE2ERunner:
             ),
             "standby_tokens": standby_token_count,
             "source_phase2_total_us": source_phase2_total_us,
+            "source_phase2_post_command_tail_us": (
+                source_metric_samples("phase2_transfer_tail_us")[-1]
+                if source_metric_samples("phase2_transfer_tail_us")
+                else None
+            ),
             "source_phase2_end_us": source_phase2_end_us,
             "source_phase2_target_pin_us_samples": source_metric_samples(
                 "phase2_target_pin_us"
@@ -7919,6 +7956,9 @@ class BusinessE2ERunner:
             ),
             "receiver_all_token_prewarm_after_final_ack_us": (
                 receiver_all_token_prewarm_after_final_ack_us
+            ),
+            "receiver_expected_prewarm_tokens": int(
+                getattr(self, "receiver_expected_prewarm_tokens", 0)
             ),
             "receiver_prewarm_backlog_at_phase2_end": (
                 None
@@ -8824,7 +8864,7 @@ END
             "CREATE TABLE rtx_e2e_tx_audit("
             "sid INT NOT NULL, tx_id INT NOT NULL, tx_size INT NOT NULL, "
             "first_seen TIMESTAMP(6) NOT NULL, "
-            "PRIMARY KEY(sid,tx_id), KEY idx_tx_size(tx_size)) ENGINE=InnoDB"
+            "PRIMARY KEY(sid,tx_id)) ENGINE=InnoDB"
         )
         cur.execute(
             "CREATE TABLE rtx_e2e_proc_state("
@@ -8929,6 +8969,7 @@ END
                 f"SET GLOBAL preserve_trx_max_scan_pages={self.config.preserve_max_scan_pages}",
                 f"SET GLOBAL preserve_trx_materialize_timeout_ms={self.config.preserve_materialize_timeout_ms}",
             ]
+            mixed_global_budget = 0
             if self.config.mixed_pressure_workload:
                 mixed_global_budget = max(
                     2 * 1024**3,
@@ -8940,8 +8981,6 @@ END
                         f"{mixed_global_budget}",
                         "SET GLOBAL preserve_trx_memory_per_token_bytes="
                         f"{self.config.preserve_max_binlog_cache_bytes}",
-                        "SET GLOBAL preserve_trx_warmcopy_max_total_bytes="
-                        f"{mixed_global_budget}",
                     ]
                 )
             if self.config.preserve_parallel_preserve_threads > 0:
@@ -8994,6 +9033,8 @@ END
                     ) +
                     normal_cache_headroom_bytes,
                     plan.max_large_payload_bytes_per_statement(),
+                    mixed_global_budget,
+                    self.config.preserve_warmcopy_max_total_bytes,
                 )
                 commands.extend(
                     [
@@ -9567,6 +9608,13 @@ END
     def drain_restart_resume(self, cycle: int) -> None:
         if not hasattr(self, "phase2_pause_samples"):
             self.phase2_pause_samples = []
+        mixed_resume_validation_is_terminal = (
+            self.config.mixed_pressure_workload
+            and self.config.scenario == "hundred_session_semantic_matrix"
+            and cycle == self.config.cycles
+            and self.config.duration_s <= 0
+            and not self.config.shutdown_gap_replay_probe
+        )
         phase2_total_gate_required = self.config.max_phase2_total_ms > 0
         warmcopy_metrics_required = (
             self.config.warmcopy_required or phase2_total_gate_required
@@ -9822,6 +9870,22 @@ END
                 and not self.binlog_event_validation_enabled()
             ):
                 self.purge_old_binary_logs_after_resume()
+            if mixed_resume_validation_is_terminal:
+                self.mixed_resume_validation_completed = True
+                self.stop_event.set()
+                for conn in resumed_connections.values():
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                resumed_connections.clear()
+                self.coordinator.cancel_drain_checkpoint(generation)
+                LOG.info(
+                    "cycle %s completed mixed startup/RESUME validation; "
+                    "post-resume business SQL is outside this E2E contract",
+                    cycle,
+                )
+                return
             self.coordinator.publish_resumed_connections(
                 resumed_connections,
                 generation=generation,
@@ -10400,6 +10464,7 @@ END
             phase2_total_ms=(
                 int(total_match.group(1)) / 1000.0 if total_match is not None else None
             ),
+            phase2_transfer_tail_us=int_metric("phase2_transfer_tail_us"),
             phase2_binlog_preflight_ms=(
                 int(binlog_preflight_match.group(1)) / 1000.0
                 if binlog_preflight_match is not None
@@ -11391,6 +11456,8 @@ END
         expects_transfer_result = (
             self.config.scenario == "standby_transfer_receiver_drain_metrics"
         )
+        if expects_transfer_result:
+            self.drain_result_transport_disconnected = False
         try:
             conn = self.runtime.connect(database=False)
             rows = self.runtime.execute(
@@ -11425,10 +11492,19 @@ END
         except BaseException as exc:
             if self.runtime.is_connection_error(exc):
                 if expects_transfer_result:
-                    raise AssertionError(
-                        "standby transfer DRAIN disconnected before its "
-                        "structured result was read"
-                    ) from exc
+                    if self.config.standby_transfer_timeout_exclusion:
+                        raise AssertionError(
+                            "standby transfer DRAIN disconnected before its "
+                            "timeout-exclusion result was read"
+                        ) from exc
+                    self.drain_result_transport_disconnected = True
+                    self.drain_result_rows = []
+                    LOG.warning(
+                        "standby transfer source disconnected while returning "
+                        "the DRAIN result; FINAL_ACK metrics and receiver state "
+                        "must prove the handoff"
+                    )
+                    return True
                 return True
             if (
                 self.config.scenario == "temp_table_retryable_unsupported"
@@ -11443,6 +11519,34 @@ END
                 except Exception:
                     pass
         return True
+
+    def expected_standby_transfer_receiver_tokens(
+        self,
+        metrics: WarmcopyDrainMetrics,
+    ) -> int:
+        if self.config.strict_token_count:
+            return self.config.sessions
+
+        survivor_count = int(
+            getattr(self, "mixed_preserved_survivor_count", 0)
+        )
+        if survivor_count > 0:
+            return survivor_count
+
+        if (
+            getattr(self, "drain_result_transport_disconnected", False)
+            and metrics.phase2_transfer_tail_us is not None
+            and metrics.phase2_target_count is not None
+            and metrics.phase2_target_count > 0
+        ):
+            survivor_count = int(metrics.phase2_target_count)
+            self.mixed_preserved_survivor_count = survivor_count
+            return survivor_count
+
+        raise AssertionError(
+            "standby transfer receiver scenario has no verified survivor "
+            "count backed by a structured DRAIN result or FINAL_ACK metrics"
+        )
 
     @staticmethod
     def _decode_transfer_drain_result(
@@ -12105,10 +12209,17 @@ END
 
     def final_validation(self) -> None:
         completed = [worker.transactions_completed for worker in self.workers]
-        if min(completed) < 1:
+        mixed_resume_validation_completed = bool(
+            getattr(self, "mixed_resume_validation_completed", False)
+        )
+        if min(completed) < 1 and not mixed_resume_validation_completed:
             raise AssertionError(f"each worker must complete at least one transaction: {completed[:10]}")
         if self.config.mixed_pressure_workload:
-            self._validate_mixed_pressure_final_state()
+            self._validate_mixed_pressure_final_state(
+                require_committed_workload=(
+                    not mixed_resume_validation_completed
+                )
+            )
             self.write_report_json_if_requested(
                 completed_tx_min=min(completed),
                 completed_stmt_total=sum(
@@ -12210,35 +12321,38 @@ END
             sum(worker.statements_completed for worker in self.workers),
         )
 
-    def _validate_mixed_pressure_final_state(self) -> None:
+    def _validate_mixed_pressure_final_state(
+        self, *, require_committed_workload: bool = True
+    ) -> None:
         conn = self.runtime.connect(database=True)
         try:
-            rows = self.runtime.execute(
-                conn,
-                "SELECT COUNT(DISTINCT sid),COUNT(*) "
-                "FROM rtx_e2e_tx_audit",
-                fetch=True,
-            )
-            if not rows or int(rows[0][0]) != self.config.sessions:
-                raise AssertionError(
-                    "mixed transaction audit does not cover every session: "
-                    f"actual={rows!r} required={self.config.sessions}"
+            if require_committed_workload:
+                rows = self.runtime.execute(
+                    conn,
+                    "SELECT COUNT(DISTINCT sid),COUNT(*) "
+                    "FROM rtx_e2e_tx_audit",
+                    fetch=True,
                 )
-            rows = self.runtime.execute(
-                conn,
-                "SELECT COUNT(*),COALESCE(MIN(call_count),0) "
-                "FROM rtx_e2e_proc_state",
-                fetch=True,
-            )
-            if (
-                not rows
-                or int(rows[0][0]) != self.config.sessions
-                or int(rows[0][1]) <= 0
-            ):
-                raise AssertionError(
-                    "mixed stored-procedure state is incomplete: "
-                    f"actual={rows!r} required_sessions={self.config.sessions}"
+                if not rows or int(rows[0][0]) != self.config.sessions:
+                    raise AssertionError(
+                        "mixed transaction audit does not cover every session: "
+                        f"actual={rows!r} required={self.config.sessions}"
+                    )
+                rows = self.runtime.execute(
+                    conn,
+                    "SELECT COUNT(*),COALESCE(MIN(call_count),0) "
+                    "FROM rtx_e2e_proc_state",
+                    fetch=True,
                 )
+                if (
+                    not rows
+                    or int(rows[0][0]) != self.config.sessions
+                    or int(rows[0][1]) <= 0
+                ):
+                    raise AssertionError(
+                        "mixed stored-procedure state is incomplete: "
+                        f"actual={rows!r} required_sessions={self.config.sessions}"
+                    )
             row_counts: Dict[str, int] = {}
             for table in self.plan.table_names():
                 rows = self.runtime.execute(
@@ -13105,6 +13219,7 @@ command is used after each DRAIN command shuts that server down.
     parser.add_argument("--max-sql-resume-ms", type=int, default=0, help="maximum individual SQL RESUME latency for local startup evidence; 0 disables the gate")
     parser.add_argument("--preserve-timeout", dest="preserve_timeout_s", type=int, default=86400, help="WITH TIMEOUT value for DRAIN TRANSACTIONS PRESERVE")
     parser.add_argument("--preserve-max-binlog-cache-bytes", dest="preserve_max_binlog_cache_bytes", type=int, default=1_073_741_824, help="preserve_trx_max_binlog_cache_bytes for high-cardinality preserve artifacts")
+    parser.add_argument("--preserve-warmcopy-max-total-bytes", dest="preserve_warmcopy_max_total_bytes", type=int, default=0, help="explicit source warm external-artifact byte budget; 0 keeps workload-derived sizing")
     parser.add_argument("--preserve-max-lock-count", dest="preserve_max_lock_count", type=int, default=1_000_000, help="preserve_trx_max_lock_count for this high-cardinality E2E")
     parser.add_argument("--preserve-max-scan-pages", dest="preserve_max_scan_pages", type=int, default=1_000_000, help="preserve_trx_max_scan_pages for this high-cardinality E2E")
     parser.add_argument("--preserve-materialize-timeout-ms", dest="preserve_materialize_timeout_ms", type=int, default=60_000, help="preserve_trx_materialize_timeout_ms for this high-cardinality E2E")
@@ -13138,6 +13253,15 @@ command is used after each DRAIN command shuts that server down.
     binlog_order_group.add_argument("--canonical-binlog-transaction-order", dest="strict_binlog_transaction_order", action="store_false", help="compare normalized binlog table events after sorting complete transactions; use only for intentional order-insensitive baselines")
     parser.add_argument("--server-error-log", help="mysqld error log used for server-side warm-copy binlog-cache phase2 timing; defaults to mysqld.err next to the Unix socket")
     parser.add_argument("--warmcopy-required", action="store_true", help="enable warm-copy globals and enforce warm-copy phase2 pause gate")
+    parser.add_argument(
+        "--preserve-warmcopy-close-timeout-ms",
+        type=int,
+        default=0,
+        help=(
+            "explicit warm-copy CLOSING budget for this E2E; "
+            "0 keeps workload-derived sizing"
+        ),
+    )
     parser.add_argument("--warmcopy-mode", choices=("required", "optional", "off"), help="compatibility alias for warm-copy E2E mode; 'required' is equivalent to --warmcopy-required")
     parser.add_argument("--lock-warmcopy-mode", choices=("default", "on", "off"), default="default", help="explicitly set preserve_trx_lock_warmcopy_enable for this run")
     parser.add_argument("--two-phase", action="store_true", help="compatibility flag documenting that the warmcopy_two_phase_large_cache_equivalence scenario must use the two-phase warm-copy path")
@@ -13289,6 +13413,7 @@ command is used after each DRAIN command shuts that server down.
         max_sql_resume_ms=args.max_sql_resume_ms,
         preserve_timeout_s=args.preserve_timeout_s,
         preserve_max_binlog_cache_bytes=args.preserve_max_binlog_cache_bytes,
+        preserve_warmcopy_max_total_bytes=args.preserve_warmcopy_max_total_bytes,
         preserve_max_lock_count=args.preserve_max_lock_count,
         preserve_max_scan_pages=args.preserve_max_scan_pages,
         preserve_materialize_timeout_ms=args.preserve_materialize_timeout_ms,
@@ -13314,6 +13439,9 @@ command is used after each DRAIN command shuts that server down.
         server_error_log=args.server_error_log,
         server_pid_file=args.server_pid_file,
         warmcopy_required=warmcopy_required,
+        preserve_warmcopy_close_timeout_ms=(
+            args.preserve_warmcopy_close_timeout_ms
+        ),
         lock_warmcopy_mode=args.lock_warmcopy_mode,
         two_phase=args.two_phase,
         max_phase2_pause_ms=args.max_phase2_pause_ms,

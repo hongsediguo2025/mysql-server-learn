@@ -1,0 +1,4 @@
+ERROR HY000: DRAIN TRANSACTIONS PRESERVE was reset before shutdown handoff
+SELECT v FROM t_closing_late_transfer_target WHERE id=1;
+v
+21

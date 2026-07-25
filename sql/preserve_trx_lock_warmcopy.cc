@@ -50,6 +50,7 @@
 #include "my_dbug.h"
 #include "scope_guard.h"
 #include "sha2.h"
+#include "storage/innobase/include/lock0preserve_plan.h"
 #include "storage/innobase/include/lock0warmcopy.h"
 #include "storage/innobase/include/trx0preserve.h"
 
@@ -2554,6 +2555,16 @@ bool Preserve_trx_lock_warmcopy_drain_participant::
   target->phase1_record_prebuilt_blob.warmcopy_epoch = m_epoch;
   target->phase1_record_prebuilt_blob.size = descriptor.size;
   target->phase1_record_prebuilt_blob.digest = descriptor.digest;
+  lock_preserve_record_lock_metadata_facts_t metadata_facts;
+  target->phase1_record_prebuilt_blob.strict_metadata_only_compatible =
+      lock_preserve_build_record_lock_metadata_facts(payload,
+                                                     &metadata_facts) ==
+          lock_preserve_metadata_plan_status::OK &&
+      metadata_facts.unique_pages != 0 &&
+      metadata_facts.bitmap_entries != 0 && metadata_facts.bitmap_bits != 0 &&
+      !metadata_facts.predicate_lock_present &&
+      !metadata_facts.wait_lock_present &&
+      !metadata_facts.record_image_present;
   attach_record_store_contract(prebuilt_fence,
                                &target->phase1_record_prebuilt_blob);
   target->phase1_record_prebuilt_fence = prebuilt_fence;
@@ -2900,7 +2911,8 @@ bool Preserve_trx_lock_warmcopy_drain_participant::
         mdl_descriptors_payload,
         static_cast<uint32_t>(mdl_descriptor_count));
   }
-  if (!seed_phase1_record_payload_for_thread(thread_id, record_locks_payload)) {
+  if (!seed_phase1_record_payload_for_thread(thread_id,
+                                             record_locks_payload)) {
     lock_warmcopy_record_store_clear_for_target(thread_id);
   } else if (active_scan) {
     m_phase1_record_active_scan_targets.insert(thread_id);
@@ -2930,7 +2942,6 @@ bool Preserve_trx_lock_warmcopy_drain_participant::
         record_locks_payload.empty()) {
       continue;
     }
-
     if (!seed_phase1_record_payload_for_thread(target_id,
                                                record_locks_payload)) {
       lock_warmcopy_record_store_clear_for_target(target_id);

@@ -1393,6 +1393,18 @@ class _TransferDrainRuntime(_FakeRuntime):
         return ()
 
 
+class _TransferDrainDisconnectRuntime(_FakeRuntime):
+    def execute(self, conn, sql, fetch=False):
+        self.sql.append(sql)
+        self.calls.append((sql, fetch))
+        if sql.startswith("DRAIN TRANSACTIONS PRESERVE"):
+            raise _FakeConnectionLost("source closed after FINAL_ACK")
+        return ()
+
+    def is_connection_error(self, exc):
+        return isinstance(exc, _FakeConnectionLost)
+
+
 class _InflightDrainRuntime(_DrainRuntime):
     def __init__(
         self,
@@ -2875,6 +2887,33 @@ class WorkloadPlanTest(unittest.TestCase):
             runner.runtime.sql,
         )
 
+    def test_explicit_warmcopy_artifact_budget_does_not_raise_heap_budget(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            sessions=1000,
+            statements_per_tx=10_000,
+            mixed_pressure_workload=True,
+            mixed_seed_rows_per_table=300_000,
+            mixed_transaction_sizes=[10_000, 1_000, 100, 10],
+            mixed_transaction_weights=[10, 20, 30, 40],
+            mixed_min_started_sessions=1,
+            mixed_min_completed_statements=1,
+            business_run_before_drain_s=1.0,
+            warmcopy_required=True,
+            preserve_warmcopy_max_total_bytes=8 * 1024**3,
+        )
+        runner.runtime = _FakeRuntime()
+        runner.configure_preserve_globals()
+
+        self.assertIn(
+            "SET GLOBAL preserve_trx_memory_budget_bytes=2147483648",
+            runner.runtime.sql,
+        )
+        self.assertIn(
+            "SET GLOBAL preserve_trx_warmcopy_max_total_bytes=8589934592",
+            runner.runtime.sql,
+        )
+
     def test_expected_state_tracks_exact_committed_fingerprints_across_all_tables(self):
         cfg = HarnessConfig(sessions=2)
         plan = WorkloadPlan(cfg)
@@ -4033,6 +4072,67 @@ class WorkloadPlanTest(unittest.TestCase):
             expected_survivor_count=1,
             expected_excluded_connection_id=299,
         )
+
+    def test_transfer_drain_records_source_disconnect_for_receiver_validation(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            scenario="standby_transfer_receiver_drain_metrics",
+            sessions=3,
+            receiver_preserve_dir="/tmp/receiver-preserve",
+            receiver_unix_socket="/tmp/receiver.sock",
+        )
+        runner.runtime = _TransferDrainDisconnectRuntime()
+
+        self.assertTrue(runner._execute_drain_preserve())
+        self.assertTrue(runner.drain_result_transport_disconnected)
+        self.assertEqual(getattr(runner, "drain_result_rows", []), [])
+
+    def test_transfer_disconnect_uses_final_ack_metrics_for_survivor_count(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            scenario="standby_transfer_receiver_drain_metrics",
+            sessions=1000,
+            strict_token_count=False,
+            mixed_pressure_workload=True,
+            receiver_preserve_dir="/tmp/receiver-preserve",
+            receiver_unix_socket="/tmp/receiver.sock",
+        )
+        runner.drain_result_transport_disconnected = True
+        metrics = WarmcopyDrainMetrics(
+            phase2_pause_ms=1.0,
+            full_copy_to_count=0,
+            phase2_transfer_tail_us=200000,
+            phase2_target_count=947,
+        )
+
+        self.assertEqual(
+            runner.expected_standby_transfer_receiver_tokens(metrics),
+            947,
+        )
+        self.assertEqual(runner.mixed_preserved_survivor_count, 947)
+
+    def test_transfer_disconnect_without_final_ack_metrics_is_rejected(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            scenario="standby_transfer_receiver_drain_metrics",
+            sessions=1000,
+            strict_token_count=False,
+            mixed_pressure_workload=True,
+            receiver_preserve_dir="/tmp/receiver-preserve",
+            receiver_unix_socket="/tmp/receiver.sock",
+        )
+        runner.drain_result_transport_disconnected = True
+        metrics = WarmcopyDrainMetrics(
+            phase2_pause_ms=1.0,
+            full_copy_to_count=0,
+            phase2_target_count=947,
+        )
+
+        with self.assertRaisesRegex(
+            AssertionError,
+            "FINAL_ACK metrics",
+        ):
+            runner.expected_standby_transfer_receiver_tokens(metrics)
 
     def test_standby_transfer_workers_use_non_ha_source_account(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
@@ -5592,6 +5692,7 @@ class WorkloadPlanTest(unittest.TestCase):
             )
 
     def test_standby_transfer_receiver_allows_bounded_final_catchup_metric(self):
+        calls = []
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
         runner.config = HarnessConfig(
             scenario="standby_transfer_receiver_drain_metrics",
@@ -5602,7 +5703,9 @@ class WorkloadPlanTest(unittest.TestCase):
         ).validate()
         runner.runtime = mock.Mock()
         runner.runtime.wait_until_up = mock.Mock()
-        runner.runtime.wait_until_down = mock.Mock()
+        runner.runtime.wait_until_down = mock.Mock(
+            side_effect=lambda _timeout: calls.append("source_down")
+        )
         runner.coordinator = mock.Mock()
         runner.coordinator.request_drain_checkpoint.return_value = 1
         runner.stop_event = threading.Event()
@@ -5643,7 +5746,9 @@ class WorkloadPlanTest(unittest.TestCase):
                 "epoch_commit_count": 1,
             }
         )
-        runner.wait_for_receiver_readiness = mock.Mock()
+        runner.wait_for_receiver_readiness = mock.Mock(
+            side_effect=lambda **_kwargs: calls.append("receiver_validated")
+        )
         runner.write_standby_transfer_receiver_report = mock.Mock()
         runner.join_workers = mock.Mock()
 
@@ -5656,6 +5761,10 @@ class WorkloadPlanTest(unittest.TestCase):
         )
         runner.wait_for_receiver_artifacts.assert_called_once()
         runner.wait_for_receiver_readiness.assert_called_once()
+        self.assertLess(
+            calls.index("receiver_validated"),
+            calls.index("source_down"),
+        )
         runner.write_standby_transfer_receiver_report.assert_called_with(
             status="success",
             completed_stmt_total=0,
@@ -5801,6 +5910,7 @@ class WorkloadPlanTest(unittest.TestCase):
                     phase2_pause_ms=12.0,
                     full_copy_to_count=2,
                     phase2_total_ms=34.0,
+                    phase2_transfer_tail_us=456000,
                     phase2_end_monotonic_us=1_000_000,
                     phase2_slo_guaranteed=0,
                     phase2_slo_reason="non_record_family_live_compare",
@@ -5974,6 +6084,7 @@ class WorkloadPlanTest(unittest.TestCase):
             self.assertTrue(report["receiver_epoch_fact_bound"])
             self.assertEqual(report["phase2_total_samples_ms"], [34.0])
             self.assertEqual(report["source_phase2_total_us"], [34000])
+            self.assertEqual(report["source_phase2_post_command_tail_us"], 456000)
             self.assertEqual(report["source_phase2_end_us"], 1_000_000)
             self.assertEqual(report["phase2_transfer_bulk_bytes"], 12345)
             self.assertNotIn("phase2_receiver_prewarm_wait_us", report)
@@ -6250,6 +6361,33 @@ class WorkloadPlanTest(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "FINAL_ACK"):
             runner.validate_standby_transfer_receiver_committed_not_ready(
                 expected_tokens=2
+            )
+
+    def test_standby_transfer_committed_not_ready_stops_after_epoch_expiry(
+        self,
+    ):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.receiver_prewarm_metrics = mock.sentinel.not_ready
+        runner.read_receiver_prewarm_metrics_from_status = mock.Mock(
+            return_value=runner.receiver_prewarm_metrics
+        )
+        runner.validate_standby_transfer_receiver_committed_not_ready = mock.Mock(
+            side_effect=AssertionError("metadata prewarm did not finish")
+        )
+        runner._read_status_int = mock.Mock(
+            side_effect=lambda field, connection_factory=None: (
+                0
+                if field == "Preserve_trx_transfer_receiver_active_epochs"
+                else 1
+            )
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "accepted epoch expired"):
+            runner.wait_for_receiver_committed_not_ready(
+                expected_tokens=1000,
+                timeout_s=0,
+                poll_interval_s=0,
+                connection_factory=lambda: None,
             )
 
     def test_standby_transfer_committed_not_ready_rejects_strict_side_effects(
@@ -8461,8 +8599,32 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
         ):
             plan = WorkloadPlan(cfg)
             self.assertGreaterEqual(plan.warmcopy_close_timeout_ms(), 290000)
-            self.assertGreater(plan.drain_hard_timeout_ms(),
-                               plan.warmcopy_close_timeout_ms())
+        self.assertGreater(plan.drain_hard_timeout_ms(),
+                           plan.warmcopy_close_timeout_ms())
+
+    def test_warmcopy_required_honors_explicit_close_timeout(self):
+        cfg = HarnessConfig(
+            sessions=1000,
+            warmcopy_required=True,
+            preserve_warmcopy_close_timeout_ms=600000,
+            artifact_dir=".",
+        )
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = cfg
+        runner.plan = WorkloadPlan(cfg)
+        runner.runtime = _FakeRuntime()
+
+        runner.configure_preserve_globals()
+
+        close_timeout_settings = [
+            sql
+            for sql in runner.runtime.sql
+            if sql.startswith("SET GLOBAL preserve_trx_warmcopy_close_timeout_ms=")
+        ]
+        self.assertEqual(
+            ["SET GLOBAL preserve_trx_warmcopy_close_timeout_ms=600000"],
+            close_timeout_settings,
+        )
 
     def test_warmcopy_required_without_large_cache_keeps_prefix_headroom(self):
         cfg = HarnessConfig(
@@ -8486,6 +8648,34 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
         self.assertEqual(len(total_settings), 1)
         configured_total = int(total_settings[0].split("=")[1])
         self.assertGreaterEqual(configured_total, 200 * 1024 * 1024)
+
+    def test_mixed_pressure_keeps_its_warmcopy_capacity_budget(self):
+        cfg = HarnessConfig(
+            sessions=8,
+            statements_per_tx=1,
+            business_run_before_drain_s=1.0,
+            warmcopy_required=True,
+            mixed_pressure_workload=True,
+            mixed_seed_rows_per_table=8,
+            mixed_transaction_sizes=[1],
+            mixed_transaction_weights=[1],
+            mixed_min_started_sessions=1,
+            mixed_min_completed_statements=1,
+            artifact_dir=".",
+        )
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = cfg
+        runner.plan = WorkloadPlan(cfg)
+        runner.runtime = _FakeRuntime()
+
+        runner.configure_preserve_globals()
+
+        total_settings = [
+            sql for sql in runner.runtime.sql
+            if sql.startswith("SET GLOBAL preserve_trx_warmcopy_max_total_bytes=")
+        ]
+        self.assertEqual(len(total_settings), 1)
+        self.assertEqual(int(total_settings[0].split("=")[1]), 2 * 1024**3)
 
     def test_no_preserve_baseline_globals_require_startup_disabled_preserve(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
@@ -8805,6 +8995,7 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
             error_log.write(
                 "PRESERVE: warm-copy drain metrics "
                 "phase2_pause_us=123000 phase2_total_us=2500000 "
+                "phase2_transfer_tail_us=456000 "
                 "phase2_binlog_preflight_us=1700000 "
                 "phase2_end_monotonic_us=987654321 "
                 "phase2_slo_guaranteed=0 "
@@ -8859,6 +9050,7 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
         self.assertIsNotNone(metrics)
         self.assertEqual(metrics.phase2_pause_ms, 123.0)
         self.assertEqual(metrics.phase2_total_ms, 2500.0)
+        self.assertEqual(metrics.phase2_transfer_tail_us, 456000)
         self.assertEqual(metrics.phase2_binlog_preflight_ms, 1700.0)
         self.assertEqual(metrics.phase2_end_monotonic_us, 987654321)
         self.assertEqual(metrics.phase2_slo_guaranteed, 0)
@@ -9295,6 +9487,47 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
             self.assertEqual(runner.phase2_pause_samples[0].bucket_mb, 64)
             self.assertEqual(runner.phase2_pause_samples[0].phase2_pause_ms, 123.456)
 
+    def test_final_mixed_cycle_stops_after_sql_resume_without_worker_handoff(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            scenario="hundred_session_semantic_matrix",
+            sessions=2,
+            cycles=1,
+            strict_token_count=True,
+            mixed_pressure_workload=True,
+            mixed_seed_rows_per_table=10,
+            mixed_transaction_sizes=[10],
+            mixed_transaction_weights=[1],
+            mixed_min_started_sessions=2,
+            mixed_min_completed_statements=20,
+            business_run_before_drain_s=1.0,
+        )
+        runner.plan = WorkloadPlan(runner.config)
+        runner.runtime = _ResumeMappingRuntime([(1, 10, 0), (2, 10, 0)])
+        runner.coordinator = _ReadyCoordinator()
+        runner.stop_event = threading.Event()
+        runner.phase2_pause_samples = []
+        runner.resume_token_elapsed_samples_us = []
+        runner.mixed_resumed_survivor_details = []
+        runner.restart_server = lambda: None
+        runner.configure_preserve_globals = lambda: None
+        runner.read_preserved_tokens = lambda: ["tok-a", "tok-b"]
+        runner._execute_drain_preserve = lambda: None
+        runner._mixed_resumed_stored_procedure_proof = (
+            lambda conn, sid, tx_id: {
+                "stored_procedure_completed": True,
+                "stored_procedure_last_tx_id": tx_id,
+                "stored_procedure_last_stmt_no": 8,
+            }
+        )
+
+        runner.drain_restart_resume(cycle=1)
+
+        self.assertTrue(runner.stop_event.is_set())
+        self.assertTrue(runner.mixed_resume_validation_completed)
+        self.assertEqual(runner.coordinator.cancelled, [1])
+        self.assertEqual(runner.coordinator.published, [])
+
     def test_drain_restart_resume_rejects_phase2_total_over_gate(self):
         with tempfile.NamedTemporaryFile("w+", encoding="utf-8") as error_log:
             runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
@@ -9522,6 +9755,37 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
 
         with self.assertRaises(AssertionError):
             runner.final_validation()
+
+    def test_final_validation_accepts_resume_only_mixed_workload(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            mixed_pressure_workload=True,
+            mixed_seed_rows_per_table=10,
+            mixed_transaction_sizes=[10],
+            mixed_transaction_weights=[1],
+            mixed_min_started_sessions=1,
+            mixed_min_completed_statements=1,
+            business_run_before_drain_s=1.0,
+        )
+        runner.workers = [
+            mock.Mock(
+                transactions_completed=0,
+                statements_completed=10,
+            )
+        ]
+        runner.mixed_resume_validation_completed = True
+        runner._validate_mixed_pressure_final_state = mock.Mock()
+        runner.write_report_json_if_requested = mock.Mock()
+
+        runner.final_validation()
+
+        runner._validate_mixed_pressure_final_state.assert_called_once_with(
+            require_committed_workload=False
+        )
+        runner.write_report_json_if_requested.assert_called_once_with(
+            completed_tx_min=0,
+            completed_stmt_total=10,
+        )
 
     def test_final_validation_writes_temp_table_nfr_report_json(self):
         with tempfile.TemporaryDirectory() as tmpdir:

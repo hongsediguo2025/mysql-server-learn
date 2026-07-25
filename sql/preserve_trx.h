@@ -246,7 +246,6 @@ ulonglong preserve_trx_lock_warmcopy_conversion_freeze_waits_status();
 void preserve_trx_warmcopy_note_prefix_bytes(uint64_t bytes);
 void preserve_trx_warmcopy_note_digest_bytes(uint64_t bytes);
 void preserve_trx_warmcopy_note_durable_bytes(uint64_t bytes);
-void preserve_trx_warmcopy_admit_current_thd_binlog_write(THD *thd);
 
 bool preserve_trx_temp_table_session_needs_eligibility_check(const THD *thd);
 bool preserve_trx_temp_table_session_supported(THD *thd);

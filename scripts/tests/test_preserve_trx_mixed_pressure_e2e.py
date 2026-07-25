@@ -15,6 +15,7 @@ from scripts.preserve_trx_full_pressure_runner import (
     build_acceptance_contract,
     build_e2e_command,
     build_mysqld_commands,
+    validate_mixed_pressure_report,
 )
 from scripts.resumable_trx_business_e2e import (
     BusinessWorker,
@@ -271,6 +272,13 @@ class MixedPressureContractTest(unittest.TestCase):
             "CREATE TABLE rtx_e2e_seed_digit(d INT NOT NULL PRIMARY KEY) ENGINE=MEMORY",
             sql_calls,
         )
+        audit_ddl = next(
+            sql
+            for sql in sql_calls
+            if sql.startswith("CREATE TABLE rtx_e2e_tx_audit(")
+        )
+        self.assertIn("PRIMARY KEY(sid,tx_id)", audit_ddl)
+        self.assertNotIn("idx_tx_size", audit_ddl)
         self.assertFalse(
             any("CREATE TEMPORARY TABLE rtx_e2e_seed_digit" in sql for sql in sql_calls)
         )
@@ -583,6 +591,95 @@ class MixedPressureContractTest(unittest.TestCase):
 
 
 class MixedPressureCommandTest(unittest.TestCase):
+    @staticmethod
+    def _valid_transfer_report():
+        profile = MIXED_SMOKE_PROFILE
+        operation_counts = {
+            key: 1
+            for key in (
+                "tx_audit",
+                "insert",
+                "update",
+                "delete",
+                "replace",
+                "upsert",
+                "insert_select",
+                "multi_table_update",
+                "select",
+                "locking_select",
+                "json_update",
+                "typed_update",
+                "join_select",
+                "range_update",
+                "stored_procedure",
+            )
+        }
+        return {
+            "status": "success",
+            "success": True,
+            "mixed_pressure_workload": True,
+            "mixed_drain_trigger_mode": "independent_control_connection",
+            "mixed_harness_checkpoint_before_drain": False,
+            "sessions": profile.sessions,
+            "mixed_seed_rows_per_table": profile.mixed_seed_rows_per_table,
+            "mixed_total_seed_rows": (
+                profile.tables * profile.mixed_seed_rows_per_table
+            ),
+            "mixed_transaction_sizes": list(profile.mixed_transaction_sizes),
+            "mixed_transaction_weights": list(
+                profile.mixed_transaction_weights
+            ),
+            "mixed_source_log_bin_enabled": True,
+            "mixed_source_binlog_format": "ROW",
+            "mixed_transaction_class_connection_counts": {
+                "100": 1,
+                "50": 1,
+                "20": 2,
+                "10": 4,
+            },
+            "mixed_pre_drain_readiness": {
+                "started_sessions": profile.sessions,
+                "completed_statements": profile.mixed_min_completed_statements,
+                "minimum_completed_statements_per_session": 10,
+                "operation_counts": operation_counts,
+                "duration_class_counts": {
+                    "short": 1,
+                    "hundreds_ms": 1,
+                    "seconds": 1,
+                    "tens_seconds": 1,
+                },
+            },
+            "mixed_duration_class_min_us": {"short": 10_000},
+            "mixed_duration_class_max_us": {
+                "hundreds_ms": 150_000,
+                "seconds": 1_500_000,
+                "tens_seconds": 10_500_000,
+            },
+            "mixed_preserved_survivor_count": profile.sessions,
+            "evidence_kind": "STANDALONE_TRANSFER_E2E",
+            "mixed_receiver_log_bin_enabled": True,
+            "mixed_receiver_binlog_format": "ROW",
+            "mixed_restart_fresh_connection_count": 0,
+            "receiver_readiness_contract": "COMMITTED_NOT_READY",
+            "receiver_epoch_storage": "PROCESS_LOCAL",
+            "receiver_process_local_epoch_accepted": True,
+            "receiver_epoch_fact_bound": True,
+            "source_phase2_total_us": [20_000_000],
+            "source_phase2_post_command_tail_us": [400_000],
+            "receiver_all_prewarm_after_final_ack_us": 400_000,
+            "receiver_expected_prewarm_tokens": profile.sessions,
+            "receiver_seal_prewarm_tokens": profile.sessions,
+            "receiver_seal_prewarm_success_tokens": profile.sessions,
+            "receiver_seal_prewarm_not_ready_tokens": 0,
+            "receiver_queued_bytes": 0,
+            "receiver_worker_active": 0,
+            "receiver_read_load_qps_drop_pct": 4.0,
+            "receiver_read_load_p99_increase_pct": 9.0,
+            "physical_replication": False,
+            "production_provider": False,
+            "write_enable_exercised": False,
+        }
+
     def _paths(self) -> FullPressurePaths:
         root = Path(self.tempdir.name)
         return FullPressurePaths.resolve(
@@ -626,6 +723,7 @@ class MixedPressureCommandTest(unittest.TestCase):
         self.assertIn("--mixed-min-started-sessions", command)
         self.assertIn("--max-sql-resume-ms", command)
         self.assertIn("--allow-partial-tokens", command)
+        self.assertIn("--warmcopy-required", command)
         self.assertIn("--source-start-command", command)
         self.assertIn("--restart-command", command)
         self.assertNotIn("--receiver-start-command", command)
@@ -686,6 +784,74 @@ class MixedPressureCommandTest(unittest.TestCase):
         self.assertIn("--binlog-format=ROW", source)
         self.assertIn("--binlog-format=ROW", receiver)
         self.assertNotIn("--receiver-unix-socket", command)
+        self.assertIn("--warmcopy-required", command)
+        self.assertIn(
+            "--preserve-trx-transfer-runtime-profile=PROMOTION_PREPARE",
+            source,
+        )
+        self.assertIn(
+            "--preserve-trx-promotion-prewarm-workers=2", receiver
+        )
+
+    def test_mixed_transfer_requires_truthful_post_command_and_prewarm_tails(self):
+        report = self._valid_transfer_report()
+
+        metrics = validate_mixed_pressure_report(
+            MIXED_SMOKE_PROFILE, report, "mixed-transfer"
+        )
+
+        self.assertEqual(400_000, metrics["source_post_command_tail_us"])
+        self.assertEqual(
+            400_000, metrics["receiver_all_prewarm_after_final_ack_us"]
+        )
+
+        for key in (
+            "source_phase2_post_command_tail_us",
+            "receiver_all_prewarm_after_final_ack_us",
+        ):
+            invalid = dict(report)
+            invalid[key] = None
+            with self.assertRaisesRegex(RuntimeError, key):
+                validate_mixed_pressure_report(
+                    MIXED_SMOKE_PROFILE, invalid, "mixed-transfer"
+                )
+
+        too_slow = dict(report)
+        too_slow["source_phase2_post_command_tail_us"] = [500_001]
+        too_slow["receiver_all_prewarm_after_final_ack_us"] = 500_001
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "source_phase2_post_command_tail_us.*"
+            "receiver_all_prewarm_after_final_ack_us",
+        ):
+            validate_mixed_pressure_report(
+                MIXED_SMOKE_PROFILE, too_slow, "mixed-transfer"
+            )
+
+        at_limit = dict(report)
+        at_limit["source_phase2_post_command_tail_us"] = [500_000]
+        at_limit["receiver_all_prewarm_after_final_ack_us"] = 500_000
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "source_phase2_post_command_tail_us.*"
+            "receiver_all_prewarm_after_final_ack_us",
+        ):
+            validate_mixed_pressure_report(
+                MIXED_SMOKE_PROFILE, at_limit, "mixed-transfer"
+            )
+
+    def test_mixed_transfer_prewarm_count_must_close_actual_survivor_set(self):
+        report = self._valid_transfer_report()
+        report["receiver_expected_prewarm_tokens"] = 1
+        report["receiver_seal_prewarm_tokens"] = 1
+        report["receiver_seal_prewarm_success_tokens"] = 1
+
+        with self.assertRaisesRegex(
+            RuntimeError, "receiver_expected_prewarm_tokens"
+        ):
+            validate_mixed_pressure_report(
+                MIXED_SMOKE_PROFILE, report, "mixed-transfer"
+            )
 
 
 if __name__ == "__main__":

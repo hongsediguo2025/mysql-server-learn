@@ -33,6 +33,8 @@ my $binlog_warmcopy_path = File::Spec->catfile($source_root, 'sql',
                                                'binlog_warmcopy.cc');
 my $binlog_ostream_path = File::Spec->catfile($source_root, 'sql',
                                               'binlog_ostream.cc');
+my $binlog_ostream_header_path = File::Spec->catfile(
+  $source_root, 'sql', 'binlog_ostream.h');
 my $bundle_path = File::Spec->catfile($source_root, 'sql',
                                       'preserve_trx_bundle.cc');
 my $lock_path = File::Spec->catfile($source_root, 'storage', 'innobase',
@@ -114,6 +116,7 @@ my $preserve_header = read_source($preserve_header_path);
 my $binlog = read_source($binlog_path);
 my $binlog_warmcopy = read_source($binlog_warmcopy_path);
 my $binlog_ostream = read_source($binlog_ostream_path);
+my $binlog_ostream_h = read_source($binlog_ostream_header_path);
 my $bundle = read_source($bundle_path);
 my $lock = read_source($lock_path);
 my $lock_preserve = read_source($lock_preserve_path);
@@ -204,7 +207,7 @@ die "standby streaming transfer source epoch session must expose chunk-level obj
          $transfer =~ /Preserve_trx_transfer_source_epoch_session::write_object_chunk/s;
 die "standby streaming transfer must declare large objects before the final token manifest so receiver prewarm can start early\n"
   unless $transfer_header =~ /DECLARE_OBJECT/s &&
-         $transfer_header =~ /declare_object\s*\(\s*uint64_t\s+transfer_token\s*,\s*const\s+Preserve_trx_transfer_object_descriptor\s*&\s*descriptor\s*\)/s &&
+         $transfer_header =~ /declare_object\s*\(\s*uint64_t\s+transfer_token\s*,\s*const\s+Preserve_trx_transfer_object_descriptor\s*&\s*descriptor[\s\S]{0,320}?\)\s*;/s &&
          $transfer =~ /Preserve_trx_transfer_source_epoch_session::declare_object/s &&
          $transfer =~ /Preserve_trx_transfer_frame_type::DECLARE_OBJECT/s;
 my ($session_artifact_sink_publish) =
@@ -451,8 +454,9 @@ die "standby streaming transfer binlog catch-up must stay before final target pr
 die "standby streaming transfer must not do generic unbounded bulk backfill in phase2\n"
   if $preserve =~ /backfill_batch_transfer_binlog_blobs/s ||
      $preserve =~ /transfer_binlog_phase2_backfill/s;
-die "standby streaming transfer must not late-declare final targets without streaming phase1 objects\n"
-  if $preserve =~ /standby_transfer_declare_failed/s;
+die "standby streaming transfer must declare the authoritative CLOSING transaction set before object catch-up\n"
+  unless $preserve =~
+     /Preserve_batch_target_counter[\s\S]*declare_transfer_targets\s*\(\s*counter\.transaction_target_thread_ids\s*\(\s*\)/s;
 die "standby streaming transfer batch path must commit the source epoch only after all batch target snapshots are ready\n"
   unless $preserve =~ /batch_transfer_source_session[\s\S]*commit_epoch/s;
 die "standby streaming transfer phase2 publish must skip external objects already sealed during phase1\n"
@@ -514,6 +518,36 @@ die "table-lock export must use trx->lock.table_locks instead of scanning every 
   if $preserve_export_table_locks =~ /trx->lock\.trx_locks/s;
 die "table-lock export must explicitly iterate the per-transaction table_locks vector\n"
   unless $preserve_export_table_locks =~ /trx->lock\.table_locks/s;
+die "table-lock export must use the global shared latch so concurrent exporters do not serialize\n"
+  unless $preserve_export_table_locks =~ /Global_shared_latch_guard/s;
+die "table-lock export must not take the global exclusive latch\n"
+  if $preserve_export_table_locks =~ /Global_exclusive_latch_guard/s;
+die "table-lock shared export must pin the transaction until payload copy completes\n"
+  unless $preserve_export_table_locks =~ /trx_reference\s*\(\s*trx\s*,\s*true\s*\)/s &&
+         $preserve_export_table_locks =~ /trx_release_reference\s*\(\s*trx\s*\)/s;
+die "table-lock shared export must reject stale or foreign lock ownership\n"
+  unless $preserve_export_table_locks =~
+         /lock\s*==\s*nullptr[\s\S]*lock->trx\s*!=\s*trx[\s\S]*LOCK_TABLE[\s\S]*tab_lock\.table\s*==\s*nullptr/s;
+
+$binlog =~ /int binlog_cache_data::write_event\s*\([^)]*\)\s*\{[\s\S]*?^}/m
+  or die "could not isolate binlog_cache_data::write_event\n";
+my $binlog_write_event = $&;
+die "binlog write_event must not add a deep scope-guard frame for warmcopy tracking\n"
+  if $binlog_write_event =~ /create_scope_guard/s;
+die "drain coordinator must not install an active mirror against another THD\n"
+  if $preserve =~ /prepare_active_thd\s*\(/s;
+die "drain coordinator must not rebuild an active mirror against another THD\n"
+  if $preserve =~ /refresh_stale_active_thd\s*\(/s;
+$binlog_warmcopy =~
+  /bool begin\s*\(\s*bool\s*\*\s*has_blob\s*\)\s*\{[\s\S]*?^  \}/m
+  or die "could not isolate Mysql_binlog_warmcopy_session::begin\n";
+my $binlog_warmcopy_session_begin = $&;
+die "active binlog mirror install must run the complete source eligibility check and only relax in-flight statement state\n"
+  unless $binlog_warmcopy_session_begin =~
+           /mysql_binlog_warmcopy_source_eligible\s*\([\s\S]*m_allow_inflight_statement\s*\)/s;
+die "active binlog mirror install must not bypass source eligibility\n"
+  if $binlog_warmcopy_session_begin =~
+       /if\s*\(\s*!\s*m_allow_inflight_statement\s*\)[\s\S]*mysql_binlog_warmcopy_source_eligible/s;
 
 $lock_preserve =~ /static dberr_t lock_preserve_import_record_lock[\s\S]*?^}/m
   or die "could not isolate lock_preserve_import_record_lock\n";
@@ -601,9 +635,20 @@ die "record-lock import loop must fail closed with DB_INTERRUPTED when its deadl
 die "promotion shared recover/adopt kernel must pass its deadline callback into record-lock import\n"
   unless $preserve =~
          /trx_preserve_import_record_locks\s*\([\s\S]*metadata\.record_locks_payload[\s\S]*recover_or_adopt_deadline_expired_callback[\s\S]*&options/s;
-die "phase1 record warmcopy seed must use compact stable-page record payloads\n"
+die "could not isolate phase1 record-lock scanner\n"
   unless $sql_lock_warmcopy =~
-         /prepare_phase1_record_scan_target[\s\S]*trx_preserve_export_record_locks_stable_page_only\s*\(/s;
+         /prepare_phase1_record_scan_target\s*\(\s*THD\s*\*target\s*,\s*bool\s+active_scan\s*\)\s*\{([\s\S]*?)(?=bool\s+Preserve_trx_lock_warmcopy_drain_participant::\s*prepare_phase1_record_store_targets)/s;
+my $phase1_record_scanner = $1;
+die "phase1 record warmcopy must export only stable-page metadata\n"
+  unless $phase1_record_scanner =~
+         /trx_preserve_export_record_locks_stable_page_only\s*\(/s &&
+         $phase1_record_scanner =~
+         /seed_phase1_record_payload_for_thread\s*\(/s;
+die "phase1 record warmcopy must not build full record images and project them back to metadata\n"
+  if $phase1_record_scanner =~
+     /trx_preserve_export_record_locks\s*\(/s ||
+     $phase1_record_scanner =~
+     /build_metadata_only_record_payload/s;
 die "compact stable-page record export must keep ordinary live export on the legacy image-bearing path\n"
   unless $lock_preserve =~
          /static\s+dberr_t\s+lock_preserve_export_record_locks_low[\s\S]*bool\s+stable_page_only/s &&
@@ -716,22 +761,14 @@ die "warmcopy live-session path must compute and publish the external blob diges
 $binlog =~ /int binlog_cache_data::write_event[\s\S]*?^}/m
   or die "could not isolate binlog_cache_data::write_event\n";
 my $binlog_cache_write_event = $&;
-die "native binlog write admission must remain one thin Preserve hook\n"
-  unless $binlog_cache_write_event =~
+die "native binlog write path must only bracket serialization with the per-cache mirror gate\n"
+  unless $binlog_cache_write_event =~ /m_cache\.begin_warmcopy_event\s*\(\s*\)/s &&
+         $binlog_cache_write_event =~ /m_cache\.end_warmcopy_event\s*\(\s*\)/s &&
+         $binlog_cache_write_event !~
            /preserve_trx_warmcopy_admit_current_thd_binlog_write/s &&
-         $binlog_cache_write_event !~ /preserve_trx_is_enabled/s;
-
-$preserve =~
-  /void preserve_trx_warmcopy_admit_current_thd_binlog_write_impl[\s\S]*?^}/m
-  or die "could not isolate Preserve binlog write admission\n";
-my $preserve_binlog_write_admission = $&;
-die "Preserve binlog write admission must test the active drain window before the global feature switch\n"
-  unless $preserve_binlog_write_admission =~
-           /g_warmcopy_admission_open\.load[\s\S]*preserve_trx_is_enabled/s &&
-         index($preserve_binlog_write_admission,
-               'g_warmcopy_admission_open.load') <
-         index($preserve_binlog_write_admission,
-               'preserve_trx_is_enabled');
+         $binlog_cache_write_event !~ /Warmcopy_batch_blob_provider/s;
+die "business binlog writes must not retain a Preserve provider admission callback\n"
+  if $preserve =~ /preserve_trx_warmcopy_admit_current_thd_binlog_write_impl/s;
 
 $preserve =~ /bool preserved_trx_metadata_locks_count[\s\S]*?^}/m
   or die "could not isolate preserved_trx_metadata_locks_count\n";
@@ -1131,6 +1168,27 @@ die "binlog cache write must avoid the warmcopy mutex when no mirror is installe
 die "ordinary binlog cache writes must not maintain Preserve truncate generation\n"
   if $binlog_cache_write =~ /m_truncate_generation/;
 
+$binlog =~ /int binlog_cache_data::write_event[\s\S]*?^}/m
+  or die "could not isolate binlog_cache_data::write_event\n";
+my $binlog_cache_write_event_gate = $&;
+die "binlog event serialization must join the per-cache warmcopy mutation gate\n"
+  unless $binlog_cache_write_event_gate =~
+           /begin_warmcopy_event\s*\(\s*\)[\s\S]*binary_event_serialize/s &&
+         $binlog_cache_write_event_gate =~ /end_warmcopy_event/s;
+
+$binlog_ostream =~ /bool Binlog_cache_storage::begin_warmcopy_mutation[\s\S]*?^}/m
+  or die "could not isolate Binlog_cache_storage::begin_warmcopy_mutation\n";
+my $binlog_cache_begin_mutation = $&;
+die "warmcopy mutation gate must short-circuit Preserve OFF before atomic admission\n"
+  unless $binlog_cache_begin_mutation =~
+           /if\s*\(\s*!preserve_trx_is_enabled\s*\(\s*\)\s*\)\s*return\s+false/s &&
+         index($binlog_cache_begin_mutation, 'preserve_trx_is_enabled') <
+         index($binlog_cache_begin_mutation, 'm_warmcopy_mutation_gate');
+die "warmcopy mutation gate must remain per-cache and must not use a global mutex\n"
+  unless $binlog_ostream_h =~
+           /class Binlog_cache_storage[\s\S]*std::atomic<uint32_t>\s+m_warmcopy_mutation_gate/s &&
+         $binlog_cache_begin_mutation !~ /std::mutex|mysql_mutex/;
+
 $binlog_ostream =~ /bool Binlog_cache_storage::truncate[\s\S]*?^}/m
   or die "could not isolate Binlog_cache_storage::truncate\n";
 my $binlog_cache_truncate = $&;
@@ -1138,14 +1196,13 @@ die "binlog cache truncate must avoid the warmcopy mutex when no mirror is insta
   unless $binlog_cache_truncate =~ /lease->active\s*\(\s*\)/s &&
          index($binlog_cache_truncate, 'lease->active') <
          index($binlog_cache_truncate, 'std::lock_guard');
-die "binlog cache truncate must preserve the lease-null native fast return\n"
+die "binlog cache truncate must join the install fence before changing source bytes\n"
   unless $binlog_cache_truncate =~
-         /if\s*\(\s*lease\s*==\s*nullptr\s*\)[\s\S]{0,160}return\s+m_pipeline_head->truncate\s*\(\s*offset\s*\)/s &&
-         index($binlog_cache_truncate, 'lease == nullptr') <
-         index($binlog_cache_truncate, 'preserve_trx_is_enabled');
-die "inactive-mirror truncate generation must be isolated by preserve_trx_enable\n"
+           /begin_warmcopy_mutation\s*\(\s*\)[\s\S]*m_pipeline_head->truncate\s*\(\s*offset\s*\)/s &&
+         $binlog_cache_truncate =~ /end_warmcopy_mutation/s;
+die "inactive-mirror truncate generation must be isolated by the Preserve-gated mutation admission\n"
   unless $binlog_cache_truncate =~
-         /if\s*\(\s*!source_error\s*&&\s*preserve_trx_is_enabled\s*\(\s*\)\s*\)[\s\S]{0,160}m_truncate_generation\.fetch_add/s;
+         /if\s*\(\s*!source_error\s*&&\s*tracked\s*\)[\s\S]{0,160}m_truncate_generation\.fetch_add/s;
 
 $binlog_ostream =~ /bool Binlog_cache_storage::reset[\s\S]*?^}/m
   or die "could not isolate Binlog_cache_storage::reset\n";
@@ -1154,14 +1211,13 @@ die "binlog cache reset must avoid the warmcopy mutex when no mirror is installe
   unless $binlog_cache_reset =~ /lease->active\s*\(\s*\)/s &&
          index($binlog_cache_reset, 'lease->active') <
          index($binlog_cache_reset, 'std::lock_guard');
-die "binlog cache reset must preserve the lease-null native fast return\n"
+die "binlog cache reset must join the install fence before changing source bytes\n"
   unless $binlog_cache_reset =~
-         /if\s*\(\s*lease\s*==\s*nullptr\s*\)\s*return\s+m_file\.reset\s*\(\s*\)/s &&
-         index($binlog_cache_reset, 'lease == nullptr') <
-         index($binlog_cache_reset, 'preserve_trx_is_enabled');
-die "inactive-mirror reset generation must be isolated by preserve_trx_enable\n"
+           /begin_warmcopy_mutation\s*\(\s*\)[\s\S]*m_file\.reset\s*\(\s*\)/s &&
+         $binlog_cache_reset =~ /end_warmcopy_mutation/s;
+die "inactive-mirror reset generation must be isolated by the Preserve-gated mutation admission\n"
   unless $binlog_cache_reset =~
-         /if\s*\(\s*!source_error\s*&&\s*preserve_trx_is_enabled\s*\(\s*\)\s*\)[\s\S]{0,160}m_truncate_generation\.fetch_add/s;
+         /if\s*\(\s*!source_error\s*&&\s*tracked\s*\)[\s\S]{0,160}m_truncate_generation\.fetch_add/s;
 
 die "temp dirty-page hook must test active source-space before per-space admission-close checks\n"
   unless $temp_stage_dirty_page =~

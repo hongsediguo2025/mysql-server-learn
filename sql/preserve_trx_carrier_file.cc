@@ -941,8 +941,12 @@ Preserved_trx_carrier_status map_atomic_write_status(
 class Local_file_external_blob_writer final
     : public Preserved_trx_external_blob_writer {
  public:
-  Local_file_external_blob_writer(std::string dir, std::string path)
-      : m_dir(std::move(dir)), m_path(std::move(path)) {}
+  Local_file_external_blob_writer(
+      std::string dir, std::string path,
+      const Preserve_snapshot_write_options &write_options)
+      : m_dir(std::move(dir)),
+        m_path(std::move(path)),
+        m_write_options(write_options) {}
 
   ~Local_file_external_blob_writer() override {
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -1004,6 +1008,9 @@ class Local_file_external_blob_writer final
   Preserved_trx_carrier_status flush() override {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (m_file < 0) return Preserved_trx_carrier_status::CORRUPT;
+    if (m_write_options.defer_file_fsync) {
+      return Preserved_trx_carrier_status::OK;
+    }
     return my_sync(m_file, MYF(0)) == 0 ? Preserved_trx_carrier_status::OK
                                         : Preserved_trx_carrier_status::IO_ERROR;
   }
@@ -1043,7 +1050,7 @@ class Local_file_external_blob_writer final
     return map_atomic_write_status(atomic_write_file(
         m_dir, warm_external_blob_descriptor_filename(filename_from_path(m_path)),
         warm_external_blob_descriptor_payload(descriptor), 0600,
-        Preserve_snapshot_write_options{}, false, true));
+        m_write_options, false, true));
   }
 
   Preserved_trx_carrier_status abort() override {
@@ -1056,7 +1063,9 @@ class Local_file_external_blob_writer final
     if (my_delete((m_path + ".desc").c_str(), MYF(0)) && my_errno() != ENOENT) {
       error = true;
     }
-    if (fsync_directory(m_dir)) error = true;
+    if (!m_write_options.defer_directory_fsync && fsync_directory(m_dir)) {
+      error = true;
+    }
     return error ? Preserved_trx_carrier_status::IO_ERROR
                  : Preserved_trx_carrier_status::OK;
   }
@@ -1068,7 +1077,7 @@ class Local_file_external_blob_writer final
                       : Preserved_trx_carrier_status::CORRUPT;
     }
     bool error = false;
-    if (sync_file) {
+    if (sync_file && !m_write_options.defer_file_fsync) {
       DBUG_EXECUTE_IF("preserve_trx_fail_warmcopy_blob_close_sync",
                       error = true;);
       if (my_sync(m_file, MYF(0)) != 0) error = true;
@@ -1086,6 +1095,7 @@ class Local_file_external_blob_writer final
 
   std::string m_dir;
   std::string m_path;
+  Preserve_snapshot_write_options m_write_options;
   File m_file{-1};
   bool m_closed{false};
   bool m_registered{false};
@@ -2806,7 +2816,8 @@ Local_file_preserved_trx_carrier::create_warm_external_blob_writer(
   */
   auto local_writer = std::make_unique<Local_file_external_blob_writer>(
       m_dir, join_path(m_dir, warm_external_blob_filename(warmcopy_id,
-                                                          blob_name, epoch)));
+                                                          blob_name, epoch)),
+      m_write_options);
   const Preserved_trx_carrier_status status = local_writer->open();
   if (status != Preserved_trx_carrier_status::OK) return status;
 
@@ -3107,6 +3118,182 @@ Local_file_preserved_trx_carrier::read_warm_external_blob(
     return Preserved_trx_carrier_status::CORRUPT;
   }
   *blob = std::move(materialized);
+  return Preserved_trx_carrier_status::OK;
+}
+
+Preserved_trx_carrier_status
+Local_file_preserved_trx_carrier::
+    snapshot_active_warm_external_blob_prefix(
+        const std::string &source_warmcopy_id,
+        const std::string &destination_warmcopy_id,
+        const std::string &blob_name, uint64_t warmcopy_epoch,
+        const Preserved_trx_external_blob_descriptor &prefix_descriptor) {
+  if (source_warmcopy_id == destination_warmcopy_id ||
+      !token_is_filename_safe(source_warmcopy_id) ||
+      !token_is_filename_safe(destination_warmcopy_id) ||
+      !prebuilt_external_blob_name_is_supported(blob_name) ||
+      prefix_descriptor.name != blob_name || prefix_descriptor.size == 0) {
+    return Preserved_trx_carrier_status::CORRUPT;
+  }
+
+  std::string source_filename;
+  Preserved_trx_carrier_status status = find_warm_external_blob_filename(
+      m_dir, source_warmcopy_id, blob_name, warmcopy_epoch, &source_filename);
+  if (status != Preserved_trx_carrier_status::OK) return status;
+
+  const std::string source_path = join_path(m_dir, source_filename);
+  MY_STAT source_stat;
+  if (path_is_symlink(source_path) ||
+      !file_exists(source_path, &source_stat)) {
+    return Preserved_trx_carrier_status::NOT_FOUND;
+  }
+  if (!MY_S_ISREG(source_stat.st_mode) || source_stat.st_size < 0 ||
+      static_cast<uint64_t>(source_stat.st_size) < prefix_descriptor.size ||
+      !warm_external_blob_path_is_active(source_path)) {
+    return Preserved_trx_carrier_status::CORRUPT;
+  }
+
+  File source = my_open(source_path.c_str(), O_RDONLY | O_NOFOLLOW, MYF(0));
+  if (source < 0) return Preserved_trx_carrier_status::IO_ERROR;
+  MY_STAT opened_stat;
+  bool source_error =
+      my_fstat(source, &opened_stat) != 0 ||
+      !MY_S_ISREG(opened_stat.st_mode) || opened_stat.st_size < 0 ||
+      static_cast<uint64_t>(opened_stat.st_size) < prefix_descriptor.size;
+#ifndef _WIN32
+  source_error =
+      source_error || source_stat.st_dev != opened_stat.st_dev ||
+      source_stat.st_ino != opened_stat.st_ino;
+#endif
+  if (source_error) {
+    (void)my_close(source, MYF(0));
+    return Preserved_trx_carrier_status::CORRUPT;
+  }
+
+  std::unique_ptr<Preserved_trx_external_blob_writer> writer;
+  status = create_warm_external_blob_writer(
+      destination_warmcopy_id, blob_name, warmcopy_epoch, &writer);
+  if (status != Preserved_trx_carrier_status::OK) {
+    (void)my_close(source, MYF(0));
+    return status;
+  }
+
+  EVP_MD_CTX *digest_ctx = EVP_MD_CTX_new();
+  if (digest_ctx == nullptr ||
+      EVP_DigestInit_ex(digest_ctx, EVP_sha256(), nullptr) != 1) {
+    if (digest_ctx != nullptr) EVP_MD_CTX_free(digest_ctx);
+    (void)my_close(source, MYF(0));
+    (void)writer->abort();
+    return Preserved_trx_carrier_status::IO_ERROR;
+  }
+
+  std::array<unsigned char, 64 * 1024> buffer{};
+  uint64_t offset = 0;
+  while (offset < prefix_descriptor.size && !source_error) {
+    const size_t bytes_to_read = static_cast<size_t>(std::min<uint64_t>(
+        prefix_descriptor.size - offset, buffer.size()));
+    const size_t bytes_read =
+        my_read(source, buffer.data(), bytes_to_read, MYF(0));
+    source_error =
+        bytes_read != bytes_to_read ||
+        EVP_DigestUpdate(digest_ctx, buffer.data(), bytes_read) != 1 ||
+        writer->write_at(offset, buffer.data(), bytes_read) !=
+            Preserved_trx_carrier_status::OK;
+    offset += source_error ? 0 : bytes_read;
+  }
+  if (my_close(source, MYF(0))) source_error = true;
+
+  std::array<unsigned char, kPreservedTrxSha256Length> copied_digest{};
+  unsigned int digest_length = 0;
+  if (!source_error &&
+      (EVP_DigestFinal_ex(digest_ctx, copied_digest.data(), &digest_length) !=
+           1 ||
+       digest_length != copied_digest.size())) {
+    source_error = true;
+  }
+  EVP_MD_CTX_free(digest_ctx);
+  if (source_error || copied_digest != prefix_descriptor.digest) {
+    (void)writer->abort();
+    return source_error ? Preserved_trx_carrier_status::IO_ERROR
+                        : Preserved_trx_carrier_status::CORRUPT;
+  }
+  if (writer->close_without_sync() != Preserved_trx_carrier_status::OK ||
+      writer->seal_descriptor(prefix_descriptor) !=
+          Preserved_trx_carrier_status::OK) {
+    (void)writer->abort();
+    return Preserved_trx_carrier_status::IO_ERROR;
+  }
+  return Preserved_trx_carrier_status::OK;
+}
+
+Preserved_trx_carrier_status
+Local_file_preserved_trx_carrier::read_active_warm_external_blob_range(
+    const std::string &warmcopy_id, const std::string &blob_name,
+    uint64_t warmcopy_epoch, uint64_t offset, uint64_t length,
+    uint64_t max_bytes, std::string *payload) {
+  if (payload == nullptr || !token_is_filename_safe(warmcopy_id) ||
+      !prebuilt_external_blob_name_is_supported(blob_name) ||
+      length > max_bytes ||
+      offset > std::numeric_limits<uint64_t>::max() - length ||
+      offset + length >
+          static_cast<uint64_t>(std::numeric_limits<my_off_t>::max()) ||
+      length > std::numeric_limits<size_t>::max()) {
+    return Preserved_trx_carrier_status::CORRUPT;
+  }
+  if (length == 0) {
+    payload->clear();
+    return Preserved_trx_carrier_status::OK;
+  }
+
+  std::string source_filename;
+  Preserved_trx_carrier_status status = find_warm_external_blob_filename(
+      m_dir, warmcopy_id, blob_name, warmcopy_epoch, &source_filename);
+  if (status != Preserved_trx_carrier_status::OK) return status;
+
+  const std::string source_path = join_path(m_dir, source_filename);
+  MY_STAT path_stat;
+  if (path_is_symlink(source_path) ||
+      !file_exists(source_path, &path_stat)) {
+    return Preserved_trx_carrier_status::NOT_FOUND;
+  }
+  if (!MY_S_ISREG(path_stat.st_mode) || path_stat.st_size < 0 ||
+      static_cast<uint64_t>(path_stat.st_size) < offset + length ||
+      !warm_external_blob_path_is_active(source_path)) {
+    return Preserved_trx_carrier_status::CORRUPT;
+  }
+
+  File source = my_open(source_path.c_str(), O_RDONLY | O_NOFOLLOW, MYF(0));
+  if (source < 0) return Preserved_trx_carrier_status::IO_ERROR;
+  MY_STAT opened_stat;
+  bool source_error =
+      my_fstat(source, &opened_stat) != 0 ||
+      !MY_S_ISREG(opened_stat.st_mode) || opened_stat.st_size < 0 ||
+      static_cast<uint64_t>(opened_stat.st_size) < offset + length;
+#ifndef _WIN32
+  source_error =
+      source_error || path_stat.st_dev != opened_stat.st_dev ||
+      path_stat.st_ino != opened_stat.st_ino;
+#endif
+
+  std::string read_payload;
+  if (!source_error) {
+    try {
+      read_payload.resize(static_cast<size_t>(length));
+    } catch (...) {
+      source_error = true;
+    }
+  }
+  if (!source_error &&
+      my_pread(source,
+               reinterpret_cast<unsigned char *>(&read_payload[0]),
+               static_cast<size_t>(length), static_cast<my_off_t>(offset),
+               MYF(0)) != static_cast<size_t>(length)) {
+    source_error = true;
+  }
+  if (my_close(source, MYF(0))) source_error = true;
+  if (source_error) return Preserved_trx_carrier_status::IO_ERROR;
+
+  *payload = std::move(read_payload);
   return Preserved_trx_carrier_status::OK;
 }
 

@@ -408,6 +408,29 @@ class Preserved_trx_warm_external_blob_carrier {
       uint64_t max_bytes, Preserved_trx_external_blob *blob) = 0;
 
   /*
+    Copy and seal an immutable prefix of an active warm artifact. Transfer uses
+    this after a live mirror has published its current contiguous prefix facts,
+    avoiding a second read of the source transaction cache while the command is
+    running.
+  */
+  virtual Preserved_trx_carrier_status
+  snapshot_active_warm_external_blob_prefix(
+      const std::string &source_warmcopy_id,
+      const std::string &destination_warmcopy_id,
+      const std::string &blob_name, uint64_t warmcopy_epoch,
+      const Preserved_trx_external_blob_descriptor &prefix_descriptor) = 0;
+
+  /*
+    Read one already-published range from an active warm artifact. The caller
+    owns the generation/freshness check before publishing these bytes; this
+    method only guarantees exact range I/O from the same regular file.
+  */
+  virtual Preserved_trx_carrier_status read_active_warm_external_blob_range(
+      const std::string &warmcopy_id, const std::string &blob_name,
+      uint64_t warmcopy_epoch, uint64_t offset, uint64_t length,
+      uint64_t max_bytes, std::string *payload) = 0;
+
+  /*
     Cleanup wildcard for one warmcopy id/blob family. It removes staged bodies
     and descriptors that match that scratch identity, regardless of epoch, and
     must not touch already adopted token-owned blobs.

@@ -153,9 +153,9 @@ my ($reset_participant_stop) =
   $preserve =~
     /(auto stop_reset_participant_admission = \[\&\]\(\) \{[\s\S]*?^  \};)/m
   or die "RESET must expose a narrow participant-admission stop helper\n";
-die "RESET participant-admission stop must close binlog warmcopy admission without destroying the provider\n"
+die "RESET participant-admission stop must detach binlog warmcopy mirrors without destroying the provider\n"
   unless $reset_participant_stop =~
-         /warmcopy_participant->stop_admission_for_reset\s*\(\s*\)/s;
+         /warmcopy_participant->stop_mirroring_for_reset\s*\(\s*\)/s;
 die "RESET participant-admission stop must close the lock warmcopy epoch before sessions become runnable\n"
   unless $reset_participant_stop =~ /lock_warmcopy_close_epoch\s*\(\s*\)/s;
 

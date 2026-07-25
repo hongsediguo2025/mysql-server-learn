@@ -94,6 +94,15 @@ class RecordingWarmcopyMirror final : public Binlog_cache_warmcopy_mirror {
 
   void note_source_cache_closed() override { ++source_cache_closed; }
 
+  bool snapshot_prefix(PrebuiltBinlogCacheBlob *blob,
+                       bool *has_blob) const override {
+    ++prefix_snapshots;
+    if (has_blob != nullptr) *has_blob = snapshot_available;
+    if (fail_snapshot || (snapshot_available && blob == nullptr)) return true;
+    if (snapshot_available) *blob = snapshot_blob;
+    return false;
+  }
+
   std::vector<Write> writes;
   std::vector<uint64_t> truncates;
   bool fail_write{false};
@@ -103,6 +112,10 @@ class RecordingWarmcopyMirror final : public Binlog_cache_warmcopy_mirror {
   int source_write_failures{0};
   int non_lifecycle_resets{0};
   int source_cache_closed{0};
+  mutable int prefix_snapshots{0};
+  bool snapshot_available{false};
+  bool fail_snapshot{false};
+  PrebuiltBinlogCacheBlob snapshot_blob;
 };
 
 class PreservedTrxWarmcopyCarrierTest : public ::testing::Test {
@@ -312,6 +325,31 @@ TEST_F(BinlogWarmcopyMirrorTest, SourceWriteAndMirrorWriteUseSameOffset) {
   EXPECT_FALSE(m_mirror.degraded);
 }
 
+TEST_F(BinlogWarmcopyMirrorTest,
+       PrefixSnapshotRequiresCurrentMirrorOwner) {
+  m_mirror.snapshot_available = true;
+  m_mirror.snapshot_blob.warmcopy_id = "current-mirror";
+  m_mirror.snapshot_blob.name = kPreservedTrxBlobBinlogCache;
+  m_mirror.snapshot_blob.size = 123;
+
+  PrebuiltBinlogCacheBlob snapshot;
+  bool has_snapshot = false;
+  EXPECT_FALSE(
+      m_storage.warmcopy_prefix_snapshot(&m_mirror, &snapshot, &has_snapshot));
+  EXPECT_TRUE(has_snapshot);
+  EXPECT_EQ("current-mirror", snapshot.warmcopy_id);
+  EXPECT_EQ(123U, snapshot.size);
+  EXPECT_EQ(1, m_mirror.prefix_snapshots);
+
+  RecordingWarmcopyMirror stale_mirror;
+  has_snapshot = true;
+  EXPECT_TRUE(m_storage.warmcopy_prefix_snapshot(
+      &stale_mirror, &snapshot, &has_snapshot));
+  EXPECT_FALSE(has_snapshot);
+  EXPECT_EQ(1, m_mirror.prefix_snapshots);
+  EXPECT_EQ(0, stale_mirror.prefix_snapshots);
+}
+
 TEST_F(BinlogWarmcopyMirrorTest, SourceSuccessMirrorFailureMarksDegraded) {
   const std::string payload = "abc";
   m_mirror.fail_write = true;
@@ -503,6 +541,56 @@ TEST_F(BinlogWarmcopyMirrorTest,
   EXPECT_FALSE(m_storage.warmcopy_mirror_active());
 }
 
+TEST_F(BinlogWarmcopyMirrorTest, PreserveOffSkipsMutationGate) {
+  const bool saved_enable = preserve_trx_is_enabled();
+  preserve_trx_set_enable_value(false);
+
+  EXPECT_FALSE(m_storage.begin_warmcopy_mutation());
+
+  preserve_trx_set_enable_value(saved_enable);
+}
+
+TEST_F(BinlogWarmcopyMirrorTest,
+       InstallWaitsForInFlightMutationAndMirrorsOnlyTheSuffix) {
+  m_storage.clear_warmcopy_mirror(&m_mirror);
+  const std::string prefix = "prefix-before-install";
+  const std::string suffix = "suffix-after-install";
+  const bool prefix_mutation = m_storage.begin_warmcopy_mutation();
+  ASSERT_TRUE(prefix_mutation);
+
+  std::atomic<bool> install_attempted{false};
+  bool already_installed = true;
+  my_off_t sampled_length = -1;
+  uint64_t sampled_generation = 0;
+  std::thread installer([&]() {
+    install_attempted.store(true, std::memory_order_release);
+    already_installed = m_storage.install_warmcopy_mirror_if_absent(
+        &m_mirror, &sampled_length, &sampled_generation);
+  });
+
+  while (!install_attempted.load(std::memory_order_acquire)) {
+    std::this_thread::yield();
+  }
+  ASSERT_FALSE(m_storage.write(
+      reinterpret_cast<const uchar *>(prefix.data()), prefix.size()));
+  m_storage.end_warmcopy_mutation(prefix_mutation);
+  installer.join();
+
+  EXPECT_FALSE(already_installed);
+  EXPECT_EQ(static_cast<my_off_t>(prefix.size()), sampled_length);
+  EXPECT_TRUE(m_mirror.writes.empty());
+
+  const bool suffix_mutation = m_storage.begin_warmcopy_mutation();
+  ASSERT_TRUE(suffix_mutation);
+  ASSERT_FALSE(m_storage.write(
+      reinterpret_cast<const uchar *>(suffix.data()), suffix.size()));
+  m_storage.end_warmcopy_mutation(suffix_mutation);
+
+  ASSERT_EQ(1U, m_mirror.writes.size());
+  EXPECT_EQ(prefix.size(), m_mirror.writes[0].offset);
+  EXPECT_EQ(suffix, m_mirror.writes[0].payload);
+}
+
 TEST_F(BinlogWarmcopyMirrorTest, RangeCopyRejectsStaleGenerationAfterTruncate) {
   const std::string payload = "abcdef";
   RecordingBasicOstream out;
@@ -667,55 +755,101 @@ TEST(WarmcopyHelperModelParticipantTest, PrefixCopyThenMirrorReady) {
   EXPECT_EQ(Binlog_warmcopy_participant_state::READY, participant.state());
 }
 
-TEST(WarmcopyReservationTest, EntryLimitExcludesOtherReservedBytes) {
-  uint64_t limit = 0;
-
-  EXPECT_FALSE(warmcopy_entry_blob_limit(700, 200, 1000, &limit));
-  EXPECT_EQ(500U, limit);
-}
-
-TEST(WarmcopyReservationTest, EffectiveEntryLimitCapsAtSingleBlobLimit) {
-  uint64_t limit = 0;
-
-  EXPECT_FALSE(warmcopy_effective_entry_blob_limit(700, 200, 1000, 300,
-                                                  &limit));
-  EXPECT_EQ(300U, limit);
-}
-
-TEST(WarmcopyReservationTest, ReservationUsesActualPrefixAndCapsTailAtLimit) {
-  uint64_t reservation = 0;
+TEST(WarmcopyReservationTest, ActiveEntryGrowsInChunksUpToPerTokenLimit) {
+  std::atomic<uint64_t> total{0};
+  uint64_t entry = 0;
 
   EXPECT_FALSE(
-      warmcopy_reservation_with_tail_budget(450, 200, 500, &reservation));
-  EXPECT_EQ(500U, reservation);
+      warmcopy_reserve_entry_growth(&total, 8192, 4096, 1024, 1, &entry));
+  EXPECT_EQ(1024U, entry);
+  EXPECT_EQ(1024U, total.load());
+
+  EXPECT_FALSE(warmcopy_reserve_entry_growth(&total, 8192, 4096, 1024, 1024,
+                                             &entry));
+  EXPECT_EQ(1024U, entry);
+  EXPECT_EQ(1024U, total.load());
+
+  EXPECT_FALSE(warmcopy_reserve_entry_growth(&total, 8192, 4096, 1024, 1025,
+                                             &entry));
+  EXPECT_EQ(2048U, entry);
+  EXPECT_EQ(2048U, total.load());
 }
 
 TEST(WarmcopyReservationTest,
-     AccountedSessionLimitNeverDropsBelowOpenSessionLimit) {
-  uint64_t accounted = 0;
+     GlobalBudgetFailureDoesNotChangeEntryOrTotalReservation) {
+  std::atomic<uint64_t> total{1536};
+  uint64_t entry = 1024;
 
-  EXPECT_FALSE(warmcopy_accounted_session_reservation(700, 500, &accounted));
-  EXPECT_EQ(700U, accounted);
+  EXPECT_TRUE(warmcopy_reserve_entry_growth(&total, 2048, 4096, 1024, 1025,
+                                            &entry));
+  EXPECT_EQ(1024U, entry);
+  EXPECT_EQ(1536U, total.load());
+}
+
+TEST(WarmcopyReservationTest,
+     LargeCopyChunkDoesNotExhaustBudgetForTinyEntries) {
+  constexpr uint64_t kTotalBudget = 8ULL * 1024 * 1024 * 1024;
+  constexpr uint64_t kEntryLimit = 1024ULL * 1024 * 1024;
+  constexpr uint64_t kCopyChunk = 16ULL * 1024 * 1024;
+  constexpr uint64_t kTinyEntryBytes = 2ULL * 1024;
+  constexpr size_t kEntryCount = 1000;
+  std::atomic<uint64_t> total{0};
+
+  for (size_t i = 0; i < kEntryCount; ++i) {
+    uint64_t entry = 0;
+    ASSERT_FALSE(warmcopy_reserve_entry_growth(
+        &total, kTotalBudget, kEntryLimit, kCopyChunk, kTinyEntryBytes, &entry))
+        << "entry " << i;
+    EXPECT_EQ(1024ULL * 1024, entry);
+  }
+  EXPECT_EQ(kEntryCount * 1024ULL * 1024, total.load());
+}
+
+TEST(WarmcopyReservationTest, FinalizeShrinksReservationToArtifactSize) {
+  std::atomic<uint64_t> total{3072};
+  uint64_t entry = 2048;
+
+  EXPECT_FALSE(warmcopy_retain_entry_reservation(&total, 1500, &entry));
+  EXPECT_EQ(1500U, entry);
+  EXPECT_EQ(2524U, total.load());
+}
+
+TEST(WarmcopyTailBudgetTest, UsesLatestPublishedHighWatermark) {
+  uint64_t tail_bytes = 0;
+
+  EXPECT_FALSE(warmcopy_unpublished_tail_bytes(3 * 1024 * 1024,
+                                               2560 * 1024, &tail_bytes));
+  EXPECT_EQ(512U * 1024U, tail_bytes);
+  EXPECT_TRUE(warmcopy_unpublished_tail_bytes(1024, 1025, &tail_bytes));
 }
 
 TEST(WarmcopyPendingRangeLimitTest, RejectsRangeCountOverflow) {
   uint64_t pending_bytes = 0;
 
-  EXPECT_TRUE(warmcopy_pending_range_limit_exceeded(4, 128, 16, 4, 1024,
+  EXPECT_TRUE(warmcopy_pending_range_limit_exceeded(4, 128, 16, true, 4, 1024,
                                                     &pending_bytes));
+}
+
+TEST(WarmcopyPendingRangeLimitTest,
+     ContiguousAppendDoesNotConsumeAnotherRangeSlot) {
+  uint64_t pending_bytes = 0;
+
+  EXPECT_FALSE(warmcopy_pending_range_limit_exceeded(
+      4, 128, 16, false, 4, 1024, &pending_bytes));
+  EXPECT_EQ(144U, pending_bytes);
 }
 
 TEST(WarmcopyPendingRangeLimitTest, RejectsPendingByteOverflow) {
   uint64_t pending_bytes = 0;
 
-  EXPECT_TRUE(warmcopy_pending_range_limit_exceeded(2, 1000, 32, 8, 1024,
+  EXPECT_TRUE(warmcopy_pending_range_limit_exceeded(2, 1000, 32, true, 8, 1024,
                                                     &pending_bytes));
 }
 
 TEST(WarmcopyPendingRangeLimitTest, AdmitsWithinRangeAndByteLimits) {
   uint64_t pending_bytes = 0;
 
-  EXPECT_FALSE(warmcopy_pending_range_limit_exceeded(2, 1000, 24, 8, 1024,
+  EXPECT_FALSE(warmcopy_pending_range_limit_exceeded(2, 1000, 24, true, 8, 1024,
                                                      &pending_bytes));
   EXPECT_EQ(1024U, pending_bytes);
 }
@@ -724,7 +858,7 @@ TEST(WarmcopyPendingRangeLimitTest, RejectsPendingByteCounterOverflow) {
   uint64_t pending_bytes = 0;
 
   EXPECT_TRUE(warmcopy_pending_range_limit_exceeded(
-      1, std::numeric_limits<uint64_t>::max(), 1, 8,
+      1, std::numeric_limits<uint64_t>::max(), 1, false, 8,
       std::numeric_limits<uint64_t>::max(), &pending_bytes));
 }
 
@@ -1378,7 +1512,8 @@ TEST_F(PreserveWarmcopyProviderTest, ProviderFailureFailsPreserveInput) {
    public:
     bool has_blob_for_thd(const THD *) const override { return true; }
     Preserve_snapshot_status finalize_for_preserve(
-        THD *, const std::string &, PrebuiltBinlogCacheBlob *) override {
+        THD *, const std::string &, PrebuiltBinlogCacheBlob *,
+        const PreserveBinlogBlobFinalizeContext &) override {
       return Preserve_snapshot_status::IO_ERROR;
     }
     void discard_for_preserve(THD *, const std::string &,
@@ -1389,7 +1524,9 @@ TEST_F(PreserveWarmcopyProviderTest, ProviderFailureFailsPreserveInput) {
   PrebuiltBinlogCacheBlob blob;
   EXPECT_TRUE(provider.has_blob_for_thd(nullptr));
   EXPECT_EQ(Preserve_snapshot_status::IO_ERROR,
-            provider.finalize_for_preserve(nullptr, "token_1", &blob));
+            provider.finalize_for_preserve(
+                nullptr, "token_1", &blob,
+                PreserveBinlogBlobFinalizeContext{}));
 }
 
 TEST_F(PreserveWarmcopyProviderTest, StoreSkipsPayloadWriteForPrebuiltBlob) {
@@ -1745,6 +1882,37 @@ TEST_F(PreservedTrxWarmcopyCarrierTest,
                 descriptor_for_payload(payload)));
   EXPECT_EQ(payload,
             read_file("warmcopy_no_sync_close.binlog_cache.warm.7"));
+}
+
+TEST_F(PreservedTrxWarmcopyCarrierTest,
+       ProcessLocalWriterSkipsFlushAndCloseFsync) {
+  const std::string payload = "process-local-prefix";
+  auto process_local =
+      create_preserved_trx_process_local_warm_external_blob_carrier(m_dir);
+  ASSERT_NE(nullptr, process_local);
+
+  std::unique_ptr<Preserved_trx_external_blob_writer> writer;
+  ASSERT_EQ(Preserved_trx_carrier_status::OK,
+            process_local->create_warm_external_blob_writer(
+                "warmcopy_process_local", kPreservedTrxBlobBinlogCache, 7,
+                &writer));
+  ASSERT_NE(nullptr, writer);
+  ASSERT_EQ(Preserved_trx_carrier_status::OK,
+            writer->write_at(0,
+                             reinterpret_cast<const uchar *>(payload.data()),
+                             payload.size()));
+#if !defined(NDEBUG) && !defined(DBUG_OFF)
+  DBUG_SET("+d,preserve_trx_fail_warmcopy_blob_close_sync");
+#endif
+  EXPECT_EQ(Preserved_trx_carrier_status::OK, writer->flush());
+  EXPECT_EQ(Preserved_trx_carrier_status::OK, writer->close());
+#if !defined(NDEBUG) && !defined(DBUG_OFF)
+  DBUG_SET("");
+#endif
+  EXPECT_EQ(Preserved_trx_carrier_status::OK,
+            writer->seal_descriptor(descriptor_for_payload(payload)));
+  EXPECT_EQ(payload,
+            read_file("warmcopy_process_local.binlog_cache.warm.7"));
 }
 
 TEST_F(PreservedTrxWarmcopyCarrierTest, AbortRemovesWarmArtifact) {

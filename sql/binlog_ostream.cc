@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <atomic>
 #include <limits>
+#include <thread>
 #include <vector>
 #include "my_aes.h"
 #include "my_inttypes.h"
@@ -41,6 +42,13 @@
 #ifndef NDEBUG
 bool binlog_cache_is_reset = false;
 #endif
+
+namespace {
+
+constexpr uint32_t kWarmcopyInstalling = uint32_t{1} << 31;
+constexpr uint32_t kWarmcopyMutationCountMask = ~kWarmcopyInstalling;
+
+}  // namespace
 
 IO_CACHE_binlog_cache_storage::IO_CACHE_binlog_cache_storage() = default;
 IO_CACHE_binlog_cache_storage::~IO_CACHE_binlog_cache_storage() { close(); }
@@ -377,6 +385,15 @@ bool Binlog_cache_storage::install_warmcopy_mirror_if_absent(
     Binlog_cache_warmcopy_mirror *mirror, my_off_t *length,
     uint64_t *truncate_generation,
     std::shared_ptr<Binlog_cache_warmcopy_lease> *lease) {
+  std::lock_guard<std::mutex> install_guard(m_warmcopy_install_mutex);
+  m_warmcopy_mutation_gate.fetch_or(kWarmcopyInstalling,
+                                    std::memory_order_acq_rel);
+  while ((m_warmcopy_mutation_gate.load(std::memory_order_acquire) &
+          kWarmcopyMutationCountMask) != 0) {
+    std::this_thread::yield();
+  }
+
+  bool already_has_mirror = true;
   std::lock_guard<std::mutex> lock(m_warmcopy_mutex);
   auto current_lease = std::atomic_load_explicit(&m_warmcopy_lease,
                                                  std::memory_order_acquire);
@@ -389,9 +406,53 @@ bool Binlog_cache_storage::install_warmcopy_mirror_if_absent(
   if (truncate_generation != nullptr)
     *truncate_generation =
         m_truncate_generation.load(std::memory_order_relaxed);
-  if (current_lease->install_if_absent(mirror)) return true;
-  if (lease != nullptr) *lease = current_lease;
-  return false;
+  already_has_mirror = current_lease->install_if_absent(mirror);
+  if (!already_has_mirror && lease != nullptr) *lease = current_lease;
+  m_warmcopy_mutation_gate.fetch_and(kWarmcopyMutationCountMask,
+                                     std::memory_order_release);
+  return already_has_mirror;
+}
+
+bool Binlog_cache_storage::begin_warmcopy_mutation() {
+  if (!preserve_trx_is_enabled()) return false;
+
+  for (;;) {
+    uint32_t state =
+        m_warmcopy_mutation_gate.load(std::memory_order_acquire);
+    if ((state & kWarmcopyInstalling) != 0) {
+      std::this_thread::yield();
+      continue;
+    }
+    if ((state & kWarmcopyMutationCountMask) ==
+        kWarmcopyMutationCountMask) {
+      std::this_thread::yield();
+      continue;
+    }
+    if (m_warmcopy_mutation_gate.compare_exchange_weak(
+            state, state + 1, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+      return true;
+    }
+  }
+}
+
+void Binlog_cache_storage::end_warmcopy_mutation(bool tracked) {
+  if (!tracked) return;
+  const uint32_t previous =
+      m_warmcopy_mutation_gate.fetch_sub(1, std::memory_order_release);
+  (void)previous;
+  assert((previous & kWarmcopyMutationCountMask) != 0);
+}
+
+void Binlog_cache_storage::begin_warmcopy_event() {
+  assert(!m_warmcopy_event_tracked);
+  m_warmcopy_event_tracked = begin_warmcopy_mutation();
+}
+
+void Binlog_cache_storage::end_warmcopy_event() {
+  const bool tracked = m_warmcopy_event_tracked;
+  m_warmcopy_event_tracked = false;
+  end_warmcopy_mutation(tracked);
 }
 
 void Binlog_cache_storage::clear_warmcopy_mirror(
@@ -409,6 +470,28 @@ bool Binlog_cache_storage::warmcopy_mirror_active() const {
 
 uint64_t Binlog_cache_storage::truncate_generation() const {
   return m_truncate_generation.load(std::memory_order_relaxed);
+}
+
+bool Binlog_cache_storage::warmcopy_prefix_snapshot(
+    Binlog_cache_warmcopy_mirror *expected_mirror,
+    PrebuiltBinlogCacheBlob *blob, bool *has_blob) const {
+  std::lock_guard<std::mutex> install_guard(m_warmcopy_install_mutex);
+  m_warmcopy_mutation_gate.fetch_or(kWarmcopyInstalling,
+                                    std::memory_order_acq_rel);
+  while ((m_warmcopy_mutation_gate.load(std::memory_order_acquire) &
+          kWarmcopyMutationCountMask) != 0) {
+    std::this_thread::yield();
+  }
+
+  bool error = true;
+  std::lock_guard<std::mutex> lock(m_warmcopy_mutex);
+  const auto lease = std::atomic_load_explicit(&m_warmcopy_lease,
+                                                std::memory_order_acquire);
+  error = lease == nullptr ||
+          lease->snapshot_prefix(expected_mirror, blob, has_blob);
+  m_warmcopy_mutation_gate.fetch_and(kWarmcopyMutationCountMask,
+                                     std::memory_order_release);
+  return error;
 }
 
 bool Binlog_cache_storage::write(const unsigned char *buffer,
@@ -445,28 +528,41 @@ bool Binlog_cache_storage::write(const unsigned char *buffer,
 }
 
 bool Binlog_cache_storage::truncate(my_off_t offset) {
+  const bool tracked = begin_warmcopy_mutation();
   auto lease = std::atomic_load_explicit(&m_warmcopy_lease,
                                          std::memory_order_acquire);
   if (lease == nullptr) {
-    if (m_pipeline_head == nullptr) return true;
-    return m_pipeline_head->truncate(offset);
-  }
-  if (!lease->active()) {
-    if (m_pipeline_head == nullptr) return true;
-    const bool source_error = m_pipeline_head->truncate(offset);
-    if (!source_error && preserve_trx_is_enabled()) {
+    const bool source_error =
+        m_pipeline_head == nullptr || m_pipeline_head->truncate(offset);
+    if (!source_error && tracked) {
       m_truncate_generation.fetch_add(1, std::memory_order_relaxed);
     }
+    end_warmcopy_mutation(tracked);
+    return source_error;
+  }
+  if (!lease->active()) {
+    const bool source_error =
+        m_pipeline_head == nullptr || m_pipeline_head->truncate(offset);
+    if (!source_error && tracked) {
+      m_truncate_generation.fetch_add(1, std::memory_order_relaxed);
+    }
+    end_warmcopy_mutation(tracked);
     return source_error;
   }
 
   std::lock_guard<std::mutex> lock(m_warmcopy_mutex);
   lease = std::atomic_load_explicit(&m_warmcopy_lease,
                                     std::memory_order_acquire);
-  if (m_pipeline_head == nullptr) return true;
+  if (m_pipeline_head == nullptr) {
+    end_warmcopy_mutation(tracked);
+    return true;
+  }
 
   const bool source_error = m_pipeline_head->truncate(offset);
-  if (source_error) return true;
+  if (source_error) {
+    end_warmcopy_mutation(tracked);
+    return true;
+  }
 
   m_truncate_generation.fetch_add(1, std::memory_order_relaxed);
   if (lease != nullptr && lease->active() &&
@@ -474,18 +570,28 @@ bool Binlog_cache_storage::truncate(my_off_t offset) {
           Binlog_warmcopy_mirror_status::ERROR) {
     lease->mark_degraded("mirror truncate failed");
   }
+  end_warmcopy_mutation(tracked);
   return false;
 }
 
 bool Binlog_cache_storage::reset() {
+  const bool tracked = begin_warmcopy_mutation();
   auto lease = std::atomic_load_explicit(&m_warmcopy_lease,
                                          std::memory_order_acquire);
-  if (lease == nullptr) return m_file.reset();
-  if (!lease->active()) {
+  if (lease == nullptr) {
     const bool source_error = m_file.reset();
-    if (!source_error && preserve_trx_is_enabled()) {
+    if (!source_error && tracked) {
       m_truncate_generation.fetch_add(1, std::memory_order_relaxed);
     }
+    end_warmcopy_mutation(tracked);
+    return source_error;
+  }
+  if (!lease->active()) {
+    const bool source_error = m_file.reset();
+    if (!source_error && tracked) {
+      m_truncate_generation.fetch_add(1, std::memory_order_relaxed);
+    }
+    end_warmcopy_mutation(tracked);
     return source_error;
   }
 
@@ -493,10 +599,14 @@ bool Binlog_cache_storage::reset() {
   lease = std::atomic_load_explicit(&m_warmcopy_lease,
                                     std::memory_order_acquire);
   const bool source_error = m_file.reset();
-  if (source_error) return true;
+  if (source_error) {
+    end_warmcopy_mutation(tracked);
+    return true;
+  }
 
   m_truncate_generation.fetch_add(1, std::memory_order_relaxed);
   if (lease != nullptr && lease->active()) lease->note_non_lifecycle_reset();
+  end_warmcopy_mutation(tracked);
   return false;
 }
 

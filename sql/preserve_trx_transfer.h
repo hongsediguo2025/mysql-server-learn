@@ -265,6 +265,15 @@ struct Preserve_trx_transfer_phase1_blob_request {
   uint64_t warmcopy_epoch{0};
   uint64_t size{0};
   std::array<unsigned char, kPreservedTrxSha256Length> digest{};
+  uint64_t preserved_prefix_size{0};
+  std::array<unsigned char, kPreservedTrxSha256Length>
+      preserved_prefix_digest{};
+  /*
+    Process-local payload for an already-verified active mirror range. It is
+    never encoded into the transfer protocol or retained by the receiver.
+  */
+  std::string inline_payload;
+  uint64_t required_source_prepare_lsn{0};
   uint16_t lock_plan_contract_version{0};
   uint64_t source_live_lock_generation{0};
   std::array<unsigned char, kPreservedTrxSha256Length>
@@ -863,14 +872,20 @@ class Preserve_trx_transfer_source_epoch_session {
       const std::vector<uint64_t> &transfer_tokens);
   Preserve_trx_transfer_status declare_object(
       uint64_t transfer_token,
-      const Preserve_trx_transfer_object_descriptor &descriptor);
+      const Preserve_trx_transfer_object_descriptor &descriptor,
+      uint64_t preserved_prefix_size = 0,
+      const std::array<unsigned char, kPreservedTrxSha256Length>
+          *preserved_prefix_digest = nullptr);
   Preserve_trx_transfer_status begin_token_objects(
       const Preserve_trx_transfer_manifest &manifest,
       bool queue_final_metadata = false);
   Preserve_trx_transfer_status begin_token_prewarm_manifest(
-      uint64_t transfer_token);
+      uint64_t transfer_token, uint64_t required_source_prepare_lsn = 0);
   Preserve_trx_transfer_status begin_token_prewarm_manifests_batch(
       const std::vector<uint64_t> &transfer_tokens);
+  bool token_prewarm_lsn_fact(uint64_t transfer_token,
+                              uint64_t *source_prepare_lsn,
+                              uint64_t *source_epoch_commit_lsn) const;
   Preserve_trx_transfer_status stream_prebuilt_blobs_batch(
       const std::string &preserve_dir,
       const std::vector<Preserve_trx_transfer_phase1_blob_request> &requests);
@@ -958,6 +973,7 @@ class Preserve_trx_transfer_source_epoch_session {
   std::set<uint64_t> m_aborted_tokens;
   std::map<uint64_t, Preserve_trx_transfer_manifest> m_streaming_manifests;
   std::set<uint64_t> m_prewarm_manifest_tokens;
+  std::map<uint64_t, std::pair<uint64_t, uint64_t>> m_prewarm_lsn_facts;
   std::map<uint64_t, std::map<std::string,
                               Preserve_trx_transfer_object_descriptor>>
       m_streaming_declared_objects;
@@ -986,6 +1002,18 @@ Preserve_trx_transfer_status preserve_trx_transfer_stream_prebuilt_blobs_batch(
     const std::string &preserve_dir,
     const std::vector<Preserve_trx_transfer_phase1_blob_request> &requests,
     uint64_t max_batch_bytes);
+
+/*
+  Send a large request set as bounded synchronous batches. The acknowledged
+  count advances only after a complete batch returns OK, so callers can publish
+  their process-local high-watermarks after this function succeeds.
+*/
+Preserve_trx_transfer_status
+preserve_trx_transfer_stream_prebuilt_blob_request_batches(
+    Preserve_trx_transfer_source_epoch_session *session,
+    const std::string &preserve_dir,
+    const std::vector<Preserve_trx_transfer_phase1_blob_request> &requests,
+    uint64_t max_batch_bytes, uint64_t *acknowledged_batch_count);
 
 struct Preserve_trx_transfer_client_endpoint {
   std::string target_server_uuid;
@@ -1360,8 +1388,13 @@ struct Preserve_trx_deferred_transfer_candidate {
   Preserved_trx_bundle bundle;
   Preserve_trx_resurrection_index_entry resurrection_entry;
   bool has_resurrection_entry{false};
+  uint64_t source_prepare_lsn{0};
+  uint64_t source_epoch_commit_lsn{0};
   bool captured{false};
   bool external_objects_staged{false};
+  bool binlog_cache_batch_pending{false};
+  bool binlog_prewarm_seed_staged{false};
+  bool binlog_prewarm_seed_batch_pending{false};
   bool finalized{false};
 };
 
@@ -1377,7 +1410,8 @@ Preserve_trx_transfer_status
 preserve_trx_transfer_stage_deferred_candidate_external_objects(
     Preserve_trx_transfer_source_epoch_session *session,
     const std::string &preserve_dir,
-    Preserve_trx_deferred_transfer_candidate *candidate);
+    Preserve_trx_deferred_transfer_candidate *candidate,
+    Preserve_trx_transfer_phase1_batch_sender *batch_sender = nullptr);
 
 Preserve_trx_transfer_status
 preserve_trx_transfer_replace_deferred_candidate_record_locks(

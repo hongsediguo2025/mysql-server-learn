@@ -1,0 +1,131 @@
+# Phase1 must not flush a target THD after an idle sample becomes stale.
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/have_log_bin.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+--disable_query_log
+--let $credential_file= $MYSQL_TMP_DIR/idle_to_active_binlog_race.secret
+--write_file $credential_file
+idle-to-active-binlog-race-secret
+EOF
+--exec chmod 600 $credential_file
+
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+DROP USER IF EXISTS idle_to_active_binlog_app@localhost;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'idle-to-active-binlog-race-secret';
+GRANT SHUTDOWN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.*
+  TO preserve_trx_ha_admin@localhost;
+GRANT FILE ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+CREATE USER idle_to_active_binlog_app@localhost;
+GRANT SELECT, INSERT, UPDATE ON test.* TO idle_to_active_binlog_app@localhost;
+GRANT SESSION_VARIABLES_ADMIN ON *.* TO idle_to_active_binlog_app@localhost;
+
+--let $source_uuid= query_get_value(SELECT @@GLOBAL.server_uuid AS uuid, uuid, 1)
+--let $restart_parameters= restart: --preserve-trx-enable=ON --preserve-trx-transfer-receiver-enable=ON --preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --preserve-trx-transfer-allowed-source-uuid=$source_uuid --preserve-trx-transfer-target-server-uuid=$source_uuid --preserve-trx-transfer-target-socket=$MASTER_MYSOCK --preserve-trx-transfer-target-user=preserve_trx_ha_admin --preserve-trx-transfer-credential-name=idle_to_active_binlog_race --preserve-trx-transfer-credential-secret-file=$credential_file
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--let $restart_parameters=
+--disable_query_log
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_transfer_prewarm_paused=OFF;
+SET GLOBAL preserve_trx_drain_closing_command_timeout_ms=30000;
+SET GLOBAL binlog_format=ROW;
+
+CREATE TABLE t_idle_to_active_binlog_race(
+  id INT PRIMARY KEY,
+  v INT NOT NULL,
+  payload VARBINARY(4096) NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_idle_to_active_binlog_race
+VALUES(1, 0, REPEAT('a', 4096));
+
+--connect(idle_to_active_app,localhost,idle_to_active_binlog_app,,test)
+START TRANSACTION;
+UPDATE t_idle_to_active_binlog_race SET v=v+1 WHERE id=1;
+
+--connect(idle_to_active_owner,localhost,root,,test)
+SET DEBUG_SYNC=
+  'preserve_trx_transfer_after_phase1_target_collection SIGNAL idle_target_collected WAIT_FOR idle_target_collection_continue';
+SET DEBUG_SYNC=
+  'preserve_trx_transfer_after_phase1_binlog_stream SIGNAL idle_target_phase1_streamed WAIT_FOR idle_target_phase1_continue';
+SET DEBUG_SYNC=
+  'preserve_trx_transfer_after_commit_ack_before_final_ack SIGNAL idle_target_receiver_accepted WAIT_FOR idle_target_final_ack_continue';
+--send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+
+--connect(idle_to_active_control,localhost,preserve_trx_ha_admin,idle-to-active-binlog-race-secret,test)
+SET DEBUG_SYNC='now WAIT_FOR idle_target_collected TIMEOUT 30';
+
+--connection idle_to_active_app
+SET DEBUG_SYNC=
+  'ha_write_row_end SIGNAL idle_target_pending_ready WAIT_FOR idle_target_pending_continue';
+--send INSERT INTO t_idle_to_active_binlog_race VALUES(2, 1, REPEAT('b', 4096))
+
+--connection idle_to_active_control
+SET DEBUG_SYNC='now WAIT_FOR idle_target_pending_ready TIMEOUT 30';
+SET DEBUG_SYNC='now SIGNAL idle_target_collection_continue';
+SET DEBUG_SYNC='now WAIT_FOR idle_target_phase1_streamed TIMEOUT 30';
+--enable_query_log
+SELECT 1 AS server_survived_idle_to_active_race;
+--disable_query_log
+SET DEBUG_SYNC='now SIGNAL idle_target_pending_continue';
+
+--connection idle_to_active_app
+--reap
+
+--connection idle_to_active_control
+SET DEBUG_SYNC='now SIGNAL idle_target_phase1_continue';
+SET DEBUG_SYNC='now WAIT_FOR idle_target_receiver_accepted TIMEOUT 30';
+
+--connect(idle_to_active_reset,localhost,preserve_trx_ha_admin,idle-to-active-binlog-race-secret,test)
+--send RESET DRAIN
+
+--connection idle_to_active_control
+--let $wait_condition= SELECT COUNT(*)=1 FROM performance_schema.threads WHERE PROCESSLIST_INFO='RESET DRAIN'
+--source include/wait_condition.inc
+SET DEBUG_SYNC='now SIGNAL idle_target_final_ack_continue';
+
+--connection idle_to_active_reset
+--reap
+
+--connection idle_to_active_owner
+--disable_result_log
+--error 4021
+--reap
+--enable_result_log
+
+--connection idle_to_active_app
+COMMIT;
+
+--connection default
+--enable_query_log
+SELECT COUNT(*) AS row_count, SUM(v) AS value_sum
+  FROM t_idle_to_active_binlog_race;
+--disable_query_log
+
+--disconnect idle_to_active_app
+--disconnect idle_to_active_reset
+--disconnect idle_to_active_owner
+--disconnect idle_to_active_control
+DROP TABLE t_idle_to_active_binlog_race;
+DROP USER idle_to_active_binlog_app@localhost;
+DROP USER preserve_trx_ha_admin@localhost;
+SET DEBUG_SYNC='RESET';
+SET GLOBAL preserve_trx_drain_closing_command_timeout_ms=1000;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_enable=ON;
+--remove_file $credential_file

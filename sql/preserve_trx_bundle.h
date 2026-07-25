@@ -395,6 +395,21 @@ struct PrebuiltRecordLocksBlob {
       source_live_lock_digest{};
   std::array<unsigned char, kPreservedTrxSha256Length>
       record_store_fingerprint{};
+  /*
+    Process-local compatibility fact. Strict receiver lock plans accept only
+    page-free metadata and reject record images. Never encoded.
+  */
+  bool strict_metadata_only_compatible{false};
+};
+
+struct PreserveBinlogBlobFinalizeContext {
+  /*
+    Set only by strict transfer after the receiver has acknowledged this exact
+    source generation and digest prefix. Local durable warmcopy leaves it false
+    and retains the original prefix-to-final tail contract.
+  */
+  bool receiver_prefix_published{false};
+  uint64_t receiver_prefix_bytes{0};
 };
 
 /*
@@ -410,7 +425,9 @@ class PreserveBinlogBlobProvider {
 
   virtual bool has_blob_for_thd(const THD *thd) const = 0;
   virtual Preserve_snapshot_status finalize_for_preserve(
-      THD *thd, const std::string &token, PrebuiltBinlogCacheBlob *blob) = 0;
+      THD *thd, const std::string &token, PrebuiltBinlogCacheBlob *blob,
+      const PreserveBinlogBlobFinalizeContext &context =
+          PreserveBinlogBlobFinalizeContext{}) = 0;
   virtual void discard_for_preserve(THD *thd, const std::string &token,
                                     const PrebuiltBinlogCacheBlob &blob) = 0;
 };

@@ -23,6 +23,7 @@ GRANT SHUTDOWN ON *.* TO preserve_trx_ha_admin@localhost;
 GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
 GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.*
   TO preserve_trx_ha_admin@localhost;
+GRANT FILE ON *.* TO preserve_trx_ha_admin@localhost;
 GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
 CREATE USER preserve_trx_aba_app@localhost;
 GRANT SELECT, UPDATE ON test.* TO preserve_trx_aba_app@localhost;
@@ -38,6 +39,7 @@ GRANT SELECT, UPDATE ON test.* TO preserve_trx_aba_app@localhost;
 SET GLOBAL preserve_trx_enable=ON;
 SET GLOBAL preserve_trx_warmcopy_enable=ON;
 SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
+SET GLOBAL preserve_trx_warmcopy_chunk_bytes=1024;
 SET GLOBAL preserve_trx_transfer_prewarm_paused=ON;
 SET GLOBAL binlog_format=ROW;
 
@@ -49,12 +51,27 @@ CREATE TABLE t_binlog_savepoint_aba(
   note VARCHAR(64) NOT NULL
 ) ENGINE=InnoDB;
 INSERT INTO t_binlog_savepoint_aba VALUES(1, 'seed');
+delimiter |;
+CREATE PROCEDURE p_binlog_savepoint_aba(IN p_prefix CHAR(1))
+BEGIN
+  DECLARE i INT DEFAULT 0;
+  WHILE i < 200 DO
+    SET i=i+1;
+    UPDATE t_binlog_savepoint_aba
+      SET note=CONCAT(p_prefix, LPAD(i, 6, '0'), REPEAT(p_prefix, 40))
+      WHERE id=1;
+  END WHILE;
+END|
+delimiter ;|
+GRANT EXECUTE ON PROCEDURE test.p_binlog_savepoint_aba
+  TO preserve_trx_aba_app@localhost;
 
 RESET MASTER;
 START TRANSACTION;
 SAVEPOINT binlog_aba;
-UPDATE t_binlog_savepoint_aba SET note='transfer-aba-A' WHERE id=1;
+CALL p_binlog_savepoint_aba('A');
 ROLLBACK TO SAVEPOINT binlog_aba;
+CALL p_binlog_savepoint_aba('B');
 UPDATE t_binlog_savepoint_aba SET note='transfer-aba-B' WHERE id=1;
 COMMIT;
 
@@ -67,25 +84,44 @@ RESET MASTER;
 --connect(binlog_aba_app,localhost,preserve_trx_aba_app,,test)
 START TRANSACTION;
 SAVEPOINT binlog_aba;
-UPDATE t_binlog_savepoint_aba SET note='transfer-aba-A' WHERE id=1;
+CALL p_binlog_savepoint_aba('A');
 
 --connect(binlog_aba_owner,localhost,root,,test)
 SET DEBUG_SYNC=
-  'preserve_trx_transfer_after_phase1_binlog_stream SIGNAL binlog_aba_phase1_streamed WAIT_FOR binlog_aba_phase1_continue';
+  'preserve_trx_warmcopy_before_prefix_digest_replay SIGNAL binlog_aba_mirror_installed';
+SET DEBUG_SYNC=
+  'preserve_trx_warmcopy_after_descriptor_hwm SIGNAL binlog_aba_phase1_ready WAIT_FOR binlog_aba_phase1_continue';
 SET DEBUG_SYNC=
   'preserve_trx_transfer_after_commit_ack_before_final_ack SIGNAL binlog_aba_receiver_accepted WAIT_FOR binlog_aba_final_ack_continue';
 --send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
 
 --connect(binlog_aba_control,localhost,preserve_trx_ha_admin,binlog-savepoint-aba-secret,test)
-SET DEBUG_SYNC='now WAIT_FOR binlog_aba_phase1_streamed TIMEOUT 30';
+SET DEBUG_SYNC='now WAIT_FOR binlog_aba_mirror_installed TIMEOUT 30';
+SET DEBUG_SYNC='now WAIT_FOR binlog_aba_phase1_ready TIMEOUT 30';
 
 --connection binlog_aba_app
 ROLLBACK TO SAVEPOINT binlog_aba;
+CALL p_binlog_savepoint_aba('B');
 UPDATE t_binlog_savepoint_aba SET note='transfer-aba-B' WHERE id=1;
 
 --connection binlog_aba_control
+--let $assert_text= business writes do not rebuild a stale live mirror
+--let $assert_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--let $assert_select= PRESERVE: active binlog mirror reinstall target=[0-9]+
+--let $assert_count= 0
+--source include/assert_grep.inc
 SET DEBUG_SYNC='now SIGNAL binlog_aba_phase1_continue';
 SET DEBUG_SYNC='now WAIT_FOR binlog_aba_receiver_accepted TIMEOUT 60';
+--let $assert_text= drain owner rebuilt the stale token-local mirror
+--let $assert_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--let $assert_select= PRESERVE: drain-owned active binlog mirror rebuild target=[0-9]+ prepared=1
+--let $assert_count= 1
+--source include/assert_grep.inc
+--let $assert_text= drain-owned rebuild avoided final full-cache fallback
+--let $assert_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--let $assert_select= transfer_binlog_fallback_
+--let $assert_count= 0
+--source include/assert_grep.inc
 
 --connect(binlog_aba_reset,localhost,preserve_trx_ha_admin,binlog-savepoint-aba-secret,test)
 --send RESET DRAIN
@@ -101,13 +137,6 @@ SET DEBUG_SYNC='now SIGNAL binlog_aba_final_ack_continue';
 --error 4021
 --reap
 --enable_result_log
-
---connection default
---let $assert_text= Early preserve rejects the equal-length stale Phase1 binlog blob
---let $assert_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
---let $assert_select= PRESERVE: standby transfer early binlog catchup target=[0-9]+ bytes=[1-9][0-9]*
---let $assert_count_condition= >= 1
---source include/assert_grep.inc
 
 --connection binlog_aba_app
 COMMIT;
@@ -159,11 +188,13 @@ EOF
 SELECT note FROM t_binlog_savepoint_aba WHERE id=1;
 --disable_query_log
 
+DROP PROCEDURE p_binlog_savepoint_aba;
 DROP TABLE t_binlog_savepoint_aba;
 DROP USER preserve_trx_ha_admin@localhost;
 DROP USER preserve_trx_aba_app@localhost;
 SET DEBUG_SYNC='RESET';
 SET GLOBAL preserve_trx_transfer_prewarm_paused=OFF;
+SET GLOBAL preserve_trx_warmcopy_chunk_bytes=1048576;
 SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
 SET GLOBAL preserve_trx_warmcopy_enable=ON;
 SET GLOBAL preserve_trx_enable=ON;

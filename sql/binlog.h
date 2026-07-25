@@ -995,19 +995,28 @@ bool mysql_binlog_preserve_warmcopy_build_blob(
 bool mysql_binlog_preserve_warmcopy_begin_session(
     THD *thd, const std::string &warmcopy_id, uint64_t epoch,
     Preserved_trx_warm_external_blob_carrier *carrier,
-    uint64_t max_blob_bytes, Mysql_binlog_warmcopy_session **session,
-    bool *has_blob, uint64_t *prefix_bytes = nullptr);
+    uint64_t max_blob_bytes, std::atomic<uint64_t> *total_reserved_bytes,
+    uint64_t max_total_bytes, uint64_t reservation_chunk_bytes,
+    Mysql_binlog_warmcopy_session **session, bool *has_blob,
+    uint64_t *prefix_bytes = nullptr, bool allow_inflight_statement = false);
 bool mysql_binlog_preserve_warmcopy_finalize_session(
     THD *thd, Mysql_binlog_warmcopy_session *session,
-    uint64_t tail_budget_bytes, PrebuiltBinlogCacheBlob *blob,
-    bool *has_blob);
+    uint64_t tail_budget_bytes, bool receiver_prefix_published,
+    uint64_t receiver_prefix_bytes, PrebuiltBinlogCacheBlob *blob,
+    bool *has_blob, uint64_t *retained_reservation_bytes);
+bool mysql_binlog_preserve_warmcopy_prefix_blob(
+    THD *thd, Mysql_binlog_warmcopy_session *session,
+    PrebuiltBinlogCacheBlob *blob, bool *has_blob);
 bool mysql_binlog_preserve_warmcopy_tail_budget_exceeded(
     THD *thd, Mysql_binlog_warmcopy_session *session,
     uint64_t tail_budget_bytes, bool *exceeded);
+void mysql_binlog_preserve_warmcopy_stop_session_mirroring(
+    Mysql_binlog_warmcopy_session *session);
 void mysql_binlog_preserve_warmcopy_abort_session(
     Mysql_binlog_warmcopy_session *session);
 bool mysql_binlog_preserve_warmcopy_cache_length(THD *thd, uint64_t *length,
-                                                 bool *has_blob);
+                                                 bool *has_blob,
+                                                 bool allow_inflight_statement = false);
 bool mysql_binlog_preserve_import(
     THD *thd, const Mysql_binlog_preserve_snapshot &snapshot);
 bool mysql_binlog_preserve_reactivate_after_prepare_failure(

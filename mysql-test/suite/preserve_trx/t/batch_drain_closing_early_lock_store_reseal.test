@@ -1,0 +1,120 @@
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/have_log_bin.inc
+--source include/force_restart.inc
+
+--disable_query_log
+--let $credential_file= $MYSQL_TMP_DIR/closing_early_lock_reseal.secret
+--write_file $credential_file
+closing-early-lock-reseal-secret
+EOF
+--exec chmod 600 $credential_file
+
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+DROP USER IF EXISTS closing_early_lock_reseal_app@localhost;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'closing-early-lock-reseal-secret';
+GRANT SHUTDOWN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.*
+  TO preserve_trx_ha_admin@localhost;
+CREATE USER closing_early_lock_reseal_app@localhost;
+GRANT SELECT, UPDATE ON test.* TO closing_early_lock_reseal_app@localhost;
+
+--let $source_uuid= query_get_value(SELECT @@GLOBAL.server_uuid AS uuid, uuid, 1)
+--let $restart_parameters= restart: --preserve-trx-enable=ON --preserve-trx-transfer-receiver-enable=ON --preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --preserve-trx-transfer-allowed-source-uuid=$source_uuid --preserve-trx-transfer-target-server-uuid=$source_uuid --preserve-trx-transfer-target-socket=$MASTER_MYSOCK --preserve-trx-transfer-target-user=preserve_trx_ha_admin --preserve-trx-transfer-credential-name=closing_early_lock_reseal --preserve-trx-transfer-credential-secret-file=$credential_file
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--let $restart_parameters=
+--disable_query_log
+
+SET GLOBAL preserve_trx_batch_max_transactions=1;
+SET GLOBAL preserve_trx_drain_command_timeout_fail_batch=ON;
+SET GLOBAL preserve_trx_drain_closing_command_timeout_ms=60000;
+SET GLOBAL preserve_trx_transfer_prewarm_paused=ON;
+
+SET @lock_reseal_valid_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME='Preserve_trx_lock_warmcopy_sealed_valid');
+SET @lock_reseal_fallback_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME='Preserve_trx_lock_warmcopy_live_fallback');
+
+CREATE TABLE t_closing_early_lock_reseal(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_closing_early_lock_reseal VALUES (1,10),(2,20);
+
+--connect(closing_early_lock_reseal_ha,localhost,preserve_trx_ha_admin,closing-early-lock-reseal-secret,test)
+--connect(closing_early_lock_reseal_app,localhost,closing_early_lock_reseal_app,,test)
+START TRANSACTION;
+UPDATE t_closing_early_lock_reseal SET v=v+1 WHERE id=1;
+
+--connect(closing_early_lock_reseal_owner,localhost,root,,test)
+SET DEBUG_SYNC =
+  'preserve_trx_transfer_after_phase1_binlog_stream SIGNAL early_lock_phase1_sent WAIT_FOR early_lock_phase1_continue';
+SET DEBUG_SYNC =
+  'preserve_trx_batch_after_one_target_preserved SIGNAL early_lock_target_staged WAIT_FOR early_lock_target_continue';
+--send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+
+--connection closing_early_lock_reseal_ha
+SET DEBUG_SYNC='now WAIT_FOR early_lock_phase1_sent TIMEOUT 30';
+
+# Mutate the record-lock set only after the Phase1 record blob has been built
+# and sent. The QUIESCED path must reject the stale Phase1 blob and use the
+# existing stable live-export fallback for this token.
+--connection closing_early_lock_reseal_app
+UPDATE t_closing_early_lock_reseal SET v=v+2 WHERE id=2;
+
+--connection closing_early_lock_reseal_ha
+SET DEBUG_SYNC='now SIGNAL early_lock_phase1_continue';
+SET DEBUG_SYNC='now WAIT_FOR early_lock_target_staged TIMEOUT 30';
+
+--connect(closing_early_lock_reseal_reset,localhost,preserve_trx_ha_admin,closing-early-lock-reseal-secret,test)
+--send RESET DRAIN
+
+--connection closing_early_lock_reseal_ha
+SET DEBUG_SYNC='now SIGNAL early_lock_target_continue';
+
+--connection closing_early_lock_reseal_owner
+--error 4021
+--reap
+
+--connection closing_early_lock_reseal_reset
+--reap
+
+--connection default
+SELECT
+  (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME='Preserve_trx_lock_warmcopy_sealed_valid')
+     = @lock_reseal_valid_before AS stale_prebuilt_rejected,
+  (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME='Preserve_trx_lock_warmcopy_live_fallback')
+     > @lock_reseal_fallback_before AS live_lock_list_fallback,
+  (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME='Preserve_trx_early_staged_tokens')=1
+     AS early_token_staged;
+
+--connection closing_early_lock_reseal_app
+COMMIT;
+
+--connection default
+SELECT COUNT(*) AS preserved_count_after_reset
+  FROM performance_schema.preserved_transactions;
+SELECT id, v FROM t_closing_early_lock_reseal ORDER BY id;
+
+--disconnect closing_early_lock_reseal_reset
+--disconnect closing_early_lock_reseal_owner
+--disconnect closing_early_lock_reseal_app
+--disconnect closing_early_lock_reseal_ha
+
+--connection default
+DROP TABLE t_closing_early_lock_reseal;
+DROP USER closing_early_lock_reseal_app@localhost;
+DROP USER preserve_trx_ha_admin@localhost;
+--remove_file $credential_file
+SET DEBUG_SYNC='RESET';

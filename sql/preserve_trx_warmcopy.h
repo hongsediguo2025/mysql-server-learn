@@ -24,6 +24,7 @@
 #ifndef SQL_PRESERVE_TRX_WARMCOPY_INCLUDED
 #define SQL_PRESERVE_TRX_WARMCOPY_INCLUDED
 
+#include <atomic>
 #include <cstdint>
 #include <initializer_list>
 #include <mutex>
@@ -320,46 +321,34 @@ bool warmcopy_has_active_degraded_participant(
     std::initializer_list<const WarmcopyParticipant *> participants);
 
 /*
-  Derive the remaining per-entry capacity from total reserved bytes and the
-  global warm external blob budget. false means a usable capacity was written to
-  entry_blob_limit; true means invalid accounting or no safe capacity, so the
-  caller must degrade or fail closed.
-*/
-bool warmcopy_entry_blob_limit(uint64_t total_reserved_bytes,
-                               uint64_t entry_reserved_bytes,
-                               uint64_t max_total_bytes,
-                               uint64_t *entry_blob_limit);
-
-/*
   Compute the maximum blob bytes one participant may name after accounting for
   the drain-wide byte budget and per-entry cap. These values are artifact
   reservation limits for warm external blobs; they are not a measurement of
-  process heap memory.
+  process heap memory. Large caller copy chunks are internally bounded so they
+  cannot create disproportionate per-entry reservation slack.
 */
-bool warmcopy_effective_entry_blob_limit(uint64_t total_reserved_bytes,
-                                         uint64_t entry_reserved_bytes,
-                                         uint64_t max_total_bytes,
-                                         uint64_t max_entry_blob_bytes,
-                                         uint64_t *entry_blob_limit);
+bool warmcopy_reserve_entry_growth(
+    std::atomic<uint64_t> *total_reserved_bytes, uint64_t max_total_bytes,
+    uint64_t max_entry_blob_bytes, uint64_t reservation_chunk_bytes,
+    uint64_t required_bytes, uint64_t *entry_reserved_bytes);
 
 /*
-  Reserve the prefix plus as much tail budget as still fits in the entry limit.
-  false means reservation was written. true means the prefix cannot be
-  represented, the output pointer is invalid, or accounting is otherwise unsafe.
+  Shrink or release one entry's reservation after finalize or abort. The entry
+  owns entry_reserved_bytes, so subtracting its private delta needs no global
+  provider mutex; the atomic total only arbitrates concurrent participants.
 */
-bool warmcopy_reservation_with_tail_budget(uint64_t prefix_bytes,
-                                           uint64_t tail_budget_bytes,
-                                           uint64_t entry_blob_limit,
-                                           uint64_t *reservation);
+bool warmcopy_retain_entry_reservation(
+    std::atomic<uint64_t> *total_reserved_bytes, uint64_t retained_bytes,
+    uint64_t *entry_reserved_bytes);
 
 /*
-  Keep accounting at least as large as the already opened session limit. The
-  accounted value is what the drain coordinator reserves for the artifact, not
-  bytes already copied or resident in memory.
+  Compute bytes not covered by the latest receiver-acknowledged prefix. A
+  published high watermark beyond the final source length is stale and must be
+  rejected rather than interpreted as an empty tail.
 */
-bool warmcopy_accounted_session_reservation(uint64_t session_blob_limit,
-                                            uint64_t requested_reservation,
-                                            uint64_t *accounted_reservation);
+bool warmcopy_unpublished_tail_bytes(uint64_t final_length,
+                                     uint64_t published_high_watermark,
+                                     uint64_t *tail_bytes);
 
 /*
   Enforce pending tail-range limits before adding a new mirrored range. Returning
@@ -370,6 +359,7 @@ bool warmcopy_accounted_session_reservation(uint64_t session_blob_limit,
 bool warmcopy_pending_range_limit_exceeded(uint64_t pending_range_count,
                                            uint64_t pending_range_bytes,
                                            uint64_t new_range_bytes,
+                                           bool creates_new_range,
                                            uint64_t max_range_count,
                                            uint64_t max_pending_bytes,
                                            uint64_t *next_pending_range_bytes);

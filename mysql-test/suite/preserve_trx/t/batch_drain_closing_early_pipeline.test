@@ -3,7 +3,7 @@
 --source include/have_debug.inc
 --source include/have_debug_sync.inc
 --source include/not_windows.inc
---source include/not_log_bin.inc
+--source include/have_log_bin.inc
 --source include/force_restart.inc
 
 --disable_query_log
@@ -41,12 +41,14 @@ SET GLOBAL preserve_trx_batch_max_transactions=2;
 SET GLOBAL preserve_trx_drain_command_timeout_fail_batch=ON;
 SET GLOBAL preserve_trx_drain_closing_command_timeout_ms=60000;
 SET GLOBAL preserve_trx_transfer_prewarm_paused=ON;
+SET GLOBAL preserve_trx_parallel_preserve_threads=1;
 
 CREATE TABLE t_closing_early_pipeline(
   id INT PRIMARY KEY,
   v INT NOT NULL
 ) ENGINE=InnoDB;
 INSERT INTO t_closing_early_pipeline VALUES (1,10),(2,20);
+INSERT INTO t_closing_early_pipeline VALUES (3,30);
 delimiter |;
 CREATE PROCEDURE p_closing_early_pipeline()
 BEGIN
@@ -63,7 +65,9 @@ START TRANSACTION;
 UPDATE t_closing_early_pipeline SET v=v+1 WHERE id=1;
 SET DEBUG_SYNC=
   'before_execute_sql_command SIGNAL closing_early_app_1_blocked WAIT_FOR closing_early_app_1_continue';
---send UPDATE t_closing_early_pipeline SET v=v+10 WHERE id=1
+SET DEBUG_SYNC=
+  'preserve_trx_closing_command_blocked_before_response SIGNAL closing_early_app_1_rejected WAIT_FOR closing_early_app_1_reject_continue';
+--send UPDATE t_closing_early_pipeline SET v=v+10 WHERE id=3
 
 --connect(closing_early_app_2,localhost,closing_early_app,,test)
 START TRANSACTION;
@@ -95,14 +99,38 @@ SET DEBUG_SYNC=
   'preserve_trx_warmcopy_after_closing_state_before_targets SIGNAL closing_early_entered';
 SET DEBUG_SYNC=
   'preserve_trx_batch_after_one_target_preserved SIGNAL closing_early_first_staged';
+SET DEBUG_SYNC=
+  'preserve_trx_batch_final_attach_observed_rejection_inflight SIGNAL closing_early_attach_observed_busy WAIT_FOR closing_early_attach_retry';
 --send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
 
 --connection closing_early_ha
 SET DEBUG_SYNC='now WAIT_FOR closing_early_entered TIMEOUT 30';
+SET @last_object_seal_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME=
+    'Preserve_trx_transfer_receiver_last_object_seal_monotonic_us');
 SET DEBUG_SYNC='now SIGNAL closing_early_app_1_continue';
 SET DEBUG_SYNC='now SIGNAL closing_early_probe_continue';
 
 --connection closing_early_app_1
+--reap
+--send SELECT 1
+
+# The command following the old in-flight command is admitted only far enough
+# to return 4020. While that response is in flight the early worker must retain
+# the target and wait for its next idle boundary instead of failing the epoch.
+--connection closing_early_ha
+SET DEBUG_SYNC='now WAIT_FOR closing_early_app_1_rejected TIMEOUT 10';
+# Keep the response boundary closed for one bounded Debug Sync interval so the
+# early worker must observe the non-idle target before it can attach.
+--disable_warnings
+SET DEBUG_SYNC='now WAIT_FOR closing_early_attach_observed_busy TIMEOUT 1';
+--enable_warnings
+SET DEBUG_SYNC='now SIGNAL closing_early_app_1_reject_continue';
+SET DEBUG_SYNC='now SIGNAL closing_early_attach_retry';
+
+--connection closing_early_app_1
+--error ER_PRESERVE_TRX_SESSION_DRAINED
 --reap
 
 --connection closing_early_probe
@@ -115,6 +143,11 @@ SET DEBUG_SYNC='now WAIT_FOR closing_early_first_staged TIMEOUT 10';
 SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')
        - @accepted_before AS accepted_epoch_delta_before_final_ack;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+        WHERE VARIABLE_NAME=
+          'Preserve_trx_transfer_receiver_last_object_seal_monotonic_us')
+       > @last_object_seal_before
+       AS early_object_sealed_before_second_boundary;
 
 --connect(closing_early_reset,localhost,preserve_trx_ha_admin,closing-early-pipeline-secret,test)
 --send RESET DRAIN
@@ -160,4 +193,5 @@ DROP TABLE t_closing_early_pipeline;
 DROP USER closing_early_app@localhost;
 DROP USER preserve_trx_ha_admin@localhost;
 SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_parallel_preserve_threads=DEFAULT;
 --remove_file $credential_file

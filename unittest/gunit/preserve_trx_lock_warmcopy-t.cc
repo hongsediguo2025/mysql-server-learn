@@ -36,6 +36,7 @@
 #include "sql/preserve_trx_drain.h"
 #include "sql/preserve_trx_lock_warmcopy.h"
 #include "sql/mdl.h"
+#include "storage/innobase/include/lock0preserve_plan.h"
 #include "storage/innobase/include/lock0warmcopy.h"
 
 namespace preserve_trx_lock_warmcopy_unittest {
@@ -126,18 +127,21 @@ std::string make_record_entry(uint64_t table_id, uint64_t index_id,
                               char image_marker,
                               uint64_t page_lsn =
                                   0x0102030405060708ULL,
-                              uint32_t page_n_heap = 6) {
+                              uint32_t page_n_heap = 6,
+                              bool include_record_image = true,
+                              uint32_t type_mode = 3) {
   std::string bitmap(1, '\0');
   bitmap[0] = static_cast<char>(1U << heap_no);
   const std::string heap_offsets = make_heap_offsets(heap_no);
-  const std::string record_images = make_record_image(image_marker);
+  const std::string record_images =
+      include_record_image ? make_record_image(image_marker) : std::string();
 
   std::string entry;
   append_u64(&entry, table_id);
   append_u64(&entry, index_id);
   append_u32(&entry, 7);  // space_id
   append_u32(&entry, page_no);
-  append_u32(&entry, 3);  // LOCK_REC | LOCK_X in the current payload contract
+  append_u32(&entry, type_mode);
   append_u32(&entry, 8);  // n_bits
   append_u64(&entry, page_lsn);
   append_u32(&entry, page_n_heap);
@@ -606,6 +610,8 @@ TEST(PreserveTrxLockWarmcopyDrainParticipant,
   EXPECT_TRUE(artifact->valid);
   EXPECT_TRUE(artifact->record_locks_payload.empty());
   EXPECT_TRUE(artifact->has_prebuilt_record_locks_blob);
+  EXPECT_FALSE(
+      artifact->prebuilt_record_locks_blob.strict_metadata_only_compatible);
   EXPECT_EQ(1U, artifact->record_lock_count);
 
   const Preserve_trx_drain_participant_observation observation =
@@ -645,10 +651,47 @@ TEST(PreserveTrxLockWarmcopyDrainParticipant,
   ASSERT_TRUE(participant.prepare_phase1_record_store_targets(
       [&](uint64_t token, const PrebuiltRecordLocksBlob &blob) {
         callback_tokens.push_back(token);
-        return blob.size != 0 && !blob.warmcopy_id.empty();
+        return blob.size != 0 && !blob.warmcopy_id.empty() &&
+               !blob.strict_metadata_only_compatible;
       }));
   ASSERT_EQ(1U, callback_tokens.size());
   EXPECT_EQ(42U, callback_tokens[0]);
+
+  participant.finalize_phase();
+  (void)rmdir(options.preserve_dir.c_str());
+}
+
+TEST(PreserveTrxLockWarmcopyDrainParticipant,
+     Phase1MetadataOnlyRecordBlobIsStrictCompatible) {
+  lock_warmcopy_reset_for_unit_test();
+  const std::string payload = make_record_payload(
+      {make_record_entry(100, 200, 11, 2, 'm', 0x0102030405060708ULL, 6,
+                         false, 35)});
+  lock_preserve_record_lock_metadata_facts_t facts;
+  ASSERT_EQ(lock_preserve_metadata_plan_status::OK,
+            lock_preserve_build_record_lock_metadata_facts(payload, &facts));
+  EXPECT_FALSE(facts.record_image_present);
+
+  Preserve_trx_lock_warmcopy_options options =
+      preserve_trx_lock_warmcopy_current_options();
+  options.preserve_dir =
+      unique_dir_for_test("preserve-lock-warmcopy-metadata-only");
+  Preserve_trx_lock_warmcopy_drain_participant participant(options);
+
+  ASSERT_TRUE(participant.open_phase1());
+  ASSERT_TRUE(participant.prepare_phase1_record_payload_for_thread_for_unit_test(
+      42, payload));
+  ASSERT_TRUE(participant.prepare_quiesced_targets_for_unit_test({42}));
+  ASSERT_TRUE(participant.close_phase1());
+  ASSERT_TRUE(participant.phase2_preflight(
+      Preserve_trx_drain_phase_mode::TWO_PHASE));
+
+  const Preserve_trx_lock_warmcopy_artifact *artifact =
+      participant.artifact_for_thread(42);
+  ASSERT_NE(nullptr, artifact);
+  ASSERT_TRUE(artifact->has_prebuilt_record_locks_blob);
+  EXPECT_TRUE(
+      artifact->prebuilt_record_locks_blob.strict_metadata_only_compatible);
 
   participant.finalize_phase();
   (void)rmdir(options.preserve_dir.c_str());

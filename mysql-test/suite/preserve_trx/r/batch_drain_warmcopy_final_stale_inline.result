@@ -1,0 +1,6 @@
+include/assert_grep.inc [final stale token avoided drain-owned mirror rebuild]
+include/assert_grep.inc [final stale token published one batched replacement]
+include/assert_grep.inc [final stale token avoided full-cache fallback artifact]
+SELECT note FROM t_final_stale_inline WHERE id=1;
+note
+transfer-final-B

@@ -2227,7 +2227,7 @@ int binlog_cache_data::write_event(Log_event *ev) {
   DBUG_TRACE;
 
   if (ev != nullptr) {
-    preserve_trx_warmcopy_admit_current_thd_binlog_write(ev->thd);
+    m_cache.begin_warmcopy_event();
 
     DBUG_EXECUTE_IF("simulate_disk_full_at_flush_pending",
                     { DBUG_SET("+d,simulate_file_write_error"); });
@@ -2245,6 +2245,7 @@ int binlog_cache_data::write_event(Log_event *ev) {
         */
         DBUG_SET("+d,simulate_do_write_cache_failure");
       });
+      m_cache.end_warmcopy_event();
       return 1;
     }
     if (ev->get_type_code() == binary_log::XID_EVENT) flags.with_xid = true;
@@ -2261,6 +2262,7 @@ int binlog_cache_data::write_event(Log_event *ev) {
     event_counter++;
     DBUG_PRINT("debug",
                ("event_counter= %lu", static_cast<ulong>(event_counter)));
+    m_cache.end_warmcopy_event();
   }
   return 0;
 }
@@ -3977,7 +3979,8 @@ bool mysql_binlog_preserve_export_metadata_only(
 
 bool mysql_binlog_warmcopy_source_eligible(THD *thd, bool require_nonempty,
                                            uint64_t *cache_length,
-                                           bool *has_blob, bool *eligible) {
+                                           bool *has_blob, bool *eligible,
+                                           bool allow_inflight_statement) {
   if (cache_length != nullptr) *cache_length = 0;
   if (has_blob != nullptr) *has_blob = false;
   if (eligible != nullptr) *eligible = false;
@@ -3986,14 +3989,38 @@ bool mysql_binlog_warmcopy_source_eligible(THD *thd, bool require_nonempty,
   if (!(thd->variables.option_bits & OPTION_BIN_LOG)) return false;
 
   binlog_cache_mngr *const cache_mngr = thd_get_cache_mngr(thd);
-  if (cache_mngr == nullptr || cache_mngr->trx_cache.pending() != nullptr ||
-      !cache_mngr->stmt_cache.is_binlog_empty() ||
-      cache_mngr->trx_cache.get_prev_position() != MY_OFF_T_UNDEF ||
-      cache_mngr->stmt_cache.has_incident() ||
-      cache_mngr->trx_cache.has_incident() ||
-      cache_mngr->stmt_cache.is_finalized() ||
-      cache_mngr->trx_cache.is_finalized() ||
-      cache_mngr->trx_cache.cannot_rollback()) {
+  /*
+    A strict transfer live mirror may start from the already serialized
+    transaction-cache prefix while its statement remains active. The owning
+    command flushes a pending Rows_log_event through the normal append path.
+    Statement rollback truncates the source cache through
+    Binlog_cache_storage, which advances the generation and invalidates this
+    token's mirror. One-shot and final snapshot callers remain strict.
+  */
+  if (cache_mngr == nullptr) return false;
+  const bool pending_rows_event =
+      cache_mngr->trx_cache.pending() != nullptr;
+  const bool stmt_cache_nonempty =
+      !cache_mngr->stmt_cache.is_binlog_empty();
+  const bool statement_position_active =
+      cache_mngr->trx_cache.get_prev_position() != MY_OFF_T_UNDEF;
+  const bool incident = cache_mngr->stmt_cache.has_incident() ||
+                        cache_mngr->trx_cache.has_incident();
+  const bool finalized = cache_mngr->stmt_cache.is_finalized() ||
+                         cache_mngr->trx_cache.is_finalized();
+  const bool cannot_rollback = cache_mngr->trx_cache.cannot_rollback();
+  if ((!allow_inflight_statement &&
+       (pending_rows_event || statement_position_active)) ||
+      stmt_cache_nonempty || incident || finalized || cannot_rollback) {
+    DBUG_PRINT("info",
+               ("active binlog mirror eligibility rejected: thread_id=%llu "
+                "pending_rows_event=%d stmt_cache_nonempty=%d "
+                "statement_position_active=%d incident=%d finalized=%d "
+                "cannot_rollback=%d",
+                static_cast<unsigned long long>(thd->thread_id()),
+                pending_rows_event, stmt_cache_nonempty,
+                statement_position_active, incident, finalized,
+                cannot_rollback));
     return false;
   }
 
@@ -4056,6 +4083,19 @@ bool mysql_binlog_warmcopy_source_truncate_generation(
   *truncate_generation =
       cache_mngr->trx_cache.get_cache()->truncate_generation();
   return false;
+}
+
+bool mysql_binlog_warmcopy_source_prefix_snapshot(
+    THD *thd, Binlog_cache_warmcopy_mirror *expected_mirror,
+    PrebuiltBinlogCacheBlob *blob, bool *has_blob) {
+  if (has_blob != nullptr) *has_blob = false;
+  if (thd == nullptr || expected_mirror == nullptr || blob == nullptr) {
+    return true;
+  }
+  binlog_cache_mngr *const cache_mngr = thd_get_cache_mngr(thd);
+  return cache_mngr == nullptr ||
+         cache_mngr->trx_cache.get_cache()->warmcopy_prefix_snapshot(
+             expected_mirror, blob, has_blob);
 }
 
 static void discard_binlog_preserve_import_and_reset_scopes(THD *thd) {

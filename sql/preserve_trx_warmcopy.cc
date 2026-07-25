@@ -35,6 +35,8 @@
 
 namespace {
 
+constexpr uint64_t kWarmcopyMaxReservationChunkBytes = 1024 * 1024;
+
 bool uint64_add_overflows(uint64_t left, uint64_t right) {
   return right > std::numeric_limits<uint64_t>::max() - left;
 }
@@ -545,77 +547,91 @@ bool warmcopy_has_active_degraded_participant(
   return false;
 }
 
-bool warmcopy_entry_blob_limit(uint64_t total_reserved_bytes,
-                               uint64_t entry_reserved_bytes,
-                               uint64_t max_total_bytes,
-                               uint64_t *entry_blob_limit) {
-  if (entry_blob_limit == nullptr) return true;
-  *entry_blob_limit = 0;
-  if (entry_reserved_bytes > total_reserved_bytes) return true;
-
-  const uint64_t other_reserved_bytes =
-      total_reserved_bytes - entry_reserved_bytes;
-  if (other_reserved_bytes > max_total_bytes) return true;
-
-  *entry_blob_limit = max_total_bytes - other_reserved_bytes;
-  return false;
-}
-
-bool warmcopy_effective_entry_blob_limit(uint64_t total_reserved_bytes,
-                                         uint64_t entry_reserved_bytes,
-                                         uint64_t max_total_bytes,
-                                         uint64_t max_entry_blob_bytes,
-                                         uint64_t *entry_blob_limit) {
-  /*
-    Entry limit is the remaining global blob budget after accounting for other
-    sessions, capped again by the per-entry maximum. It is a byte-budget for
-    external artifacts, not an estimate of heap memory.
-  */
-  if (warmcopy_entry_blob_limit(total_reserved_bytes, entry_reserved_bytes,
-                                max_total_bytes, entry_blob_limit)) {
+bool warmcopy_reserve_entry_growth(
+    std::atomic<uint64_t> *total_reserved_bytes, uint64_t max_total_bytes,
+    uint64_t max_entry_blob_bytes, uint64_t reservation_chunk_bytes,
+    uint64_t required_bytes, uint64_t *entry_reserved_bytes) {
+  if (total_reserved_bytes == nullptr || entry_reserved_bytes == nullptr ||
+      reservation_chunk_bytes == 0 ||
+      *entry_reserved_bytes > max_entry_blob_bytes ||
+      required_bytes > max_entry_blob_bytes) {
     return true;
   }
-  *entry_blob_limit = std::min(*entry_blob_limit, max_entry_blob_bytes);
-  return false;
-}
+  if (required_bytes <= *entry_reserved_bytes) return false;
 
-bool warmcopy_reservation_with_tail_budget(uint64_t prefix_bytes,
-                                           uint64_t tail_budget_bytes,
-                                           uint64_t entry_blob_limit,
-                                           uint64_t *reservation) {
-  if (reservation == nullptr) return true;
-  *reservation = 0;
-  if (prefix_bytes > entry_blob_limit) return true;
-
-  if (tail_budget_bytes >
-      std::numeric_limits<uint64_t>::max() - prefix_bytes) {
-    *reservation = entry_blob_limit;
-    return false;
+  /*
+    Prefix-copy chunks may be tuned much larger for throughput. Do not charge
+    every small transaction that full copy chunk before those bytes exist.
+  */
+  const uint64_t accounting_chunk_bytes =
+      std::min(reservation_chunk_bytes, kWarmcopyMaxReservationChunkBytes);
+  const uint64_t chunks =
+      required_bytes / accounting_chunk_bytes +
+      (required_bytes % accounting_chunk_bytes == 0 ? 0 : 1);
+  uint64_t target_reservation = max_entry_blob_bytes;
+  if (chunks <=
+      std::numeric_limits<uint64_t>::max() / accounting_chunk_bytes) {
+    target_reservation =
+        std::min(max_entry_blob_bytes, chunks * accounting_chunk_bytes);
+  }
+  if (target_reservation < required_bytes ||
+      target_reservation < *entry_reserved_bytes) {
+    return true;
   }
 
-  const uint64_t wanted = prefix_bytes + tail_budget_bytes;
-  *reservation = std::min(wanted, entry_blob_limit);
-  return false;
+  const uint64_t delta = target_reservation - *entry_reserved_bytes;
+  uint64_t total = total_reserved_bytes->load(std::memory_order_relaxed);
+  for (;;) {
+    if (total > max_total_bytes || delta > max_total_bytes - total) return true;
+    if (total_reserved_bytes->compare_exchange_weak(
+            total, total + delta, std::memory_order_relaxed,
+            std::memory_order_relaxed)) {
+      *entry_reserved_bytes = target_reservation;
+      return false;
+    }
+  }
 }
 
-bool warmcopy_accounted_session_reservation(uint64_t session_blob_limit,
-                                            uint64_t requested_reservation,
-                                            uint64_t *accounted_reservation) {
-  if (accounted_reservation == nullptr) return true;
-  *accounted_reservation = 0;
-  *accounted_reservation = std::max(session_blob_limit, requested_reservation);
+bool warmcopy_retain_entry_reservation(
+    std::atomic<uint64_t> *total_reserved_bytes, uint64_t retained_bytes,
+    uint64_t *entry_reserved_bytes) {
+  if (total_reserved_bytes == nullptr || entry_reserved_bytes == nullptr ||
+      retained_bytes > *entry_reserved_bytes) {
+    return true;
+  }
+  const uint64_t released_bytes = *entry_reserved_bytes - retained_bytes;
+  uint64_t total = total_reserved_bytes->load(std::memory_order_relaxed);
+  for (;;) {
+    if (released_bytes > total) return true;
+    if (total_reserved_bytes->compare_exchange_weak(
+            total, total - released_bytes, std::memory_order_relaxed,
+            std::memory_order_relaxed)) {
+      *entry_reserved_bytes = retained_bytes;
+      return false;
+    }
+  }
+}
+
+bool warmcopy_unpublished_tail_bytes(uint64_t final_length,
+                                     uint64_t published_high_watermark,
+                                     uint64_t *tail_bytes) {
+  if (tail_bytes == nullptr || published_high_watermark > final_length) {
+    return true;
+  }
+  *tail_bytes = final_length - published_high_watermark;
   return false;
 }
 
 bool warmcopy_pending_range_limit_exceeded(uint64_t pending_range_count,
                                            uint64_t pending_range_bytes,
                                            uint64_t new_range_bytes,
+                                           bool creates_new_range,
                                            uint64_t max_range_count,
                                            uint64_t max_pending_bytes,
                                            uint64_t *next_pending_range_bytes) {
   if (next_pending_range_bytes == nullptr) return true;
   *next_pending_range_bytes = 0;
-  if (pending_range_count >= max_range_count) return true;
+  if (creates_new_range && pending_range_count >= max_range_count) return true;
   if (new_range_bytes >
       std::numeric_limits<uint64_t>::max() - pending_range_bytes) {
     return true;

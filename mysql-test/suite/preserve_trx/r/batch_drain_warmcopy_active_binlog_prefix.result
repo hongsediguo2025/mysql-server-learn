@@ -1,0 +1,17 @@
+SELECT VARIABLE_VALUE+0 > @binlog_prewarm_before
+AS active_binlog_prefix_streamed_before_command_boundary
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_recv_binlog_obj_prewarm_first_start_us';
+active_binlog_prefix_streamed_before_command_boundary
+1
+include/assert_grep.inc [active stored-procedure mirror advanced beyond one MiB before command boundary]
+include/assert_grep.inc [business command did not rebuild the DRAIN-owned mirror]
+include/assert_grep.inc [contiguous active binlog appends did not exhaust the pending range limit]
+include/assert_grep.inc [quiesced target closed on a final or already-published receiver high watermark]
+include/assert_grep.inc [quiesced final high watermark joined the coordinator batch]
+include/assert_grep.inc [ACKed final high watermark satisfied source freshness coverage]
+include/assert_grep.inc [final transfer reused the receiver high watermark without full fallback]
+ERROR HY000: DRAIN TRANSACTIONS PRESERVE was reset before shutdown handoff
+row_count	value_sum	min_payload_bytes	max_payload_bytes
+865	1281	4096	4096

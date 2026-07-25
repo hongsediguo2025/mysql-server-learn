@@ -1634,6 +1634,7 @@ bool dispatch_command(THD *thd, const COM_DATA *com_data,
         thd->get_stmt_da()->disable_status();
         goto done;
       }
+      DEBUG_SYNC(thd, "preserve_trx_closing_command_blocked_before_response");
       my_error(ER_PRESERVE_TRX_SESSION_DRAINED, MYF(0));
       goto done;
     case Preserve_trx_command_block_result::BLOCK_DRAINING:

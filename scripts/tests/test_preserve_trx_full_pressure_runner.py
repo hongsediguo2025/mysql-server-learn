@@ -8,8 +8,10 @@ from pathlib import Path
 
 from scripts.preserve_trx_full_pressure_runner import (
     FULL_PROFILE,
+    MIXED_FULL_PROFILE,
     RESET_FULL_PROFILE,
     RESET_SMOKE_PROFILE,
+    SMOKE_PROFILE,
     FullPressurePaths,
     archive_run_evidence,
     build_e2e_command,
@@ -40,6 +42,21 @@ class FullPressureProfileTest(unittest.TestCase):
         self.assertEqual(8 * 1024**2, FULL_PROFILE.phase1_batch_bytes)
         self.assertEqual(50, FULL_PROFILE.phase1_batch_linger_ms)
         self.assertEqual(500_000, FULL_PROFILE.source_phase2_limit_us)
+        self.assertEqual(
+            500_000, FULL_PROFILE.source_post_command_tail_limit_us
+        )
+        self.assertEqual(
+            "PROMOTION_PREPARE", FULL_PROFILE.transfer_runtime_profile
+        )
+        self.assertEqual(
+            1024**3, FULL_PROFILE.transfer_io_bytes_per_sec_base
+        )
+        self.assertEqual(
+            1024**3, FULL_PROFILE.prewarm_io_bytes_per_sec_base
+        )
+        self.assertEqual(8, FULL_PROFILE.promotion_prewarm_workers)
+        self.assertEqual(1024**2, SMOKE_PROFILE.phase1_batch_bytes)
+        self.assertTrue(FULL_PROFILE.warmcopy_required)
 
     def test_reset_profile_is_large_repeated_write_without_lockset_replacement(self):
         self.assertEqual(1000, RESET_FULL_PROFILE.sessions)
@@ -51,6 +68,62 @@ class FullPressureProfileTest(unittest.TestCase):
         self.assertEqual(2 * 1024**3, RESET_FULL_PROFILE.source_buffer_pool_bytes)
         self.assertEqual(2 * 1024**3, RESET_FULL_PROFILE.receiver_buffer_pool_bytes)
         self.assertEqual(3, RESET_SMOKE_PROFILE.sessions)
+
+    def test_mixed_full_separates_heap_and_warm_artifact_budgets(self):
+        self.assertEqual(
+            2 * 1024**3, MIXED_FULL_PROFILE.preserve_memory_budget_bytes
+        )
+        self.assertEqual(
+            8 * 1024**3, MIXED_FULL_PROFILE.warmcopy_artifact_budget_bytes
+        )
+        self.assertEqual(600_000_000, MIXED_FULL_PROFILE.source_phase2_limit_us)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            paths = FullPressurePaths.resolve(
+                repo_root=root / "repo",
+                build_dir=Path("build-release"),
+                work_root=root / "work",
+                history_root=root / "history",
+                run_id="run-mixed-resource-budgets",
+            )
+            source, receiver = build_mysqld_commands(
+                MIXED_FULL_PROFILE,
+                paths,
+                source_uuid="11111111-1111-1111-1111-111111111111",
+                receiver_uuid="22222222-2222-2222-2222-222222222222",
+                source_port=3511,
+                receiver_port=3512,
+            )
+            command = build_e2e_command(
+                MIXED_FULL_PROFILE,
+                paths,
+                source_command=source,
+                receiver_command=receiver,
+                source_port=3511,
+                receiver_port=3512,
+                credential_secret="secret",
+                evidence="mixed-transfer",
+            )
+
+        self.assertIn(
+            "--preserve-trx-memory-budget-bytes=2147483648", source
+        )
+        self.assertIn(
+            "--preserve-trx-warmcopy-max-total-bytes=8589934592", source
+        )
+        for option in (
+            "--preserve-trx-drain-closing-command-timeout-ms=600000",
+            "--preserve-trx-warmcopy-close-timeout-ms=600000",
+            "--preserve-trx-drain-hard-timeout-ms=600000",
+        ):
+            self.assertIn(option, source)
+        option = "--preserve-warmcopy-max-total-bytes"
+        self.assertIn(option, command)
+        self.assertEqual("8589934592", command[command.index(option) + 1])
+        option = "--preserve-warmcopy-close-timeout-ms"
+        self.assertIn(option, command)
+        self.assertEqual("600000", command[command.index(option) + 1])
 
     def test_paths_derive_receiver_preserve_dir_from_datadir(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -112,6 +185,28 @@ class FullPressureProfileTest(unittest.TestCase):
         self.assertIn("--log-error-verbosity=3", source)
         self.assertIn("--log-error-verbosity=3", receiver)
         self.assertIn("--innodb-buffer-pool-size=2147483648", receiver)
+        self.assertIn(
+            "--preserve-trx-transfer-runtime-profile=PROMOTION_PREPARE",
+            source,
+        )
+        self.assertIn(
+            "--preserve-trx-transfer-io-bytes-per-sec=1073741824", source
+        )
+        self.assertIn(
+            "--preserve-trx-transfer-runtime-profile=PROMOTION_PREPARE",
+            receiver,
+        )
+        self.assertIn(
+            "--preserve-trx-transfer-io-bytes-per-sec=1073741824", receiver
+        )
+        self.assertIn(
+            "--preserve-trx-promotion-prewarm-io-bytes-per-sec=1073741824",
+            receiver,
+        )
+        self.assertIn(
+            "--preserve-trx-promotion-prewarm-workers=8", receiver
+        )
+        self.assertIn("--warmcopy-required", command)
 
     def test_full_pressure_uses_tcp_for_source_receiver_and_transfer(self):
         with tempfile.TemporaryDirectory() as tmpdir:

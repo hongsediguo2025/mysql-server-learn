@@ -58,7 +58,13 @@ class FullPressureProfile:
     phase1_batch_bytes: int
     phase1_batch_linger_ms: int
     source_phase2_limit_us: int
+    source_post_command_tail_limit_us: int
     ready_after_final_spool_ack_limit_us: int
+    transfer_runtime_profile: str
+    transfer_io_bytes_per_sec_base: int
+    prewarm_io_bytes_per_sec_base: int
+    promotion_prewarm_workers: int
+    warmcopy_required: bool
     receiver_read_load_threads: int
     receiver_read_load_baseline_s: float
     receiver_read_load_max_qps_drop_pct: float
@@ -75,6 +81,7 @@ class FullPressureProfile:
     mixed_min_completed_statements: int = 0
     mixed_min_survivor_count: int = 0
     max_sql_resume_ms: int = 0
+    warmcopy_artifact_budget_bytes: int = 0
     source_tiered_load_threads_per_tier: int = 0
     source_tiered_load_work_units: Tuple[int, ...] = ()
     source_tiered_load_min_samples_per_tier: int = 0
@@ -102,7 +109,13 @@ FULL_PROFILE = FullPressureProfile(
     phase1_batch_bytes=8 * 1024**2,
     phase1_batch_linger_ms=50,
     source_phase2_limit_us=500_000,
+    source_post_command_tail_limit_us=500_000,
     ready_after_final_spool_ack_limit_us=500_000,
+    transfer_runtime_profile="PROMOTION_PREPARE",
+    transfer_io_bytes_per_sec_base=1024**3,
+    prewarm_io_bytes_per_sec_base=1024**3,
+    promotion_prewarm_workers=8,
+    warmcopy_required=True,
     receiver_read_load_threads=8,
     receiver_read_load_baseline_s=5.0,
     receiver_read_load_max_qps_drop_pct=5.0,
@@ -195,8 +208,9 @@ MIXED_FULL_PROFILE = dataclasses.replace(
     mixed_min_started_sessions=1000,
     mixed_min_completed_statements=10_000,
     mixed_min_survivor_count=1,
-    source_phase2_limit_us=180_000_000,
+    source_phase2_limit_us=600_000_000,
     max_sql_resume_ms=100,
+    warmcopy_artifact_budget_bytes=8 * 1024**3,
 )
 
 MIXED_SMOKE_PROFILE = dataclasses.replace(
@@ -216,7 +230,9 @@ MIXED_SMOKE_PROFILE = dataclasses.replace(
     mixed_min_completed_statements=80,
     mixed_min_survivor_count=1,
     source_phase2_limit_us=180_000_000,
+    ready_after_final_spool_ack_limit_us=500_000,
     max_sql_resume_ms=100,
+    warmcopy_artifact_budget_bytes=2 * 1024**3,
 )
 
 
@@ -478,18 +494,28 @@ def build_mysqld_commands(
         f"--innodb-buffer-pool-size={profile.source_buffer_pool_bytes}",
     ]
     if profile.mixed_seed_rows_per_table > 0:
+        mixed_close_timeout_ms = max(
+            120_000, (profile.source_phase2_limit_us + 999) // 1000
+        )
         source.extend(
             [
-                "--preserve-trx-drain-closing-command-timeout-ms=120000",
-                "--preserve-trx-warmcopy-close-timeout-ms=120000",
-                "--preserve-trx-drain-hard-timeout-ms=120000",
+                "--preserve-trx-drain-closing-command-timeout-ms="
+                f"{mixed_close_timeout_ms}",
+                "--preserve-trx-warmcopy-close-timeout-ms="
+                f"{mixed_close_timeout_ms}",
+                "--preserve-trx-drain-hard-timeout-ms="
+                f"{mixed_close_timeout_ms}",
                 "--preserve-trx-memory-per-token-bytes=1073741824",
-                f"--preserve-trx-warmcopy-max-total-bytes={profile.preserve_memory_budget_bytes}",
+                "--preserve-trx-warmcopy-max-total-bytes="
+                f"{profile.warmcopy_artifact_budget_bytes}",
             ]
         )
     if transfer_enabled:
         source.extend(
             [
+                f"--preserve-trx-transfer-runtime-profile={profile.transfer_runtime_profile}",
+                "--preserve-trx-transfer-io-bytes-per-sec="
+                f"{profile.transfer_io_bytes_per_sec_base}",
                 "--preserve-trx-transfer-target-user=preserve_transfer",
                 "--preserve-trx-transfer-credential-name=fullpressure",
                 "--preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE",
@@ -504,6 +530,13 @@ def build_mysqld_commands(
         )
         return source, []
     receiver = common + [
+        f"--preserve-trx-transfer-runtime-profile={profile.transfer_runtime_profile}",
+        "--preserve-trx-transfer-io-bytes-per-sec="
+        f"{profile.transfer_io_bytes_per_sec_base}",
+        "--preserve-trx-promotion-prewarm-io-bytes-per-sec="
+        f"{profile.prewarm_io_bytes_per_sec_base}",
+        "--preserve-trx-promotion-prewarm-workers="
+        f"{min(profile.promotion_prewarm_workers, profile.receiver_workers)}",
         "--preserve-trx-transfer-target-user=preserve_transfer",
         "--preserve-trx-transfer-credential-name=fullpressure",
         f"--datadir={paths.receiver_datadir}",
@@ -560,8 +593,27 @@ def build_e2e_command(
         "--max-sql-resume-ms",
         str(profile.max_sql_resume_ms),
     ]
+    if profile.mixed_seed_rows_per_table > 0:
+        mixed_arguments.extend(
+            [
+                "--preserve-warmcopy-close-timeout-ms",
+                str(
+                    max(
+                        120_000,
+                        (profile.source_phase2_limit_us + 999) // 1000,
+                    )
+                ),
+            ]
+        )
+    if profile.warmcopy_artifact_budget_bytes > 0:
+        mixed_arguments.extend(
+            [
+                "--preserve-warmcopy-max-total-bytes",
+                str(profile.warmcopy_artifact_budget_bytes),
+            ]
+        )
     if evidence == "mixed-shutdown-startup":
-        return [
+        command = [
             sys.executable,
             str(paths.e2e_script),
             "--scenario",
@@ -618,6 +670,9 @@ def build_e2e_command(
             str(profile.resume_timeout_s),
             *mixed_arguments,
         ]
+        if profile.warmcopy_required:
+            command.append("--warmcopy-required")
+        return command
     command = [
         sys.executable,
         str(paths.e2e_script),
@@ -715,6 +770,8 @@ def build_e2e_command(
         "--resume-timeout",
         str(profile.resume_timeout_s),
     ]
+    if profile.warmcopy_required:
+        command.append("--warmcopy-required")
     if evidence == "transfer-phase2":
         return command
 
@@ -1509,17 +1566,86 @@ def validate_mixed_pressure_report(
                 "source phase2 exceeded: "
                 f"actual_us={phase2_us} limit_us={profile.source_phase2_limit_us}"
             )
+        try:
+            post_command_tail_us = _metric_max(
+                report, "source_phase2_post_command_tail_us"
+            )
+        except (RuntimeError, TypeError, ValueError) as exc:
+            failures.append(str(exc))
+            post_command_tail_us = 0
+        if post_command_tail_us >= profile.source_post_command_tail_limit_us:
+            failures.append(
+                "source_phase2_post_command_tail_us exceeded: "
+                f"actual_us={post_command_tail_us} "
+                f"limit_us={profile.source_post_command_tail_limit_us}"
+            )
+        try:
+            all_prewarm_after_ack_us = _metric_max(
+                report, "receiver_all_prewarm_after_final_ack_us"
+            )
+        except (RuntimeError, TypeError, ValueError) as exc:
+            failures.append(str(exc))
+            all_prewarm_after_ack_us = 0
+        if (
+            all_prewarm_after_ack_us
+            >= profile.ready_after_final_spool_ack_limit_us
+        ):
+            failures.append(
+                "receiver_all_prewarm_after_final_ack_us exceeded: "
+                f"actual_us={all_prewarm_after_ack_us} "
+                f"limit_us={profile.ready_after_final_spool_ack_limit_us}"
+            )
+        expected_prewarm_tokens = int(
+            report.get("receiver_expected_prewarm_tokens") or 0
+        )
+        if expected_prewarm_tokens != survivor_count:
+            failures.append(
+                "receiver_expected_prewarm_tokens does not match survivor set: "
+                f"actual={expected_prewarm_tokens} survivors={survivor_count}"
+            )
+        for key, expected in (
+            ("receiver_seal_prewarm_tokens", survivor_count),
+            ("receiver_seal_prewarm_success_tokens", survivor_count),
+            ("receiver_seal_prewarm_not_ready_tokens", 0),
+            ("receiver_queued_bytes", 0),
+            ("receiver_worker_active", 0),
+        ):
+            actual = int(report.get(key) or 0)
+            if actual != expected:
+                failures.append(
+                    f"{key}: expected={expected} actual={actual}"
+                )
+        read_qps_drop_pct = float(
+            report.get("receiver_read_load_qps_drop_pct", float("inf"))
+        )
+        if read_qps_drop_pct > profile.receiver_read_load_max_qps_drop_pct:
+            failures.append(
+                "receiver_read_load_qps_drop_pct exceeded: "
+                f"actual={read_qps_drop_pct} "
+                f"limit={profile.receiver_read_load_max_qps_drop_pct}"
+            )
+        read_p99_increase_pct = float(
+            report.get(
+                "receiver_read_load_p99_increase_pct", float("inf")
+            )
+        )
+        if (
+            read_p99_increase_pct
+            > profile.receiver_read_load_max_p99_increase_pct
+        ):
+            failures.append(
+                "receiver_read_load_p99_increase_pct exceeded: "
+                f"actual={read_p99_increase_pct} "
+                f"limit={profile.receiver_read_load_max_p99_increase_pct}"
+            )
         mode_metrics = {
             "source_phase2_total_us": phase2_us,
-            "receiver_all_prewarm_after_final_ack_us": int(
-                report.get("receiver_all_prewarm_after_final_ack_us") or 0
+            "source_post_command_tail_us": post_command_tail_us,
+            "receiver_all_prewarm_after_final_ack_us": (
+                all_prewarm_after_ack_us
             ),
-            "receiver_read_load_qps_drop_pct": float(
-                report.get("receiver_read_load_qps_drop_pct") or 0.0
-            ),
-            "receiver_read_load_p99_increase_pct": float(
-                report.get("receiver_read_load_p99_increase_pct") or 0.0
-            ),
+            "receiver_read_load_qps_drop_pct": read_qps_drop_pct,
+            "receiver_read_load_p99_increase_pct": read_p99_increase_pct,
         }
     else:
         raise ValueError(f"unknown mixed evidence mode: {evidence}")

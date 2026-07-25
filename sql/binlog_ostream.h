@@ -186,6 +186,8 @@ class Binlog_cache_warmcopy_lease {
                                          size_t length);
   Binlog_warmcopy_mirror_status truncate(uint64_t length);
   void mark_degraded(const char *reason);
+  bool snapshot_prefix(Binlog_cache_warmcopy_mirror *expected_mirror,
+                       PrebuiltBinlogCacheBlob *blob, bool *has_blob) const;
 
  private:
   mutable std::mutex m_mutex;
@@ -268,15 +270,30 @@ class Binlog_cache_storage : public Basic_ostream {
                                          std::shared_ptr<
                                              Binlog_cache_warmcopy_lease>
                                              *lease = nullptr);
+  bool begin_warmcopy_mutation();
+  void end_warmcopy_mutation(bool tracked);
+  void begin_warmcopy_event();
+  void end_warmcopy_event();
   void clear_warmcopy_mirror(Binlog_cache_warmcopy_mirror *mirror);
   bool warmcopy_mirror_active() const;
   uint64_t truncate_generation() const;
+  bool warmcopy_prefix_snapshot(
+      Binlog_cache_warmcopy_mirror *expected_mirror,
+      PrebuiltBinlogCacheBlob *blob, bool *has_blob) const;
 
  private:
   Truncatable_ostream *m_pipeline_head = nullptr;
   IO_CACHE_binlog_cache_storage m_file;
   mutable std::mutex m_warmcopy_mutex;
+  mutable std::mutex m_warmcopy_install_mutex;
   std::shared_ptr<Binlog_cache_warmcopy_lease> m_warmcopy_lease{nullptr};
+  /*
+    The high bit closes admission while a cross-thread mirror install or
+    prefix snapshot waits for already-started cache mutations. Remaining bits
+    count mutations that started before that boundary.
+  */
+  mutable std::atomic<uint32_t> m_warmcopy_mutation_gate{0};
+  bool m_warmcopy_event_tracked{false};
   /* Preserve-only ABA fence; it does not publish cache contents. */
   std::atomic<uint64_t> m_truncate_generation{0};
 };

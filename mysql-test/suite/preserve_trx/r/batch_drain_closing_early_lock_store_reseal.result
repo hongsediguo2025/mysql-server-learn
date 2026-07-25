@@ -1,0 +1,8 @@
+ERROR HY000: DRAIN TRANSACTIONS PRESERVE was reset before shutdown handoff
+stale_prebuilt_rejected	live_lock_list_fallback	early_token_staged
+1	1	1
+preserved_count_after_reset
+0
+id	v
+1	11
+2	22

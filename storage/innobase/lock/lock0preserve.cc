@@ -3029,36 +3029,37 @@ dberr_t lock_preserve_export_table_locks(trx_t *trx, std::string *payload,
 
   std::vector<Preserve_table_lock_entry> entries;
   uint32_t exported = 0;
+  dberr_t export_status = DB_SUCCESS;
   {
-    locksys::Global_exclusive_latch_guard guard{};
+    locksys::Global_shared_latch_guard guard{};
+    if (trx_reference(trx, true) == nullptr) {
+      return DB_ERROR;
+    }
     trx_mutex_enter(trx);
 
     for (const lock_t *lock : trx->lock.table_locks) {
+      if (lock == nullptr || lock->trx != trx ||
+          lock_get_type(lock) != LOCK_TABLE ||
+          lock->tab_lock.table == nullptr) {
+        export_status = DB_ERROR;
+        break;
+      }
       if (lock->is_waiting()) {
-        trx_mutex_exit(trx);
-        payload->clear();
-        return DB_UNSUPPORTED;
+        export_status = DB_UNSUPPORTED;
+        break;
       }
 
       const uint32_t mode = lock_get_mode(lock);
       if (!lock_preserve_table_lock_mode_is_valid(mode)) {
-        trx_mutex_exit(trx);
-        payload->clear();
-        return DB_UNSUPPORTED;
-      }
-
-      if (lock->tab_lock.table == nullptr) {
-        trx_mutex_exit(trx);
-        payload->clear();
-        return DB_ERROR;
+        export_status = DB_UNSUPPORTED;
+        break;
       }
 
       if (max_lock_count != UINT32_MAX &&
           (already_used >= max_lock_count ||
            exported >= max_lock_count - already_used)) {
-        trx_mutex_exit(trx);
-        payload->clear();
-        return DB_UNSUPPORTED;
+        export_status = DB_UNSUPPORTED;
+        break;
       }
 
       Preserve_table_lock_entry entry;
@@ -3071,6 +3072,11 @@ dberr_t lock_preserve_export_table_locks(trx_t *trx, std::string *payload,
     }
 
     trx_mutex_exit(trx);
+    trx_release_reference(trx);
+  }
+  if (export_status != DB_SUCCESS) {
+    payload->clear();
+    return export_status;
   }
 
   if (entries.empty()) {

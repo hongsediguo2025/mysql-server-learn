@@ -1,0 +1,7 @@
+SELECT 1 AS server_survived_idle_to_active_race;
+server_survived_idle_to_active_race
+1
+SELECT COUNT(*) AS row_count, SUM(v) AS value_sum
+FROM t_idle_to_active_binlog_race;
+row_count	value_sum
+2	2

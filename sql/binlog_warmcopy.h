@@ -24,6 +24,7 @@
 #ifndef SQL_BINLOG_WARMCOPY_INCLUDED
 #define SQL_BINLOG_WARMCOPY_INCLUDED
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -58,6 +59,8 @@ class Binlog_cache_warmcopy_mirror {
   virtual void note_source_write_failed() = 0;
   virtual void note_non_lifecycle_reset() = 0;
   virtual void note_source_cache_closed() {}
+  virtual bool snapshot_prefix(PrebuiltBinlogCacheBlob *blob,
+                               bool *has_blob) const = 0;
 };
 
 /*
@@ -67,7 +70,8 @@ class Binlog_cache_warmcopy_mirror {
 */
 bool mysql_binlog_warmcopy_source_eligible(THD *thd, bool require_nonempty,
                                            uint64_t *cache_length,
-                                           bool *has_blob, bool *eligible);
+                                           bool *has_blob, bool *eligible,
+                                           bool allow_inflight_statement);
 bool mysql_binlog_warmcopy_source_install_mirror(
     THD *thd, Binlog_cache_warmcopy_mirror *mirror, uint64_t *prefix_end,
     uint64_t *truncate_generation,
@@ -77,6 +81,9 @@ bool mysql_binlog_warmcopy_source_copy_range(
     uint64_t expected_truncate_generation, bool *stale_generation);
 bool mysql_binlog_warmcopy_source_truncate_generation(
     THD *thd, uint64_t *truncate_generation);
+bool mysql_binlog_warmcopy_source_prefix_snapshot(
+    THD *thd, Binlog_cache_warmcopy_mirror *expected_mirror,
+    PrebuiltBinlogCacheBlob *blob, bool *has_blob);
 
 /*
   One-shot warmcopy path for an already quiesced cache. It is not the batch drain
@@ -98,13 +105,17 @@ bool mysql_binlog_preserve_warmcopy_build_blob(
   abort_session(); callers must not leak it across drain epochs. has_blob reports
   whether a non-empty prefix existed at begin time. A zero-prefix session can
   still be returned so later tail writes are mirrored and must be finalized or
-  aborted normally.
+  aborted normally. allow_inflight_statement is only for active strict-transfer
+  installation; it copies neither a pending Rows_log_event nor uncommitted
+  statement state outside the serialized transaction-cache prefix.
 */
 bool mysql_binlog_preserve_warmcopy_begin_session(
     THD *thd, const std::string &warmcopy_id, uint64_t epoch,
     Preserved_trx_warm_external_blob_carrier *carrier,
-    uint64_t max_blob_bytes, Mysql_binlog_warmcopy_session **session,
-    bool *has_blob, uint64_t *prefix_bytes);
+    uint64_t max_blob_bytes, std::atomic<uint64_t> *total_reserved_bytes,
+    uint64_t max_total_bytes, uint64_t reservation_chunk_bytes,
+    Mysql_binlog_warmcopy_session **session, bool *has_blob,
+    uint64_t *prefix_bytes, bool allow_inflight_statement);
 /*
   Finalize verifies that the live-mirrored tail is bounded and complete, checks
   digest/durable high-water marks and pending ranges, then detaches the mirror
@@ -113,12 +124,26 @@ bool mysql_binlog_preserve_warmcopy_begin_session(
 */
 bool mysql_binlog_preserve_warmcopy_finalize_session(
     THD *thd, Mysql_binlog_warmcopy_session *session,
-    uint64_t tail_budget_bytes, PrebuiltBinlogCacheBlob *blob,
-    bool *has_blob);
+    uint64_t tail_budget_bytes, bool receiver_prefix_published,
+    uint64_t receiver_prefix_bytes, PrebuiltBinlogCacheBlob *blob,
+    bool *has_blob, uint64_t *retained_reservation_bytes);
+bool mysql_binlog_preserve_warmcopy_prefix_blob(
+    THD *thd, Mysql_binlog_warmcopy_session *session,
+    PrebuiltBinlogCacheBlob *blob, bool *has_blob);
+/*
+  A source truncate/reset invalidates the mirrored prefix but is recoverable by
+  replacing only this token's live session. Carrier, digest, and capacity
+  failures are not rebuildable through this path.
+*/
+bool mysql_binlog_preserve_warmcopy_session_stale_rebuildable(
+    const Mysql_binlog_warmcopy_session *session);
 /* Check whether the current tail would exceed the caller's phase-2 budget. */
 bool mysql_binlog_preserve_warmcopy_tail_budget_exceeded(
     THD *thd, Mysql_binlog_warmcopy_session *session,
     uint64_t tail_budget_bytes, bool *exceeded);
+/* Detach the source-cache mirror while retaining the session for cleanup. */
+void mysql_binlog_preserve_warmcopy_stop_session_mirroring(
+    Mysql_binlog_warmcopy_session *session);
 /* Abort detaches the mirror and releases the session without publishing a blob. */
 void mysql_binlog_preserve_warmcopy_abort_session(
     Mysql_binlog_warmcopy_session *session);
@@ -128,6 +153,7 @@ void mysql_binlog_preserve_warmcopy_abort_session(
   still have to apply their own binlog state, timeout, and fallback rules.
 */
 bool mysql_binlog_preserve_warmcopy_cache_length(THD *thd, uint64_t *length,
-                                                 bool *has_blob);
+                                                 bool *has_blob,
+                                                 bool allow_inflight_statement);
 
 #endif  // SQL_BINLOG_WARMCOPY_INCLUDED
