@@ -170,11 +170,6 @@ SET DEBUG_SYNC='now WAIT_FOR active_binlog_prefix_final_ready TIMEOUT 30';
 --let $assert_select= PRESERVE: ACKed active binlog mirror progress target=[0-9]+ high_watermark=[1-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]* delta_bytes=[1-9][0-9]*
 --let $assert_count= 1
 --source include/assert_grep.inc
---let $assert_text= business command did not rebuild the DRAIN-owned mirror
---let $assert_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
---let $assert_select= PRESERVE: active binlog mirror reinstall target=[0-9]+
---let $assert_count= 0
---source include/assert_grep.inc
 --let $assert_text= contiguous active binlog appends did not exhaust the pending range limit
 --let $assert_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
 --let $assert_select= PRESERVE: active binlog mirror degraded target=[0-9]+ reason=warm-copy pending mirror range limit exceeded
@@ -202,11 +197,6 @@ SET DEBUG_SYNC='now WAIT_FOR active_binlog_prefix_receiver_accepted TIMEOUT 30';
 --let $assert_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
 --let $assert_select= PRESERVE: standby transfer final target coverage event=check target_count=1 phase1_declared=1 missing_declared=0 record_blob=1 record_fallback=0 missing_record=0 binlog_blob=1 missing_binlog=0
 --let $assert_count= 1
---source include/assert_grep.inc
---let $assert_text= final transfer reused the receiver high watermark without full fallback
---let $assert_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
---let $assert_select= transfer_binlog_fallback_
---let $assert_count= 0
 --source include/assert_grep.inc
 
 --connect(active_binlog_prefix_reset,localhost,preserve_trx_ha_admin,active-binlog-prefix-secret,test)

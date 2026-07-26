@@ -7192,7 +7192,7 @@ class Warmcopy_batch_blob_provider final : public PreserveBinlogBlobProvider {
     uint64_t cache_length = 0;
     bool has_current_blob = false;
     if (mysql_binlog_preserve_warmcopy_cache_length(
-            thd, &cache_length, &has_current_blob, false)) {
+            thd, &cache_length, &has_current_blob)) {
       std::lock_guard<std::mutex> guard(m_mutex);
       note_token_prepare_failure_locked();
       return false;
@@ -7721,7 +7721,7 @@ class Warmcopy_batch_blob_provider final : public PreserveBinlogBlobProvider {
       bool has_current_blob = false;
       const bool cache_length_error =
           mysql_binlog_preserve_warmcopy_cache_length(
-              thd, &cache_length, &has_current_blob, false);
+              thd, &cache_length, &has_current_blob);
       if (cache_length_error) {
         std::lock_guard<std::mutex> guard(m_mutex);
         note_token_prepare_failure_locked();
@@ -8076,7 +8076,7 @@ static bool stream_phase1_transfer_binlog_cache_blobs(
   if (source_session == nullptr || declared_tokens.empty()) return false;
 
   std::unique_ptr<Preserved_trx_warm_external_blob_carrier> warm_carrier =
-      create_preserved_trx_default_warm_external_blob_carrier(
+      create_preserved_trx_process_local_warm_external_blob_carrier(
           preserve_trx_default_dir());
   if (warm_carrier == nullptr) return true;
 
@@ -9185,7 +9185,6 @@ struct Preserve_batch_target_execution {
   bool visited_target{false};
   bool error{false};
   bool no_token_target{false};
-  bool binlog_batch_pending{false};
   bool early_objects_staged{false};
   bool lock_artifact_prepared{false};
   bool initial_lock_fence_valid{false};
@@ -18549,9 +18548,6 @@ bool Preserve_trx_drain_service::execute(
                         Preserve_trx_binlog_catchup_result::FAILED) {
                       return "early_binlog_catchup_failed";
                     }
-                    execution.binlog_batch_pending =
-                        catchup_result ==
-                        Preserve_trx_binlog_catchup_result::QUEUED;
                     if (catchup_result ==
                             Preserve_trx_binlog_catchup_result::QUEUED ||
                         catchup_result ==
@@ -18587,8 +18583,6 @@ bool Preserve_trx_drain_service::execute(
                       Preserve_trx_preserve_stage::COMPLETE) {
                 const ulonglong external_stage_started_us =
                     preserve_trx_monotonic_us();
-                execution.deferred_candidate.binlog_cache_batch_pending =
-                    execution.binlog_batch_pending;
                 execution.initial_lock_fence_valid =
                     trx_preserve_sample_lock_warmcopy_fence(
                         execution.result.preserved_trx,

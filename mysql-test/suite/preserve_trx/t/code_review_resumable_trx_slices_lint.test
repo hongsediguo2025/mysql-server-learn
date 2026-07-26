@@ -396,6 +396,21 @@ my ($phase1_binlog_streamer) =
   or die "could not isolate phase1 transfer binlog-cache streaming helper\n";
 die "standby phase1 binlog-cache streaming must be target-set driven, not idle-scan-only\n"
   if $phase1_binlog_streamer =~ /Warmcopy_prepare_idle_participants/s;
+die "standby phase1 binlog-cache snapshots must use a process-local carrier\n"
+  unless $phase1_binlog_streamer =~
+         /create_preserved_trx_process_local_warm_external_blob_carrier/s;
+die "standby phase1 binlog-cache snapshots must not use the durable default carrier\n"
+  if $phase1_binlog_streamer =~
+       /create_preserved_trx_default_warm_external_blob_carrier/s;
+die "test-only prebuilt request batching must not be exposed in production transfer code\n"
+  if $transfer_header =~
+       /preserve_trx_transfer_stream_prebuilt_blob_request_batches/s ||
+     $transfer =~
+       /preserve_trx_transfer_stream_prebuilt_blob_request_batches/s;
+die "deferred candidates must not retain an unreachable binlog batch-pending state\n"
+  if $preserve =~ /binlog_batch_pending/s ||
+     $transfer_header =~ /binlog_cache_batch_pending/s ||
+     $transfer =~ /binlog_cache_batch_pending/s;
 die "standby streaming transfer must send phase1 prewarm manifests before WARMCOPY_CLOSING\n"
   unless $preserve =~
      /begin_phase1_transfer_prewarm_manifests[\s\S]*transition_to\s*\(\s*Preserve_trx_manager_state::WARMCOPY_CLOSING/s;

@@ -31,6 +31,11 @@ GRANT SELECT, UPDATE ON test.* TO closing_early_lock_reseal_app@localhost;
 --let $restart_parameters=
 --disable_query_log
 
+--let $old_batch_max= `SELECT @@GLOBAL.preserve_trx_batch_max_transactions`
+--let $old_fail_batch= `SELECT @@GLOBAL.preserve_trx_drain_command_timeout_fail_batch`
+--let $old_closing_timeout= `SELECT @@GLOBAL.preserve_trx_drain_closing_command_timeout_ms`
+--let $old_prewarm_paused= `SELECT @@GLOBAL.preserve_trx_transfer_prewarm_paused`
+
 SET GLOBAL preserve_trx_batch_max_transactions=1;
 SET GLOBAL preserve_trx_drain_command_timeout_fail_batch=ON;
 SET GLOBAL preserve_trx_drain_closing_command_timeout_ms=60000;
@@ -118,3 +123,9 @@ DROP USER closing_early_lock_reseal_app@localhost;
 DROP USER preserve_trx_ha_admin@localhost;
 --remove_file $credential_file
 SET DEBUG_SYNC='RESET';
+--disable_result_log
+--eval SET GLOBAL preserve_trx_batch_max_transactions=$old_batch_max
+--eval SET GLOBAL preserve_trx_drain_command_timeout_fail_batch=$old_fail_batch
+--eval SET GLOBAL preserve_trx_drain_closing_command_timeout_ms=$old_closing_timeout
+--eval SET GLOBAL preserve_trx_transfer_prewarm_paused=$old_prewarm_paused
+--enable_result_log

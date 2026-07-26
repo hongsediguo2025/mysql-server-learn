@@ -10959,58 +10959,6 @@ Preserve_trx_transfer_status preserve_trx_transfer_stream_prebuilt_blobs_batch(
 }
 
 Preserve_trx_transfer_status
-preserve_trx_transfer_stream_prebuilt_blob_request_batches(
-    Preserve_trx_transfer_source_epoch_session *session,
-    const std::string &preserve_dir,
-    const std::vector<Preserve_trx_transfer_phase1_blob_request> &requests,
-    uint64_t max_batch_bytes, uint64_t *acknowledged_batch_count) {
-  if (acknowledged_batch_count != nullptr) *acknowledged_batch_count = 0;
-  if (session == nullptr || requests.empty() || max_batch_bytes == 0) {
-    return Preserve_trx_transfer_status::INVALID_ARGUMENT;
-  }
-
-  std::vector<Preserve_trx_transfer_phase1_blob_request> batch;
-  uint64_t batch_bytes = 0;
-  auto flush_batch = [&]() {
-    if (batch.empty()) return Preserve_trx_transfer_status::OK;
-    const Preserve_trx_transfer_status status =
-        preserve_trx_transfer_stream_prebuilt_blobs_batch(
-            session, preserve_dir, batch, max_batch_bytes);
-    if (status != Preserve_trx_transfer_status::OK) return status;
-    if (acknowledged_batch_count != nullptr) ++*acknowledged_batch_count;
-    batch.clear();
-    batch_bytes = 0;
-    return Preserve_trx_transfer_status::OK;
-  };
-
-  for (const auto &request : requests) {
-    if (request.size == 0 || request.preserved_prefix_size >= request.size) {
-      return Preserve_trx_transfer_status::INVALID_ARGUMENT;
-    }
-    const uint64_t payload_bytes =
-        request.inline_payload.empty()
-            ? request.size - request.preserved_prefix_size
-            : static_cast<uint64_t>(request.inline_payload.size());
-    if (payload_bytes != request.size - request.preserved_prefix_size) {
-      return Preserve_trx_transfer_status::INVALID_ARGUMENT;
-    }
-    if (!batch.empty() &&
-        (batch_bytes >= max_batch_bytes ||
-         payload_bytes > max_batch_bytes - batch_bytes)) {
-      const Preserve_trx_transfer_status status = flush_batch();
-      if (status != Preserve_trx_transfer_status::OK) return status;
-    }
-    batch.push_back(request);
-    batch_bytes += payload_bytes;
-    if (batch_bytes >= max_batch_bytes) {
-      const Preserve_trx_transfer_status status = flush_batch();
-      if (status != Preserve_trx_transfer_status::OK) return status;
-    }
-  }
-  return flush_batch();
-}
-
-Preserve_trx_transfer_status
 preserve_trx_transfer_stream_prebuilt_record_locks_blob(
     Preserve_trx_transfer_source_epoch_session *session,
     uint64_t transfer_token, const std::string &preserve_dir,
@@ -11085,10 +11033,6 @@ preserve_trx_transfer_stage_deferred_candidate_external_objects(
 
   for (const Preserved_trx_external_blob &blob :
        candidate->bundle.external_blobs) {
-    if (candidate->binlog_cache_batch_pending &&
-        blob.name == kPreservedTrxBlobBinlogCache) {
-      continue;
-    }
     const Preserve_trx_transfer_object_descriptor descriptor =
         transfer_external_blob_descriptor(candidate->epoch_id,
                                           candidate->transfer_token, blob);

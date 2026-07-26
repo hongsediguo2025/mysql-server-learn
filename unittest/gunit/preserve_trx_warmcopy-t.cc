@@ -27,6 +27,7 @@
 #include <atomic>
 #include <cstdio>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -97,6 +98,9 @@ class RecordingWarmcopyMirror final : public Binlog_cache_warmcopy_mirror {
   bool snapshot_prefix(PrebuiltBinlogCacheBlob *blob,
                        bool *has_blob) const override {
     ++prefix_snapshots;
+    if (throw_snapshot) {
+      throw std::runtime_error("injected warmcopy snapshot failure");
+    }
     if (has_blob != nullptr) *has_blob = snapshot_available;
     if (fail_snapshot || (snapshot_available && blob == nullptr)) return true;
     if (snapshot_available) *blob = snapshot_blob;
@@ -115,6 +119,7 @@ class RecordingWarmcopyMirror final : public Binlog_cache_warmcopy_mirror {
   mutable int prefix_snapshots{0};
   bool snapshot_available{false};
   bool fail_snapshot{false};
+  bool throw_snapshot{false};
   PrebuiltBinlogCacheBlob snapshot_blob;
 };
 
@@ -348,6 +353,21 @@ TEST_F(BinlogWarmcopyMirrorTest,
   EXPECT_FALSE(has_snapshot);
   EXPECT_EQ(1, m_mirror.prefix_snapshots);
   EXPECT_EQ(0, stale_mirror.prefix_snapshots);
+}
+
+TEST_F(BinlogWarmcopyMirrorTest,
+       PrefixSnapshotExceptionReleasesMutationGate) {
+  m_mirror.throw_snapshot = true;
+  PrebuiltBinlogCacheBlob snapshot;
+  bool has_snapshot = false;
+
+  EXPECT_THROW(
+      m_storage.warmcopy_prefix_snapshot(&m_mirror, &snapshot, &has_snapshot),
+      std::runtime_error);
+
+  const bool tracked = m_storage.begin_warmcopy_mutation();
+  EXPECT_TRUE(tracked);
+  m_storage.end_warmcopy_mutation(tracked);
 }
 
 TEST_F(BinlogWarmcopyMirrorTest, SourceSuccessMirrorFailureMarksDegraded) {

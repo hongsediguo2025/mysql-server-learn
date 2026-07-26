@@ -1003,18 +1003,6 @@ Preserve_trx_transfer_status preserve_trx_transfer_stream_prebuilt_blobs_batch(
     const std::vector<Preserve_trx_transfer_phase1_blob_request> &requests,
     uint64_t max_batch_bytes);
 
-/*
-  Send a large request set as bounded synchronous batches. The acknowledged
-  count advances only after a complete batch returns OK, so callers can publish
-  their process-local high-watermarks after this function succeeds.
-*/
-Preserve_trx_transfer_status
-preserve_trx_transfer_stream_prebuilt_blob_request_batches(
-    Preserve_trx_transfer_source_epoch_session *session,
-    const std::string &preserve_dir,
-    const std::vector<Preserve_trx_transfer_phase1_blob_request> &requests,
-    uint64_t max_batch_bytes, uint64_t *acknowledged_batch_count);
-
 struct Preserve_trx_transfer_client_endpoint {
   std::string target_server_uuid;
   std::string host;
@@ -1392,7 +1380,6 @@ struct Preserve_trx_deferred_transfer_candidate {
   uint64_t source_epoch_commit_lsn{0};
   bool captured{false};
   bool external_objects_staged{false};
-  bool binlog_cache_batch_pending{false};
   bool binlog_prewarm_seed_staged{false};
   bool binlog_prewarm_seed_batch_pending{false};
   bool finalized{false};

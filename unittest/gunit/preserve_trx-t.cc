@@ -18467,6 +18467,15 @@ TEST_F(PreserveSnapshotTest,
                 "active-prefix-source", "active-prefix-snapshot",
                 kPreservedTrxBlobBinlogCache, epoch, prefix_descriptor));
 
+#if !defined(NDEBUG) && !defined(DBUG_OFF)
+  DBUG_SET("+d,preserve_trx_fail_warmcopy_blob_close_sync");
+  EXPECT_EQ(Preserved_trx_carrier_status::IO_ERROR,
+            carrier.snapshot_active_warm_external_blob_prefix(
+                "active-prefix-source", "active-prefix-sync-failure",
+                kPreservedTrxBlobBinlogCache, epoch, prefix_descriptor));
+  DBUG_SET("");
+#endif
+
   Preserved_trx_external_blob snapshot;
   ASSERT_EQ(Preserved_trx_carrier_status::OK,
             carrier.read_warm_external_blob(
@@ -21785,52 +21794,6 @@ TEST_F(PreserveSnapshotTest,
   final_descriptor.total_size = final_request.size;
   final_descriptor.digest = final_request.digest;
   EXPECT_TRUE(session.object_presealed_for_token(837, final_descriptor));
-}
-
-TEST_F(PreserveSnapshotTest,
-       TransferBoundedBlobBatchesCoalesceManyInlineRequests) {
-  Transfer_codec_context_guard codec_guard;
-  Preserve_trx_transfer_source_epoch_options options;
-  options.chunk_bytes = 64;
-  options.max_inflight_bytes = 4096;
-  options.phase1_batch_bytes = 4096;
-  Capturing_transfer_frame_sink sink;
-  Preserve_trx_transfer_source_epoch_session session(
-      "epoch-bounded-inline-batches", "source-uuid", "target-uuid", options,
-      &sink);
-
-  std::vector<uint64_t> tokens;
-  std::vector<Preserve_trx_transfer_phase1_blob_request> requests;
-  for (uint64_t token = 900; token < 910; ++token) {
-    tokens.push_back(token);
-    Preserve_trx_transfer_phase1_blob_request request;
-    request.transfer_token = token;
-    request.object_id = kPreservedTrxBlobBinlogCache;
-    request.warmcopy_id = "bounded-inline-" + std::to_string(token);
-    request.warmcopy_epoch = 1;
-    request.inline_payload.assign(10, static_cast<char>('a' + token - 900));
-    request.size = request.inline_payload.size();
-    request.digest = test_sha256(request.inline_payload);
-    requests.push_back(std::move(request));
-  }
-  ASSERT_EQ(Preserve_trx_transfer_status::OK,
-            session.declare_tokens_batch(tokens));
-
-  uint64_t acknowledged_batch_count = 0;
-  EXPECT_EQ(Preserve_trx_transfer_status::OK,
-            preserve_trx_transfer_stream_prebuilt_blob_request_batches(
-                &session, m_dir, requests, 25, &acknowledged_batch_count));
-  EXPECT_EQ(5U, acknowledged_batch_count);
-
-  for (const auto &request : requests) {
-    Preserve_trx_transfer_object_descriptor descriptor;
-    descriptor.object_id = request.object_id;
-    descriptor.kind = Preserve_trx_transfer_object_kind::EXTERNAL_BLOB;
-    descriptor.total_size = request.size;
-    descriptor.digest = request.digest;
-    EXPECT_TRUE(
-        session.object_presealed_for_token(request.transfer_token, descriptor));
-  }
 }
 
 TEST_F(PreserveSnapshotTest,
@@ -26423,8 +26386,6 @@ TEST_F(PreserveSnapshotTest,
                   session.epoch_id(), session.source_server_uuid(),
                   session.target_server_uuid(), token, std::move(bundle), 300,
                   &resurrection_entry, &candidate, nullptr));
-    candidate.binlog_cache_batch_pending = true;
-
     const Preserved_trx_external_blob &binlog_blob =
         candidate.bundle.external_blobs.front();
     Preserve_trx_transfer_phase1_blob_request request;
@@ -26732,99 +26693,6 @@ TEST_F(PreserveSnapshotTest,
             preserve_trx_transfer_receiver_object_prewarm_miss_count_status());
 }
 
-TEST_F(PreserveSnapshotTest,
-       DeferredTransferBinlogSeedWaitsForLatePayloadSeal) {
-  Transfer_codec_context_guard codec_guard;
-  Transfer_receiver_config_guard receiver_config;
-  Transfer_native_binlog_runtime_guard binlog_runtime;
-  receiver_config.allow("source-uuid", "target-uuid");
-
-  const uint64_t transfer_token = 717;
-  Mysql_binlog_preserve_snapshot snapshot;
-  snapshot.cache_payload.assign(4 * 1024 * 1024, 'b');
-  snapshot.gtid_next = "AUTOMATIC";
-  snapshot.event_counter = 3;
-  snapshot.with_rbr = true;
-  snapshot.with_start = true;
-  snapshot.with_content = true;
-  Preserve_snapshot_metadata meta = logged_with_cache_metadata();
-  meta.token = test_transfer_token_string(transfer_token);
-  Preserved_trx_bundle bundle;
-  Preserved_trx_bundle_build_input input;
-  input.metadata = meta;
-  input.logged_binlog_snapshot = &snapshot;
-  ASSERT_EQ(Preserve_snapshot_status::OK,
-            build_preserved_trx_bundle(input, &bundle));
-  ASSERT_EQ(1U, bundle.external_blobs.size());
-
-  Local_file_preserved_trx_carrier carrier(m_dir);
-  Preserved_trx_store store(&carrier);
-  Preserve_trx_transfer_receiver_registry registry;
-  Preserve_snapshot_metadata receiver_metadata;
-  Transfer_receiver_payload_test_sink frame_sink(
-      m_dir, &store, &registry, &receiver_metadata);
-  Preserve_trx_transfer_source_epoch_session session(
-      "epoch-deferred-late-binlog", "source-uuid", "target-uuid", 17,
-      &frame_sink);
-  ASSERT_EQ(Preserve_trx_transfer_status::OK,
-            session.declare_token(transfer_token));
-
-  Preserve_trx_deferred_transfer_candidate candidate;
-  ASSERT_EQ(Preserve_snapshot_status::OK,
-            preserve_trx_transfer_capture_deferred_candidate(
-                session.epoch_id(), session.source_server_uuid(),
-                session.target_server_uuid(), transfer_token, std::move(bundle),
-                300, nullptr, &candidate, nullptr));
-  candidate.binlog_cache_batch_pending = true;
-
-  preserve_trx_transfer_set_prewarm_paused_for_unit_test(true);
-  auto resume_prewarm = create_scope_guard([] {
-    preserve_trx_transfer_set_prewarm_paused_for_unit_test(false);
-  });
-  ASSERT_EQ(Preserve_trx_transfer_status::OK,
-            preserve_trx_transfer_stage_deferred_candidate_external_objects(
-                &session, m_dir, &candidate));
-
-  const Preserved_trx_external_blob &binlog_blob =
-      candidate.bundle.external_blobs.front();
-  Preserve_trx_transfer_object_descriptor descriptor;
-  descriptor.object_id = binlog_blob.name;
-  descriptor.kind = Preserve_trx_transfer_object_kind::EXTERNAL_BLOB;
-  descriptor.total_size = binlog_blob.payload.size();
-  descriptor.digest = test_sha256(binlog_blob.payload);
-  ASSERT_EQ(Preserve_trx_transfer_status::OK,
-            session.declare_object(transfer_token, descriptor));
-  for (uint64_t offset = 0; offset < binlog_blob.payload.size();
-       offset += session.chunk_bytes()) {
-    const size_t length = std::min<uint64_t>(
-        session.chunk_bytes(), binlog_blob.payload.size() - offset);
-    ASSERT_EQ(Preserve_trx_transfer_status::OK,
-              session.write_object_chunk(
-                  transfer_token, descriptor.object_id, offset,
-                  binlog_blob.payload.substr(offset, length)));
-  }
-  ASSERT_EQ(Preserve_trx_transfer_status::OK,
-            session.seal_object(transfer_token, descriptor.object_id));
-
-  const uint64_t object_miss_before =
-      preserve_trx_transfer_receiver_object_prewarm_miss_count_status();
-  candidate.binlog_cache_batch_pending = false;
-  ASSERT_EQ(Preserve_trx_transfer_status::OK,
-            preserve_trx_transfer_finalize_deferred_candidate(&session,
-                                                               &candidate));
-  ASSERT_EQ(Preserve_trx_transfer_status::OK, session.commit_epoch());
-  preserve_trx_transfer_set_prewarm_paused_for_unit_test(false);
-  resume_prewarm.commit();
-
-  Preserve_trx_promotion_ready_summary ready_summary;
-  ASSERT_TRUE(wait_for_epoch_ready_token(session.epoch_id(), transfer_token,
-                                         &ready_summary))
-      << (ready_summary.token_results.empty()
-              ? std::string("no ready token result")
-              : ready_summary.token_results.front().reason);
-  EXPECT_EQ(object_miss_before,
-            preserve_trx_transfer_receiver_object_prewarm_miss_count_status());
-}
 #endif
 
 TEST_F(PreserveSnapshotTest,

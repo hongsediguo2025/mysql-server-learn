@@ -34,6 +34,7 @@
 #include "mysql/components/services/log_builtins.h"
 #include "mysql/psi/mysql_file.h"
 #include "mysqld_error.h"
+#include "scope_guard.h"
 #include "sql/mysqld.h"
 #include "sql/preserve_trx.h"
 #include "sql/rpl_log_encryption.h"
@@ -388,6 +389,10 @@ bool Binlog_cache_storage::install_warmcopy_mirror_if_absent(
   std::lock_guard<std::mutex> install_guard(m_warmcopy_install_mutex);
   m_warmcopy_mutation_gate.fetch_or(kWarmcopyInstalling,
                                     std::memory_order_acq_rel);
+  auto clear_installing = create_scope_guard([&] {
+    m_warmcopy_mutation_gate.fetch_and(kWarmcopyMutationCountMask,
+                                       std::memory_order_release);
+  });
   while ((m_warmcopy_mutation_gate.load(std::memory_order_acquire) &
           kWarmcopyMutationCountMask) != 0) {
     std::this_thread::yield();
@@ -408,8 +413,6 @@ bool Binlog_cache_storage::install_warmcopy_mirror_if_absent(
         m_truncate_generation.load(std::memory_order_relaxed);
   already_has_mirror = current_lease->install_if_absent(mirror);
   if (!already_has_mirror && lease != nullptr) *lease = current_lease;
-  m_warmcopy_mutation_gate.fetch_and(kWarmcopyMutationCountMask,
-                                     std::memory_order_release);
   return already_has_mirror;
 }
 
@@ -478,6 +481,10 @@ bool Binlog_cache_storage::warmcopy_prefix_snapshot(
   std::lock_guard<std::mutex> install_guard(m_warmcopy_install_mutex);
   m_warmcopy_mutation_gate.fetch_or(kWarmcopyInstalling,
                                     std::memory_order_acq_rel);
+  auto clear_installing = create_scope_guard([&] {
+    m_warmcopy_mutation_gate.fetch_and(kWarmcopyMutationCountMask,
+                                       std::memory_order_release);
+  });
   while ((m_warmcopy_mutation_gate.load(std::memory_order_acquire) &
           kWarmcopyMutationCountMask) != 0) {
     std::this_thread::yield();
@@ -489,8 +496,6 @@ bool Binlog_cache_storage::warmcopy_prefix_snapshot(
                                                 std::memory_order_acquire);
   error = lease == nullptr ||
           lease->snapshot_prefix(expected_mirror, blob, has_blob);
-  m_warmcopy_mutation_gate.fetch_and(kWarmcopyMutationCountMask,
-                                     std::memory_order_release);
   return error;
 }
 

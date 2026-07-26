@@ -3217,7 +3217,7 @@ Local_file_preserved_trx_carrier::
     return source_error ? Preserved_trx_carrier_status::IO_ERROR
                         : Preserved_trx_carrier_status::CORRUPT;
   }
-  if (writer->close_without_sync() != Preserved_trx_carrier_status::OK ||
+  if (writer->close() != Preserved_trx_carrier_status::OK ||
       writer->seal_descriptor(prefix_descriptor) !=
           Preserved_trx_carrier_status::OK) {
     (void)writer->abort();

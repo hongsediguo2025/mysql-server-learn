@@ -1015,8 +1015,7 @@ void mysql_binlog_preserve_warmcopy_stop_session_mirroring(
 void mysql_binlog_preserve_warmcopy_abort_session(
     Mysql_binlog_warmcopy_session *session);
 bool mysql_binlog_preserve_warmcopy_cache_length(THD *thd, uint64_t *length,
-                                                 bool *has_blob,
-                                                 bool allow_inflight_statement = false);
+                                                 bool *has_blob);
 bool mysql_binlog_preserve_import(
     THD *thd, const Mysql_binlog_preserve_snapshot &snapshot);
 bool mysql_binlog_preserve_reactivate_after_prepare_failure(

@@ -153,7 +153,6 @@ void mysql_binlog_preserve_warmcopy_abort_session(
   still have to apply their own binlog state, timeout, and fallback rules.
 */
 bool mysql_binlog_preserve_warmcopy_cache_length(THD *thd, uint64_t *length,
-                                                 bool *has_blob,
-                                                 bool allow_inflight_statement);
+                                                 bool *has_blob);
 
 #endif  // SQL_BINLOG_WARMCOPY_INCLUDED

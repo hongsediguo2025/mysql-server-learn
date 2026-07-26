@@ -418,8 +418,8 @@ class Mysql_binlog_warmcopy_session final
 
     uint64_t current_length = 0;
     bool current_has_blob = false;
-    if (mysql_binlog_preserve_warmcopy_cache_length(thd, &current_length,
-                                                    &current_has_blob, false)) {
+    if (mysql_binlog_preserve_warmcopy_cache_length(
+            thd, &current_length, &current_has_blob)) {
       return true;
     }
     if (!current_has_blob || current_length < m_prefix_end) return true;
@@ -468,8 +468,8 @@ class Mysql_binlog_warmcopy_session final
 
     uint64_t current_length = 0;
     bool current_has_blob = false;
-    if (mysql_binlog_preserve_warmcopy_cache_length(thd, &current_length,
-                                                    &current_has_blob, false)) {
+    if (mysql_binlog_preserve_warmcopy_cache_length(
+            thd, &current_length, &current_has_blob)) {
       log_finalize_failure("warm-copy cache length lookup failed", 0, false);
       return true;
     }
@@ -802,15 +802,13 @@ class Mysql_binlog_warmcopy_session final
 };
 
 bool mysql_binlog_preserve_warmcopy_cache_length(THD *thd, uint64_t *length,
-                                                 bool *has_blob,
-                                                 bool allow_inflight_statement) {
+                                                 bool *has_blob) {
   if (length != nullptr) *length = 0;
   if (has_blob != nullptr) *has_blob = false;
   if (thd == nullptr || length == nullptr) return true;
   bool source_eligible = false;
   if (mysql_binlog_warmcopy_source_eligible(thd, true, length, has_blob,
-                                            &source_eligible,
-                                            allow_inflight_statement)) {
+                                            &source_eligible, false)) {
     return true;
   }
   return false;
@@ -828,8 +826,8 @@ bool mysql_binlog_preserve_warmcopy_build_blob(
 
   uint64_t cache_length = 0;
   bool cache_has_blob = false;
-  if (mysql_binlog_preserve_warmcopy_cache_length(thd, &cache_length,
-                                                  &cache_has_blob, false)) {
+  if (mysql_binlog_preserve_warmcopy_cache_length(
+          thd, &cache_length, &cache_has_blob)) {
     return true;
   }
   if (!cache_has_blob) return false;
@@ -868,7 +866,6 @@ bool mysql_binlog_preserve_warmcopy_build_blob(
       return true;
     }
     copied += bytes_to_copy;
-    DEBUG_SYNC(current_thd, "preserve_trx_warmcopy_after_one_shot_chunk");
   }
   DBUG_EXECUTE_IF("preserve_trx_warmcopy_fail_after_source_copy", {
     (void)writer->abort();

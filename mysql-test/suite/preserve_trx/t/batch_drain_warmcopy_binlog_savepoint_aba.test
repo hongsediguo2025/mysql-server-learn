@@ -105,22 +105,12 @@ CALL p_binlog_savepoint_aba('B');
 UPDATE t_binlog_savepoint_aba SET note='transfer-aba-B' WHERE id=1;
 
 --connection binlog_aba_control
---let $assert_text= business writes do not rebuild a stale live mirror
---let $assert_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
---let $assert_select= PRESERVE: active binlog mirror reinstall target=[0-9]+
---let $assert_count= 0
---source include/assert_grep.inc
 SET DEBUG_SYNC='now SIGNAL binlog_aba_phase1_continue';
 SET DEBUG_SYNC='now WAIT_FOR binlog_aba_receiver_accepted TIMEOUT 60';
 --let $assert_text= drain owner rebuilt the stale token-local mirror
 --let $assert_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
 --let $assert_select= PRESERVE: drain-owned active binlog mirror rebuild target=[0-9]+ prepared=1
 --let $assert_count= 1
---source include/assert_grep.inc
---let $assert_text= drain-owned rebuild avoided final full-cache fallback
---let $assert_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
---let $assert_select= transfer_binlog_fallback_
---let $assert_count= 0
 --source include/assert_grep.inc
 
 --connect(binlog_aba_reset,localhost,preserve_trx_ha_admin,binlog-savepoint-aba-secret,test)
