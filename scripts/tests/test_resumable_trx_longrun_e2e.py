@@ -4478,23 +4478,28 @@ class ResumableTrxLongRunE2ETest(unittest.TestCase):
         self.assertTrue(result["kill_scenario_results"][0]["resume_sql_started"])
         self.assertIn("RESUME_OBSERVED_KILL", executed)
 
-    def test_mysql_cycle_runtime_restart_skips_shutdown_wait_without_drain(self):
+    def test_mysql_cycle_runtime_restart_waits_for_old_pid_without_drain(self):
         class FakeCursor:
             def __init__(self, conn):
                 self.conn = conn
+                self.last_sql = ""
 
             def execute(self, sql):
+                self.last_sql = sql
                 self.conn.executed.append(sql)
 
             def fetchall(self):
+                if self.last_sql == "SHOW VARIABLES LIKE 'pid_file'":
+                    return [("pid_file", self.conn.pid_file)]
                 return [(1,)]
 
             def close(self):
                 pass
 
         class FakeConnection:
-            def __init__(self, executed):
+            def __init__(self, executed, pid_file):
                 self.executed = executed
+                self.pid_file = pid_file
 
             def cursor(self):
                 return FakeCursor(self)
@@ -4502,38 +4507,54 @@ class ResumableTrxLongRunE2ETest(unittest.TestCase):
             def close(self):
                 self.executed.append("CONNECTION_CLOSED")
 
-        executed = []
-        connect_count = {"value": 0}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pid_file = Path(tmpdir) / "mysqld.pid"
+            pid_file.write_text("4242\n", encoding="utf-8")
+            executed = []
+            connect_count = {"value": 0}
 
-        def connect_factory(**kwargs):
-            connect_count["value"] += 1
-            return FakeConnection(executed)
+            def connect_factory(**kwargs):
+                connect_count["value"] += 1
+                return FakeConnection(executed, str(pid_file))
 
-        runtime = MysqlCycleRuntime(
-            MysqlCycleRuntimeOptions(
-                connection=MysqlConnectionOptions(database="longrun_live"),
-                restart_command="restart mysqld",
-            ),
-            connect_factory=connect_factory,
-            restart_runner=lambda command: executed.append(command),
-        )
+            runtime = MysqlCycleRuntime(
+                MysqlCycleRuntimeOptions(
+                    connection=MysqlConnectionOptions(database="longrun_live"),
+                    restart_command="restart mysqld",
+                ),
+                connect_factory=connect_factory,
+                restart_runner=lambda command: executed.append(command),
+                sleep_func=lambda duration: executed.append(("SLEEP", duration)),
+            )
+            old_pid_alive = iter([True, False])
+            runtime.process_is_alive = lambda pid: (
+                executed.append(("PROCESS_IS_ALIVE", pid))
+                or next(old_pid_alive)
+            )
 
-        result = runtime.restart(
-            LongRunConfig.for_profile(
-                "baseline-restart-no-preserve",
-                Path("/tmp/unused"),
-                cycles=1,
-            ),
-            cycle_id=1,
-        )
+            result = runtime.restart(
+                LongRunConfig.for_profile(
+                    "baseline-restart-no-preserve",
+                    Path("/tmp/unused"),
+                    cycles=1,
+                ),
+                cycle_id=1,
+            )
 
-        self.assertEqual("pass", result["status"])
-        self.assertNotIn("shutdown_wait_status", result)
-        self.assertEqual(1, connect_count["value"])
-        self.assertLess(
-            executed.index("restart mysqld"),
-            executed.index("SELECT 1"),
-        )
+            self.assertEqual("pass", result["status"])
+            self.assertNotIn("shutdown_wait_status", result)
+            self.assertEqual("pass", result["old_pid_wait_status"])
+            self.assertEqual(4242, result["old_server_pid"])
+            self.assertEqual(2, result["old_pid_wait_attempts"])
+            self.assertEqual(2, connect_count["value"])
+            self.assertLess(
+                executed.index("restart mysqld"),
+                executed.index(("PROCESS_IS_ALIVE", 4242)),
+            )
+            self.assertLess(
+                executed.index(("PROCESS_IS_ALIVE", 4242)),
+                executed.index("SELECT 1"),
+            )
 
     def test_mysql_cycle_runtime_restart_reports_startup_timeout(self):
         now = {"value": 100.0}

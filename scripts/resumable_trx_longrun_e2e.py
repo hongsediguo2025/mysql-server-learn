@@ -1510,6 +1510,7 @@ CREATE TEMPORARY TABLE {table} (
             }
         kill_results = self.run_kill_scenarios("restart")
         shutdown_wait_result: Dict[str, object] = {}
+        old_server_pid: Optional[int] = None
         if config.drain_enabled and config.preserve_enabled:
             shutdown_wait_result = self.wait_until_unavailable()
             if shutdown_wait_result.get("shutdown_wait_status") != "pass":
@@ -1522,10 +1523,46 @@ CREATE TEMPORARY TABLE {table} (
                     ),
                     "kill_scenario_results": kill_results,
                 }
+        else:
+            try:
+                conn = self._connect(database=False, autocommit=True)
+                try:
+                    self.remember_server_pid_file(conn)
+                finally:
+                    self._close_connection(conn)
+            except Exception as exc:
+                return {
+                    "status": "fail",
+                    "last_error": f"could not capture old server pid: {exc}",
+                    "kill_scenario_results": kill_results,
+                }
+            if self._server_pid_file:
+                old_server_pid = self.read_pid_file(self._server_pid_file)
+            if old_server_pid is None:
+                return {
+                    "status": "fail",
+                    "last_error": "could not capture old server pid before restart",
+                    "kill_scenario_results": kill_results,
+                }
         self.restart_runner(self.options.restart_command)
+        old_pid_wait_result: Dict[str, object] = {}
+        if old_server_pid is not None:
+            old_pid_wait_result = self.wait_until_pid_exited(old_server_pid)
+            if old_pid_wait_result.get("old_pid_wait_status") != "pass":
+                return {
+                    "status": "fail",
+                    **old_pid_wait_result,
+                    "last_error": old_pid_wait_result.get(
+                        "last_shutdown_probe_error",
+                        "old server pid did not exit before startup probe",
+                    ),
+                    "restart_command": self.options.restart_command,
+                    "kill_scenario_results": kill_results,
+                }
         wait_result = self.wait_until_available()
         return {
             **shutdown_wait_result,
+            **old_pid_wait_result,
             **wait_result,
             "restart_command": self.options.restart_command,
             "kill_scenario_results": kill_results,
@@ -1606,6 +1643,28 @@ CREATE TEMPORARY TABLE {table} (
                     "shutdown_pid_wait_status": "fail",
                     "shutdown_pid_wait_attempts": attempts,
                     "shutdown_pid_file": self._server_pid_file,
+                    "last_shutdown_probe_error": last_error,
+                }
+            self.sleep_func(min(self.options.ping_interval_s, remaining))
+
+    def wait_until_pid_exited(self, pid: int) -> Dict[str, object]:
+        deadline = self.time_provider() + self.options.shutdown_timeout_s
+        attempts = 0
+        while True:
+            attempts += 1
+            if not self.process_is_alive(pid):
+                return {
+                    "old_pid_wait_status": "pass",
+                    "old_pid_wait_attempts": attempts,
+                    "old_server_pid": pid,
+                }
+            last_error = f"old server pid {pid} is still alive"
+            remaining = deadline - self.time_provider()
+            if remaining <= 0:
+                return {
+                    "old_pid_wait_status": "fail",
+                    "old_pid_wait_attempts": attempts,
+                    "old_server_pid": pid,
                     "last_shutdown_probe_error": last_error,
                 }
             self.sleep_func(min(self.options.ping_interval_s, remaining))

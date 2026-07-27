@@ -46,7 +46,7 @@ my $allow_warm = ($ENV{'_PNR_ALLOW_WARMCOPY_ARTIFACTS'} || 0) + 0;
 opendir(my $dh, $dir) or die "cannot open preserve dir $dir: $!";
 my @bad;
 while (defined(my $name = readdir($dh))) {
-  next if $name eq '.' || $name eq '..' || $name eq '.key';
+  next if $name eq '.' || $name eq '..';
   my $path = File::Spec->catfile($dir, $name);
   next unless -f $path;
 

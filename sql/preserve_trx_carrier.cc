@@ -31,7 +31,6 @@
 #include <utility>
 
 #include <openssl/crypto.h>
-#include <openssl/hmac.h>
 
 #include "my_systime.h"
 #include "my_sys.h"
@@ -40,8 +39,6 @@
 
 namespace {
 
-constexpr size_t kHmacOffset = preserve_trx_bundle_hmac_offset();
-constexpr size_t kHmacLength = preserve_trx_bundle_hmac_length();
 constexpr size_t kCrcOffset = preserve_trx_bundle_crc_offset();
 constexpr size_t kCrcLength = preserve_trx_bundle_crc_length();
 constexpr size_t kMicrosecondsPerSecond = 1000000ULL;
@@ -86,29 +83,11 @@ void store_le32(std::vector<unsigned char> *bytes, size_t offset,
   }
 }
 
-bool hmac_sha256(const std::array<unsigned char, kPreservedTrxKeyLength> &key,
-                 const std::vector<unsigned char> &bytes,
-                 std::array<unsigned char, kPreservedTrxSha256Length> *digest) {
-  unsigned int length = 0;
-  unsigned char *result = HMAC(EVP_sha256(), key.data(),
-                               static_cast<int>(key.size()), bytes.data(),
-                               bytes.size(), digest->data(), &length);
-  return result == nullptr || length != digest->size();
-}
-
-bool refresh_snapshot_authentication(
-    const Preserved_trx_codec_context &context,
-    std::vector<unsigned char> *bytes) {
+bool refresh_snapshot_crc(std::vector<unsigned char> *bytes) {
   if (bytes == nullptr || bytes->size() < kCrcOffset + kCrcLength) return true;
 
-  std::fill(bytes->begin() + kHmacOffset, bytes->begin() + kHmacOffset + kHmacLength,
-            0);
   std::fill(bytes->begin() + kCrcOffset, bytes->begin() + kCrcOffset + kCrcLength,
             0);
-
-  std::array<unsigned char, kPreservedTrxSha256Length> digest{};
-  if (hmac_sha256(context.hmac_key, *bytes, &digest)) return true;
-  std::copy(digest.begin(), digest.end(), bytes->begin() + kHmacOffset);
   store_le32(bytes, kCrcOffset, my_checksum(0, bytes->data(), bytes->size()));
   return false;
 }
@@ -759,11 +738,8 @@ Preserve_snapshot_status Preserved_trx_store::rewrite_recovered_count(
 
   store_le32(&encoded.snapshot_bytes,
              preserve_trx_bundle_recovered_count_offset(), recovered_count);
-  /*
-    recovered_count is an authenticated header field. Rewriting it in place must
-    refresh both HMAC and CRC before the carrier publishes the modified snapshot.
-  */
-  if (refresh_snapshot_authentication(context, &encoded.snapshot_bytes))
+  /* recovered_count is covered by the product-v1 snapshot CRC. */
+  if (refresh_snapshot_crc(&encoded.snapshot_bytes))
     return Preserve_snapshot_status::IO_ERROR;
 
   carrier_status = m_carrier->rewrite_existing(token, encoded.snapshot_bytes);

@@ -375,6 +375,11 @@ class FullPressureProfileTest(unittest.TestCase):
             "source_phase2_total_us": [250000],
             "phase2_record_lock_count_samples": [100_000_000],
             "receiver_ready_after_final_spool_ack_us": 0,
+            "receiver_final_metadata_accepted_monotonic_us": 1_000_000,
+            "receiver_terminal_commit_admitted_monotonic_us": 1_001_000,
+            "receiver_ready_monotonic_us": 0,
+            "receiver_ready_after_final_metadata_accepted_us": 0,
+            "receiver_ready_after_terminal_commit_admitted_us": 0,
             "receiver_all_prewarm_after_final_ack_us": 450000,
             "receiver_record_lock_page_count": 0,
             "receiver_record_lock_resident_pages": 0,
@@ -429,6 +434,21 @@ class FullPressureProfileTest(unittest.TestCase):
             RuntimeError, "workload_table_count.*receiver_read_load_qps_drop_pct"
         ):
             validate_e2e_report(FULL_PROFILE, report)
+
+    def test_full_report_gate_rejects_missing_receiver_local_timing_metrics(self):
+        required = (
+            "receiver_final_metadata_accepted_monotonic_us",
+            "receiver_terminal_commit_admitted_monotonic_us",
+            "receiver_ready_monotonic_us",
+            "receiver_ready_after_final_metadata_accepted_us",
+            "receiver_ready_after_terminal_commit_admitted_us",
+        )
+        for field in required:
+            with self.subTest(field=field):
+                report = self._valid_committed_not_ready_report()
+                del report[field]
+                with self.assertRaisesRegex(RuntimeError, field):
+                    validate_e2e_report(FULL_PROFILE, report)
 
     def test_full_report_gate_rejects_strict_side_effects_and_false_ready(self):
         report = self._valid_committed_not_ready_report()
@@ -529,6 +549,11 @@ class FullPressureProfileTest(unittest.TestCase):
             "source_phase2_total_us": [250000],
             "phase2_record_lock_count_samples": [100_000_000],
             "receiver_ready_after_final_spool_ack_us": 0,
+            "receiver_final_metadata_accepted_monotonic_us": 1_000_000,
+            "receiver_terminal_commit_admitted_monotonic_us": 1_001_000,
+            "receiver_ready_monotonic_us": 0,
+            "receiver_ready_after_final_metadata_accepted_us": 0,
+            "receiver_ready_after_terminal_commit_admitted_us": 0,
             "receiver_all_prewarm_after_final_ack_us": 450000,
             "receiver_record_lock_page_count": 0,
             "receiver_record_lock_resident_pages": 0,

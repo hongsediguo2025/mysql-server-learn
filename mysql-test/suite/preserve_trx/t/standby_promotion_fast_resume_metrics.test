@@ -26,3 +26,26 @@ SELECT COUNT(*) AS registered_fast_resume_metrics
     'Preserve_trx_resume_binlog_attach_count',
     'Preserve_trx_resume_physical_consistency_mode',
     'Preserve_trx_resume_real_redo_apply');
+
+SELECT COUNT(*) AS registered_transfer_ownership_metrics
+  FROM performance_schema.global_status
+  WHERE VARIABLE_NAME IN (
+    'Preserve_trx_transfer_recv_final_metadata_accepted_mono_us',
+    'Preserve_trx_transfer_recv_terminal_commit_admitted_mono_us',
+    'Preserve_trx_transfer_receiver_ready_monotonic_us',
+    'Preserve_trx_transfer_recv_ready_after_final_metadata_us',
+    'Preserve_trx_transfer_recv_ready_after_terminal_commit_us',
+    'Preserve_trx_transfer_receiver_admitted_frames',
+    'Preserve_trx_transfer_receiver_admitted_bytes',
+    'Preserve_trx_transfer_source_handoff_pending_epochs',
+    'Preserve_trx_transfer_source_commit_unknown_epochs',
+    'Preserve_trx_transfer_source_restore_guard_rejects',
+    'Preserve_trx_transfer_receiver_terminal_cas_wins',
+    'Preserve_trx_transfer_receiver_terminal_cas_duplicates',
+    'Preserve_trx_transfer_receiver_terminal_cas_conflicts',
+    'Preserve_trx_transfer_receiver_terminal_status_tombstones',
+    'Preserve_trx_transfer_recv_terminal_tombstone_expiries',
+    'Preserve_trx_transfer_quarantine_epochs',
+    'Preserve_trx_transfer_quarantine_tokens',
+    'Preserve_trx_transfer_quarantine_bytes',
+    'Preserve_trx_transfer_quarantine_oldest_age_us');

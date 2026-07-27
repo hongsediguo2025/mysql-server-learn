@@ -9775,7 +9775,6 @@ class TempPhysicalTlvTest : public PreserveTrxTempTableCarrierTest {
 
   static Preserved_trx_codec_context codec_context() {
     Preserved_trx_codec_context context;
-    std::fill(context.hmac_key.begin(), context.hmac_key.end(), 0x5a);
     std::fill(context.datadir_fingerprint.begin(),
               context.datadir_fingerprint.end(), 0x7b);
     context.server_uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";

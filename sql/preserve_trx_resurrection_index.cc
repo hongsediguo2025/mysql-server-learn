@@ -12,12 +12,13 @@
 #include <set>
 
 #include <openssl/crypto.h>
-#include <openssl/hmac.h>
+
+#include "sha2.h"
 
 namespace {
 
 constexpr char kResurrectionIndexMagic[] = {'P', 'T', 'R', 'X',
-                                             'I', 'D', 'X', '1'};
+                                             'R', 'I', 'X', '1'};
 constexpr size_t kResurrectionIndexMagicLength =
     sizeof(kResurrectionIndexMagic);
 constexpr size_t kResurrectionIndexMaxBytes = 64U * 1024U * 1024U;
@@ -65,11 +66,6 @@ bool component_is_valid(const std::string &value) {
   return value != "." && value != "..";
 }
 
-bool key_is_valid(const Preserved_trx_codec_context &context) {
-  return std::any_of(context.hmac_key.begin(), context.hmac_key.end(),
-                     [](unsigned char value) { return value != 0; });
-}
-
 bool digest_is_nonzero(
     const std::array<unsigned char, kPreservedTrxSha256Length> &digest) {
   return std::any_of(digest.begin(), digest.end(),
@@ -112,8 +108,7 @@ bool entry_is_valid(const Preserve_trx_resurrection_index_entry &entry) {
 
 bool index_is_valid(const Preserve_trx_resurrection_index &index) {
   if (index.version != kPreserveTrxResurrectionIndexVersion ||
-      !component_is_valid(index.source_server_uuid) ||
-      !component_is_valid(index.target_server_uuid) ||
+      !component_is_valid(index.local_instance_identity) ||
       !component_is_valid(index.epoch_id) || index.entries.empty() ||
       index.entries.size() > kResurrectionIndexMaxEntries) {
     return false;
@@ -130,16 +125,13 @@ bool index_is_valid(const Preserve_trx_resurrection_index &index) {
   return true;
 }
 
-bool hmac_sha256(const Preserved_trx_codec_context &context,
-                 const std::string &payload,
-                 std::array<unsigned char, kPreservedTrxSha256Length> *digest) {
-  unsigned int length = 0;
-  return digest != nullptr &&
-         HMAC(EVP_sha256(), context.hmac_key.data(),
-              static_cast<int>(context.hmac_key.size()),
-              reinterpret_cast<const unsigned char *>(payload.data()),
-              payload.size(), digest->data(), &length) != nullptr &&
-         length == digest->size();
+bool canonical_sha256(
+    const std::string &payload,
+    std::array<unsigned char, kPreservedTrxSha256Length> *digest) {
+  if (digest == nullptr) return false;
+  SHA_EVP256(reinterpret_cast<const unsigned char *>(payload.data()),
+             payload.size(), digest->data());
+  return true;
 }
 
 class Index_reader {
@@ -217,7 +209,8 @@ class Index_reader {
 Preserve_trx_resurrection_index_status preserve_trx_encode_resurrection_index(
     const Preserve_trx_resurrection_index &index,
     const Preserved_trx_codec_context &context, std::string *encoded) {
-  if (encoded == nullptr || !key_is_valid(context)) {
+  if (encoded == nullptr || !component_is_valid(context.server_uuid) ||
+      index.local_instance_identity != context.server_uuid) {
     return Preserve_trx_resurrection_index_status::INVALID_ARGUMENT;
   }
   if (index.version != kPreserveTrxResurrectionIndexVersion) {
@@ -231,8 +224,7 @@ Preserve_trx_resurrection_index_status preserve_trx_encode_resurrection_index(
     out.append(kResurrectionIndexMagic, kResurrectionIndexMagicLength);
     append_u16(&out, index.version);
     append_u16(&out, 0);
-    if (!append_string(&out, index.source_server_uuid) ||
-        !append_string(&out, index.target_server_uuid) ||
+    if (!append_string(&out, index.local_instance_identity) ||
         !append_string(&out, index.epoch_id)) {
       return Preserve_trx_resurrection_index_status::INVALID_ARGUMENT;
     }
@@ -271,7 +263,7 @@ Preserve_trx_resurrection_index_status preserve_trx_encode_resurrection_index(
       }
     }
     std::array<unsigned char, kPreservedTrxSha256Length> digest{};
-    if (!hmac_sha256(context, out, &digest)) {
+    if (!canonical_sha256(out, &digest)) {
       return Preserve_trx_resurrection_index_status::INVALID_ARGUMENT;
     }
     out.append(reinterpret_cast<const char *>(digest.data()), digest.size());
@@ -285,7 +277,7 @@ Preserve_trx_resurrection_index_status preserve_trx_encode_resurrection_index(
 Preserve_trx_resurrection_index_status preserve_trx_decode_resurrection_index(
     const std::string &encoded, const Preserved_trx_codec_context &context,
     Preserve_trx_resurrection_index *index) {
-  if (index == nullptr || !key_is_valid(context)) {
+  if (index == nullptr || !component_is_valid(context.server_uuid)) {
     return Preserve_trx_resurrection_index_status::INVALID_ARGUMENT;
   }
   if (encoded.size() < kResurrectionIndexMagicLength + sizeof(uint16_t) * 2 +
@@ -299,12 +291,12 @@ Preserve_trx_resurrection_index_status preserve_trx_decode_resurrection_index(
   }
   const size_t body_length = encoded.size() - kPreservedTrxSha256Length;
   std::array<unsigned char, kPreservedTrxSha256Length> expected{};
-  if (!hmac_sha256(context, encoded.substr(0, body_length), &expected)) {
+  if (!canonical_sha256(encoded.substr(0, body_length), &expected)) {
     return Preserve_trx_resurrection_index_status::INVALID_ARGUMENT;
   }
   if (CRYPTO_memcmp(expected.data(), encoded.data() + body_length,
                     expected.size()) != 0) {
-    return Preserve_trx_resurrection_index_status::AUTHENTICATION_FAILED;
+    return Preserve_trx_resurrection_index_status::DIGEST_MISMATCH;
   }
 
   try {
@@ -319,8 +311,8 @@ Preserve_trx_resurrection_index_status preserve_trx_decode_resurrection_index(
     if (parsed.version != kPreserveTrxResurrectionIndexVersion) {
       return Preserve_trx_resurrection_index_status::UNSUPPORTED;
     }
-    if (reserved != 0 || !reader.read_string(&parsed.source_server_uuid) ||
-        !reader.read_string(&parsed.target_server_uuid) ||
+    if (reserved != 0 ||
+        !reader.read_string(&parsed.local_instance_identity) ||
         !reader.read_string(&parsed.epoch_id)) {
       return Preserve_trx_resurrection_index_status::CORRUPT;
     }
@@ -392,7 +384,8 @@ Preserve_trx_resurrection_index_status preserve_trx_decode_resurrection_index(
       }
       parsed.entries.push_back(std::move(entry));
     }
-    if (!reader.eof() || !index_is_valid(parsed)) {
+    if (!reader.eof() || !index_is_valid(parsed) ||
+        parsed.local_instance_identity != context.server_uuid) {
       return Preserve_trx_resurrection_index_status::CORRUPT;
     }
     *index = std::move(parsed);

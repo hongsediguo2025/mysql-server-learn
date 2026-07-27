@@ -519,7 +519,6 @@ def build_mysqld_commands(
                 "--preserve-trx-transfer-target-user=preserve_transfer",
                 "--preserve-trx-transfer-credential-name=fullpressure",
                 "--preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE",
-                f"--preserve-trx-transfer-target-server-uuid={receiver_uuid}",
                 "--preserve-trx-transfer-target-host=127.0.0.1",
                 f"--preserve-trx-transfer-target-port={receiver_port}",
             ]
@@ -537,8 +536,6 @@ def build_mysqld_commands(
         f"{profile.prewarm_io_bytes_per_sec_base}",
         "--preserve-trx-promotion-prewarm-workers="
         f"{min(profile.promotion_prewarm_workers, profile.receiver_workers)}",
-        "--preserve-trx-transfer-target-user=preserve_transfer",
-        "--preserve-trx-transfer-credential-name=fullpressure",
         f"--datadir={paths.receiver_datadir}",
         f"--socket={paths.receiver_socket}",
         f"--port={receiver_port}",
@@ -549,8 +546,6 @@ def build_mysqld_commands(
         f"--innodb-buffer-pool-size={profile.receiver_buffer_pool_bytes}",
         "--preserve-trx-transfer-receiver-enable=ON",
         f"--preserve-trx-transfer-receiver-workers={profile.receiver_workers}",
-        f"--preserve-trx-transfer-target-server-uuid={receiver_uuid}",
-        f"--preserve-trx-transfer-allowed-source-uuid={source_uuid}",
     ]
     return source, receiver
 
@@ -1688,6 +1683,21 @@ def validate_e2e_report(
         return validate_reset_drain_report(profile, report)
     if evidence != "transfer-phase2":
         raise ValueError(f"unknown evidence mode: {evidence}")
+    required_receiver_timing_metrics = (
+        "receiver_final_metadata_accepted_monotonic_us",
+        "receiver_terminal_commit_admitted_monotonic_us",
+        "receiver_ready_monotonic_us",
+        "receiver_ready_after_final_metadata_accepted_us",
+        "receiver_ready_after_terminal_commit_admitted_us",
+    )
+    missing_receiver_timing_metrics = [
+        field for field in required_receiver_timing_metrics if field not in report
+    ]
+    if missing_receiver_timing_metrics:
+        raise RuntimeError(
+            "full-pressure report missing required receiver timing metrics: "
+            + ", ".join(missing_receiver_timing_metrics)
+        )
     failures: List[str] = []
 
     def require_equal(key: str, expected: Any) -> None:

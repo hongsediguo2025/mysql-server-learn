@@ -105,7 +105,7 @@ class Preserve_trx_targeted_publication_capability {
 
  private:
   std::weak_ptr<Preserve_trx_targeted_publication_revocation_state> m_state;
-  std::string m_source_uuid;
+  std::string m_epoch_scope;
   std::string m_epoch_id;
   std::string m_token;
   std::string m_target_boot_incarnation;
@@ -186,10 +186,10 @@ struct Preserve_trx_strict_promotion_intent_epoch {
   std::vector<Preserve_trx_strict_promotion_intent_token> tokens;
 };
 
-bool preserved_trx_encode_strict_promotion_intent_v2(
+bool preserved_trx_encode_strict_promotion_intent_v1(
     const Preserve_trx_strict_promotion_intent_epoch &marker,
     std::string *encoded);
-bool preserved_trx_decode_strict_promotion_intent_v2(
+bool preserved_trx_decode_strict_promotion_intent_v1(
     const std::string &encoded,
     Preserve_trx_strict_promotion_intent_epoch *marker);
 
@@ -251,7 +251,7 @@ enum class Preserve_trx_gate_abort_outcome : uint8_t {
 
 struct Preserve_trx_prepared_token_key {
   std::string preserve_dir;
-  std::string source_uuid;
+  std::string epoch_scope;
   std::string epoch_id;
   std::string token;
   std::string target_boot_incarnation;
@@ -558,7 +558,7 @@ class Preserve_trx_prepared_token_registry {
       const Preserve_trx_prepared_token_key &key,
       uint64_t expected_generation, Preserve_trx_final_token_facts facts);
   Preserve_trx_prepared_status update_epoch_prepare_deadline(
-      const std::string &source_uuid, const std::string &epoch_id,
+      const std::string &epoch_scope, const std::string &epoch_id,
       size_t expected_token_count, uint64_t deadline_monotonic_us);
   Preserve_trx_prepared_status pin_epoch_for_physical_promotion(
       const std::vector<Preserve_trx_prepared_token_key> &keys,
@@ -613,13 +613,13 @@ class Preserve_trx_prepared_token_registry {
       Preserve_trx_prepared_token_snapshot *snapshot) const;
   Preserve_trx_prepared_registry_counts status_counts() const;
   void invalidate_incarnation(const std::string &current_boot_incarnation);
-  size_t expire_ready_facts_pending_lease(const std::string &source_uuid,
+  size_t expire_ready_facts_pending_lease(const std::string &epoch_scope,
                                           const std::string &epoch_id,
                                           uint64_t now_us);
   Preserve_trx_prepared_expire_result expire_once(uint64_t now_us);
   Preserve_trx_prepared_status purge_token(
       const Preserve_trx_prepared_token_key &key);
-  void purge_epoch(const std::string &source_uuid,
+  void purge_epoch(const std::string &epoch_scope,
                    const std::string &epoch_id);
   /* Process shutdown only: discard receiver-owned prepared resources. */
   size_t discard_all_for_process_shutdown();

@@ -82,12 +82,12 @@ struct Preserve_trx_prepared_token_entry {
 };
 
 struct Preserve_trx_prepared_token_locator {
-  std::string source_uuid;
+  std::string epoch_scope;
   std::string epoch_id;
   std::string token;
 
   bool operator<(const Preserve_trx_prepared_token_locator &other) const {
-    if (source_uuid != other.source_uuid) return source_uuid < other.source_uuid;
+    if (epoch_scope != other.epoch_scope) return epoch_scope < other.epoch_scope;
     if (epoch_id != other.epoch_id) return epoch_id < other.epoch_id;
     return token < other.token;
   }
@@ -164,10 +164,10 @@ uint64_t prepared_monotonic_us() {
           .count());
 }
 
-constexpr char kStrictPromotionIntentV2Magic[] =
-    "PTRX_STRICT_PROMOTION_INTENT_EPOCH_V2";
-constexpr char kStrictAttachIntentV1Magic[] =
-    "PTRX_STRICT_PROMOTION_ATTACH_INTENT_V1";
+constexpr char kStrictPromotionIntentProductV1Magic[] =
+    "PTRX_STRICT_PROMOTION_INTENT_EPOCH_PRODUCT_V1";
+constexpr char kStrictAttachIntentProductV1Magic[] =
+    "PTRX_STRICT_PROMOTION_ATTACH_INTENT_PRODUCT_V1";
 constexpr size_t kStrictPromotionIntentDigestHexLength =
     SHA256_DIGEST_LENGTH * 2;
 constexpr size_t kStrictPromotionIntentMaxBytes = 64U * 1024U * 1024U;
@@ -285,20 +285,20 @@ bool proofs_match(const Preserve_trx_physical_fence_proof &expected,
 }
 
 bool prepared_token_key_is_valid(const Preserve_trx_prepared_token_key &key) {
-  return !key.preserve_dir.empty() && !key.source_uuid.empty() &&
+  return !key.preserve_dir.empty() && !key.epoch_scope.empty() &&
          !key.epoch_id.empty() && !key.token.empty() &&
          !key.target_boot_incarnation.empty() && key.generation != 0;
 }
 
 Preserve_trx_prepared_token_locator prepared_token_locator(
     const Preserve_trx_prepared_token_key &key) {
-  return {key.source_uuid, key.epoch_id, key.token};
+  return {key.epoch_scope, key.epoch_id, key.token};
 }
 
 bool prepared_token_keys_match(const Preserve_trx_prepared_token_key &lhs,
                                const Preserve_trx_prepared_token_key &rhs) {
   return lhs.preserve_dir == rhs.preserve_dir &&
-         lhs.source_uuid == rhs.source_uuid && lhs.epoch_id == rhs.epoch_id &&
+         lhs.epoch_scope == rhs.epoch_scope && lhs.epoch_id == rhs.epoch_id &&
          lhs.token == rhs.token &&
          lhs.target_boot_incarnation == rhs.target_boot_incarnation &&
          lhs.generation == rhs.generation;
@@ -470,7 +470,7 @@ bool strict_attach_intent_is_valid(
   };
   return prepared_token_key_is_valid(intent.key) &&
          string_is_valid(intent.key.preserve_dir) &&
-         string_is_valid(intent.key.source_uuid) &&
+         string_is_valid(intent.key.epoch_scope) &&
          string_is_valid(intent.key.epoch_id) &&
          string_is_valid(intent.key.token) &&
          string_is_valid(intent.key.target_boot_incarnation) &&
@@ -516,14 +516,14 @@ bool final_token_facts_are_valid(const Preserve_trx_final_token_facts &facts) {
 
 std::string prepared_resource_token(
     const Preserve_trx_prepared_token_key &key) {
-  return key.source_uuid + "\x1f" + key.epoch_id + "\x1f" + key.token +
+  return key.epoch_scope + "\x1f" + key.epoch_id + "\x1f" + key.token +
          "\x1f" + std::to_string(key.generation);
 }
 
 Mysql_binlog_preserve_token_identity prepared_binlog_identity(
     const Preserve_trx_prepared_token_key &key) {
   Mysql_binlog_preserve_token_identity identity;
-  identity.source_uuid = key.source_uuid;
+  identity.epoch_scope = key.epoch_scope;
   identity.epoch_id = key.epoch_id;
   identity.token = key.token;
   identity.target_boot_incarnation = key.target_boot_incarnation;
@@ -704,7 +704,7 @@ bool Preserve_trx_targeted_publication_capability::valid_for(
   const auto state = m_state.lock();
   return state != nullptr && state->active.load(std::memory_order_acquire) &&
          prepared_token_key_is_valid(key) &&
-         key.source_uuid == m_source_uuid && key.epoch_id == m_epoch_id &&
+         key.epoch_scope == m_epoch_scope && key.epoch_id == m_epoch_id &&
          key.token == m_token &&
          key.target_boot_incarnation == m_target_boot_incarnation &&
          key.generation == m_generation && m_source_fence_lsn != 0 &&
@@ -723,12 +723,12 @@ bool Preserve_trx_physical_fence_lease::
       m_targeted_publication_state == nullptr ||
       !m_targeted_publication_state->active.load(std::memory_order_acquire) ||
       !prepared_token_key_is_valid(key) ||
-      key.source_uuid != m_proof.source_lineage_uuid ||
+      key.epoch_scope != m_proof.source_lineage_uuid ||
       key.target_boot_incarnation != m_proof.target_boot_incarnation) {
     return false;
   }
   capability->m_state = m_targeted_publication_state;
-  capability->m_source_uuid = key.source_uuid;
+  capability->m_epoch_scope = key.epoch_scope;
   capability->m_epoch_id = key.epoch_id;
   capability->m_token = key.token;
   capability->m_target_boot_incarnation = key.target_boot_incarnation;
@@ -798,7 +798,7 @@ bool preserved_trx_physical_fence_proof_is_valid(
          proof.apply_frozen && proof.implicit_native_continuity_proven;
 }
 
-bool preserved_trx_encode_strict_promotion_intent_v2(
+bool preserved_trx_encode_strict_promotion_intent_v1(
     const Preserve_trx_strict_promotion_intent_epoch &marker,
     std::string *encoded) {
   if (encoded == nullptr || marker.epoch_id.empty() ||
@@ -822,8 +822,8 @@ bool preserved_trx_encode_strict_promotion_intent_v2(
     }
   }
 
-  std::string body(kStrictPromotionIntentV2Magic,
-                   sizeof(kStrictPromotionIntentV2Magic) - 1);
+  std::string body(kStrictPromotionIntentProductV1Magic,
+                   sizeof(kStrictPromotionIntentProductV1Magic) - 1);
   body.push_back(static_cast<char>(marker.physical_fence.consistency_mode));
   if (!append_canonical_string(&body, marker.epoch_id) ||
       !append_canonical_string(&body,
@@ -866,10 +866,11 @@ bool preserved_trx_encode_strict_promotion_intent_v2(
   return true;
 }
 
-bool preserved_trx_decode_strict_promotion_intent_v2(
+bool preserved_trx_decode_strict_promotion_intent_v1(
     const std::string &encoded,
     Preserve_trx_strict_promotion_intent_epoch *marker) {
-  constexpr size_t kMagicLength = sizeof(kStrictPromotionIntentV2Magic) - 1;
+  constexpr size_t kMagicLength =
+      sizeof(kStrictPromotionIntentProductV1Magic) - 1;
   if (marker == nullptr ||
       encoded.size() <= kMagicLength + kStrictPromotionIntentDigestHexLength ||
       encoded.size() > kStrictPromotionIntentMaxBytes) {
@@ -878,7 +879,8 @@ bool preserved_trx_decode_strict_promotion_intent_v2(
   const size_t body_length =
       encoded.size() - kStrictPromotionIntentDigestHexLength;
   const std::string body = encoded.substr(0, body_length);
-  if (body.compare(0, kMagicLength, kStrictPromotionIntentV2Magic) != 0 ||
+  if (body.compare(0, kMagicLength,
+                   kStrictPromotionIntentProductV1Magic) != 0 ||
       encoded.compare(body_length, kStrictPromotionIntentDigestHexLength,
                       sha256_hex_string(body)) != 0) {
     return false;
@@ -959,10 +961,10 @@ bool preserved_trx_encode_strict_attach_intent_v1(
   if (encoded == nullptr || !strict_attach_intent_is_valid(intent)) {
     return false;
   }
-  std::string body(kStrictAttachIntentV1Magic,
-                   sizeof(kStrictAttachIntentV1Magic) - 1);
+  std::string body(kStrictAttachIntentProductV1Magic,
+                   sizeof(kStrictAttachIntentProductV1Magic) - 1);
   if (!append_canonical_string(&body, intent.key.preserve_dir) ||
-      !append_canonical_string(&body, intent.key.source_uuid) ||
+      !append_canonical_string(&body, intent.key.epoch_scope) ||
       !append_canonical_string(&body, intent.key.epoch_id) ||
       !append_canonical_string(&body, intent.key.token) ||
       !append_canonical_string(&body,
@@ -984,7 +986,8 @@ bool preserved_trx_encode_strict_attach_intent_v1(
 
 bool preserved_trx_decode_strict_attach_intent_v1(
     const std::string &encoded, Preserve_trx_strict_attach_intent *intent) {
-  constexpr size_t kMagicLength = sizeof(kStrictAttachIntentV1Magic) - 1;
+  constexpr size_t kMagicLength =
+      sizeof(kStrictAttachIntentProductV1Magic) - 1;
   if (intent == nullptr ||
       encoded.size() <= kMagicLength + kStrictPromotionIntentDigestHexLength ||
       encoded.size() > kStrictPromotionIntentMaxBytes) {
@@ -993,7 +996,7 @@ bool preserved_trx_decode_strict_attach_intent_v1(
   const size_t body_length =
       encoded.size() - kStrictPromotionIntentDigestHexLength;
   const std::string body = encoded.substr(0, body_length);
-  if (body.compare(0, kMagicLength, kStrictAttachIntentV1Magic) != 0 ||
+  if (body.compare(0, kMagicLength, kStrictAttachIntentProductV1Magic) != 0 ||
       encoded.compare(body_length, kStrictPromotionIntentDigestHexLength,
                       sha256_hex_string(body)) != 0) {
     return false;
@@ -1003,7 +1006,7 @@ bool preserved_trx_decode_strict_attach_intent_v1(
   size_t offset = kMagicLength;
   uint8_t state = 0;
   if (!read_canonical_string(body, &offset, &parsed.key.preserve_dir) ||
-      !read_canonical_string(body, &offset, &parsed.key.source_uuid) ||
+      !read_canonical_string(body, &offset, &parsed.key.epoch_scope) ||
       !read_canonical_string(body, &offset, &parsed.key.epoch_id) ||
       !read_canonical_string(body, &offset, &parsed.key.token) ||
       !read_canonical_string(body, &offset,
@@ -1026,7 +1029,7 @@ std::string preserved_trx_strict_attach_intent_journal_id(
   if (!prepared_token_key_is_valid(key)) return {};
   std::string identity;
   if (!append_canonical_string(&identity, key.preserve_dir) ||
-      !append_canonical_string(&identity, key.source_uuid) ||
+      !append_canonical_string(&identity, key.epoch_scope) ||
       !append_canonical_string(&identity, key.epoch_id) ||
       !append_canonical_string(&identity, key.token) ||
       !append_canonical_string(&identity, key.target_boot_incarnation)) {
@@ -1219,7 +1222,7 @@ Preserve_trx_prepared_token_resources::prepare_native_binlog_handle_for_receiver
     const Mysql_binlog_preserve_cache_facts &facts,
     Mysql_binlog_preserve_payload_reader *reader) {
   if (m_impl == nullptr || !m_impl->acquired || reader == nullptr ||
-      m_impl->key.source_uuid != facts.identity.source_uuid ||
+      m_impl->key.epoch_scope != facts.identity.epoch_scope ||
       m_impl->key.epoch_id != facts.identity.epoch_id ||
       m_impl->key.token != facts.identity.token ||
       m_impl->key.target_boot_incarnation !=
@@ -1745,9 +1748,9 @@ Preserve_trx_prepared_token_registry::bind_final_facts(
 
 Preserve_trx_prepared_status
 Preserve_trx_prepared_token_registry::update_epoch_prepare_deadline(
-    const std::string &source_uuid, const std::string &epoch_id,
+    const std::string &epoch_scope, const std::string &epoch_id,
     size_t expected_token_count, uint64_t deadline_monotonic_us) {
-  if (source_uuid.empty() || epoch_id.empty() || expected_token_count == 0 ||
+  if (epoch_scope.empty() || epoch_id.empty() || expected_token_count == 0 ||
       deadline_monotonic_us == 0) {
     return Preserve_trx_prepared_status::INVALID_ARGUMENT;
   }
@@ -1760,7 +1763,7 @@ Preserve_trx_prepared_token_registry::update_epoch_prepare_deadline(
     std::lock_guard<std::mutex> registry_guard(m_state->mutex);
     entries.reserve(expected_token_count);
     for (const auto &item : m_state->entries) {
-      if (item.first.source_uuid == source_uuid &&
+      if (item.first.epoch_scope == epoch_scope &&
           item.first.epoch_id == epoch_id) {
         entries.push_back(item.second);
       }
@@ -1782,7 +1785,7 @@ Preserve_trx_prepared_token_registry::update_epoch_prepare_deadline(
       }
       const auto current = std::atomic_load_explicit(
           &entry->publication, std::memory_order_acquire);
-      if (current == nullptr || current->key.source_uuid != source_uuid ||
+      if (current == nullptr || current->key.epoch_scope != epoch_scope ||
           current->key.epoch_id != epoch_id) {
         return Preserve_trx_prepared_status::STALE_GENERATION;
       }
@@ -1830,12 +1833,12 @@ Preserve_trx_prepared_token_registry::pin_epoch_for_physical_promotion(
       entries.reserve(keys.size());
       for (const auto &key : keys) {
         if (!prepared_token_key_is_valid(key) ||
-            key.source_uuid != keys.front().source_uuid ||
+            key.epoch_scope != keys.front().epoch_scope ||
             key.epoch_id != keys.front().epoch_id) {
           return Preserve_trx_prepared_status::INVALID_ARGUMENT;
         }
         const auto found = m_state->entries.find(
-            {key.source_uuid, key.epoch_id, key.token});
+            {key.epoch_scope, key.epoch_id, key.token});
         if (found == m_state->entries.end() ||
             !prepared_token_keys_match(found->second->key, key)) {
           return Preserve_trx_prepared_status::NOT_FOUND;
@@ -2590,13 +2593,13 @@ void Preserve_trx_prepared_token_registry::invalidate_incarnation(
 }
 
 size_t Preserve_trx_prepared_token_registry::expire_ready_facts_pending_lease(
-    const std::string &source_uuid, const std::string &epoch_id,
+    const std::string &epoch_scope, const std::string &epoch_id,
     uint64_t now_us) {
   std::vector<std::shared_ptr<Preserve_trx_prepared_token_entry>> entries;
   {
     std::lock_guard<std::mutex> guard(m_state->mutex);
     for (const auto &item : m_state->entries) {
-      if (item.first.source_uuid == source_uuid &&
+      if (item.first.epoch_scope == epoch_scope &&
           item.first.epoch_id == epoch_id) {
         entries.push_back(item.second);
       }
@@ -2729,12 +2732,12 @@ Preserve_trx_prepared_token_registry::purge_token(
 }
 
 void Preserve_trx_prepared_token_registry::purge_epoch(
-    const std::string &source_uuid, const std::string &epoch_id) {
+    const std::string &epoch_scope, const std::string &epoch_id) {
   std::vector<Preserve_trx_prepared_token_resources> retired_resources;
   {
     std::lock_guard<std::mutex> guard(m_state->mutex);
     for (auto it = m_state->entries.begin(); it != m_state->entries.end();) {
-      if (it->first.source_uuid == source_uuid &&
+      if (it->first.epoch_scope == epoch_scope &&
           it->first.epoch_id == epoch_id) {
         std::lock_guard<std::mutex> entry_guard(it->second->mutex);
         auto expected = it->second->state.load(std::memory_order_acquire);

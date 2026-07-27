@@ -1,5 +1,5 @@
 @@GLOBAL.preserve_trx_transfer_receiver_workers
-8
+3
 @@GLOBAL.preserve_trx_transfer_phase1_batch_bytes
 4194304
 @@GLOBAL.preserve_trx_transfer_phase1_batch_linger_ms

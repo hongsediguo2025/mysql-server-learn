@@ -1277,7 +1277,7 @@ std::atomic<uint64_t> g_preserve_attached_binlog_resource_count{0};
 
 bool preserve_binlog_identity_is_valid(
     const Mysql_binlog_preserve_token_identity &identity) {
-  return !identity.source_uuid.empty() && !identity.epoch_id.empty() &&
+  return !identity.epoch_scope.empty() && !identity.epoch_id.empty() &&
          !identity.token.empty() &&
          !identity.target_boot_incarnation.empty() && identity.generation != 0;
 }
@@ -1285,7 +1285,7 @@ bool preserve_binlog_identity_is_valid(
 bool preserve_binlog_identities_match(
     const Mysql_binlog_preserve_token_identity &lhs,
     const Mysql_binlog_preserve_token_identity &rhs) {
-  return lhs.source_uuid == rhs.source_uuid && lhs.epoch_id == rhs.epoch_id &&
+  return lhs.epoch_scope == rhs.epoch_scope && lhs.epoch_id == rhs.epoch_id &&
          lhs.token == rhs.token &&
          lhs.target_boot_incarnation == rhs.target_boot_incarnation &&
          lhs.generation == rhs.generation;
@@ -1334,7 +1334,7 @@ bool preserve_binlog_encode_cache_facts(
     return false;
   }
   encoded->clear();
-  if (!preserve_binlog_append_string(encoded, facts.identity.source_uuid) ||
+  if (!preserve_binlog_append_string(encoded, facts.identity.epoch_scope) ||
       !preserve_binlog_append_string(encoded, facts.identity.epoch_id) ||
       !preserve_binlog_append_string(encoded, facts.identity.token) ||
       !preserve_binlog_append_string(
@@ -1529,7 +1529,7 @@ uint64_t mysql_binlog_preserve_native_memory_bytes_required(
           sizeof(Mysql_binlog_preserve_cache_state),
       static_cast<uint64_t>(facts.cache_states.size()) *
           kPreserveBinlogCacheStateMapNodeAdmissionBytes,
-      static_cast<uint64_t>(facts.identity.source_uuid.capacity()),
+      static_cast<uint64_t>(facts.identity.epoch_scope.capacity()),
       static_cast<uint64_t>(facts.identity.epoch_id.capacity()),
       static_cast<uint64_t>(facts.identity.token.capacity()),
       static_cast<uint64_t>(

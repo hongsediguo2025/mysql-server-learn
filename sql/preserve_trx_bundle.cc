@@ -32,7 +32,6 @@
 #include <utility>
 
 #include <openssl/crypto.h>
-#include <openssl/hmac.h>
 
 #include "my_sys.h"
 #include "my_dbug.h"
@@ -138,9 +137,9 @@ Preserve_snapshot_status preserve_trx_snapshot_codec_peak_bytes(
 
 namespace {
 
-constexpr char kSnapshotMagic[] = "MSP_PRES";
-constexpr uint16_t kMinReadableSnapshotFormatVersion = 9;
-constexpr uint16_t kSnapshotFormatVersion = 9;
+constexpr char kSnapshotMagic[] = "PTRXSNP1";
+constexpr uint16_t kMinReadableSnapshotFormatVersion = 1;
+constexpr uint16_t kSnapshotFormatVersion = 1;
 constexpr size_t kMagicLength = 8;
 constexpr size_t kFormatVersionOffset = 8;
 constexpr size_t kHeaderSizeOffset = 10;
@@ -166,8 +165,6 @@ constexpr size_t kOwnerHostOffset = 324;
 constexpr size_t kOwnerHostLength = 128;
 constexpr size_t kSchemaOffset = 452;
 constexpr size_t kSchemaLength = 64;
-constexpr size_t kHmacOffset = preserve_trx_bundle_hmac_offset();
-constexpr size_t kHmacLength = preserve_trx_bundle_hmac_length();
 constexpr size_t kCrcOffset = preserve_trx_bundle_crc_offset();
 constexpr size_t kCrcLength = preserve_trx_bundle_crc_length();
 constexpr size_t kSnapshotHeaderLength =
@@ -1026,16 +1023,6 @@ bool apply_binlog_no_cache_metadata_tlv(const std::string &value,
   if (offset != value.length()) return true;
   return !metadata->binlog_gtid_next.empty() ||
          !metadata->binlog_owned_gtid.empty();
-}
-
-bool hmac_sha256(const std::array<unsigned char, kPreservedTrxKeyLength> &key,
-                 const std::vector<unsigned char> &bytes,
-                 std::array<unsigned char, kHmacLength> *digest) {
-  unsigned int digest_length = 0;
-  unsigned char *result =
-      HMAC(EVP_sha256(), key.data(), static_cast<int>(key.size()),
-           bytes.data(), bytes.size(), digest->data(), &digest_length);
-  return result == nullptr || digest_length != digest->size();
 }
 
 bool apply_modified_tables_tlv(const std::vector<Preserve_snapshot_tlv> &tlvs,
@@ -2748,16 +2735,7 @@ Preserve_snapshot_status encode_preserved_trx_bundle(
   std::copy(payload.begin(), payload.end(),
             bytes.begin() + kSnapshotHeaderLength);
 
-  /*
-    Authentication is computed over the final snapshot layout with mutable
-    authentication fields cleared. HMAC is written first, then CRC covers the
-    HMAC-bearing bytes with the CRC field zeroed.
-  */
-  std::array<unsigned char, kHmacLength> digest{};
-  if (hmac_sha256(context.hmac_key, bytes, &digest)) {
-    return Preserve_snapshot_status::IO_ERROR;
-  }
-  std::copy(digest.begin(), digest.end(), bytes.begin() + kHmacOffset);
+  /* CRC covers the complete product-v1 envelope with its own field cleared. */
   store_le32(&bytes, kCrcOffset, my_checksum(0, bytes.data(), bytes.size()));
 
   built.snapshot_bytes = std::move(bytes);
@@ -2796,27 +2774,10 @@ Preserve_snapshot_status decode_preserved_trx_snapshot_bytes(
 
   std::vector<unsigned char> crc_bytes = snapshot_bytes;
   const uint32_t stored_crc = read_le32(crc_bytes, kCrcOffset);
-  /*
-    Decode mirrors encode: first prove the cheap transport checksum over the
-    HMAC-bearing snapshot, then clear the HMAC field and verify the keyed digest
-    over the authenticated metadata and payload.
-  */
+  /* Decode mirrors encode and validates the complete product-v1 envelope. */
   std::fill(crc_bytes.begin() + kCrcOffset,
             crc_bytes.begin() + kCrcOffset + kCrcLength, 0);
   if (my_checksum(0, crc_bytes.data(), crc_bytes.size()) != stored_crc) {
-    return Preserve_snapshot_status::CORRUPT;
-  }
-
-  std::vector<unsigned char> hmac_bytes = crc_bytes;
-  std::fill(hmac_bytes.begin() + kHmacOffset,
-            hmac_bytes.begin() + kHmacOffset + kHmacLength, 0);
-  std::array<unsigned char, kHmacLength> expected_hmac{};
-  if (hmac_sha256(context.hmac_key, hmac_bytes, &expected_hmac)) {
-    return Preserve_snapshot_status::IO_ERROR;
-  }
-  if (CRYPTO_memcmp(expected_hmac.data(),
-                    snapshot_bytes.data() + kHmacOffset,
-                    expected_hmac.size()) != 0) {
     return Preserve_snapshot_status::CORRUPT;
   }
 
@@ -2863,23 +2824,7 @@ Preserve_snapshot_status decode_preserved_trx_snapshot_bytes(
                  &built.tlvs)) {
     return Preserve_snapshot_status::CORRUPT;
   }
-  if (format_version < 2 && find_tlv(built.tlvs, kTlvRecordLocks) != nullptr)
-    return Preserve_snapshot_status::CORRUPT;
-  if (format_version < 3 && find_tlv(built.tlvs, kTlvTableLocks) != nullptr)
-    return Preserve_snapshot_status::CORRUPT;
-  if (format_version < 4 && find_tlv(built.tlvs, kTlvPredicateLocks) != nullptr)
-    return Preserve_snapshot_status::CORRUPT;
-  if (format_version < 5 &&
-      find_tlv(built.tlvs, kTlvBinlogNoCacheMetadata) != nullptr)
-    return Preserve_snapshot_status::CORRUPT;
-  if (format_version < 6 &&
-      find_tlv(built.tlvs, kTlvTempTableManifest) != nullptr)
-    return Preserve_snapshot_status::CORRUPT;
-  if (format_version < 8 &&
-      find_tlv(built.tlvs, kTlvExternalBlobDescriptors) != nullptr)
-    return Preserve_snapshot_status::CORRUPT;
-  if (apply_bundle_semantics(&built.tlvs, &metadata, format_version < 4,
-                             format_version < 5, format_version < 3))
+  if (apply_bundle_semantics(&built.tlvs, &metadata, false, false, false))
     return Preserve_snapshot_status::CORRUPT;
 
   std::set<std::string> descriptor_names;

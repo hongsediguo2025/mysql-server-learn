@@ -1,6 +1,7 @@
 --perl
 use strict;
 use warnings;
+use File::Find;
 use File::Spec;
 
 # Lint-only source-shape guard; behavior coverage lives in targeted MTR/gunit
@@ -37,6 +38,12 @@ my $binlog_ostream_header_path = File::Spec->catfile(
   $source_root, 'sql', 'binlog_ostream.h');
 my $bundle_path = File::Spec->catfile($source_root, 'sql',
                                       'preserve_trx_bundle.cc');
+my $bundle_header_path = File::Spec->catfile($source_root, 'sql',
+                                             'preserve_trx_bundle.h');
+my $resurrection_index_path = File::Spec->catfile(
+  $source_root, 'sql', 'preserve_trx_resurrection_index.cc');
+my $resurrection_index_header_path = File::Spec->catfile(
+  $source_root, 'sql', 'preserve_trx_resurrection_index.h');
 my $lock_path = File::Spec->catfile($source_root, 'storage', 'innobase',
                                     'lock', 'lock0lock.cc');
 my $lock_preserve_path = File::Spec->catfile($source_root, 'storage',
@@ -108,6 +115,8 @@ my $promotion_path = File::Spec->catfile($source_root, 'sql',
                                          'preserve_trx_promotion.cc');
 my $promotion_header_path = File::Spec->catfile($source_root, 'sql',
                                                 'preserve_trx_promotion.h');
+my $promotion_prepared_path = File::Spec->catfile(
+  $source_root, 'sql', 'preserve_trx_promotion_prepared.cc');
 my $standby_transfer_doc_path = File::Spec->catfile(
   $source_root, 'design', 'preserve-resume-8.0.22-standby-transfer-design.md');
 
@@ -118,6 +127,9 @@ my $binlog_warmcopy = read_source($binlog_warmcopy_path);
 my $binlog_ostream = read_source($binlog_ostream_path);
 my $binlog_ostream_h = read_source($binlog_ostream_header_path);
 my $bundle = read_source($bundle_path);
+my $bundle_header = read_source($bundle_header_path);
+my $resurrection_index = read_source($resurrection_index_path);
+my $resurrection_index_header = read_source($resurrection_index_header_path);
 my $lock = read_source($lock_path);
 my $lock_preserve = read_source($lock_preserve_path);
 my $lock_header = read_source($lock_header_path);
@@ -155,6 +167,7 @@ my $transfer_header = read_source($transfer_header_path);
 my $sql_lock_warmcopy = read_source($sql_lock_warmcopy_path);
 my $promotion = read_source($promotion_path);
 my $promotion_header = read_source($promotion_header_path);
+my $promotion_prepared = read_source($promotion_prepared_path);
 my $standby_transfer_doc = read_optional_source($standby_transfer_doc_path);
 
 my ($trx_id_store_fact_capture) =
@@ -170,21 +183,76 @@ my ($simulated_publication_body) =
   or die "could not isolate simulated targeted publication\n";
 die "online targeted publication must not mutate startup-only found_prepared_trx\n"
   if $simulated_publication_body =~ /found_prepared_trx/s;
-die "standby transfer wire contract must keep v3 legacy and v4 strict versions distinct\n"
+die "standby transfer wire contract must expose one product v1 and no pre-product compatibility constant\n"
   unless $transfer_header =~
-           /kPreserveTrxTransferLegacyProtocolVersion\s*=\s*3/s &&
-         $transfer_header =~ /kPreserveTrxTransferProtocolVersion\s*=\s*4/s;
-die "standby transfer v4 COMMIT frame and epoch fact V3 must carry the complete TRX_SYS store proof\n"
+           /kPreserveTrxTransferProtocolVersion\s*=\s*1/s &&
+         $transfer_header !~ /kPreserveTrxTransferLegacyProtocolVersion/s;
+die "standby transfer v1 COMMIT frame and epoch fact must carry the complete TRX_SYS store proof\n"
   unless $transfer =~
            /append_u64\s*\(&out,\s*frame\.trx_id_store\.source_trx_id_store\)[\s\S]*source_trx_id_store_lsn[\s\S]*source_safe_next_trx_id_floor/s &&
-         $transfer =~ /PTRXFER_EPOCH_FACT_V3[\s\S]*source_trx_id_store=[\s\S]*source_trx_id_store_lsn=[\s\S]*source_safe_next_trx_id_floor=/s;
+         $transfer =~ /PTRXFER_EPOCH_FACT_V1[\s\S]*source_trx_id_store=[\s\S]*source_trx_id_store_lsn=[\s\S]*source_safe_next_trx_id_floor=/s;
 
-die "standby transfer portable bundle codec must not use a production hard-coded HMAC key\n"
-  if $transfer =~ /std::fill\s*\([^;]*hmac_key[^;]*0x74[^;]*\)/s;
-die "standby transfer portable bundle codec must not use a production hard-coded datadir fingerprint\n"
-  if $transfer =~ /std::fill\s*\([^;]*datadir_fingerprint[^;]*0x72[^;]*\)/s;
-die "standby transfer portable bundle codec must not use a production zero server uuid\n"
-  if $transfer =~ /server_uuid\s*=\s*"00000000-0000-0000-0000-000000000000"/s;
+die "snapshot product v1 must use its unique magic, version 1 and 520-byte header\n"
+  unless $bundle =~ /kSnapshotMagic\[\]\s*=\s*"PTRXSNP1"/s &&
+         $bundle =~ /kSnapshotFormatVersion\s*=\s*1/s &&
+         $bundle_header =~ /kPreservedTrxSnapshotHeaderLength\s*=\s*520/s;
+my ($prototype_file_cleanup) =
+  $carrier_file =~ /(Preserved_trx_carrier_support_status remove_stale_prototype_file\([\s\S]*?^})/m
+  or die "could not isolate stale prototype file cleanup\n";
+my ($prototype_key_cleanup) =
+  $carrier_file =~ /(Preserved_trx_carrier_support_status cleanup_stale_prototype_key_files\([\s\S]*?^})/m
+  or die "could not isolate stale prototype key cleanup\n";
+my $carrier_file_without_prototype_key_cleanup = $carrier_file;
+$carrier_file_without_prototype_key_cleanup =~
+  s/\Q$prototype_file_cleanup\E//;
+$carrier_file_without_prototype_key_cleanup =~
+  s/\Q$prototype_key_cleanup\E//;
+die "prototype key cleanup must only unlink exact stale files without reading their contents\n"
+  unless $prototype_file_cleanup =~ /path_is_symlink/s &&
+         $prototype_file_cleanup =~ /MY_S_ISREG/s &&
+         $prototype_file_cleanup =~ /my_delete/s &&
+         $prototype_file_cleanup !~ /\bmy_open\b|\bmy_read\b|\bmy_create\b/s &&
+         $prototype_key_cleanup =~ /"\.key"/s &&
+         $prototype_key_cleanup =~ /"\.key\.tmp"/s &&
+         $prototype_key_cleanup =~ /remove_stale_prototype_file/s;
+die "carrier startup support must remove stale prototype key files only after directory validation succeeds\n"
+  unless $carrier_file =~
+         /support_status_ready:[\s\S]*support_status\s*==\s*Preserved_trx_carrier_support_status::OK[\s\S]*cleanup_stale_prototype_key_files\s*\(\s*dir\s*\)/s;
+die "snapshot/carrier product v1 must not retain a Preserve HMAC or key context\n"
+  if $bundle =~ /\bHMAC\s*\(/s ||
+     $bundle_header =~ /hmac_key|kPreservedTrxHmac|kPreservedTrxKeyLength/s ||
+     $carrier_file_without_prototype_key_cleanup =~
+       /MSPKEY1|bound_key|ensure_key|read_key|create_key|\.key\.tmp/s;
+die "resurrection index product v1 must use a local identity and canonical digest\n"
+  unless $resurrection_index =~
+           /kResurrectionIndexMagic\[\]\s*=\s*\{'P',\s*'T',\s*'R',\s*'X',\s*'R',\s*'I',\s*'X',\s*'1'\}/s &&
+         $resurrection_index_header =~ /local_instance_identity/s &&
+         $resurrection_index !~ /\bHMAC\s*\(|source_server_uuid|target_server_uuid/s;
+die "provenance and snapshot identity product v1 must use canonical SHA-256 without a key\n"
+  unless $preserve =~ /PTRX_XID_PROVENANCE_PRODUCT_V1/s &&
+         $preserve =~ /PTRX_SNAPSHOT_IDENTITY_PRODUCT_V1/s &&
+         $preserve =~ /"sha256 "\s*\+\s*digest/s &&
+         $preserve !~ /preserve_trx_hmac_hex|preserve_trx_xid_codec_context/s;
+die "lock-plan and promotion intent contracts must use independent product-v1 domains\n"
+  unless $bundle_header =~
+           /kPreservedTrxLockPlanContractVersion\s*=\s*1/s &&
+         $sql_lock_warmcopy =~ /PRESERVE_LOCK_PLAN_LIVE_PRODUCT_V1/s &&
+         $promotion_prepared =~
+           /PTRX_STRICT_PROMOTION_INTENT_EPOCH_PRODUCT_V1/s &&
+         $promotion_prepared =~
+           /PTRX_STRICT_PROMOTION_ATTACH_INTENT_PRODUCT_V1/s &&
+         $promotion_prepared !~
+           /PTRX_STRICT_PROMOTION_INTENT_EPOCH_V2|PTRX_STRICT_PROMOTION_ATTACH_INTENT_V1/s;
+my ($decode_object_descriptor) =
+  $transfer =~ /(Preserve_trx_transfer_status decode_transfer_object_descriptor\([\s\S]*?^})/m
+  or die "could not isolate transfer object descriptor decoder\n";
+die "external object product-v1 decoder must reject descriptors without the lock-plan contract tail\n"
+  if $decode_object_descriptor =~
+     /if\s*\(\s*!reader\.eof\(\)\s*\)[\s\S]*lock_plan/s;
+die "standby transfer portable bundle codec must use a fixed product domain, not password or routing UUID derivation\n"
+  unless $transfer =~
+           /transfer_bundle_codec_context_from_config[\s\S]*datadir_fingerprint\.fill\(0\)[\s\S]*server_uuid\s*=\s*"preserve-transfer-product-v1"/s &&
+         $transfer !~ /preserve-trx-transfer-hmac-v1|preserve-trx-transfer-fingerprint-v1|digest_context_material/s;
 die "standby transfer commit marker publication must not truncate an existing temp file\n"
   if $transfer =~
      /write_commit_marker_file[\s\S]*my_create\s*\([^;]*O_WRONLY\s*\|\s*O_TRUNC[^;]*\)/s;
@@ -241,10 +309,10 @@ die "THD::release_resources must wait for preserve external THD pins before rele
 my ($receiver_payload_batch) =
   $transfer =~ /(Preserve_trx_transfer_status preserve_trx_transfer_handle_receiver_payload_batch\([\s\S]*?^})/m
   or die "could not isolate standby receiver encoded payload batch path\n";
-die "standby receiver encoded payload batch path must acknowledge written spool bytes before semantic apply\n"
+die "standby receiver encoded payload batch path must acknowledge sequence/digest admission before semantic apply\n"
   unless $receiver_payload_batch !~ /\(void\)\s*worker_count\s*;/ &&
          $receiver_payload_batch =~ /worker_count/s &&
-         $receiver_payload_batch =~ /pre_admit_receiver_batch_sequence[\s\S]*after_spool[\s\S]*preserve_trx_transfer_apply_receiver_frame_batch_with_workers/s &&
+         $receiver_payload_batch =~ /pre_admit_receiver_batch_sequence[\s\S]*after_admission[\s\S]*preserve_trx_transfer_apply_receiver_frame_batch_with_workers/s &&
          $receiver_payload_batch =~ /preserve_trx_transfer_apply_receiver_frame_batch_with_workers\(\s*frames,\s*(?:worker_count|written_metadata\s*==\s*nullptr\s*\?\s*worker_count\s*:\s*1)/s;
 my ($receiver_apply_frame) =
   $transfer =~ /(preserve_trx_transfer_apply_receiver_frame_internal\([\s\S]*?^}\n\nPreserve_trx_transfer_status preserve_trx_transfer_apply_receiver_frame\()/m
@@ -439,9 +507,9 @@ die "standby phase1 control frames must use batch source-session APIs\n"
 my ($receiver_dispatch_command) =
   $transfer =~ /(void preserve_trx_transfer_dispatch_command\(THD \*thd\)[\s\S]*?^}\n\nPreserve_snapshot_status Preserve_trx_local_carrier_artifact_sink::publish_bundle)/m
   or die "could not isolate standby receiver COM dispatch path\n";
-die "standby receiver single sequence frame must use the authenticated spool/apply ACK path\n"
+die "standby receiver single sequence frame must use the authenticated admission/apply ACK path\n"
   unless $receiver_dispatch_command =~
-     /receiver_frame_should_spool\s*\(\s*decoded_frame\.type\s*\)[\s\S]*preserve_trx_transfer_handle_receiver_payload_batch[\s\S]*send_receiver_spool_write_ack/s;
+     /receiver_frame_is_sequence_tracked\s*\(\s*decoded_frame\.type\s*\)[\s\S]*preserve_trx_transfer_handle_receiver_payload_batch[\s\S]*send_receiver_admission_ack/s;
 die "standby streaming transfer must abort phase1-declared tokens that are not in the final quiesced target set\n"
   unless $preserve =~ /abort_phase1_transfer_targets_not_quiesced/s;
 die "standby streaming transfer must re-sweep phase1 target declarations before object streaming\n"
@@ -1606,13 +1674,9 @@ die "recovered-count offset must not be duplicated in carrier\n"
 die "carrier recovered-count rewrite must use bundle-owned header offset\n"
   unless $carrier =~ /preserve_trx_bundle_recovered_count_offset\s*\(\s*\)/s;
 
-$carrier_file =~ /bool create_key[\s\S]*?^}/m
-  or die "could not isolate create_key\n";
-my $carrier_create_key = $&;
-die "carrier key tmp creation must use O_CREAT and O_EXCL\n"
-  unless $carrier_create_key =~ /my_create\s*\([^;]*O_CREAT[^;]*O_EXCL/s;
-die "carrier key tmp creation must reject preexisting tmp symlinks\n"
-  unless $carrier_create_key =~ /path_is_symlink\s*\(\s*tmp_path\s*\)/s;
+die "product-v1 carrier must not create, read, or authenticate with a local key file\n"
+  if $carrier_file_without_prototype_key_cleanup =~
+     /bool\s+create_key|MSPKEY1|bound_key|ensure_key|read_key|\.key\.tmp/s;
 
 $bundle =~ /Preserve_snapshot_status encode_preserved_trx_bundle[\s\S]*?^}/m
   or die "could not isolate encode_preserved_trx_bundle\n";
@@ -1798,8 +1862,9 @@ die "DRAIN service must route drain participant phases through DrainOrchestrator
   unless $drain_service_impl =~ /Preserve_trx_drain_orchestrator/s;
 die "DRAIN service must adapt warm-copy through DrainParticipant\n"
   unless $drain_service_impl =~ /Warmcopy_batch_drain_participant/s;
-die "DRAIN service must not directly open warm-copy epochs\n"
-  if $drain_service_impl =~ /\bopen_epoch\s*\(/s;
+die "DRAIN service must not directly open drain participant phase1\n"
+  if $drain_service_impl =~
+     /\b(?:warmcopy|lock_warmcopy|temp_table)_participant\s*->\s*(?:open_epoch|open_phase1)\s*\(/s;
 die "DRAIN service must not directly begin warm-copy closing\n"
   if $drain_service_impl =~ /\bbegin_closing\s*\(/s;
 die "DRAIN service must not directly prepare warm-copy payloads\n"
@@ -2331,16 +2396,12 @@ die "startup recovery stale tmp cleanup must use listing-derived tmp tokens to a
          $carrier_file =~ /listing->stale_tmp_tokens/s &&
          $preserve =~ /listing\.stale_tmp_tokens/s &&
          $preserve =~ /delete_stale_tmp_files_or_log[\s\S]*heavy_cleanup/s;
-my $bundle_doc_matches =
-  $bundle_doc eq '' ||
-  ($bundle_doc =~ /Format Version 8 and TLV Extensions/s &&
-   $bundle_doc =~ /0x81[\s\S]*kTlvExternalBlobDescriptors/s &&
-   $bundle_doc =~ /> 8/s);
-die "TLV registry source contract must keep the current writer format and multi-blob descriptor tag\n"
-  unless $bundle =~ /constexpr uint16_t kSnapshotFormatVersion\s*=\s*9\s*;/s &&
+die "TLV registry source contract must keep the product-v1 format and multi-blob descriptor tag\n"
+  unless $bundle =~ /constexpr uint16_t kMinReadableSnapshotFormatVersion\s*=\s*1\s*;/s &&
+         $bundle =~ /constexpr uint16_t kSnapshotFormatVersion\s*=\s*1\s*;/s &&
          $bundle =~ /constexpr uint16_t kTlvExternalBlobDescriptors\s*=\s*0x81\s*;/s &&
-         $bundle =~ /format_version\s*<\s*8[\s\S]*kTlvExternalBlobDescriptors/s &&
-         $bundle_doc_matches;
+         $bundle =~
+           /format_version\s*<\s*kMinReadableSnapshotFormatVersion[\s\S]*format_version\s*>\s*kSnapshotFormatVersion/s;
 die "SQL savepoint validator must bound binlog positions and event counters by snapshot metadata\n"
   unless $bundle =~
          /bool sql_savepoints_payload_is_valid[\s\S]*max_binlog_position[\s\S]*max_binlog_event_counter[\s\S]*binlog_position\s*>\s*max_binlog_position[\s\S]*checkpoint_event_counter\s*>\s*max_binlog_event_counter/s &&
@@ -2413,11 +2474,18 @@ $transfer =~
 my $transfer_artifact_decision = $&;
 die "standby-transfer artifact decision must require a configured source endpoint before entering STANDBY_TRANSFER_SAVE\n"
   unless $transfer_endpoint_ready =~
-         /preserve_trx_transfer_target_host[\s\S]*preserve_trx_transfer_target_port[\s\S]*preserve_trx_transfer_target_socket[\s\S]*preserve_trx_transfer_target_server_uuid[\s\S]*preserve_trx_transfer_target_user[\s\S]*preserve_trx_transfer_credential_name/s &&
+         /preserve_trx_transfer_target_host[\s\S]*preserve_trx_transfer_target_port[\s\S]*preserve_trx_transfer_target_socket[\s\S]*preserve_trx_transfer_target_user[\s\S]*preserve_trx_transfer_source_credential_ready/s &&
          $transfer_artifact_decision =~
          /preserve_trx_transfer_source_endpoint_ready\s*\(\s*\)[\s\S]*UNSUPPORTED[\s\S]*STANDBY_TRANSFER_SAVE/s &&
          $transfer =~
          /preserve_trx_transfer_make_configured_frame_sink[\s\S]*preserve_trx_transfer_source_endpoint_ready\s*\(\s*\)[\s\S]*UNSUPPORTED/s;
+die "online standby transfer must not expose source/target routing UUID sysvars\n"
+  if $sys_vars =~
+         /preserve_trx_transfer_(?:allowed_source_uuid|target_server_uuid)/s ||
+     $transfer =~
+         /preserve_trx_transfer_(?:allowed_source_uuid|target_server_uuid)/s ||
+     $transfer_header =~
+         /preserve_trx_transfer_(?:allowed_source_uuid|target_server_uuid)/s;
 $transfer =~
   /Preserve_trx_transfer_artifact_decision\s+preserve_trx_transfer_artifact_decision_for_request[\s\S]*?^}/m
   or die "could not isolate preserve_trx_transfer_artifact_decision_for_request\n";
@@ -2477,14 +2545,16 @@ die "standby transfer staged-token publish must not re-seal already sealed objec
 die "standby transfer COMMIT_EPOCH final metadata failures must log the finalize substage\n"
   unless $transfer_commit_epoch_branch =~
          /standby transfer receiver commit epoch finalize failed[\s\S]*transfer_status_name\s*\(\s*status\s*\)/s;
-die "standby transfer production source client must resolve credential-name before opening a socket\n"
+die "standby transfer source must freeze one credential snapshot before creating the network sink\n"
   unless $transfer =~
-         /default_transfer_client_connect[\s\S]*resolve_transfer_credential[\s\S]*mysql_real_connect/s &&
+         /preserve_trx_transfer_make_configured_frame_sink[\s\S]*snapshot_transfer_epoch_credential[\s\S]*Preserve_trx_transfer_client_frame_sink/s &&
+         $gunit =~ /CredentialSnapshotPinsPasswordAcrossReplacementAndReconnect/s &&
          $gunit =~ /ConfiguredFrameSinkDefaultClientUsesCredentialStore/s;
-die "standby transfer TCP client must use the server CA and verify peer identity\n"
-  unless $transfer =~
-         /default_transfer_client_connect[\s\S]*MYSQL_OPT_PROTOCOL[\s\S]*Ssl_mysql_main_status::get_ssl_ca_and_capath[\s\S]*MYSQL_OPT_SSL_CA[\s\S]*MYSQL_OPT_SSL_CAPATH[\s\S]*SSL_MODE_VERIFY_IDENTITY[\s\S]*mysql_real_connect[\s\S]*mysql_get_ssl_cipher/s &&
-         $transfer =~ /has_tcp_target\s*!=\s*has_socket_target/s;
+die "standby transfer client must preserve TCP/socket endpoint exclusivity\n"
+  unless $transfer =~ /has_tcp_target\s*!=\s*has_socket_target/s;
+die "standby transfer must not impose a Preserve-specific TLS policy\n"
+  if $transfer =~
+       /Ssl_mysql_main_status::get_ssl_ca_and_capath|MYSQL_OPT_SSL_CA|MYSQL_OPT_SSL_CAPATH|SSL_MODE_VERIFY_IDENTITY|mysql_get_ssl_cipher/s;
 die "standby transfer credential file must be opened and validated without following links\n"
   unless $transfer =~
          /read_transfer_credential_secret_file[\s\S]*O_CLOEXEC[\s\S]*O_NOFOLLOW[\s\S]*O_NONBLOCK[\s\S]*my_fstat[\s\S]*transfer_credential_file_metadata_is_secure/s;
@@ -2494,19 +2564,20 @@ die "standby transfer credential buffers must be cleansed after use\n"
 die "standby transfer production source client must send frames through COM_PRESERVE_TRX_TRANSFER\n"
   unless $transfer =~
          /default_transfer_client_send[\s\S]*simple_command[\s\S]*COM_PRESERVE_TRX_TRANSFER/s;
-die "standby transfer production source epochs must include a per-start incarnation\n"
-  unless $preserve =~ /preserve_trx_transfer_qualify_epoch_id/s &&
-         $transfer =~ /my_rand_buffer[\s\S]*transfer_source_incarnation_id/s;
-die "standby transfer default client must verify the authenticated receiver ACK\n"
+die "standby transfer production source epochs must include a per-start boot nonce\n"
+  unless $preserve =~ /preserve_trx_transfer_make_epoch_id/s &&
+         $transfer =~ /my_rand_buffer[\s\S]*transfer_source_epoch_boot_nonce/s;
+die "standby transfer default client must verify receiver ACK identity and control integrity\n"
   unless $transfer =~
          /default_transfer_client_send[\s\S]*preserve_trx_transfer_verify_frame_ack/s &&
-         $transfer =~ /HMAC\s*\([\s\S]*EVP_sha256/s;
+         $transfer =~
+         /preserve_trx_transfer_verify_frame_ack[\s\S]*receiver_process_nonce[\s\S]*frame_digest[\s\S]*my_checksum/s;
 die "standby transfer source must pin an unconfirmed payload until its exact ACK arrives\n"
   unless $transfer =~
          /m_uncertain_payloads\s*\[\s*connection_index\s*\][\s\S]*uncertain_payload\s*!=\s*encoded_frame[\s\S]*ACK_UNCERTAIN/s;
-die "standby transfer receiver must validate source incarnation and batch order before creating store side effects\n"
+die "standby transfer receiver must validate process nonce, principal, and batch order before creating store side effects\n"
   unless $receiver_dispatch_command =~
-         /preserve_trx_transfer_validate_online_payload_identity[\s\S]*create_preserved_trx_process_local_store/s;
+         /preserve_trx_transfer_validate_online_payload_identity[\s\S]*validate_online_epoch[\s\S]*create_preserved_trx_process_local_store/s;
 die "standby transfer receiver dispatch must not use the crash-durable local preserve store\n"
   if $receiver_dispatch_command =~ /create_preserved_trx_default_store/s;
 die "standby transfer receiver retries must bind sequence admission to frame digest\n"
@@ -2520,11 +2591,10 @@ die "standby transfer batch decoder must validate count against remaining bytes 
          /preserve_trx_transfer_decode_manifest[\s\S]*kMinEncodedObjectBytes[\s\S]*acquire_transfer_decode_memory_lease[\s\S]*reserve\s*\(\s*object_count\s*\)/s;
 die "standby transfer online handler must retain aggregate decoded payload accounting through apply and ACK\n"
   unless $receiver_payload_batch =~
-         /payload_lease[\s\S]*after_spool[\s\S]*preserve_trx_transfer_apply_receiver_frame_batch_with_workers/s;
-die "standby transfer unconfirmed short-write rollback must taint sequence admission\n"
-  unless $transfer =~
-         /rollback_confirmed[\s\S]*Preserve_trx_transfer_status::CORRUPT/s &&
-         $transfer =~ /mark_frame_sequence_corrupt/s;
+         /payload_lease[\s\S]*after_admission[\s\S]*preserve_trx_transfer_apply_receiver_frame_batch_with_workers/s;
+die "standby transfer online receiver must not persist or replay raw frame spool files\n"
+  if $transfer =~
+     /receiver\.frames|append_receiver_frame_spool|Receiver_frame_spool_disable_guard/s;
 die "standby transfer online SEAL must keep external objects epoch-scoped instead of flat-token preinstall\n"
   if $transfer =~
      /case\s+Preserve_trx_transfer_frame_type::SEAL_OBJECT:[\s\S]*?install_receiver_sealed_external_object[\s\S]*?break\s*;/s;
@@ -2573,7 +2643,7 @@ die "standby transfer multi-session receiver must serialize process-local sequen
              /preserve_trx_transfer_handle_receiver_payload_batch[\s\S]*begin_payload_sequence[\s\S]*end_payload_sequence[\s\S]*pre_admit_receiver_batch_sequence[\s\S]*preserve_trx_transfer_apply_receiver_frame_batch_with_workers/s;
 die "standby transfer receiver must register same-token apply order before releasing sequence admission and wait only after ACK\n"
   unless $receiver_payload_batch =~
-         /pre_admit_receiver_batch_sequence[\s\S]*reserve_payload_apply[\s\S]*payload_sequence_guard\.rollback[\s\S]*after_spool[\s\S]*wait_for_payload_apply_turn[\s\S]*preserve_trx_transfer_apply_receiver_frame_batch_with_workers/s;
+         /pre_admit_receiver_batch_sequence[\s\S]*reserve_payload_apply[\s\S]*payload_sequence_guard\.rollback[\s\S]*after_admission[\s\S]*wait_for_payload_apply_turn[\s\S]*preserve_trx_transfer_apply_receiver_frame_batch_with_workers/s;
 die "standby transfer wire compatibility must retain the legacy promotion frame identifiers\n"
   unless $transfer_header =~ /PROMOTION_PREWARM_TOKEN/s &&
          $transfer_header =~ /PROMOTION_GATE_EPOCH/s;
@@ -2604,15 +2674,14 @@ die "standby transfer SEAL_OBJECT must verify object digest with streaming IO, n
   unless $transfer =~ /sha256_digest_file_streaming/s &&
          $transfer_seal_staged_object =~ /sha256_digest_file_streaming/s &&
          $transfer_seal_staged_object !~ /read_whole_file/s;
-die "standby promotion transfer must emit v4 while decoding legacy v3\n"
+die "standby promotion transfer must emit and decode only product v1\n"
   unless $transfer_header =~
-         /kPreserveTrxTransferLegacyProtocolVersion\s*=\s*3\s*;/s &&
-         $transfer_header =~
-         /kPreserveTrxTransferProtocolVersion\s*=\s*4\s*;/s &&
+         /kPreserveTrxTransferProtocolVersion\s*=\s*1\s*;/s &&
+         $transfer_header !~ /kPreserveTrxTransferLegacyProtocolVersion/s &&
          $transfer_header =~ /source_prepare_lsn/s &&
          $transfer_header =~ /source_epoch_commit_lsn/s &&
          $transfer =~
-         /transfer_protocol_version_is_decodable[\s\S]*kPreserveTrxTransferLegacyProtocolVersion[\s\S]*kPreserveTrxTransferProtocolVersion/s;
+         /transfer_protocol_version_is_decodable[\s\S]*return\s+version\s*==\s*kPreserveTrxTransferProtocolVersion/s;
 die "standby promotion Phase A must expose a single promotion adopt entry point\n"
   unless $promotion =~
          /preserved_trx_adopt_standby_pending_all_for_promotion/s;
@@ -3030,6 +3099,73 @@ die "Preserve command identity must keep the OFF path ahead of clock, THD lock, 
          $marker_lock > $marker_clock &&
          $marker_sequence > $marker_lock &&
          $marker_started > $marker_lock;
+my ($handoff_resolution_cc_refs, $handoff_resolution_header_refs,
+    $ha_capability_factory_definitions) = (0, 0, 0);
+find(
+  {
+    no_chdir => 1,
+    wanted => sub {
+      return unless -f $_ && /\.(?:cc|cpp|cxx|h|hpp)$/;
+      my $source = read_source($File::Find::name);
+      my $refs =
+          () = $source =~ /\bpreserved_trx_resolve_handoff_unknown\b/g;
+      if (/\.(?:cc|cpp|cxx)$/) {
+        $handoff_resolution_cc_refs += $refs;
+      } else {
+        $handoff_resolution_header_refs += $refs;
+      }
+      $ha_capability_factory_definitions += () =
+          $source =~
+          /Preserve_trx_ha_control_capability\s+preserve_trx_transfer_make_ha_control_capability_for_unit_test\s*\([^\)]*\)\s*\{/g;
+    },
+  },
+  map { File::Spec->catdir($source_root, $_) }
+      qw(sql storage plugin components router));
+die "HA handoff resolution must have one production definition, two header declarations, and no production caller before the HA provider is integrated\n"
+  unless $handoff_resolution_cc_refs == 1 &&
+         $handoff_resolution_header_refs == 2;
+die "the unit-test HA capability factory must not have a production definition\n"
+  unless $ha_capability_factory_definitions == 0;
+die "the unit-test HA capability factory must not be linked into production code\n"
+  if $transfer =~
+     /\bpreserve_trx_transfer_make_ha_control_capability_for_unit_test\b/;
+$preserve =~
+  /Preserve_trx_transfer_status\s+preserved_trx_resolve_handoff_unknown\s*\([\s\S]*?^}/m
+  or die "could not isolate HA handoff resolution core\n";
+my $handoff_resolution_core = $&;
+die "HA handoff resolution must reuse the existing proof latch and drain ownership state\n"
+  unless $handoff_resolution_core =~ /handoff_resolution\.begin/s &&
+         $handoff_resolution_core =~ /begin_source_restore/s &&
+         $handoff_resolution_core =~ /complete_source_restore/s &&
+         $handoff_resolution_core =~ /acknowledge_commit/s;
+my $resolution_ready_check =
+    index($handoff_resolution_core, 'handoff_resolution_ready.load');
+my $resolution_begin =
+    index($handoff_resolution_core, 'handoff_resolution.begin');
+die "HA handoff resolution must wait until quarantine publication and drain teardown are complete\n"
+  unless $resolution_ready_check >= 0 &&
+         $resolution_begin > $resolution_ready_check;
+die "source-owns handoff resolution must restore through the guarded batch restore entry\n"
+  unless $handoff_resolution_core =~
+         /restore_preserved_batch_items_to_original_thds/s;
+$preserve =~
+  /bool\s+Preserve_trx_drain_ownership_state::resolve_not_committed_clean\s*\(\)\s*\{([\s\S]*?)^}/m
+  or die "could not isolate NOT_COMMITTED_CLEAN source ownership claim\n";
+my $not_committed_clean_claim = $&;
+die "NOT_COMMITTED_CLEAN must claim SOURCE_RESTORE_PENDING before guarded restore, not expose RUNNING to RESET\n"
+  unless $not_committed_clean_claim =~ /SOURCE_RESTORE_PENDING/s &&
+         $not_committed_clean_claim !~ /Preserve_trx_drain_terminal::RUNNING/s;
+die "online NOT_COMMITTED_CLEAN restore must publish SOURCE_RESTORED only after guarded restore succeeds\n"
+  unless $preserve =~
+         /standby_transfer_not_committed_clean_restore_failed[\s\S]{0,500}complete_source_restore\(\)[\s\S]{0,300}standby_transfer_not_committed_clean_state_failed/s;
+my $unknown_finalize =
+    index($preserve,
+          'finalize_drain_participants("standby_transfer_commit_unknown")');
+my $resolution_ready_publish =
+    index($preserve, 'handoff_resolution_ready.store');
+die "COMMIT_UNKNOWN must publish HA resolution readiness only after source drain teardown\n"
+  unless $unknown_finalize >= 0 &&
+         $resolution_ready_publish > $unknown_finalize;
 EOF
 
 SELECT 'ok' AS code_review_resumable_trx_slices_lint;

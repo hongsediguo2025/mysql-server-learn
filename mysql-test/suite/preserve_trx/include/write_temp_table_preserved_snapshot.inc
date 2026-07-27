@@ -2,7 +2,7 @@
 use strict;
 use warnings;
 use Compress::Zlib qw(crc32);
-use Digest::SHA qw(hmac_sha256 sha256);
+use Digest::SHA qw(sha256);
 use File::Basename qw(dirname);
 use File::Path qw(make_path);
 use File::Spec;
@@ -58,23 +58,6 @@ my $normalized_datadir = $datadir;
 $normalized_datadir .= '/' unless $normalized_datadir =~ m{/$};
 my $preserve_dir = $normalized_datadir . 'preserve';
 make_path($preserve_dir, {mode => 0700}) unless -d $preserve_dir;
-
-my $key_path = File::Spec->catfile($preserve_dir, '.key');
-my $key;
-if (-e $key_path) {
-  open(my $kh, '<:raw', $key_path) or die "cannot read $key_path: $!";
-  local $/;
-  $key = <$kh>;
-  close($kh);
-  $key = substr($key, -32) if length($key) == 110;
-  die "bad preserve key length" unless length($key) == 32;
-} else {
-  $key = pack('C*', 1 .. 32);
-  open(my $kh, '>:raw', $key_path) or die "cannot write $key_path: $!";
-  print {$kh} $key;
-  close($kh);
-  chmod 0600, $key_path or die "cannot chmod $key_path: $!";
-}
 
 sub le16 { return pack('v', $_[0]); }
 sub le32 { return pack('V', $_[0]); }
@@ -244,10 +227,10 @@ my $payload =
   tlv(0x61, $no_cache_metadata) .
   tlv(0x80, $manifest);
 
-my $header_len = 552;
+my $header_len = 520;
 my $snapshot = "\0" x ($header_len + length($payload));
-substr($snapshot, 0, 8) = 'MSP_PRES';
-substr($snapshot, 8, 2) = le16(9);
+substr($snapshot, 0, 8) = 'PTRXSNP1';
+substr($snapshot, 8, 2) = le16(1);
 substr($snapshot, 10, 2) = le16($header_len);
 substr($snapshot, 12, 4) = le32($mysql_version_id);
 substr($snapshot, 16, 4) = le32(0);
@@ -271,10 +254,8 @@ substr($snapshot, 324, 128) = fixed_field('localhost', 128);
 substr($snapshot, 452, 64) = fixed_field('test', 64);
 substr($snapshot, $header_len, length($payload)) = $payload;
 
-substr($snapshot, 516, 32) = "\0" x 32;
-substr($snapshot, 548, 4) = "\0" x 4;
-substr($snapshot, 516, 32) = hmac_sha256($snapshot, $key);
-substr($snapshot, 548, 4) = le32(crc32($snapshot));
+substr($snapshot, 516, 4) = "\0" x 4;
+substr($snapshot, 516, 4) = le32(crc32($snapshot));
 
 open(my $sh, '>:raw', File::Spec->catfile($preserve_dir, "$token.bin"))
   or die "cannot write snapshot: $!";
@@ -282,14 +263,14 @@ print {$sh} $snapshot;
 close($sh);
 
 my $identity =
-  "PTRX_SNAPSHOT_IDENTITY_V1\n" .
+  "PTRX_SNAPSHOT_IDENTITY_PRODUCT_V1\n" .
   length($token) . ":$token\n" .
   length('root') . ":root\n" .
   length('localhost') . ":localhost\n" .
   "$created_at\n" .
   ($created_at + 300 * 1000000) . "\n" .
   "2\n0\n1\n0\n";
-my $identity_digest = unpack('H*', hmac_sha256($identity, $key));
+my $identity_digest = unpack('H*', sha256($identity));
 my $generation = substr(unpack('H*', sha256("test-generation:$token")), 0, 32);
 my $ledger_path = File::Spec->catfile($preserve_dir, '.xid_provenance');
 my %provenance;
@@ -297,8 +278,8 @@ if (-e $ledger_path) {
   open(my $lh, '<:raw', $ledger_path) or die "cannot read $ledger_path: $!";
   while (my $line = <$lh>) {
     chomp($line);
-    next if $line eq 'PTRX_XID_PROVENANCE_LEDGER_V1' ||
-            $line =~ /^hmac / || $line eq '';
+    next if $line eq 'PTRX_XID_PROVENANCE_PRODUCT_V1' ||
+            $line =~ /^sha256 / || $line eq '';
     $line =~ /^(\S+) B ([0-9a-f]{32}) ([0-9a-f]{64})$/
       or die "invalid existing provenance record: $line";
     $provenance{$1} = [$2, $3];
@@ -306,13 +287,13 @@ if (-e $ledger_path) {
   close($lh);
 }
 $provenance{$token} = [$generation, $identity_digest];
-my $ledger_body = "PTRX_XID_PROVENANCE_LEDGER_V1\n";
+my $ledger_body = "PTRX_XID_PROVENANCE_PRODUCT_V1\n";
 for my $ledger_token (sort keys %provenance) {
   $ledger_body .= "$ledger_token B $provenance{$ledger_token}[0] " .
                   "$provenance{$ledger_token}[1]\n";
 }
-my $ledger_hmac = unpack('H*', hmac_sha256($ledger_body, $key));
+my $ledger_digest = unpack('H*', sha256($ledger_body));
 open(my $lh, '>:raw', $ledger_path) or die "cannot write $ledger_path: $!";
-print {$lh} $ledger_body, "hmac $ledger_hmac\n";
+print {$lh} $ledger_body, "sha256 $ledger_digest\n";
 close($lh);
 EOF

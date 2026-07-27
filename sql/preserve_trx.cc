@@ -50,7 +50,6 @@
 #include <vector>
 
 #include <openssl/crypto.h>
-#include <openssl/hmac.h>
 #include <openssl/sha.h>
 
 #include "mem_root_deque.h"
@@ -239,6 +238,111 @@ std::string preserved_trx_redacted_token(const std::string &token) {
   const size_t suffix_length = std::min<size_t>(4, token.length());
   redacted.append(token, token.length() - suffix_length, suffix_length);
   return redacted;
+}
+
+Preserve_trx_drain_terminal Preserve_trx_drain_ownership_state::state() const {
+  return m_state.load(std::memory_order_acquire);
+}
+
+bool Preserve_trx_drain_ownership_state::request_reset() {
+  Preserve_trx_drain_terminal expected =
+      Preserve_trx_drain_terminal::RUNNING;
+  return m_state.compare_exchange_strong(
+      expected, Preserve_trx_drain_terminal::RESET_REQUESTED);
+}
+
+bool Preserve_trx_drain_ownership_state::begin_commit_send() {
+  Preserve_trx_drain_terminal expected =
+      Preserve_trx_drain_terminal::RUNNING;
+  if (m_state.compare_exchange_strong(
+          expected,
+          Preserve_trx_drain_terminal::FINAL_METADATA_ACCEPTED_LOCAL)) {
+    expected = Preserve_trx_drain_terminal::FINAL_METADATA_ACCEPTED_LOCAL;
+  } else if (expected == Preserve_trx_drain_terminal::HANDOFF_PENDING) {
+    return true;
+  } else if (expected !=
+             Preserve_trx_drain_terminal::FINAL_METADATA_ACCEPTED_LOCAL) {
+    return false;
+  }
+  return m_state.compare_exchange_strong(
+             expected, Preserve_trx_drain_terminal::HANDOFF_PENDING) ||
+         expected == Preserve_trx_drain_terminal::HANDOFF_PENDING;
+}
+
+bool Preserve_trx_drain_ownership_state::mark_commit_unknown() {
+  Preserve_trx_drain_terminal expected =
+      Preserve_trx_drain_terminal::HANDOFF_PENDING;
+  return m_state.compare_exchange_strong(
+             expected, Preserve_trx_drain_terminal::COMMIT_UNKNOWN) ||
+         expected == Preserve_trx_drain_terminal::COMMIT_UNKNOWN;
+}
+
+bool Preserve_trx_drain_ownership_state::resolve_not_committed_clean() {
+  Preserve_trx_drain_terminal expected =
+      Preserve_trx_drain_terminal::HANDOFF_PENDING;
+  if (m_state.compare_exchange_strong(
+          expected, Preserve_trx_drain_terminal::SOURCE_RESTORE_PENDING)) {
+    return true;
+  }
+  if (expected == Preserve_trx_drain_terminal::COMMIT_UNKNOWN) {
+    return m_state.compare_exchange_strong(
+               expected,
+               Preserve_trx_drain_terminal::SOURCE_RESTORE_PENDING) ||
+           expected ==
+               Preserve_trx_drain_terminal::SOURCE_RESTORE_PENDING;
+  }
+  return expected == Preserve_trx_drain_terminal::SOURCE_RESTORE_PENDING;
+}
+
+bool Preserve_trx_drain_ownership_state::begin_source_restore() {
+  return resolve_not_committed_clean();
+}
+
+bool Preserve_trx_drain_ownership_state::complete_source_restore() {
+  Preserve_trx_drain_terminal expected =
+      Preserve_trx_drain_terminal::SOURCE_RESTORE_PENDING;
+  return m_state.compare_exchange_strong(
+             expected, Preserve_trx_drain_terminal::SOURCE_RESTORED) ||
+         expected == Preserve_trx_drain_terminal::SOURCE_RESTORED;
+}
+
+bool Preserve_trx_drain_ownership_state::acknowledge_commit() {
+  Preserve_trx_drain_terminal expected =
+      Preserve_trx_drain_terminal::HANDOFF_PENDING;
+  if (m_state.compare_exchange_strong(
+          expected, Preserve_trx_drain_terminal::SHUTDOWN_HANDOFF)) {
+    return true;
+  }
+  if (expected == Preserve_trx_drain_terminal::COMMIT_UNKNOWN) {
+    return m_state.compare_exchange_strong(
+               expected, Preserve_trx_drain_terminal::SHUTDOWN_HANDOFF) ||
+           expected == Preserve_trx_drain_terminal::SHUTDOWN_HANDOFF;
+  }
+  return expected == Preserve_trx_drain_terminal::SHUTDOWN_HANDOFF;
+}
+
+bool Preserve_trx_drain_ownership_state::shutdown_without_commit() {
+  Preserve_trx_drain_terminal expected =
+      Preserve_trx_drain_terminal::RUNNING;
+  return m_state.compare_exchange_strong(
+             expected, Preserve_trx_drain_terminal::SHUTDOWN_HANDOFF) ||
+         expected == Preserve_trx_drain_terminal::SHUTDOWN_HANDOFF;
+}
+
+bool Preserve_trx_drain_ownership_state::restore_allowed() const {
+  switch (state()) {
+    case Preserve_trx_drain_terminal::RUNNING:
+    case Preserve_trx_drain_terminal::FINAL_METADATA_ACCEPTED_LOCAL:
+    case Preserve_trx_drain_terminal::SOURCE_RESTORE_PENDING:
+    case Preserve_trx_drain_terminal::RESET_REQUESTED:
+      return true;
+    case Preserve_trx_drain_terminal::HANDOFF_PENDING:
+    case Preserve_trx_drain_terminal::COMMIT_UNKNOWN:
+    case Preserve_trx_drain_terminal::SOURCE_RESTORED:
+    case Preserve_trx_drain_terminal::SHUTDOWN_HANDOFF:
+      return false;
+  }
+  return false;
 }
 
 namespace {
@@ -551,7 +655,7 @@ constexpr char kPreservedTrxRecoveryAttemptLedgerMagic[] =
 constexpr char kPreservedTrxXidProvenanceLedgerFilename[] =
     ".xid_provenance";
 constexpr char kPreservedTrxXidProvenanceLedgerMagic[] =
-    "PTRX_XID_PROVENANCE_LEDGER_V1";
+    "PTRX_XID_PROVENANCE_PRODUCT_V1";
 
 void preserve_trx_warmcopy_reset_status() {
   g_warmcopy_prefix_bytes.store(0);
@@ -745,10 +849,11 @@ Preserved_trx_manager_state_publication_probe
     g_manager_state_publication_probe{nullptr};
 void *g_manager_state_publication_probe_arg{nullptr};
 
-enum class Preserve_trx_drain_terminal : uint8_t {
-  RUNNING,
-  RESET_REQUESTED,
-  SHUTDOWN_HANDOFF
+struct Preserve_trx_batch_item {
+  my_thread_id original_thread_id{0};
+  std::string token;
+  bool logged_binlog_cache{false};
+  std::unique_ptr<Preserve_trx_source_rollback_image> source_rollback_image;
 };
 
 struct Preserve_trx_drain_attempt {
@@ -759,17 +864,23 @@ struct Preserve_trx_drain_attempt {
 
   ulonglong generation{0};
   my_thread_id owner_thread_id{0};
-  std::atomic<Preserve_trx_drain_terminal> terminal{
-      Preserve_trx_drain_terminal::RUNNING};
+  Preserve_trx_drain_ownership_state ownership;
   std::atomic<bool> closing_command_gate_published{false};
   std::atomic<bool> all_transactions_runnable{false};
   std::atomic<bool> reset_failed{false};
   std::mutex sink_mutex;
   Preserve_trx_transfer_encoded_frame_sink *sink{nullptr};
+  std::mutex quarantine_mutex;
+  std::vector<Preserve_trx_batch_item> quarantined_items;
+  std::set<std::string> quarantined_source_warmcopy_ids;
+  uint64_t quarantine_started_monotonic_us{0};
+  std::atomic<bool> handoff_resolution_ready{false};
+  Preserve_trx_handoff_resolution_state handoff_resolution;
 };
 
 std::mutex g_active_drain_attempt_mutex;
 std::shared_ptr<Preserve_trx_drain_attempt> g_active_drain_attempt;
+std::shared_ptr<Preserve_trx_drain_attempt> g_last_resolved_drain_attempt;
 
 void preserve_trx_notify_manager_state_published_for_unit_test() {
   Preserved_trx_manager_state_publication_probe probe =
@@ -856,8 +967,7 @@ bool preserve_trx_register_active_drain_sink(
     Preserve_trx_transfer_encoded_frame_sink *sink) {
   if (attempt == nullptr || sink == nullptr) return false;
   std::lock_guard<std::mutex> lock(attempt->sink_mutex);
-  if (attempt->terminal.load(std::memory_order_acquire) !=
-      Preserve_trx_drain_terminal::RUNNING) {
+  if (attempt->ownership.state() != Preserve_trx_drain_terminal::RUNNING) {
     sink->request_cancel();
     return false;
   }
@@ -876,7 +986,7 @@ void preserve_trx_unregister_active_drain_sink(
 bool preserve_trx_active_drain_reset_requested(
     const std::shared_ptr<Preserve_trx_drain_attempt> &attempt) {
   return attempt != nullptr &&
-         attempt->terminal.load(std::memory_order_acquire) ==
+         attempt->ownership.state() ==
              Preserve_trx_drain_terminal::RESET_REQUESTED;
 }
 
@@ -906,14 +1016,13 @@ Preserve_trx_reset_drain_result preserve_trx_request_active_drain_reset(
   }
 
   Preserve_trx_reset_drain_result result;
-  Preserve_trx_drain_terminal expected = Preserve_trx_drain_terminal::RUNNING;
-  if (attempt->terminal.compare_exchange_strong(
-          expected, Preserve_trx_drain_terminal::RESET_REQUESTED)) {
+  if (attempt->ownership.request_reset()) {
     result = Preserve_trx_reset_drain_result::RESET_WON;
     if (!preserve_trx_publish_reset_cleanup(*attempt))
       return Preserve_trx_reset_drain_result::UNSUPPORTED;
     g_reset_drain_wins.fetch_add(1);
-  } else if (expected == Preserve_trx_drain_terminal::RESET_REQUESTED) {
+  } else if (attempt->ownership.state() ==
+             Preserve_trx_drain_terminal::RESET_REQUESTED) {
     result = Preserve_trx_reset_drain_result::RESET_JOINED;
   } else {
     g_reset_drain_too_late.fetch_add(1);
@@ -934,14 +1043,26 @@ Preserve_trx_reset_drain_result preserve_trx_request_active_drain_reset(
 bool preserve_trx_try_active_drain_shutdown_handoff(
     Preserve_trx_drain_attempt *attempt) {
   if (attempt == nullptr) return false;
-  Preserve_trx_drain_terminal expected = Preserve_trx_drain_terminal::RUNNING;
-  return attempt->terminal.compare_exchange_strong(
-      expected, Preserve_trx_drain_terminal::SHUTDOWN_HANDOFF);
+  return attempt->ownership.shutdown_without_commit();
+}
+
+bool preserve_trx_active_drain_before_commit_send(void *context) {
+  auto *attempt = static_cast<Preserve_trx_drain_attempt *>(context);
+  if (attempt == nullptr) return false;
+  const Preserve_trx_drain_terminal before = attempt->ownership.state();
+  if (!attempt->ownership.begin_commit_send()) return false;
+  if (before != Preserve_trx_drain_terminal::HANDOFF_PENDING) {
+    preserve_trx_transfer_note_source_handoff_pending();
+  }
+  return true;
 }
 
 bool preserve_trx_active_drain_final_ack_arbiter(void *context) {
-  return preserve_trx_try_active_drain_shutdown_handoff(
-      static_cast<Preserve_trx_drain_attempt *>(context));
+  auto *attempt = static_cast<Preserve_trx_drain_attempt *>(context);
+  if (attempt == nullptr || !attempt->ownership.acknowledge_commit())
+    return false;
+  preserve_trx_transfer_note_source_handoff_committed();
+  return true;
 }
 
 /*
@@ -993,7 +1114,7 @@ static bool preserved_trx_promotion_keys_match(
     const Preserve_trx_prepared_token_key &lhs,
     const Preserve_trx_prepared_token_key &rhs) {
   return lhs.preserve_dir == rhs.preserve_dir &&
-         lhs.source_uuid == rhs.source_uuid && lhs.epoch_id == rhs.epoch_id &&
+         lhs.epoch_scope == rhs.epoch_scope && lhs.epoch_id == rhs.epoch_id &&
          lhs.token == rhs.token &&
          lhs.target_boot_incarnation == rhs.target_boot_incarnation &&
          lhs.generation == rhs.generation;
@@ -1003,13 +1124,6 @@ struct Preserve_batch_account_count {
   std::string user;
   std::string host;
   uint count{0};
-};
-
-struct Preserve_trx_batch_item {
-  my_thread_id original_thread_id{0};
-  std::string token;
-  bool logged_binlog_cache{false};
-  std::unique_ptr<Preserve_trx_source_rollback_image> source_rollback_image;
 };
 
 struct Pending_token_delivery {
@@ -1605,7 +1719,7 @@ bool preserved_trx_add_record(const Preserve_snapshot_metadata &metadata,
   if (promotion_key != nullptr) {
     if (promotion_key->token != metadata.token ||
         promotion_key->preserve_dir.empty() ||
-        promotion_key->source_uuid.empty() || promotion_key->epoch_id.empty() ||
+        promotion_key->epoch_scope.empty() || promotion_key->epoch_id.empty() ||
         promotion_key->target_boot_incarnation.empty() ||
         promotion_key->generation == 0) {
       return true;
@@ -2036,10 +2150,6 @@ std::shared_ptr<const Preserve_trx_xid_provenance_map>
     g_preserve_trx_xid_provenance =
         std::make_shared<const Preserve_trx_xid_provenance_map>();
 
-bool preserve_trx_xid_codec_context(
-    Preserved_trx_codec_context_purpose purpose,
-    Preserved_trx_codec_context *context);
-
 static std::string preserve_trx_hex(const unsigned char *bytes, size_t length) {
   static constexpr char kHexDigits[] = "0123456789abcdef";
   std::string encoded(length * 2, '0');
@@ -2058,22 +2168,15 @@ static bool preserve_trx_lower_hex(const std::string &value,
          });
 }
 
-static bool preserve_trx_hmac_hex(const std::string &payload,
-                                  std::string *digest) {
+static bool preserve_trx_sha256_hex(const std::string &payload,
+                                    std::string *digest) {
   if (digest == nullptr) return true;
-  Preserved_trx_codec_context context;
-  if (preserve_trx_xid_codec_context(
-          Preserved_trx_codec_context_purpose::READ_EXISTING, &context)) {
+  unsigned char bytes[SHA256_DIGEST_LENGTH]{};
+  if (SHA256(reinterpret_cast<const unsigned char *>(payload.data()),
+             payload.size(), bytes) == nullptr) {
     return true;
   }
-  unsigned char bytes[EVP_MAX_MD_SIZE]{};
-  unsigned int length = 0;
-  if (HMAC(EVP_sha256(), context.hmac_key.data(), context.hmac_key.size(),
-           reinterpret_cast<const unsigned char *>(payload.data()),
-           payload.size(), bytes, &length) == nullptr || length != 32) {
-    return true;
-  }
-  *digest = preserve_trx_hex(bytes, length);
+  *digest = preserve_trx_hex(bytes, sizeof(bytes));
   return false;
 }
 
@@ -2122,8 +2225,8 @@ static bool preserve_trx_encode_xid_provenance_ledger(
          << '\n';
   }
   std::string digest;
-  if (preserve_trx_hmac_hex(body.str(), &digest)) return true;
-  *encoded = body.str() + "hmac " + digest + "\n";
+  if (preserve_trx_sha256_hex(body.str(), &digest)) return true;
+  *encoded = body.str() + "sha256 " + digest + "\n";
   return false;
 }
 
@@ -2131,17 +2234,18 @@ static bool preserve_trx_decode_xid_provenance_ledger(
     const std::string &encoded, Preserve_trx_xid_provenance_map *records) {
   if (records == nullptr || encoded.empty() || encoded.size() > 16 * 1024 * 1024)
     return true;
-  const size_t hmac_offset = encoded.rfind("hmac ");
-  if (hmac_offset == std::string::npos || hmac_offset == 0 ||
+  const size_t digest_offset = encoded.rfind("sha256 ");
+  if (digest_offset == std::string::npos || digest_offset == 0 ||
       encoded.back() != '\n') {
     return true;
   }
-  const std::string body = encoded.substr(0, hmac_offset);
+  const std::string body = encoded.substr(0, digest_offset);
   const std::string supplied_digest =
-      encoded.substr(hmac_offset + 5, encoded.size() - hmac_offset - 6);
+      encoded.substr(digest_offset + 7,
+                     encoded.size() - digest_offset - 8);
   if (!preserve_trx_lower_hex(supplied_digest, 64)) return true;
   std::string expected_digest;
-  if (preserve_trx_hmac_hex(body, &expected_digest) ||
+  if (preserve_trx_sha256_hex(body, &expected_digest) ||
       CRYPTO_memcmp(supplied_digest.data(), expected_digest.data(),
                     expected_digest.size()) != 0) {
     return true;
@@ -2437,7 +2541,7 @@ static bool preserve_trx_xid_provenance_preload(
 static bool preserve_trx_snapshot_identity_digest(
     const Preserve_snapshot_metadata &metadata, std::string *digest) {
   std::ostringstream canonical;
-  canonical << "PTRX_SNAPSHOT_IDENTITY_V1\n"
+  canonical << "PTRX_SNAPSHOT_IDENTITY_PRODUCT_V1\n"
             << metadata.token.length() << ':' << metadata.token << '\n'
             << metadata.owner_user.length() << ':' << metadata.owner_user
             << '\n'
@@ -2449,7 +2553,7 @@ static bool preserve_trx_snapshot_identity_digest(
             << metadata.has_persistent_engine_state << '\n'
             << metadata.has_temp_engine_state << '\n'
             << metadata.has_logged_persistent_work << '\n';
-  return preserve_trx_hmac_hex(canonical.str(), digest);
+  return preserve_trx_sha256_hex(canonical.str(), digest);
 }
 
 static bool preserve_trx_decode_sha256_hex(
@@ -2615,8 +2719,7 @@ static void preserve_trx_write_local_resurrection_index(
       Preserve_trx_resurrection_index_status::INVALID_ARGUMENT;
   std::string encoded;
   if (!input_error) {
-    index.source_server_uuid = context.server_uuid;
-    index.target_server_uuid = context.server_uuid;
+    index.local_instance_identity = context.server_uuid;
     index.entries.push_back(std::move(entry));
     encode_status =
         preserve_trx_encode_resurrection_index(index, context, &encoded);
@@ -2700,31 +2803,6 @@ bool preserve_trx_token_to_xid(const std::string &token, XID *xid) {
 bool preserved_trx_file_exists_for_token(const std::string &token) {
   return preserved_trx_default_carrier_generated_token_exists(
       preserve_trx_default_dir(), token);
-}
-
-std::mutex g_preserve_trx_xid_codec_context_mutex;
-bool g_preserve_trx_xid_codec_context_valid = false;
-Preserved_trx_codec_context g_preserve_trx_xid_codec_context;
-
-bool preserve_trx_xid_codec_context(
-    Preserved_trx_codec_context_purpose purpose,
-    Preserved_trx_codec_context *context) {
-  if (context == nullptr) return true;
-  std::lock_guard<std::mutex> lock(g_preserve_trx_xid_codec_context_mutex);
-  if (g_preserve_trx_xid_codec_context_valid) {
-    *context = g_preserve_trx_xid_codec_context;
-    return false;
-  }
-
-  auto store = create_preserved_trx_default_store(preserve_trx_default_dir());
-  Preserved_trx_codec_context loaded;
-  if (store->codec_context(&loaded, purpose) != Preserve_snapshot_status::OK) {
-    return true;
-  }
-  g_preserve_trx_xid_codec_context = loaded;
-  g_preserve_trx_xid_codec_context_valid = true;
-  *context = loaded;
-  return false;
 }
 
 bool preserve_trx_magic_xid_has_snapshot_impl(const XID &xid) {
@@ -12478,7 +12556,14 @@ class Preserve_batch_restore_target_collector final : public Do_THD_Impl {
 
 static bool restore_preserved_batch_items_to_original_thds(
     ulonglong generation, const std::vector<Preserve_trx_batch_item> &items,
+    const std::shared_ptr<Preserve_trx_drain_attempt> &active_drain_attempt,
     std::vector<Preserve_trx_batch_reset_cleanup> *deferred_cleanup = nullptr) {
+  if (active_drain_attempt != nullptr &&
+      !active_drain_attempt->ownership.restore_allowed()) {
+    preserve_trx_transfer_note_source_restore_guard_reject();
+    return true;
+  }
+
   /*
     Roll back a partially successful batch in reverse preserve order. Later
     targets may depend on earlier batch state being held drained until their
@@ -12505,6 +12590,126 @@ static bool restore_preserved_batch_items_to_original_thds(
       deferred_cleanup->push_back(std::move(cleanup));
   }
   return false;
+}
+
+static bool preserve_trx_transition_manager_after_handoff_resolution(
+    const Preserve_trx_drain_attempt &attempt,
+    Preserve_trx_manager_state desired_state, my_thread_id desired_owner) {
+  for (;;) {
+    const Preserve_trx_manager_state_owner current =
+        preserve_trx_manager_state_owner_snapshot();
+    if (current.state == desired_state &&
+        current.owner_thread_id == desired_owner) {
+      return true;
+    }
+    if (current.owner_thread_id != attempt.owner_thread_id) return false;
+    switch (current.state) {
+      case Preserve_trx_manager_state::WARMCOPY_DRAINING:
+      case Preserve_trx_manager_state::WARMCOPY_CLOSING:
+      case Preserve_trx_manager_state::BATCH_DRAINING:
+        break;
+      default:
+        return false;
+    }
+    if (preserve_trx_compare_exchange_manager_state_owner(
+            current.state, current.owner_thread_id, desired_state,
+            desired_owner)) {
+      return true;
+    }
+  }
+}
+
+Preserve_trx_transfer_status preserved_trx_resolve_handoff_unknown(
+    const Preserve_trx_ha_control_capability &capability,
+    const Preserve_trx_handoff_resolution_proof &proof) {
+  std::unique_lock<std::mutex> active_guard(g_active_drain_attempt_mutex);
+  std::shared_ptr<Preserve_trx_drain_attempt> attempt;
+  if (g_active_drain_attempt != nullptr &&
+      g_active_drain_attempt->handoff_resolution.matches_context(proof)) {
+    attempt = g_active_drain_attempt;
+  } else if (g_last_resolved_drain_attempt != nullptr &&
+             g_last_resolved_drain_attempt->handoff_resolution.matches_context(
+                 proof)) {
+    attempt = g_last_resolved_drain_attempt;
+  } else if (g_active_drain_attempt != nullptr) {
+    attempt = g_active_drain_attempt;
+  } else {
+    attempt = g_last_resolved_drain_attempt;
+  }
+  if (attempt == nullptr) return Preserve_trx_transfer_status::UNSUPPORTED;
+  if (!attempt->handoff_resolution_ready.load(std::memory_order_acquire)) {
+    return Preserve_trx_transfer_status::ACK_UNCERTAIN;
+  }
+
+  bool first_decision = false;
+  const Preserve_trx_transfer_status begin_status =
+      attempt->handoff_resolution.begin(capability, proof, &first_decision);
+  if (begin_status != Preserve_trx_transfer_status::OK || !first_decision) {
+    return begin_status;
+  }
+  if (g_active_drain_attempt != attempt ||
+      attempt->ownership.state() !=
+          Preserve_trx_drain_terminal::COMMIT_UNKNOWN) {
+    (void)attempt->handoff_resolution.complete(
+        proof, Preserve_trx_transfer_status::CORRUPT);
+    return Preserve_trx_transfer_status::CORRUPT;
+  }
+
+  Preserve_trx_transfer_status result = Preserve_trx_transfer_status::CORRUPT;
+  if (proof.resolution ==
+      Preserve_trx_handoff_resolution::RECEIVER_FENCED_SOURCE_OWNS) {
+    if (!attempt->ownership.begin_source_restore()) {
+      (void)attempt->handoff_resolution.complete(proof, result);
+      return result;
+    }
+    {
+      std::lock_guard<std::mutex> quarantine_guard(attempt->quarantine_mutex);
+      if (restore_preserved_batch_items_to_original_thds(
+              attempt->generation, attempt->quarantined_items, attempt)) {
+        result = Preserve_trx_transfer_status::IO_ERROR;
+        (void)attempt->handoff_resolution.complete(proof, result);
+        return result;
+      }
+    }
+    if (!preserve_trx_transition_manager_after_handoff_resolution(
+            *attempt, Preserve_trx_manager_state::IDLE, 0)) {
+      (void)attempt->handoff_resolution.complete(proof, result);
+      return result;
+    }
+    if (!attempt->ownership.complete_source_restore()) {
+      (void)attempt->handoff_resolution.complete(proof, result);
+      return result;
+    }
+    result = Preserve_trx_transfer_status::NOT_COMMITTED_CLEAN;
+    preserve_trx_mark_active_drain_transactions_runnable(attempt);
+  } else {
+    if (!attempt->ownership.acknowledge_commit() ||
+        !preserve_trx_transition_manager_after_handoff_resolution(
+            *attempt, Preserve_trx_manager_state::SHUTDOWN_REQUESTED,
+            attempt->owner_thread_id)) {
+      (void)attempt->handoff_resolution.complete(proof, result);
+      return result;
+    }
+    result = Preserve_trx_transfer_status::COMMITTED_NOT_READY;
+  }
+
+  std::set<std::string> deferred_source_warm_cleanup;
+  {
+    std::lock_guard<std::mutex> quarantine_guard(attempt->quarantine_mutex);
+    attempt->quarantined_items.clear();
+    deferred_source_warm_cleanup =
+        std::move(attempt->quarantined_source_warmcopy_ids);
+    attempt->quarantine_started_monotonic_us = 0;
+  }
+  preserve_trx_defer_source_warm_blob_cleanup(
+      preserve_trx_default_dir(), std::move(deferred_source_warm_cleanup));
+  preserve_trx_transfer_note_source_handoff_committed();
+  if (!attempt->handoff_resolution.complete(proof, result)) {
+    return Preserve_trx_transfer_status::CORRUPT;
+  }
+  g_active_drain_attempt.reset();
+  g_last_resolved_drain_attempt = std::move(attempt);
+  return result;
 }
 
 static bool reattach_current_batch_preserve_failure_to_original_thd(
@@ -14001,7 +14206,7 @@ void preserved_trx_resurrection_index_bootstrap_preamble() {
           Preserve_snapshot_status::OK ||
       context.server_uuid.empty()) {
     LogErr(WARNING_LEVEL, ER_LOG_PRINTF_MSG,
-           "PRESERVE: startup Resurrection Index authentication context "
+           "PRESERVE: startup Resurrection Index identity context "
            "unavailable; native Undo scan remains authoritative");
     return;
   }
@@ -14024,11 +14229,10 @@ void preserved_trx_resurrection_index_bootstrap_preamble() {
     const std::string encoded(index_bytes.begin(), index_bytes.end());
     if (preserve_trx_decode_resurrection_index(encoded, context, &index) !=
             Preserve_trx_resurrection_index_status::OK ||
-        index.source_server_uuid != context.server_uuid ||
-        index.target_server_uuid != context.server_uuid ||
+        index.local_instance_identity != context.server_uuid ||
         index.epoch_id != "local-" + token || index.entries.size() != 1) {
       log_preserved_trx_recovery_warning(
-          token, "startup Resurrection Index authentication or identity "
+          token, "startup Resurrection Index digest or identity "
                  "mismatch; native Undo scan will be used");
       continue;
     }
@@ -16736,11 +16940,6 @@ bool preserve_trx_kernel_preserve_attached_transaction(
     }
   }
   std::unique_ptr<Preserve_trx_artifact_sink> artifact_sink;
-  const std::string source_server_uuid(server_uuid);
-  const std::string target_server_uuid =
-      preserve_trx_transfer_target_server_uuid == nullptr
-          ? std::string()
-          : std::string(preserve_trx_transfer_target_server_uuid);
   substep_started_us = preserve_trx_monotonic_us();
   Preserve_snapshot_status status = Preserve_snapshot_status::OK;
   if (request.deferred_transfer_candidate != nullptr) {
@@ -16749,8 +16948,6 @@ bool preserve_trx_kernel_preserve_attached_transaction(
     } else {
       status = preserve_trx_transfer_capture_deferred_candidate(
           request.transfer_source_epoch_session->epoch_id(),
-          request.transfer_source_epoch_session->source_server_uuid(),
-          request.transfer_source_epoch_session->target_server_uuid(),
           token_selection.transfer_token, std::move(bundle), timeout_seconds,
           transfer_resurrection_entry_ptr,
           request.deferred_transfer_candidate, &metadata);
@@ -16759,7 +16956,6 @@ bool preserve_trx_kernel_preserve_attached_transaction(
     const Preserve_snapshot_status artifact_sink_status =
         preserve_trx_make_artifact_sink_for_decision(
             artifact_decision, &store.store(), metadata.token,
-            source_server_uuid, target_server_uuid,
             token_selection.transfer_token, preserve_trx_transfer_chunk_bytes,
             transfer_frame_sink.get(), &artifact_sink,
             request.transfer_source_epoch_session,
@@ -17417,7 +17613,7 @@ bool Preserve_trx_drain_service::execute(
       batch_transfer_phase1_sender.reset();
     }
     if (active_drain_attempt != nullptr &&
-        active_drain_attempt->terminal.load(std::memory_order_acquire) ==
+        active_drain_attempt->ownership.state() ==
             Preserve_trx_drain_terminal::RESET_REQUESTED) {
       return;
     }
@@ -17506,18 +17702,13 @@ bool Preserve_trx_drain_service::execute(
     }
 
     const std::string batch_transfer_epoch_id =
-        preserve_trx_transfer_qualify_epoch_id(
+        preserve_trx_transfer_make_epoch_id(
             "batch-" + std::to_string(generation) + "-" +
             std::to_string(preserve_trx_monotonic_us()));
     if (batch_transfer_epoch_id.empty()) {
-      abort_drain_participants("standby_transfer_source_incarnation_failed");
+      abort_drain_participants("standby_transfer_epoch_id_generation_failed");
       return true;
     }
-    const std::string source_server_uuid(server_uuid);
-    const std::string target_server_uuid =
-        preserve_trx_transfer_target_server_uuid == nullptr
-            ? std::string()
-            : std::string(preserve_trx_transfer_target_server_uuid);
     batch_transfer_phase1_options.max_batch_bytes =
         preserve_trx_transfer_phase1_batch_bytes;
     batch_transfer_phase1_options.linger_ms =
@@ -17540,14 +17731,39 @@ bool Preserve_trx_drain_service::execute(
         batch_transfer_phase1_options.max_inflight_bytes;
     source_epoch_options.phase1_batch_bytes =
         batch_transfer_phase1_options.max_batch_bytes;
+    source_epoch_options.before_commit_send =
+        preserve_trx_active_drain_before_commit_send;
+    source_epoch_options.before_commit_send_context =
+        active_drain_attempt.get();
     source_epoch_options.final_ack_arbiter =
         preserve_trx_active_drain_final_ack_arbiter;
     source_epoch_options.final_ack_arbiter_context =
         active_drain_attempt.get();
     batch_transfer_source_session.reset(
         new Preserve_trx_transfer_source_epoch_session(
-            batch_transfer_epoch_id, source_server_uuid, target_server_uuid,
-            source_epoch_options, batch_transfer_frame_sink.get()));
+            batch_transfer_epoch_id, source_epoch_options,
+            batch_transfer_frame_sink.get()));
+    uint64_t epoch_transport_deadline_us = phase1_readiness_deadline_us;
+    epoch_transport_deadline_us = preserve_trx_monotonic_deadline_after_ms(
+        epoch_transport_deadline_us, preserve_trx_transfer_phase2_timeout_ms);
+    epoch_transport_deadline_us = preserve_trx_monotonic_deadline_after_ms(
+        epoch_transport_deadline_us, preserve_trx_transfer_commit_timeout_ms);
+    const uint64_t requested_terminal_retention_us = std::max<uint64_t>(
+        1, static_cast<uint64_t>(preserve_trx_transfer_commit_timeout_ms) *
+               2000);
+    const Preserve_trx_transfer_status open_status =
+        batch_transfer_source_session->open_epoch(
+            requested_terminal_retention_us, epoch_transport_deadline_us);
+    if (open_status != Preserve_trx_transfer_status::OK) {
+      LogErr(WARNING_LEVEL, ER_LOG_PRINTF_MSG,
+             ("PRESERVE: standby transfer OPEN_EPOCH failed status=" +
+              std::to_string(static_cast<int>(open_status)))
+                 .c_str());
+      batch_transfer_source_session.reset();
+      release_batch_transfer_frame_sink();
+      abort_drain_participants("standby_transfer_open_epoch_failed");
+      return true;
+    }
     batch_transfer_source_session->set_phase1_metrics_enabled(true);
     batch_transfer_phase1_flush_context.session =
         batch_transfer_source_session.get();
@@ -18094,7 +18310,8 @@ bool Preserve_trx_drain_service::execute(
         const bool semantic_restore_failed =
             items != nullptr && !items->empty()
                 ? restore_preserved_batch_items_to_original_thds(
-                      generation, *items, &deferred_cleanup)
+                      generation, *items, active_drain_attempt,
+                      &deferred_cleanup)
                 : [&]() {
                     Preserve_batch_clear_generation clear(generation);
                     Global_THD_manager::get_instance()->do_for_all_thd_copy(
@@ -18147,7 +18364,7 @@ bool Preserve_trx_drain_service::execute(
     if (active_drain_attempt != nullptr) {
       if (reset_requested())
         return finish_phase2_reset(nullptr, "reset_before_shutdown");
-      if (active_drain_attempt->terminal.load(std::memory_order_acquire) ==
+      if (active_drain_attempt->ownership.state() ==
               Preserve_trx_drain_terminal::RUNNING &&
           !preserve_trx_try_active_drain_shutdown_handoff(
               active_drain_attempt.get())) {
@@ -18179,7 +18396,7 @@ bool Preserve_trx_drain_service::execute(
     publish_phase2_metrics();
 #if defined(ENABLED_DEBUG_SYNC)
     if (active_drain_attempt != nullptr &&
-        active_drain_attempt->terminal.load(std::memory_order_acquire) ==
+        active_drain_attempt->ownership.state() ==
             Preserve_trx_drain_terminal::SHUTDOWN_HANDOFF) {
       DEBUG_SYNC(thd, "preserve_trx_drain_after_shutdown_handoff");
     }
@@ -18978,7 +19195,7 @@ bool Preserve_trx_drain_service::execute(
       }
       const bool cleanup_error =
           restore_preserved_batch_items_to_original_thds(
-              generation, preserved_batch_items);
+              generation, preserved_batch_items, active_drain_attempt);
       abort_batch_transfer_epoch("early_target_pipeline_failed");
       abort_drain_participants("early_target_pipeline_failed");
       if (cleanup_error) {
@@ -19993,7 +20210,7 @@ bool Preserve_trx_drain_service::execute(
       if (preserved_batch_items.size() == 1 &&
           quiesced_target_thread_ids.size() > 1) {
         if (restore_preserved_batch_items_to_original_thds(
-                generation, preserved_batch_items)) {
+                generation, preserved_batch_items, active_drain_attempt)) {
           batch_provenance_cleanup.commit();
           if (reconcile_failed_batch_provenance()) {
             LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
@@ -20062,8 +20279,9 @@ bool Preserve_trx_drain_service::execute(
         " logged_binlog_cache=" +
         std::to_string(batch_result.logged_binlog_cache ? 1 : 0);
     LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG, message.c_str());
-    const bool prior_cleanup_error = restore_preserved_batch_items_to_original_thds(
-        generation, preserved_batch_items);
+    const bool prior_cleanup_error =
+        restore_preserved_batch_items_to_original_thds(
+            generation, preserved_batch_items, active_drain_attempt);
     const bool cleanup_error =
         batch_result.cleanup_failed_after_reattach || prior_cleanup_error;
     if (cleanup_error) {
@@ -20116,7 +20334,7 @@ bool Preserve_trx_drain_service::execute(
       return finish_reset_with_provenance(
           &preserved_batch_items, "reset_during_xid_provenance_bind");
     const bool cleanup_error = restore_preserved_batch_items_to_original_thds(
-        generation, preserved_batch_items);
+        generation, preserved_batch_items, active_drain_attempt);
     abort_batch_transfer_epoch("xid_provenance_batch_bind_failed");
     if (cleanup_error) {
       batch_provenance_cleanup.commit();
@@ -20151,8 +20369,9 @@ bool Preserve_trx_drain_service::execute(
       LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
              "Preserved transaction batch directory fsync failed after "
              "deferred snapshot writes");
-      const bool cleanup_error = restore_preserved_batch_items_to_original_thds(
-          generation, preserved_batch_items);
+      const bool cleanup_error =
+          restore_preserved_batch_items_to_original_thds(
+              generation, preserved_batch_items, active_drain_attempt);
       if (cleanup_error) {
         abort_batch_transfer_epoch(
             "deferred_snapshot_directory_fsync_cleanup_failed");
@@ -20187,7 +20406,7 @@ bool Preserve_trx_drain_service::execute(
       ++phase2_metrics.final_validation_rejects;
       const bool cleanup_error =
           restore_preserved_batch_items_to_original_thds(
-              generation, preserved_batch_items);
+              generation, preserved_batch_items, active_drain_attempt);
       abort_batch_transfer_epoch("early_final_lock_fence_changed");
       abort_drain_participants("early_final_lock_fence_changed");
       if (cleanup_error) {
@@ -20208,6 +20427,92 @@ bool Preserve_trx_drain_service::execute(
     return finish_reset_with_provenance(&preserved_batch_items,
                                         "reset_before_transfer_commit");
   if (batch_transfer_source_session != nullptr) {
+    auto quarantine_retained_bytes = [&]() {
+      uint64_t retained_bytes = 0;
+      for (const Preserve_trx_batch_item &item : preserved_batch_items) {
+        if (item.source_rollback_image == nullptr) continue;
+        const uint64_t item_bytes =
+            !item.source_rollback_image->binlog_snapshot.cache_payload.empty()
+                ? item.source_rollback_image->binlog_snapshot.cache_payload
+                      .size()
+                : item.source_rollback_image->has_prebuilt_binlog_blob
+                      ? item.source_rollback_image->prebuilt_binlog_blob.size
+                      : 0;
+        retained_bytes =
+            item_bytes > std::numeric_limits<uint64_t>::max() - retained_bytes
+                ? std::numeric_limits<uint64_t>::max()
+                : retained_bytes + item_bytes;
+      }
+      return retained_bytes;
+    };
+    auto enter_commit_unknown = [&](Preserve_trx_transfer_status status) {
+      if (active_drain_attempt == nullptr) {
+        LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+               "PRESERVE: standby transfer has no active attempt for "
+               "COMMIT_UNKNOWN");
+        return finish_cleanup_failure_without_shutdown(
+            "standby_transfer_commit_unknown_state_failed");
+      }
+
+      const Preserve_trx_handoff_resolution_context handoff_context =
+          batch_transfer_source_session->handoff_resolution_context();
+      const uint64_t retained_bytes = quarantine_retained_bytes();
+      const uint64_t retained_token_count = preserved_batch_items.size();
+      std::set<std::string> retained_warmcopy_ids;
+      if (batch_transfer_binlog_blob_provider != nullptr) {
+        retained_warmcopy_ids =
+            batch_transfer_binlog_blob_provider
+                ->release_phase1_blobs_for_deferred_cleanup();
+      }
+      {
+        std::lock_guard<std::mutex> lock(
+            active_drain_attempt->quarantine_mutex);
+        active_drain_attempt->quarantine_started_monotonic_us =
+            preserve_trx_monotonic_us();
+        active_drain_attempt->quarantined_items =
+            std::move(preserved_batch_items);
+        active_drain_attempt->quarantined_source_warmcopy_ids =
+            std::move(retained_warmcopy_ids);
+      }
+      const bool resolution_armed =
+          active_drain_attempt->handoff_resolution.arm(handoff_context);
+      if (!resolution_armed) {
+        LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+               "PRESERVE: standby transfer could not arm HA handoff "
+               "resolution context");
+      }
+      const bool commit_unknown_published =
+          active_drain_attempt->ownership.mark_commit_unknown();
+      if (!commit_unknown_published) {
+        LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+               "PRESERVE: standby transfer could not publish COMMIT_UNKNOWN");
+      }
+      preserve_trx_transfer_note_source_commit_unknown(
+          retained_token_count, retained_bytes);
+
+      batch_provenance_cleanup.commit();
+      batch_transfer_phase1_flush_context.session = nullptr;
+      batch_transfer_source_session.reset();
+      release_batch_transfer_frame_sink();
+      batch_transfer_binlog_blob_provider.reset();
+      batch_transfer_phase1_declared_tokens.clear();
+      finalize_drain_participants("standby_transfer_commit_unknown");
+
+      active_drain_attempt_cleanup.commit();
+      draining->dismiss();
+      active_drain_attempt->handoff_resolution_ready.store(
+          resolution_armed && commit_unknown_published,
+          std::memory_order_release);
+      LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+             ("PRESERVE: standby transfer source entered COMMIT_UNKNOWN "
+              "status=" +
+              std::to_string(static_cast<int>(status)) + " token_count=" +
+              std::to_string(retained_token_count) +
+              " retained_bytes=" + std::to_string(retained_bytes))
+                 .c_str());
+      return preserve_trx_reject_unsupported();
+    };
+
     const ulonglong commit_epoch_started_us = preserve_trx_monotonic_us();
     const Preserve_trx_transfer_status commit_status =
         batch_transfer_source_session->commit_epoch();
@@ -20224,6 +20529,35 @@ bool Preserve_trx_drain_service::execute(
       if (reset_requested())
         return finish_reset_with_provenance(
             &preserved_batch_items, "reset_during_transfer_commit");
+      if (commit_status ==
+          Preserve_trx_transfer_status::NOT_COMMITTED_CLEAN) {
+        if (active_drain_attempt == nullptr ||
+            !active_drain_attempt->ownership.resolve_not_committed_clean()) {
+          return enter_commit_unknown(commit_status);
+        }
+        preserve_trx_transfer_note_source_handoff_committed();
+        const bool cleanup_error =
+            restore_preserved_batch_items_to_original_thds(
+                generation, preserved_batch_items, active_drain_attempt);
+        if (cleanup_error) {
+          return finish_cleanup_failure_without_shutdown(
+              "standby_transfer_not_committed_clean_restore_failed");
+        }
+        if (!active_drain_attempt->ownership.complete_source_restore()) {
+          return finish_cleanup_failure_without_shutdown(
+              "standby_transfer_not_committed_clean_state_failed");
+        }
+        abort_drain_participants(
+            "standby_transfer_receiver_not_committed_clean");
+        return preserve_trx_reject_unsupported();
+      }
+      if (active_drain_attempt != nullptr &&
+          (active_drain_attempt->ownership.state() ==
+               Preserve_trx_drain_terminal::HANDOFF_PENDING ||
+           active_drain_attempt->ownership.state() ==
+               Preserve_trx_drain_terminal::COMMIT_UNKNOWN)) {
+        return enter_commit_unknown(commit_status);
+      }
       LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
              ("PRESERVE: standby transfer source epoch commit failed status=" +
               std::to_string(static_cast<int>(commit_status)))
@@ -20231,8 +20565,9 @@ bool Preserve_trx_drain_service::execute(
       if (!receiver_committed) {
         abort_batch_transfer_epoch("standby_transfer_commit_failed");
       }
-      const bool cleanup_error = restore_preserved_batch_items_to_original_thds(
-          generation, preserved_batch_items);
+      const bool cleanup_error =
+          restore_preserved_batch_items_to_original_thds(
+              generation, preserved_batch_items, active_drain_attempt);
       if (cleanup_error) {
         LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
                "Preserved transaction batch cleanup failed after standby "
@@ -21559,7 +21894,7 @@ preserved_trx_resume_adopted_for_promotion_on_current_thd(
     return status;
   };
   if (target == nullptr || key.preserve_dir.empty() ||
-      key.source_uuid.empty() || key.epoch_id.empty() || key.token.empty() ||
+      key.epoch_scope.empty() || key.epoch_id.empty() || key.token.empty() ||
       key.target_boot_incarnation.empty() || key.generation == 0) {
     return finish(Preserved_trx_promotion_resume_status::INVALID_ARGUMENT);
   }

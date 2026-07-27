@@ -32,7 +32,7 @@ PREPARE SHUTDOWN PRESERVE TRANSACTION;
 use strict;
 use warnings;
 use Compress::Zlib qw(crc32);
-use Digest::SHA qw(hmac_sha256 sha256);
+use Digest::SHA qw(sha256);
 use File::Copy qw(copy);
 use File::Spec;
 
@@ -78,7 +78,7 @@ sub tlv {
   return le16($tag) . le32(length($value)) . $value;
 }
 
-die "bad preserve magic" unless substr($snapshot, 0, 8) eq 'MSP_PRES';
+die "bad preserve magic" unless substr($snapshot, 0, 8) eq 'PTRXSNP1';
 my $header_len = read_le16_at($snapshot, 10);
 my $payload_len = read_le64_at($snapshot, 48);
 my $payload = substr($snapshot, $header_len, $payload_len);
@@ -143,16 +143,8 @@ substr($snapshot, $header_len, $payload_len) = $new_payload;
 substr($snapshot, 48, 8) = le64(length($new_payload));
 substr($snapshot, 56, 8) = le64(0);
 
-open(my $kh, '<:raw', File::Spec->catfile($preserve_dir, '.key'))
-  or die "cannot read preserve key: $!";
-my $key = do { local $/; <$kh> };
-close($kh);
-$key = substr($key, -32) if length($key) == 110;
-die "bad key length" unless length($key) == 32;
-substr($snapshot, 516, 32) = "\0" x 32;
-substr($snapshot, 548, 4) = "\0" x 4;
-substr($snapshot, 516, 32) = hmac_sha256($snapshot, $key);
-substr($snapshot, 548, 4) = le32(crc32($snapshot));
+substr($snapshot, 516, 4) = "\0" x 4;
+substr($snapshot, 516, 4) = le32(crc32($snapshot));
 
 open(my $out, '>:raw', $bin_path) or die "cannot rewrite $bin_path: $!";
 print {$out} $snapshot;

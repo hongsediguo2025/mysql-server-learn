@@ -49,7 +49,6 @@
 #include "my_dir.h"
 #include "my_dbug.h"
 #include "my_io.h"
-#include "my_rnd.h"
 #include "my_sys.h"
 #include "my_systime.h"
 #include "my_thread_local.h"
@@ -64,7 +63,6 @@
 
 namespace {
 
-enum class Preserve_key_status { OK, MISSING, CORRUPT, IO_ERROR };
 enum class Atomic_write_status { OK, ALREADY_EXISTS, IO_ERROR };
 
 constexpr char kGenericExternalBlobShardRoot[] = "blob_shards";
@@ -394,6 +392,42 @@ static bool preserve_trx_errno_is_transient_io(int err) {
   }
 }
 
+Preserved_trx_carrier_support_status remove_stale_prototype_file(
+    const std::string &path) {
+  if (!path_is_symlink(path)) {
+    MY_STAT stat_area;
+    if (my_stat(path.c_str(), &stat_area, MYF(0)) == nullptr) {
+      const int stat_errno = my_errno();
+      if (stat_errno == ENOENT)
+        return Preserved_trx_carrier_support_status::OK;
+      return preserve_trx_errno_is_transient_io(stat_errno)
+                 ? Preserved_trx_carrier_support_status::TRANSIENT_IO
+                 : Preserved_trx_carrier_support_status::
+                       PERMISSION_PATH_ERROR;
+    }
+    if (!MY_S_ISREG(stat_area.st_mode)) {
+      return Preserved_trx_carrier_support_status::PERMISSION_PATH_ERROR;
+    }
+  }
+
+  if (my_delete(path.c_str(), MYF(0)) == 0 || my_errno() == ENOENT) {
+    return Preserved_trx_carrier_support_status::OK;
+  }
+  return preserve_trx_errno_is_transient_io(my_errno())
+             ? Preserved_trx_carrier_support_status::TRANSIENT_IO
+             : Preserved_trx_carrier_support_status::PERMISSION_PATH_ERROR;
+}
+
+Preserved_trx_carrier_support_status cleanup_stale_prototype_key_files(
+    const std::string &dir) {
+  for (const char *filename : {".key", ".key.tmp"}) {
+    const Preserved_trx_carrier_support_status status =
+        remove_stale_prototype_file(join_path(dir, filename));
+    if (status != Preserved_trx_carrier_support_status::OK) return status;
+  }
+  return Preserved_trx_carrier_support_status::OK;
+}
+
 Preserved_trx_carrier_support_status ensure_directory_support_status(
     const std::string &dir) {
   DBUG_EXECUTE_IF("preserve_trx_simulate_startup_dir_mkdir_io_once", {
@@ -402,14 +436,27 @@ Preserved_trx_carrier_support_status ensure_directory_support_status(
       return Preserved_trx_carrier_support_status::TRANSIENT_IO;
   });
 
-  if (my_mkdir(normalize_dir(dir).c_str(), 0700, MYF(0)) == 0)
+  const std::string normalized_dir = normalize_dir(dir);
+  if (my_mkdir(normalized_dir.c_str(), 0700, MYF(0)) == 0)
     return Preserved_trx_carrier_support_status::OK;
 
   const int mkdir_errno = my_errno();
   if (mkdir_errno == EEXIST) {
-    return path_is_symlink(dir)
-               ? Preserved_trx_carrier_support_status::PERMISSION_PATH_ERROR
-               : Preserved_trx_carrier_support_status::OK;
+    MY_STAT dir_stat;
+    if (path_is_symlink(normalized_dir)) {
+      return Preserved_trx_carrier_support_status::PERMISSION_PATH_ERROR;
+    }
+    if (my_stat(normalized_dir.c_str(), &dir_stat, MYF(0)) == nullptr) {
+      return preserve_trx_errno_is_transient_io(my_errno())
+                 ? Preserved_trx_carrier_support_status::TRANSIENT_IO
+                 : Preserved_trx_carrier_support_status::
+                       PERMISSION_PATH_ERROR;
+    }
+    if (!MY_S_ISDIR(dir_stat.st_mode) ||
+        my_access(normalized_dir.c_str(), R_OK | W_OK | X_OK) != 0) {
+      return Preserved_trx_carrier_support_status::PERMISSION_PATH_ERROR;
+    }
+    return Preserved_trx_carrier_support_status::OK;
   }
   return preserve_trx_errno_is_transient_io(mkdir_errno)
              ? Preserved_trx_carrier_support_status::TRANSIENT_IO
@@ -648,7 +695,7 @@ bool intent_marker_tokens_from_payload(const std::vector<unsigned char> &bytes,
   if (tokens == nullptr) return false;
   const std::string encoded(bytes.begin(), bytes.end());
   Preserve_trx_strict_promotion_intent_epoch strict_intent;
-  if (preserved_trx_decode_strict_promotion_intent_v2(encoded,
+  if (preserved_trx_decode_strict_promotion_intent_v1(encoded,
                                                        &strict_intent)) {
     for (const Preserve_trx_strict_promotion_intent_token &token :
          strict_intent.tokens) {
@@ -770,15 +817,6 @@ bool write_all(File file, const std::vector<unsigned char> &bytes) {
   });
   return bytes.empty() ||
          my_write(file, bytes.data(), bytes.size(), MYF(0)) == bytes.size();
-}
-
-bool write_all(File file, const unsigned char *bytes, size_t size) {
-  DBUG_EXECUTE_IF("preserve_trx_simulate_short_write", return false;);
-  DBUG_EXECUTE_IF("preserve_trx_simulate_enospc_write", {
-    set_my_errno(ENOSPC);
-    return false;
-  });
-  return size == 0 || my_write(file, bytes, size, MYF(0)) == size;
 }
 
 void notify_step(const Preserve_snapshot_write_options &options,
@@ -1102,14 +1140,7 @@ class Local_file_external_blob_writer final
   std::mutex m_mutex;
 };
 
-constexpr std::array<unsigned char, 8> kPreservedTrxBoundKeyMagic = {
-    'M', 'S', 'P', 'K', 'E', 'Y', '1', '\0'};
-constexpr uint16_t kPreservedTrxBoundKeyVersion = 1;
-constexpr size_t kPreservedTrxKeyServerUuidLength = 36;
-constexpr size_t kPreservedTrxBoundKeyLength =
-    kPreservedTrxBoundKeyMagic.size() + 2 +
-    kPreservedTrxKeyServerUuidLength + kPreservedTrxSha256Length +
-    kPreservedTrxKeyLength;
+constexpr size_t kPreservedTrxLocalServerUuidLength = 36;
 
 std::array<unsigned char, kPreservedTrxSha256Length> datadir_fingerprint(
     const std::string &dir);
@@ -1133,10 +1164,10 @@ std::string server_uuid_from_auto_cnf_for_preserve_dir(const std::string &dir) {
   size_t pos = contents.find(prefix);
   if (pos == std::string::npos) return "";
   pos += strlen(prefix);
-  if (pos + kPreservedTrxKeyServerUuidLength > contents.length()) return "";
+  if (pos + kPreservedTrxLocalServerUuidLength > contents.length()) return "";
   const std::string uuid =
-      contents.substr(pos, kPreservedTrxKeyServerUuidLength);
-  const size_t end = pos + kPreservedTrxKeyServerUuidLength;
+      contents.substr(pos, kPreservedTrxLocalServerUuidLength);
+  const size_t end = pos + kPreservedTrxLocalServerUuidLength;
   if (end < contents.length() && contents[end] != '\n' &&
       contents[end] != '\r') {
     return "";
@@ -1144,208 +1175,14 @@ std::string server_uuid_from_auto_cnf_for_preserve_dir(const std::string &dir) {
   return uuid;
 }
 
-std::string current_server_uuid_for_preserve_key(const std::string &dir) {
+std::string current_server_uuid_for_preserve_dir(const std::string &dir) {
   if (server_uuid_ptr != nullptr &&
-      std::strlen(server_uuid_ptr) == kPreservedTrxKeyServerUuidLength) {
+      std::strlen(server_uuid_ptr) == kPreservedTrxLocalServerUuidLength) {
     return server_uuid_ptr;
   }
-  if (std::strlen(server_uuid) == kPreservedTrxKeyServerUuidLength)
+  if (std::strlen(server_uuid) == kPreservedTrxLocalServerUuidLength)
     return server_uuid;
   return server_uuid_from_auto_cnf_for_preserve_dir(dir);
-}
-
-bool preserve_key_uuid_available(const std::string &dir) {
-  return current_server_uuid_for_preserve_key(dir).length() ==
-         kPreservedTrxKeyServerUuidLength;
-}
-
-bool append_bound_key_payload(
-    const std::string &dir,
-    const std::array<unsigned char, kPreservedTrxKeyLength> &key,
-    std::vector<unsigned char> *payload) {
-  if (payload == nullptr) return false;
-  const std::string uuid = current_server_uuid_for_preserve_key(dir);
-  if (uuid.length() != kPreservedTrxKeyServerUuidLength) return false;
-  payload->clear();
-  payload->reserve(kPreservedTrxBoundKeyLength);
-  payload->insert(payload->end(), kPreservedTrxBoundKeyMagic.begin(),
-                  kPreservedTrxBoundKeyMagic.end());
-  append_le16(payload, kPreservedTrxBoundKeyVersion);
-  payload->insert(payload->end(), uuid.begin(), uuid.end());
-  const auto fingerprint = datadir_fingerprint(dir);
-  payload->insert(payload->end(), fingerprint.begin(), fingerprint.end());
-  payload->insert(payload->end(), key.begin(), key.end());
-  return payload->size() == kPreservedTrxBoundKeyLength;
-}
-
-bool parse_bound_key_payload(
-    const std::string &dir, const std::vector<unsigned char> &payload,
-    std::array<unsigned char, kPreservedTrxKeyLength> *key) {
-  if (key == nullptr || payload.size() != kPreservedTrxBoundKeyLength)
-    return false;
-  size_t offset = 0;
-  if (!std::equal(kPreservedTrxBoundKeyMagic.begin(),
-                  kPreservedTrxBoundKeyMagic.end(),
-                  payload.begin() + offset)) {
-    return false;
-  }
-  offset += kPreservedTrxBoundKeyMagic.size();
-  if (read_le16(payload, offset) != kPreservedTrxBoundKeyVersion) return false;
-  offset += 2;
-
-  const std::string uuid = current_server_uuid_for_preserve_key(dir);
-  if (uuid.length() != kPreservedTrxKeyServerUuidLength) return false;
-  if (!std::equal(payload.begin() + offset,
-                  payload.begin() + offset + kPreservedTrxKeyServerUuidLength,
-                  uuid.begin())) {
-    return false;
-  }
-  offset += kPreservedTrxKeyServerUuidLength;
-
-  const auto fingerprint = datadir_fingerprint(dir);
-  if (!std::equal(fingerprint.begin(), fingerprint.end(),
-                  payload.begin() + offset)) {
-    return false;
-  }
-  offset += fingerprint.size();
-
-  std::copy(payload.begin() + offset,
-            payload.begin() + offset + kPreservedTrxKeyLength, key->begin());
-  return true;
-}
-
-Preserve_key_status read_key(
-    const std::string &dir,
-    std::array<unsigned char, kPreservedTrxKeyLength> *key) {
-  DBUG_EXECUTE_IF("preserve_trx_simulate_startup_key_read_io_once", {
-    static std::atomic_uint injected_read_errors{0};
-    if (injected_read_errors.fetch_add(1, std::memory_order_acq_rel) == 0)
-      return Preserve_key_status::IO_ERROR;
-  });
-
-  const std::string path = join_path(dir, ".key");
-  MY_STAT stat_area;
-  if (my_stat(path.c_str(), &stat_area, MYF(0)) == nullptr) {
-    if (my_errno() == ENOENT) {
-      return path_is_symlink(path) ? Preserve_key_status::CORRUPT
-                                   : Preserve_key_status::MISSING;
-    }
-    return Preserve_key_status::IO_ERROR;
-  }
-  if (path_is_symlink(path)) return Preserve_key_status::CORRUPT;
-  if (!MY_S_ISREG(stat_area.st_mode)) return Preserve_key_status::CORRUPT;
-#ifndef _WIN32
-  if (stat_area.st_uid != geteuid() || (stat_area.st_mode & 0777) != 0600) {
-    return Preserve_key_status::CORRUPT;
-  }
-#endif
-  if (stat_area.st_size < 0) return Preserve_key_status::IO_ERROR;
-  if (static_cast<size_t>(stat_area.st_size) != kPreservedTrxBoundKeyLength) {
-    return Preserve_key_status::CORRUPT;
-  }
-
-  File file;
-  const Preserved_trx_carrier_status open_status =
-      open_regular_file_no_follow_for_read(path, stat_area, &file);
-  if (open_status != Preserved_trx_carrier_status::OK) {
-    return open_status == Preserved_trx_carrier_status::CORRUPT
-               ? Preserve_key_status::CORRUPT
-               : Preserve_key_status::IO_ERROR;
-  }
-
-  std::vector<unsigned char> payload(kPreservedTrxBoundKeyLength, 0);
-  const size_t read_len = my_read(file, payload.data(), payload.size(), MYF(0));
-  bool error = read_len != payload.size();
-  if (my_close(file, MYF(0))) error = true;
-  if (error) return Preserve_key_status::IO_ERROR;
-  if (!parse_bound_key_payload(dir, payload, key))
-    return Preserve_key_status::CORRUPT;
-  return Preserve_key_status::OK;
-}
-
-bool create_key(const std::string &dir) {
-  static std::atomic<uint64_t> key_tmp_counter{0};
-  std::array<unsigned char, kPreservedTrxKeyLength> key;
-  if (my_rand_buffer(key.data(), key.size())) return true;
-
-  const std::string key_path = join_path(dir, ".key");
-  const std::string legacy_tmp_path = key_path + ".tmp";
-  if (path_is_symlink(legacy_tmp_path)) return true;
-  MY_STAT tmp_stat;
-  if (my_stat(legacy_tmp_path.c_str(), &tmp_stat, MYF(0)) != nullptr) {
-    if (!MY_S_ISREG(tmp_stat.st_mode)) return true;
-    if (my_delete(legacy_tmp_path.c_str(), MYF(0))) return true;
-  } else if (my_errno() != ENOENT) {
-    return true;
-  }
-
-  const std::string tmp_path =
-      legacy_tmp_path + "." + std::to_string(current_pid) + "." +
-      std::to_string(
-          key_tmp_counter.fetch_add(1, std::memory_order_relaxed));
-  File file = my_create(tmp_path.c_str(), 0600,
-                        O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, MYF(0));
-  if (file < 0) return true;
-  if (path_is_symlink(tmp_path)) {
-    (void)my_close(file, MYF(0));
-    (void)my_delete(tmp_path.c_str(), MYF(0));
-    return true;
-  }
-
-  std::vector<unsigned char> payload;
-  bool error = !append_bound_key_payload(dir, key, &payload);
-  if (!error) error = !write_all(file, payload.data(), payload.size());
-  if (!error && my_sync(file, MYF(0))) error = true;
-  if (my_close(file, MYF(0))) error = true;
-  Atomic_write_status install_status = Atomic_write_status::IO_ERROR;
-  if (!error) {
-    install_status = install_temp_file(tmp_path, key_path, true, nullptr);
-    error = install_status == Atomic_write_status::IO_ERROR;
-  }
-  if (error) {
-    (void)my_delete(tmp_path.c_str(), MYF(0));
-    return true;
-  }
-  if (install_status == Atomic_write_status::ALREADY_EXISTS) {
-    (void)my_delete(tmp_path.c_str(), MYF(0));
-    std::array<unsigned char, kPreservedTrxKeyLength> installed_key;
-    if (read_key(dir, &installed_key) != Preserve_key_status::OK) return true;
-  }
-  return fsync_directory(dir);
-}
-
-bool ensure_key(const std::string &dir) {
-  std::array<unsigned char, kPreservedTrxKeyLength> key;
-  switch (read_key(dir, &key)) {
-    case Preserve_key_status::OK:
-      return false;
-    case Preserve_key_status::MISSING:
-      return create_key(dir);
-    case Preserve_key_status::CORRUPT:
-    case Preserve_key_status::IO_ERROR:
-      return true;
-  }
-  return true;
-}
-
-Preserved_trx_carrier_support_status ensure_key_support_status(
-    const std::string &dir) {
-  std::array<unsigned char, kPreservedTrxKeyLength> key;
-  switch (read_key(dir, &key)) {
-    case Preserve_key_status::OK:
-      return Preserved_trx_carrier_support_status::OK;
-    case Preserve_key_status::MISSING:
-      if (!preserve_key_uuid_available(dir))
-        return Preserved_trx_carrier_support_status::OK;
-      return create_key(dir)
-                 ? Preserved_trx_carrier_support_status::TRANSIENT_IO
-                 : Preserved_trx_carrier_support_status::OK;
-    case Preserve_key_status::CORRUPT:
-      return Preserved_trx_carrier_support_status::CORRUPT_KEY;
-    case Preserve_key_status::IO_ERROR:
-      return Preserved_trx_carrier_support_status::TRANSIENT_IO;
-  }
-  return Preserved_trx_carrier_support_status::CONFIG_ERROR;
 }
 
 std::array<unsigned char, kPreservedTrxSha256Length> datadir_fingerprint(
@@ -2010,10 +1847,6 @@ bool preserve_trx_errno_is_transient_io_for_unit_test(int err) {
   return preserve_trx_errno_is_transient_io(err);
 }
 
-bool preserve_trx_create_key_for_unit_test(const std::string &dir) {
-  return create_key(dir);
-}
-
 Local_file_preserved_trx_carrier::Local_file_preserved_trx_carrier(
     const std::string &dir, const Preserve_snapshot_write_options &write_options)
     : m_dir(normalize_dir(dir)), m_write_options(write_options) {}
@@ -2024,20 +1857,13 @@ Preserved_trx_carrier_status Local_file_preserved_trx_carrier::codec_context(
   if (out == nullptr) return Preserved_trx_carrier_status::CORRUPT;
   if (purpose == Preserved_trx_codec_context_purpose::WRITE_NEW) {
     if (ensure_directory(m_dir)) return Preserved_trx_carrier_status::IO_ERROR;
-    if (ensure_key(m_dir)) return Preserved_trx_carrier_status::IO_ERROR;
   }
 
-  std::array<unsigned char, kPreservedTrxKeyLength> key;
-  const Preserve_key_status key_status = read_key(m_dir, &key);
-  if (key_status != Preserve_key_status::OK) {
-    return key_status == Preserve_key_status::IO_ERROR
-               ? Preserved_trx_carrier_status::IO_ERROR
-               : Preserved_trx_carrier_status::CORRUPT;
-  }
-
-  out->hmac_key = key;
   out->datadir_fingerprint = datadir_fingerprint(m_dir);
-  out->server_uuid = current_server_uuid_for_preserve_key(m_dir);
+  out->server_uuid = current_server_uuid_for_preserve_dir(m_dir);
+  if (out->server_uuid.length() != kPreservedTrxLocalServerUuidLength) {
+    return Preserved_trx_carrier_status::CORRUPT;
+  }
   return Preserved_trx_carrier_status::OK;
 }
 
@@ -3501,8 +3327,6 @@ preserved_trx_default_carrier_support_status(const std::string &dir,
 
     if (allow_create_missing) {
       support_status = ensure_directory_support_status(dir);
-      if (support_status == Preserved_trx_carrier_support_status::OK)
-        support_status = ensure_key_support_status(dir);
     } else {
       MY_STAT dir_stat;
       DBUG_EXECUTE_IF("preserve_trx_simulate_startup_dir_stat_io_once", {
@@ -3530,27 +3354,16 @@ preserved_trx_default_carrier_support_status(const std::string &dir,
       } else if (!MY_S_ISDIR(dir_stat.st_mode)) {
         support_status =
             Preserved_trx_carrier_support_status::PERMISSION_PATH_ERROR;
-      } else {
-        std::array<unsigned char, kPreservedTrxKeyLength> key;
-        const Preserve_key_status status = read_key(dir, &key);
-        switch (status) {
-          case Preserve_key_status::OK:
-          case Preserve_key_status::MISSING:
-            support_status = Preserved_trx_carrier_support_status::OK;
-            break;
-          case Preserve_key_status::CORRUPT:
-            support_status =
-                Preserved_trx_carrier_support_status::CORRUPT_KEY;
-            break;
-          case Preserve_key_status::IO_ERROR:
-            support_status =
-                Preserved_trx_carrier_support_status::TRANSIENT_IO;
-            break;
-        }
+      } else if (my_access(dir.c_str(), R_OK | W_OK | X_OK) != 0) {
+        support_status =
+            Preserved_trx_carrier_support_status::PERMISSION_PATH_ERROR;
       }
     }
 
 support_status_ready:
+    if (support_status == Preserved_trx_carrier_support_status::OK) {
+      support_status = cleanup_stale_prototype_key_files(dir);
+    }
     if (support_status != Preserved_trx_carrier_support_status::TRANSIENT_IO) {
       if (retried_transient_io &&
           support_status == Preserved_trx_carrier_support_status::OK) {

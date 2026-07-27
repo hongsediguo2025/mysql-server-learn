@@ -566,6 +566,49 @@ int show_preserve_trx_transfer_receiver_auto_prewarm_last_status(
 int show_preserve_trx_transfer_receiver_ready_monotonic_us(THD *thd,
                                                            SHOW_VAR *var,
                                                            char *buf);
+int show_preserve_trx_transfer_receiver_final_metadata_accepted_monotonic_us(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_terminal_commit_admitted_monotonic_us(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_ready_after_final_metadata_accepted_us(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_ready_after_terminal_commit_admitted_us(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_admitted_frames(THD *thd,
+                                                        SHOW_VAR *var,
+                                                        char *buf);
+int show_preserve_trx_transfer_receiver_admitted_bytes(THD *thd,
+                                                       SHOW_VAR *var,
+                                                       char *buf);
+int show_preserve_trx_transfer_source_handoff_pending_epochs(THD *thd,
+                                                             SHOW_VAR *var,
+                                                             char *buf);
+int show_preserve_trx_transfer_source_commit_unknown_epochs(THD *thd,
+                                                            SHOW_VAR *var,
+                                                            char *buf);
+int show_preserve_trx_transfer_source_restore_guard_rejects(THD *thd,
+                                                            SHOW_VAR *var,
+                                                            char *buf);
+int show_preserve_trx_transfer_receiver_terminal_cas_wins(THD *thd,
+                                                          SHOW_VAR *var,
+                                                          char *buf);
+int show_preserve_trx_transfer_receiver_terminal_cas_duplicates(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_terminal_cas_conflicts(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_terminal_status_tombstones(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_terminal_status_tombstone_expiries(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_quarantine_epochs(THD *thd, SHOW_VAR *var,
+                                                 char *buf);
+int show_preserve_trx_transfer_quarantine_tokens(THD *thd, SHOW_VAR *var,
+                                                 char *buf);
+int show_preserve_trx_transfer_quarantine_bytes(THD *thd, SHOW_VAR *var,
+                                                char *buf);
+int show_preserve_trx_transfer_quarantine_oldest_age_us(THD *thd,
+                                                        SHOW_VAR *var,
+                                                        char *buf);
 int show_preserve_trx_transfer_receiver_first_frame_monotonic_us(THD *thd,
                                                                  SHOW_VAR *var,
                                                                  char *buf);

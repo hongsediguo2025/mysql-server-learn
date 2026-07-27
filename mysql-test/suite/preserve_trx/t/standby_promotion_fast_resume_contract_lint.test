@@ -92,10 +92,10 @@ die "strict gate must use the shared physical-fence kernel entry\n"
 die "promotion wrapper must not directly claim or import prepared trx state\n"
   if $promotion =~ /trx_preserve_claim_prepared|trx_preserve_import_read_view|preserved_trx_add_record/;
 
-die "strict gate must write versioned epoch intent before and after adopt\n"
+die "strict gate must write product-v1 epoch intent before and after adopt\n"
   unless $promotion =~ /write_strict_promotion_intent[\s\S]*false/ &&
          $promotion =~ /write_strict_promotion_intent[\s\S]*true/ &&
-         $prepared =~ /PTRX_STRICT_PROMOTION_INTENT_EPOCH_V2/;
+         $prepared =~ /PTRX_STRICT_PROMOTION_INTENT_EPOCH_PRODUCT_V1/;
 
 die "P0 strict contract module must not read InnoDB pages\n"
   if $prepared =~ /buf_page_get|btr_cur_|row_search|record_image_resolve/;
@@ -174,8 +174,8 @@ die "strict promotion SQL RESUME must accept only the executing current THD\n"
   unless $preserve =~
            /preserved_trx_resume_adopted_for_promotion_on_current_thd[\s\S]*current_thd\s*==\s*target[\s\S]*Preserve_trx_batch_thd_state::NONE/s &&
          $preserve !~ /protected_peer_thd/s;
-die "P5 attach activation must be bracketed by versioned durable token intent\n"
-  unless $prepared =~ /PTRX_STRICT_PROMOTION_ATTACH_INTENT_V1/s &&
+die "P5 attach activation must be bracketed by product-v1 durable token intent\n"
+  unless $prepared =~ /PTRX_STRICT_PROMOTION_ATTACH_INTENT_PRODUCT_V1/s &&
          $prepared =~ /begin_activation[\s\S]*intent_writer/s &&
          $prepared =~ /commit_attach[\s\S]*intent_writer/s &&
          $preserve =~ /ATTACHING[\s\S]*ACTIVATING[\s\S]*ACTIVE/s;

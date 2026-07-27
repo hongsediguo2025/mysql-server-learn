@@ -16,9 +16,7 @@ use File::Path qw(make_path remove_tree);
 use File::Spec;
 
 my $dir = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve');
-my $key = File::Spec->catfile($dir, '.key');
 my $target = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve-real-target');
-unlink($key) or die "cannot remove key before directory symlink test: $!";
 rmdir($dir) or die "cannot remove preserve dir before directory symlink test: $!";
 remove_tree($target) if -e $target;
 make_path($target, {mode => 0700});
@@ -62,50 +60,6 @@ use warnings;
 use File::Spec;
 
 my $dir = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve');
-my $key = File::Spec->catfile($dir, '.key');
-open(my $key_fh, '>', $key) or die "cannot corrupt key: $!";
-binmode($key_fh);
-print {$key_fh} 'short';
-close($key_fh);
-print "key malformed\n";
-EOF
-
---perl
-use strict;
-use warnings;
-my $path = $ENV{'error_log'} || '';
-unlink $path if $path ne '' && -e $path;
-EOF
-
---error 1
---exec $MYSQLD_CMD --validate-config --preserve-trx-enable=ON --log-error=$error_log > $error_log 2>&1
-
---let SEARCH_FILE= $error_log
---let SEARCH_PATTERN= preserve_trx_enable=ON requires valid snapshot support
---source include/search_pattern.inc
-
---perl
-use strict;
-use warnings;
-use File::Spec;
-
-my $dir = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve');
-my $key = File::Spec->catfile($dir, '.key');
-unlink($key) or die "cannot remove malformed key: $!";
-EOF
-
---let $restart_parameters= restart: --preserve-trx-enable=ON
---source include/restart_mysqld.inc
---let $restart_parameters=
-
---perl
-use strict;
-use warnings;
-use File::Spec;
-
-my $dir = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve');
-my $key = File::Spec->catfile($dir, '.key');
-unlink($key) if -e $key;
 rmdir($dir) or die "cannot remove preserve dir: $!";
 open(my $preserve_fh, '>', $dir) or die "cannot create preserve file: $!";
 print {$preserve_fh} 'not a directory';
@@ -146,11 +100,9 @@ use warnings;
 use File::Spec;
 
 my $dir = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve');
-my $key = File::Spec->catfile($dir, '.key');
 die "preserve dir missing: $dir" unless -d $dir;
-die "preserve key missing: $key" unless -f $key;
 chmod(0000, $dir) or die "cannot remove preserve dir access: $!";
-print "preserve key inaccessible\n";
+print "preserve dir inaccessible\n";
 EOF
 
 --perl
@@ -173,9 +125,7 @@ use warnings;
 use File::Spec;
 
 my $dir = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve');
-my $key = File::Spec->catfile($dir, '.key');
 chmod(0700, $dir) or die "cannot restore preserve dir access: $!";
-unlink($key) or die "cannot remove inaccessible key after restore: $!";
 EOF
 
 --let $restart_parameters= restart: --preserve-trx-enable=ON
@@ -188,8 +138,6 @@ use warnings;
 use File::Spec;
 
 my $dir = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve');
-my $key = File::Spec->catfile($dir, '.key');
-unlink($key) or die "cannot remove key before symlink test: $!";
 rmdir($dir) or die "cannot remove preserve dir before symlink test: $!";
 symlink('missing-preserve-target', $dir) or die "cannot create dangling symlink: $!";
 print "preserve path is dangling symlink\n";
@@ -216,45 +164,6 @@ use File::Spec;
 
 my $dir = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve');
 unlink($dir) or die "cannot remove preserve symlink: $!";
-EOF
-
---let $restart_parameters= restart: --preserve-trx-enable=ON
---source include/restart_mysqld.inc
---let $restart_parameters=
-
---perl
-use strict;
-use warnings;
-use File::Spec;
-
-my $dir = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve');
-my $key = File::Spec->catfile($dir, '.key');
-unlink($key) or die "cannot remove key before dangling key symlink test: $!";
-symlink('missing-preserve-key-target', $key) or die "cannot create dangling key symlink: $!";
-print "preserve key is dangling symlink\n";
-EOF
-
---perl
-use strict;
-use warnings;
-my $path = $ENV{'error_log'} || '';
-unlink $path if $path ne '' && -e $path;
-EOF
-
---error 1
---exec $MYSQLD_CMD --validate-config --preserve-trx-enable=ON --log-error=$error_log > $error_log 2>&1
-
---let SEARCH_FILE= $error_log
---let SEARCH_PATTERN= preserve_trx_enable=ON requires valid snapshot support
---source include/search_pattern.inc
-
---perl
-use strict;
-use warnings;
-use File::Spec;
-
-my $key = File::Spec->catfile($ENV{'MYSQLD_DATADIR'}, 'preserve', '.key');
-unlink($key) or die "cannot remove dangling key symlink: $!";
 EOF
 
 --let $restart_parameters= restart: --preserve-trx-enable=ON

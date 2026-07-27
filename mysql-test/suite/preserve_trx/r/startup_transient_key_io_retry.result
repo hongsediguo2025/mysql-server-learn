@@ -1,4 +1,0 @@
-SET GLOBAL preserve_trx_enable=ON;
-Pattern "preserve_trx startup support transient I/O retry succeeded" found
-Pattern "preserve_trx startup support transient I/O retry succeeded" found
-SET GLOBAL preserve_trx_enable=ON;

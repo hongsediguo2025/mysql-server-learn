@@ -39,7 +39,7 @@ DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 use strict;
 use warnings;
 use Compress::Zlib qw(crc32);
-use Digest::SHA qw(hmac_sha256 sha256);
+use Digest::SHA qw(sha256);
 use File::Spec;
 
 require File::Spec->catfile($ENV{'MYSQL_TEST_DIR'}, 'suite',
@@ -91,18 +91,10 @@ sub mutate_record_payload {
   return 0;
 }
 
-sub resign_snapshot {
-  my ($snapshot_ref, $preserve_dir) = @_;
-  open(my $kh, '<:raw', File::Spec->catfile($preserve_dir, '.key'))
-    or die "cannot read preserve key: $!";
-  my $key = do { local $/; <$kh> };
-  close($kh);
-  $key = substr($key, -32) if length($key) == 110;
-  die "bad key length" unless length($key) == 32;
-  substr($$snapshot_ref, 516, 32) = "\0" x 32;
-  substr($$snapshot_ref, 548, 4) = "\0" x 4;
-  substr($$snapshot_ref, 516, 32) = hmac_sha256($$snapshot_ref, $key);
-  substr($$snapshot_ref, 548, 4) = le32(crc32($$snapshot_ref));
+sub refresh_snapshot_crc {
+  my ($snapshot_ref) = @_;
+  substr($$snapshot_ref, 516, 4) = "\0" x 4;
+  substr($$snapshot_ref, 516, 4) = le32(crc32($$snapshot_ref));
 }
 
 sub update_record_blob_descriptor {
@@ -152,7 +144,8 @@ for my $bin_path (@bin_paths) {
   my $snapshot = do { local $/; <$fh> };
   close($fh);
 
-  die "bad preserve magic in $bin_name" unless substr($snapshot, 0, 8) eq 'MSP_PRES';
+  die "bad preserve magic in $bin_name"
+    unless substr($snapshot, 0, 8) eq 'PTRXSNP1';
   my $header_len = read_le16_at($snapshot, 10);
   my $payload_len = read_le64_at($snapshot, 48);
 
@@ -169,7 +162,7 @@ for my $bin_path (@bin_paths) {
         unless update_record_blob_descriptor(\$snapshot, $header_len,
                                              $payload_len, $digest,
                                              length($record_blob));
-      resign_snapshot(\$snapshot, $preserve_dir);
+      refresh_snapshot_crc(\$snapshot);
       open(my $bout, '>:raw', $record_blob_path)
         or die "cannot rewrite $record_blob_path: $!";
       print {$bout} $record_blob;
@@ -196,7 +189,7 @@ for my $bin_path (@bin_paths) {
       if (mutate_record_payload(\$value)) {
         substr($payload, $value_pos, $len) = $value;
         substr($snapshot, $header_len, $payload_len) = $payload;
-        resign_snapshot(\$snapshot, $preserve_dir);
+        refresh_snapshot_crc(\$snapshot);
         open(my $out, '>:raw', $bin_path) or die "cannot rewrite $bin_path: $!";
         print {$out} $snapshot;
         close($out);

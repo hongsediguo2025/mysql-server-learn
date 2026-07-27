@@ -855,6 +855,60 @@ DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_transfer_receiver_ready_monotonic_us,
     preserve_trx_transfer_receiver_ready_monotonic_us_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_final_metadata_accepted_monotonic_us,
+    preserve_trx_transfer_receiver_final_metadata_accepted_monotonic_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_terminal_commit_admitted_monotonic_us,
+    preserve_trx_transfer_receiver_terminal_commit_admitted_monotonic_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_ready_after_final_metadata_accepted_us,
+    preserve_trx_transfer_receiver_ready_after_final_metadata_accepted_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_ready_after_terminal_commit_admitted_us,
+    preserve_trx_transfer_receiver_ready_after_terminal_commit_admitted_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_admitted_frames,
+    preserve_trx_transfer_receiver_admitted_frames_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_admitted_bytes,
+    preserve_trx_transfer_receiver_admitted_bytes_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_source_handoff_pending_epochs,
+    preserve_trx_transfer_source_handoff_pending_epochs_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_source_commit_unknown_epochs,
+    preserve_trx_transfer_source_commit_unknown_epochs_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_source_restore_guard_rejects,
+    preserve_trx_transfer_source_restore_guard_rejects_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_terminal_cas_wins,
+    preserve_trx_transfer_receiver_terminal_cas_wins_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_terminal_cas_duplicates,
+    preserve_trx_transfer_receiver_terminal_cas_duplicates_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_terminal_cas_conflicts,
+    preserve_trx_transfer_receiver_terminal_cas_conflicts_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_terminal_status_tombstones,
+    preserve_trx_transfer_receiver_terminal_status_tombstones_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_terminal_status_tombstone_expiries,
+    preserve_trx_transfer_receiver_terminal_status_tombstone_expiries_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_quarantine_epochs,
+    preserve_trx_transfer_quarantine_epochs_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_quarantine_tokens,
+    preserve_trx_transfer_quarantine_tokens_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_quarantine_bytes,
+    preserve_trx_transfer_quarantine_bytes_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_quarantine_oldest_age_us,
+    preserve_trx_transfer_quarantine_oldest_age_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_transfer_receiver_first_frame_monotonic_us,
     preserve_trx_transfer_receiver_first_frame_monotonic_us_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(

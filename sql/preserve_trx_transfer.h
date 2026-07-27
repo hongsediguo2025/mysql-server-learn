@@ -44,12 +44,12 @@
 
 class THD;
 class lock_preserve_metadata_plan_t;
+struct MYSQL;
 struct lock_preserve_record_lock_metadata_facts_t;
 struct Preserve_trx_prepared_token_key;
 enum class Preserve_trx_delivery_mode;
 
-static constexpr uint16_t kPreserveTrxTransferLegacyProtocolVersion = 3;
-static constexpr uint16_t kPreserveTrxTransferProtocolVersion = 4;
+static constexpr uint16_t kPreserveTrxTransferProtocolVersion = 1;
 static constexpr uint16_t kPreserveTrxTransferLockPlanContractVersion =
     kPreservedTrxLockPlanContractVersion;
 static constexpr uint32_t PRESERVE_TRX_TRANSFER_STRICT_PREPARED_REDO = 1U << 0;
@@ -79,8 +79,6 @@ enum class Preserve_trx_transfer_artifact_decision {
 };
 
 extern bool preserve_trx_transfer_receiver_enable;
-extern char *preserve_trx_transfer_allowed_source_uuid;
-extern char *preserve_trx_transfer_target_server_uuid;
 extern char *preserve_trx_transfer_target_host;
 extern uint preserve_trx_transfer_target_port;
 extern char *preserve_trx_transfer_target_socket;
@@ -130,8 +128,6 @@ std::string preserve_trx_transfer_receiver_last_failed_reason_status();
 uint64_t preserve_trx_transfer_receiver_active_epochs_status();
 uint64_t preserve_trx_transfer_receiver_expired_epochs_status();
 
-bool preserve_trx_transfer_tls_identity_config_is_valid_for_unit_test(
-    bool unix_socket, const std::string &ssl_ca, const std::string &ssl_capath);
 bool preserve_trx_transfer_credential_file_metadata_is_secure_for_unit_test(
     uint64_t mode, uint64_t owner_uid, uint64_t effective_uid);
 bool preserve_trx_transfer_read_credential_secret_file_for_unit_test(
@@ -142,6 +138,34 @@ uint64_t preserve_trx_transfer_receiver_auto_prewarm_ready_tokens_status();
 uint64_t preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens_status();
 uint64_t preserve_trx_transfer_receiver_auto_prewarm_last_status();
 uint64_t preserve_trx_transfer_receiver_ready_monotonic_us_status();
+uint64_t
+preserve_trx_transfer_receiver_final_metadata_accepted_monotonic_us_status();
+uint64_t
+preserve_trx_transfer_receiver_terminal_commit_admitted_monotonic_us_status();
+uint64_t
+preserve_trx_transfer_receiver_ready_after_final_metadata_accepted_us_status();
+uint64_t
+preserve_trx_transfer_receiver_ready_after_terminal_commit_admitted_us_status();
+uint64_t preserve_trx_transfer_receiver_admitted_frames_status();
+uint64_t preserve_trx_transfer_receiver_admitted_bytes_status();
+uint64_t preserve_trx_transfer_source_handoff_pending_epochs_status();
+uint64_t preserve_trx_transfer_source_commit_unknown_epochs_status();
+uint64_t preserve_trx_transfer_source_restore_guard_rejects_status();
+void preserve_trx_transfer_note_source_handoff_pending();
+void preserve_trx_transfer_note_source_handoff_committed();
+void preserve_trx_transfer_note_source_commit_unknown(uint64_t token_count,
+                                                      uint64_t retained_bytes);
+void preserve_trx_transfer_note_source_restore_guard_reject();
+uint64_t preserve_trx_transfer_receiver_terminal_cas_wins_status();
+uint64_t preserve_trx_transfer_receiver_terminal_cas_duplicates_status();
+uint64_t preserve_trx_transfer_receiver_terminal_cas_conflicts_status();
+uint64_t preserve_trx_transfer_receiver_terminal_status_tombstones_status();
+uint64_t
+preserve_trx_transfer_receiver_terminal_status_tombstone_expiries_status();
+uint64_t preserve_trx_transfer_quarantine_epochs_status();
+uint64_t preserve_trx_transfer_quarantine_tokens_status();
+uint64_t preserve_trx_transfer_quarantine_bytes_status();
+uint64_t preserve_trx_transfer_quarantine_oldest_age_us_status();
 uint64_t preserve_trx_transfer_receiver_first_frame_monotonic_us_status();
 uint64_t preserve_trx_transfer_receiver_last_object_seal_monotonic_us_status();
 uint64_t preserve_trx_transfer_receiver_prewarm_start_monotonic_us_status();
@@ -244,8 +268,103 @@ enum class Preserve_trx_transfer_status {
   COMMITTED_NOT_READY = 7,
   COMMITTED_CORRUPT = 8,
   ACK_UNCERTAIN = 9,
-  LOCK_PLAN_STALE = 10
+  LOCK_PLAN_STALE = 10,
+  NOT_COMMITTED = 11,
+  NOT_COMMITTED_CLEAN = 12
 };
+
+enum class Preserve_trx_transfer_password_status {
+  OK = 0,
+  INVALID_ARGUMENT,
+  UNAUTHORIZED,
+  WRONG_ROLE,
+  FEATURE_DISABLED,
+  RESOURCE_EXHAUSTED
+};
+
+enum class Preserve_trx_handoff_resolution : uint8_t {
+  RECEIVER_FENCED_SOURCE_OWNS,
+  SOURCE_FENCED_RECEIVER_OWNS
+};
+
+struct Preserve_trx_handoff_resolution_context {
+  std::string epoch_id;
+  std::array<unsigned char, kPreservedTrxSha256Length> final_fact_digest{};
+  std::string source_process_generation;
+  std::string receiver_process_generation;
+};
+
+struct Preserve_trx_handoff_resolution_proof {
+  std::string epoch_id;
+  std::array<unsigned char, kPreservedTrxSha256Length> final_fact_digest{};
+  std::string source_process_generation;
+  std::string receiver_process_generation;
+  uint64_t ha_role_generation{0};
+  Preserve_trx_handoff_resolution resolution{
+      Preserve_trx_handoff_resolution::RECEIVER_FENCED_SOURCE_OWNS};
+};
+
+class Preserve_trx_ha_control_capability {
+ public:
+  Preserve_trx_ha_control_capability() = default;
+
+ private:
+  explicit Preserve_trx_ha_control_capability(uint64_t role_generation)
+      : m_role_generation(role_generation) {}
+  bool valid() const { return m_role_generation != 0; }
+  uint64_t role_generation() const { return m_role_generation; }
+
+  uint64_t m_role_generation{0};
+
+  friend Preserve_trx_transfer_password_status
+  preserved_trx_transfer_set_runtime_password(
+      const Preserve_trx_ha_control_capability &, const unsigned char *,
+      size_t);
+  friend Preserve_trx_transfer_password_status
+  preserved_trx_transfer_clear_runtime_password(
+      const Preserve_trx_ha_control_capability &);
+  friend class Preserve_trx_handoff_resolution_state;
+  friend Preserve_trx_transfer_status preserved_trx_resolve_handoff_unknown(
+      const Preserve_trx_ha_control_capability &,
+      const Preserve_trx_handoff_resolution_proof &);
+  friend Preserve_trx_ha_control_capability
+  preserve_trx_transfer_make_ha_control_capability_for_unit_test(
+      uint64_t role_generation);
+};
+
+class Preserve_trx_handoff_resolution_state {
+ public:
+  bool arm(const Preserve_trx_handoff_resolution_context &context);
+  Preserve_trx_transfer_status begin(
+      const Preserve_trx_ha_control_capability &capability,
+      const Preserve_trx_handoff_resolution_proof &proof,
+      bool *first_decision);
+  bool complete(const Preserve_trx_handoff_resolution_proof &proof,
+                Preserve_trx_transfer_status result);
+  bool matches_context(
+      const Preserve_trx_handoff_resolution_proof &proof) const;
+
+ private:
+  mutable std::mutex m_mutex;
+  bool m_armed{false};
+  bool m_started{false};
+  bool m_completed{false};
+  Preserve_trx_handoff_resolution_context m_context;
+  Preserve_trx_handoff_resolution_proof m_accepted_proof;
+  Preserve_trx_transfer_status m_result{
+      Preserve_trx_transfer_status::UNSUPPORTED};
+};
+
+Preserve_trx_transfer_password_status
+preserved_trx_transfer_set_runtime_password(
+    const Preserve_trx_ha_control_capability &capability,
+    const unsigned char *password, size_t password_length);
+Preserve_trx_transfer_password_status
+preserved_trx_transfer_clear_runtime_password(
+    const Preserve_trx_ha_control_capability &capability);
+Preserve_trx_transfer_status preserved_trx_resolve_handoff_unknown(
+    const Preserve_trx_ha_control_capability &capability,
+    const Preserve_trx_handoff_resolution_proof &proof);
 
 /*
   COMMITTED_* describes acceptance by the current receiver mysqld process.
@@ -339,6 +458,7 @@ enum class Preserve_trx_transfer_strict_eligibility_status : uint8_t {
 };
 
 enum class Preserve_trx_transfer_frame_type : uint16_t {
+  OPEN_EPOCH = 11,
   BEGIN = 1,
   OBJECT_CHUNK = 2,
   SEAL_OBJECT = 3,
@@ -348,7 +468,8 @@ enum class Preserve_trx_transfer_frame_type : uint16_t {
   PROMOTION_GATE_EPOCH = 7,
   DECLARE_TOKEN = 8,
   DECLARE_OBJECT = 9,
-  QUERY_EPOCH_STATUS = 10
+  QUERY_EPOCH_STATUS = 10,
+  ABANDON_EPOCH_IF_NOT_COMMITTED = 12
 };
 
 struct Preserve_trx_transfer_lock_plan_contract {
@@ -396,14 +517,12 @@ struct Preserve_trx_transfer_object_payload {
 
 struct Preserve_trx_transfer_manifest {
   /*
-    Portable manifest for one token. It intentionally describes transfer
-    objects and endpoint identity only; snapshot TLVs and engine semantics stay
-    inside the existing Preserved_trx_bundle codec.
+    Portable manifest for one token. Endpoint authentication and receiver
+    process identity are bound by OPEN_EPOCH and are not repeated per token.
+    Snapshot TLVs and engine semantics stay inside the existing bundle codec.
   */
   uint16_t protocol_version{kPreserveTrxTransferProtocolVersion};
   std::string epoch_id;
-  std::string source_server_uuid;
-  std::string target_server_uuid;
   uint64_t token{0};
   uint64_t frame_sequence{0};
   uint64_t source_prepare_lsn{0};
@@ -428,8 +547,6 @@ struct Preserve_trx_transfer_trx_id_store_fact {
 
 struct Preserve_trx_transfer_epoch_fact {
   std::string epoch_id;
-  std::string source_server_uuid;
-  std::string target_server_uuid;
   uint64_t source_fence_lsn{0};
   Preserve_trx_transfer_trx_id_store_fact trx_id_store;
   std::vector<Preserve_trx_transfer_epoch_fact_token> tokens;
@@ -449,22 +566,25 @@ struct Preserve_trx_transfer_frame {
   uint16_t protocol_version{kPreserveTrxTransferProtocolVersion};
   uint64_t sequence{0};
   std::string epoch_id;
+  std::string receiver_process_nonce;
   uint64_t token{0};
   std::string object_id;
   uint64_t chunk_offset{0};
   Preserve_trx_transfer_trx_id_store_fact trx_id_store;
+  uint64_t requested_terminal_status_retention_us{0};
+  std::array<unsigned char, kPreservedTrxSha256Length> terminal_fact_digest{};
   std::string manifest_payload;
   std::string chunk_payload;
   std::string reason;
 };
 
 struct Preserve_trx_transfer_frame_ack {
-  std::string source_incarnation_id;
   std::string epoch_id;
+  std::string receiver_process_nonce;
   uint64_t sequence{0};
   std::array<unsigned char, kPreservedTrxSha256Length> frame_digest{};
   Preserve_trx_transfer_status status{Preserve_trx_transfer_status::OK};
-  std::array<unsigned char, kPreservedTrxSha256Length> hmac{};
+  uint64_t accepted_terminal_status_retention_us{0};
 };
 
 enum class Preserve_trx_transfer_receiver_state {
@@ -488,8 +608,6 @@ struct Preserve_trx_transfer_receiver_record {
   uint64_t token{0};
   uint16_t protocol_version{kPreserveTrxTransferProtocolVersion};
   uint32_t strict_eligibility_flags{0};
-  std::string source_server_uuid;
-  std::string target_server_uuid;
   uint64_t source_prepare_lsn{0};
   uint64_t source_epoch_commit_lsn{0};
   Preserve_trx_transfer_receiver_state state{
@@ -526,8 +644,6 @@ enum class Preserve_trx_receiver_promotion_lease_status : uint8_t {
 struct Preserve_trx_transfer_accepted_epoch {
   std::string root_dir;
   std::string epoch_id;
-  std::string source_server_uuid;
-  std::string target_server_uuid;
   std::string receiver_process_generation;
   uint64_t source_fence_lsn{0};
   std::vector<uint64_t> tokens;
@@ -537,6 +653,46 @@ struct Preserve_trx_transfer_accepted_epoch {
       Preserve_trx_transfer_epoch_lifecycle::PREWARMING};
   uint64_t deadline_monotonic_us{0};
   bool flat_projection_published{false};
+};
+
+enum class Preserve_trx_transfer_epoch_terminal_operation : uint8_t {
+  NONE,
+  COMMIT,
+  ABANDON
+};
+
+enum class Preserve_trx_transfer_epoch_terminal_outcome : uint8_t {
+  NOT_COMMITTED,
+  ABANDONING,
+  COMMITTED,
+  NOT_COMMITTED_CLEAN,
+  CORRUPT,
+  EPOCH_NOT_FOUND
+};
+
+struct Preserve_trx_transfer_epoch_terminal_request {
+  std::string root_dir;
+  std::string epoch_id;
+  std::string receiver_process_generation;
+  std::string authenticated_principal;
+  std::string operation_id;
+  std::array<unsigned char, kPreservedTrxSha256Length> fact_digest{};
+  uint64_t now_us{0};
+  uint64_t retention_us{0};
+};
+
+struct Preserve_trx_transfer_epoch_terminal_status {
+  Preserve_trx_transfer_epoch_terminal_operation operation{
+      Preserve_trx_transfer_epoch_terminal_operation::NONE};
+  Preserve_trx_transfer_epoch_terminal_outcome outcome{
+      Preserve_trx_transfer_epoch_terminal_outcome::EPOCH_NOT_FOUND};
+  std::string receiver_process_generation;
+  std::string receiver_process_nonce;
+  std::string authenticated_principal;
+  std::string operation_id;
+  std::array<unsigned char, kPreservedTrxSha256Length> fact_digest{};
+  uint64_t terminal_cas_monotonic_us{0};
+  uint64_t retire_after_us{0};
 };
 
 struct Preserve_trx_transfer_payload_apply_reservation {
@@ -549,10 +705,18 @@ class Preserve_trx_transfer_receiver_registry {
  public:
   ~Preserve_trx_transfer_receiver_registry();
 
-  Preserve_trx_transfer_status declare_token(
-      const std::string &epoch_id, uint64_t token,
-      const std::string &source_server_uuid,
-      const std::string &target_server_uuid);
+  Preserve_trx_transfer_status open_online_epoch(
+      const std::string &epoch_id, const std::string &authenticated_principal,
+      uint64_t requested_terminal_status_retention_us,
+      const std::string &receiver_process_nonce,
+      uint64_t *accepted_terminal_status_retention_us);
+  Preserve_trx_transfer_status validate_online_epoch(
+      const std::string &epoch_id, const std::string &authenticated_principal,
+      const std::string &receiver_process_nonce,
+      uint64_t *accepted_terminal_status_retention_us = nullptr) const;
+
+  Preserve_trx_transfer_status declare_token(const std::string &epoch_id,
+                                             uint64_t token);
 
   Preserve_trx_transfer_status begin_receive(
       const Preserve_trx_transfer_manifest &manifest,
@@ -561,20 +725,20 @@ class Preserve_trx_transfer_receiver_registry {
       const std::string &epoch_id, uint64_t token,
       const Preserve_trx_transfer_object_descriptor &descriptor);
 
-  Preserve_trx_transfer_status stage_strict_v4_object_chunk(
+  Preserve_trx_transfer_status stage_strict_v1_object_chunk(
       const Preserve_trx_transfer_manifest &manifest,
       const std::string &object_id, uint64_t chunk_offset,
       const std::string &chunk_payload);
-  Preserve_trx_transfer_status seal_strict_v4_object(
+  Preserve_trx_transfer_status seal_strict_v1_object(
       const Preserve_trx_transfer_manifest &manifest,
       const std::string &object_id);
-  Preserve_trx_transfer_status read_strict_v4_object(
+  Preserve_trx_transfer_status read_strict_v1_object(
       const Preserve_trx_transfer_manifest &manifest,
       const std::string &object_id,
       std::shared_ptr<const std::string> *payload) const;
-  void erase_strict_v4_object(const std::string &epoch_id, uint64_t token,
+  void erase_strict_v1_object(const std::string &epoch_id, uint64_t token,
                               const std::string &object_id);
-  void erase_strict_v4_token_objects(const std::string &epoch_id,
+  void erase_strict_v1_token_objects(const std::string &epoch_id,
                                      uint64_t token);
 
   Preserve_trx_transfer_status mark_saved_online(const std::string &epoch_id,
@@ -596,6 +760,19 @@ class Preserve_trx_transfer_receiver_registry {
   Preserve_trx_transfer_status query_accepted_epoch(
       const std::string &root_dir, const std::string &epoch_id,
       Preserve_trx_transfer_accepted_epoch *accepted = nullptr) const;
+  Preserve_trx_transfer_epoch_terminal_outcome query_epoch_terminal(
+      const std::string &root_dir, const std::string &epoch_id,
+      Preserve_trx_transfer_epoch_terminal_status *terminal = nullptr) const;
+  Preserve_trx_transfer_status query_epoch_terminal_authenticated(
+      const std::string &root_dir, const std::string &epoch_id,
+      const std::string &authenticated_principal,
+      const std::string &receiver_process_nonce,
+      const std::array<unsigned char, kPreservedTrxSha256Length> &fact_digest,
+      Preserve_trx_transfer_epoch_terminal_status *terminal = nullptr) const;
+  Preserve_trx_transfer_epoch_terminal_outcome try_begin_epoch_abandon(
+      const Preserve_trx_transfer_epoch_terminal_request &request);
+  Preserve_trx_transfer_epoch_terminal_outcome complete_epoch_abandon(
+      const Preserve_trx_transfer_epoch_terminal_request &request);
   bool accepted_epoch_is_live(const std::string &root_dir,
                               const std::string &epoch_id) const;
   bool accepted_epoch_is_expired(const std::string &root_dir,
@@ -723,26 +900,47 @@ class Preserve_trx_transfer_receiver_registry {
     uint64_t next_retry_us{0};
     uint attempts{0};
   };
-  struct Strict_v4_object {
+  struct Strict_v1_object {
     Preserve_trx_transfer_object_descriptor descriptor;
     std::shared_ptr<std::string> payload;
     bool sealed{false};
   };
-  std::map<Token_key, std::map<std::string, Strict_v4_object>>
-      m_strict_v4_objects;
+  std::map<Token_key, std::map<std::string, Strict_v1_object>>
+      m_strict_v1_objects;
   std::map<Token_key, Cleanup_debt> m_cleanup_debts;
   uint64_t m_last_failed_token{0};
   std::string m_last_failed_reason;
+  struct Online_epoch {
+    std::string receiver_process_nonce;
+    std::string authenticated_principal;
+    uint64_t requested_terminal_status_retention_us{0};
+    uint64_t accepted_terminal_status_retention_us{0};
+  };
+  std::map<std::string, Online_epoch> m_online_epochs;
   struct Acknowledged_epoch {
     std::string root_dir;
+    std::string receiver_process_generation;
+    std::string receiver_process_nonce;
+    std::string authenticated_principal;
+    std::string terminal_operation_id;
+    Preserve_trx_transfer_epoch_terminal_operation terminal_operation{
+        Preserve_trx_transfer_epoch_terminal_operation::NONE};
+    Preserve_trx_transfer_epoch_terminal_outcome terminal_outcome{
+        Preserve_trx_transfer_epoch_terminal_outcome::NOT_COMMITTED};
+    std::array<unsigned char, kPreservedTrxSha256Length> fact_digest{};
+    uint64_t terminal_cas_monotonic_us{0};
     uint64_t retire_after_us{0};
-    bool spool_deleted{false};
   };
   std::map<std::string, Acknowledged_epoch> m_acknowledged_epochs;
   std::map<std::string, Preserve_trx_transfer_accepted_epoch>
       m_accepted_epochs;
   uint64_t m_expired_epoch_count{0};
 };
+
+Preserve_trx_transfer_epoch_terminal_outcome
+preserve_trx_transfer_abandon_receiver_epoch_if_not_committed(
+    const Preserve_trx_transfer_epoch_terminal_request &request,
+    Preserve_trx_transfer_receiver_registry *registry);
 
 Preserve_trx_transfer_status preserve_trx_transfer_encode_manifest(
     const Preserve_trx_transfer_manifest &manifest, std::string *encoded);
@@ -778,24 +976,22 @@ Preserve_trx_transfer_status preserve_trx_transfer_decode_frame_batch(
 
 Preserve_trx_transfer_status
 preserve_trx_transfer_validate_online_payload_identity(
-    const std::string &encoded_payload, std::string *source_incarnation_id,
+    const std::string &encoded_payload, std::string *receiver_process_nonce,
     std::string *epoch_id, uint64_t *last_sequence);
 
 Preserve_trx_transfer_status preserve_trx_transfer_build_frame_ack(
-    const std::string &source_incarnation_id,
+    const std::string &receiver_process_nonce,
     const std::string &encoded_payload, Preserve_trx_transfer_status status,
     Preserve_trx_transfer_frame_ack *ack);
 Preserve_trx_transfer_status preserve_trx_transfer_encode_frame_ack(
     const Preserve_trx_transfer_frame_ack &ack, std::string *encoded);
 Preserve_trx_transfer_status preserve_trx_transfer_verify_frame_ack(
     const std::string &encoded_ack,
-    const std::string &expected_source_incarnation_id,
+    const std::string &expected_receiver_process_nonce,
     const std::string &encoded_payload, Preserve_trx_transfer_frame_ack *ack);
 
 Preserve_trx_transfer_status preserve_trx_transfer_validate_receiver_manifest(
-    const Preserve_trx_transfer_manifest &manifest,
-    const std::string &allowed_source_server_uuid,
-    const std::string &local_target_server_uuid);
+    const Preserve_trx_transfer_manifest &manifest);
 
 Preserve_trx_transfer_status
 preserve_trx_transfer_validate_receiver_manifest_from_config(
@@ -808,8 +1004,7 @@ Preserve_trx_transfer_status preserve_trx_transfer_decode_portable_bundle(
     const std::string &encoded, Preserved_trx_bundle *bundle);
 
 Preserve_trx_transfer_status preserve_trx_transfer_build_portable_objects(
-    const std::string &epoch_id, const std::string &source_server_uuid,
-    const std::string &target_server_uuid, const Preserved_trx_bundle &bundle,
+    const std::string &epoch_id, const Preserved_trx_bundle &bundle,
     uint64_t transfer_token, Preserve_trx_transfer_manifest *manifest,
     std::vector<Preserve_trx_transfer_object_payload> *objects,
     const Preserve_trx_resurrection_index_entry *resurrection_entry = nullptr);
@@ -821,8 +1016,7 @@ Preserve_trx_transfer_status preserve_trx_transfer_build_frame_sequence(
 
 Preserve_trx_transfer_status
 preserve_trx_transfer_build_encoded_frame_sequence(
-    const std::string &epoch_id, const std::string &source_server_uuid,
-    const std::string &target_server_uuid, const Preserved_trx_bundle &bundle,
+    const std::string &epoch_id, const Preserved_trx_bundle &bundle,
     uint64_t transfer_token, uint32_t chunk_bytes,
     std::vector<std::string> *encoded_frames,
     Preserve_trx_transfer_manifest *manifest = nullptr);
@@ -838,6 +1032,21 @@ class Preserve_trx_transfer_encoded_frame_sink {
     (void)session_index;
     return send_encoded_frame(encoded_frame);
   }
+  virtual Preserve_trx_transfer_status open_epoch_transport(
+      const std::string &epoch_id,
+      uint64_t requested_terminal_status_retention_us,
+      uint64_t absolute_monotonic_deadline_us,
+      std::string *receiver_process_nonce,
+      uint64_t *accepted_terminal_status_retention_us) {
+    (void)epoch_id;
+    (void)requested_terminal_status_retention_us;
+    (void)absolute_monotonic_deadline_us;
+    if (receiver_process_nonce != nullptr) receiver_process_nonce->clear();
+    if (accepted_terminal_status_retention_us != nullptr) {
+      *accepted_terminal_status_retention_us = 0;
+    }
+    return Preserve_trx_transfer_status::OK;
+  }
   virtual void set_operation_timeout_ms(uint timeout_ms) {
     (void)timeout_ms;
   }
@@ -846,11 +1055,14 @@ class Preserve_trx_transfer_encoded_frame_sink {
 };
 
 using Preserve_trx_transfer_source_final_ack_arbiter = bool (*)(void *);
+using Preserve_trx_transfer_source_before_commit_send = bool (*)(void *);
 
 struct Preserve_trx_transfer_source_epoch_options {
   uint32_t chunk_bytes{0};
   uint64_t max_inflight_bytes{0};
   uint64_t phase1_batch_bytes{0};
+  Preserve_trx_transfer_source_before_commit_send before_commit_send{nullptr};
+  void *before_commit_send_context{nullptr};
   Preserve_trx_transfer_source_final_ack_arbiter final_ack_arbiter{nullptr};
   void *final_ack_arbiter_context{nullptr};
 };
@@ -858,16 +1070,17 @@ struct Preserve_trx_transfer_source_epoch_options {
 class Preserve_trx_transfer_source_epoch_session {
  public:
   Preserve_trx_transfer_source_epoch_session(
-      const std::string &epoch_id, const std::string &source_server_uuid,
-      const std::string &target_server_uuid, uint32_t chunk_bytes,
+      const std::string &epoch_id, uint32_t chunk_bytes,
       Preserve_trx_transfer_encoded_frame_sink *sink);
   Preserve_trx_transfer_source_epoch_session(
-      const std::string &epoch_id, const std::string &source_server_uuid,
-      const std::string &target_server_uuid,
+      const std::string &epoch_id,
       const Preserve_trx_transfer_source_epoch_options &options,
       Preserve_trx_transfer_encoded_frame_sink *sink);
 
   Preserve_trx_transfer_status declare_token(uint64_t transfer_token);
+  Preserve_trx_transfer_status open_epoch(
+      uint64_t requested_terminal_status_retention_us,
+      uint64_t absolute_monotonic_deadline_us);
   Preserve_trx_transfer_status declare_tokens_batch(
       const std::vector<uint64_t> &transfer_tokens);
   Preserve_trx_transfer_status declare_object(
@@ -917,11 +1130,14 @@ class Preserve_trx_transfer_source_epoch_session {
   Preserve_trx_transfer_status abort_epoch(const std::string &reason);
   Preserve_trx_transfer_status commit_epoch();
   std::string epoch_id() const { return m_epoch_id; }
-  std::string source_server_uuid() const { return m_source_server_uuid; }
-  std::string target_server_uuid() const { return m_target_server_uuid; }
   uint32_t chunk_bytes() const { return m_chunk_bytes; }
   uint64_t max_inflight_bytes() const { return m_max_inflight_bytes; }
   uint64_t phase1_batch_bytes() const { return m_phase1_batch_bytes; }
+  std::string receiver_process_nonce() const {
+    std::lock_guard<std::mutex> guard(m_mutex);
+    return m_receiver_process_nonce;
+  }
+  Preserve_trx_handoff_resolution_context handoff_resolution_context() const;
   void set_operation_timeout_ms(uint timeout_ms) {
     std::lock_guard<std::mutex> guard(m_mutex);
     if (!m_commit_in_progress && m_sink != nullptr) {
@@ -946,6 +1162,8 @@ class Preserve_trx_transfer_source_epoch_session {
       bool queue_final_metadata);
   Preserve_trx_transfer_status emit_frame_locked(
       Preserve_trx_transfer_frame frame, bool queue_final_metadata);
+  void stamp_online_epoch_context_locked(
+      Preserve_trx_transfer_frame *frame) const;
   Preserve_trx_transfer_status send_phase1_control_batches_locked(
       const std::vector<std::string> &encoded_frames,
       size_t *acknowledged_frame_count);
@@ -954,12 +1172,13 @@ class Preserve_trx_transfer_source_epoch_session {
                                                   bool allow_finalized);
 
   std::string m_epoch_id;
-  std::string m_source_server_uuid;
-  std::string m_target_server_uuid;
   uint32_t m_chunk_bytes{0};
   uint64_t m_max_inflight_bytes{0};
   uint64_t m_phase1_batch_bytes{0};
   Preserve_trx_transfer_encoded_frame_sink *m_sink{nullptr};
+  Preserve_trx_transfer_source_before_commit_send m_before_commit_send{
+      nullptr};
+  void *m_before_commit_send_context{nullptr};
   Preserve_trx_transfer_source_final_ack_arbiter m_final_ack_arbiter{nullptr};
   void *m_final_ack_arbiter_context{nullptr};
   uint64_t m_next_sequence{1};
@@ -968,6 +1187,14 @@ class Preserve_trx_transfer_source_epoch_session {
   bool m_commit_in_progress{false};
   bool m_phase1_metrics_enabled{false};
   bool m_ack_uncertain{false};
+  bool m_epoch_transport_open{false};
+  uint64_t m_requested_terminal_status_retention_us{0};
+  uint64_t m_absolute_monotonic_deadline_us{0};
+  std::string m_source_process_generation;
+  std::string m_receiver_process_nonce;
+  std::array<unsigned char, kPreservedTrxSha256Length>
+      m_terminal_fact_digest{};
+  uint64_t m_accepted_terminal_status_retention_us{0};
   std::set<uint64_t> m_declared_tokens;
   std::set<uint64_t> m_finalized_tokens;
   std::set<uint64_t> m_aborted_tokens;
@@ -1004,38 +1231,39 @@ Preserve_trx_transfer_status preserve_trx_transfer_stream_prebuilt_blobs_batch(
     uint64_t max_batch_bytes);
 
 struct Preserve_trx_transfer_client_endpoint {
-  std::string target_server_uuid;
   std::string host;
   uint port{0};
   std::string socket;
   std::string user;
   std::string credential_name;
+  std::string auth_plugin;
   uint operation_timeout_ms{0};
 };
 
 struct Preserve_trx_transfer_client_ops {
   Preserve_trx_transfer_status (*connect)(
       const Preserve_trx_transfer_client_endpoint &endpoint,
+      const unsigned char *password, size_t password_length,
       void **connection);
-  Preserve_trx_transfer_status (*send_frame)(void *connection,
-                                             const std::string &encoded_frame);
+  Preserve_trx_transfer_status (*send_frame)(
+      void *connection, const std::string &encoded_frame,
+      Preserve_trx_transfer_frame_ack *ack);
+  Preserve_trx_transfer_status (*set_operation_timeout)(
+      void *connection, uint operation_timeout_ms);
   void (*interrupt)(void *connection);
   void (*disconnect)(void *connection);
 };
 
 void preserve_trx_transfer_set_client_ops_for_unit_test(
     const Preserve_trx_transfer_client_ops *ops);
-std::string preserve_trx_transfer_qualify_epoch_id(
-    const std::string &epoch_id);
-std::string preserve_trx_transfer_source_incarnation_id_for_unit_test();
-std::string preserve_trx_transfer_qualify_epoch_id_for_unit_test(
-    const std::string &epoch_id);
-void preserve_trx_transfer_set_spool_short_write_for_unit_test(bool enabled);
-void preserve_trx_transfer_set_spool_sync_failure_for_unit_test(bool enabled);
-void preserve_trx_transfer_set_spool_rollback_failure_for_unit_test(
-    bool enabled);
-void preserve_trx_transfer_reset_spool_sync_count_for_unit_test();
-uint64_t preserve_trx_transfer_spool_sync_count_for_unit_test();
+void preserve_trx_transfer_reset_runtime_password_for_unit_test();
+size_t preserve_trx_transfer_cleanse_mysql_passwords_for_unit_test(
+    MYSQL *mysql);
+std::string preserve_trx_transfer_make_epoch_id(
+    const std::string &monotonic_epoch_id);
+std::string preserve_trx_transfer_source_epoch_boot_nonce_for_unit_test();
+std::string preserve_trx_transfer_make_epoch_id_for_unit_test(
+    const std::string &monotonic_epoch_id);
 void preserve_trx_transfer_set_staging_cleanup_failures_for_unit_test(
     uint failures);
 Preserve_trx_transfer_status
@@ -1187,8 +1415,7 @@ bool preserve_trx_transfer_receiver_object_proof_metadata_only_for_unit_test(
     const std::string &object_id);
 
 Preserve_trx_transfer_status preserve_trx_transfer_send_bundle_frames(
-    const std::string &epoch_id, const std::string &source_server_uuid,
-    const std::string &target_server_uuid, const Preserved_trx_bundle &bundle,
+    const std::string &epoch_id, const Preserved_trx_bundle &bundle,
     uint64_t transfer_token, uint32_t chunk_bytes,
     Preserve_trx_transfer_encoded_frame_sink *sink,
     Preserve_trx_transfer_manifest *manifest = nullptr,
@@ -1199,8 +1426,7 @@ Preserve_trx_transfer_status preserve_trx_transfer_send_epoch_begin_frames(
     Preserve_trx_transfer_encoded_frame_sink *sink, uint64_t *next_sequence);
 
 Preserve_trx_transfer_status preserve_trx_transfer_send_epoch_declare_token_frame(
-    const std::string &epoch_id, const std::string &source_server_uuid,
-    const std::string &target_server_uuid, uint64_t transfer_token,
+    const std::string &epoch_id, uint64_t transfer_token,
     Preserve_trx_transfer_encoded_frame_sink *sink, uint64_t *next_sequence);
 
 Preserve_trx_transfer_status preserve_trx_transfer_send_epoch_object_frames(
@@ -1214,8 +1440,7 @@ Preserve_trx_transfer_status preserve_trx_transfer_send_epoch_commit_frame(
     Preserve_trx_transfer_encoded_frame_sink *sink, uint64_t *next_sequence);
 
 Preserve_trx_transfer_status preserve_trx_transfer_send_epoch_bundles(
-    const std::string &epoch_id, const std::string &source_server_uuid,
-    const std::string &target_server_uuid,
+    const std::string &epoch_id,
     const std::vector<Preserved_trx_bundle> &bundles,
     const std::vector<uint64_t> &transfer_tokens, uint32_t chunk_bytes,
     Preserve_trx_transfer_encoded_frame_sink *sink,
@@ -1307,11 +1532,7 @@ Preserve_trx_transfer_status preserve_trx_transfer_handle_receiver_payload(
     uint64_t timeout_seconds,
     Preserve_snapshot_metadata *written_metadata = nullptr);
 
-/*
-  Historical name retained for compatibility. The callback runs after sequence
-  admission; strict-v4 phase-2 batches are process-local and need not be spooled.
-*/
-using Preserve_trx_transfer_after_spool_callback =
+using Preserve_trx_transfer_after_admission_callback =
     Preserve_trx_transfer_status (*)(void *context,
                                      bool contains_commit_epoch);
 
@@ -1325,8 +1546,8 @@ Preserve_trx_transfer_status preserve_trx_transfer_handle_receiver_payload_batch
     Preserved_trx_store *store, Preserve_trx_transfer_receiver_registry *registry,
     uint64_t timeout_seconds, uint worker_count,
     Preserve_snapshot_metadata *written_metadata = nullptr,
-    Preserve_trx_transfer_after_spool_callback after_spool = nullptr,
-    void *after_spool_context = nullptr,
+    Preserve_trx_transfer_after_admission_callback after_admission = nullptr,
+    void *after_admission_context = nullptr,
     Preserve_trx_transfer_commit_accepted_callback commit_accepted = nullptr,
     void *commit_accepted_context = nullptr);
 
@@ -1369,8 +1590,6 @@ class Preserve_trx_artifact_sink {
 */
 struct Preserve_trx_deferred_transfer_candidate {
   std::string epoch_id;
-  std::string source_server_uuid;
-  std::string target_server_uuid;
   uint64_t transfer_token{0};
   uint64_t timeout_seconds{0};
   Preserved_trx_bundle bundle;
@@ -1386,8 +1605,7 @@ struct Preserve_trx_deferred_transfer_candidate {
 };
 
 Preserve_snapshot_status preserve_trx_transfer_capture_deferred_candidate(
-    const std::string &epoch_id, const std::string &source_server_uuid,
-    const std::string &target_server_uuid, uint64_t transfer_token,
+    const std::string &epoch_id, uint64_t transfer_token,
     Preserved_trx_bundle bundle, uint64_t timeout_seconds,
     const Preserve_trx_resurrection_index_entry *resurrection_entry,
     Preserve_trx_deferred_transfer_candidate *candidate,
@@ -1430,15 +1648,12 @@ class Preserve_trx_transfer_artifact_sink final
     : public Preserve_trx_artifact_sink {
  public:
   Preserve_trx_transfer_artifact_sink(
-      std::string epoch_id, std::string source_server_uuid,
-      std::string target_server_uuid, uint64_t transfer_token,
+      std::string epoch_id, uint64_t transfer_token,
       uint32_t chunk_bytes,
       Preserve_trx_transfer_encoded_frame_sink *frame_sink,
       std::string preserve_dir = "",
       const Preserve_trx_resurrection_index_entry *resurrection_entry = nullptr)
       : m_epoch_id(std::move(epoch_id)),
-        m_source_server_uuid(std::move(source_server_uuid)),
-        m_target_server_uuid(std::move(target_server_uuid)),
         m_transfer_token(transfer_token),
         m_chunk_bytes(chunk_bytes),
         m_frame_sink(frame_sink),
@@ -1458,8 +1673,6 @@ class Preserve_trx_transfer_artifact_sink final
 
  private:
   std::string m_epoch_id;
-  std::string m_source_server_uuid;
-  std::string m_target_server_uuid;
   uint64_t m_transfer_token{0};
   uint32_t m_chunk_bytes{0};
   Preserve_trx_transfer_encoded_frame_sink *m_frame_sink{nullptr};
@@ -1521,8 +1734,7 @@ class Preserve_trx_standby_pending_artifact_sink final
 
 Preserve_snapshot_status preserve_trx_make_artifact_sink_for_decision(
     Preserve_trx_transfer_artifact_decision decision, Preserved_trx_store *store,
-    const std::string &epoch_id, const std::string &source_server_uuid,
-    const std::string &target_server_uuid, uint64_t transfer_token,
+    const std::string &epoch_id, uint64_t transfer_token,
     uint32_t chunk_bytes, Preserve_trx_transfer_encoded_frame_sink *frame_sink,
     std::unique_ptr<Preserve_trx_artifact_sink> *sink,
     Preserve_trx_transfer_source_epoch_session *source_epoch_session = nullptr,

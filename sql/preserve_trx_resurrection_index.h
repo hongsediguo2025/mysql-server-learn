@@ -21,7 +21,7 @@ enum class Preserve_trx_resurrection_index_status : uint8_t {
   OK = 0,
   INVALID_ARGUMENT,
   CORRUPT,
-  AUTHENTICATION_FAILED,
+  DIGEST_MISMATCH,
   UNSUPPORTED,
   RESOURCE_EXHAUSTED
 };
@@ -72,8 +72,7 @@ struct Preserve_trx_resurrection_index_entry {
 
 struct Preserve_trx_resurrection_index {
   uint16_t version{kPreserveTrxResurrectionIndexVersion};
-  std::string source_server_uuid;
-  std::string target_server_uuid;
+  std::string local_instance_identity;
   std::string epoch_id;
   std::vector<Preserve_trx_resurrection_index_entry> entries;
 };

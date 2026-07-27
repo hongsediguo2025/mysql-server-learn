@@ -26,6 +26,7 @@
 
 #include <stddef.h>
 
+#include <atomic>
 #include <memory>
 #include <string>
 #include <vector>
@@ -302,6 +303,35 @@ enum class Preserve_trx_reset_drain_result : uint8_t {
   RESET_JOINED,
   TOO_LATE,
   UNSUPPORTED
+};
+
+enum class Preserve_trx_drain_terminal : uint8_t {
+  RUNNING,
+  FINAL_METADATA_ACCEPTED_LOCAL,
+  HANDOFF_PENDING,
+  COMMIT_UNKNOWN,
+  SOURCE_RESTORE_PENDING,
+  SOURCE_RESTORED,
+  RESET_REQUESTED,
+  SHUTDOWN_HANDOFF
+};
+
+class Preserve_trx_drain_ownership_state {
+ public:
+  Preserve_trx_drain_terminal state() const;
+  bool request_reset();
+  bool begin_commit_send();
+  bool mark_commit_unknown();
+  bool resolve_not_committed_clean();
+  bool begin_source_restore();
+  bool complete_source_restore();
+  bool acknowledge_commit();
+  bool shutdown_without_commit();
+  bool restore_allowed() const;
+
+ private:
+  std::atomic<Preserve_trx_drain_terminal> m_state{
+      Preserve_trx_drain_terminal::RUNNING};
 };
 
 enum class Preserve_trx_command_block_result {

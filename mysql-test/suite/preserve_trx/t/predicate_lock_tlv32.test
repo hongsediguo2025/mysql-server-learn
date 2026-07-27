@@ -56,9 +56,9 @@ open(my $fh, '<:raw', $path) or die "cannot open snapshot $path: $!";
 my $bytes = do { local $/; <$fh> };
 close($fh);
 
-die "snapshot too short\n" if length($bytes) < 552;
+die "snapshot too short\n" if length($bytes) < 520;
 my $payload_size = unpack('Q<', substr($bytes, 48, 8));
-my $offset = 552;
+my $offset = 520;
 my $end = $offset + $payload_size;
 die "snapshot payload extends past file\n" if $end > length($bytes);
 

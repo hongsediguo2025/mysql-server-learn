@@ -2,7 +2,7 @@
 
 --let $PRESERVE_TRX_DIR= `SELECT @@global.preserve_trx_dir`
 --let $TRANSFER_EPOCH_DIR= $PRESERVE_TRX_DIR/.transfer/restart-epoch/9001
---let $TRANSFER_SPOOL= $TRANSFER_EPOCH_DIR/receiver.frames
+--let $TRANSFER_STAGED_OBJECT= $TRANSFER_EPOCH_DIR/snapshot.part
 --let $STANDBY_MARKER= $PRESERVE_TRX_DIR/9001.standby_pending
 --let $SNAPSHOT_FILE= $PRESERVE_TRX_DIR/9001.bin
 --let $RECORD_LOCK_BLOB= $PRESERVE_TRX_DIR/9001.blob.record_locks
@@ -13,7 +13,7 @@
 --let $EPOCH_COMMIT= $PRESERVE_TRX_DIR/.transfer/restart-epoch/epoch.commit
 
 --exec mkdir -p "$TRANSFER_EPOCH_DIR"
---exec echo frame > "$TRANSFER_SPOOL"
+--exec echo staged-object > "$TRANSFER_STAGED_OBJECT"
 --exec echo standby_pending > "$STANDBY_MARKER"
 --exec echo snapshot > "$SNAPSHOT_FILE"
 --exec echo record_locks > "$RECORD_LOCK_BLOB"

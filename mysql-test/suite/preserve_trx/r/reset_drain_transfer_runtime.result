@@ -12,7 +12,7 @@ SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_expired_epochs')
 - @receiver_expired_before AS receiver_expired_delta;
 receiver_expired_delta
-1
+0
 SELECT GROUP_CONCAT(CONCAT(id, ':', v) ORDER BY id) AS committed_values
 FROM t_reset_drain_transfer_runtime;
 committed_values

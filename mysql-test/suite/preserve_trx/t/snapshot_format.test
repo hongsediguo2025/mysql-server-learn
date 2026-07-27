@@ -17,9 +17,8 @@ my $key = File::Spec->catfile($dir, '.key');
 die "preserve dir missing: $dir" unless -d $dir;
 print "preserve dir exists\n";
 
-my @stat = stat($key) or die "preserve key missing: $key";
-printf ".key mode %04o\n", $stat[2] & 0777;
-print ".key size $stat[7]\n";
+die "obsolete preserve key exists: $key" if -e $key || -l $key;
+print "no preserve key\n";
 
 opendir(my $dh, $dir) or die "cannot open preserve dir: $!";
 my @tmp = grep { /\.tmp$/ } readdir($dh);

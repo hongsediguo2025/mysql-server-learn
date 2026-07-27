@@ -50,16 +50,12 @@ INSERT INTO t_snapshot_header_corrupt_matrix VALUES(1,10);
 --let $corrupt_offset= 100
 --source suite/preserve_trx/include/snapshot_header_corrupt_failclosed_once.inc
 
---let $snapshot_corrupt_label= hmac
+--let $snapshot_corrupt_label= crc
 --let $corrupt_offset= 516
 --source suite/preserve_trx/include/snapshot_header_corrupt_failclosed_once.inc
 
---let $snapshot_corrupt_label= crc
---let $corrupt_offset= 548
---source suite/preserve_trx/include/snapshot_header_corrupt_failclosed_once.inc
-
 --let $snapshot_corrupt_label= first tlv byte
---let $corrupt_offset= 552
+--let $corrupt_offset= 520
 --source suite/preserve_trx/include/snapshot_header_corrupt_failclosed_once.inc
 
 SELECT * FROM t_snapshot_header_corrupt_matrix ORDER BY id;

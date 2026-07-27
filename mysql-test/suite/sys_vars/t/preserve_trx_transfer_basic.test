@@ -1,8 +1,6 @@
 --disable_query_log
 --disable_result_log
 SELECT @@GLOBAL.preserve_trx_transfer_receiver_enable;
-SELECT @@GLOBAL.preserve_trx_transfer_allowed_source_uuid;
-SELECT @@GLOBAL.preserve_trx_transfer_target_server_uuid;
 SELECT @@GLOBAL.preserve_trx_transfer_target_host;
 SELECT @@GLOBAL.preserve_trx_transfer_target_port;
 SELECT @@GLOBAL.preserve_trx_transfer_target_socket;
@@ -40,10 +38,6 @@ WHERE VARIABLE_NAME IN (
 --disable_result_log
 --error ER_WRONG_ARGUMENTS
 SET @@GLOBAL.preserve_trx_transfer_receiver_enable=ON;
---error ER_INCORRECT_GLOBAL_LOCAL_VAR
-SET @@GLOBAL.preserve_trx_transfer_allowed_source_uuid='source-uuid';
---error ER_INCORRECT_GLOBAL_LOCAL_VAR
-SET @@GLOBAL.preserve_trx_transfer_target_server_uuid='target-uuid';
 --error ER_INCORRECT_GLOBAL_LOCAL_VAR
 SET @@GLOBAL.preserve_trx_transfer_target_host='127.0.0.1';
 --error ER_INCORRECT_GLOBAL_LOCAL_VAR

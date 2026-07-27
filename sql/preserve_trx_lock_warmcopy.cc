@@ -146,7 +146,7 @@ void attach_record_store_contract(
               blob->record_store_fingerprint.size());
 
   std::string commitment;
-  commitment.append("PRESERVE_LOCK_PLAN_LIVE_V2", 26);
+  commitment.append("PRESERVE_LOCK_PLAN_LIVE_PRODUCT_V1", 34);
   append_le16(&commitment, blob->lock_plan_contract_version);
   append_le32(&commitment, fence.shard_count);
   append_le64(&commitment, fence.total_mutation_generation);

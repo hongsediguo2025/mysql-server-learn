@@ -29,7 +29,7 @@ enum class Preserve_trx_internal_operation : uint8_t {
 };
 
 struct Mysql_binlog_preserve_token_identity {
-  std::string source_uuid;
+  std::string epoch_scope;
   std::string epoch_id;
   std::string token;
   std::string target_boot_incarnation;
@@ -43,8 +43,8 @@ class Preserve_trx_internal_operation_capability {
                const Mysql_binlog_preserve_token_identity &identity,
                uint64_t binlog_incarnation, uint64_t key_generation) const {
     return m_operation == operation &&
-           !m_identity.source_uuid.empty() &&
-           m_identity.source_uuid == identity.source_uuid &&
+           !m_identity.epoch_scope.empty() &&
+           m_identity.epoch_scope == identity.epoch_scope &&
            m_identity.epoch_id == identity.epoch_id &&
            m_identity.token == identity.token &&
            m_identity.target_boot_incarnation ==

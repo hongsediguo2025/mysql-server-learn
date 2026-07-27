@@ -58,8 +58,8 @@ sysopen(my $fh, $path, O_RDWR) or die "cannot open $path: $!";
 binmode($fh);
 
 my $bytes = do { local $/; <$fh> };
-die "snapshot too small" unless length($bytes) > 552;
-my $offset = 552;
+die "snapshot too small" unless length($bytes) > 520;
+my $offset = 520;
 my $found;
 while ($offset + 6 <= length($bytes)) {
   my $tag = unpack('v', substr($bytes, $offset, 2));

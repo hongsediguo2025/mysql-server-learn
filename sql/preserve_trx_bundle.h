@@ -33,35 +33,19 @@
 
 class THD;
 
-static constexpr size_t kPreservedTrxKeyLength = 32;
 static constexpr size_t kPreservedTrxSha256Length = 32;
-static constexpr uint16_t kPreservedTrxLockPlanContractVersion = 2;
+static constexpr uint16_t kPreservedTrxLockPlanContractVersion = 1;
 static constexpr size_t kPreservedTrxRecoveredCountOffset = 25;
-static constexpr size_t kPreservedTrxHmacOffset = 516;
-static constexpr size_t kPreservedTrxHmacLength = 32;
-static constexpr size_t kPreservedTrxCrcOffset = 548;
+static constexpr size_t kPreservedTrxCrcOffset = 516;
 static constexpr size_t kPreservedTrxCrcLength = 4;
-static constexpr size_t kPreservedTrxSnapshotHeaderLength = 552;
+static constexpr size_t kPreservedTrxSnapshotHeaderLength = 520;
 
-static_assert(kPreservedTrxHmacLength == kPreservedTrxSha256Length,
-              "HMAC length must match SHA-256 length");
-static_assert(kPreservedTrxHmacOffset + kPreservedTrxHmacLength ==
-                  kPreservedTrxCrcOffset,
-              "CRC field must follow HMAC field");
 static_assert(kPreservedTrxCrcOffset + kPreservedTrxCrcLength ==
                   kPreservedTrxSnapshotHeaderLength,
               "CRC field must terminate the snapshot header");
 
 inline constexpr size_t preserve_trx_bundle_recovered_count_offset() {
   return kPreservedTrxRecoveredCountOffset;
-}
-
-inline constexpr size_t preserve_trx_bundle_hmac_offset() {
-  return kPreservedTrxHmacOffset;
-}
-
-inline constexpr size_t preserve_trx_bundle_hmac_length() {
-  return kPreservedTrxHmacLength;
 }
 
 inline constexpr size_t preserve_trx_bundle_crc_offset() {
@@ -467,7 +451,6 @@ struct Preserved_trx_encoded_bundle {
   instead of silently treating a local snapshot as portable.
 */
 struct Preserved_trx_codec_context {
-  std::array<unsigned char, kPreservedTrxKeyLength> hmac_key{};
   std::array<unsigned char, kPreservedTrxSha256Length> datadir_fingerprint{};
   std::string server_uuid;
 };

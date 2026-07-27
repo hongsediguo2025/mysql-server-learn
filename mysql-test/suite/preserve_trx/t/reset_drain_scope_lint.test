@@ -85,8 +85,8 @@ die "receiver expiry must reuse housekeeping instead of adding a reaper thread\n
 
 die "standby transfer protocol version changed\n"
   unless $transfer_header =~
-         /kPreserveTrxTransferLegacyProtocolVersion\s*=\s*3/ &&
-         $transfer_header =~ /kPreserveTrxTransferProtocolVersion\s*=\s*4/;
+         /kPreserveTrxTransferProtocolVersion\s*=\s*1/ &&
+         $transfer_header !~ /kPreserveTrxTransferLegacyProtocolVersion/;
 
 my ($frame_enum) =
   $transfer_header =~
@@ -109,6 +109,11 @@ my ($commit_body) =
 my $ack_pos = index($commit_body, 'const bool commit_acknowledged');
 my $arbiter_pos = index($commit_body, 'm_final_ack_arbiter(');
 my $committed_pos = index($commit_body, 'm_epoch_committed = true');
+my $handoff_pos = index($commit_body, 'm_before_commit_send(');
+my $commit_send_pos =
+  index($commit_body, 'sink->send_encoded_frame(encoded_commit)');
+die "source ownership handoff must be acquired immediately before the first COMMIT network send\n"
+  unless $handoff_pos >= 0 && $commit_send_pos > $handoff_pos;
 die "FINAL_ACK arbiter must stay after receiver commit acknowledgement and before epoch publication\n"
   unless $ack_pos >= 0 && $arbiter_pos > $ack_pos &&
          $committed_pos > $arbiter_pos;
@@ -143,11 +148,19 @@ my $collector_scan_count = () =
   $batch_restore =~ /do_for_all_thd_copy\(&collector\)/g;
 die "RESET batch restore must collect target THDs in one global scan\n"
   unless $collector_scan_count == 1;
+my $restore_guard_pos = index($batch_restore, 'ownership.restore_allowed()');
+my $restore_scan_pos = index($batch_restore, 'do_for_all_thd_copy(&collector)');
+die "batch restore must reject HANDOFF_PENDING/COMMIT_UNKNOWN before touching target THDs\n"
+  unless $restore_guard_pos >= 0 && $restore_scan_pos > $restore_guard_pos;
 die "RESET batch restore must replay targets in reverse preserve order\n"
   unless $batch_restore =~
            /for \(size_t i = items\.size\(\); i != 0; --i\)/s &&
          $batch_restore =~
            /targets\[i - 1\]\.thd, items\[i - 1\]/s;
+
+die "receiver COMMIT status query must use the epoch terminal tombstone, not accepted lifecycle alone\n"
+  unless $transfer =~
+         /preserve_trx_transfer_query_epoch_commit_status\([\s\S]*query_epoch_terminal\s*\(\s*root_dir,\s*epoch_id\s*\)/s;
 
 my ($reset_participant_stop) =
   $preserve =~

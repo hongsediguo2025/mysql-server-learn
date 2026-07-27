@@ -49,7 +49,6 @@
 
 #include <openssl/evp.h>
 #include <openssl/crypto.h>
-#include <openssl/hmac.h>
 #include <openssl/sha.h>
 
 #include "my_dir.h"
@@ -84,8 +83,6 @@
 #include "storage/innobase/include/trx0preserve.h"
 
 bool preserve_trx_transfer_receiver_enable = false;
-char *preserve_trx_transfer_allowed_source_uuid = nullptr;
-char *preserve_trx_transfer_target_server_uuid = nullptr;
 char *preserve_trx_transfer_target_host = nullptr;
 uint preserve_trx_transfer_target_port = 0;
 char *preserve_trx_transfer_target_socket = nullptr;
@@ -113,11 +110,9 @@ uint preserve_trx_transfer_phase1_batch_linger_ms = 20;
 
 static constexpr char kBinlogPrewarmSeedObjectId[] =
     "binlog_prewarm_seed_v1";
+static constexpr uint64_t kReceiverTerminalStatusRetentionUs = 60000000;
+static constexpr char kReceiverCommitOperationId[] = "commit_epoch";
 
-static std::atomic<bool> g_transfer_spool_short_write_for_unit_test{false};
-static std::atomic<bool> g_transfer_spool_sync_failure_for_unit_test{false};
-static std::atomic<bool> g_transfer_spool_rollback_failure_for_unit_test{false};
-static std::atomic<uint64_t> g_transfer_spool_sync_count_for_unit_test{0};
 static std::atomic<uint> g_transfer_staging_cleanup_failures_for_unit_test{0};
 static std::atomic<uint64_t> g_transfer_throttled_us{0};
 static std::atomic<uint64_t> g_transfer_last_throttle_reason{0};
@@ -131,6 +126,29 @@ static std::atomic<uint64_t> g_receiver_auto_prewarm_ready_tokens{0};
 static std::atomic<uint64_t> g_receiver_auto_prewarm_not_ready_tokens{0};
 static std::atomic<uint64_t> g_receiver_auto_prewarm_last_status{0};
 static std::atomic<uint64_t> g_receiver_ready_monotonic_us{0};
+static std::atomic<uint64_t>
+    g_receiver_final_metadata_accepted_monotonic_us{0};
+static std::atomic<uint64_t>
+    g_receiver_terminal_commit_admitted_monotonic_us{0};
+static std::atomic<uint64_t>
+    g_receiver_ready_after_final_metadata_accepted_us{0};
+static std::atomic<uint64_t>
+    g_receiver_ready_after_terminal_commit_admitted_us{0};
+static std::atomic<uint64_t> g_receiver_admitted_frames{0};
+static std::atomic<uint64_t> g_receiver_admitted_bytes{0};
+static std::atomic<uint64_t> g_source_handoff_pending_epochs{0};
+static std::atomic<uint64_t> g_source_commit_unknown_epochs{0};
+static std::atomic<uint64_t> g_source_restore_guard_rejects{0};
+static std::atomic<uint64_t> g_receiver_terminal_cas_wins{0};
+static std::atomic<uint64_t> g_receiver_terminal_cas_duplicates{0};
+static std::atomic<uint64_t> g_receiver_terminal_cas_conflicts{0};
+static std::atomic<uint64_t> g_receiver_terminal_status_tombstones{0};
+static std::atomic<uint64_t> g_receiver_terminal_status_tombstone_expiries{0};
+static std::atomic<uint64_t> g_quarantine_epochs{0};
+static std::atomic<uint64_t> g_quarantine_tokens{0};
+static std::atomic<uint64_t> g_quarantine_bytes{0};
+static std::atomic<uint64_t> g_quarantine_oldest_age_us{0};
+static std::atomic<uint64_t> g_quarantine_started_monotonic_us{0};
 static std::atomic<uint64_t> g_receiver_first_frame_monotonic_us{0};
 static std::atomic<uint64_t> g_receiver_last_object_seal_monotonic_us{0};
 static std::atomic<uint64_t> g_receiver_prewarm_start_monotonic_us{0};
@@ -396,7 +414,6 @@ static constexpr uint64_t kReceiverRecordLockResidencyPollIntervalUs = 1000;
 static constexpr uint kReceiverRecordLockObjectProofRetryLimit = 16;
 static std::array<std::atomic<uint64_t>, kProjectionPublishP95BucketsUs.size()>
     g_receiver_projection_publish_histogram{};
-static thread_local bool g_receiver_frame_spool_disabled = false;
 static thread_local bool g_receiver_frame_sequence_disabled = false;
 
 static uint64_t transfer_monotonic_us() {
@@ -1000,6 +1017,118 @@ uint64_t preserve_trx_transfer_receiver_ready_monotonic_us_status() {
   return g_receiver_ready_monotonic_us.load();
 }
 
+uint64_t
+preserve_trx_transfer_receiver_final_metadata_accepted_monotonic_us_status() {
+  return g_receiver_final_metadata_accepted_monotonic_us.load();
+}
+
+uint64_t
+preserve_trx_transfer_receiver_terminal_commit_admitted_monotonic_us_status() {
+  return g_receiver_terminal_commit_admitted_monotonic_us.load();
+}
+
+uint64_t
+preserve_trx_transfer_receiver_ready_after_final_metadata_accepted_us_status() {
+  return g_receiver_ready_after_final_metadata_accepted_us.load();
+}
+
+uint64_t
+preserve_trx_transfer_receiver_ready_after_terminal_commit_admitted_us_status() {
+  return g_receiver_ready_after_terminal_commit_admitted_us.load();
+}
+
+uint64_t preserve_trx_transfer_receiver_admitted_frames_status() {
+  return g_receiver_admitted_frames.load();
+}
+
+uint64_t preserve_trx_transfer_receiver_admitted_bytes_status() {
+  return g_receiver_admitted_bytes.load();
+}
+
+uint64_t preserve_trx_transfer_source_handoff_pending_epochs_status() {
+  return g_source_handoff_pending_epochs.load();
+}
+
+uint64_t preserve_trx_transfer_source_commit_unknown_epochs_status() {
+  return g_source_commit_unknown_epochs.load();
+}
+
+uint64_t preserve_trx_transfer_source_restore_guard_rejects_status() {
+  return g_source_restore_guard_rejects.load();
+}
+
+void preserve_trx_transfer_note_source_handoff_pending() {
+  g_source_handoff_pending_epochs.store(1);
+}
+
+void preserve_trx_transfer_note_source_handoff_committed() {
+  g_source_handoff_pending_epochs.store(0);
+  g_source_commit_unknown_epochs.store(0);
+  g_quarantine_epochs.store(0);
+  g_quarantine_tokens.store(0);
+  g_quarantine_bytes.store(0);
+  g_quarantine_oldest_age_us.store(0);
+  g_quarantine_started_monotonic_us.store(0);
+}
+
+void preserve_trx_transfer_note_source_commit_unknown(uint64_t token_count,
+                                                      uint64_t retained_bytes) {
+  g_source_handoff_pending_epochs.store(0);
+  g_source_commit_unknown_epochs.store(1);
+  g_quarantine_epochs.store(1);
+  g_quarantine_tokens.store(token_count);
+  g_quarantine_bytes.store(retained_bytes);
+  g_quarantine_oldest_age_us.store(0);
+  g_quarantine_started_monotonic_us.store(transfer_monotonic_us());
+}
+
+void preserve_trx_transfer_note_source_restore_guard_reject() {
+  g_source_restore_guard_rejects.fetch_add(1);
+}
+
+uint64_t preserve_trx_transfer_receiver_terminal_cas_wins_status() {
+  return g_receiver_terminal_cas_wins.load();
+}
+
+uint64_t preserve_trx_transfer_receiver_terminal_cas_duplicates_status() {
+  return g_receiver_terminal_cas_duplicates.load();
+}
+
+uint64_t preserve_trx_transfer_receiver_terminal_cas_conflicts_status() {
+  return g_receiver_terminal_cas_conflicts.load();
+}
+
+uint64_t preserve_trx_transfer_receiver_terminal_status_tombstones_status() {
+  return g_receiver_terminal_status_tombstones.load();
+}
+
+uint64_t
+preserve_trx_transfer_receiver_terminal_status_tombstone_expiries_status() {
+  return g_receiver_terminal_status_tombstone_expiries.load();
+}
+
+uint64_t preserve_trx_transfer_quarantine_epochs_status() {
+  return g_quarantine_epochs.load();
+}
+
+uint64_t preserve_trx_transfer_quarantine_tokens_status() {
+  return g_quarantine_tokens.load();
+}
+
+uint64_t preserve_trx_transfer_quarantine_bytes_status() {
+  return g_quarantine_bytes.load();
+}
+
+uint64_t preserve_trx_transfer_quarantine_oldest_age_us_status() {
+  if (g_quarantine_epochs.load() == 0) return 0;
+  const uint64_t started_us = g_quarantine_started_monotonic_us.load();
+  const uint64_t now_us = transfer_monotonic_us();
+  const uint64_t age_us =
+      started_us != 0 && now_us > started_us ? now_us - started_us : 0;
+  g_quarantine_oldest_age_us.store(age_us);
+  return age_us;
+}
+
 uint64_t preserve_trx_transfer_receiver_first_frame_monotonic_us_status() {
   return g_receiver_first_frame_monotonic_us.load();
 }
@@ -1259,6 +1388,10 @@ static bool preserve_trx_transfer_string_is_set(const char *value) {
   return value != nullptr && value[0] != '\0';
 }
 
+namespace {
+bool preserve_trx_transfer_source_credential_ready();
+}
+
 static bool preserve_trx_transfer_source_endpoint_ready() {
   const bool has_tcp_host =
       preserve_trx_transfer_string_is_set(preserve_trx_transfer_target_host);
@@ -1268,11 +1401,8 @@ static bool preserve_trx_transfer_source_endpoint_ready() {
       preserve_trx_transfer_string_is_set(preserve_trx_transfer_target_socket);
 
   return preserve_trx_transfer_string_is_set(
-             preserve_trx_transfer_target_server_uuid) &&
-         preserve_trx_transfer_string_is_set(
              preserve_trx_transfer_target_user) &&
-         preserve_trx_transfer_string_is_set(
-             preserve_trx_transfer_credential_name) &&
+         preserve_trx_transfer_source_credential_ready() &&
          has_tcp_host == has_tcp_port &&
          (has_tcp_target != has_socket_target);
 }
@@ -1314,40 +1444,46 @@ void purge_receiver_epoch_derived_state(const std::string &root_dir,
 
 namespace {
 
+bool transfer_component_safe(const std::string &component);
+
 bool transfer_status_is_committed_outcome(
     Preserve_trx_transfer_status status) {
   return status == Preserve_trx_transfer_status::COMMITTED_READY ||
          status == Preserve_trx_transfer_status::COMMITTED_NOT_READY;
 }
 
+bool transfer_status_has_authenticated_ack(
+    Preserve_trx_transfer_status status) {
+  return status == Preserve_trx_transfer_status::OK ||
+         transfer_status_is_committed_outcome(status) ||
+         status == Preserve_trx_transfer_status::NOT_COMMITTED ||
+         status == Preserve_trx_transfer_status::NOT_COMMITTED_CLEAN;
+}
+
 constexpr char kTransferManifestMagic[] = {'P', 'T', 'R', 'X',
-                                           'F', 'E', 'R', '1'};
+                                           'O', 'M', 'N', '1'};
 constexpr size_t kTransferManifestMagicLength = sizeof(kTransferManifestMagic);
 constexpr char kTransferObjectDescriptorMagic[] = {'P', 'T', 'R', 'X',
-                                                   'O', 'B', 'J', '1'};
+                                                   'O', 'D', 'V', '1'};
 constexpr size_t kTransferObjectDescriptorMagicLength =
     sizeof(kTransferObjectDescriptorMagic);
+constexpr uint16_t kTransferObjectDescriptorVersion = 1;
 constexpr char kTransferBundleMagic[] = {'P', 'T', 'R', 'X',
                                          'B', 'N', 'D', '1'};
 constexpr size_t kTransferBundleMagicLength = sizeof(kTransferBundleMagic);
 constexpr char kTransferFrameMagic[] = {'P', 'T', 'R', 'X',
-                                        'F', 'R', 'M', '1'};
+                                        'O', 'F', 'R', '1'};
 constexpr size_t kTransferFrameMagicLength = sizeof(kTransferFrameMagic);
 constexpr char kTransferFrameBatchMagic[] = {'P', 'T', 'R', 'X',
-                                             'F', 'B', 'T', '1'};
+                                             'O', 'B', 'T', '1'};
 constexpr size_t kTransferFrameBatchMagicLength =
     sizeof(kTransferFrameBatchMagic);
-constexpr char kReceiverFrameSpoolRecordMagic[] = {'P', 'T', 'R', 'X',
-                                                   'S', 'P', 'L', '1'};
-constexpr size_t kReceiverFrameSpoolRecordMagicLength =
-    sizeof(kReceiverFrameSpoolRecordMagic);
 constexpr uint32_t kMaxTransferManifestStringBytes = 1024 * 1024;
 constexpr uint32_t kMaxTransferManifestObjects = 1024 * 1024;
 constexpr uint32_t kMaxTransferChunkBytes = 1024 * 1024;
 
 bool transfer_protocol_version_is_decodable(uint16_t version) {
-  return version == kPreserveTrxTransferLegacyProtocolVersion ||
-         version == kPreserveTrxTransferProtocolVersion;
+  return version == kPreserveTrxTransferProtocolVersion;
 }
 
 std::string bytes_to_lower_hex(const unsigned char *bytes, size_t length) {
@@ -1360,21 +1496,21 @@ std::string bytes_to_lower_hex(const unsigned char *bytes, size_t length) {
   return out;
 }
 
-const std::string &transfer_source_incarnation_id() {
-  static const std::string incarnation = []() {
+const std::string &transfer_source_epoch_boot_nonce() {
+  static const std::string boot_nonce = []() {
     std::array<unsigned char, 16> random_bytes{};
     if (my_rand_buffer(random_bytes.data(), random_bytes.size()) != 0) {
       return std::string();
     }
     return bytes_to_lower_hex(random_bytes.data(), random_bytes.size());
   }();
-  return incarnation;
+  return boot_nonce;
 }
 
-std::string qualify_transfer_epoch_id(const std::string &epoch_id) {
-  const std::string &incarnation = transfer_source_incarnation_id();
-  if (incarnation.empty() || epoch_id.empty()) return {};
-  return incarnation + "-" + epoch_id;
+std::string make_transfer_epoch_id(const std::string &monotonic_epoch_id) {
+  const std::string &boot_nonce = transfer_source_epoch_boot_nonce();
+  if (boot_nonce.empty() || monotonic_epoch_id.empty()) return {};
+  return boot_nonce + "-" + monotonic_epoch_id;
 }
 
 void cleanse_transfer_secret(std::string *value) {
@@ -1391,10 +1527,64 @@ struct Transfer_resolved_credential {
   ~Transfer_resolved_credential() { cleanse_transfer_secret(&password); }
 };
 
-bool transfer_tls_identity_config_is_valid(bool unix_socket,
-                                           const std::string &ssl_ca,
-                                           const std::string &ssl_capath) {
-  return unix_socket || !ssl_ca.empty() || !ssl_capath.empty();
+class Transfer_epoch_password {
+ public:
+  Transfer_epoch_password(const unsigned char *password, size_t length)
+      : m_bytes(password, password + length) {
+    m_bytes.push_back(0);
+  }
+
+  ~Transfer_epoch_password() {
+    if (!m_bytes.empty()) {
+      OPENSSL_cleanse(m_bytes.data(), m_bytes.size());
+    }
+  }
+
+  const unsigned char *data() const { return m_bytes.data(); }
+  size_t size() const { return m_bytes.empty() ? 0 : m_bytes.size() - 1; }
+
+ private:
+  std::vector<unsigned char> m_bytes;
+};
+
+struct Transfer_epoch_credential {
+  std::string user;
+  std::string auth_plugin;
+  std::shared_ptr<const Transfer_epoch_password> password;
+};
+
+std::mutex g_transfer_runtime_password_mutex;
+std::shared_ptr<const Transfer_epoch_password> g_transfer_runtime_password;
+bool g_transfer_runtime_password_managed{false};
+
+bool preserve_trx_transfer_source_credential_ready() {
+  std::lock_guard<std::mutex> guard(g_transfer_runtime_password_mutex);
+  if (g_transfer_runtime_password_managed) {
+    return g_transfer_runtime_password != nullptr;
+  }
+  return preserve_trx_transfer_string_is_set(
+      preserve_trx_transfer_credential_name);
+}
+
+Preserve_trx_transfer_password_status transfer_runtime_password_role_status() {
+  if (!preserve_trx_is_enabled()) {
+    return Preserve_trx_transfer_password_status::FEATURE_DISABLED;
+  }
+  if (preserve_trx_transfer_receiver_enable ||
+      preserve_trx_transfer_artifact_mode !=
+          PRESERVE_TRX_TRANSFER_ARTIFACT_STANDBY_TRANSFER_SAVE) {
+    return Preserve_trx_transfer_password_status::WRONG_ROLE;
+  }
+  return Preserve_trx_transfer_password_status::OK;
+}
+
+std::shared_ptr<const Transfer_epoch_password> make_transfer_epoch_password(
+    const unsigned char *password, size_t length) {
+  try {
+    return std::make_shared<const Transfer_epoch_password>(password, length);
+  } catch (const std::bad_alloc &) {
+    return {};
+  }
 }
 
 bool transfer_credential_file_metadata_is_secure(uint64_t mode,
@@ -1497,6 +1687,54 @@ bool resolve_transfer_credential(const std::string &credential_name,
   return true;
 }
 
+bool snapshot_transfer_epoch_credential(
+    const Preserve_trx_transfer_client_endpoint &endpoint,
+    Transfer_epoch_credential *credential) {
+  if (credential == nullptr) return false;
+
+  {
+    std::lock_guard<std::mutex> guard(g_transfer_runtime_password_mutex);
+    if (g_transfer_runtime_password_managed) {
+      if (g_transfer_runtime_password == nullptr || endpoint.user.empty()) {
+        return false;
+      }
+      credential->user = endpoint.user;
+      credential->auth_plugin = endpoint.auth_plugin;
+      credential->password = g_transfer_runtime_password;
+      return true;
+    }
+  }
+
+  Transfer_resolved_credential resolved;
+  if (!resolve_transfer_credential(endpoint.credential_name, endpoint.user,
+                                   &resolved)) {
+    return false;
+  }
+  std::shared_ptr<const Transfer_epoch_password> fallback_password =
+      make_transfer_epoch_password(
+          reinterpret_cast<const unsigned char *>(resolved.password.data()),
+          resolved.password.size());
+  if (fallback_password == nullptr) return false;
+
+  {
+    std::lock_guard<std::mutex> guard(g_transfer_runtime_password_mutex);
+    if (g_transfer_runtime_password_managed) {
+      if (g_transfer_runtime_password == nullptr || endpoint.user.empty()) {
+        return false;
+      }
+      credential->user = endpoint.user;
+      credential->auth_plugin = endpoint.auth_plugin;
+      credential->password = g_transfer_runtime_password;
+      return true;
+    }
+  }
+
+  credential->user = std::move(resolved.user);
+  credential->auth_plugin = std::move(resolved.auth_plugin);
+  credential->password = std::move(fallback_password);
+  return !credential->user.empty();
+}
+
 struct Transfer_client_connection {
   MYSQL *mysql{nullptr};
 };
@@ -1518,19 +1756,47 @@ class Transfer_client_current_thd_guard {
   THD *m_saved;
 };
 
-Preserve_trx_transfer_status default_transfer_client_connect(
-    const Preserve_trx_transfer_client_endpoint &endpoint, void **connection) {
-  if (connection == nullptr) return Preserve_trx_transfer_status::INVALID_ARGUMENT;
-  *connection = nullptr;
-
-  Transfer_resolved_credential credential;
-  if (!resolve_transfer_credential(endpoint.credential_name, endpoint.user,
-                                   &credential)) {
-    return Preserve_trx_transfer_status::UNSUPPORTED;
+size_t cleanse_transfer_mysql_password_copies(MYSQL *mysql) {
+  if (mysql == nullptr) return 0;
+  std::array<char *, 2> copies{{mysql->passwd, mysql->options.password}};
+  std::array<char *, 2> cleansed{{nullptr, nullptr}};
+  size_t cleansed_count = 0;
+  for (char *copy : copies) {
+    if (copy == nullptr ||
+        std::find(cleansed.begin(), cleansed.end(), copy) != cleansed.end()) {
+      continue;
+    }
+    const size_t length = std::strlen(copy);
+    if (length != 0) OPENSSL_cleanse(copy, length);
+    cleansed[cleansed_count++] = copy;
   }
+  return cleansed_count;
+}
+
+void secure_transfer_mysql_close(MYSQL *mysql) {
+  if (mysql == nullptr) return;
+  mysql->reconnect = false;
+  (void)cleanse_transfer_mysql_password_copies(mysql);
+  mysql_close(mysql);
+}
+
+Preserve_trx_transfer_status default_transfer_client_connect(
+    const Preserve_trx_transfer_client_endpoint &endpoint,
+    const unsigned char *password, size_t password_length,
+    void **connection) {
+  if (connection == nullptr || password == nullptr || password_length == 0 ||
+      password_length > 256 ||
+      std::find(password, password + password_length, '\0') !=
+          password + password_length ||
+      endpoint.user.empty()) {
+    return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+  }
+  *connection = nullptr;
 
   MYSQL *mysql = mysql_init(nullptr);
   if (mysql == nullptr) return Preserve_trx_transfer_status::IO_ERROR;
+  auto close_mysql =
+      create_scope_guard([&] { secure_transfer_mysql_close(mysql); });
 
   const uint operation_timeout_ms = endpoint.operation_timeout_ms == 0
                                         ? preserve_trx_transfer_commit_timeout_ms
@@ -1543,9 +1809,11 @@ Preserve_trx_transfer_status default_transfer_client_connect(
   mysql_options(mysql, MYSQL_OPT_CONNECT_TIMEOUT, &timeout_seconds);
   mysql_options(mysql, MYSQL_OPT_READ_TIMEOUT, &timeout_seconds);
   mysql_options(mysql, MYSQL_OPT_WRITE_TIMEOUT, &timeout_seconds);
+  bool reconnect = false;
+  mysql_options(mysql, MYSQL_OPT_RECONNECT, &reconnect);
 
-  if (!credential.auth_plugin.empty()) {
-    mysql_options(mysql, MYSQL_DEFAULT_AUTH, credential.auth_plugin.c_str());
+  if (!endpoint.auth_plugin.empty()) {
+    mysql_options(mysql, MYSQL_DEFAULT_AUTH, endpoint.auth_plugin.c_str());
   }
   mysql_options4(mysql, MYSQL_OPT_CONNECT_ATTR_ADD, "program_name", "mysqld");
   mysql_options4(mysql, MYSQL_OPT_CONNECT_ATTR_ADD, "_client_role",
@@ -1560,68 +1828,38 @@ Preserve_trx_transfer_status default_transfer_client_connect(
   const bool unix_socket = socket != nullptr;
   if (tcp_configured == unix_socket ||
       (tcp_configured && (endpoint.host.empty() || endpoint.port == 0))) {
-    mysql_close(mysql);
     return Preserve_trx_transfer_status::UNSUPPORTED;
   }
   uint protocol =
       unix_socket ? MYSQL_PROTOCOL_SOCKET : MYSQL_PROTOCOL_TCP;
   if (mysql_options(mysql, MYSQL_OPT_PROTOCOL, &protocol) != 0) {
-    mysql_close(mysql);
-    return Preserve_trx_transfer_status::UNSUPPORTED;
-  }
-  std::string ssl_ca;
-  std::string ssl_capath;
-  enum mysql_ssl_mode ssl_mode = SSL_MODE_DISABLED;
-  if (!unix_socket) {
-    if (!Ssl_mysql_main_status::get_ssl_ca_and_capath(&ssl_ca, &ssl_capath) ||
-        !transfer_tls_identity_config_is_valid(false, ssl_ca, ssl_capath)) {
-      mysql_close(mysql);
-      return Preserve_trx_transfer_status::UNSUPPORTED;
-    }
-    if ((!ssl_ca.empty() &&
-         mysql_options(mysql, MYSQL_OPT_SSL_CA, ssl_ca.c_str()) != 0) ||
-        (!ssl_capath.empty() &&
-         mysql_options(mysql, MYSQL_OPT_SSL_CAPATH, ssl_capath.c_str()) != 0)) {
-      mysql_close(mysql);
-      return Preserve_trx_transfer_status::UNSUPPORTED;
-    }
-    ssl_mode = SSL_MODE_VERIFY_IDENTITY;
-  }
-  if (mysql_options(mysql, MYSQL_OPT_SSL_MODE, &ssl_mode) != 0) {
-    mysql_close(mysql);
     return Preserve_trx_transfer_status::UNSUPPORTED;
   }
   Transfer_client_current_thd_guard current_thd_guard;
-  if (mysql_real_connect(mysql, host, credential.user.c_str(),
-                         credential.password.c_str(), nullptr, endpoint.port,
-                         socket, 0) == nullptr) {
+  if (mysql_real_connect(
+          mysql, host, endpoint.user.c_str(),
+          reinterpret_cast<const char *>(password), nullptr, endpoint.port,
+          socket, 0) == nullptr) {
     const std::string message =
         "PRESERVE: standby transfer client connect failed errno=" +
         std::to_string(mysql_errno(mysql)) + " error=" + mysql_error(mysql);
     LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG, message.c_str());
-    mysql_close(mysql);
     return Preserve_trx_transfer_status::IO_ERROR;
   }
-  if (!unix_socket) {
-    const char *cipher = mysql_get_ssl_cipher(mysql);
-    if (cipher == nullptr || cipher[0] == '\0') {
-      mysql_close(mysql);
-      return Preserve_trx_transfer_status::IO_ERROR;
-    }
-  }
-
   Transfer_client_connection *client = new (std::nothrow) Transfer_client_connection;
   if (client == nullptr) {
-    mysql_close(mysql);
     return Preserve_trx_transfer_status::IO_ERROR;
   }
   client->mysql = mysql;
   *connection = client;
+  mysql = nullptr;
+  close_mysql.commit();
   return Preserve_trx_transfer_status::OK;
 }
 
 Preserve_trx_transfer_status default_transfer_client_send(
-    void *connection, const std::string &encoded_frame) {
+    void *connection, const std::string &encoded_frame,
+    Preserve_trx_transfer_frame_ack *out_ack) {
   Transfer_client_connection *client =
       static_cast<Transfer_client_connection *>(connection);
   if (client == nullptr || client->mysql == nullptr) {
@@ -1639,10 +1877,12 @@ Preserve_trx_transfer_status default_transfer_client_send(
     Preserve_trx_transfer_frame_ack ack;
     const Preserve_trx_transfer_status ack_status =
         preserve_trx_transfer_verify_frame_ack(
-            info, transfer_source_incarnation_id(), encoded_frame, &ack);
-    return ack_status == Preserve_trx_transfer_status::OK
-               ? ack.status
-               : Preserve_trx_transfer_status::ACK_UNCERTAIN;
+            info, "", encoded_frame, &ack);
+    if (ack_status != Preserve_trx_transfer_status::OK) {
+      return Preserve_trx_transfer_status::ACK_UNCERTAIN;
+    }
+    if (out_ack != nullptr) *out_ack = ack;
+    return ack.status;
   }
   const std::string message =
       "PRESERVE: standby transfer client send failed errno=" +
@@ -1653,11 +1893,30 @@ Preserve_trx_transfer_status default_transfer_client_send(
   return Preserve_trx_transfer_status::IO_ERROR;
 }
 
+Preserve_trx_transfer_status default_transfer_client_set_operation_timeout(
+    void *connection, uint operation_timeout_ms) {
+  Transfer_client_connection *client =
+      static_cast<Transfer_client_connection *>(connection);
+  if (client == nullptr || client->mysql == nullptr ||
+      client->mysql->net.vio == nullptr || operation_timeout_ms == 0) {
+    return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+  }
+  const int timeout_seconds = static_cast<int>(std::max<uint64_t>(
+      1, std::min<uint64_t>(
+             (static_cast<uint64_t>(operation_timeout_ms) + 999) / 1000,
+             INT_MAX)));
+  if (vio_timeout(client->mysql->net.vio, 0, timeout_seconds) != 0 ||
+      vio_timeout(client->mysql->net.vio, 1, timeout_seconds) != 0) {
+    return Preserve_trx_transfer_status::IO_ERROR;
+  }
+  return Preserve_trx_transfer_status::OK;
+}
+
 void default_transfer_client_disconnect(void *connection) {
   Transfer_client_connection *client =
       static_cast<Transfer_client_connection *>(connection);
   if (client == nullptr) return;
-  if (client->mysql != nullptr) mysql_close(client->mysql);
+  if (client->mysql != nullptr) secure_transfer_mysql_close(client->mysql);
   delete client;
 }
 
@@ -1673,6 +1932,7 @@ void default_transfer_client_interrupt(void *connection) {
 
 const Preserve_trx_transfer_client_ops kDefault_transfer_client_ops = {
     default_transfer_client_connect, default_transfer_client_send,
+    default_transfer_client_set_operation_timeout,
     default_transfer_client_interrupt,
     default_transfer_client_disconnect};
 
@@ -1714,59 +1974,11 @@ unit_terminal_lock_proof_provider() {
   return provider;
 }
 
-void append_context_component(std::string *out, const std::string &component) {
-  out->append(component);
-  out->push_back('\0');
-}
-
-std::array<unsigned char, kPreservedTrxSha256Length> digest_context_material(
-    const std::string &label, const std::string &credential_name,
-    const std::string &target_server_uuid, const std::string &secret) {
-  std::string material;
-  material.reserve(label.length() + credential_name.length() +
-                   target_server_uuid.length() + secret.length() + 8);
-  append_context_component(&material, label);
-  append_context_component(&material, credential_name);
-  append_context_component(&material, target_server_uuid);
-  append_context_component(&material, secret);
-
-  std::array<unsigned char, kPreservedTrxSha256Length> digest{};
-  SHA256(reinterpret_cast<const unsigned char *>(material.data()),
-         material.length(), digest.data());
-  cleanse_transfer_secret(&material);
-  return digest;
-}
-
 bool transfer_bundle_codec_context_from_config(
     Preserved_trx_codec_context *context) {
-  if (context == nullptr ||
-      !preserve_trx_transfer_string_is_set(
-          preserve_trx_transfer_credential_name) ||
-      !preserve_trx_transfer_string_is_set(
-          preserve_trx_transfer_target_server_uuid)) {
-    return false;
-  }
-
-  Transfer_resolved_credential credential;
-  if (!resolve_transfer_credential(
-          preserve_trx_transfer_credential_name,
-          preserve_trx_transfer_string_is_set(preserve_trx_transfer_target_user)
-              ? preserve_trx_transfer_target_user
-              : "",
-          &credential))
-    return false;
-
-  const std::string credential_name = preserve_trx_transfer_credential_name;
-  const std::string target_server_uuid = preserve_trx_transfer_target_server_uuid;
-  if (target_server_uuid.length() > 36) return false;
-
-  context->hmac_key = digest_context_material(
-      "preserve-trx-transfer-hmac-v1", credential_name, target_server_uuid,
-      credential.password);
-  context->datadir_fingerprint = digest_context_material(
-      "preserve-trx-transfer-fingerprint-v1", credential_name,
-      target_server_uuid, credential.password);
-  context->server_uuid = target_server_uuid;
+  if (context == nullptr) return false;
+  context->datadir_fingerprint.fill(0);
+  context->server_uuid = "preserve-transfer-product-v1";
   return true;
 }
 
@@ -1882,9 +2094,6 @@ std::mutex &transfer_object_stage_mutex(
 Preserve_trx_transfer_client_endpoint configured_transfer_client_endpoint() {
   Preserve_trx_transfer_client_endpoint endpoint;
   endpoint.operation_timeout_ms = preserve_trx_transfer_phase1_timeout_ms;
-  if (preserve_trx_transfer_target_server_uuid != nullptr) {
-    endpoint.target_server_uuid = preserve_trx_transfer_target_server_uuid;
-  }
   if (preserve_trx_transfer_target_host != nullptr) {
     endpoint.host = preserve_trx_transfer_target_host;
   }
@@ -1900,6 +2109,9 @@ Preserve_trx_transfer_client_endpoint configured_transfer_client_endpoint() {
   }
   return endpoint;
 }
+
+bool transfer_digest_is_zero(
+    const std::array<unsigned char, kPreservedTrxSha256Length> &digest);
 
 bool build_epoch_status_query_payload(const std::string &encoded_payload,
                                       std::string *encoded_query) {
@@ -1931,14 +2143,41 @@ bool build_epoch_status_query_payload(const std::string &encoded_payload,
     found_commit = true;
   }
   if (!found_commit) return false;
+  if (transfer_digest_is_zero(commit.terminal_fact_digest)) return false;
 
   Preserve_trx_transfer_frame query;
   query.type = Preserve_trx_transfer_frame_type::QUERY_EPOCH_STATUS;
   query.protocol_version = kPreserveTrxTransferProtocolVersion;
   query.sequence = commit.sequence;
   query.epoch_id = commit.epoch_id;
+  query.receiver_process_nonce = commit.receiver_process_nonce;
   query.token = commit.token;
+  query.terminal_fact_digest = commit.terminal_fact_digest;
   return preserve_trx_transfer_encode_frame(query, encoded_query) ==
+         Preserve_trx_transfer_status::OK;
+}
+
+bool build_epoch_abandon_payload(const std::string &encoded_commit,
+                                 std::string *encoded_abandon) {
+  if (encoded_abandon == nullptr) return false;
+  Preserve_trx_transfer_frame commit;
+  if (preserve_trx_transfer_decode_frame(encoded_commit, &commit) !=
+          Preserve_trx_transfer_status::OK ||
+      commit.type != Preserve_trx_transfer_frame_type::COMMIT_EPOCH ||
+      transfer_digest_is_zero(commit.terminal_fact_digest)) {
+    return false;
+  }
+
+  Preserve_trx_transfer_frame abandon;
+  abandon.type =
+      Preserve_trx_transfer_frame_type::ABANDON_EPOCH_IF_NOT_COMMITTED;
+  abandon.protocol_version = kPreserveTrxTransferProtocolVersion;
+  abandon.sequence = commit.sequence;
+  abandon.epoch_id = commit.epoch_id;
+  abandon.receiver_process_nonce = commit.receiver_process_nonce;
+  abandon.token = commit.token;
+  abandon.terminal_fact_digest = commit.terminal_fact_digest;
+  return preserve_trx_transfer_encode_frame(abandon, encoded_abandon) ==
          Preserve_trx_transfer_status::OK;
 }
 
@@ -1947,8 +2186,10 @@ class Preserve_trx_transfer_client_frame_sink final
  public:
   Preserve_trx_transfer_client_frame_sink(
       Preserve_trx_transfer_client_endpoint endpoint,
+      std::shared_ptr<const Transfer_epoch_password> password,
       const Preserve_trx_transfer_client_ops *ops)
       : m_endpoint(std::move(endpoint)),
+        m_password(std::move(password)),
         m_operation_timeout_ms(m_endpoint.operation_timeout_ms),
         m_ops(ops) {
     const size_t session_count =
@@ -1970,13 +2211,81 @@ class Preserve_trx_transfer_client_frame_sink final
   Preserve_trx_transfer_status send_encoded_frame(
       const std::string &encoded_frame) override {
     return send_encoded_frame_on_connection(
-        encoded_frame, connection_index_for_frame(encoded_frame));
+        encoded_frame, connection_index_for_frame(encoded_frame), nullptr);
   }
 
   Preserve_trx_transfer_status send_encoded_frame_on_session(
       const std::string &encoded_frame, size_t session_index) override {
     return send_encoded_frame_on_connection(
-        encoded_frame, session_index % m_connections.size());
+        encoded_frame, session_index % m_connections.size(), nullptr);
+  }
+
+  Preserve_trx_transfer_status open_epoch_transport(
+      const std::string &epoch_id,
+      uint64_t requested_terminal_status_retention_us,
+      uint64_t absolute_monotonic_deadline_us,
+      std::string *receiver_process_nonce,
+      uint64_t *accepted_terminal_status_retention_us) override {
+    if (receiver_process_nonce == nullptr ||
+        accepted_terminal_status_retention_us == nullptr ||
+        !transfer_component_safe(epoch_id) ||
+        requested_terminal_status_retention_us == 0 ||
+        absolute_monotonic_deadline_us <= transfer_monotonic_us()) {
+      return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+    }
+    {
+      std::lock_guard<std::mutex> guard(m_epoch_context_mutex);
+      if (m_epoch_context_bound) {
+        if (m_epoch_id != epoch_id ||
+            m_requested_terminal_status_retention_us !=
+                requested_terminal_status_retention_us ||
+            m_absolute_monotonic_deadline_us !=
+                absolute_monotonic_deadline_us) {
+          return Preserve_trx_transfer_status::CORRUPT;
+        }
+        if (!m_receiver_process_nonce.empty()) {
+          *receiver_process_nonce = m_receiver_process_nonce;
+          *accepted_terminal_status_retention_us =
+              m_accepted_terminal_status_retention_us;
+          return Preserve_trx_transfer_status::OK;
+        }
+      } else {
+        m_epoch_id = epoch_id;
+        m_requested_terminal_status_retention_us =
+            requested_terminal_status_retention_us;
+        m_absolute_monotonic_deadline_us = absolute_monotonic_deadline_us;
+        m_epoch_context_bound = true;
+      }
+    }
+    Preserve_trx_transfer_frame open;
+    open.type = Preserve_trx_transfer_frame_type::OPEN_EPOCH;
+    open.epoch_id = epoch_id;
+    open.requested_terminal_status_retention_us =
+        requested_terminal_status_retention_us;
+    std::string encoded_open;
+    Preserve_trx_transfer_status status =
+        preserve_trx_transfer_encode_frame(open, &encoded_open);
+    if (status != Preserve_trx_transfer_status::OK) return status;
+    Preserve_trx_transfer_frame_ack ack;
+    status = send_encoded_frame_on_connection(encoded_open, 0, &ack);
+    if (status != Preserve_trx_transfer_status::OK ||
+        ack.receiver_process_nonce.length() != 32 ||
+        ack.accepted_terminal_status_retention_us <
+            requested_terminal_status_retention_us) {
+      return status == Preserve_trx_transfer_status::OK
+                 ? Preserve_trx_transfer_status::CORRUPT
+                 : status;
+    }
+    {
+      std::lock_guard<std::mutex> guard(m_epoch_context_mutex);
+      m_receiver_process_nonce = ack.receiver_process_nonce;
+      m_accepted_terminal_status_retention_us =
+          ack.accepted_terminal_status_retention_us;
+      *receiver_process_nonce = m_receiver_process_nonce;
+      *accepted_terminal_status_retention_us =
+          m_accepted_terminal_status_retention_us;
+    }
+    return Preserve_trx_transfer_status::OK;
   }
 
   void request_cancel() override {
@@ -2031,14 +2340,93 @@ class Preserve_trx_transfer_client_frame_sink final
     }
   }
 
+  bool epoch_deadline_expired() const {
+    uint64_t absolute_deadline_us = 0;
+    {
+      std::lock_guard<std::mutex> guard(m_epoch_context_mutex);
+      absolute_deadline_us = m_absolute_monotonic_deadline_us;
+    }
+    return absolute_deadline_us != 0 &&
+           transfer_monotonic_us() >= absolute_deadline_us;
+  }
+
+  Preserve_trx_transfer_status refresh_connection_operation_timeout(
+      size_t connection_index) {
+    if (m_ops == nullptr || m_ops->set_operation_timeout == nullptr) {
+      return Preserve_trx_transfer_status::OK;
+    }
+    uint64_t absolute_deadline_us = 0;
+    {
+      std::lock_guard<std::mutex> guard(m_epoch_context_mutex);
+      absolute_deadline_us = m_absolute_monotonic_deadline_us;
+    }
+    if (absolute_deadline_us == 0) return Preserve_trx_transfer_status::OK;
+    const uint64_t now_us = transfer_monotonic_us();
+    if (now_us >= absolute_deadline_us) {
+      return Preserve_trx_transfer_status::IO_ERROR;
+    }
+    const uint64_t remaining_ms =
+        std::max<uint64_t>(1, (absolute_deadline_us - now_us + 999) / 1000);
+    const uint64_t configured_timeout_ms = m_operation_timeout_ms.load();
+    const uint timeout_ms = static_cast<uint>(std::min<uint64_t>(
+        configured_timeout_ms == 0
+            ? remaining_ms
+            : std::min<uint64_t>(configured_timeout_ms, remaining_ms),
+        UINT_MAX32));
+    void *connection = connection_snapshot(connection_index);
+    if (connection == nullptr) {
+      return Preserve_trx_transfer_status::IO_ERROR;
+    }
+    return m_ops->set_operation_timeout(connection, timeout_ms);
+  }
+
   Preserve_trx_transfer_status connect_owned_connection(
       size_t connection_index, bool retrying_uncertain) {
     if (cancel_requested()) return Preserve_trx_transfer_status::UNSUPPORTED;
+    std::unique_lock<std::mutex> reconnect_guard;
+    if (retrying_uncertain) {
+      reconnect_guard = std::unique_lock<std::mutex>(m_reconnect_mutex);
+      uint reconnect_attempts = m_reconnect_attempts.load();
+      while (true) {
+        if (reconnect_attempts >= kMaxReconnectAttempts) {
+          return Preserve_trx_transfer_status::ACK_UNCERTAIN;
+        }
+        if (m_reconnect_attempts.compare_exchange_weak(
+                reconnect_attempts, reconnect_attempts + 1)) {
+          break;
+        }
+      }
+    }
     void *new_connection = nullptr;
     Preserve_trx_transfer_client_endpoint endpoint = m_endpoint;
     endpoint.operation_timeout_ms = m_operation_timeout_ms.load();
+    uint64_t absolute_deadline_us = 0;
+    {
+      std::lock_guard<std::mutex> guard(m_epoch_context_mutex);
+      absolute_deadline_us = m_absolute_monotonic_deadline_us;
+    }
+    if (absolute_deadline_us != 0) {
+      const uint64_t now_us = transfer_monotonic_us();
+      if (now_us >= absolute_deadline_us) {
+        return retrying_uncertain
+                   ? Preserve_trx_transfer_status::ACK_UNCERTAIN
+                   : Preserve_trx_transfer_status::IO_ERROR;
+      }
+      const uint64_t remaining_ms =
+          std::max<uint64_t>(1, (absolute_deadline_us - now_us + 999) / 1000);
+      endpoint.operation_timeout_ms = static_cast<uint>(std::min<uint64_t>(
+          endpoint.operation_timeout_ms == 0
+              ? remaining_ms
+              : std::min<uint64_t>(endpoint.operation_timeout_ms,
+                                   remaining_ms),
+          UINT_MAX32));
+    }
+    if (m_password == nullptr || m_password->size() == 0) {
+      return Preserve_trx_transfer_status::UNSUPPORTED;
+    }
     const Preserve_trx_transfer_status connect_status =
-        m_ops->connect(endpoint, &new_connection);
+        m_ops->connect(endpoint, m_password->data(), m_password->size(),
+                       &new_connection);
     if (connect_status != Preserve_trx_transfer_status::OK) {
       if (connect_status == Preserve_trx_transfer_status::UNSUPPORTED) {
         LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
@@ -2072,16 +2460,23 @@ class Preserve_trx_transfer_client_frame_sink final
   }
 
   Preserve_trx_transfer_status send_on_owned_connection(
-      size_t connection_index, const std::string &encoded_frame) {
+      size_t connection_index, const std::string &encoded_frame,
+      Preserve_trx_transfer_frame_ack *ack) {
+    const Preserve_trx_transfer_status timeout_status =
+        refresh_connection_operation_timeout(connection_index);
+    if (timeout_status != Preserve_trx_transfer_status::OK) {
+      return timeout_status;
+    }
     void *connection = connection_snapshot(connection_index);
     if (connection == nullptr) {
       return Preserve_trx_transfer_status::IO_ERROR;
     }
-    return m_ops->send_frame(connection, encoded_frame);
+    return m_ops->send_frame(connection, encoded_frame, ack);
   }
 
   Preserve_trx_transfer_status send_encoded_frame_on_connection(
-      const std::string &encoded_frame, size_t connection_index) {
+      const std::string &encoded_frame, size_t connection_index,
+      Preserve_trx_transfer_frame_ack *out_ack) {
     if (m_ops == nullptr || m_ops->connect == nullptr ||
         m_ops->send_frame == nullptr || m_ops->disconnect == nullptr) {
       return Preserve_trx_transfer_status::UNSUPPORTED;
@@ -2095,6 +2490,12 @@ class Preserve_trx_transfer_client_frame_sink final
       return Preserve_trx_transfer_status::ACK_UNCERTAIN;
     }
     const bool retrying_uncertain = !uncertain_payload.empty();
+    if (epoch_deadline_expired()) {
+      disconnect_owned_connection(connection_index);
+      return retrying_uncertain
+                 ? Preserve_trx_transfer_status::ACK_UNCERTAIN
+                 : Preserve_trx_transfer_status::IO_ERROR;
+    }
     if (connection_snapshot(connection_index) == nullptr) {
       const Preserve_trx_transfer_status connect_status =
           connect_owned_connection(connection_index, retrying_uncertain);
@@ -2106,15 +2507,20 @@ class Preserve_trx_transfer_client_frame_sink final
       return Preserve_trx_transfer_status::UNSUPPORTED;
     }
 
+    Preserve_trx_transfer_frame_ack ack;
     Preserve_trx_transfer_status status =
-        send_on_owned_connection(connection_index, encoded_frame);
+        send_on_owned_connection(connection_index, encoded_frame, &ack);
     if (disconnect_if_cancelled(connection_index)) {
       return Preserve_trx_transfer_status::UNSUPPORTED;
     }
     if (status != Preserve_trx_transfer_status::IO_ERROR &&
         status != Preserve_trx_transfer_status::ACK_UNCERTAIN) {
-      if (status == Preserve_trx_transfer_status::OK ||
-          transfer_status_is_committed_outcome(status)) {
+      if (transfer_status_has_authenticated_ack(status)) {
+        if (!ack_matches_epoch(ack)) {
+          disconnect_owned_connection(connection_index);
+          return Preserve_trx_transfer_status::CORRUPT;
+        }
+        if (out_ack != nullptr) *out_ack = ack;
         uncertain_payload.clear();
       }
       return status;
@@ -2137,12 +2543,17 @@ class Preserve_trx_transfer_client_frame_sink final
     if (disconnect_if_cancelled(connection_index)) {
       return Preserve_trx_transfer_status::UNSUPPORTED;
     }
-    status = send_on_owned_connection(connection_index, encoded_frame);
+    ack = Preserve_trx_transfer_frame_ack();
+    status = send_on_owned_connection(connection_index, encoded_frame, &ack);
     if (disconnect_if_cancelled(connection_index)) {
       return Preserve_trx_transfer_status::UNSUPPORTED;
     }
-    if (status == Preserve_trx_transfer_status::OK ||
-        transfer_status_is_committed_outcome(status)) {
+    if (transfer_status_has_authenticated_ack(status)) {
+      if (!ack_matches_epoch(ack)) {
+        disconnect_owned_connection(connection_index);
+        return Preserve_trx_transfer_status::CORRUPT;
+      }
+      if (out_ack != nullptr) *out_ack = ack;
       uncertain_payload.clear();
       return status;
     }
@@ -2161,13 +2572,43 @@ class Preserve_trx_transfer_client_frame_sink final
             return Preserve_trx_transfer_status::UNSUPPORTED;
           }
           const Preserve_trx_transfer_status query_status =
-              send_on_owned_connection(connection_index, encoded_query);
+              send_on_owned_connection(connection_index, encoded_query,
+                                       &ack);
           if (disconnect_if_cancelled(connection_index)) {
             return Preserve_trx_transfer_status::UNSUPPORTED;
           }
-          if (transfer_status_is_committed_outcome(query_status)) {
-            uncertain_payload.clear();
-            return query_status;
+          if (transfer_status_has_authenticated_ack(query_status)) {
+            if (!ack_matches_epoch(ack)) {
+              disconnect_owned_connection(connection_index);
+              return Preserve_trx_transfer_status::CORRUPT;
+            }
+            if (transfer_status_is_committed_outcome(query_status) ||
+                query_status ==
+                    Preserve_trx_transfer_status::NOT_COMMITTED_CLEAN) {
+              if (out_ack != nullptr) *out_ack = ack;
+              uncertain_payload.clear();
+              return query_status;
+            }
+            if (query_status ==
+                Preserve_trx_transfer_status::NOT_COMMITTED) {
+              std::string encoded_abandon;
+              if (build_epoch_abandon_payload(encoded_frame,
+                                              &encoded_abandon)) {
+                ack = Preserve_trx_transfer_frame_ack();
+                const Preserve_trx_transfer_status abandon_status =
+                    send_on_owned_connection(connection_index,
+                                             encoded_abandon, &ack);
+                if (transfer_status_has_authenticated_ack(abandon_status) &&
+                    ack_matches_epoch(ack) &&
+                    (abandon_status ==
+                         Preserve_trx_transfer_status::NOT_COMMITTED_CLEAN ||
+                     transfer_status_is_committed_outcome(abandon_status))) {
+                  if (out_ack != nullptr) *out_ack = ack;
+                  uncertain_payload.clear();
+                  return abandon_status;
+                }
+              }
+            }
           }
         } else if (cancel_requested() ||
                    reconnect_status ==
@@ -2179,6 +2620,12 @@ class Preserve_trx_transfer_client_frame_sink final
       return Preserve_trx_transfer_status::ACK_UNCERTAIN;
     }
     return status;
+  }
+
+  bool ack_matches_epoch(const Preserve_trx_transfer_frame_ack &ack) const {
+    std::lock_guard<std::mutex> guard(m_epoch_context_mutex);
+    return m_receiver_process_nonce.empty() ||
+           ack.receiver_process_nonce == m_receiver_process_nonce;
   }
 
   void set_operation_timeout_ms(uint timeout_ms) override {
@@ -2216,6 +2663,9 @@ class Preserve_trx_transfer_client_frame_sink final
           frame.type ==
               Preserve_trx_transfer_frame_type::QUERY_EPOCH_STATUS ||
           frame.type ==
+              Preserve_trx_transfer_frame_type::
+                  ABANDON_EPOCH_IF_NOT_COMMITTED ||
+          frame.type ==
               Preserve_trx_transfer_frame_type::PROMOTION_GATE_EPOCH) {
         return 0;
       }
@@ -2225,12 +2675,23 @@ class Preserve_trx_transfer_client_frame_sink final
   }
 
   Preserve_trx_transfer_client_endpoint m_endpoint;
+  static constexpr uint kMaxReconnectAttempts = 3;
+  std::shared_ptr<const Transfer_epoch_password> m_password;
   std::atomic<uint> m_operation_timeout_ms{0};
   const Preserve_trx_transfer_client_ops *m_ops{nullptr};
   std::vector<void *> m_connections;
   std::vector<std::unique_ptr<std::mutex>> m_operation_mutexes;
   std::vector<std::unique_ptr<std::mutex>> m_connection_mutexes;
   std::vector<std::string> m_uncertain_payloads;
+  mutable std::mutex m_epoch_context_mutex;
+  std::mutex m_reconnect_mutex;
+  std::string m_epoch_id;
+  bool m_epoch_context_bound{false};
+  uint64_t m_requested_terminal_status_retention_us{0};
+  std::string m_receiver_process_nonce;
+  uint64_t m_accepted_terminal_status_retention_us{0};
+  uint64_t m_absolute_monotonic_deadline_us{0};
+  std::atomic<uint> m_reconnect_attempts{0};
   std::atomic<bool> m_cancel_requested{false};
 };
 
@@ -2306,12 +2767,6 @@ std::string transfer_epoch_fact_path(const std::string &root_dir,
                                      const std::string &epoch_id) {
   return join_path(transfer_epoch_dir_for_epoch(root_dir, epoch_id),
                    "epoch.fact");
-}
-
-std::string transfer_receiver_frame_spool_path(const std::string &root_dir,
-                                               const std::string &epoch_id) {
-  return join_path(transfer_epoch_dir_for_epoch(root_dir, epoch_id),
-                   "receiver.frames");
 }
 
 std::string transfer_object_path(
@@ -2610,8 +3065,6 @@ Preserve_trx_transfer_status validate_manifest_components(
     const Preserve_trx_transfer_manifest &manifest,
     bool decoded_remote_manifest) {
   if (!transfer_component_safe(manifest.epoch_id) ||
-      !transfer_component_safe(manifest.source_server_uuid) ||
-      !transfer_component_safe(manifest.target_server_uuid) ||
       manifest.token == 0 ||
       manifest.objects.size() > kMaxTransferManifestObjects) {
     return decoded_remote_manifest ? Preserve_trx_transfer_status::CORRUPT
@@ -2619,12 +3072,9 @@ Preserve_trx_transfer_status validate_manifest_components(
                                          INVALID_ARGUMENT;
   }
 
-  const bool legacy_protocol =
-      manifest.protocol_version == kPreserveTrxTransferLegacyProtocolVersion;
-  if ((legacy_protocol && manifest.strict_eligibility_flags != 0) ||
-      (manifest.protocol_version == kPreserveTrxTransferProtocolVersion &&
-       (manifest.strict_eligibility_flags &
-        ~kPreserveTrxTransferStrictEligibilityKnownFlags) != 0)) {
+  if (manifest.protocol_version != kPreserveTrxTransferProtocolVersion ||
+      (manifest.strict_eligibility_flags &
+       ~kPreserveTrxTransferStrictEligibilityKnownFlags) != 0) {
     return decoded_remote_manifest ? Preserve_trx_transfer_status::CORRUPT
                                    : Preserve_trx_transfer_status::
                                          INVALID_ARGUMENT;
@@ -2635,11 +3085,7 @@ Preserve_trx_transfer_status validate_manifest_components(
        manifest.objects) {
     if (!transfer_component_safe(object.object_id) ||
         !object_ids.insert(object.object_id).second ||
-        !transfer_lock_plan_contract_valid(object) ||
-        (legacy_protocol && object.lock_plan.version != 0) ||
-        (legacy_protocol &&
-         object.kind ==
-             Preserve_trx_transfer_object_kind::RESURRECTION_INDEX)) {
+        !transfer_lock_plan_contract_valid(object)) {
       return decoded_remote_manifest ? Preserve_trx_transfer_status::CORRUPT
                                      : Preserve_trx_transfer_status::
                                            INVALID_ARGUMENT;
@@ -2777,9 +3223,7 @@ Preserve_trx_transfer_status read_whole_file(const std::string &path,
 
 std::string commit_marker_payload(
     const Preserve_trx_transfer_manifest &manifest) {
-  return "PTRXFER_COMMIT\n" + manifest.epoch_id + "\n" +
-         manifest.source_server_uuid + "\n" + manifest.target_server_uuid +
-         "\n";
+  return "PTRXFER_COMMIT_V1\n" + manifest.epoch_id + "\n";
 }
 
 std::string transfer_unique_tmp_path(const std::string &final_path,
@@ -3048,32 +3492,6 @@ std::vector<std::string> split_pipe_fields(const std::string &line) {
   return fields;
 }
 
-bool decode_declare_token_reason(const std::string &reason,
-                                 std::string *source_server_uuid,
-                                 std::string *target_server_uuid) {
-  if (source_server_uuid == nullptr || target_server_uuid == nullptr)
-    return false;
-  const size_t newline = reason.find('\n');
-  if (newline == std::string::npos ||
-      reason.find('\n', newline + 1) != std::string::npos) {
-    return false;
-  }
-  const std::string source = reason.substr(0, newline);
-  const std::string target = reason.substr(newline + 1);
-  if (!transfer_component_safe(source) || !transfer_component_safe(target)) {
-    return false;
-  }
-  *source_server_uuid = source;
-  *target_server_uuid = target;
-  return true;
-}
-
-std::string encode_declare_token_reason(
-    const std::string &source_server_uuid,
-    const std::string &target_server_uuid) {
-  return source_server_uuid + "\n" + target_server_uuid;
-}
-
 bool staged_ranges_cover_object(
     const std::string &root_dir, const Preserve_trx_transfer_manifest &manifest,
     const Preserve_trx_transfer_object_descriptor &object) {
@@ -3206,8 +3624,11 @@ Preserve_trx_transfer_object_descriptor transfer_external_blob_descriptor(
   return descriptor;
 }
 
-bool receiver_frame_should_spool(Preserve_trx_transfer_frame_type type) {
+bool receiver_frame_is_sequence_tracked(
+    Preserve_trx_transfer_frame_type type) {
   switch (type) {
+    case Preserve_trx_transfer_frame_type::OPEN_EPOCH:
+      return false;
     case Preserve_trx_transfer_frame_type::DECLARE_TOKEN:
     case Preserve_trx_transfer_frame_type::DECLARE_OBJECT:
     case Preserve_trx_transfer_frame_type::BEGIN:
@@ -3219,117 +3640,11 @@ bool receiver_frame_should_spool(Preserve_trx_transfer_frame_type type) {
     case Preserve_trx_transfer_frame_type::PROMOTION_PREWARM_TOKEN:
     case Preserve_trx_transfer_frame_type::PROMOTION_GATE_EPOCH:
     case Preserve_trx_transfer_frame_type::QUERY_EPOCH_STATUS:
+    case Preserve_trx_transfer_frame_type::ABANDON_EPOCH_IF_NOT_COMMITTED:
       return false;
   }
   return false;
 }
-
-Preserve_trx_transfer_status append_receiver_frame_spool_records(
-    const std::string &root_dir,
-    const std::vector<Preserve_trx_transfer_frame> &frames) {
-  if (root_dir.empty() || frames.empty() ||
-      !transfer_component_safe(frames.front().epoch_id)) {
-    return Preserve_trx_transfer_status::INVALID_ARGUMENT;
-  }
-  const std::string &epoch_id = frames.front().epoch_id;
-
-  const std::string transfer_root = join_path(root_dir, ".transfer");
-  const std::string epoch_dir =
-      transfer_epoch_dir_for_epoch(root_dir, epoch_id);
-  if (ensure_dir_exists(transfer_root) || ensure_dir_exists(epoch_dir)) {
-    return Preserve_trx_transfer_status::IO_ERROR;
-  }
-
-  std::string records;
-  for (const Preserve_trx_transfer_frame &frame : frames) {
-    if (frame.epoch_id != epoch_id) {
-      return Preserve_trx_transfer_status::INVALID_ARGUMENT;
-    }
-    std::string encoded_frame;
-    const Preserve_trx_transfer_status status =
-        preserve_trx_transfer_encode_frame(frame, &encoded_frame);
-    if (status != Preserve_trx_transfer_status::OK) return status;
-    const uint64_t record_bytes =
-        kReceiverFrameSpoolRecordMagicLength + sizeof(uint64_t) +
-        kPreservedTrxSha256Length + encoded_frame.length();
-    if (record_bytes > std::numeric_limits<size_t>::max() - records.length()) {
-      return Preserve_trx_transfer_status::RESOURCE_EXHAUSTED;
-    }
-    records.append(kReceiverFrameSpoolRecordMagic,
-                   kReceiverFrameSpoolRecordMagicLength);
-    append_u64(&records, encoded_frame.length());
-    const std::array<unsigned char, kPreservedTrxSha256Length> digest =
-        sha256_digest(encoded_frame);
-    records.append(reinterpret_cast<const char *>(digest.data()), digest.size());
-    records.append(encoded_frame);
-  }
-
-  /* No receiver registry or object mutex is held across this wait. */
-  throttle_receiver_saved_io(records.length());
-
-  const std::string spool_path =
-      transfer_receiver_frame_spool_path(root_dir, epoch_id);
-  File file = my_open(spool_path.c_str(), O_WRONLY | O_APPEND, MYF(0));
-  if (file < 0) {
-    file = my_create(spool_path.c_str(), 0600,
-                     O_WRONLY | O_CREAT | O_EXCL, MYF(0));
-    if (file < 0 && my_errno() == EEXIST) {
-      file = my_open(spool_path.c_str(), O_WRONLY | O_APPEND, MYF(0));
-    }
-    if (file < 0) return Preserve_trx_transfer_status::IO_ERROR;
-  }
-
-  const my_off_t original_length = my_seek(file, 0, MY_SEEK_END, MYF(0));
-  if (original_length == MY_FILEPOS_ERROR) {
-    (void)my_close(file, MYF(0));
-    return Preserve_trx_transfer_status::IO_ERROR;
-  }
-  size_t write_length = records.length();
-  const bool inject_short_write =
-      g_transfer_spool_short_write_for_unit_test.load() && write_length > 1;
-  if (inject_short_write) write_length /= 2;
-  const bool write_error =
-      my_write(file, reinterpret_cast<const unsigned char *>(records.data()),
-               write_length, MYF(0)) != write_length ||
-      inject_short_write;
-  const bool close_error = my_close(file, MYF(0)) != 0;
-  if (!write_error && !close_error) {
-    return Preserve_trx_transfer_status::OK;
-  }
-
-  bool rollback_confirmed = false;
-  if (!g_transfer_spool_rollback_failure_for_unit_test.load()) {
-    File rollback_file = my_open(spool_path.c_str(), O_WRONLY, MYF(0));
-    if (rollback_file >= 0) {
-      const bool truncate_ok =
-          my_chsize(rollback_file, original_length, 0, MYF(0)) == 0;
-      const bool rollback_close_ok = my_close(rollback_file, MYF(0)) == 0;
-      rollback_confirmed = truncate_ok && rollback_close_ok;
-    }
-  }
-  return rollback_confirmed ? Preserve_trx_transfer_status::IO_ERROR
-                            : Preserve_trx_transfer_status::CORRUPT;
-}
-
-Preserve_trx_transfer_status append_receiver_frame_spool_record(
-    const std::string &root_dir, const Preserve_trx_transfer_frame &frame) {
-  return append_receiver_frame_spool_records(root_dir, {frame});
-}
-
-class Receiver_frame_spool_disable_guard {
- public:
-  Receiver_frame_spool_disable_guard()
-      : m_previous(g_receiver_frame_spool_disabled) {
-    g_receiver_frame_spool_disabled = true;
-  }
-
-  ~Receiver_frame_spool_disable_guard() {
-    g_receiver_frame_spool_disabled = m_previous;
-  }
-
- private:
-  bool m_previous;
-};
 
 class Receiver_frame_sequence_disable_guard {
  public:
@@ -3459,6 +3774,7 @@ Preserve_trx_transfer_status encode_transfer_object_descriptor(
   std::string out;
   out.append(kTransferObjectDescriptorMagic,
              kTransferObjectDescriptorMagicLength);
+  append_u16(&out, kTransferObjectDescriptorVersion);
   if (append_string(&out, object.object_id)) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
@@ -3495,6 +3811,13 @@ Preserve_trx_transfer_status decode_transfer_object_descriptor(
                   kTransferObjectDescriptorMagicLength) != 0) {
     return Preserve_trx_transfer_status::CORRUPT;
   }
+  uint16_t version = 0;
+  if (reader.read_u16(&version)) {
+    return Preserve_trx_transfer_status::CORRUPT;
+  }
+  if (version != kTransferObjectDescriptorVersion) {
+    return Preserve_trx_transfer_status::UNSUPPORTED;
+  }
 
   Preserve_trx_transfer_object_descriptor parsed;
   uint16_t raw_kind = 0;
@@ -3507,35 +3830,32 @@ Preserve_trx_transfer_status decode_transfer_object_descriptor(
     return Preserve_trx_transfer_status::CORRUPT;
   }
   std::memcpy(parsed.digest.data(), digest, parsed.digest.size());
-  if (!reader.eof()) {
-    const char *source_live_digest = nullptr;
-    const char *record_store_fingerprint = nullptr;
-    const char *terminal_proof = nullptr;
-    uint16_t terminal_proof_present = 0;
-    if (reader.read_u16(&parsed.lock_plan.version) ||
-        reader.read_u64(&parsed.lock_plan.source_live_generation) ||
-        reader.read_fixed(parsed.lock_plan.source_live_digest.size(),
-                          &source_live_digest) ||
-        reader.read_fixed(parsed.lock_plan.record_store_fingerprint.size(),
-                          &record_store_fingerprint) ||
-        reader.read_u16(&terminal_proof_present) ||
-        terminal_proof_present > 1 ||
-        reader.read_fixed(parsed.lock_plan.terminal_proof.size(),
-                          &terminal_proof) ||
-        !reader.eof()) {
-      return Preserve_trx_transfer_status::CORRUPT;
-    }
-    parsed.lock_plan.simulated_terminal_proof =
-        terminal_proof_present != 0;
-    std::memcpy(parsed.lock_plan.source_live_digest.data(),
-                source_live_digest,
-                parsed.lock_plan.source_live_digest.size());
-    std::memcpy(parsed.lock_plan.record_store_fingerprint.data(),
-                record_store_fingerprint,
-                parsed.lock_plan.record_store_fingerprint.size());
-    std::memcpy(parsed.lock_plan.terminal_proof.data(), terminal_proof,
-                parsed.lock_plan.terminal_proof.size());
+  const char *source_live_digest = nullptr;
+  const char *record_store_fingerprint = nullptr;
+  const char *terminal_proof = nullptr;
+  uint16_t terminal_proof_present = 0;
+  if (reader.read_u16(&parsed.lock_plan.version) ||
+      reader.read_u64(&parsed.lock_plan.source_live_generation) ||
+      reader.read_fixed(parsed.lock_plan.source_live_digest.size(),
+                        &source_live_digest) ||
+      reader.read_fixed(parsed.lock_plan.record_store_fingerprint.size(),
+                        &record_store_fingerprint) ||
+      reader.read_u16(&terminal_proof_present) ||
+      terminal_proof_present > 1 ||
+      reader.read_fixed(parsed.lock_plan.terminal_proof.size(),
+                        &terminal_proof) ||
+      !reader.eof()) {
+    return Preserve_trx_transfer_status::CORRUPT;
   }
+  parsed.lock_plan.simulated_terminal_proof =
+      terminal_proof_present != 0;
+  std::memcpy(parsed.lock_plan.source_live_digest.data(), source_live_digest,
+              parsed.lock_plan.source_live_digest.size());
+  std::memcpy(parsed.lock_plan.record_store_fingerprint.data(),
+              record_store_fingerprint,
+              parsed.lock_plan.record_store_fingerprint.size());
+  std::memcpy(parsed.lock_plan.terminal_proof.data(), terminal_proof,
+              parsed.lock_plan.terminal_proof.size());
   if (!transfer_lock_plan_contract_valid(parsed)) {
     return Preserve_trx_transfer_status::CORRUPT;
   }
@@ -3561,6 +3881,7 @@ bool frame_type_supported(uint16_t raw_type,
                           Preserve_trx_transfer_frame_type *type) {
   if (type == nullptr) return false;
   switch (static_cast<Preserve_trx_transfer_frame_type>(raw_type)) {
+    case Preserve_trx_transfer_frame_type::OPEN_EPOCH:
     case Preserve_trx_transfer_frame_type::BEGIN:
     case Preserve_trx_transfer_frame_type::OBJECT_CHUNK:
     case Preserve_trx_transfer_frame_type::SEAL_OBJECT:
@@ -3571,6 +3892,7 @@ bool frame_type_supported(uint16_t raw_type,
     case Preserve_trx_transfer_frame_type::DECLARE_TOKEN:
     case Preserve_trx_transfer_frame_type::DECLARE_OBJECT:
     case Preserve_trx_transfer_frame_type::QUERY_EPOCH_STATUS:
+    case Preserve_trx_transfer_frame_type::ABANDON_EPOCH_IF_NOT_COMMITTED:
       *type = static_cast<Preserve_trx_transfer_frame_type>(raw_type);
       return true;
   }
@@ -3586,6 +3908,7 @@ Preserve_trx_transfer_status validate_frame_components(
   };
 
   const bool token_optional =
+      frame.type == Preserve_trx_transfer_frame_type::OPEN_EPOCH ||
       frame.type == Preserve_trx_transfer_frame_type::PROMOTION_GATE_EPOCH;
   if (!transfer_protocol_version_is_decodable(frame.protocol_version) ||
       !transfer_component_safe(frame.epoch_id) ||
@@ -3606,21 +3929,44 @@ Preserve_trx_transfer_status validate_frame_components(
   }
   const bool trx_id_store_fact_empty =
       transfer_trx_id_store_fact_is_empty(frame.trx_id_store);
+  const bool terminal_fact_digest_empty =
+      transfer_digest_is_zero(frame.terminal_fact_digest);
   if (frame.type != Preserve_trx_transfer_frame_type::COMMIT_EPOCH &&
       !trx_id_store_fact_empty) {
     return frame_error();
   }
+  if (frame.type != Preserve_trx_transfer_frame_type::COMMIT_EPOCH &&
+      frame.type != Preserve_trx_transfer_frame_type::QUERY_EPOCH_STATUS &&
+      frame.type !=
+          Preserve_trx_transfer_frame_type::ABANDON_EPOCH_IF_NOT_COMMITTED &&
+      !terminal_fact_digest_empty) {
+    return frame_error();
+  }
 
   switch (frame.type) {
-    case Preserve_trx_transfer_frame_type::DECLARE_TOKEN:
-      if (!frame.object_id.empty() || frame.chunk_offset != 0 ||
+    case Preserve_trx_transfer_frame_type::OPEN_EPOCH:
+      if (frame.sequence != 0 || frame.token != 0 ||
+          !frame.receiver_process_nonce.empty() ||
+          frame.requested_terminal_status_retention_us == 0 ||
+          !frame.object_id.empty() || frame.chunk_offset != 0 ||
           !frame.manifest_payload.empty() || !frame.chunk_payload.empty() ||
-          frame.reason.empty()) {
+          !frame.reason.empty()) {
+        return frame_error();
+      }
+      break;
+    case Preserve_trx_transfer_frame_type::DECLARE_TOKEN:
+      if (frame.requested_terminal_status_retention_us != 0 ||
+          !frame.object_id.empty() || frame.chunk_offset != 0 ||
+          !frame.manifest_payload.empty() || !frame.chunk_payload.empty() ||
+          !frame.reason.empty()) {
         return frame_error();
       }
       break;
     case Preserve_trx_transfer_frame_type::DECLARE_OBJECT:
       {
+        if (frame.requested_terminal_status_retention_us != 0) {
+          return frame_error();
+        }
         uint64_t prefix_size = 0;
         std::array<unsigned char, kPreservedTrxSha256Length> prefix_digest{};
         const bool append_prefix = decode_binlog_append_prefix_reason(
@@ -3634,49 +3980,72 @@ Preserve_trx_transfer_status validate_frame_components(
       }
       break;
     case Preserve_trx_transfer_frame_type::BEGIN:
+      if (frame.requested_terminal_status_retention_us != 0) {
+        return frame_error();
+      }
       if (!frame.object_id.empty() || frame.chunk_offset != 0 ||
           !frame.chunk_payload.empty() || !frame.reason.empty()) {
         return frame_error();
       }
       break;
     case Preserve_trx_transfer_frame_type::OBJECT_CHUNK:
+      if (frame.requested_terminal_status_retention_us != 0) {
+        return frame_error();
+      }
       if (!frame.manifest_payload.empty() || !frame.reason.empty()) {
         return frame_error();
       }
       break;
     case Preserve_trx_transfer_frame_type::SEAL_OBJECT:
+      if (frame.requested_terminal_status_retention_us != 0) {
+        return frame_error();
+      }
       if (frame.chunk_offset != 0 || !frame.manifest_payload.empty() ||
           !frame.chunk_payload.empty() || !frame.reason.empty()) {
         return frame_error();
       }
       break;
     case Preserve_trx_transfer_frame_type::COMMIT_EPOCH:
+      if (frame.requested_terminal_status_retention_us != 0) {
+        return frame_error();
+      }
       if (!frame.object_id.empty() || !frame.manifest_payload.empty() ||
           !frame.chunk_payload.empty() ||
           !frame.reason.empty()) {
         return frame_error();
       }
-      if ((frame.protocol_version == kPreserveTrxTransferLegacyProtocolVersion &&
-           !trx_id_store_fact_empty) ||
-          (!trx_id_store_fact_empty &&
+      if (!trx_id_store_fact_empty &&
            !transfer_trx_id_store_fact_is_valid(frame.trx_id_store,
-                                                frame.chunk_offset))) {
+                                                frame.chunk_offset)) {
+        return frame_error();
+      }
+      if (!frame.receiver_process_nonce.empty() &&
+          terminal_fact_digest_empty) {
         return frame_error();
       }
       break;
     case Preserve_trx_transfer_frame_type::ABORT:
+      if (frame.requested_terminal_status_retention_us != 0) {
+        return frame_error();
+      }
       if (!frame.object_id.empty() || frame.chunk_offset != 0 ||
           !frame.manifest_payload.empty() || !frame.chunk_payload.empty()) {
         return frame_error();
       }
       break;
     case Preserve_trx_transfer_frame_type::PROMOTION_PREWARM_TOKEN:
+      if (frame.requested_terminal_status_retention_us != 0) {
+        return frame_error();
+      }
       if (!frame.object_id.empty() || !frame.manifest_payload.empty() ||
           !frame.chunk_payload.empty() || !frame.reason.empty()) {
         return frame_error();
       }
       break;
     case Preserve_trx_transfer_frame_type::PROMOTION_GATE_EPOCH:
+      if (frame.requested_terminal_status_retention_us != 0) {
+        return frame_error();
+      }
       if (frame.token != 0 || !frame.object_id.empty() ||
           !frame.manifest_payload.empty() || !frame.chunk_payload.empty() ||
           !frame.reason.empty()) {
@@ -3684,7 +4053,12 @@ Preserve_trx_transfer_status validate_frame_components(
       }
       break;
     case Preserve_trx_transfer_frame_type::QUERY_EPOCH_STATUS:
+    case Preserve_trx_transfer_frame_type::ABANDON_EPOCH_IF_NOT_COMMITTED:
+      if (frame.requested_terminal_status_retention_us != 0) {
+        return frame_error();
+      }
       if (frame.protocol_version != kPreserveTrxTransferProtocolVersion ||
+          terminal_fact_digest_empty ||
           !frame.object_id.empty() || frame.chunk_offset != 0 ||
           !frame.manifest_payload.empty() || !frame.chunk_payload.empty() ||
           !frame.reason.empty()) {
@@ -3728,6 +4102,9 @@ Preserve_snapshot_status map_transfer_status_to_snapshot(
     case Preserve_trx_transfer_status::RESOURCE_EXHAUSTED:
     case Preserve_trx_transfer_status::ACK_UNCERTAIN:
       return Preserve_snapshot_status::IO_ERROR;
+    case Preserve_trx_transfer_status::NOT_COMMITTED:
+    case Preserve_trx_transfer_status::NOT_COMMITTED_CLEAN:
+      return Preserve_snapshot_status::UNSUPPORTED;
     case Preserve_trx_transfer_status::COMMITTED_READY:
     case Preserve_trx_transfer_status::COMMITTED_NOT_READY:
       return Preserve_snapshot_status::OK;
@@ -3779,6 +4156,10 @@ std::string transfer_status_name(Preserve_trx_transfer_status status) {
       return "ACK_UNCERTAIN";
     case Preserve_trx_transfer_status::LOCK_PLAN_STALE:
       return "LOCK_PLAN_STALE";
+    case Preserve_trx_transfer_status::NOT_COMMITTED:
+      return "NOT_COMMITTED";
+    case Preserve_trx_transfer_status::NOT_COMMITTED_CLEAN:
+      return "NOT_COMMITTED_CLEAN";
   }
   return "UNKNOWN";
 }
@@ -3788,8 +4169,6 @@ Preserve_trx_transfer_manifest receiver_record_manifest(
   Preserve_trx_transfer_manifest manifest;
   manifest.protocol_version = record.protocol_version;
   manifest.epoch_id = record.epoch_id;
-  manifest.source_server_uuid = record.source_server_uuid;
-  manifest.target_server_uuid = record.target_server_uuid;
   manifest.token = record.token;
   manifest.source_prepare_lsn = record.source_prepare_lsn;
   manifest.source_epoch_commit_lsn = record.source_epoch_commit_lsn;
@@ -3799,8 +4178,14 @@ Preserve_trx_transfer_manifest receiver_record_manifest(
 }
 
 std::string receiver_boot_incarnation() {
-  return std::string(server_uuid) + ":" + std::to_string(server_start_time) +
-         ":" + std::to_string(current_pid);
+  static const std::string nonce = []() {
+    std::array<unsigned char, 16> random_bytes{};
+    if (my_rand_buffer(random_bytes.data(), random_bytes.size()) != 0) {
+      return std::string();
+    }
+    return bytes_to_lower_hex(random_bytes.data(), random_bytes.size());
+  }();
+  return nonce;
 }
 
 bool strict_prepared_key_for_receiver(
@@ -3808,13 +4193,14 @@ bool strict_prepared_key_for_receiver(
     const Preserve_trx_transfer_manifest &manifest,
     const std::string &semantic_token,
     Preserve_trx_prepared_token_key *key) {
-  if (key == nullptr || root_dir.empty() || manifest.source_server_uuid.empty() ||
+  const std::string epoch_scope = receiver_boot_incarnation();
+  if (key == nullptr || root_dir.empty() || epoch_scope.empty() ||
       manifest.epoch_id.empty() || semantic_token.empty() ||
       manifest.source_epoch_commit_lsn == 0) {
     return false;
   }
   key->preserve_dir = root_dir;
-  key->source_uuid = manifest.source_server_uuid;
+  key->epoch_scope = epoch_scope;
   key->epoch_id = manifest.epoch_id;
   key->token = semantic_token;
   key->target_boot_incarnation = receiver_boot_incarnation();
@@ -3825,7 +4211,7 @@ bool strict_prepared_key_for_receiver(
 bool receiver_prepared_key_equal(const Preserve_trx_prepared_token_key &lhs,
                                  const Preserve_trx_prepared_token_key &rhs) {
   return lhs.preserve_dir == rhs.preserve_dir &&
-         lhs.source_uuid == rhs.source_uuid &&
+         lhs.epoch_scope == rhs.epoch_scope &&
          lhs.epoch_id == rhs.epoch_id && lhs.token == rhs.token &&
          lhs.target_boot_incarnation == rhs.target_boot_incarnation &&
          lhs.generation == rhs.generation;
@@ -4212,7 +4598,7 @@ bool build_receiver_binlog_prepared_from_seed(
     return false;
   }
   Mysql_binlog_preserve_token_identity identity;
-  identity.source_uuid = key.source_uuid;
+  identity.epoch_scope = key.epoch_scope;
   identity.epoch_id = key.epoch_id;
   identity.token = key.token;
   identity.target_boot_incarnation = key.target_boot_incarnation;
@@ -4249,7 +4635,7 @@ bool build_receiver_binlog_prepared_from_seed(
   return true;
 }
 
-bool transfer_object_uses_strict_v4_memory_staging(
+bool transfer_object_uses_strict_v1_memory_staging(
     const Preserve_trx_transfer_manifest &manifest,
     const Preserve_trx_transfer_object_descriptor &object);
 
@@ -4264,8 +4650,8 @@ Preserve_trx_transfer_status read_receiver_sealed_object_payload(
       find_object(manifest, object_id);
   if (object == nullptr) return Preserve_trx_transfer_status::CORRUPT;
   if (registry != nullptr &&
-      transfer_object_uses_strict_v4_memory_staging(manifest, *object)) {
-    return registry->read_strict_v4_object(manifest, object_id, payload);
+      transfer_object_uses_strict_v1_memory_staging(manifest, *object)) {
+    return registry->read_strict_v1_object(manifest, object_id, payload);
   }
 
   auto staged_payload = std::make_shared<std::string>();
@@ -4311,9 +4697,7 @@ bool resurrection_index_matches_receiver_bundle(
       Preserve_trx_resurrection_index_status::OK) {
     return false;
   }
-  if (index.source_server_uuid != manifest.source_server_uuid ||
-      index.target_server_uuid != manifest.target_server_uuid ||
-      index.epoch_id != manifest.epoch_id || index.entries.size() != 1) {
+  if (index.epoch_id != manifest.epoch_id || index.entries.size() != 1) {
     return false;
   }
 
@@ -4401,7 +4785,7 @@ bool prepare_strict_bundle_for_receiver(
     descriptor.size = binlog_object->total_size;
     descriptor.digest = binlog_object->digest;
     Mysql_binlog_preserve_token_identity identity;
-    identity.source_uuid = key.source_uuid;
+    identity.epoch_scope = key.epoch_scope;
     identity.epoch_id = key.epoch_id;
     identity.token = key.token;
     identity.target_boot_incarnation = key.target_boot_incarnation;
@@ -4608,8 +4992,6 @@ void bind_strict_prepared_tokens_from_epoch_fact(
 
     Preserve_trx_transfer_manifest manifest;
     manifest.epoch_id = fact.epoch_id;
-    manifest.source_server_uuid = fact.source_server_uuid;
-    manifest.target_server_uuid = fact.target_server_uuid;
     manifest.token = token.token;
     manifest.source_prepare_lsn = token.source_prepare_lsn;
     manifest.source_epoch_commit_lsn = token.source_epoch_commit_lsn;
@@ -4959,6 +5341,22 @@ void refresh_receiver_ready_after_final_spool_ack() {
       ready_us > ack_us ? ready_us - ack_us : 0);
 }
 
+void refresh_receiver_ready_after_final_metadata_accepted() {
+  const uint64_t accepted_us =
+      g_receiver_final_metadata_accepted_monotonic_us.load();
+  const uint64_t ready_us = g_receiver_ready_monotonic_us.load();
+  g_receiver_ready_after_final_metadata_accepted_us.store(
+      accepted_us != 0 && ready_us > accepted_us ? ready_us - accepted_us : 0);
+}
+
+void refresh_receiver_ready_after_terminal_commit_admitted() {
+  const uint64_t admitted_us =
+      g_receiver_terminal_commit_admitted_monotonic_us.load();
+  const uint64_t ready_us = g_receiver_ready_monotonic_us.load();
+  g_receiver_ready_after_terminal_commit_admitted_us.store(
+      admitted_us != 0 && ready_us > admitted_us ? ready_us - admitted_us : 0);
+}
+
 void note_receiver_seal_prewarm_status(
     Preserve_trx_promotion_adopt_status status) {
   g_receiver_seal_prewarm_tokens.fetch_add(1);
@@ -5033,7 +5431,7 @@ bool synchronize_receiver_epoch_ready_deadline(
   }
 
   if (preserved_trx_strict_prepared_token_registry()
-          .update_epoch_prepare_deadline(fact.source_server_uuid,
+          .update_epoch_prepare_deadline(receiver_boot_incarnation(),
                                          fact.epoch_id, fact.tokens.size(),
                                          ready_deadline_us) !=
       Preserve_trx_prepared_status::OK) {
@@ -5077,7 +5475,8 @@ bool publish_receiver_epoch_ready_from_fact_if_possible_impl(
     Preserve_trx_transfer_receiver_registry *registry) {
   if (registry != nullptr &&
       registry->accepted_epoch_is_expired(root_dir, epoch_id)) {
-    purge_receiver_epoch_derived_state(root_dir, epoch_id, "");
+    purge_receiver_epoch_derived_state(root_dir, epoch_id,
+                                       receiver_boot_incarnation());
     return false;
   }
 
@@ -5148,8 +5547,8 @@ bool publish_receiver_epoch_ready_from_fact_if_possible_impl(
 
   if (registry != nullptr &&
       !registry->accepted_epoch_is_live(root_dir, epoch_id)) {
-    purge_receiver_epoch_derived_state(
-        root_dir, epoch_id, fact == nullptr ? "" : fact->source_server_uuid);
+    purge_receiver_epoch_derived_state(root_dir, epoch_id,
+                                       receiver_boot_incarnation());
     return false;
   }
   if (already_bound) {
@@ -5159,8 +5558,8 @@ bool publish_receiver_epoch_ready_from_fact_if_possible_impl(
                                                   registry)) {
       return true;
     }
-    purge_receiver_epoch_derived_state(
-        root_dir, epoch_id, fact == nullptr ? "" : fact->source_server_uuid);
+    purge_receiver_epoch_derived_state(root_dir, epoch_id,
+                                       receiver_boot_incarnation());
     return false;
   }
 
@@ -5168,8 +5567,6 @@ bool publish_receiver_epoch_ready_from_fact_if_possible_impl(
        fact->tokens) {
     Preserve_trx_transfer_manifest strict_manifest;
     strict_manifest.epoch_id = fact->epoch_id;
-    strict_manifest.source_server_uuid = fact->source_server_uuid;
-    strict_manifest.target_server_uuid = fact->target_server_uuid;
     strict_manifest.token = fact_token.token;
     strict_manifest.source_prepare_lsn = fact_token.source_prepare_lsn;
     strict_manifest.source_epoch_commit_lsn =
@@ -5190,7 +5587,7 @@ bool publish_receiver_epoch_ready_from_fact_if_possible_impl(
 
   if (!synchronize_receiver_epoch_ready_deadline(root_dir, *fact, registry)) {
     purge_receiver_epoch_derived_state(root_dir, epoch_id,
-                                       fact->source_server_uuid);
+                                       receiver_boot_incarnation());
     return false;
   }
 
@@ -5212,6 +5609,8 @@ bool publish_receiver_epoch_ready_from_fact_if_possible_impl(
   g_receiver_ready_monotonic_us.store(transfer_monotonic_us());
   refresh_receiver_ready_after_final_metadata();
   refresh_receiver_ready_after_final_spool_ack();
+  refresh_receiver_ready_after_final_metadata_accepted();
+  refresh_receiver_ready_after_terminal_commit_admitted();
   return true;
 }
 
@@ -5282,7 +5681,7 @@ bool transfer_manifest_uses_strict_metadata_only_prewarm(
              kPreserveTrxTransferStrictEligibilityKnownFlags;
 }
 
-bool transfer_object_uses_strict_v4_memory_staging(
+bool transfer_object_uses_strict_v1_memory_staging(
     const Preserve_trx_transfer_manifest &manifest,
     const Preserve_trx_transfer_object_descriptor &object) {
   return transfer_manifest_uses_strict_metadata_only_prewarm(manifest) &&
@@ -5292,7 +5691,7 @@ bool transfer_object_uses_strict_v4_memory_staging(
               Preserve_trx_transfer_object_kind::RESURRECTION_INDEX);
 }
 
-bool transfer_manifest_uses_v4_metadata_only_lock_prewarm(
+bool transfer_manifest_uses_v1_metadata_only_lock_prewarm(
     const Preserve_trx_transfer_manifest &manifest) {
   return manifest.protocol_version == kPreserveTrxTransferProtocolVersion;
 }
@@ -5371,6 +5770,8 @@ void signal_transfer_dispatch_error(THD *thd,
       return;
     case Preserve_trx_transfer_status::COMMITTED_READY:
     case Preserve_trx_transfer_status::COMMITTED_NOT_READY:
+    case Preserve_trx_transfer_status::NOT_COMMITTED:
+    case Preserve_trx_transfer_status::NOT_COMMITTED_CLEAN:
     case Preserve_trx_transfer_status::OK:
       my_ok(thd);
       return;
@@ -5472,50 +5873,23 @@ uint64_t preserve_trx_transfer_receiver_expired_epochs_status() {
   return default_receiver_registry().expired_epoch_count();
 }
 
-std::string preserve_trx_transfer_qualify_epoch_id(
-    const std::string &epoch_id) {
-  return qualify_transfer_epoch_id(epoch_id);
+std::string preserve_trx_transfer_make_epoch_id(
+    const std::string &monotonic_epoch_id) {
+  return make_transfer_epoch_id(monotonic_epoch_id);
 }
 
-std::string preserve_trx_transfer_source_incarnation_id_for_unit_test() {
-  return transfer_source_incarnation_id();
+std::string preserve_trx_transfer_source_epoch_boot_nonce_for_unit_test() {
+  return transfer_source_epoch_boot_nonce();
 }
 
-std::string preserve_trx_transfer_qualify_epoch_id_for_unit_test(
-    const std::string &epoch_id) {
-  return qualify_transfer_epoch_id(epoch_id);
-}
-
-void preserve_trx_transfer_set_spool_short_write_for_unit_test(bool enabled) {
-  g_transfer_spool_short_write_for_unit_test.store(enabled);
-}
-
-void preserve_trx_transfer_set_spool_sync_failure_for_unit_test(bool enabled) {
-  g_transfer_spool_sync_failure_for_unit_test.store(enabled);
-}
-
-void preserve_trx_transfer_set_spool_rollback_failure_for_unit_test(
-    bool enabled) {
-  g_transfer_spool_rollback_failure_for_unit_test.store(enabled);
-}
-
-void preserve_trx_transfer_reset_spool_sync_count_for_unit_test() {
-  g_transfer_spool_sync_count_for_unit_test.store(0);
-}
-
-uint64_t preserve_trx_transfer_spool_sync_count_for_unit_test() {
-  return g_transfer_spool_sync_count_for_unit_test.load();
+std::string preserve_trx_transfer_make_epoch_id_for_unit_test(
+    const std::string &monotonic_epoch_id) {
+  return make_transfer_epoch_id(monotonic_epoch_id);
 }
 
 void preserve_trx_transfer_set_staging_cleanup_failures_for_unit_test(
     uint failures) {
   g_transfer_staging_cleanup_failures_for_unit_test.store(failures);
-}
-
-bool preserve_trx_transfer_tls_identity_config_is_valid_for_unit_test(
-    bool unix_socket, const std::string &ssl_ca, const std::string &ssl_capath) {
-  return transfer_tls_identity_config_is_valid(unix_socket, ssl_ca,
-                                               ssl_capath);
 }
 
 bool preserve_trx_transfer_credential_file_metadata_is_secure_for_unit_test(
@@ -5563,16 +5937,10 @@ Preserve_trx_transfer_status preserve_trx_transfer_encode_manifest(
   out.append(kTransferManifestMagic, kTransferManifestMagicLength);
   append_u16(&out, manifest.protocol_version);
   append_u64(&out, manifest.frame_sequence);
-  if (manifest.protocol_version != 2) {
-    append_u64(&out, manifest.source_prepare_lsn);
-    append_u64(&out, manifest.source_epoch_commit_lsn);
-  }
-  if (manifest.protocol_version >= kPreserveTrxTransferProtocolVersion) {
-    append_u32(&out, manifest.strict_eligibility_flags);
-  }
-  if (append_string(&out, manifest.epoch_id) ||
-      append_string(&out, manifest.source_server_uuid) ||
-      append_string(&out, manifest.target_server_uuid)) {
+  append_u64(&out, manifest.source_prepare_lsn);
+  append_u64(&out, manifest.source_epoch_commit_lsn);
+  append_u32(&out, manifest.strict_eligibility_flags);
+  if (append_string(&out, manifest.epoch_id)) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
   append_u64(&out, manifest.token);
@@ -5587,20 +5955,18 @@ Preserve_trx_transfer_status preserve_trx_transfer_encode_manifest(
     append_u64(&out, object.total_size);
     out.append(reinterpret_cast<const char *>(object.digest.data()),
                object.digest.size());
-    if (manifest.protocol_version >= kPreserveTrxTransferProtocolVersion) {
-      append_u16(&out, object.lock_plan.version);
-      append_u64(&out, object.lock_plan.source_live_generation);
-      out.append(reinterpret_cast<const char *>(
-                     object.lock_plan.source_live_digest.data()),
-                 object.lock_plan.source_live_digest.size());
-      out.append(reinterpret_cast<const char *>(
-                     object.lock_plan.record_store_fingerprint.data()),
-                 object.lock_plan.record_store_fingerprint.size());
-      append_u16(&out, object.lock_plan.simulated_terminal_proof ? 1 : 0);
-      out.append(reinterpret_cast<const char *>(
-                     object.lock_plan.terminal_proof.data()),
-                 object.lock_plan.terminal_proof.size());
-    }
+    append_u16(&out, object.lock_plan.version);
+    append_u64(&out, object.lock_plan.source_live_generation);
+    out.append(reinterpret_cast<const char *>(
+                   object.lock_plan.source_live_digest.data()),
+               object.lock_plan.source_live_digest.size());
+    out.append(reinterpret_cast<const char *>(
+                   object.lock_plan.record_store_fingerprint.data()),
+               object.lock_plan.record_store_fingerprint.size());
+    append_u16(&out, object.lock_plan.simulated_terminal_proof ? 1 : 0);
+    out.append(reinterpret_cast<const char *>(
+                   object.lock_plan.terminal_proof.data()),
+               object.lock_plan.terminal_proof.size());
   }
 
   *encoded = std::move(out);
@@ -5631,14 +5997,10 @@ Preserve_trx_transfer_status preserve_trx_transfer_decode_manifest(
       reader.read_u64(&parsed.source_epoch_commit_lsn)) {
     return Preserve_trx_transfer_status::CORRUPT;
   }
-  if (parsed.protocol_version >= kPreserveTrxTransferProtocolVersion &&
-      reader.read_u32(&parsed.strict_eligibility_flags)) {
+  if (reader.read_u32(&parsed.strict_eligibility_flags)) {
     return Preserve_trx_transfer_status::CORRUPT;
   }
-  if (reader.read_string(&parsed.epoch_id) ||
-      reader.read_string(&parsed.source_server_uuid) ||
-      reader.read_string(&parsed.target_server_uuid) ||
-      reader.read_u64(&parsed.token)) {
+  if (reader.read_string(&parsed.epoch_id) || reader.read_u64(&parsed.token)) {
     return Preserve_trx_transfer_status::CORRUPT;
   }
 
@@ -5675,35 +6037,31 @@ Preserve_trx_transfer_status preserve_trx_transfer_decode_manifest(
         return Preserve_trx_transfer_status::CORRUPT;
       }
       std::memcpy(object.digest.data(), digest, object.digest.size());
-      if (parsed.protocol_version >= kPreserveTrxTransferProtocolVersion) {
-        const char *source_live_digest = nullptr;
-        const char *record_store_fingerprint = nullptr;
-        const char *terminal_proof = nullptr;
-        uint16_t terminal_proof_present = 0;
-        if (reader.read_u16(&object.lock_plan.version) ||
-            reader.read_u64(&object.lock_plan.source_live_generation) ||
-            reader.read_fixed(object.lock_plan.source_live_digest.size(),
-                              &source_live_digest) ||
-            reader.read_fixed(
-                object.lock_plan.record_store_fingerprint.size(),
-                &record_store_fingerprint) ||
-            reader.read_u16(&terminal_proof_present) ||
-            terminal_proof_present > 1 ||
-            reader.read_fixed(object.lock_plan.terminal_proof.size(),
-                              &terminal_proof)) {
-          return Preserve_trx_transfer_status::CORRUPT;
-        }
-        object.lock_plan.simulated_terminal_proof =
-            terminal_proof_present != 0;
-        std::memcpy(object.lock_plan.source_live_digest.data(),
-                    source_live_digest,
-                    object.lock_plan.source_live_digest.size());
-        std::memcpy(object.lock_plan.record_store_fingerprint.data(),
-                    record_store_fingerprint,
-                    object.lock_plan.record_store_fingerprint.size());
-        std::memcpy(object.lock_plan.terminal_proof.data(), terminal_proof,
-                    object.lock_plan.terminal_proof.size());
+      const char *source_live_digest = nullptr;
+      const char *record_store_fingerprint = nullptr;
+      const char *terminal_proof = nullptr;
+      uint16_t terminal_proof_present = 0;
+      if (reader.read_u16(&object.lock_plan.version) ||
+          reader.read_u64(&object.lock_plan.source_live_generation) ||
+          reader.read_fixed(object.lock_plan.source_live_digest.size(),
+                            &source_live_digest) ||
+          reader.read_fixed(object.lock_plan.record_store_fingerprint.size(),
+                            &record_store_fingerprint) ||
+          reader.read_u16(&terminal_proof_present) ||
+          terminal_proof_present > 1 ||
+          reader.read_fixed(object.lock_plan.terminal_proof.size(),
+                            &terminal_proof)) {
+        return Preserve_trx_transfer_status::CORRUPT;
       }
+      object.lock_plan.simulated_terminal_proof =
+          terminal_proof_present != 0;
+      std::memcpy(object.lock_plan.source_live_digest.data(), source_live_digest,
+                  object.lock_plan.source_live_digest.size());
+      std::memcpy(object.lock_plan.record_store_fingerprint.data(),
+                  record_store_fingerprint,
+                  object.lock_plan.record_store_fingerprint.size());
+      std::memcpy(object.lock_plan.terminal_proof.data(), terminal_proof,
+                  object.lock_plan.terminal_proof.size());
       parsed.objects.push_back(object);
     }
   } catch (const std::bad_alloc &) {
@@ -5788,13 +6146,11 @@ preserve_trx_transfer_validate_strict_eligibility(
 
 Preserve_trx_transfer_status preserve_trx_transfer_encode_epoch_fact(
     const Preserve_trx_transfer_epoch_fact &fact, std::string *encoded) {
-  const bool legacy_without_trx_id_store =
+  const bool empty_trx_id_store =
       transfer_trx_id_store_fact_is_empty(fact.trx_id_store);
   if (encoded == nullptr || !transfer_component_safe(fact.epoch_id) ||
-      !transfer_component_safe(fact.source_server_uuid) ||
-      !transfer_component_safe(fact.target_server_uuid) ||
       fact.source_fence_lsn == 0 || fact.tokens.empty() ||
-      (!legacy_without_trx_id_store &&
+      (!empty_trx_id_store &&
        !transfer_trx_id_store_fact_is_valid(fact.trx_id_store,
                                             fact.source_fence_lsn))) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
@@ -5808,26 +6164,21 @@ Preserve_trx_transfer_status preserve_trx_transfer_encode_epoch_fact(
             });
 
   std::string body;
-  body.append(legacy_without_trx_id_store ? "PTRXFER_EPOCH_FACT_V2\n"
-                                          : "PTRXFER_EPOCH_FACT_V4\n");
+  body.append("PTRXFER_EPOCH_FACT_V1\n");
   body.append("epoch=").append(fact.epoch_id).append("\n");
-  body.append("source=").append(fact.source_server_uuid).append("\n");
-  body.append("target=").append(fact.target_server_uuid).append("\n");
   body.append("source_fence_lsn=")
       .append(std::to_string(fact.source_fence_lsn))
       .append("\n");
-  if (!legacy_without_trx_id_store) {
-    body.append("source_trx_id_store=")
-        .append(std::to_string(fact.trx_id_store.source_trx_id_store))
-        .append("\n");
-    body.append("source_trx_id_store_lsn=")
-        .append(std::to_string(fact.trx_id_store.source_trx_id_store_lsn))
-        .append("\n");
-    body.append("source_safe_next_trx_id_floor=")
-        .append(std::to_string(
-            fact.trx_id_store.source_safe_next_trx_id_floor))
-        .append("\n");
-  }
+  body.append("source_trx_id_store=")
+      .append(std::to_string(fact.trx_id_store.source_trx_id_store))
+      .append("\n");
+  body.append("source_trx_id_store_lsn=")
+      .append(std::to_string(fact.trx_id_store.source_trx_id_store_lsn))
+      .append("\n");
+  body.append("source_safe_next_trx_id_floor=")
+      .append(
+          std::to_string(fact.trx_id_store.source_safe_next_trx_id_floor))
+      .append("\n");
   body.append("token_count=").append(std::to_string(tokens.size())).append("\n");
 
   uint64_t previous_token = 0;
@@ -5868,22 +6219,20 @@ Preserve_trx_transfer_status preserve_trx_transfer_encode_epoch_fact(
           .append("|")
           .append(std::to_string(object.total_size))
           .append("|")
-          .append(digest_hex(object.digest));
-      if (!legacy_without_trx_id_store) {
-        body.append("|")
-            .append(std::to_string(object.lock_plan.version))
-            .append("|")
-            .append(std::to_string(object.lock_plan.source_live_generation))
-            .append("|")
-            .append(digest_hex(object.lock_plan.source_live_digest))
-            .append("|")
-            .append(digest_hex(object.lock_plan.record_store_fingerprint))
-            .append("|")
-            .append(object.lock_plan.simulated_terminal_proof ? "1" : "0")
-            .append("|")
-            .append(digest_hex(object.lock_plan.terminal_proof));
-      }
-      body.append("\n");
+          .append(digest_hex(object.digest))
+          .append("|")
+          .append(std::to_string(object.lock_plan.version))
+          .append("|")
+          .append(std::to_string(object.lock_plan.source_live_generation))
+          .append("|")
+          .append(digest_hex(object.lock_plan.source_live_digest))
+          .append("|")
+          .append(digest_hex(object.lock_plan.record_store_fingerprint))
+          .append("|")
+          .append(object.lock_plan.simulated_terminal_proof ? "1" : "0")
+          .append("|")
+          .append(digest_hex(object.lock_plan.terminal_proof))
+          .append("\n");
     }
   }
   const std::array<unsigned char, kPreservedTrxSha256Length> body_digest =
@@ -5913,25 +6262,11 @@ Preserve_trx_transfer_status preserve_trx_transfer_decode_epoch_fact(
   };
 
   Preserve_trx_transfer_epoch_fact parsed;
-  if (!next_line()) return Preserve_trx_transfer_status::CORRUPT;
-  const bool has_lock_plan_contract = line == "PTRXFER_EPOCH_FACT_V4";
-  const bool has_trx_id_store_fact =
-      has_lock_plan_contract || line == "PTRXFER_EPOCH_FACT_V3";
-  if (!has_trx_id_store_fact && line != "PTRXFER_EPOCH_FACT_V2")
+  if (!next_line() || line != "PTRXFER_EPOCH_FACT_V1")
     return Preserve_trx_transfer_status::CORRUPT;
   std::string value;
   if (!next_line() || !line_has_prefix(line, "epoch=", &parsed.epoch_id) ||
       !transfer_component_safe(parsed.epoch_id)) {
-    return Preserve_trx_transfer_status::CORRUPT;
-  }
-  if (!next_line() ||
-      !line_has_prefix(line, "source=", &parsed.source_server_uuid) ||
-      !transfer_component_safe(parsed.source_server_uuid)) {
-    return Preserve_trx_transfer_status::CORRUPT;
-  }
-  if (!next_line() ||
-      !line_has_prefix(line, "target=", &parsed.target_server_uuid) ||
-      !transfer_component_safe(parsed.target_server_uuid)) {
     return Preserve_trx_transfer_status::CORRUPT;
   }
   if (!next_line() || !line_has_prefix(line, "source_fence_lsn=", &value) ||
@@ -5939,24 +6274,22 @@ Preserve_trx_transfer_status preserve_trx_transfer_decode_epoch_fact(
       parsed.source_fence_lsn == 0) {
     return Preserve_trx_transfer_status::CORRUPT;
   }
-  if (has_trx_id_store_fact) {
-    if (!next_line() ||
-        !line_has_prefix(line, "source_trx_id_store=", &value) ||
-        !parse_uint64_strict(
-            value, &parsed.trx_id_store.source_trx_id_store) ||
-        !next_line() ||
-        !line_has_prefix(line, "source_trx_id_store_lsn=", &value) ||
-        !parse_uint64_strict(
-            value, &parsed.trx_id_store.source_trx_id_store_lsn) ||
-        !next_line() ||
-        !line_has_prefix(line, "source_safe_next_trx_id_floor=", &value) ||
-        !parse_uint64_strict(
-            value,
-            &parsed.trx_id_store.source_safe_next_trx_id_floor) ||
-        !transfer_trx_id_store_fact_is_valid(parsed.trx_id_store,
-                                             parsed.source_fence_lsn)) {
-      return Preserve_trx_transfer_status::CORRUPT;
-    }
+  if (!next_line() ||
+      !line_has_prefix(line, "source_trx_id_store=", &value) ||
+      !parse_uint64_strict(value,
+                           &parsed.trx_id_store.source_trx_id_store) ||
+      !next_line() ||
+      !line_has_prefix(line, "source_trx_id_store_lsn=", &value) ||
+      !parse_uint64_strict(value,
+                           &parsed.trx_id_store.source_trx_id_store_lsn) ||
+      !next_line() ||
+      !line_has_prefix(line, "source_safe_next_trx_id_floor=", &value) ||
+      !parse_uint64_strict(
+          value, &parsed.trx_id_store.source_safe_next_trx_id_floor) ||
+      (!transfer_trx_id_store_fact_is_empty(parsed.trx_id_store) &&
+       !transfer_trx_id_store_fact_is_valid(parsed.trx_id_store,
+                                            parsed.source_fence_lsn))) {
+    return Preserve_trx_transfer_status::CORRUPT;
   }
   uint64_t token_count = 0;
   if (!next_line() || !line_has_prefix(line, "token_count=", &value) ||
@@ -6005,8 +6338,7 @@ Preserve_trx_transfer_status preserve_trx_transfer_decode_epoch_fact(
         return Preserve_trx_transfer_status::CORRUPT;
       }
       const std::vector<std::string> fields = split_pipe_fields(value);
-      if (fields.size() != (has_lock_plan_contract ? 11U : 5U) ||
-          !transfer_component_safe(fields[0]) ||
+      if (fields.size() != 11U || !transfer_component_safe(fields[0]) ||
           !object_ids.insert(fields[0]).second) {
         return Preserve_trx_transfer_status::CORRUPT;
       }
@@ -6025,27 +6357,24 @@ Preserve_trx_transfer_status preserve_trx_transfer_decode_epoch_fact(
         return Preserve_trx_transfer_status::CORRUPT;
       }
       object.flags = static_cast<uint32_t>(flags);
-      if (has_lock_plan_contract) {
-        uint64_t contract_version = 0;
-        uint64_t terminal_proof_present = 0;
-        if (!parse_uint64_strict(fields[5], &contract_version) ||
-            contract_version > std::numeric_limits<uint16_t>::max() ||
-            !parse_uint64_strict(
-                fields[6], &object.lock_plan.source_live_generation) ||
-            !parse_digest_hex(fields[7],
-                              &object.lock_plan.source_live_digest) ||
-            !parse_digest_hex(fields[8],
-                              &object.lock_plan.record_store_fingerprint) ||
-            !parse_uint64_strict(fields[9], &terminal_proof_present) ||
-            terminal_proof_present > 1 ||
-            !parse_digest_hex(fields[10],
-                              &object.lock_plan.terminal_proof)) {
-          return Preserve_trx_transfer_status::CORRUPT;
-        }
-        object.lock_plan.version = static_cast<uint16_t>(contract_version);
-        object.lock_plan.simulated_terminal_proof =
-            terminal_proof_present != 0;
+      uint64_t contract_version = 0;
+      uint64_t terminal_proof_present = 0;
+      if (!parse_uint64_strict(fields[5], &contract_version) ||
+          contract_version > std::numeric_limits<uint16_t>::max() ||
+          !parse_uint64_strict(
+              fields[6], &object.lock_plan.source_live_generation) ||
+          !parse_digest_hex(fields[7],
+                            &object.lock_plan.source_live_digest) ||
+          !parse_digest_hex(fields[8],
+                            &object.lock_plan.record_store_fingerprint) ||
+          !parse_uint64_strict(fields[9], &terminal_proof_present) ||
+          terminal_proof_present > 1 ||
+          !parse_digest_hex(fields[10], &object.lock_plan.terminal_proof)) {
+        return Preserve_trx_transfer_status::CORRUPT;
       }
+      object.lock_plan.version = static_cast<uint16_t>(contract_version);
+      object.lock_plan.simulated_terminal_proof =
+          terminal_proof_present != 0;
       if (!transfer_lock_plan_contract_valid(object)) {
         return Preserve_trx_transfer_status::CORRUPT;
       }
@@ -6069,8 +6398,6 @@ Preserve_trx_transfer_status build_epoch_fact_from_manifests(
 
   Preserve_trx_transfer_epoch_fact built;
   built.epoch_id = manifests.front().epoch_id;
-  built.source_server_uuid = manifests.front().source_server_uuid;
-  built.target_server_uuid = manifests.front().target_server_uuid;
   built.source_fence_lsn = source_fence_lsn;
   built.trx_id_store = trx_id_store_fact;
   if (built.source_fence_lsn == 0) {
@@ -6089,8 +6416,6 @@ Preserve_trx_transfer_status build_epoch_fact_from_manifests(
     if (validation_status != Preserve_trx_transfer_status::OK)
       return validation_status;
     if (manifest.epoch_id != built.epoch_id ||
-        manifest.source_server_uuid != built.source_server_uuid ||
-        manifest.target_server_uuid != built.target_server_uuid ||
         !tokens.insert(manifest.token).second) {
       return Preserve_trx_transfer_status::CORRUPT;
     }
@@ -6165,9 +6490,7 @@ bool epoch_fact_matches_manifest(const std::string &root_dir,
       Preserve_trx_transfer_status::OK) {
     return false;
   }
-  if (fact.epoch_id != manifest.epoch_id ||
-      fact.source_server_uuid != manifest.source_server_uuid ||
-      fact.target_server_uuid != manifest.target_server_uuid) {
+  if (fact.epoch_id != manifest.epoch_id) {
     return false;
   }
 
@@ -6389,8 +6712,6 @@ Preserve_trx_transfer_status write_epoch_fact_file(
       return read_existing_status;
     }
     if (existing_fact.epoch_id != fact.epoch_id ||
-        existing_fact.source_server_uuid != fact.source_server_uuid ||
-        existing_fact.target_server_uuid != fact.target_server_uuid ||
         existing_fact.source_fence_lsn != fact.source_fence_lsn ||
         existing_fact.trx_id_store.source_trx_id_store !=
             fact.trx_id_store.source_trx_id_store ||
@@ -6462,12 +6783,21 @@ Preserve_trx_transfer_status preserve_trx_transfer_encode_frame(
   if (validation_status != Preserve_trx_transfer_status::OK)
     return validation_status;
 
+  std::string payload;
+  if (append_string(&payload, frame.manifest_payload) ||
+      append_string(&payload, frame.chunk_payload) ||
+      append_string(&payload, frame.reason)) {
+    return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+  }
+  const auto payload_digest = sha256_digest(payload);
+
   std::string out;
   out.append(kTransferFrameMagic, kTransferFrameMagicLength);
   append_u16(&out, frame.protocol_version);
   append_u16(&out, static_cast<uint16_t>(frame.type));
   append_u64(&out, frame.sequence);
-  if (append_string(&out, frame.epoch_id)) {
+  if (append_string(&out, frame.epoch_id) ||
+      append_string(&out, frame.receiver_process_nonce)) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
   append_u64(&out, frame.token);
@@ -6475,17 +6805,20 @@ Preserve_trx_transfer_status preserve_trx_transfer_encode_frame(
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
   append_u64(&out, frame.chunk_offset);
-  if (frame.protocol_version >= kPreserveTrxTransferProtocolVersion) {
-    append_u64(&out, frame.trx_id_store.source_trx_id_store);
-    append_u64(&out, frame.trx_id_store.source_trx_id_store_lsn);
-    append_u64(&out,
-               frame.trx_id_store.source_safe_next_trx_id_floor);
-  }
-  if (append_string(&out, frame.manifest_payload) ||
-      append_string(&out, frame.chunk_payload) ||
-      append_string(&out, frame.reason)) {
-    return Preserve_trx_transfer_status::INVALID_ARGUMENT;
-  }
+  append_u64(&out, frame.trx_id_store.source_trx_id_store);
+  append_u64(&out, frame.trx_id_store.source_trx_id_store_lsn);
+  append_u64(&out, frame.trx_id_store.source_safe_next_trx_id_floor);
+  append_u64(&out, frame.requested_terminal_status_retention_us);
+  out.append(reinterpret_cast<const char *>(
+                 frame.terminal_fact_digest.data()),
+             frame.terminal_fact_digest.size());
+  append_u64(&out, payload.length());
+  out.append(reinterpret_cast<const char *>(payload_digest.data()),
+             payload_digest.size());
+  append_u32(&out,
+             static_cast<uint32_t>(my_checksum(
+                 0, pointer_cast<const uchar *>(out.data()), out.length())));
+  out.append(payload);
 
   *encoded = std::move(out);
   return Preserve_trx_transfer_status::OK;
@@ -6504,30 +6837,70 @@ Preserve_trx_transfer_status preserve_trx_transfer_decode_frame(
 
   Preserve_trx_transfer_frame parsed;
   uint16_t raw_type = 0;
-  if (reader.read_u16(&parsed.protocol_version) ||
-      reader.read_u16(&raw_type) ||
+  if (reader.read_u16(&parsed.protocol_version)) {
+    return Preserve_trx_transfer_status::CORRUPT;
+  }
+  if (!transfer_protocol_version_is_decodable(parsed.protocol_version)) {
+    return Preserve_trx_transfer_status::UNSUPPORTED;
+  }
+  if (reader.read_u16(&raw_type) ||
       !frame_type_supported(raw_type, &parsed.type) ||
       reader.read_u64(&parsed.sequence) ||
       reader.read_string(&parsed.epoch_id) ||
+      reader.read_string(&parsed.receiver_process_nonce) ||
       reader.read_u64(&parsed.token) ||
       reader.read_string(&parsed.object_id) ||
       reader.read_u64(&parsed.chunk_offset)) {
     return Preserve_trx_transfer_status::CORRUPT;
   }
-  if (parsed.protocol_version >= kPreserveTrxTransferProtocolVersion &&
-      (reader.read_u64(&parsed.trx_id_store.source_trx_id_store) ||
-       reader.read_u64(&parsed.trx_id_store.source_trx_id_store_lsn) ||
-       reader.read_u64(
-           &parsed.trx_id_store.source_safe_next_trx_id_floor))) {
+  uint64_t payload_length = 0;
+  const char *payload_digest_bytes = nullptr;
+  const char *terminal_fact_digest_bytes = nullptr;
+  uint32_t stored_control_crc = 0;
+  if (reader.read_u64(&parsed.trx_id_store.source_trx_id_store) ||
+      reader.read_u64(&parsed.trx_id_store.source_trx_id_store_lsn) ||
+      reader.read_u64(
+          &parsed.trx_id_store.source_safe_next_trx_id_floor) ||
+      reader.read_u64(&parsed.requested_terminal_status_retention_us) ||
+      reader.read_fixed(parsed.terminal_fact_digest.size(),
+                        &terminal_fact_digest_bytes) ||
+      reader.read_u64(&payload_length) ||
+      reader.read_fixed(kPreservedTrxSha256Length, &payload_digest_bytes) ||
+      reader.read_u32(&stored_control_crc)) {
     return Preserve_trx_transfer_status::CORRUPT;
   }
-  if (reader.read_string(&parsed.manifest_payload) ||
-      reader.read_string(&parsed.chunk_payload) ||
-      reader.read_string(&parsed.reason) || !reader.eof()) {
+  std::memcpy(parsed.terminal_fact_digest.data(),
+              terminal_fact_digest_bytes,
+              parsed.terminal_fact_digest.size());
+  if (payload_length != reader.remaining() ||
+      payload_length > std::numeric_limits<size_t>::max()) {
     return Preserve_trx_transfer_status::CORRUPT;
   }
-  if (!transfer_protocol_version_is_decodable(parsed.protocol_version)) {
-    return Preserve_trx_transfer_status::UNSUPPORTED;
+  const size_t control_length =
+      encoded.length() - static_cast<size_t>(payload_length) -
+      sizeof(uint32_t);
+  const uint32_t expected_control_crc = static_cast<uint32_t>(my_checksum(
+      0, pointer_cast<const uchar *>(encoded.data()), control_length));
+  if (expected_control_crc != stored_control_crc) {
+    return Preserve_trx_transfer_status::CORRUPT;
+  }
+  const char *payload_bytes = nullptr;
+  if (reader.read_fixed(static_cast<size_t>(payload_length), &payload_bytes) ||
+      !reader.eof()) {
+    return Preserve_trx_transfer_status::CORRUPT;
+  }
+  const std::string payload(payload_bytes, static_cast<size_t>(payload_length));
+  std::array<unsigned char, kPreservedTrxSha256Length> stored_payload_digest{};
+  std::memcpy(stored_payload_digest.data(), payload_digest_bytes,
+              stored_payload_digest.size());
+  if (stored_payload_digest != sha256_digest(payload)) {
+    return Preserve_trx_transfer_status::CORRUPT;
+  }
+  Manifest_reader payload_reader(payload);
+  if (payload_reader.read_string(&parsed.manifest_payload) ||
+      payload_reader.read_string(&parsed.chunk_payload) ||
+      payload_reader.read_string(&parsed.reason) || !payload_reader.eof()) {
+    return Preserve_trx_transfer_status::CORRUPT;
   }
 
   const Preserve_trx_transfer_status validation_status =
@@ -6553,28 +6926,42 @@ static Preserve_trx_transfer_status encode_frame_batch_with_limit(
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
 
-  std::string out;
-  out.append(kTransferFrameBatchMagic, kTransferFrameBatchMagicLength);
-  append_u16(&out, kPreserveTrxTransferProtocolVersion);
-  append_u32(&out, static_cast<uint32_t>(encoded_frames.size()));
-  uint64_t total_bytes = out.length();
+  constexpr uint64_t kBatchControlBytes =
+      kTransferFrameBatchMagicLength + sizeof(uint16_t) + sizeof(uint32_t) +
+      sizeof(uint64_t) + kPreservedTrxSha256Length + sizeof(uint32_t);
+  std::string payload;
+  uint64_t total_bytes = kBatchControlBytes;
   for (const std::string &encoded_frame : encoded_frames) {
     Preserve_trx_transfer_frame ignored;
     const Preserve_trx_transfer_status frame_status =
         preserve_trx_transfer_decode_frame(encoded_frame, &ignored);
     if (frame_status != Preserve_trx_transfer_status::OK) return frame_status;
     if (encoded_frame.length() >
+            std::numeric_limits<uint64_t>::max() - sizeof(uint64_t) ||
+        encoded_frame.length() + sizeof(uint64_t) >
             std::numeric_limits<uint64_t>::max() - total_bytes ||
         encoded_frame.length() > std::numeric_limits<size_t>::max()) {
       return Preserve_trx_transfer_status::UNSUPPORTED;
     }
-    total_bytes += encoded_frame.length();
+    total_bytes += sizeof(uint64_t) + encoded_frame.length();
     if (max_bytes != 0 && total_bytes > max_bytes) {
       return Preserve_trx_transfer_status::UNSUPPORTED;
     }
-    append_u64(&out, encoded_frame.length());
-    out.append(encoded_frame);
+    append_u64(&payload, encoded_frame.length());
+    payload.append(encoded_frame);
   }
+  const auto payload_digest = sha256_digest(payload);
+  std::string out;
+  out.append(kTransferFrameBatchMagic, kTransferFrameBatchMagicLength);
+  append_u16(&out, kPreserveTrxTransferProtocolVersion);
+  append_u32(&out, static_cast<uint32_t>(encoded_frames.size()));
+  append_u64(&out, payload.length());
+  out.append(reinterpret_cast<const char *>(payload_digest.data()),
+             payload_digest.size());
+  append_u32(&out,
+             static_cast<uint32_t>(my_checksum(
+                 0, pointer_cast<const uchar *>(out.data()), out.length())));
+  out.append(payload);
   *encoded_batch = std::move(out);
   return Preserve_trx_transfer_status::OK;
 }
@@ -6587,7 +6974,8 @@ static Preserve_trx_transfer_status encode_frame_batches_with_limit(
   }
   encoded_batches->clear();
   const uint64_t batch_overhead =
-      kTransferFrameBatchMagicLength + sizeof(uint16_t) + sizeof(uint32_t);
+      kTransferFrameBatchMagicLength + sizeof(uint16_t) + sizeof(uint32_t) +
+      sizeof(uint64_t) + kPreservedTrxSha256Length + sizeof(uint32_t);
   std::vector<std::string> batch;
   uint64_t batch_bytes = batch_overhead;
   for (const std::string &frame : encoded_frames) {
@@ -6643,18 +7031,51 @@ Preserve_trx_transfer_status preserve_trx_transfer_decode_frame_batch(
   const char *magic = nullptr;
   uint16_t version = 0;
   uint32_t count = 0;
+  uint64_t payload_length = 0;
+  const char *payload_digest_bytes = nullptr;
+  uint32_t stored_control_crc = 0;
   if (reader.read_fixed(kTransferFrameBatchMagicLength, &magic) ||
       std::memcmp(magic, kTransferFrameBatchMagic,
                   kTransferFrameBatchMagicLength) != 0 ||
-      reader.read_u16(&version) || reader.read_u32(&count) || count == 0 ||
-      count > kMaxTransferManifestObjects) {
+      reader.read_u16(&version)) {
     return Preserve_trx_transfer_status::CORRUPT;
   }
   if (!transfer_protocol_version_is_decodable(version)) {
     return Preserve_trx_transfer_status::UNSUPPORTED;
   }
+  if (reader.read_u32(&count) || count == 0 ||
+      count > kMaxTransferManifestObjects ||
+      reader.read_u64(&payload_length) ||
+      reader.read_fixed(kPreservedTrxSha256Length, &payload_digest_bytes) ||
+      reader.read_u32(&stored_control_crc) ||
+      payload_length != reader.remaining() ||
+      payload_length > std::numeric_limits<size_t>::max()) {
+    return Preserve_trx_transfer_status::CORRUPT;
+  }
+  const size_t control_length =
+      encoded_batch.length() - static_cast<size_t>(payload_length) -
+      sizeof(uint32_t);
+  if (stored_control_crc !=
+      static_cast<uint32_t>(my_checksum(
+          0, pointer_cast<const uchar *>(encoded_batch.data()),
+          control_length))) {
+    return Preserve_trx_transfer_status::CORRUPT;
+  }
+  const char *payload_bytes = nullptr;
+  if (reader.read_fixed(static_cast<size_t>(payload_length), &payload_bytes) ||
+      !reader.eof()) {
+    return Preserve_trx_transfer_status::CORRUPT;
+  }
+  const std::string payload(payload_bytes, static_cast<size_t>(payload_length));
+  std::array<unsigned char, kPreservedTrxSha256Length> stored_payload_digest{};
+  std::memcpy(stored_payload_digest.data(), payload_digest_bytes,
+              stored_payload_digest.size());
+  if (stored_payload_digest != sha256_digest(payload)) {
+    return Preserve_trx_transfer_status::CORRUPT;
+  }
+  Manifest_reader payload_reader(payload);
   if (!preserve_trx_transfer_frame_batch_count_fits_payload(
-          count, reader.remaining())) {
+          count, payload_reader.remaining())) {
     return Preserve_trx_transfer_status::CORRUPT;
   }
   const uint64_t decode_bytes =
@@ -6671,9 +7092,9 @@ Preserve_trx_transfer_status preserve_trx_transfer_decode_frame_batch(
     for (uint32_t i = 0; i < count; ++i) {
       uint64_t length = 0;
       const char *ptr = nullptr;
-      if (reader.read_u64(&length) ||
+      if (payload_reader.read_u64(&length) ||
           length > std::numeric_limits<size_t>::max() ||
-          reader.read_fixed(static_cast<size_t>(length), &ptr)) {
+          payload_reader.read_fixed(static_cast<size_t>(length), &ptr)) {
         return Preserve_trx_transfer_status::CORRUPT;
       }
       std::string encoded_frame(ptr, static_cast<size_t>(length));
@@ -6683,7 +7104,8 @@ Preserve_trx_transfer_status preserve_trx_transfer_decode_frame_batch(
       if (frame_status != Preserve_trx_transfer_status::OK) return frame_status;
       out.push_back(std::move(encoded_frame));
     }
-    if (!reader.eof()) return Preserve_trx_transfer_status::CORRUPT;
+    if (!payload_reader.eof())
+      return Preserve_trx_transfer_status::CORRUPT;
     *encoded_frames = std::move(out);
   } catch (const std::bad_alloc &) {
     return Preserve_trx_transfer_status::RESOURCE_EXHAUSTED;
@@ -6699,7 +7121,8 @@ bool preserve_trx_transfer_frame_batch_count_fits_payload(
 
 namespace {
 
-constexpr char kTransferAckMagic[] = {'P', 'T', 'R', 'A', '1'};
+constexpr char kTransferAckMagic[] = {'P', 'T', 'R', 'X',
+                                      'O', 'A', 'K', '1'};
 constexpr size_t kTransferAckMagicLength = sizeof(kTransferAckMagic);
 
 bool decode_lower_hex(const std::string &encoded, std::string *decoded) {
@@ -6772,7 +7195,7 @@ Preserve_trx_transfer_status transfer_payload_identity(
     }
     payload_sequence = frame.sequence;
   }
-  if (payload_epoch.empty() || payload_sequence == 0) {
+  if (payload_epoch.empty()) {
     return Preserve_trx_transfer_status::CORRUPT;
   }
   *epoch_id = std::move(payload_epoch);
@@ -6782,48 +7205,39 @@ Preserve_trx_transfer_status transfer_payload_identity(
 
 Preserve_trx_transfer_status build_ack_body(
     const Preserve_trx_transfer_frame_ack &ack, std::string *body) {
-  if (body == nullptr || ack.source_incarnation_id.length() != 32 ||
-      !transfer_component_safe(ack.source_incarnation_id) ||
-      !transfer_component_safe(ack.epoch_id) || ack.sequence == 0) {
+  const bool open_ack = ack.sequence == 0;
+  if (body == nullptr || ack.receiver_process_nonce.length() != 32 ||
+      !transfer_component_safe(ack.receiver_process_nonce) ||
+      !transfer_component_safe(ack.epoch_id) ||
+      (open_ack == (ack.accepted_terminal_status_retention_us == 0))) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
   body->clear();
   body->append(kTransferAckMagic, kTransferAckMagicLength);
-  if (append_string(body, ack.source_incarnation_id) ||
-      append_string(body, ack.epoch_id)) {
+  append_u16(body, kPreserveTrxTransferProtocolVersion);
+  if (append_string(body, ack.epoch_id) ||
+      append_string(body, ack.receiver_process_nonce)) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
   append_u64(body, ack.sequence);
   body->append(reinterpret_cast<const char *>(ack.frame_digest.data()),
                ack.frame_digest.size());
   append_u16(body, static_cast<uint16_t>(ack.status));
+  append_u64(body, ack.accepted_terminal_status_retention_us);
   return Preserve_trx_transfer_status::OK;
-}
-
-bool compute_ack_hmac(const std::string &body,
-                      std::array<unsigned char, kPreservedTrxSha256Length> *out) {
-  if (out == nullptr) return false;
-  Preserved_trx_codec_context context;
-  if (!transfer_bundle_codec_context(&context)) return false;
-  unsigned int length = 0;
-  unsigned char *result = HMAC(
-      EVP_sha256(), context.hmac_key.data(), context.hmac_key.size(),
-      reinterpret_cast<const unsigned char *>(body.data()), body.length(),
-      out->data(), &length);
-  return result != nullptr && length == out->size();
 }
 
 }  // namespace
 
 Preserve_trx_transfer_status preserve_trx_transfer_build_frame_ack(
-    const std::string &source_incarnation_id,
+    const std::string &receiver_process_nonce,
     const std::string &encoded_payload, Preserve_trx_transfer_status status,
     Preserve_trx_transfer_frame_ack *ack) {
-  if (ack == nullptr || source_incarnation_id.length() != 32) {
+  if (ack == nullptr || receiver_process_nonce.length() != 32) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
   Preserve_trx_transfer_frame_ack built;
-  built.source_incarnation_id = source_incarnation_id;
+  built.receiver_process_nonce = receiver_process_nonce;
   Preserve_trx_transfer_status identity_status = transfer_payload_identity(
       encoded_payload, &built.epoch_id, &built.sequence);
   if (identity_status != Preserve_trx_transfer_status::OK) {
@@ -6831,11 +7245,13 @@ Preserve_trx_transfer_status preserve_trx_transfer_build_frame_ack(
   }
   built.frame_digest = sha256_digest(encoded_payload);
   built.status = status;
-  std::string body;
-  Preserve_trx_transfer_status body_status = build_ack_body(built, &body);
-  if (body_status != Preserve_trx_transfer_status::OK) return body_status;
-  if (!compute_ack_hmac(body, &built.hmac)) {
-    return Preserve_trx_transfer_status::UNSUPPORTED;
+  Preserve_trx_transfer_frame payload_frame;
+  if (built.sequence == 0 &&
+      preserve_trx_transfer_decode_frame(encoded_payload, &payload_frame) ==
+          Preserve_trx_transfer_status::OK &&
+      payload_frame.type == Preserve_trx_transfer_frame_type::OPEN_EPOCH) {
+    built.accepted_terminal_status_retention_us =
+        payload_frame.requested_terminal_status_retention_us;
   }
   *ack = std::move(built);
   return Preserve_trx_transfer_status::OK;
@@ -6847,11 +7263,9 @@ Preserve_trx_transfer_status preserve_trx_transfer_encode_frame_ack(
   std::string body;
   Preserve_trx_transfer_status status = build_ack_body(ack, &body);
   if (status != Preserve_trx_transfer_status::OK) return status;
-  std::array<unsigned char, kPreservedTrxSha256Length> expected_hmac{};
-  if (!compute_ack_hmac(body, &expected_hmac) || expected_hmac != ack.hmac) {
-    return Preserve_trx_transfer_status::CORRUPT;
-  }
-  body.append(reinterpret_cast<const char *>(ack.hmac.data()), ack.hmac.size());
+  append_u32(&body,
+             static_cast<uint32_t>(my_checksum(
+                 0, pointer_cast<const uchar *>(body.data()), body.length())));
   *encoded = bytes_to_lower_hex(
       reinterpret_cast<const unsigned char *>(body.data()), body.length());
   return Preserve_trx_transfer_status::OK;
@@ -6859,9 +7273,11 @@ Preserve_trx_transfer_status preserve_trx_transfer_encode_frame_ack(
 
 Preserve_trx_transfer_status preserve_trx_transfer_verify_frame_ack(
     const std::string &encoded_ack,
-    const std::string &expected_source_incarnation_id,
+    const std::string &expected_receiver_process_nonce,
     const std::string &encoded_payload, Preserve_trx_transfer_frame_ack *ack) {
-  if (ack == nullptr || expected_source_incarnation_id.length() != 32) {
+  if (ack == nullptr ||
+      (!expected_receiver_process_nonce.empty() &&
+       expected_receiver_process_nonce.length() != 32)) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
   std::string raw;
@@ -6872,25 +7288,32 @@ Preserve_trx_transfer_status preserve_trx_transfer_verify_frame_ack(
   const char *magic = nullptr;
   Preserve_trx_transfer_frame_ack parsed;
   const char *digest = nullptr;
-  const char *hmac = nullptr;
+  uint16_t version = 0;
   uint16_t raw_status = 0;
+  uint32_t stored_control_crc = 0;
   if (reader.read_fixed(kTransferAckMagicLength, &magic) ||
       std::memcmp(magic, kTransferAckMagic, kTransferAckMagicLength) != 0 ||
-      reader.read_string(&parsed.source_incarnation_id) ||
-      reader.read_string(&parsed.epoch_id) || reader.read_u64(&parsed.sequence) ||
+      reader.read_u16(&version)) {
+    return Preserve_trx_transfer_status::CORRUPT;
+  }
+  if (!transfer_protocol_version_is_decodable(version)) {
+    return Preserve_trx_transfer_status::UNSUPPORTED;
+  }
+  if (reader.read_string(&parsed.epoch_id) ||
+      reader.read_string(&parsed.receiver_process_nonce) ||
+      reader.read_u64(&parsed.sequence) ||
       reader.read_fixed(parsed.frame_digest.size(), &digest) ||
       reader.read_u16(&raw_status) ||
       !transfer_status_from_wire(raw_status, &parsed.status) ||
-      reader.read_fixed(parsed.hmac.size(), &hmac) || !reader.eof()) {
+      reader.read_u64(&parsed.accepted_terminal_status_retention_us) ||
+      reader.read_u32(&stored_control_crc) || !reader.eof()) {
     return Preserve_trx_transfer_status::CORRUPT;
   }
   std::memcpy(parsed.frame_digest.data(), digest, parsed.frame_digest.size());
-  std::memcpy(parsed.hmac.data(), hmac, parsed.hmac.size());
-  const size_t body_length = raw.length() - parsed.hmac.size();
-  std::array<unsigned char, kPreservedTrxSha256Length> expected_hmac{};
-  if (!compute_ack_hmac(raw.substr(0, body_length), &expected_hmac) ||
-      CRYPTO_memcmp(expected_hmac.data(), parsed.hmac.data(),
-                    parsed.hmac.size()) != 0) {
+  const size_t control_length = raw.length() - sizeof(uint32_t);
+  if (stored_control_crc !=
+      static_cast<uint32_t>(my_checksum(
+          0, pointer_cast<const uchar *>(raw.data()), control_length))) {
     return Preserve_trx_transfer_status::CORRUPT;
   }
   std::string expected_epoch;
@@ -6898,81 +7321,135 @@ Preserve_trx_transfer_status preserve_trx_transfer_verify_frame_ack(
   Preserve_trx_transfer_status status = transfer_payload_identity(
       encoded_payload, &expected_epoch, &expected_sequence);
   if (status != Preserve_trx_transfer_status::OK) return status;
-  if (parsed.source_incarnation_id != expected_source_incarnation_id ||
+  if ((!expected_receiver_process_nonce.empty() &&
+       parsed.receiver_process_nonce != expected_receiver_process_nonce) ||
+      parsed.receiver_process_nonce.length() != 32 ||
       parsed.epoch_id != expected_epoch ||
       parsed.sequence != expected_sequence ||
       parsed.frame_digest != sha256_digest(encoded_payload)) {
     return Preserve_trx_transfer_status::CORRUPT;
+  }
+  if (transfer_frame_batch_magic_matches(encoded_payload)) {
+    if (parsed.accepted_terminal_status_retention_us != 0) {
+      return Preserve_trx_transfer_status::CORRUPT;
+    }
+  } else {
+    Preserve_trx_transfer_frame payload_frame;
+    status = preserve_trx_transfer_decode_frame(encoded_payload, &payload_frame);
+    if (status != Preserve_trx_transfer_status::OK) return status;
+    if (payload_frame.type == Preserve_trx_transfer_frame_type::OPEN_EPOCH) {
+      if (parsed.accepted_terminal_status_retention_us <
+          payload_frame.requested_terminal_status_retention_us) {
+        return Preserve_trx_transfer_status::CORRUPT;
+      }
+    } else if (parsed.accepted_terminal_status_retention_us != 0) {
+      return Preserve_trx_transfer_status::CORRUPT;
+    }
   }
   *ack = std::move(parsed);
   return Preserve_trx_transfer_status::OK;
 }
 
 Preserve_trx_transfer_status preserve_trx_transfer_validate_receiver_manifest(
-    const Preserve_trx_transfer_manifest &manifest,
-    const std::string &allowed_source_server_uuid,
-    const std::string &local_target_server_uuid) {
+    const Preserve_trx_transfer_manifest &manifest) {
   if (!preserve_trx_transfer_receiver_enable) {
     return Preserve_trx_transfer_status::UNSUPPORTED;
   }
 
-  const Preserve_trx_transfer_status validation_status =
-      validate_manifest_components(manifest, false);
-  if (validation_status != Preserve_trx_transfer_status::OK)
-    return validation_status;
-
-  if (allowed_source_server_uuid.empty() ||
-      manifest.source_server_uuid != allowed_source_server_uuid) {
-    return Preserve_trx_transfer_status::UNSUPPORTED;
-  }
-  if (local_target_server_uuid.empty() ||
-      manifest.target_server_uuid != local_target_server_uuid) {
-    return Preserve_trx_transfer_status::UNSUPPORTED;
-  }
-  return Preserve_trx_transfer_status::OK;
+  return validate_manifest_components(manifest, false);
 }
 
 Preserve_trx_transfer_status
 preserve_trx_transfer_validate_receiver_manifest_from_config(
     const Preserve_trx_transfer_manifest &manifest) {
-  const std::string allowed_source =
-      preserve_trx_transfer_allowed_source_uuid == nullptr
-          ? std::string()
-          : std::string(preserve_trx_transfer_allowed_source_uuid);
-  const std::string target =
-      preserve_trx_transfer_target_server_uuid == nullptr
-          ? std::string()
-          : std::string(preserve_trx_transfer_target_server_uuid);
-  /*
-    The configured target UUID is an admission policy, not receiver identity.
-    A standby receiver must only accept artifacts addressed to this mysqld;
-    otherwise a misconfigured process could publish artifacts for another
-    server and later make promotion readiness look trustworthy.
-  */
-  if (target.empty() || target != server_uuid) {
+  return preserve_trx_transfer_validate_receiver_manifest(manifest);
+}
+
+Preserve_trx_transfer_status
+Preserve_trx_transfer_receiver_registry::open_online_epoch(
+    const std::string &epoch_id, const std::string &authenticated_principal,
+    uint64_t requested_terminal_status_retention_us,
+    const std::string &receiver_process_nonce,
+    uint64_t *accepted_terminal_status_retention_us) {
+  static constexpr uint64_t kMinimumRetentionUs = 60000000;
+  static constexpr uint64_t kMaximumRetentionUs = 300000000;
+  if (!transfer_component_safe(epoch_id) || authenticated_principal.empty() ||
+      receiver_process_nonce.length() != 32 ||
+      !transfer_component_safe(receiver_process_nonce) ||
+      requested_terminal_status_retention_us == 0 ||
+      requested_terminal_status_retention_us > kMaximumRetentionUs ||
+      accepted_terminal_status_retention_us == nullptr) {
+    return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+  }
+  const uint64_t accepted_retention_us =
+      std::max(requested_terminal_status_retention_us, kMinimumRetentionUs);
+
+  std::lock_guard<std::mutex> guard(m_mutex);
+  auto existing = m_online_epochs.find(epoch_id);
+  if (existing != m_online_epochs.end()) {
+    if (existing->second.receiver_process_nonce != receiver_process_nonce ||
+        existing->second.authenticated_principal != authenticated_principal ||
+        existing->second.requested_terminal_status_retention_us !=
+            requested_terminal_status_retention_us ||
+        existing->second.accepted_terminal_status_retention_us !=
+            accepted_retention_us) {
+      return Preserve_trx_transfer_status::CORRUPT;
+    }
+    *accepted_terminal_status_retention_us =
+        existing->second.accepted_terminal_status_retention_us;
+    return Preserve_trx_transfer_status::OK;
+  }
+  try {
+    Online_epoch context;
+    context.receiver_process_nonce = receiver_process_nonce;
+    context.authenticated_principal = authenticated_principal;
+    context.requested_terminal_status_retention_us =
+        requested_terminal_status_retention_us;
+    context.accepted_terminal_status_retention_us = accepted_retention_us;
+    m_online_epochs.emplace(epoch_id, std::move(context));
+  } catch (...) {
+    return Preserve_trx_transfer_status::RESOURCE_EXHAUSTED;
+  }
+  *accepted_terminal_status_retention_us = accepted_retention_us;
+  return Preserve_trx_transfer_status::OK;
+}
+
+Preserve_trx_transfer_status
+Preserve_trx_transfer_receiver_registry::validate_online_epoch(
+    const std::string &epoch_id, const std::string &authenticated_principal,
+    const std::string &receiver_process_nonce,
+    uint64_t *accepted_terminal_status_retention_us) const {
+  if (!transfer_component_safe(epoch_id) || authenticated_principal.empty() ||
+      receiver_process_nonce.length() != 32 ||
+      !transfer_component_safe(receiver_process_nonce)) {
+    return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+  }
+  std::lock_guard<std::mutex> guard(m_mutex);
+  const auto existing = m_online_epochs.find(epoch_id);
+  if (existing == m_online_epochs.end()) {
     return Preserve_trx_transfer_status::UNSUPPORTED;
   }
-  return preserve_trx_transfer_validate_receiver_manifest(manifest,
-                                                          allowed_source,
-                                                          target);
+  if (existing->second.receiver_process_nonce != receiver_process_nonce ||
+      existing->second.authenticated_principal != authenticated_principal) {
+    return Preserve_trx_transfer_status::CORRUPT;
+  }
+  if (accepted_terminal_status_retention_us != nullptr) {
+    *accepted_terminal_status_retention_us =
+        existing->second.accepted_terminal_status_retention_us;
+  }
+  return Preserve_trx_transfer_status::OK;
 }
 
 Preserve_trx_transfer_status
 Preserve_trx_transfer_receiver_registry::declare_token(
-    const std::string &epoch_id, uint64_t token,
-    const std::string &source_server_uuid,
-    const std::string &target_server_uuid) {
-  if (!transfer_component_safe(epoch_id) ||
-      !transfer_component_safe(source_server_uuid) ||
-      !transfer_component_safe(target_server_uuid) || token == 0) {
+    const std::string &epoch_id, uint64_t token) {
+  if (!transfer_component_safe(epoch_id) || token == 0) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
 
   Preserve_trx_transfer_receiver_record record;
   record.epoch_id = epoch_id;
   record.token = token;
-  record.source_server_uuid = source_server_uuid;
-  record.target_server_uuid = target_server_uuid;
   record.state = Preserve_trx_transfer_receiver_state::DECLARED;
 
   std::lock_guard<std::mutex> guard(m_mutex);
@@ -7021,8 +7498,6 @@ Preserve_trx_transfer_receiver_registry::begin_receive(
   record.strict_eligibility_flags = manifest.strict_eligibility_flags;
   record.epoch_id = manifest.epoch_id;
   record.token = manifest.token;
-  record.source_server_uuid = manifest.source_server_uuid;
-  record.target_server_uuid = manifest.target_server_uuid;
   record.source_prepare_lsn = manifest.source_prepare_lsn;
   record.source_epoch_commit_lsn = manifest.source_epoch_commit_lsn;
   record.state = Preserve_trx_transfer_receiver_state::RECEIVING;
@@ -7036,11 +7511,7 @@ Preserve_trx_transfer_receiver_registry::begin_receive(
     if ((existing_record->second.state !=
              Preserve_trx_transfer_receiver_state::DECLARED &&
          existing_record->second.state !=
-             Preserve_trx_transfer_receiver_state::RECEIVING) ||
-        existing_record->second.source_server_uuid !=
-            manifest.source_server_uuid ||
-        existing_record->second.target_server_uuid !=
-            manifest.target_server_uuid) {
+             Preserve_trx_transfer_receiver_state::RECEIVING)) {
       return Preserve_trx_transfer_status::UNSUPPORTED;
     }
     const Preserve_trx_transfer_manifest existing_manifest =
@@ -7247,7 +7718,7 @@ Preserve_trx_transfer_receiver_registry::declare_object(
 }
 
 Preserve_trx_transfer_status
-Preserve_trx_transfer_receiver_registry::stage_strict_v4_object_chunk(
+Preserve_trx_transfer_receiver_registry::stage_strict_v1_object_chunk(
     const Preserve_trx_transfer_manifest &manifest,
     const std::string &object_id, uint64_t chunk_offset,
     const std::string &chunk_payload) {
@@ -7259,7 +7730,7 @@ Preserve_trx_transfer_receiver_registry::stage_strict_v4_object_chunk(
   const Preserve_trx_transfer_object_descriptor *object =
       find_object(manifest, object_id);
   if (object == nullptr ||
-      !transfer_object_uses_strict_v4_memory_staging(manifest, *object)) {
+      !transfer_object_uses_strict_v1_memory_staging(manifest, *object)) {
     return Preserve_trx_transfer_status::UNSUPPORTED;
   }
   if (object->total_size > std::numeric_limits<size_t>::max()) {
@@ -7288,12 +7759,12 @@ Preserve_trx_transfer_receiver_registry::stage_strict_v4_object_chunk(
     return Preserve_trx_transfer_status::CORRUPT;
   }
 
-  Strict_v4_object *staged = nullptr;
+  Strict_v1_object *staged = nullptr;
   try {
-    auto &objects = m_strict_v4_objects[key];
+    auto &objects = m_strict_v1_objects[key];
     auto found = objects.find(object_id);
     if (found == objects.end()) {
-      Strict_v4_object value;
+      Strict_v1_object value;
       value.descriptor = *object;
       value.payload = std::make_shared<std::string>();
       value.payload->reserve(static_cast<size_t>(object->total_size));
@@ -7332,13 +7803,13 @@ Preserve_trx_transfer_receiver_registry::stage_strict_v4_object_chunk(
 }
 
 Preserve_trx_transfer_status
-Preserve_trx_transfer_receiver_registry::seal_strict_v4_object(
+Preserve_trx_transfer_receiver_registry::seal_strict_v1_object(
     const Preserve_trx_transfer_manifest &manifest,
     const std::string &object_id) {
   const Preserve_trx_transfer_object_descriptor *object =
       find_object(manifest, object_id);
   if (object == nullptr ||
-      !transfer_object_uses_strict_v4_memory_staging(manifest, *object)) {
+      !transfer_object_uses_strict_v1_memory_staging(manifest, *object)) {
     return Preserve_trx_transfer_status::UNSUPPORTED;
   }
 
@@ -7346,8 +7817,8 @@ Preserve_trx_transfer_receiver_registry::seal_strict_v4_object(
   {
     std::lock_guard<std::mutex> guard(m_mutex);
     const auto token =
-        m_strict_v4_objects.find(Token_key(manifest.epoch_id, manifest.token));
-    if (token == m_strict_v4_objects.end()) {
+        m_strict_v1_objects.find(Token_key(manifest.epoch_id, manifest.token));
+    if (token == m_strict_v1_objects.end()) {
       return Preserve_trx_transfer_status::CORRUPT;
     }
     const auto found = token->second.find(object_id);
@@ -7365,8 +7836,8 @@ Preserve_trx_transfer_receiver_registry::seal_strict_v4_object(
   }
   std::lock_guard<std::mutex> guard(m_mutex);
   const auto token =
-      m_strict_v4_objects.find(Token_key(manifest.epoch_id, manifest.token));
-  if (token == m_strict_v4_objects.end()) {
+      m_strict_v1_objects.find(Token_key(manifest.epoch_id, manifest.token));
+  if (token == m_strict_v1_objects.end()) {
     return Preserve_trx_transfer_status::CORRUPT;
   }
   const auto found = token->second.find(object_id);
@@ -7380,7 +7851,7 @@ Preserve_trx_transfer_receiver_registry::seal_strict_v4_object(
 }
 
 Preserve_trx_transfer_status
-Preserve_trx_transfer_receiver_registry::read_strict_v4_object(
+Preserve_trx_transfer_receiver_registry::read_strict_v1_object(
     const Preserve_trx_transfer_manifest &manifest,
     const std::string &object_id,
     std::shared_ptr<const std::string> *payload) const {
@@ -7388,13 +7859,13 @@ Preserve_trx_transfer_receiver_registry::read_strict_v4_object(
   const Preserve_trx_transfer_object_descriptor *object =
       find_object(manifest, object_id);
   if (object == nullptr ||
-      !transfer_object_uses_strict_v4_memory_staging(manifest, *object)) {
+      !transfer_object_uses_strict_v1_memory_staging(manifest, *object)) {
     return Preserve_trx_transfer_status::UNSUPPORTED;
   }
   std::lock_guard<std::mutex> guard(m_mutex);
   const auto token =
-      m_strict_v4_objects.find(Token_key(manifest.epoch_id, manifest.token));
-  if (token == m_strict_v4_objects.end()) {
+      m_strict_v1_objects.find(Token_key(manifest.epoch_id, manifest.token));
+  if (token == m_strict_v1_objects.end()) {
     return Preserve_trx_transfer_status::CORRUPT;
   }
   const auto found = token->second.find(object_id);
@@ -7407,20 +7878,20 @@ Preserve_trx_transfer_receiver_registry::read_strict_v4_object(
   return Preserve_trx_transfer_status::OK;
 }
 
-void Preserve_trx_transfer_receiver_registry::erase_strict_v4_object(
+void Preserve_trx_transfer_receiver_registry::erase_strict_v1_object(
     const std::string &epoch_id, uint64_t token,
     const std::string &object_id) {
   std::lock_guard<std::mutex> guard(m_mutex);
-  const auto found = m_strict_v4_objects.find(Token_key(epoch_id, token));
-  if (found == m_strict_v4_objects.end()) return;
+  const auto found = m_strict_v1_objects.find(Token_key(epoch_id, token));
+  if (found == m_strict_v1_objects.end()) return;
   found->second.erase(object_id);
-  if (found->second.empty()) m_strict_v4_objects.erase(found);
+  if (found->second.empty()) m_strict_v1_objects.erase(found);
 }
 
-void Preserve_trx_transfer_receiver_registry::erase_strict_v4_token_objects(
+void Preserve_trx_transfer_receiver_registry::erase_strict_v1_token_objects(
     const std::string &epoch_id, uint64_t token) {
   std::lock_guard<std::mutex> guard(m_mutex);
-  m_strict_v4_objects.erase(Token_key(epoch_id, token));
+  m_strict_v1_objects.erase(Token_key(epoch_id, token));
 }
 
 Preserve_trx_transfer_status
@@ -7443,7 +7914,7 @@ Preserve_trx_transfer_receiver_registry::mark_saved_online(
   found->second.state = Preserve_trx_transfer_receiver_state::SAVED_ONLINE;
   found->second.reserved_bytes = 0;
   found->second.last_error.clear();
-  m_strict_v4_objects.erase(key);
+  m_strict_v1_objects.erase(key);
   m_cleanup_debts.erase(key);
   return Preserve_trx_transfer_status::OK;
 }
@@ -7556,16 +8027,304 @@ Preserve_trx_transfer_receiver_registry::cleanup_debt_count_for_unit_test()
   return m_cleanup_debts.size();
 }
 
+Preserve_trx_transfer_epoch_terminal_outcome
+Preserve_trx_transfer_receiver_registry::query_epoch_terminal(
+    const std::string &root_dir, const std::string &epoch_id,
+    Preserve_trx_transfer_epoch_terminal_status *terminal) const {
+  if (root_dir.empty() || !transfer_component_safe(epoch_id)) {
+    return Preserve_trx_transfer_epoch_terminal_outcome::EPOCH_NOT_FOUND;
+  }
+  std::lock_guard<std::mutex> guard(m_mutex);
+  const auto acknowledged = m_acknowledged_epochs.find(epoch_id);
+  if (acknowledged != m_acknowledged_epochs.end() &&
+      acknowledged->second.root_dir == root_dir &&
+      acknowledged->second.terminal_operation !=
+          Preserve_trx_transfer_epoch_terminal_operation::NONE) {
+    if (terminal != nullptr) {
+      terminal->operation = acknowledged->second.terminal_operation;
+      terminal->outcome = acknowledged->second.terminal_outcome;
+      terminal->receiver_process_generation =
+          acknowledged->second.receiver_process_generation;
+      terminal->receiver_process_nonce =
+          acknowledged->second.receiver_process_nonce;
+      terminal->authenticated_principal =
+          acknowledged->second.authenticated_principal;
+      terminal->operation_id =
+          acknowledged->second.terminal_operation_id;
+      terminal->fact_digest = acknowledged->second.fact_digest;
+      terminal->terminal_cas_monotonic_us =
+          acknowledged->second.terminal_cas_monotonic_us;
+      terminal->retire_after_us = acknowledged->second.retire_after_us;
+    }
+    return acknowledged->second.terminal_outcome;
+  }
+
+  const bool receiving = std::any_of(
+      m_records.begin(), m_records.end(), [&](const auto &item) {
+        return item.first.first == epoch_id;
+      });
+  if (receiving) {
+    if (terminal != nullptr) {
+      *terminal = Preserve_trx_transfer_epoch_terminal_status();
+      terminal->outcome =
+          Preserve_trx_transfer_epoch_terminal_outcome::NOT_COMMITTED;
+    }
+    return Preserve_trx_transfer_epoch_terminal_outcome::NOT_COMMITTED;
+  }
+  return Preserve_trx_transfer_epoch_terminal_outcome::EPOCH_NOT_FOUND;
+}
+
 Preserve_trx_transfer_status
-Preserve_trx_transfer_receiver_registry::publish_accepted_epoch(
+Preserve_trx_transfer_receiver_registry::query_epoch_terminal_authenticated(
+    const std::string &root_dir, const std::string &epoch_id,
+    const std::string &authenticated_principal,
+    const std::string &receiver_process_nonce,
+    const std::array<unsigned char, kPreservedTrxSha256Length> &fact_digest,
+    Preserve_trx_transfer_epoch_terminal_status *terminal) const {
+  if (root_dir.empty() || !transfer_component_safe(epoch_id) ||
+      authenticated_principal.empty() ||
+      receiver_process_nonce.length() != 32 ||
+      !transfer_component_safe(receiver_process_nonce) ||
+      transfer_digest_is_zero(fact_digest)) {
+    return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+  }
+
+  std::lock_guard<std::mutex> guard(m_mutex);
+  const auto acknowledged = m_acknowledged_epochs.find(epoch_id);
+  if (acknowledged != m_acknowledged_epochs.end() &&
+      acknowledged->second.root_dir == root_dir &&
+      acknowledged->second.terminal_operation !=
+          Preserve_trx_transfer_epoch_terminal_operation::NONE) {
+    const Acknowledged_epoch &current = acknowledged->second;
+    if (current.authenticated_principal != authenticated_principal ||
+        current.receiver_process_nonce != receiver_process_nonce ||
+        current.fact_digest != fact_digest) {
+      return Preserve_trx_transfer_status::CORRUPT;
+    }
+    if (terminal != nullptr) {
+      terminal->operation = current.terminal_operation;
+      terminal->outcome = current.terminal_outcome;
+      terminal->receiver_process_generation =
+          current.receiver_process_generation;
+      terminal->receiver_process_nonce = current.receiver_process_nonce;
+      terminal->authenticated_principal = current.authenticated_principal;
+      terminal->operation_id = current.terminal_operation_id;
+      terminal->fact_digest = current.fact_digest;
+      terminal->terminal_cas_monotonic_us = current.terminal_cas_monotonic_us;
+      terminal->retire_after_us = current.retire_after_us;
+    }
+    return Preserve_trx_transfer_status::OK;
+  }
+
+  const auto online = m_online_epochs.find(epoch_id);
+  if (online == m_online_epochs.end()) {
+    return Preserve_trx_transfer_status::UNSUPPORTED;
+  }
+  if (online->second.authenticated_principal != authenticated_principal ||
+      online->second.receiver_process_nonce != receiver_process_nonce) {
+    return Preserve_trx_transfer_status::CORRUPT;
+  }
+  if (terminal != nullptr) {
+    *terminal = Preserve_trx_transfer_epoch_terminal_status();
+    terminal->outcome =
+        Preserve_trx_transfer_epoch_terminal_outcome::NOT_COMMITTED;
+    terminal->receiver_process_nonce = receiver_process_nonce;
+    terminal->authenticated_principal = authenticated_principal;
+  }
+  return Preserve_trx_transfer_status::OK;
+}
+
+Preserve_trx_transfer_epoch_terminal_outcome
+Preserve_trx_transfer_receiver_registry::try_begin_epoch_abandon(
+    const Preserve_trx_transfer_epoch_terminal_request &request) {
+  if (request.root_dir.empty() ||
+      !transfer_component_safe(request.epoch_id) ||
+      request.receiver_process_generation.empty() ||
+      request.operation_id.empty() ||
+      transfer_digest_is_zero(request.fact_digest) ||
+      request.retention_us == 0) {
+    return Preserve_trx_transfer_epoch_terminal_outcome::CORRUPT;
+  }
+  const uint64_t retire_after_us =
+      request.now_us >
+              std::numeric_limits<uint64_t>::max() - request.retention_us
+          ? std::numeric_limits<uint64_t>::max()
+          : request.now_us + request.retention_us;
+
+  std::lock_guard<std::mutex> guard(m_mutex);
+  auto acknowledged = m_acknowledged_epochs.find(request.epoch_id);
+  if (acknowledged != m_acknowledged_epochs.end() &&
+      acknowledged->second.root_dir != request.root_dir) {
+    g_receiver_terminal_cas_conflicts.fetch_add(1);
+    return Preserve_trx_transfer_epoch_terminal_outcome::CORRUPT;
+  }
+  if (acknowledged != m_acknowledged_epochs.end() &&
+      acknowledged->second.terminal_operation !=
+          Preserve_trx_transfer_epoch_terminal_operation::NONE) {
+    Acknowledged_epoch &current = acknowledged->second;
+    if (current.terminal_operation ==
+        Preserve_trx_transfer_epoch_terminal_operation::COMMIT) {
+      g_receiver_terminal_cas_conflicts.fetch_add(1);
+      return current.terminal_outcome;
+    }
+    const bool same_operation =
+        current.root_dir == request.root_dir &&
+        current.receiver_process_generation ==
+            request.receiver_process_generation &&
+        current.authenticated_principal ==
+            request.authenticated_principal &&
+        current.terminal_operation_id == request.operation_id &&
+        current.fact_digest == request.fact_digest;
+    if (same_operation) {
+      g_receiver_terminal_cas_duplicates.fetch_add(1);
+      return current.terminal_outcome;
+    }
+    current.terminal_outcome =
+        Preserve_trx_transfer_epoch_terminal_outcome::CORRUPT;
+    const auto accepted = m_accepted_epochs.find(request.epoch_id);
+    if (accepted != m_accepted_epochs.end()) {
+      accepted->second.lifecycle =
+          Preserve_trx_transfer_epoch_lifecycle::ABANDONING;
+    }
+    g_receiver_terminal_cas_conflicts.fetch_add(1);
+    return Preserve_trx_transfer_epoch_terminal_outcome::CORRUPT;
+  }
+
+  const bool receiving = std::any_of(
+      m_records.begin(), m_records.end(), [&](const auto &item) {
+        return item.first.first == request.epoch_id;
+      });
+  if (!receiving) {
+    return Preserve_trx_transfer_epoch_terminal_outcome::EPOCH_NOT_FOUND;
+  }
+
+  try {
+    if (acknowledged == m_acknowledged_epochs.end()) {
+      acknowledged =
+          m_acknowledged_epochs.emplace(request.epoch_id, Acknowledged_epoch())
+              .first;
+    }
+    Acknowledged_epoch &terminal = acknowledged->second;
+    terminal.root_dir = request.root_dir;
+    terminal.receiver_process_generation =
+        request.receiver_process_generation;
+    terminal.receiver_process_nonce = request.receiver_process_generation;
+    terminal.authenticated_principal = request.authenticated_principal;
+    terminal.terminal_operation_id = request.operation_id;
+    terminal.terminal_operation =
+        Preserve_trx_transfer_epoch_terminal_operation::ABANDON;
+    terminal.terminal_outcome =
+        Preserve_trx_transfer_epoch_terminal_outcome::ABANDONING;
+    terminal.fact_digest = request.fact_digest;
+    terminal.terminal_cas_monotonic_us = request.now_us;
+    terminal.retire_after_us =
+        std::max(terminal.retire_after_us, retire_after_us);
+  } catch (...) {
+    return Preserve_trx_transfer_epoch_terminal_outcome::CORRUPT;
+  }
+  g_receiver_terminal_cas_wins.fetch_add(1);
+  g_receiver_terminal_status_tombstones.fetch_add(1);
+  return Preserve_trx_transfer_epoch_terminal_outcome::ABANDONING;
+}
+
+Preserve_trx_transfer_epoch_terminal_outcome
+Preserve_trx_transfer_receiver_registry::complete_epoch_abandon(
+    const Preserve_trx_transfer_epoch_terminal_request &request) {
+  if (request.root_dir.empty() ||
+      !transfer_component_safe(request.epoch_id) ||
+      request.receiver_process_generation.empty() ||
+      request.operation_id.empty() ||
+      transfer_digest_is_zero(request.fact_digest)) {
+    return Preserve_trx_transfer_epoch_terminal_outcome::CORRUPT;
+  }
+  std::lock_guard<std::mutex> guard(m_mutex);
+  const auto acknowledged = m_acknowledged_epochs.find(request.epoch_id);
+  if (acknowledged == m_acknowledged_epochs.end() ||
+      acknowledged->second.terminal_operation ==
+          Preserve_trx_transfer_epoch_terminal_operation::NONE) {
+    return Preserve_trx_transfer_epoch_terminal_outcome::EPOCH_NOT_FOUND;
+  }
+  Acknowledged_epoch &current = acknowledged->second;
+  if (current.terminal_operation ==
+      Preserve_trx_transfer_epoch_terminal_operation::COMMIT) {
+    g_receiver_terminal_cas_conflicts.fetch_add(1);
+    return current.terminal_outcome;
+  }
+  const bool same_operation =
+      current.root_dir == request.root_dir &&
+      current.receiver_process_generation ==
+          request.receiver_process_generation &&
+      current.authenticated_principal == request.authenticated_principal &&
+      current.terminal_operation_id == request.operation_id &&
+      current.fact_digest == request.fact_digest;
+  if (!same_operation) {
+    current.terminal_outcome =
+        Preserve_trx_transfer_epoch_terminal_outcome::CORRUPT;
+    g_receiver_terminal_cas_conflicts.fetch_add(1);
+    return Preserve_trx_transfer_epoch_terminal_outcome::CORRUPT;
+  }
+  if (current.terminal_outcome ==
+      Preserve_trx_transfer_epoch_terminal_outcome::NOT_COMMITTED_CLEAN) {
+    g_receiver_terminal_cas_duplicates.fetch_add(1);
+    return current.terminal_outcome;
+  }
+  if (current.terminal_outcome !=
+      Preserve_trx_transfer_epoch_terminal_outcome::ABANDONING) {
+    return current.terminal_outcome;
+  }
+  current.terminal_outcome =
+      Preserve_trx_transfer_epoch_terminal_outcome::NOT_COMMITTED_CLEAN;
+  for (auto record = m_records.begin(); record != m_records.end();) {
+    record = record->first.first == request.epoch_id
+                 ? m_records.erase(record)
+                 : std::next(record);
+  }
+  for (auto object = m_strict_v1_objects.begin();
+       object != m_strict_v1_objects.end();) {
+    object = object->first.first == request.epoch_id
+                 ? m_strict_v1_objects.erase(object)
+                 : std::next(object);
+  }
+  for (auto debt = m_cleanup_debts.begin(); debt != m_cleanup_debts.end();) {
+    debt = debt->first.first == request.epoch_id
+               ? m_cleanup_debts.erase(debt)
+               : std::next(debt);
+  }
+  for (auto frame = m_frame_sequences.begin();
+       frame != m_frame_sequences.end();) {
+    frame = frame->first.first == request.epoch_id
+                ? m_frame_sequences.erase(frame)
+                : std::next(frame);
+  }
+  for (auto apply = m_payload_apply_records.begin();
+       apply != m_payload_apply_records.end();) {
+    apply = apply->first.first == request.epoch_id
+                ? m_payload_apply_records.erase(apply)
+                : std::next(apply);
+  }
+  for (auto queue = m_payload_apply_queue_by_token.begin();
+       queue != m_payload_apply_queue_by_token.end();) {
+    queue = queue->first.first == request.epoch_id
+                ? m_payload_apply_queue_by_token.erase(queue)
+                : std::next(queue);
+  }
+  m_next_sequence_by_epoch.erase(request.epoch_id);
+  m_active_payload_sequences.erase(request.epoch_id);
+  m_applied_sequence_by_epoch.erase(request.epoch_id);
+  m_first_apply_failure_by_epoch.erase(request.epoch_id);
+  m_accepted_epochs.erase(request.epoch_id);
+  m_sequence_condition.notify_all();
+  return current.terminal_outcome;
+}
+
+Preserve_trx_transfer_status
+  Preserve_trx_transfer_receiver_registry::publish_accepted_epoch(
     const std::string &root_dir,
     std::shared_ptr<const Preserve_trx_transfer_epoch_fact> fact,
     const std::string &receiver_process_generation, uint64_t now_us,
     uint64_t prewarm_timeout_ms, bool flat_projection_published) {
   if (fact == nullptr || root_dir.empty() ||
       !transfer_component_safe(fact->epoch_id) ||
-      !transfer_component_safe(fact->source_server_uuid) ||
-      !transfer_component_safe(fact->target_server_uuid) ||
       receiver_process_generation.empty() || fact->source_fence_lsn == 0 ||
       fact->tokens.empty() || transfer_digest_is_zero(fact->fact_digest) ||
       prewarm_timeout_ms == 0) {
@@ -7575,8 +8334,6 @@ Preserve_trx_transfer_receiver_registry::publish_accepted_epoch(
   Preserve_trx_transfer_accepted_epoch accepted;
   accepted.root_dir = root_dir;
   accepted.epoch_id = fact->epoch_id;
-  accepted.source_server_uuid = fact->source_server_uuid;
-  accepted.target_server_uuid = fact->target_server_uuid;
   accepted.receiver_process_generation = receiver_process_generation;
   accepted.source_fence_lsn = fact->source_fence_lsn;
   accepted.fact_digest = fact->fact_digest;
@@ -7601,6 +8358,7 @@ Preserve_trx_transfer_receiver_registry::publish_accepted_epoch(
   }
 
   std::lock_guard<std::mutex> guard(m_mutex);
+  const auto online = m_online_epochs.find(fact->epoch_id);
   std::set<uint64_t> expected_tokens(accepted.tokens.begin(),
                                      accepted.tokens.end());
   size_t matching_records = 0;
@@ -7614,9 +8372,7 @@ Preserve_trx_transfer_receiver_registry::publish_accepted_epoch(
         record.state != Preserve_trx_transfer_receiver_state::SAVED_ONLINE) {
       return Preserve_trx_transfer_status::CORRUPT;
     }
-    if (expected_tokens.count(record.token) == 0 ||
-        record.source_server_uuid != fact->source_server_uuid ||
-        record.target_server_uuid != fact->target_server_uuid) {
+    if (expected_tokens.count(record.token) == 0) {
       return Preserve_trx_transfer_status::CORRUPT;
     }
     for (const Preserve_trx_transfer_object_descriptor &object :
@@ -7631,27 +8387,104 @@ Preserve_trx_transfer_receiver_registry::publish_accepted_epoch(
     return Preserve_trx_transfer_status::CORRUPT;
   }
 
+  auto acknowledged = m_acknowledged_epochs.find(fact->epoch_id);
+  if (acknowledged != m_acknowledged_epochs.end() &&
+      acknowledged->second.root_dir != root_dir) {
+    g_receiver_terminal_cas_conflicts.fetch_add(1);
+    return Preserve_trx_transfer_status::CORRUPT;
+  }
+  if (acknowledged != m_acknowledged_epochs.end() &&
+      acknowledged->second.terminal_operation !=
+          Preserve_trx_transfer_epoch_terminal_operation::NONE) {
+    Acknowledged_epoch &terminal = acknowledged->second;
+    if (terminal.terminal_operation ==
+            Preserve_trx_transfer_epoch_terminal_operation::COMMIT &&
+        terminal.root_dir == root_dir &&
+        terminal.receiver_process_generation == receiver_process_generation &&
+        terminal.terminal_operation_id == kReceiverCommitOperationId &&
+        terminal.fact_digest == fact->fact_digest &&
+        terminal.terminal_outcome ==
+            Preserve_trx_transfer_epoch_terminal_outcome::COMMITTED) {
+      g_receiver_terminal_cas_duplicates.fetch_add(1);
+      return Preserve_trx_transfer_status::OK;
+    }
+    if (terminal.terminal_operation ==
+            Preserve_trx_transfer_epoch_terminal_operation::COMMIT &&
+        terminal.fact_digest != fact->fact_digest) {
+      terminal.terminal_outcome =
+          Preserve_trx_transfer_epoch_terminal_outcome::CORRUPT;
+      const auto current = m_accepted_epochs.find(fact->epoch_id);
+      if (current != m_accepted_epochs.end()) {
+        current->second.lifecycle =
+            Preserve_trx_transfer_epoch_lifecycle::ABANDONING;
+      }
+      g_receiver_terminal_cas_conflicts.fetch_add(1);
+      return Preserve_trx_transfer_status::CORRUPT;
+    }
+    g_receiver_terminal_cas_conflicts.fetch_add(1);
+    return terminal.terminal_outcome ==
+                   Preserve_trx_transfer_epoch_terminal_outcome::CORRUPT
+               ? Preserve_trx_transfer_status::CORRUPT
+               : Preserve_trx_transfer_status::UNSUPPORTED;
+  }
+
   const auto existing = m_accepted_epochs.find(fact->epoch_id);
   if (existing != m_accepted_epochs.end()) {
     const Preserve_trx_transfer_accepted_epoch &current = existing->second;
-    return current.root_dir == accepted.root_dir &&
-                   current.source_server_uuid == accepted.source_server_uuid &&
-                   current.target_server_uuid == accepted.target_server_uuid &&
-                   current.receiver_process_generation ==
-                       accepted.receiver_process_generation &&
-                   current.source_fence_lsn == accepted.source_fence_lsn &&
-                   current.tokens == accepted.tokens &&
-                   current.fact_digest == accepted.fact_digest &&
-                   current.flat_projection_published ==
-                       accepted.flat_projection_published
-               ? Preserve_trx_transfer_status::OK
-               : Preserve_trx_transfer_status::CORRUPT;
+    if (current.root_dir != accepted.root_dir ||
+        current.receiver_process_generation !=
+            accepted.receiver_process_generation ||
+        current.source_fence_lsn != accepted.source_fence_lsn ||
+        current.tokens != accepted.tokens ||
+        current.fact_digest != accepted.fact_digest ||
+        current.flat_projection_published !=
+            accepted.flat_projection_published) {
+      return Preserve_trx_transfer_status::CORRUPT;
+    }
   }
+
+  bool accepted_inserted = false;
   try {
-    m_accepted_epochs.emplace(fact->epoch_id, std::move(accepted));
+    if (existing == m_accepted_epochs.end()) {
+      m_accepted_epochs.emplace(fact->epoch_id, std::move(accepted));
+      accepted_inserted = true;
+    }
+    if (acknowledged == m_acknowledged_epochs.end()) {
+      acknowledged =
+          m_acknowledged_epochs.emplace(fact->epoch_id, Acknowledged_epoch())
+              .first;
+    }
+    Acknowledged_epoch &terminal = acknowledged->second;
+    terminal.root_dir = root_dir;
+    terminal.receiver_process_generation = receiver_process_generation;
+    if (online != m_online_epochs.end()) {
+      terminal.receiver_process_nonce =
+          online->second.receiver_process_nonce;
+      terminal.authenticated_principal =
+          online->second.authenticated_principal;
+    }
+    terminal.terminal_operation_id = kReceiverCommitOperationId;
+    terminal.terminal_operation =
+        Preserve_trx_transfer_epoch_terminal_operation::COMMIT;
+    terminal.terminal_outcome =
+        Preserve_trx_transfer_epoch_terminal_outcome::COMMITTED;
+    terminal.fact_digest = fact->fact_digest;
+    terminal.terminal_cas_monotonic_us = now_us;
+    const uint64_t retention_us =
+        online == m_online_epochs.end()
+            ? kReceiverTerminalStatusRetentionUs
+            : online->second.accepted_terminal_status_retention_us;
+    terminal.retire_after_us =
+        std::max(terminal.retire_after_us,
+                 now_us > std::numeric_limits<uint64_t>::max() - retention_us
+                     ? std::numeric_limits<uint64_t>::max()
+                     : now_us + retention_us);
   } catch (...) {
+    if (accepted_inserted) m_accepted_epochs.erase(fact->epoch_id);
     return Preserve_trx_transfer_status::RESOURCE_EXHAUSTED;
   }
+  g_receiver_terminal_cas_wins.fetch_add(1);
+  g_receiver_terminal_status_tombstones.fetch_add(1);
   return Preserve_trx_transfer_status::OK;
 }
 
@@ -7793,11 +8626,10 @@ Preserve_trx_transfer_receiver_registry::
 }
 
 Preserve_trx_transfer_status
-Preserve_trx_transfer_receiver_registry::
+  Preserve_trx_transfer_receiver_registry::
     abandon_accepted_epoch_promotion_lease(
         const Preserve_trx_transfer_accepted_epoch &accepted) {
   if (accepted.root_dir.empty() || accepted.epoch_id.empty() ||
-      accepted.source_server_uuid.empty() ||
       accepted.receiver_process_generation.empty()) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
@@ -7807,7 +8639,6 @@ Preserve_trx_transfer_receiver_registry::
     return Preserve_trx_transfer_status::OK;
   }
   if (found->second.root_dir != accepted.root_dir ||
-      found->second.source_server_uuid != accepted.source_server_uuid ||
       found->second.receiver_process_generation !=
           accepted.receiver_process_generation) {
     return Preserve_trx_transfer_status::UNSUPPORTED;
@@ -7833,7 +8664,6 @@ Preserve_trx_transfer_receiver_registry::
   const auto found = m_accepted_epochs.find(accepted.epoch_id);
   if (found == m_accepted_epochs.end() ||
       found->second.root_dir != accepted.root_dir ||
-      found->second.source_server_uuid != accepted.source_server_uuid ||
       found->second.receiver_process_generation !=
           accepted.receiver_process_generation ||
       found->second.lifecycle !=
@@ -7911,10 +8741,10 @@ Preserve_trx_transfer_receiver_registry::erase_cleaned_epoch(
       record = record->first.first == epoch_id ? m_records.erase(record)
                                                : std::next(record);
     }
-    for (auto object = m_strict_v4_objects.begin();
-         object != m_strict_v4_objects.end();) {
+    for (auto object = m_strict_v1_objects.begin();
+         object != m_strict_v1_objects.end();) {
       object = object->first.first == epoch_id
-                   ? m_strict_v4_objects.erase(object)
+                   ? m_strict_v1_objects.erase(object)
                    : std::next(object);
     }
     for (auto debt = m_cleanup_debts.begin(); debt != m_cleanup_debts.end();) {
@@ -7943,7 +8773,7 @@ Preserve_trx_transfer_receiver_registry::erase_cleaned_epoch(
     m_active_payload_sequences.erase(epoch_id);
     m_applied_sequence_by_epoch.erase(epoch_id);
     m_first_apply_failure_by_epoch.erase(epoch_id);
-    m_acknowledged_epochs.erase(epoch_id);
+    m_online_epochs.erase(epoch_id);
     m_accepted_epochs.erase(accepted);
   }
   m_sequence_condition.notify_all();
@@ -7964,27 +8794,21 @@ Preserve_trx_transfer_receiver_registry::acknowledge_epoch(
   {
     std::lock_guard<std::mutex> guard(m_mutex);
     try {
-      Acknowledged_epoch &ack = m_acknowledged_epochs[epoch_id];
-      ack.root_dir = root_dir;
-      ack.retire_after_us = retire_after_us;
-      ack.spool_deleted = false;
+      auto acknowledged = m_acknowledged_epochs.find(epoch_id);
+      if (acknowledged == m_acknowledged_epochs.end()) {
+        acknowledged =
+            m_acknowledged_epochs.emplace(epoch_id, Acknowledged_epoch()).first;
+        acknowledged->second.root_dir = root_dir;
+      } else if (acknowledged->second.root_dir != root_dir) {
+        return Preserve_trx_transfer_status::CORRUPT;
+      }
+      Acknowledged_epoch &ack = acknowledged->second;
+      ack.retire_after_us = std::max(ack.retire_after_us, retire_after_us);
     } catch (...) {
       return Preserve_trx_transfer_status::RESOURCE_EXHAUSTED;
     }
   }
-  const std::string spool_path =
-      transfer_receiver_frame_spool_path(root_dir, epoch_id);
-  const bool spool_deleted =
-      my_delete(spool_path.c_str(), MYF(0)) == 0 || my_errno() == ENOENT;
-  {
-    std::lock_guard<std::mutex> guard(m_mutex);
-    const auto ack = m_acknowledged_epochs.find(epoch_id);
-    if (ack != m_acknowledged_epochs.end()) {
-      ack->second.spool_deleted = spool_deleted;
-    }
-  }
-  return spool_deleted ? Preserve_trx_transfer_status::OK
-                       : Preserve_trx_transfer_status::IO_ERROR;
+  return Preserve_trx_transfer_status::OK;
 }
 
 size_t
@@ -8000,20 +8824,19 @@ Preserve_trx_transfer_receiver_registry::retire_acknowledged_epochs_once(
 
   size_t retired = 0;
   for (auto &item : acknowledged) {
-    if (!item.second.spool_deleted) {
-      const std::string spool_path = transfer_receiver_frame_spool_path(
-          item.second.root_dir, item.first);
-      item.second.spool_deleted =
-          my_delete(spool_path.c_str(), MYF(0)) == 0 || my_errno() == ENOENT;
-    }
     std::lock_guard<std::mutex> guard(m_mutex);
     auto ack = m_acknowledged_epochs.find(item.first);
     if (ack == m_acknowledged_epochs.end()) continue;
-    ack->second.spool_deleted = item.second.spool_deleted;
-    if (!ack->second.spool_deleted || ack->second.retire_after_us > now_us) {
+    if (ack->second.retire_after_us > now_us) {
       continue;
     }
     if (m_accepted_epochs.count(item.first) != 0) {
+      if (ack->second.terminal_operation !=
+          Preserve_trx_transfer_epoch_terminal_operation::NONE) {
+        g_receiver_terminal_status_tombstones.fetch_sub(1);
+        g_receiver_terminal_status_tombstone_expiries.fetch_add(1);
+      }
+      m_online_epochs.erase(item.first);
       m_acknowledged_epochs.erase(ack);
       ++retired;
       continue;
@@ -8042,10 +8865,10 @@ Preserve_trx_transfer_receiver_registry::retire_acknowledged_epochs_once(
       record = record->first.first == item.first ? m_records.erase(record)
                                                  : std::next(record);
     }
-    for (auto object = m_strict_v4_objects.begin();
-         object != m_strict_v4_objects.end();) {
+    for (auto object = m_strict_v1_objects.begin();
+         object != m_strict_v1_objects.end();) {
       object = object->first.first == item.first
-                   ? m_strict_v4_objects.erase(object)
+                   ? m_strict_v1_objects.erase(object)
                    : std::next(object);
     }
     for (auto frame = m_frame_sequences.begin();
@@ -8070,6 +8893,12 @@ Preserve_trx_transfer_receiver_registry::retire_acknowledged_epochs_once(
     m_applied_sequence_by_epoch.erase(item.first);
     m_first_apply_failure_by_epoch.erase(item.first);
     m_active_payload_sequences.erase(item.first);
+    if (ack->second.terminal_operation !=
+        Preserve_trx_transfer_epoch_terminal_operation::NONE) {
+      g_receiver_terminal_status_tombstones.fetch_sub(1);
+      g_receiver_terminal_status_tombstone_expiries.fetch_add(1);
+    }
+    m_online_epochs.erase(item.first);
     m_acknowledged_epochs.erase(ack);
     ++retired;
   }
@@ -8659,7 +9488,7 @@ Preserve_trx_transfer_receiver_registry::mark_terminal_locked(
   found->second.state = state;
   found->second.reserved_bytes = 0;
   found->second.last_error = reason;
-  m_strict_v4_objects.erase(key);
+  m_strict_v1_objects.erase(key);
   m_last_failed_token = found->second.token;
   m_last_failed_reason = reason;
   return Preserve_trx_transfer_status::OK;
@@ -8805,8 +9634,7 @@ Preserve_trx_transfer_status preserve_trx_transfer_decode_portable_bundle(
 }
 
 Preserve_trx_transfer_status preserve_trx_transfer_build_portable_objects_impl(
-    const std::string &epoch_id, const std::string &source_server_uuid,
-    const std::string &target_server_uuid, const Preserved_trx_bundle &bundle,
+    const std::string &epoch_id, const Preserved_trx_bundle &bundle,
     uint64_t transfer_token, Preserve_trx_transfer_manifest *manifest,
     std::vector<Preserve_trx_transfer_object_payload> *objects,
     const std::set<std::string> *presealed_prebuilt_objects,
@@ -8853,8 +9681,6 @@ Preserve_trx_transfer_status preserve_trx_transfer_build_portable_objects_impl(
 
   Preserve_trx_transfer_manifest built_manifest;
   built_manifest.epoch_id = epoch_id;
-  built_manifest.source_server_uuid = source_server_uuid;
-  built_manifest.target_server_uuid = target_server_uuid;
   built_manifest.token = transfer_token;
   Preserve_trx_resurrection_index_entry provided_entry;
   const Preserve_trx_resurrection_index_entry *effective_entry =
@@ -8908,18 +9734,17 @@ Preserve_trx_transfer_status preserve_trx_transfer_build_portable_objects_impl(
             built_manifest.source_epoch_commit_lsn) {
       return Preserve_trx_transfer_status::INVALID_ARGUMENT;
     }
+    Preserved_trx_codec_context context;
+    if (!transfer_bundle_codec_context(&context)) {
+      return Preserve_trx_transfer_status::UNSUPPORTED;
+    }
     Preserve_trx_resurrection_index index;
-    index.source_server_uuid = source_server_uuid;
-    index.target_server_uuid = target_server_uuid;
+    index.local_instance_identity = context.server_uuid;
     index.epoch_id = epoch_id;
     index.entries.push_back(*effective_entry);
     index.entries.front().snapshot_digest =
         built_manifest.objects.front().digest;
 
-    Preserved_trx_codec_context context;
-    if (!transfer_bundle_codec_context(&context)) {
-      return Preserve_trx_transfer_status::UNSUPPORTED;
-    }
     Preserve_trx_transfer_object_payload index_object;
     index_object.descriptor.object_id =
         kPreserveTrxResurrectionIndexObjectId;
@@ -8979,8 +9804,6 @@ Preserve_trx_transfer_status preserve_trx_transfer_build_portable_objects_impl(
         "PRESERVE: standby transfer manifest validation failed status=" +
         transfer_status_name(validation_status) +
         " epoch=" + built_manifest.epoch_id +
-        " source=" + built_manifest.source_server_uuid +
-        " target=" + built_manifest.target_server_uuid +
         " token=" + std::to_string(built_manifest.token) +
         " objects=" + std::to_string(built_manifest.objects.size());
     LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG, message.c_str());
@@ -8993,14 +9816,13 @@ Preserve_trx_transfer_status preserve_trx_transfer_build_portable_objects_impl(
 }
 
 Preserve_trx_transfer_status preserve_trx_transfer_build_portable_objects(
-    const std::string &epoch_id, const std::string &source_server_uuid,
-    const std::string &target_server_uuid, const Preserved_trx_bundle &bundle,
+    const std::string &epoch_id, const Preserved_trx_bundle &bundle,
     uint64_t transfer_token, Preserve_trx_transfer_manifest *manifest,
     std::vector<Preserve_trx_transfer_object_payload> *objects,
     const Preserve_trx_resurrection_index_entry *resurrection_entry) {
   return preserve_trx_transfer_build_portable_objects_impl(
-      epoch_id, source_server_uuid, target_server_uuid, bundle, transfer_token,
-      manifest, objects, nullptr, resurrection_entry);
+      epoch_id, bundle, transfer_token, manifest, objects, nullptr,
+      resurrection_entry);
 }
 
 Preserve_trx_transfer_status preserve_trx_transfer_build_frame_sequence(
@@ -9097,16 +9919,12 @@ Preserve_trx_transfer_status preserve_trx_transfer_send_epoch_begin_frames(
   }
 
   const std::string &epoch_id = manifests.front().epoch_id;
-  const std::string &source_server_uuid = manifests.front().source_server_uuid;
-  const std::string &target_server_uuid = manifests.front().target_server_uuid;
   std::set<uint64_t> tokens;
   for (const Preserve_trx_transfer_manifest &manifest : manifests) {
     Preserve_trx_transfer_status status =
         validate_manifest_components(manifest, false);
     if (status != Preserve_trx_transfer_status::OK) return status;
     if (manifest.epoch_id != epoch_id ||
-        manifest.source_server_uuid != source_server_uuid ||
-        manifest.target_server_uuid != target_server_uuid ||
         !tokens.insert(manifest.token).second) {
       return Preserve_trx_transfer_status::INVALID_ARGUMENT;
     }
@@ -9132,13 +9950,10 @@ Preserve_trx_transfer_status preserve_trx_transfer_send_epoch_begin_frames(
 }
 
 Preserve_trx_transfer_status preserve_trx_transfer_send_epoch_declare_token_frame(
-    const std::string &epoch_id, const std::string &source_server_uuid,
-    const std::string &target_server_uuid, uint64_t transfer_token,
+    const std::string &epoch_id, uint64_t transfer_token,
     Preserve_trx_transfer_encoded_frame_sink *sink, uint64_t *next_sequence) {
   if (sink == nullptr || next_sequence == nullptr || *next_sequence == 0 ||
-      !transfer_component_safe(epoch_id) ||
-      !transfer_component_safe(source_server_uuid) ||
-      !transfer_component_safe(target_server_uuid) || transfer_token == 0) {
+      !transfer_component_safe(epoch_id) || transfer_token == 0) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
 
@@ -9147,8 +9962,6 @@ Preserve_trx_transfer_status preserve_trx_transfer_send_epoch_declare_token_fram
   declare.sequence = *next_sequence;
   declare.epoch_id = epoch_id;
   declare.token = transfer_token;
-  declare.reason =
-      encode_declare_token_reason(source_server_uuid, target_server_uuid);
   const Preserve_trx_transfer_status status =
       send_encoded_transfer_frame(sink, declare);
   if (status == Preserve_trx_transfer_status::OK) ++*next_sequence;
@@ -9267,32 +10080,42 @@ Preserve_trx_transfer_status preserve_trx_transfer_send_epoch_commit_frame(
 
 Preserve_trx_transfer_source_epoch_session::
     Preserve_trx_transfer_source_epoch_session(
-        const std::string &epoch_id, const std::string &source_server_uuid,
-        const std::string &target_server_uuid, uint32_t chunk_bytes,
+        const std::string &epoch_id, uint32_t chunk_bytes,
         Preserve_trx_transfer_encoded_frame_sink *sink)
     : m_epoch_id(epoch_id),
-      m_source_server_uuid(source_server_uuid),
-      m_target_server_uuid(target_server_uuid),
       m_chunk_bytes(chunk_bytes),
       m_max_inflight_bytes(preserve_trx_transfer_max_inflight_bytes),
       m_phase1_batch_bytes(preserve_trx_transfer_phase1_batch_bytes),
-      m_sink(sink) {}
+      m_sink(sink),
+      m_source_process_generation(transfer_source_epoch_boot_nonce()) {}
 
 Preserve_trx_transfer_source_epoch_session::
     Preserve_trx_transfer_source_epoch_session(
-        const std::string &epoch_id, const std::string &source_server_uuid,
-        const std::string &target_server_uuid,
+        const std::string &epoch_id,
         const Preserve_trx_transfer_source_epoch_options &options,
         Preserve_trx_transfer_encoded_frame_sink *sink)
     : m_epoch_id(epoch_id),
-      m_source_server_uuid(source_server_uuid),
-      m_target_server_uuid(target_server_uuid),
       m_chunk_bytes(options.chunk_bytes),
       m_max_inflight_bytes(options.max_inflight_bytes),
       m_phase1_batch_bytes(options.phase1_batch_bytes),
       m_sink(sink),
+      m_before_commit_send(options.before_commit_send),
+      m_before_commit_send_context(options.before_commit_send_context),
       m_final_ack_arbiter(options.final_ack_arbiter),
-      m_final_ack_arbiter_context(options.final_ack_arbiter_context) {}
+      m_final_ack_arbiter_context(options.final_ack_arbiter_context),
+      m_source_process_generation(transfer_source_epoch_boot_nonce()) {}
+
+Preserve_trx_handoff_resolution_context
+Preserve_trx_transfer_source_epoch_session::handoff_resolution_context()
+    const {
+  std::lock_guard<std::mutex> guard(m_mutex);
+  Preserve_trx_handoff_resolution_context context;
+  context.epoch_id = m_epoch_id;
+  context.final_fact_digest = m_terminal_fact_digest;
+  context.source_process_generation = m_source_process_generation;
+  context.receiver_process_generation = m_receiver_process_nonce;
+  return context;
+}
 
 bool Preserve_trx_transfer_source_epoch_session::token_declared(
     uint64_t transfer_token) const {
@@ -9306,6 +10129,56 @@ bool Preserve_trx_transfer_source_epoch_session::token_resolved(
 }
 
 Preserve_trx_transfer_status
+Preserve_trx_transfer_source_epoch_session::open_epoch(
+    uint64_t requested_terminal_status_retention_us,
+    uint64_t absolute_monotonic_deadline_us) {
+  std::lock_guard<std::mutex> guard(m_mutex);
+  if (m_sink == nullptr || m_epoch_committed || m_commit_in_progress ||
+      m_next_sequence != 1 || !m_declared_tokens.empty() ||
+      requested_terminal_status_retention_us == 0 ||
+      absolute_monotonic_deadline_us <= transfer_monotonic_us()) {
+    return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+  }
+  if (m_epoch_transport_open) {
+    return m_requested_terminal_status_retention_us ==
+                       requested_terminal_status_retention_us &&
+                   m_absolute_monotonic_deadline_us ==
+                       absolute_monotonic_deadline_us
+               ? Preserve_trx_transfer_status::OK
+               : Preserve_trx_transfer_status::CORRUPT;
+  }
+  std::string receiver_process_nonce;
+  uint64_t accepted_terminal_status_retention_us = 0;
+  const Preserve_trx_transfer_status status = m_sink->open_epoch_transport(
+      m_epoch_id, requested_terminal_status_retention_us,
+      absolute_monotonic_deadline_us, &receiver_process_nonce,
+      &accepted_terminal_status_retention_us);
+  if (status != Preserve_trx_transfer_status::OK) return status;
+  if (receiver_process_nonce.length() != 32 ||
+      !transfer_component_safe(receiver_process_nonce) ||
+      accepted_terminal_status_retention_us <
+          requested_terminal_status_retention_us) {
+    return Preserve_trx_transfer_status::CORRUPT;
+  }
+  m_requested_terminal_status_retention_us =
+      requested_terminal_status_retention_us;
+  m_absolute_monotonic_deadline_us = absolute_monotonic_deadline_us;
+  m_receiver_process_nonce = std::move(receiver_process_nonce);
+  m_accepted_terminal_status_retention_us =
+      accepted_terminal_status_retention_us;
+  m_epoch_transport_open = true;
+  return Preserve_trx_transfer_status::OK;
+}
+
+void Preserve_trx_transfer_source_epoch_session::
+    stamp_online_epoch_context_locked(
+        Preserve_trx_transfer_frame *frame) const {
+  if (frame != nullptr && m_epoch_transport_open) {
+    frame->receiver_process_nonce = m_receiver_process_nonce;
+  }
+}
+
+Preserve_trx_transfer_status
 Preserve_trx_transfer_source_epoch_session::emit_frame_locked(
     Preserve_trx_transfer_frame frame, bool queue_final_metadata) {
   if (m_sink == nullptr) return Preserve_trx_transfer_status::INVALID_ARGUMENT;
@@ -9314,6 +10187,7 @@ Preserve_trx_transfer_source_epoch_session::emit_frame_locked(
       frame.type != Preserve_trx_transfer_frame_type::ABORT) {
     return Preserve_trx_transfer_status::ACK_UNCERTAIN;
   }
+  stamp_online_epoch_context_locked(&frame);
   frame.sequence = m_next_sequence;
   if (queue_final_metadata) {
     m_pending_final_metadata_frames.push_back(std::move(frame));
@@ -9399,9 +10273,7 @@ Preserve_trx_transfer_source_epoch_session::declare_token(
     uint64_t transfer_token) {
   std::lock_guard<std::mutex> guard(m_mutex);
   if (m_sink == nullptr || m_chunk_bytes == 0 ||
-      !transfer_component_safe(m_epoch_id) ||
-      !transfer_component_safe(m_source_server_uuid) ||
-      !transfer_component_safe(m_target_server_uuid) || transfer_token == 0) {
+      !transfer_component_safe(m_epoch_id) || transfer_token == 0) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
   if (m_chunk_bytes > kMaxTransferChunkBytes) {
@@ -9417,8 +10289,6 @@ Preserve_trx_transfer_source_epoch_session::declare_token(
   declare.type = Preserve_trx_transfer_frame_type::DECLARE_TOKEN;
   declare.epoch_id = m_epoch_id;
   declare.token = transfer_token;
-  declare.reason =
-      encode_declare_token_reason(m_source_server_uuid, m_target_server_uuid);
   Preserve_trx_transfer_status status =
       emit_frame_locked(std::move(declare), false);
   if (status != Preserve_trx_transfer_status::OK) return status;
@@ -9434,9 +10304,7 @@ Preserve_trx_transfer_source_epoch_session::declare_tokens_batch(
   }
   std::lock_guard<std::mutex> guard(m_mutex);
   if (m_sink == nullptr || m_chunk_bytes == 0 ||
-      !transfer_component_safe(m_epoch_id) ||
-      !transfer_component_safe(m_source_server_uuid) ||
-      !transfer_component_safe(m_target_server_uuid) || m_epoch_committed ||
+      !transfer_component_safe(m_epoch_id) || m_epoch_committed ||
       m_commit_in_progress) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
@@ -9461,8 +10329,7 @@ Preserve_trx_transfer_source_epoch_session::declare_tokens_batch(
     declare.sequence = m_next_sequence++;
     declare.epoch_id = m_epoch_id;
     declare.token = transfer_token;
-    declare.reason =
-        encode_declare_token_reason(m_source_server_uuid, m_target_server_uuid);
+    stamp_online_epoch_context_locked(&declare);
     std::string encoded_frame;
     Preserve_trx_transfer_status status =
         preserve_trx_transfer_encode_frame(declare, &encoded_frame);
@@ -9569,9 +10436,7 @@ Preserve_trx_transfer_source_epoch_session::begin_token_objects(
     const Preserve_trx_transfer_manifest &manifest, bool queue_final_metadata) {
   std::lock_guard<std::mutex> guard(m_mutex);
   if (m_sink == nullptr || m_chunk_bytes == 0 || manifest.token == 0 ||
-      manifest.epoch_id != m_epoch_id ||
-      manifest.source_server_uuid != m_source_server_uuid ||
-      manifest.target_server_uuid != m_target_server_uuid) {
+      manifest.epoch_id != m_epoch_id) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
   if (m_epoch_committed || m_commit_in_progress ||
@@ -9660,8 +10525,6 @@ Preserve_trx_transfer_source_epoch_session::begin_token_prewarm_manifest(
 
   Preserve_trx_transfer_manifest manifest;
   manifest.epoch_id = m_epoch_id;
-  manifest.source_server_uuid = m_source_server_uuid;
-  manifest.target_server_uuid = m_target_server_uuid;
   manifest.token = transfer_token;
   if (prewarm_manifest_started) {
     const auto lsn_fact = m_prewarm_lsn_facts.find(transfer_token);
@@ -9750,8 +10613,6 @@ Preserve_trx_transfer_source_epoch_session::begin_token_prewarm_manifests_batch(
 
     Preserve_trx_transfer_manifest manifest;
     manifest.epoch_id = m_epoch_id;
-    manifest.source_server_uuid = m_source_server_uuid;
-    manifest.target_server_uuid = m_target_server_uuid;
     manifest.token = transfer_token;
     if (!load_source_transfer_lsn_fact(&manifest.source_prepare_lsn,
                                        &manifest.source_epoch_commit_lsn)) {
@@ -9773,6 +10634,7 @@ Preserve_trx_transfer_source_epoch_session::begin_token_prewarm_manifests_batch(
     begin.epoch_id = manifest.epoch_id;
     begin.token = manifest.token;
     begin.manifest_payload = std::move(manifest_payload);
+    stamp_online_epoch_context_locked(&begin);
     std::string encoded_frame;
     status = preserve_trx_transfer_encode_frame(begin, &encoded_frame);
     if (status != Preserve_trx_transfer_status::OK) return status;
@@ -9992,9 +10854,7 @@ Preserve_trx_transfer_source_epoch_session::send_token_objects_locked(
     const std::vector<Preserve_trx_transfer_object_payload> &objects,
     bool queue_final_metadata) {
   if (m_sink == nullptr || m_chunk_bytes == 0 || manifest.token == 0 ||
-      manifest.epoch_id != m_epoch_id ||
-      manifest.source_server_uuid != m_source_server_uuid ||
-      manifest.target_server_uuid != m_target_server_uuid) {
+      manifest.epoch_id != m_epoch_id) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
   if (m_epoch_committed || m_commit_in_progress)
@@ -10111,9 +10971,7 @@ Preserve_trx_transfer_source_epoch_session::send_token_objects_batch(
   }
   std::lock_guard<std::mutex> guard(m_mutex);
   if (m_sink == nullptr || m_chunk_bytes == 0 || manifest.token == 0 ||
-      manifest.epoch_id != m_epoch_id ||
-      manifest.source_server_uuid != m_source_server_uuid ||
-      manifest.target_server_uuid != m_target_server_uuid) {
+      manifest.epoch_id != m_epoch_id) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
   if (m_epoch_committed || m_commit_in_progress ||
@@ -10255,6 +11113,7 @@ Preserve_trx_transfer_source_epoch_session::send_token_objects_batch(
     std::vector<std::string> encoded_frames;
     encoded_frames.reserve(frames.size());
     for (Preserve_trx_transfer_frame &frame : frames) {
+      stamp_online_epoch_context_locked(&frame);
       frame.sequence = m_next_sequence++;
       std::string encoded_frame;
       status = preserve_trx_transfer_encode_frame(frame, &encoded_frame);
@@ -10314,8 +11173,7 @@ Preserve_trx_transfer_source_epoch_session::send_token_bundle(
   std::vector<Preserve_trx_transfer_object_payload> objects;
   Preserve_trx_transfer_status status =
       preserve_trx_transfer_build_portable_objects(
-          m_epoch_id, m_source_server_uuid, m_target_server_uuid, bundle,
-          transfer_token, &built_manifest, &objects);
+          m_epoch_id, bundle, transfer_token, &built_manifest, &objects);
   if (status != Preserve_trx_transfer_status::OK) return status;
 
   status = send_token_objects_locked(built_manifest, objects, true);
@@ -10722,6 +11580,7 @@ Preserve_trx_transfer_source_epoch_session::stream_prebuilt_blobs_batch(
           prepared.payload_offset,
           prepared.request.preserved_prefix_digest);
     }
+    stamp_online_epoch_context_locked(&declare);
     std::string encoded_declare;
     status = preserve_trx_transfer_encode_frame(declare, &encoded_declare);
     if (status != Preserve_trx_transfer_status::OK) return status;
@@ -10780,8 +11639,6 @@ Preserve_trx_transfer_source_epoch_session::stream_prebuilt_blobs_batch(
     if (publish_prewarm_manifest) {
       Preserve_trx_transfer_manifest prewarm_manifest;
       prewarm_manifest.epoch_id = m_epoch_id;
-      prewarm_manifest.source_server_uuid = m_source_server_uuid;
-      prewarm_manifest.target_server_uuid = m_target_server_uuid;
       prewarm_manifest.token = transfer_token;
       if (prewarm_manifest_started) {
         prewarm_manifest.source_prepare_lsn = prewarm_lsn_fact.first;
@@ -10819,6 +11676,7 @@ Preserve_trx_transfer_source_epoch_session::stream_prebuilt_blobs_batch(
         begin.epoch_id = m_epoch_id;
         begin.token = transfer_token;
         begin.manifest_payload = std::move(prewarm_payload);
+        stamp_online_epoch_context_locked(&begin);
         std::string encoded_begin;
         status = preserve_trx_transfer_encode_frame(begin, &encoded_begin);
         if (status != Preserve_trx_transfer_status::OK) return status;
@@ -10842,6 +11700,7 @@ Preserve_trx_transfer_source_epoch_session::stream_prebuilt_blobs_batch(
       chunk.object_id = prepared.descriptor.object_id;
       chunk.chunk_offset = prepared.payload_offset + payload_index;
       chunk.chunk_payload = prepared.payload.substr(payload_index, length);
+      stamp_online_epoch_context_locked(&chunk);
       std::string encoded_chunk;
       status = preserve_trx_transfer_encode_frame(chunk, &encoded_chunk);
       if (status != Preserve_trx_transfer_status::OK) return status;
@@ -10856,6 +11715,7 @@ Preserve_trx_transfer_source_epoch_session::stream_prebuilt_blobs_batch(
     seal.epoch_id = m_epoch_id;
     seal.token = transfer_token;
     seal.object_id = prepared.descriptor.object_id;
+    stamp_online_epoch_context_locked(&seal);
     std::string encoded_seal;
     status = preserve_trx_transfer_encode_frame(seal, &encoded_seal);
     if (status != Preserve_trx_transfer_status::OK) return status;
@@ -10998,9 +11858,7 @@ preserve_trx_transfer_stage_deferred_candidate_external_objects(
     Preserve_trx_transfer_phase1_batch_sender *batch_sender) {
   if (session == nullptr || candidate == nullptr || !candidate->captured ||
       candidate->finalized || candidate->transfer_token == 0 ||
-      candidate->epoch_id != session->epoch_id() ||
-      candidate->source_server_uuid != session->source_server_uuid() ||
-      candidate->target_server_uuid != session->target_server_uuid()) {
+      candidate->epoch_id != session->epoch_id()) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
   if (candidate->external_objects_staged)
@@ -11187,9 +12045,7 @@ Preserve_trx_transfer_status preserve_trx_transfer_finalize_deferred_candidate(
     Preserve_trx_deferred_transfer_candidate *candidate) {
   if (session == nullptr || candidate == nullptr || !candidate->captured ||
       !candidate->external_objects_staged || candidate->transfer_token == 0 ||
-      candidate->epoch_id != session->epoch_id() ||
-      candidate->source_server_uuid != session->source_server_uuid() ||
-      candidate->target_server_uuid != session->target_server_uuid()) {
+      candidate->epoch_id != session->epoch_id()) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
   if (candidate->finalized) return Preserve_trx_transfer_status::OK;
@@ -11221,9 +12077,8 @@ Preserve_trx_transfer_status preserve_trx_transfer_finalize_deferred_candidate(
   std::vector<Preserve_trx_transfer_object_payload> objects;
   Preserve_trx_transfer_status status =
       preserve_trx_transfer_build_portable_objects_impl(
-          candidate->epoch_id, candidate->source_server_uuid,
-          candidate->target_server_uuid, candidate->bundle,
-          candidate->transfer_token, &manifest, &objects,
+          candidate->epoch_id, candidate->bundle, candidate->transfer_token,
+          &manifest, &objects,
           &presealed_external_objects,
           candidate->has_resurrection_entry ? &candidate->resurrection_entry
                                             : nullptr,
@@ -11295,6 +12150,7 @@ Preserve_trx_transfer_source_epoch_session::abort_token_locked(
   abort.epoch_id = m_epoch_id;
   abort.token = transfer_token;
   abort.reason = reason;
+  stamp_online_epoch_context_locked(&abort);
   Preserve_trx_transfer_status status =
       send_encoded_transfer_frame(m_sink, abort);
   if (status != Preserve_trx_transfer_status::OK) return status;
@@ -11396,6 +12252,7 @@ Preserve_trx_transfer_source_epoch_session::commit_epoch() {
   commit.epoch_id = m_epoch_id;
   commit.token = *m_finalized_tokens.begin();
   commit.sequence = m_next_sequence;
+  stamp_online_epoch_context_locked(&commit);
   Preserve_trx_transfer_status status = populate_source_commit_proof(&commit);
   if (status != Preserve_trx_transfer_status::OK) return status;
   const uint64_t source_fence_lsn = commit.chunk_offset;
@@ -11407,6 +12264,13 @@ Preserve_trx_transfer_source_epoch_session::commit_epoch() {
       return Preserve_trx_transfer_status::CORRUPT;
     }
   }
+  Preserve_trx_transfer_epoch_fact source_fact;
+  status = build_epoch_fact_from_manifests(
+      m_finalized_manifests, source_fence_lsn, commit.trx_id_store,
+      &source_fact);
+  if (status != Preserve_trx_transfer_status::OK) return status;
+  commit.terminal_fact_digest = source_fact.fact_digest;
+  m_terminal_fact_digest = source_fact.fact_digest;
 
   status = Preserve_trx_transfer_status::OK;
   std::vector<std::string> final_token_payloads;
@@ -11539,13 +12403,36 @@ Preserve_trx_transfer_source_epoch_session::commit_epoch() {
   uint64_t ack_end_us = 0;
   if (status == Preserve_trx_transfer_status::OK) {
     throttle_source_transfer_io(encoded_commit.length());
-    ack_start_us = transfer_monotonic_us();
-    try {
-      status = sink->send_encoded_frame(encoded_commit);
-    } catch (...) {
-      status = Preserve_trx_transfer_status::UNSUPPORTED;
+    bool send_allowed = true;
+    DEBUG_SYNC(current_thd,
+               "preserve_trx_transfer_before_commit_send_ownership_cas");
+    if (m_before_commit_send != nullptr) {
+      try {
+        send_allowed =
+            m_before_commit_send(m_before_commit_send_context);
+      } catch (...) {
+        send_allowed = false;
+      }
     }
-    ack_end_us = transfer_monotonic_us();
+    if (!send_allowed) {
+      status = Preserve_trx_transfer_status::UNSUPPORTED;
+    } else {
+      try {
+        sink->set_operation_timeout_ms(
+            preserve_trx_transfer_commit_timeout_ms);
+      } catch (...) {
+        status = Preserve_trx_transfer_status::UNSUPPORTED;
+      }
+      if (status == Preserve_trx_transfer_status::OK) {
+        ack_start_us = transfer_monotonic_us();
+        try {
+          status = sink->send_encoded_frame(encoded_commit);
+        } catch (...) {
+          status = Preserve_trx_transfer_status::UNSUPPORTED;
+        }
+        ack_end_us = transfer_monotonic_us();
+      }
+    }
   }
   const bool committed_outcome = transfer_status_is_committed_outcome(status);
   const bool commit_acknowledged =
@@ -11592,8 +12479,7 @@ Preserve_trx_transfer_source_epoch_session::commit_epoch() {
 
 Preserve_trx_transfer_status
 preserve_trx_transfer_build_encoded_frame_sequence(
-    const std::string &epoch_id, const std::string &source_server_uuid,
-    const std::string &target_server_uuid, const Preserved_trx_bundle &bundle,
+    const std::string &epoch_id, const Preserved_trx_bundle &bundle,
     uint64_t transfer_token, uint32_t chunk_bytes,
     std::vector<std::string> *encoded_frames,
     Preserve_trx_transfer_manifest *manifest) {
@@ -11605,9 +12491,7 @@ preserve_trx_transfer_build_encoded_frame_sequence(
   std::vector<Preserve_trx_transfer_object_payload> objects;
   Preserve_trx_transfer_status status =
       preserve_trx_transfer_build_portable_objects(
-          epoch_id, source_server_uuid, target_server_uuid, bundle,
-          transfer_token,
-          &built_manifest, &objects);
+          epoch_id, bundle, transfer_token, &built_manifest, &objects);
   if (status != Preserve_trx_transfer_status::OK) return status;
 
   std::vector<Preserve_trx_transfer_frame> frames;
@@ -11643,14 +12527,196 @@ Preserve_trx_transfer_status preserve_trx_transfer_make_configured_frame_sink(
 
   const Preserve_trx_transfer_client_ops *ops = configured_transfer_client_ops();
   if (ops == nullptr) return Preserve_trx_transfer_status::UNSUPPORTED;
+  Preserve_trx_transfer_client_endpoint endpoint =
+      configured_transfer_client_endpoint();
+  Transfer_epoch_credential credential;
+  if (!snapshot_transfer_epoch_credential(endpoint, &credential)) {
+    return Preserve_trx_transfer_status::UNSUPPORTED;
+  }
+  endpoint.user = std::move(credential.user);
+  endpoint.auth_plugin = std::move(credential.auth_plugin);
   sink->reset(new Preserve_trx_transfer_client_frame_sink(
-      configured_transfer_client_endpoint(), ops));
+      std::move(endpoint), std::move(credential.password), ops));
   return Preserve_trx_transfer_status::OK;
+}
+
+namespace {
+
+bool handoff_resolution_proof_matches_context(
+    const Preserve_trx_handoff_resolution_proof &proof,
+    const Preserve_trx_handoff_resolution_context &context) {
+  return proof.epoch_id == context.epoch_id &&
+         proof.final_fact_digest == context.final_fact_digest &&
+         proof.source_process_generation == context.source_process_generation &&
+         proof.receiver_process_generation ==
+             context.receiver_process_generation;
+}
+
+bool same_handoff_resolution_proof(
+    const Preserve_trx_handoff_resolution_proof &left,
+    const Preserve_trx_handoff_resolution_proof &right) {
+  return left.epoch_id == right.epoch_id &&
+         left.final_fact_digest == right.final_fact_digest &&
+         left.source_process_generation == right.source_process_generation &&
+         left.receiver_process_generation ==
+             right.receiver_process_generation &&
+         left.ha_role_generation == right.ha_role_generation &&
+         left.resolution == right.resolution;
+}
+
+}  // namespace
+
+bool Preserve_trx_handoff_resolution_state::arm(
+    const Preserve_trx_handoff_resolution_context &context) {
+  if (context.epoch_id.empty() ||
+      transfer_digest_is_zero(context.final_fact_digest) ||
+      context.source_process_generation.empty() ||
+      context.receiver_process_generation.empty()) {
+    return false;
+  }
+  std::lock_guard<std::mutex> guard(m_mutex);
+  if (m_started) return false;
+  if (m_armed) {
+    return context.epoch_id == m_context.epoch_id &&
+           context.final_fact_digest == m_context.final_fact_digest &&
+           context.source_process_generation ==
+               m_context.source_process_generation &&
+           context.receiver_process_generation ==
+               m_context.receiver_process_generation;
+  }
+  m_context = context;
+  m_armed = true;
+  return true;
+}
+
+Preserve_trx_transfer_status Preserve_trx_handoff_resolution_state::begin(
+    const Preserve_trx_ha_control_capability &capability,
+    const Preserve_trx_handoff_resolution_proof &proof,
+    bool *first_decision) {
+  if (first_decision != nullptr) *first_decision = false;
+  if (!capability.valid()) {
+    return Preserve_trx_transfer_status::UNSUPPORTED;
+  }
+  if (proof.ha_role_generation != capability.role_generation()) {
+    return Preserve_trx_transfer_status::CORRUPT;
+  }
+
+  std::lock_guard<std::mutex> guard(m_mutex);
+  if (!m_armed || !handoff_resolution_proof_matches_context(proof, m_context)) {
+    return Preserve_trx_transfer_status::CORRUPT;
+  }
+  if (m_started) {
+    if (!same_handoff_resolution_proof(proof, m_accepted_proof)) {
+      return Preserve_trx_transfer_status::CORRUPT;
+    }
+    return m_completed ? m_result
+                       : Preserve_trx_transfer_status::ACK_UNCERTAIN;
+  }
+
+  m_accepted_proof = proof;
+  m_started = true;
+  if (first_decision != nullptr) *first_decision = true;
+  return Preserve_trx_transfer_status::OK;
+}
+
+bool Preserve_trx_handoff_resolution_state::complete(
+    const Preserve_trx_handoff_resolution_proof &proof,
+    Preserve_trx_transfer_status result) {
+  if (result == Preserve_trx_transfer_status::OK ||
+      result == Preserve_trx_transfer_status::ACK_UNCERTAIN) {
+    return false;
+  }
+  std::lock_guard<std::mutex> guard(m_mutex);
+  if (!m_started || !same_handoff_resolution_proof(proof, m_accepted_proof)) {
+    return false;
+  }
+  if (m_completed) return result == m_result;
+  m_result = result;
+  m_completed = true;
+  return true;
+}
+
+bool Preserve_trx_handoff_resolution_state::matches_context(
+    const Preserve_trx_handoff_resolution_proof &proof) const {
+  std::lock_guard<std::mutex> guard(m_mutex);
+  return m_armed && handoff_resolution_proof_matches_context(proof, m_context);
+}
+
+Preserve_trx_transfer_password_status
+preserved_trx_transfer_set_runtime_password(
+    const Preserve_trx_ha_control_capability &capability,
+    const unsigned char *password, size_t password_length) {
+  if (!capability.valid()) {
+    return Preserve_trx_transfer_password_status::UNAUTHORIZED;
+  }
+  const Preserve_trx_transfer_password_status role_status =
+      transfer_runtime_password_role_status();
+  if (role_status != Preserve_trx_transfer_password_status::OK) {
+    return role_status;
+  }
+  if (password == nullptr || password_length == 0 || password_length > 256 ||
+      std::find(password, password + password_length, '\0') !=
+          password + password_length) {
+    return Preserve_trx_transfer_password_status::INVALID_ARGUMENT;
+  }
+
+  std::shared_ptr<const Transfer_epoch_password> replacement =
+      make_transfer_epoch_password(password, password_length);
+  if (replacement == nullptr) {
+    return Preserve_trx_transfer_password_status::RESOURCE_EXHAUSTED;
+  }
+
+  std::shared_ptr<const Transfer_epoch_password> previous;
+  {
+    std::lock_guard<std::mutex> guard(g_transfer_runtime_password_mutex);
+    previous = std::move(g_transfer_runtime_password);
+    g_transfer_runtime_password = std::move(replacement);
+    g_transfer_runtime_password_managed = true;
+  }
+  previous.reset();
+  return Preserve_trx_transfer_password_status::OK;
+}
+
+Preserve_trx_transfer_password_status
+preserved_trx_transfer_clear_runtime_password(
+    const Preserve_trx_ha_control_capability &capability) {
+  if (!capability.valid()) {
+    return Preserve_trx_transfer_password_status::UNAUTHORIZED;
+  }
+  const Preserve_trx_transfer_password_status role_status =
+      transfer_runtime_password_role_status();
+  if (role_status != Preserve_trx_transfer_password_status::OK) {
+    return role_status;
+  }
+
+  std::shared_ptr<const Transfer_epoch_password> previous;
+  {
+    std::lock_guard<std::mutex> guard(g_transfer_runtime_password_mutex);
+    previous = std::move(g_transfer_runtime_password);
+    g_transfer_runtime_password_managed = true;
+  }
+  previous.reset();
+  return Preserve_trx_transfer_password_status::OK;
 }
 
 void preserve_trx_transfer_set_client_ops_for_unit_test(
     const Preserve_trx_transfer_client_ops *ops) {
   unit_transfer_client_ops() = ops;
+}
+
+void preserve_trx_transfer_reset_runtime_password_for_unit_test() {
+  std::shared_ptr<const Transfer_epoch_password> previous;
+  {
+    std::lock_guard<std::mutex> guard(g_transfer_runtime_password_mutex);
+    previous = std::move(g_transfer_runtime_password);
+    g_transfer_runtime_password_managed = false;
+  }
+  previous.reset();
+}
+
+size_t preserve_trx_transfer_cleanse_mysql_passwords_for_unit_test(
+    MYSQL *mysql) {
+  return cleanse_transfer_mysql_password_copies(mysql);
 }
 
 void preserve_trx_transfer_set_codec_context_provider_for_unit_test(
@@ -11749,8 +12815,7 @@ bool preserve_trx_transfer_receiver_object_proof_metadata_only_for_unit_test(
 }
 
 Preserve_trx_transfer_status preserve_trx_transfer_send_bundle_frames(
-    const std::string &epoch_id, const std::string &source_server_uuid,
-    const std::string &target_server_uuid, const Preserved_trx_bundle &bundle,
+    const std::string &epoch_id, const Preserved_trx_bundle &bundle,
     uint64_t transfer_token, uint32_t chunk_bytes,
     Preserve_trx_transfer_encoded_frame_sink *sink,
     Preserve_trx_transfer_manifest *manifest,
@@ -11761,8 +12826,8 @@ Preserve_trx_transfer_status preserve_trx_transfer_send_bundle_frames(
   std::vector<Preserve_trx_transfer_object_payload> objects;
   Preserve_trx_transfer_status status =
       preserve_trx_transfer_build_portable_objects(
-          epoch_id, source_server_uuid, target_server_uuid, bundle,
-          transfer_token, &built_manifest, &objects, resurrection_entry);
+          epoch_id, bundle, transfer_token, &built_manifest, &objects,
+          resurrection_entry);
   if (status != Preserve_trx_transfer_status::OK) {
     const std::string message =
         "PRESERVE: standby transfer build portable objects failed status=" +
@@ -11815,8 +12880,6 @@ Preserve_trx_transfer_status preserve_trx_transfer_send_bundle_frames(
   declare.sequence = 1;
   declare.epoch_id = built_manifest.epoch_id;
   declare.token = built_manifest.token;
-  declare.reason =
-      encode_declare_token_reason(source_server_uuid, target_server_uuid);
   std::string encoded_declare;
   status = preserve_trx_transfer_encode_frame(declare, &encoded_declare);
   if (status != Preserve_trx_transfer_status::OK) return status;
@@ -11858,8 +12921,7 @@ Preserve_trx_transfer_status preserve_trx_transfer_send_bundle_frames(
 }
 
 Preserve_trx_transfer_status preserve_trx_transfer_send_epoch_bundles(
-    const std::string &epoch_id, const std::string &source_server_uuid,
-    const std::string &target_server_uuid,
+    const std::string &epoch_id,
     const std::vector<Preserved_trx_bundle> &bundles,
     const std::vector<uint64_t> &transfer_tokens, uint32_t chunk_bytes,
     Preserve_trx_transfer_encoded_frame_sink *sink,
@@ -11883,8 +12945,7 @@ Preserve_trx_transfer_status preserve_trx_transfer_send_epoch_bundles(
     Token_payload token;
     Preserve_trx_transfer_status status =
         preserve_trx_transfer_build_portable_objects(
-            epoch_id, source_server_uuid, target_server_uuid, bundle,
-            transfer_tokens[tokens.size()],
+            epoch_id, bundle, transfer_tokens[tokens.size()],
             &token.manifest, &token.objects);
     if (status != Preserve_trx_transfer_status::OK) return status;
     if (!token_names.insert(token.manifest.token).second) {
@@ -11941,8 +13002,6 @@ Preserve_trx_transfer_status preserve_trx_transfer_send_epoch_bundles(
     declare.sequence = sequence++;
     declare.epoch_id = token.manifest.epoch_id;
     declare.token = token.manifest.token;
-    declare.reason = encode_declare_token_reason(source_server_uuid,
-                                                 target_server_uuid);
     const Preserve_trx_transfer_status status = send_frame(declare);
     if (status != Preserve_trx_transfer_status::OK) {
       abort_declared_tokens(status);
@@ -12304,7 +13363,7 @@ Preserve_trx_transfer_status preserve_trx_transfer_load_standby_bundle_from_stag
   const std::string *portable_snapshot = nullptr;
   Preserve_trx_transfer_status status = Preserve_trx_transfer_status::OK;
   if (registry != nullptr &&
-      transfer_object_uses_strict_v4_memory_staging(manifest, *snapshot)) {
+      transfer_object_uses_strict_v1_memory_staging(manifest, *snapshot)) {
     status = read_receiver_sealed_object_payload(
         root_dir, manifest, snapshot->object_id, registry, &online_snapshot);
     if (status == Preserve_trx_transfer_status::OK && online_snapshot != nullptr) {
@@ -12509,7 +13568,7 @@ uint64_t receiver_staged_token_file_read_bytes(
   uint64_t total = 0;
   for (const auto &object : manifest.objects) {
     /* The phase-1 object worker already consumed record-lock bytes into a plan. */
-    if (transfer_object_uses_strict_v4_memory_staging(manifest, object) ||
+    if (transfer_object_uses_strict_v1_memory_staging(manifest, object) ||
         object.object_id == kPreservedTrxBlobRecordLocks) {
       continue;
     }
@@ -12676,7 +13735,7 @@ void purge_receiver_epoch_prewarm_queues(const std::string &root_dir,
 
 void purge_receiver_epoch_derived_state(const std::string &root_dir,
                                         const std::string &epoch_id,
-                                        const std::string &source_uuid) {
+                                        const std::string &epoch_scope) {
   purge_receiver_epoch_prewarm_queues(root_dir, epoch_id);
   {
     std::lock_guard<std::mutex> guard(g_receiver_seal_prewarm_state_mutex);
@@ -12733,8 +13792,8 @@ void purge_receiver_epoch_derived_state(const std::string &root_dir,
     }
   }
   preserved_trx_promotion_ready_cache_purge_epoch(root_dir, epoch_id);
-  if (!source_uuid.empty()) {
-    preserved_trx_strict_prepared_token_registry().purge_epoch(source_uuid,
+  if (!epoch_scope.empty()) {
+    preserved_trx_strict_prepared_token_registry().purge_epoch(epoch_scope,
                                                                epoch_id);
   }
 }
@@ -12813,7 +13872,7 @@ Receiver_object_prewarm_proof_state receiver_object_prewarm_proof_state(
 bool receiver_staged_token_prewarm_job_runnable(
     const Receiver_prewarm_job &job) {
   if (receiver_binlog_prepare_pending(job.root_dir, job.manifest)) return false;
-  if (!transfer_manifest_uses_v4_metadata_only_lock_prewarm(job.manifest)) {
+  if (!transfer_manifest_uses_v1_metadata_only_lock_prewarm(job.manifest)) {
     return true;
   }
   Receiver_object_prewarm_key key;
@@ -12995,8 +14054,8 @@ preserve_trx_transfer_destroy_receiver_epoch_process_local(
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
 
-  purge_receiver_epoch_derived_state(accepted.root_dir, accepted.epoch_id,
-                                     accepted.source_server_uuid);
+  purge_receiver_epoch_derived_state(
+      accepted.root_dir, accepted.epoch_id, receiver_boot_incarnation());
 
   Preserve_trx_transfer_status cleanup_status =
       Preserve_trx_transfer_status::OK;
@@ -13133,8 +14192,8 @@ Preserve_trx_promotion_adopt_status run_receiver_staged_token_prewarm_job(
         manifest.source_epoch_commit_lsn, staged_bundle);
   }
   if (receiver_epoch_expired_or_removed(root_dir, registry, manifest)) {
-    purge_receiver_epoch_derived_state(root_dir, manifest.epoch_id,
-                                       manifest.source_server_uuid);
+    purge_receiver_epoch_derived_state(
+        root_dir, manifest.epoch_id, receiver_boot_incarnation());
     return Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY;
   }
   g_receiver_staged_token_ready_cache_us.fetch_add(transfer_monotonic_us() -
@@ -13149,8 +14208,8 @@ Preserve_trx_promotion_adopt_status run_receiver_staged_token_prewarm_job(
         root_dir, manifest.epoch_id, manifest.token, registry);
   }
   if (receiver_epoch_expired_or_removed(root_dir, registry, manifest)) {
-    purge_receiver_epoch_derived_state(root_dir, manifest.epoch_id,
-                                       manifest.source_server_uuid);
+    purge_receiver_epoch_derived_state(
+        root_dir, manifest.epoch_id, receiver_boot_incarnation());
     return Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY;
   }
   const Preserve_trx_promotion_adopt_status authoritative_status =
@@ -13380,7 +14439,7 @@ static bool run_receiver_object_prewarm_job(
          build_receiver_record_lock_prepared(root_dir, effective_manifest,
                                              payload));
     const bool strict_metadata_only =
-        transfer_manifest_uses_v4_metadata_only_lock_prewarm(
+        transfer_manifest_uses_v1_metadata_only_lock_prewarm(
             effective_manifest);
     if (receiver_object_prewarm_proof_state(key, strict_metadata_only) ==
         Receiver_object_prewarm_proof_state::READY) {
@@ -13501,7 +14560,7 @@ static bool run_receiver_object_prewarm_job(
                                         effective_manifest)) {
     purge_receiver_epoch_derived_state(
         root_dir, effective_manifest.epoch_id,
-        effective_manifest.source_server_uuid);
+        receiver_boot_incarnation());
     return false;
   }
   note_elapsed();
@@ -13594,6 +14653,8 @@ static void run_receiver_committed_epoch_prewarm_job(
     g_receiver_ready_monotonic_us.store(transfer_monotonic_us());
     refresh_receiver_ready_after_final_metadata();
     refresh_receiver_ready_after_final_spool_ack();
+    refresh_receiver_ready_after_final_metadata_accepted();
+    refresh_receiver_ready_after_terminal_commit_admitted();
   }
   if (prewarm_status != Preserve_trx_promotion_adopt_status::OK) {
     /*
@@ -13946,8 +15007,6 @@ preserve_trx_transfer_enqueue_blocked_staged_prewarm_for_unit_test(
   Preserve_trx_transfer_manifest manifest;
   manifest.protocol_version = kPreserveTrxTransferProtocolVersion;
   manifest.epoch_id = "unit-blocked-staged-prewarm";
-  manifest.source_server_uuid = "source-uuid";
-  manifest.target_server_uuid = "target-uuid";
   manifest.token = token;
 
   Preserve_trx_transfer_object_descriptor object;
@@ -13999,7 +15058,7 @@ Preserve_trx_transfer_status enqueue_receiver_prewarm_job(
       !receiver_record_lock_prepared_exists(job.root_dir, job.manifest);
   const bool strict_metadata_only =
       has_object_key && job.object_id == kPreservedTrxBlobRecordLocks &&
-      transfer_manifest_uses_v4_metadata_only_lock_prewarm(job.manifest);
+      transfer_manifest_uses_v1_metadata_only_lock_prewarm(job.manifest);
   {
     std::unique_lock<std::mutex> guard(g_receiver_prewarm_mutex);
     if (job.registry != nullptr &&
@@ -14260,6 +15319,20 @@ void retire_receiver_prewarm_registry(
 Preserve_trx_transfer_receiver_registry::
     ~Preserve_trx_transfer_receiver_registry() {
   retire_receiver_prewarm_registry(this);
+  uint64_t terminal_tombstones = 0;
+  {
+    std::lock_guard<std::mutex> guard(m_mutex);
+    terminal_tombstones =
+        std::count_if(m_acknowledged_epochs.begin(),
+                      m_acknowledged_epochs.end(), [](const auto &item) {
+                        return item.second.terminal_operation !=
+                               Preserve_trx_transfer_epoch_terminal_operation::
+                                   NONE;
+                      });
+  }
+  if (terminal_tombstones != 0) {
+    g_receiver_terminal_status_tombstones.fetch_sub(terminal_tombstones);
+  }
 }
 
 Preserve_trx_transfer_status mark_epoch_records_corrupt(
@@ -14295,7 +15368,7 @@ Preserve_trx_transfer_status cleanup_epoch_transfer_staging(
     erase_receiver_binlog_prepared(root_dir, record.epoch_id, record.token);
     purge_strict_prepared_token_for_receiver(root_dir, record);
     if (registry != nullptr) {
-      registry->erase_strict_v4_token_objects(record.epoch_id, record.token);
+      registry->erase_strict_v1_token_objects(record.epoch_id, record.token);
     }
     const Preserve_trx_transfer_status cleanup_status =
         cleanup_transfer_token_staging(root_dir, record.epoch_id, record.token);
@@ -14318,6 +15391,34 @@ Preserve_trx_transfer_status cleanup_epoch_transfer_staging(
   return first_status;
 }
 
+Preserve_trx_transfer_epoch_terminal_outcome
+preserve_trx_transfer_abandon_receiver_epoch_if_not_committed(
+    const Preserve_trx_transfer_epoch_terminal_request &request,
+    Preserve_trx_transfer_receiver_registry *registry) {
+  if (registry == nullptr) {
+    return Preserve_trx_transfer_epoch_terminal_outcome::CORRUPT;
+  }
+  const Preserve_trx_transfer_epoch_terminal_outcome begin =
+      registry->try_begin_epoch_abandon(request);
+  if (begin !=
+      Preserve_trx_transfer_epoch_terminal_outcome::ABANDONING) {
+    return begin;
+  }
+
+  const std::vector<Preserve_trx_transfer_receiver_record> records =
+      registry->receiving_records_for_epoch(request.epoch_id);
+  purge_receiver_epoch_derived_state(
+      request.root_dir, request.epoch_id, receiver_boot_incarnation());
+  if (cleanup_epoch_transfer_staging(request.root_dir, records, registry) !=
+          Preserve_trx_transfer_status::OK ||
+      remove_receiver_restart_tree(
+          transfer_epoch_dir_for_epoch(request.root_dir, request.epoch_id),
+          0) != Preserve_trx_transfer_status::OK) {
+    return Preserve_trx_transfer_epoch_terminal_outcome::CORRUPT;
+  }
+  return registry->complete_epoch_abandon(request);
+}
+
 Preserve_trx_transfer_status mark_epoch_records_corrupt_and_purge(
     const std::string &root_dir, const std::string &epoch_id,
     Preserve_trx_transfer_receiver_registry *registry,
@@ -14325,9 +15426,8 @@ Preserve_trx_transfer_status mark_epoch_records_corrupt_and_purge(
     const std::string &reason) {
   const Preserve_trx_transfer_status status =
       mark_epoch_records_corrupt(registry, records, reason);
-  const std::string source_uuid =
-      records.empty() ? std::string() : records.front().source_server_uuid;
-  purge_receiver_epoch_derived_state(root_dir, epoch_id, source_uuid);
+  purge_receiver_epoch_derived_state(root_dir, epoch_id,
+                                     receiver_boot_incarnation());
   return status;
 }
 
@@ -14364,27 +15464,12 @@ bool preserve_trx_transfer_epoch_committed(const std::string &root_dir,
       Preserve_trx_transfer_status::OK) {
     return false;
   }
-  const std::string prefix = "PTRXFER_COMMIT\n";
-  if (payload.compare(0, prefix.length(), prefix) != 0) return false;
-  std::vector<std::string> fields;
-  size_t offset = prefix.length();
-  while (offset <= payload.length()) {
-    const size_t next = payload.find('\n', offset);
-    if (next == std::string::npos) return false;
-    fields.push_back(payload.substr(offset, next - offset));
-    offset = next + 1;
-    if (offset == payload.length()) break;
-  }
-  if (fields.size() != 3 || fields[0] != epoch_id ||
-      !transfer_component_safe(fields[1]) || !transfer_component_safe(fields[2])) {
-    return false;
-  }
+  if (payload != "PTRXFER_COMMIT_V1\n" + epoch_id + "\n") return false;
 
   Preserve_trx_transfer_epoch_fact fact;
   return preserve_trx_transfer_read_epoch_fact(root_dir, epoch_id, &fact) ==
              Preserve_trx_transfer_status::OK &&
-         fact.epoch_id == epoch_id && fact.source_server_uuid == fields[1] &&
-         fact.target_server_uuid == fields[2] && !fact.tokens.empty();
+         fact.epoch_id == epoch_id && !fact.tokens.empty();
 }
 
 Preserve_trx_transfer_status preserve_trx_transfer_query_epoch_commit_status(
@@ -14400,7 +15485,23 @@ Preserve_trx_transfer_status preserve_trx_transfer_query_epoch_commit_status(
   if (registry == nullptr) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
-  return registry->query_accepted_epoch(root_dir, epoch_id, accepted);
+  const Preserve_trx_transfer_epoch_terminal_outcome terminal =
+      registry->query_epoch_terminal(root_dir, epoch_id);
+  switch (terminal) {
+    case Preserve_trx_transfer_epoch_terminal_outcome::COMMITTED:
+      if (accepted != nullptr) {
+        (void)registry->query_accepted_epoch(root_dir, epoch_id, accepted);
+      }
+      return Preserve_trx_transfer_status::COMMITTED_NOT_READY;
+    case Preserve_trx_transfer_epoch_terminal_outcome::CORRUPT:
+      return Preserve_trx_transfer_status::COMMITTED_CORRUPT;
+    case Preserve_trx_transfer_epoch_terminal_outcome::NOT_COMMITTED:
+    case Preserve_trx_transfer_epoch_terminal_outcome::ABANDONING:
+    case Preserve_trx_transfer_epoch_terminal_outcome::NOT_COMMITTED_CLEAN:
+    case Preserve_trx_transfer_epoch_terminal_outcome::EPOCH_NOT_FOUND:
+      return Preserve_trx_transfer_status::IO_ERROR;
+  }
+  return Preserve_trx_transfer_status::IO_ERROR;
 }
 
 Preserve_trx_transfer_status preserve_trx_transfer_read_epoch_fact(
@@ -14443,22 +15544,15 @@ preserve_trx_transfer_apply_receiver_frame_internal(
       frame.type == Preserve_trx_transfer_frame_type::PROMOTION_GATE_EPOCH) {
     return Preserve_trx_transfer_status::UNSUPPORTED;
   }
+  if (frame.type == Preserve_trx_transfer_frame_type::OPEN_EPOCH) {
+    return Preserve_trx_transfer_status::UNSUPPORTED;
+  }
 
-  const bool sequence_frame = receiver_frame_should_spool(frame.type);
-  bool sequence_consumed = false;
+  const bool sequence_frame =
+      receiver_frame_is_sequence_tracked(frame.type);
   if (sequence_frame && !g_receiver_frame_sequence_disabled) {
     status = registry->consume_frame_sequence(frame.epoch_id, frame.sequence);
     if (status != Preserve_trx_transfer_status::OK) return status;
-    sequence_consumed = true;
-  }
-
-  if (!g_receiver_frame_spool_disabled && sequence_frame) {
-    status = append_receiver_frame_spool_record(root_dir, frame);
-    if (status != Preserve_trx_transfer_status::OK) {
-      if (sequence_consumed)
-        registry->rollback_frame_sequence(frame.epoch_id, frame.sequence);
-      return status;
-    }
     note_receiver_first_frame_saved();
   }
 
@@ -14467,22 +15561,7 @@ preserve_trx_transfer_apply_receiver_frame_internal(
   }
 
   if (frame.type == Preserve_trx_transfer_frame_type::DECLARE_TOKEN) {
-    std::string source_server_uuid;
-    std::string target_server_uuid;
-    if (!decode_declare_token_reason(frame.reason, &source_server_uuid,
-                                     &target_server_uuid)) {
-      return Preserve_trx_transfer_status::CORRUPT;
-    }
-    Preserve_trx_transfer_manifest manifest;
-    manifest.epoch_id = frame.epoch_id;
-    manifest.token = frame.token;
-    manifest.source_server_uuid = source_server_uuid;
-    manifest.target_server_uuid = target_server_uuid;
-    status =
-        preserve_trx_transfer_validate_receiver_manifest_from_config(manifest);
-    if (status != Preserve_trx_transfer_status::OK) return status;
-    return registry->declare_token(frame.epoch_id, frame.token,
-                                   source_server_uuid, target_server_uuid);
+    return registry->declare_token(frame.epoch_id, frame.token);
   }
 
   if (frame.type == Preserve_trx_transfer_frame_type::DECLARE_OBJECT) {
@@ -14561,8 +15640,8 @@ preserve_trx_transfer_apply_receiver_frame_internal(
     const Preserve_trx_transfer_status mark_status = registry->mark_corrupt(
         frame.epoch_id, frame.token,
         "replacement_object_cleanup_failed:" + transfer_status_name(status));
-    purge_receiver_epoch_derived_state(root_dir, frame.epoch_id,
-                                       existing_record.source_server_uuid);
+    purge_receiver_epoch_derived_state(
+        root_dir, frame.epoch_id, receiver_boot_incarnation());
     return mark_status == Preserve_trx_transfer_status::OK ? status
                                                            : mark_status;
   }
@@ -14633,8 +15712,8 @@ preserve_trx_transfer_apply_receiver_frame_internal(
                   frame.epoch_id, frame.token,
                   "replacement_begin_cleanup_failed:" +
                       transfer_status_name(cleanup_status));
-          purge_receiver_epoch_derived_state(root_dir, frame.epoch_id,
-                                             existing_record.source_server_uuid);
+          purge_receiver_epoch_derived_state(
+              root_dir, frame.epoch_id, receiver_boot_incarnation());
           return mark_status == Preserve_trx_transfer_status::OK
                      ? cleanup_status
                      : mark_status;
@@ -14676,7 +15755,7 @@ preserve_trx_transfer_apply_receiver_frame_internal(
                                             frame.token);
     erase_receiver_binlog_prepared(root_dir, frame.epoch_id, frame.token);
     purge_strict_prepared_token_for_receiver(root_dir, record);
-    registry->erase_strict_v4_token_objects(frame.epoch_id, frame.token);
+    registry->erase_strict_v1_token_objects(frame.epoch_id, frame.token);
     status =
         cleanup_transfer_token_staging(root_dir, frame.epoch_id, frame.token);
     if (status != Preserve_trx_transfer_status::OK) {
@@ -14722,8 +15801,8 @@ preserve_trx_transfer_apply_receiver_frame_internal(
       const Preserve_trx_transfer_object_descriptor *object =
           find_object(manifest, frame.object_id);
       if (object != nullptr &&
-          transfer_object_uses_strict_v4_memory_staging(manifest, *object)) {
-        status = registry->stage_strict_v4_object_chunk(
+          transfer_object_uses_strict_v1_memory_staging(manifest, *object)) {
+        status = registry->stage_strict_v1_object_chunk(
             manifest, frame.object_id, frame.chunk_offset, frame.chunk_payload);
       } else {
         status = preserve_trx_transfer_stage_object_chunk(
@@ -14736,8 +15815,8 @@ preserve_trx_transfer_apply_receiver_frame_internal(
       const Preserve_trx_transfer_object_descriptor *object =
           find_object(manifest, frame.object_id);
       if (object != nullptr &&
-          transfer_object_uses_strict_v4_memory_staging(manifest, *object)) {
-        status = registry->seal_strict_v4_object(manifest, frame.object_id);
+          transfer_object_uses_strict_v1_memory_staging(manifest, *object)) {
+        status = registry->seal_strict_v1_object(manifest, frame.object_id);
       } else {
         status = preserve_trx_transfer_seal_staged_object(
             root_dir, manifest, frame.object_id);
@@ -14844,6 +15923,14 @@ preserve_trx_transfer_apply_receiver_frame_internal(
               &built_fact);
           std::shared_ptr<const Preserve_trx_transfer_epoch_fact> accepted_fact;
           if (status == Preserve_trx_transfer_status::OK) {
+            if ((!frame.receiver_process_nonce.empty() &&
+                 transfer_digest_is_zero(frame.terminal_fact_digest)) ||
+                (!transfer_digest_is_zero(frame.terminal_fact_digest) &&
+                 frame.terminal_fact_digest != built_fact.fact_digest)) {
+              status = Preserve_trx_transfer_status::CORRUPT;
+            }
+          }
+          if (status == Preserve_trx_transfer_status::OK) {
             try {
               accepted_fact =
                   std::make_shared<const Preserve_trx_transfer_epoch_fact>(
@@ -14892,6 +15979,9 @@ preserve_trx_transfer_apply_receiver_frame_internal(
                        ? status
                        : mark_status;
           }
+          g_receiver_terminal_commit_admitted_monotonic_us.store(
+              transfer_monotonic_us());
+          refresh_receiver_ready_after_terminal_commit_admitted();
           if (strict_online_epoch) {
             cache_receiver_epoch_fact(root_dir, accepted_fact);
 #ifndef NDEBUG
@@ -14995,6 +16085,7 @@ preserve_trx_transfer_apply_receiver_frame_internal(
         return Preserve_trx_transfer_status::OK;
       }
       break;
+    case Preserve_trx_transfer_frame_type::OPEN_EPOCH:
     case Preserve_trx_transfer_frame_type::BEGIN:
     case Preserve_trx_transfer_frame_type::ABORT:
     case Preserve_trx_transfer_frame_type::PROMOTION_PREWARM_TOKEN:
@@ -15002,6 +16093,7 @@ preserve_trx_transfer_apply_receiver_frame_internal(
     case Preserve_trx_transfer_frame_type::DECLARE_TOKEN:
     case Preserve_trx_transfer_frame_type::DECLARE_OBJECT:
     case Preserve_trx_transfer_frame_type::QUERY_EPOCH_STATUS:
+    case Preserve_trx_transfer_frame_type::ABANDON_EPOCH_IF_NOT_COMMITTED:
       return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
 
@@ -15011,13 +16103,13 @@ preserve_trx_transfer_apply_receiver_frame_internal(
     const Preserve_trx_transfer_status mark_status =
         registry->mark_corrupt(frame.epoch_id, frame.token, reason);
     if (mark_status != Preserve_trx_transfer_status::OK) return mark_status;
-    purge_receiver_epoch_derived_state(root_dir, frame.epoch_id,
-                                       record.source_server_uuid);
+    purge_receiver_epoch_derived_state(
+        root_dir, frame.epoch_id, receiver_boot_incarnation());
     erase_receiver_strict_record_lock_state(root_dir, frame.epoch_id,
                                             frame.token);
     erase_receiver_binlog_prepared(root_dir, frame.epoch_id, frame.token);
     purge_strict_prepared_token_for_receiver(root_dir, record);
-    registry->erase_strict_v4_token_objects(frame.epoch_id, frame.token);
+    registry->erase_strict_v1_token_objects(frame.epoch_id, frame.token);
     const Preserve_trx_transfer_status cleanup_status =
         cleanup_transfer_token_staging(root_dir, frame.epoch_id, frame.token);
     const bool cleanup_failed =
@@ -15080,7 +16172,6 @@ struct Receiver_payload_batch_apply_context {
   Preserve_snapshot_metadata *written_metadata{nullptr};
   uint64_t timeout_seconds{0};
   bool sequence_pre_admitted{false};
-  bool spool_prehandled{false};
   Preserve_trx_transfer_commit_accepted_callback commit_accepted{nullptr};
   void *commit_accepted_context{nullptr};
 };
@@ -15092,19 +16183,16 @@ static Preserve_trx_transfer_status apply_receiver_payload_batch_frame(
   if (batch_context == nullptr || batch_context->root_dir == nullptr) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
-  const bool sequence_frame = receiver_frame_should_spool(frame.type);
+  const bool sequence_frame =
+      receiver_frame_is_sequence_tracked(frame.type);
   if (sequence_frame && batch_context->registry != nullptr &&
       batch_context->registry->frame_sequence_applied(frame.epoch_id,
                                                       frame.sequence)) {
     return Preserve_trx_transfer_status::OK;
   }
   std::unique_ptr<Receiver_frame_sequence_disable_guard> sequence_guard;
-  std::unique_ptr<Receiver_frame_spool_disable_guard> spool_guard;
   if (batch_context->sequence_pre_admitted) {
     sequence_guard.reset(new Receiver_frame_sequence_disable_guard());
-  }
-  if (batch_context->spool_prehandled) {
-    spool_guard.reset(new Receiver_frame_spool_disable_guard());
   }
   const Preserve_trx_transfer_status status =
       preserve_trx_transfer_apply_receiver_frame_internal(
@@ -15133,76 +16221,17 @@ static Preserve_trx_transfer_status apply_receiver_payload_batch_frame(
   return status;
 }
 
-bool receiver_batch_is_strict_v4_process_local_phase2(
+Preserve_trx_transfer_status pre_admit_receiver_batch_sequence(
     const std::vector<Preserve_trx_transfer_frame> &frames,
     Preserve_trx_transfer_receiver_registry *registry) {
-  if (registry == nullptr) return false;
-
-  std::string epoch_id;
-  bool has_phase2_frame = false;
-  bool has_strict_manifest = false;
-  for (const Preserve_trx_transfer_frame &frame : frames) {
-    if (!receiver_frame_should_spool(frame.type)) continue;
-    if (epoch_id.empty()) epoch_id = frame.epoch_id;
-    if (epoch_id != frame.epoch_id) return false;
-
-    switch (frame.type) {
-      case Preserve_trx_transfer_frame_type::BEGIN: {
-        Preserve_trx_transfer_manifest manifest;
-        if (preserve_trx_transfer_decode_manifest(frame.manifest_payload,
-                                                  &manifest) !=
-                Preserve_trx_transfer_status::OK ||
-            manifest.epoch_id != frame.epoch_id ||
-            manifest.token != frame.token ||
-            !transfer_manifest_uses_strict_metadata_only_prewarm(manifest)) {
-          return false;
-        }
-        has_phase2_frame = true;
-        has_strict_manifest = true;
-        break;
-      }
-      case Preserve_trx_transfer_frame_type::OBJECT_CHUNK:
-      case Preserve_trx_transfer_frame_type::SEAL_OBJECT:
-      case Preserve_trx_transfer_frame_type::COMMIT_EPOCH:
-        has_phase2_frame = true;
-        break;
-      case Preserve_trx_transfer_frame_type::DECLARE_TOKEN:
-      case Preserve_trx_transfer_frame_type::DECLARE_OBJECT:
-      case Preserve_trx_transfer_frame_type::ABORT:
-      case Preserve_trx_transfer_frame_type::PROMOTION_PREWARM_TOKEN:
-      case Preserve_trx_transfer_frame_type::PROMOTION_GATE_EPOCH:
-      case Preserve_trx_transfer_frame_type::QUERY_EPOCH_STATUS:
-        break;
-    }
-  }
-  if (!has_phase2_frame || epoch_id.empty()) return false;
-
-  for (const Preserve_trx_transfer_receiver_record &record :
-       registry->receiving_records_for_epoch(epoch_id)) {
-    if (record.state != Preserve_trx_transfer_receiver_state::RECEIVING) {
-      continue;
-    }
-    if (record.protocol_version != kPreserveTrxTransferProtocolVersion ||
-        (record.strict_eligibility_flags &
-         kPreserveTrxTransferStrictEligibilityKnownFlags) !=
-            kPreserveTrxTransferStrictEligibilityKnownFlags) {
-      return false;
-    }
-    has_strict_manifest = true;
-  }
-  return has_strict_manifest;
-}
-
-Preserve_trx_transfer_status pre_admit_receiver_batch_sequence(
-    const std::string &root_dir,
-    const std::vector<Preserve_trx_transfer_frame> &frames,
-    Preserve_trx_transfer_receiver_registry *registry, bool append_spool) {
-  if (root_dir.empty() || registry == nullptr) {
+  if (registry == nullptr) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
 
   std::vector<Preserve_trx_transfer_frame> newly_admitted_frames;
   newly_admitted_frames.reserve(frames.size());
+  uint64_t newly_admitted_bytes = 0;
+  bool final_metadata_admitted = false;
   auto rollback_new_admissions = [&](Preserve_trx_transfer_status status) {
     if (status == Preserve_trx_transfer_status::CORRUPT) {
       for (const Preserve_trx_transfer_frame &frame : newly_admitted_frames) {
@@ -15217,7 +16246,7 @@ Preserve_trx_transfer_status pre_admit_receiver_batch_sequence(
   };
 
   for (const Preserve_trx_transfer_frame &frame : frames) {
-    if (!receiver_frame_should_spool(frame.type)) continue;
+    if (!receiver_frame_is_sequence_tracked(frame.type)) continue;
 
     std::string encoded_frame;
     Preserve_trx_transfer_status status =
@@ -15234,17 +16263,28 @@ Preserve_trx_transfer_status pre_admit_receiver_batch_sequence(
     }
 
     if (admission == Preserve_trx_transfer_sequence_admission::NEW_FRAME) {
+      if (encoded_frame.size() >
+          std::numeric_limits<uint64_t>::max() - newly_admitted_bytes) {
+        rollback_new_admissions(
+            Preserve_trx_transfer_status::RESOURCE_EXHAUSTED);
+        return Preserve_trx_transfer_status::RESOURCE_EXHAUSTED;
+      }
+      newly_admitted_bytes += encoded_frame.size();
+      final_metadata_admitted =
+          final_metadata_admitted ||
+          frame.type == Preserve_trx_transfer_frame_type::COMMIT_EPOCH;
       newly_admitted_frames.push_back(frame);
     }
   }
-  if (append_spool && !newly_admitted_frames.empty()) {
-    const Preserve_trx_transfer_status status =
-        append_receiver_frame_spool_records(root_dir, newly_admitted_frames);
-    if (status != Preserve_trx_transfer_status::OK) {
-      rollback_new_admissions(status);
-      return status;
-    }
+  if (!newly_admitted_frames.empty()) {
     note_receiver_first_frame_saved();
+    g_receiver_admitted_frames.fetch_add(newly_admitted_frames.size());
+    g_receiver_admitted_bytes.fetch_add(newly_admitted_bytes);
+  }
+  if (final_metadata_admitted) {
+    g_receiver_final_metadata_accepted_monotonic_us.store(
+        transfer_monotonic_us());
+    refresh_receiver_ready_after_final_metadata_accepted();
   }
   return Preserve_trx_transfer_status::OK;
 }
@@ -15385,8 +16425,8 @@ Preserve_trx_transfer_status preserve_trx_transfer_handle_receiver_payload_batch
     Preserved_trx_store *store, Preserve_trx_transfer_receiver_registry *registry,
     uint64_t timeout_seconds, uint worker_count,
     Preserve_snapshot_metadata *written_metadata,
-    Preserve_trx_transfer_after_spool_callback after_spool,
-    void *after_spool_context,
+    Preserve_trx_transfer_after_admission_callback after_admission,
+    void *after_admission_context,
     Preserve_trx_transfer_commit_accepted_callback commit_accepted,
     void *commit_accepted_context) {
   if (root_dir.empty() || store == nullptr || registry == nullptr ||
@@ -15459,7 +16499,7 @@ Preserve_trx_transfer_status preserve_trx_transfer_handle_receiver_payload_batch
   uint64_t last_sequence = 0;
   std::set<uint64_t> payload_apply_tokens;
   for (const Preserve_trx_transfer_frame &frame : frames) {
-    if (!receiver_frame_should_spool(frame.type)) continue;
+    if (!receiver_frame_is_sequence_tracked(frame.type)) continue;
     if (payload_epoch.empty()) payload_epoch = frame.epoch_id;
     if (payload_epoch != frame.epoch_id) {
       return Preserve_trx_transfer_status::CORRUPT;
@@ -15490,10 +16530,8 @@ Preserve_trx_transfer_status preserve_trx_transfer_handle_receiver_payload_batch
       registry->end_payload_sequence(payload_epoch);
     }
   });
-  const bool process_local_phase2 =
-      receiver_batch_is_strict_v4_process_local_phase2(frames, registry);
   Preserve_trx_transfer_status status = pre_admit_receiver_batch_sequence(
-      root_dir, frames, registry, !process_local_phase2);
+      frames, registry);
   if (status != Preserve_trx_transfer_status::OK) return status;
   Preserve_trx_transfer_payload_apply_reservation apply_reservation;
   bool apply_reserved = false;
@@ -15520,8 +16558,9 @@ Preserve_trx_transfer_status preserve_trx_transfer_handle_receiver_payload_batch
         payload_epoch, first_sequence - 1, payload_timeout_ms);
     if (status != Preserve_trx_transfer_status::OK) return status;
   }
-  if (after_spool != nullptr) {
-    status = after_spool(after_spool_context, contains_commit_epoch);
+  if (after_admission != nullptr) {
+    status =
+        after_admission(after_admission_context, contains_commit_epoch);
     if (status != Preserve_trx_transfer_status::OK) return status;
   }
   bool apply_owner = true;
@@ -15543,7 +16582,6 @@ Preserve_trx_transfer_status preserve_trx_transfer_handle_receiver_payload_batch
   context.written_metadata = written_metadata;
   context.timeout_seconds = timeout_seconds;
   context.sequence_pre_admitted = true;
-  context.spool_prehandled = true;
   context.commit_accepted = commit_accepted;
   context.commit_accepted_context = commit_accepted_context;
   status = preserve_trx_transfer_apply_receiver_frame_batch_with_workers(
@@ -15593,35 +16631,48 @@ preserve_trx_transfer_apply_receiver_frame_batch_with_workers(
   return flush_segment();
 }
 
-struct Receiver_spool_write_ack_context {
+struct Receiver_admission_ack_context {
   THD *thd{nullptr};
   const std::string *encoded_payload{nullptr};
   std::string root_dir;
+  uint64_t accepted_terminal_status_retention_us{0};
   bool ack_sent{false};
   bool commit_ack_pending{false};
 };
 
-bool source_incarnation_from_epoch(const std::string &epoch_id,
-                                   std::string *incarnation) {
-  if (incarnation == nullptr || epoch_id.length() <= 33 || epoch_id[32] != '-') {
+bool transfer_authenticated_principal(THD *thd, std::string *principal) {
+  if (thd == nullptr || principal == nullptr ||
+      thd->security_context() == nullptr) {
     return false;
   }
-  const std::string candidate = epoch_id.substr(0, 32);
-  for (char value : candidate) {
-    if (!((value >= '0' && value <= '9') ||
-          (value >= 'a' && value <= 'f'))) {
-      return false;
-    }
+  const LEX_CSTRING user = thd->security_context()->priv_user();
+  const LEX_CSTRING host = thd->security_context()->priv_host();
+  if (user.str == nullptr || user.length == 0 || host.str == nullptr ||
+      host.length == 0) {
+    return false;
   }
-  *incarnation = candidate;
+  try {
+    principal->clear();
+    principal->reserve(user.length + host.length + 48);
+    principal->append(std::to_string(user.length));
+    principal->push_back(':');
+    principal->append(user.str, user.length);
+    principal->push_back('|');
+    principal->append(std::to_string(host.length));
+    principal->push_back(':');
+    principal->append(host.str, host.length);
+  } catch (...) {
+    principal->clear();
+    return false;
+  }
   return true;
 }
 
 Preserve_trx_transfer_status
 preserve_trx_transfer_validate_online_payload_identity(
-    const std::string &encoded_payload, std::string *source_incarnation_id,
+    const std::string &encoded_payload, std::string *receiver_process_nonce,
     std::string *epoch_id, uint64_t *last_sequence) {
-  if (source_incarnation_id == nullptr || epoch_id == nullptr ||
+  if (receiver_process_nonce == nullptr || epoch_id == nullptr ||
       last_sequence == nullptr) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
@@ -15630,18 +16681,45 @@ preserve_trx_transfer_validate_online_payload_identity(
   Preserve_trx_transfer_status status = transfer_payload_identity(
       encoded_payload, &parsed_epoch, &parsed_sequence);
   if (status != Preserve_trx_transfer_status::OK) return status;
-  std::string parsed_incarnation;
-  if (!source_incarnation_from_epoch(parsed_epoch, &parsed_incarnation)) {
-    return Preserve_trx_transfer_status::CORRUPT;
+
+  std::vector<std::string> encoded_frames;
+  if (transfer_frame_batch_magic_matches(encoded_payload)) {
+    status =
+        preserve_trx_transfer_decode_frame_batch(encoded_payload,
+                                                 &encoded_frames);
+    if (status != Preserve_trx_transfer_status::OK) return status;
+  } else {
+    encoded_frames.push_back(encoded_payload);
   }
-  *source_incarnation_id = std::move(parsed_incarnation);
+  std::string parsed_nonce;
+  for (const std::string &encoded_frame : encoded_frames) {
+    Preserve_trx_transfer_frame frame;
+    status = preserve_trx_transfer_decode_frame(encoded_frame, &frame);
+    if (status != Preserve_trx_transfer_status::OK) return status;
+    if (frame.type == Preserve_trx_transfer_frame_type::OPEN_EPOCH) {
+      if (encoded_frames.size() != 1 || !frame.receiver_process_nonce.empty()) {
+        return Preserve_trx_transfer_status::CORRUPT;
+      }
+      continue;
+    }
+    if (frame.receiver_process_nonce.length() != 32 ||
+        !transfer_component_safe(frame.receiver_process_nonce)) {
+      return Preserve_trx_transfer_status::CORRUPT;
+    }
+    if (parsed_nonce.empty()) {
+      parsed_nonce = frame.receiver_process_nonce;
+    } else if (parsed_nonce != frame.receiver_process_nonce) {
+      return Preserve_trx_transfer_status::CORRUPT;
+    }
+  }
+  *receiver_process_nonce = std::move(parsed_nonce);
   *epoch_id = std::move(parsed_epoch);
   *last_sequence = parsed_sequence;
   return Preserve_trx_transfer_status::OK;
 }
 
 static Preserve_trx_transfer_status send_receiver_authenticated_ack(
-    Receiver_spool_write_ack_context *ack_context,
+    Receiver_admission_ack_context *ack_context,
     Preserve_trx_transfer_status ack_status, bool acknowledge_epoch) {
   if (ack_context == nullptr || ack_context->thd == nullptr) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
@@ -15659,15 +16737,18 @@ static Preserve_trx_transfer_status send_receiver_authenticated_ack(
   Preserve_trx_transfer_status status = transfer_payload_identity(
       *ack_context->encoded_payload, &epoch_id, &sequence);
   if (status != Preserve_trx_transfer_status::OK) return status;
-  std::string source_incarnation_id;
-  if (!source_incarnation_from_epoch(epoch_id, &source_incarnation_id)) {
-    return Preserve_trx_transfer_status::CORRUPT;
-  }
   Preserve_trx_transfer_frame_ack ack;
   status = preserve_trx_transfer_build_frame_ack(
-      source_incarnation_id, *ack_context->encoded_payload,
+      receiver_boot_incarnation(), *ack_context->encoded_payload,
       ack_status, &ack);
   if (status != Preserve_trx_transfer_status::OK) return status;
+  if (ack.sequence == 0) {
+    if (ack_context->accepted_terminal_status_retention_us == 0) {
+      return Preserve_trx_transfer_status::CORRUPT;
+    }
+    ack.accepted_terminal_status_retention_us =
+        ack_context->accepted_terminal_status_retention_us;
+  }
   std::string encoded_ack;
   status = preserve_trx_transfer_encode_frame_ack(ack, &encoded_ack);
   if (status != Preserve_trx_transfer_status::OK) return status;
@@ -15682,15 +16763,14 @@ static Preserve_trx_transfer_status send_receiver_authenticated_ack(
     const uint64_t ack_us = transfer_monotonic_us();
     g_receiver_final_spool_ack_monotonic_us.store(ack_us);
     refresh_receiver_ready_after_final_spool_ack();
-    static constexpr uint64_t kReceiverRetryHistoryGraceUs = 60000000;
     const Preserve_trx_transfer_status cleanup_status =
         default_receiver_registry().acknowledge_epoch(
             ack_context->root_dir, epoch_id, ack_us,
-            kReceiverRetryHistoryGraceUs);
+            ack_context->accepted_terminal_status_retention_us);
     if (cleanup_status != Preserve_trx_transfer_status::OK) {
       const std::string message =
-          "PRESERVE: receiver acknowledged epoch but frame spool cleanup "
-          "requires retry epoch=" +
+          "PRESERVE: receiver acknowledged epoch but terminal retention "
+          "registration failed epoch=" +
           epoch_id + " status=" + transfer_status_name(cleanup_status);
       LogErr(WARNING_LEVEL, ER_LOG_PRINTF_MSG, message.c_str());
     }
@@ -15698,9 +16778,9 @@ static Preserve_trx_transfer_status send_receiver_authenticated_ack(
   return Preserve_trx_transfer_status::OK;
 }
 
-static Preserve_trx_transfer_status send_receiver_spool_write_ack(
+static Preserve_trx_transfer_status send_receiver_admission_ack(
     void *context, bool contains_commit_epoch) {
-  auto *ack_context = static_cast<Receiver_spool_write_ack_context *>(context);
+  auto *ack_context = static_cast<Receiver_admission_ack_context *>(context);
   if (ack_context == nullptr) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
@@ -15715,7 +16795,7 @@ static Preserve_trx_transfer_status send_receiver_spool_write_ack(
 static Preserve_trx_transfer_status send_receiver_commit_accepted_ack(
     void *context, const std::string &epoch_id,
     Preserve_trx_transfer_status committed_status) {
-  auto *ack_context = static_cast<Receiver_spool_write_ack_context *>(context);
+  auto *ack_context = static_cast<Receiver_admission_ack_context *>(context);
   if (ack_context == nullptr || epoch_id.empty() ||
       !transfer_status_is_committed_outcome(committed_status)) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
@@ -15773,66 +16853,179 @@ void preserve_trx_transfer_dispatch_command(THD *thd) {
         identity_decode_status == Preserve_trx_transfer_status::OK;
     validate_online_identity =
         identity_frame_decoded &&
-        (receiver_frame_should_spool(identity_frame.type) ||
+        (receiver_frame_is_sequence_tracked(identity_frame.type) ||
          identity_frame.type ==
-             Preserve_trx_transfer_frame_type::QUERY_EPOCH_STATUS);
+             Preserve_trx_transfer_frame_type::QUERY_EPOCH_STATUS ||
+         identity_frame.type ==
+             Preserve_trx_transfer_frame_type::
+                 ABANDON_EPOCH_IF_NOT_COMMITTED);
+  }
+  std::string authenticated_principal;
+  if (!transfer_authenticated_principal(thd, &authenticated_principal)) {
+    signal_transfer_dispatch_error(
+        thd, Preserve_trx_transfer_status::UNSUPPORTED);
+    return;
+  }
+  const std::string preserve_dir = transfer_default_preserve_dir();
+  Receiver_admission_ack_context ack_context;
+  ack_context.thd = thd;
+  ack_context.encoded_payload = &encoded_frame;
+  ack_context.root_dir = preserve_dir;
+  if (identity_frame_decoded &&
+      identity_frame.type == Preserve_trx_transfer_frame_type::OPEN_EPOCH) {
+    Preserve_trx_transfer_status open_status =
+        default_receiver_registry().open_online_epoch(
+            identity_frame.epoch_id, authenticated_principal,
+            identity_frame.requested_terminal_status_retention_us,
+            receiver_boot_incarnation(),
+            &ack_context.accepted_terminal_status_retention_us);
+    if (open_status == Preserve_trx_transfer_status::OK) {
+      open_status = send_receiver_authenticated_ack(
+          &ack_context, Preserve_trx_transfer_status::OK, false);
+    }
+    if (open_status != Preserve_trx_transfer_status::OK) {
+      signal_transfer_dispatch_error(thd, open_status);
+    }
+    return;
   }
   if (validate_online_identity) {
-    std::string source_incarnation_id;
+    std::string receiver_process_nonce;
     std::string epoch_id;
     uint64_t last_sequence = 0;
-    const Preserve_trx_transfer_status identity_status =
+    Preserve_trx_transfer_status identity_status =
         preserve_trx_transfer_validate_online_payload_identity(
-            encoded_frame, &source_incarnation_id, &epoch_id,
+            encoded_frame, &receiver_process_nonce, &epoch_id,
             &last_sequence);
+    const bool terminal_query =
+        identity_frame_decoded &&
+        identity_frame.type ==
+            Preserve_trx_transfer_frame_type::QUERY_EPOCH_STATUS;
+    const bool terminal_abandon =
+        identity_frame_decoded &&
+        identity_frame.type ==
+            Preserve_trx_transfer_frame_type::
+                ABANDON_EPOCH_IF_NOT_COMMITTED;
+    if (identity_status == Preserve_trx_transfer_status::OK &&
+        terminal_query) {
+      Preserve_trx_transfer_epoch_terminal_status terminal;
+      identity_status =
+          default_receiver_registry().query_epoch_terminal_authenticated(
+              preserve_dir, epoch_id, authenticated_principal,
+              receiver_process_nonce, identity_frame.terminal_fact_digest,
+              &terminal);
+      if (identity_status == Preserve_trx_transfer_status::OK) {
+        Preserve_trx_transfer_status query_status =
+            Preserve_trx_transfer_status::IO_ERROR;
+        switch (terminal.outcome) {
+          case Preserve_trx_transfer_epoch_terminal_outcome::COMMITTED:
+            query_status = Preserve_trx_transfer_status::COMMITTED_NOT_READY;
+            break;
+          case Preserve_trx_transfer_epoch_terminal_outcome::CORRUPT:
+            query_status = Preserve_trx_transfer_status::COMMITTED_CORRUPT;
+            break;
+          case Preserve_trx_transfer_epoch_terminal_outcome::NOT_COMMITTED:
+          case Preserve_trx_transfer_epoch_terminal_outcome::ABANDONING:
+            query_status = Preserve_trx_transfer_status::NOT_COMMITTED;
+            break;
+          case Preserve_trx_transfer_epoch_terminal_outcome::
+              NOT_COMMITTED_CLEAN:
+            query_status =
+                Preserve_trx_transfer_status::NOT_COMMITTED_CLEAN;
+            break;
+          case Preserve_trx_transfer_epoch_terminal_outcome::EPOCH_NOT_FOUND:
+            break;
+        }
+        if (!transfer_status_has_authenticated_ack(query_status)) {
+          signal_transfer_dispatch_error(thd, query_status);
+          return;
+        }
+        const Preserve_trx_transfer_status ack_status =
+            send_receiver_authenticated_ack(&ack_context, query_status, false);
+        if (ack_status != Preserve_trx_transfer_status::OK) {
+          signal_transfer_dispatch_error(thd, ack_status);
+        }
+        return;
+      }
+    } else if (identity_status == Preserve_trx_transfer_status::OK &&
+               terminal_abandon) {
+      identity_status = default_receiver_registry().validate_online_epoch(
+          epoch_id, authenticated_principal, receiver_process_nonce,
+          &ack_context.accepted_terminal_status_retention_us);
+      if (identity_status == Preserve_trx_transfer_status::OK) {
+        Preserve_trx_transfer_epoch_terminal_request request;
+        request.root_dir = preserve_dir;
+        request.epoch_id = epoch_id;
+        request.receiver_process_generation = receiver_process_nonce;
+        request.authenticated_principal = authenticated_principal;
+        request.operation_id = "abandon-v1";
+        request.fact_digest = identity_frame.terminal_fact_digest;
+        request.now_us = transfer_monotonic_us();
+        request.retention_us =
+            ack_context.accepted_terminal_status_retention_us;
+        const Preserve_trx_transfer_epoch_terminal_outcome outcome =
+            preserve_trx_transfer_abandon_receiver_epoch_if_not_committed(
+                request, &default_receiver_registry());
+        Preserve_trx_transfer_status abandon_status =
+            Preserve_trx_transfer_status::IO_ERROR;
+        switch (outcome) {
+          case Preserve_trx_transfer_epoch_terminal_outcome::COMMITTED:
+            abandon_status =
+                Preserve_trx_transfer_status::COMMITTED_NOT_READY;
+            break;
+          case Preserve_trx_transfer_epoch_terminal_outcome::
+              NOT_COMMITTED_CLEAN:
+            abandon_status =
+                Preserve_trx_transfer_status::NOT_COMMITTED_CLEAN;
+            break;
+          case Preserve_trx_transfer_epoch_terminal_outcome::CORRUPT:
+            abandon_status = Preserve_trx_transfer_status::CORRUPT;
+            break;
+          case Preserve_trx_transfer_epoch_terminal_outcome::NOT_COMMITTED:
+          case Preserve_trx_transfer_epoch_terminal_outcome::ABANDONING:
+          case Preserve_trx_transfer_epoch_terminal_outcome::EPOCH_NOT_FOUND:
+            break;
+        }
+        if (transfer_status_has_authenticated_ack(abandon_status)) {
+          const Preserve_trx_transfer_status ack_status =
+              send_receiver_authenticated_ack(&ack_context, abandon_status,
+                                              false);
+          if (ack_status != Preserve_trx_transfer_status::OK) {
+            signal_transfer_dispatch_error(thd, ack_status);
+          }
+          return;
+        }
+        identity_status = abandon_status;
+      }
+    } else if (identity_status == Preserve_trx_transfer_status::OK) {
+      identity_status = default_receiver_registry().validate_online_epoch(
+          epoch_id, authenticated_principal, receiver_process_nonce,
+          &ack_context.accepted_terminal_status_retention_us);
+    }
     if (identity_status != Preserve_trx_transfer_status::OK) {
       signal_transfer_dispatch_error(thd, identity_status);
       return;
     }
   }
-
-  const std::string preserve_dir = transfer_default_preserve_dir();
   auto store = create_preserved_trx_process_local_store(preserve_dir);
-  Receiver_spool_write_ack_context ack_context;
-  ack_context.thd = thd;
-  ack_context.encoded_payload = &encoded_frame;
-  ack_context.root_dir = preserve_dir;
-  if (identity_frame_decoded &&
-      identity_frame.type ==
-          Preserve_trx_transfer_frame_type::QUERY_EPOCH_STATUS) {
-    const Preserve_trx_transfer_status query_status =
-        preserve_trx_transfer_query_epoch_commit_status(
-            preserve_dir, identity_frame.epoch_id);
-    if (!transfer_status_is_committed_outcome(query_status)) {
-      signal_transfer_dispatch_error(thd, query_status);
-      return;
-    }
-    const Preserve_trx_transfer_status ack_status =
-        send_receiver_authenticated_ack(&ack_context, query_status, true);
-    if (ack_status != Preserve_trx_transfer_status::OK) {
-      signal_transfer_dispatch_error(thd, ack_status);
-    }
-    return;
-  }
   Preserve_trx_transfer_status status = Preserve_trx_transfer_status::OK;
   if (transfer_frame_batch_magic_matches(encoded_frame)) {
     status = preserve_trx_transfer_handle_receiver_payload_batch(
         preserve_dir, std::vector<std::string>{encoded_frame}, &store.store(),
         &default_receiver_registry(), transfer_commit_timeout_seconds(),
         preserve_trx_transfer_receiver_workers, nullptr,
-        send_receiver_spool_write_ack, &ack_context,
+        send_receiver_admission_ack, &ack_context,
         send_receiver_commit_accepted_ack, &ack_context);
   } else {
     Preserve_trx_transfer_frame decoded_frame;
     const Preserve_trx_transfer_status decode_status =
         preserve_trx_transfer_decode_frame(encoded_frame, &decoded_frame);
     if (decode_status == Preserve_trx_transfer_status::OK &&
-        receiver_frame_should_spool(decoded_frame.type)) {
+        receiver_frame_is_sequence_tracked(decoded_frame.type)) {
       status = preserve_trx_transfer_handle_receiver_payload_batch(
           preserve_dir, std::vector<std::string>{encoded_frame}, &store.store(),
           &default_receiver_registry(), transfer_commit_timeout_seconds(),
           preserve_trx_transfer_receiver_workers, nullptr,
-          send_receiver_spool_write_ack, &ack_context,
+          send_receiver_admission_ack, &ack_context,
           send_receiver_commit_accepted_ack, &ack_context);
     } else {
       status = decode_status;
@@ -15901,15 +17094,13 @@ Preserve_snapshot_status Preserve_trx_local_carrier_artifact_sink::publish_bundl
 }
 
 Preserve_snapshot_status preserve_trx_transfer_capture_deferred_candidate(
-    const std::string &epoch_id, const std::string &source_server_uuid,
-    const std::string &target_server_uuid, uint64_t transfer_token,
+    const std::string &epoch_id, uint64_t transfer_token,
     Preserved_trx_bundle bundle, uint64_t timeout_seconds,
     const Preserve_trx_resurrection_index_entry *resurrection_entry,
     Preserve_trx_deferred_transfer_candidate *candidate,
     Preserve_snapshot_metadata *written_metadata) {
   if (candidate == nullptr || candidate->captured || transfer_token == 0 ||
-      timeout_seconds == 0 || epoch_id.empty() || source_server_uuid.empty() ||
-      target_server_uuid.empty()) {
+      timeout_seconds == 0 || epoch_id.empty()) {
     return Preserve_snapshot_status::INVALID_ARGUMENT;
   }
   if (!preserve_trx_is_enabled()) return Preserve_snapshot_status::UNSUPPORTED;
@@ -15926,8 +17117,6 @@ Preserve_snapshot_status preserve_trx_transfer_capture_deferred_candidate(
       created_at_us + timeout_seconds * kMicrosecondsPerSecond;
 
   candidate->epoch_id = epoch_id;
-  candidate->source_server_uuid = source_server_uuid;
-  candidate->target_server_uuid = target_server_uuid;
   candidate->transfer_token = transfer_token;
   candidate->timeout_seconds = timeout_seconds;
   candidate->bundle = std::move(bundle);
@@ -15977,8 +17166,8 @@ Preserve_snapshot_status Preserve_trx_transfer_artifact_sink::publish_bundle(
   const Preserve_snapshot_metadata metadata = bundle.metadata;
   const Preserve_trx_transfer_status status =
       preserve_trx_transfer_send_bundle_frames(
-          m_epoch_id, m_source_server_uuid, m_target_server_uuid, bundle,
-          m_transfer_token, m_chunk_bytes, m_frame_sink, nullptr,
+          m_epoch_id, bundle, m_transfer_token, m_chunk_bytes, m_frame_sink,
+          nullptr,
           m_has_resurrection_entry ? &m_resurrection_entry : nullptr);
   if (status != Preserve_trx_transfer_status::OK) {
     const std::string message =
@@ -16063,9 +17252,8 @@ Preserve_trx_transfer_session_artifact_sink::publish_bundle(
   std::string publish_object_id;
   Preserve_trx_transfer_status status =
       preserve_trx_transfer_build_portable_objects_impl(
-          m_session->epoch_id(), m_session->source_server_uuid(),
-          m_session->target_server_uuid(), bundle, m_transfer_token, &manifest,
-          &objects, &presealed_external_objects,
+          m_session->epoch_id(), bundle, m_transfer_token, &manifest, &objects,
+          &presealed_external_objects,
           m_has_resurrection_entry ? &m_resurrection_entry : nullptr);
   if (status == Preserve_trx_transfer_status::OK) {
     publish_step = "send_token_objects_batch";
@@ -16106,8 +17294,7 @@ Preserve_trx_standby_pending_artifact_sink::publish_bundle(
 
 Preserve_snapshot_status preserve_trx_make_artifact_sink_for_decision(
     Preserve_trx_transfer_artifact_decision decision, Preserved_trx_store *store,
-    const std::string &epoch_id, const std::string &source_server_uuid,
-    const std::string &target_server_uuid, uint64_t transfer_token,
+    const std::string &epoch_id, uint64_t transfer_token,
     uint32_t chunk_bytes, Preserve_trx_transfer_encoded_frame_sink *frame_sink,
     std::unique_ptr<Preserve_trx_artifact_sink> *sink,
     Preserve_trx_transfer_source_epoch_session *source_epoch_session,
@@ -16132,13 +17319,12 @@ Preserve_snapshot_status preserve_trx_make_artifact_sink_for_decision(
         return Preserve_snapshot_status::OK;
       }
       if (frame_sink == nullptr || transfer_token == 0 || epoch_id.empty() ||
-          source_server_uuid.empty() || target_server_uuid.empty() ||
           chunk_bytes == 0) {
         return Preserve_snapshot_status::INVALID_ARGUMENT;
       }
       sink->reset(new Preserve_trx_transfer_artifact_sink(
-          epoch_id, source_server_uuid, target_server_uuid, transfer_token,
-          chunk_bytes, frame_sink, preserve_dir, resurrection_entry));
+          epoch_id, transfer_token, chunk_bytes, frame_sink, preserve_dir,
+          resurrection_entry));
       return Preserve_snapshot_status::OK;
     case Preserve_trx_transfer_artifact_decision::UNSUPPORTED:
       return Preserve_snapshot_status::UNSUPPORTED;

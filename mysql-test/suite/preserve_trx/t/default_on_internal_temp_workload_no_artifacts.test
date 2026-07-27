@@ -67,7 +67,7 @@ my @artifacts;
 if (-d $dir) {
   opendir(my $dh, $dir) or die "cannot open preserve dir: $!";
   while (defined(my $entry = readdir($dh))) {
-    next if $entry eq '.' || $entry eq '..' || $entry eq '.key';
+    next if $entry eq '.' || $entry eq '..';
     push @artifacts, $entry;
   }
   closedir($dh);

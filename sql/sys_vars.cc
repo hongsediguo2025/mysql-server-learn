@@ -1461,20 +1461,6 @@ static Sys_var_bool Sys_preserve_trx_transfer_receiver_enable(
     DEFAULT(false), NO_MUTEX_GUARD, NOT_IN_BINLOG,
     ON_CHECK(check_preserve_trx_transfer_receiver_enable));
 
-static Sys_var_charptr Sys_preserve_trx_transfer_allowed_source_uuid(
-    "preserve_trx_transfer_allowed_source_uuid",
-    "Source server UUID accepted by the Preserve/Resume standby "
-    "direct-transfer receiver. An empty value rejects receiver manifests.",
-    READ_ONLY GLOBAL_VAR(preserve_trx_transfer_allowed_source_uuid),
-    CMD_LINE(REQUIRED_ARG), IN_SYSTEM_CHARSET, DEFAULT(""));
-
-static Sys_var_charptr Sys_preserve_trx_transfer_target_server_uuid(
-    "preserve_trx_transfer_target_server_uuid",
-    "Target server UUID expected by the Preserve/Resume standby "
-    "direct-transfer receiver. An empty value rejects receiver manifests.",
-    READ_ONLY GLOBAL_VAR(preserve_trx_transfer_target_server_uuid),
-    CMD_LINE(REQUIRED_ARG), IN_SYSTEM_CHARSET, DEFAULT(""));
-
 static Sys_var_charptr Sys_preserve_trx_transfer_target_host(
     "preserve_trx_transfer_target_host",
     "Host name or address used by Preserve/Resume standby direct-transfer "
@@ -1515,9 +1501,9 @@ static Sys_var_charptr Sys_preserve_trx_transfer_credential_name(
 static Sys_var_charptr Sys_preserve_trx_transfer_credential_secret_file(
     "preserve_trx_transfer_credential_secret_file",
     "Path to a local file containing the Preserve/Resume standby "
-    "direct-transfer credential secret. The path is read by source background "
-    "sessions and receiver codec code when no in-memory credential store entry "
-    "is available.",
+    "direct-transfer credential secret. The path is read only by source "
+    "background sessions when no in-memory credential store entry is "
+    "available.",
     READ_ONLY GLOBAL_VAR(preserve_trx_transfer_credential_secret_file),
     CMD_LINE(REQUIRED_ARG), IN_FS_CHARSET, DEFAULT(""));
 

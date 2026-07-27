@@ -41,8 +41,8 @@ LOG = logging.getLogger("resumable_trx_business_e2e")
 
 WARMCOPY_TAIL_BUDGET_BYTES = 1024 * 1024
 COM_PRESERVE_TRX_TRANSFER = 33
-TRANSFER_FRAME_MAGIC = b"PTRXFRM1"
-TRANSFER_PROTOCOL_VERSION = 4
+TRANSFER_FRAME_MAGIC = b"PTRXOFR1"
+TRANSFER_PROTOCOL_VERSION = 1
 MAX_TRANSFER_FRAME_STRING_BYTES = 1024 * 1024
 FULL_LOCK_HEAVY_MIN_RECORD_LOCK_PAGES = 2000
 FULL_LOCK_HEAVY_MIN_PHASE2_RECORD_LOCKS = 1000000
@@ -348,6 +348,7 @@ def annotate_record_lock_import_report(
 
 
 class TransferFrameType(enum.IntEnum):
+    OPEN_EPOCH = 11
     BEGIN = 1
     OBJECT_CHUNK = 2
     SEAL_OBJECT = 3
@@ -370,31 +371,51 @@ def encode_transfer_frame(
     sequence: int,
     epoch_id: str,
     token: int = 0,
+    receiver_process_nonce: str = "",
     object_id: str = "",
     chunk_offset: int = 0,
+    source_trx_id_store: int = 0,
+    source_trx_id_store_lsn: int = 0,
+    source_safe_next_trx_id_floor: int = 0,
+    requested_terminal_status_retention_us: int = 0,
     manifest_payload: str = "",
     chunk_payload: str = "",
     reason: str = "",
 ) -> bytes:
     if not epoch_id:
         raise ValueError("epoch_id is required")
-    if frame_type != TransferFrameType.PROMOTION_GATE_EPOCH and token == 0:
+    if frame_type not in (
+        TransferFrameType.OPEN_EPOCH,
+        TransferFrameType.PROMOTION_GATE_EPOCH,
+    ) and token == 0:
         raise ValueError("token is required for this transfer frame")
-    return b"".join(
+    payload = b"".join(
+        [
+            _transfer_string_payload(manifest_payload),
+            _transfer_string_payload(chunk_payload),
+            _transfer_string_payload(reason),
+        ]
+    )
+    control = b"".join(
         [
             TRANSFER_FRAME_MAGIC,
             struct.pack("<H", TRANSFER_PROTOCOL_VERSION),
             struct.pack("<H", int(frame_type)),
             struct.pack("<Q", sequence),
             _transfer_string_payload(epoch_id),
+            _transfer_string_payload(receiver_process_nonce),
             struct.pack("<Q", token),
             _transfer_string_payload(object_id),
             struct.pack("<Q", chunk_offset),
-            _transfer_string_payload(manifest_payload),
-            _transfer_string_payload(chunk_payload),
-            _transfer_string_payload(reason),
+            struct.pack("<Q", source_trx_id_store),
+            struct.pack("<Q", source_trx_id_store_lsn),
+            struct.pack("<Q", source_safe_next_trx_id_floor),
+            struct.pack("<Q", requested_terminal_status_retention_us),
+            struct.pack("<Q", len(payload)),
+            hashlib.sha256(payload).digest(),
         ]
     )
+    return control + struct.pack("<I", zlib.crc32(control) & 0xFFFFFFFF) + payload
 
 
 def encode_promotion_prewarm_frame(
@@ -1323,6 +1344,17 @@ class ReceiverPrewarmMetrics:
     seal_prewarm_success_tokens: int
     seal_prewarm_not_ready_tokens: int
     seal_prewarm_last_status: int
+    final_metadata_accepted_monotonic_us: int = 0
+    terminal_commit_admitted_monotonic_us: int = 0
+    ready_after_final_metadata_accepted_us: int = 0
+    ready_after_terminal_commit_admitted_us: int = 0
+    admitted_frames: int = 0
+    admitted_bytes: int = 0
+    terminal_cas_wins: int = 0
+    terminal_cas_duplicates: int = 0
+    terminal_cas_conflicts: int = 0
+    terminal_status_tombstones: int = 0
+    terminal_status_tombstone_expiries: int = 0
     lock_plan_capacity_bytes: int = 0
     lock_plan_epoch_peak_bytes: int = 0
     lock_plan_subpool_cap_bytes: int = 0
@@ -1373,6 +1405,17 @@ class ReceiverPrewarmMetrics:
     strict_record_index_page_reads: int = 0
     strict_ibuf_merges: int = 0
     strict_target_local_redo_bytes: int = 0
+
+
+@dataclasses.dataclass(frozen=True)
+class SourceTransferOwnershipMetrics:
+    handoff_pending_epochs: int
+    commit_unknown_epochs: int
+    restore_guard_rejects: int
+    quarantine_epochs: int
+    quarantine_tokens: int
+    quarantine_bytes: int
+    quarantine_oldest_age_us: int
 
 
 class WorkloadPlan:
@@ -1909,7 +1952,9 @@ WHERE n < {row_count}
         if not buckets or self.config.large_binlog_cache_sessions <= 0:
             self._effective_large_buckets_mb = buckets
             return buckets
-        disk_usage_path = self.large_cache_disk_usage_path()
+        disk_usage_path = self.existing_disk_usage_path(
+            self.large_cache_disk_usage_path()
+        )
         free_bytes = shutil.disk_usage(disk_usage_path).free
         usable_bytes = (free_bytes * 9) // 10
         retained_cycle_count = (
@@ -5451,6 +5496,9 @@ class BusinessE2ERunner:
         self.promotion_sql_resume_elapsed_samples_us: List[int] = []
         self.promotion_gate_server_metrics: List[PromotionGateMetrics] = []
         self.receiver_prewarm_metrics: Optional[ReceiverPrewarmMetrics] = None
+        self.source_transfer_ownership_metrics: Optional[
+            SourceTransferOwnershipMetrics
+        ] = None
         self.post_resume_temp_dml_executed = False
         self.shutdown_gap_replay_samples: List[Dict[str, object]] = []
         self.resume_token_elapsed_samples_us: List[int] = []
@@ -5755,6 +5803,9 @@ class BusinessE2ERunner:
                     timeout_s=self.config.resume_timeout_s,
                     connection_factory=self._receiver_admin_connection,
                 )
+            self.source_transfer_ownership_metrics = (
+                self.read_source_transfer_ownership_metrics_from_status()
+            )
             self.runtime.wait_until_down(self.config.shutdown_timeout_s)
             if source_tiered_load_probe is not None:
                 self.source_tiered_load_report = (
@@ -6809,15 +6860,9 @@ class BusinessE2ERunner:
         self.config.source_start_command = add_secret_file(
             self.config.source_start_command, self.config.source_datadir,
             "source")
-        self.config.receiver_start_command = add_secret_file(
-            self.config.receiver_start_command, self.config.receiver_datadir,
-            "receiver")
         self.config.restart_command = add_secret_file(
             self.config.restart_command, self.config.source_datadir,
             "source")
-        self.config.receiver_restart_command = add_secret_file(
-            self.config.receiver_restart_command, self.config.receiver_datadir,
-            "receiver")
 
     def start_source_server_if_configured(self) -> None:
         if not self.config.source_start_command:
@@ -7551,6 +7596,9 @@ class BusinessE2ERunner:
             or self.receiver_preserve_artifact_counts()
         )
         receiver_prewarm_metrics = getattr(self, "receiver_prewarm_metrics", None)
+        source_ownership_metrics = getattr(
+            self, "source_transfer_ownership_metrics", None
+        )
         source_phase2_end_us = self.latest_source_phase2_end_monotonic_us()
         receiver_object_prewarm_phase1_overlap = (
             None
@@ -7934,6 +7982,101 @@ class BusinessE2ERunner:
                 None
                 if receiver_prewarm_metrics is None
                 else receiver_prewarm_metrics.ready_after_final_metadata_us
+            ),
+            "receiver_ready_monotonic_us": (
+                None
+                if receiver_prewarm_metrics is None
+                else receiver_prewarm_metrics.ready_monotonic_us
+            ),
+            "receiver_final_metadata_accepted_monotonic_us": (
+                None
+                if receiver_prewarm_metrics is None
+                else receiver_prewarm_metrics.final_metadata_accepted_monotonic_us
+            ),
+            "receiver_terminal_commit_admitted_monotonic_us": (
+                None
+                if receiver_prewarm_metrics is None
+                else receiver_prewarm_metrics.terminal_commit_admitted_monotonic_us
+            ),
+            "receiver_ready_after_final_metadata_accepted_us": (
+                None
+                if receiver_prewarm_metrics is None
+                else receiver_prewarm_metrics.ready_after_final_metadata_accepted_us
+            ),
+            "receiver_ready_after_terminal_commit_admitted_us": (
+                None
+                if receiver_prewarm_metrics is None
+                else receiver_prewarm_metrics.ready_after_terminal_commit_admitted_us
+            ),
+            "receiver_admitted_frames": (
+                None
+                if receiver_prewarm_metrics is None
+                else receiver_prewarm_metrics.admitted_frames
+            ),
+            "receiver_admitted_bytes": (
+                None
+                if receiver_prewarm_metrics is None
+                else receiver_prewarm_metrics.admitted_bytes
+            ),
+            "receiver_terminal_cas_wins": (
+                None
+                if receiver_prewarm_metrics is None
+                else receiver_prewarm_metrics.terminal_cas_wins
+            ),
+            "receiver_terminal_cas_duplicates": (
+                None
+                if receiver_prewarm_metrics is None
+                else receiver_prewarm_metrics.terminal_cas_duplicates
+            ),
+            "receiver_terminal_cas_conflicts": (
+                None
+                if receiver_prewarm_metrics is None
+                else receiver_prewarm_metrics.terminal_cas_conflicts
+            ),
+            "receiver_terminal_status_tombstones": (
+                None
+                if receiver_prewarm_metrics is None
+                else receiver_prewarm_metrics.terminal_status_tombstones
+            ),
+            "receiver_terminal_status_tombstone_expiries": (
+                None
+                if receiver_prewarm_metrics is None
+                else receiver_prewarm_metrics.terminal_status_tombstone_expiries
+            ),
+            "source_handoff_pending_epochs": (
+                None
+                if source_ownership_metrics is None
+                else source_ownership_metrics.handoff_pending_epochs
+            ),
+            "source_commit_unknown_epochs": (
+                None
+                if source_ownership_metrics is None
+                else source_ownership_metrics.commit_unknown_epochs
+            ),
+            "source_restore_guard_rejects": (
+                None
+                if source_ownership_metrics is None
+                else source_ownership_metrics.restore_guard_rejects
+            ),
+            "quarantine_epochs": (
+                None
+                if source_ownership_metrics is None
+                else source_ownership_metrics.quarantine_epochs
+            ),
+            "quarantine_tokens": (
+                None
+                if source_ownership_metrics is None
+                else source_ownership_metrics.quarantine_tokens
+            ),
+            "quarantine_bytes": (
+                None
+                if source_ownership_metrics is None
+                else source_ownership_metrics.quarantine_bytes
+            ),
+            "quarantine_oldest_age_us": (
+                None
+                if source_ownership_metrics is None
+                else source_ownership_metrics.quarantine_oldest_age_us
             ),
             "receiver_final_spool_ack_monotonic_us": (
                 None
@@ -9214,29 +9357,6 @@ END
                     receiver_conn,
                     f"GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.* TO {account}",
                 )
-            rows = self.runtime.execute(
-                receiver_conn,
-                "SELECT "
-                "@@global.preserve_trx_transfer_credential_name, "
-                "@@global.preserve_trx_transfer_target_user",
-                fetch=True,
-            )
-            credential_name = "" if not rows else str(rows[0][0] or "")
-            target_user = "" if not rows else str(rows[0][1] or "")
-            if (
-                credential_name != self.config.standby_transfer_credential_name
-                or target_user != self.config.standby_transfer_user
-            ):
-                raise AssertionError(
-                    "receiver transfer codec configuration is incomplete: "
-                    "start the receiver mysqld with "
-                    f"--preserve-trx-transfer-credential-name="
-                    f"{self.config.standby_transfer_credential_name} and "
-                    f"--preserve-trx-transfer-target-user="
-                    f"{self.config.standby_transfer_user}; "
-                    f"observed credential_name={credential_name!r} "
-                    f"target_user={target_user!r}"
-                )
         finally:
             receiver_conn.close()
 
@@ -9422,66 +9542,71 @@ END
         try:
             source_rows = self.runtime.execute(
                 source_conn,
-                "SELECT @@global.server_uuid, "
-                "@@global.preserve_trx_transfer_target_server_uuid, "
-                "@@global.preserve_trx_transfer_artifact_mode",
+                "SELECT @@global.preserve_trx_transfer_artifact_mode, "
+                "@@global.preserve_trx_transfer_target_host, "
+                "@@global.preserve_trx_transfer_target_port, "
+                "@@global.preserve_trx_transfer_target_socket, "
+                "@@global.preserve_trx_transfer_target_user, "
+                "@@global.preserve_trx_transfer_credential_name",
                 fetch=True,
             )
             receiver_rows = self.runtime.execute(
                 receiver_conn,
-                "SELECT @@global.server_uuid, "
-                "@@global.preserve_trx_transfer_target_server_uuid, "
-                "@@global.preserve_trx_transfer_allowed_source_uuid, "
-                "@@global.preserve_trx_transfer_credential_name, "
-                "@@global.preserve_trx_transfer_target_user, "
+                "SELECT @@global.preserve_trx_transfer_receiver_enable, "
                 "@@global.preserve_trx_dir",
                 fetch=True,
             )
             if not source_rows or not receiver_rows:
                 raise AssertionError(
-                    "standby transfer endpoint UUID configuration is unavailable"
+                    "standby transfer endpoint configuration is unavailable"
                 )
-            source_uuid = str(source_rows[0][0] or "")
-            source_target_uuid = str(source_rows[0][1] or "")
-            source_artifact_mode = str(source_rows[0][2] or "")
-            receiver_uuid = str(receiver_rows[0][0] or "")
-            receiver_target_uuid = str(receiver_rows[0][1] or "")
-            receiver_allowed_source_uuid = str(receiver_rows[0][2] or "")
-            receiver_credential_name = str(receiver_rows[0][3] or "")
-            receiver_target_user = str(receiver_rows[0][4] or "")
-            receiver_preserve_dir = str(receiver_rows[0][5] or "")
+            source_artifact_mode = str(source_rows[0][0] or "")
+            source_target_host = str(source_rows[0][1] or "")
+            source_target_port = int(source_rows[0][2] or 0)
+            source_target_socket = str(source_rows[0][3] or "")
+            source_target_user = str(source_rows[0][4] or "")
+            source_credential_name = str(source_rows[0][5] or "")
+            receiver_enabled = bool(int(receiver_rows[0][0] or 0))
+            receiver_preserve_dir = str(receiver_rows[0][1] or "")
             mismatches = []
-            if source_target_uuid != receiver_uuid:
-                mismatches.append(
-                    f"source target uuid {source_target_uuid!r} != "
-                    f"receiver server_uuid {receiver_uuid!r}"
-                )
             if source_artifact_mode != "STANDBY_TRANSFER_SAVE":
                 mismatches.append(
                     f"source artifact mode {source_artifact_mode!r} != "
                     "'STANDBY_TRANSFER_SAVE'"
                 )
-            if receiver_target_uuid != receiver_uuid:
+            if self.config.receiver_unix_socket:
+                if (
+                    source_target_socket != self.config.receiver_unix_socket
+                    or source_target_host
+                    or source_target_port
+                ):
+                    mismatches.append(
+                        "source target endpoint does not match receiver unix "
+                        f"socket {self.config.receiver_unix_socket!r}"
+                    )
+            elif (
+                source_target_host != self.config.receiver_host
+                or source_target_port != self.config.receiver_port
+                or source_target_socket
+            ):
                 mismatches.append(
-                    f"receiver configured target uuid {receiver_target_uuid!r} "
-                    f"!= receiver server_uuid {receiver_uuid!r}"
+                    "source target endpoint does not match receiver TCP "
+                    f"{self.config.receiver_host!r}:{self.config.receiver_port}"
                 )
-            if receiver_allowed_source_uuid != source_uuid:
+            if source_credential_name != self.config.standby_transfer_credential_name:
                 mismatches.append(
-                    f"receiver allowed source uuid "
-                    f"{receiver_allowed_source_uuid!r} != source server_uuid "
-                    f"{source_uuid!r}"
-                )
-            if receiver_credential_name != self.config.standby_transfer_credential_name:
-                mismatches.append(
-                    f"receiver credential name {receiver_credential_name!r} "
+                    f"source credential name {source_credential_name!r} "
                     f"!= expected "
                     f"{self.config.standby_transfer_credential_name!r}"
                 )
-            if receiver_target_user != self.config.standby_transfer_user:
+            if source_target_user != self.config.standby_transfer_user:
                 mismatches.append(
-                    f"receiver transfer target user {receiver_target_user!r} "
+                    f"source transfer target user {source_target_user!r} "
                     f"!= expected {self.config.standby_transfer_user!r}"
+                )
+            if not receiver_enabled:
+                mismatches.append(
+                    "receiver transfer endpoint is disabled"
                 )
             configured_receiver_preserve_dir = str(
                 Path(self.config.receiver_preserve_dir or "")
@@ -9499,7 +9624,7 @@ END
                 )
             if mismatches:
                 raise AssertionError(
-                    "standby transfer endpoint UUID configuration is inconsistent: "
+                    "standby transfer endpoint configuration is inconsistent: "
                     + "; ".join(mismatches)
                 )
         finally:
@@ -11007,6 +11132,17 @@ END
             "Preserve_trx_transfer_receiver_prewarm_end_monotonic_us",
             "Preserve_trx_transfer_receiver_prewarm_start_monotonic_us",
             "Preserve_trx_transfer_receiver_ready_monotonic_us",
+            "Preserve_trx_transfer_recv_final_metadata_accepted_mono_us",
+            "Preserve_trx_transfer_recv_terminal_commit_admitted_mono_us",
+            "Preserve_trx_transfer_recv_ready_after_final_metadata_us",
+            "Preserve_trx_transfer_recv_ready_after_terminal_commit_us",
+            "Preserve_trx_transfer_receiver_admitted_frames",
+            "Preserve_trx_transfer_receiver_admitted_bytes",
+            "Preserve_trx_transfer_receiver_terminal_cas_wins",
+            "Preserve_trx_transfer_receiver_terminal_cas_duplicates",
+            "Preserve_trx_transfer_receiver_terminal_cas_conflicts",
+            "Preserve_trx_transfer_receiver_terminal_status_tombstones",
+            "Preserve_trx_transfer_recv_terminal_tombstone_expiries",
             "Preserve_trx_promotion_prewarm_record_lock_cold_page_gets",
             "Preserve_trx_promotion_prewarm_record_lock_page_count",
             "Preserve_trx_promotion_prewarm_record_lock_resident_pages",
@@ -11112,6 +11248,39 @@ END
                 ),
                 ready_monotonic_us=metric(
                     "Preserve_trx_transfer_receiver_ready_monotonic_us"
+                ),
+                final_metadata_accepted_monotonic_us=metric(
+                    "Preserve_trx_transfer_recv_final_metadata_accepted_mono_us"
+                ),
+                terminal_commit_admitted_monotonic_us=metric(
+                    "Preserve_trx_transfer_recv_terminal_commit_admitted_mono_us"
+                ),
+                ready_after_final_metadata_accepted_us=metric(
+                    "Preserve_trx_transfer_recv_ready_after_final_metadata_us"
+                ),
+                ready_after_terminal_commit_admitted_us=metric(
+                    "Preserve_trx_transfer_recv_ready_after_terminal_commit_us"
+                ),
+                admitted_frames=metric(
+                    "Preserve_trx_transfer_receiver_admitted_frames"
+                ),
+                admitted_bytes=metric(
+                    "Preserve_trx_transfer_receiver_admitted_bytes"
+                ),
+                terminal_cas_wins=metric(
+                    "Preserve_trx_transfer_receiver_terminal_cas_wins"
+                ),
+                terminal_cas_duplicates=metric(
+                    "Preserve_trx_transfer_receiver_terminal_cas_duplicates"
+                ),
+                terminal_cas_conflicts=metric(
+                    "Preserve_trx_transfer_receiver_terminal_cas_conflicts"
+                ),
+                terminal_status_tombstones=metric(
+                    "Preserve_trx_transfer_receiver_terminal_status_tombstones"
+                ),
+                terminal_status_tombstone_expiries=metric(
+                    "Preserve_trx_transfer_recv_terminal_tombstone_expiries"
                 ),
                 first_frame_monotonic_us=metric(
                     "Preserve_trx_transfer_receiver_first_frame_monotonic_us"
@@ -11298,6 +11467,77 @@ END
                 ),
             )
         except ValueError:
+            return None
+
+    def read_source_transfer_ownership_metrics_from_status(
+        self,
+        *,
+        connection_factory: Optional[Callable[[], object]] = None,
+    ) -> Optional[SourceTransferOwnershipMetrics]:
+        fields = {
+            "Preserve_trx_transfer_source_handoff_pending_epochs",
+            "Preserve_trx_transfer_source_commit_unknown_epochs",
+            "Preserve_trx_transfer_source_restore_guard_rejects",
+            "Preserve_trx_transfer_quarantine_epochs",
+            "Preserve_trx_transfer_quarantine_tokens",
+            "Preserve_trx_transfer_quarantine_bytes",
+            "Preserve_trx_transfer_quarantine_oldest_age_us",
+        }
+        quoted_fields = ", ".join(f"'{field}'" for field in sorted(fields))
+        sql = (
+            "SELECT VARIABLE_NAME, VARIABLE_VALUE "
+            "FROM performance_schema.global_status "
+            f"WHERE VARIABLE_NAME IN ({quoted_fields})"
+        )
+        conn = None
+        try:
+            if connection_factory is None:
+                connection_factory = lambda: self.runtime.connect(database=False)
+            conn = connection_factory()
+            rows = self.runtime.execute(conn, sql, fetch=True)
+        except BaseException:
+            return None
+        finally:
+            if conn is not None:
+                conn.close()
+        values: Dict[str, str] = {}
+        try:
+            result_rows = iter(rows)
+        except TypeError:
+            return None
+        for row in result_rows:
+            if len(row) != 2:
+                return None
+            name, value = row
+            values[str(name)] = str(value)
+        if any(field not in values for field in fields):
+            return None
+
+        try:
+            return SourceTransferOwnershipMetrics(
+                handoff_pending_epochs=int(
+                    values["Preserve_trx_transfer_source_handoff_pending_epochs"]
+                ),
+                commit_unknown_epochs=int(
+                    values["Preserve_trx_transfer_source_commit_unknown_epochs"]
+                ),
+                restore_guard_rejects=int(
+                    values["Preserve_trx_transfer_source_restore_guard_rejects"]
+                ),
+                quarantine_epochs=int(
+                    values["Preserve_trx_transfer_quarantine_epochs"]
+                ),
+                quarantine_tokens=int(
+                    values["Preserve_trx_transfer_quarantine_tokens"]
+                ),
+                quarantine_bytes=int(
+                    values["Preserve_trx_transfer_quarantine_bytes"]
+                ),
+                quarantine_oldest_age_us=int(
+                    values["Preserve_trx_transfer_quarantine_oldest_age_us"]
+                ),
+            )
+        except (TypeError, ValueError):
             return None
 
     def read_latest_startup_recovery_metrics_since(
