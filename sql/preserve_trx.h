@@ -305,6 +305,14 @@ enum class Preserve_trx_reset_drain_result : uint8_t {
   UNSUPPORTED
 };
 
+/*
+  Request reset of the active DRAIN from a trusted in-process HA coordinator.
+  When wait_for_runnable is true, a successful call returns only after the
+  affected source transactions are runnable again.
+*/
+Preserve_trx_reset_drain_result preserve_trx_request_active_drain_reset(
+    bool wait_for_runnable);
+
 enum class Preserve_trx_drain_terminal : uint8_t {
   RUNNING,
   FINAL_METADATA_ACCEPTED_LOCAL,

@@ -23117,6 +23117,14 @@ TEST(PreservedTrxDrainHandoff,
   EXPECT_FALSE(ownership.restore_allowed());
 }
 
+TEST(PreservedTrxDrainResetApi, PublicHeaderExposesStableSignature) {
+  using Request_active_drain_reset =
+      Preserve_trx_reset_drain_result (*)(bool);
+  Request_active_drain_reset request =
+      &preserve_trx_request_active_drain_reset;
+  EXPECT_NE(nullptr, request);
+}
+
 TEST(PreservedTrxDrainHandoff,
      ResetAndFirstCommitSendHaveOnlyOneWinner) {
   Preserve_trx_drain_ownership_state reset_wins;

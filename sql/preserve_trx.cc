@@ -1002,7 +1002,7 @@ void preserve_trx_mark_active_drain_reset_failed(
     attempt->reset_failed.store(true, std::memory_order_release);
 }
 
-Preserve_trx_reset_drain_result preserve_trx_request_active_drain_reset(
+Preserve_trx_reset_drain_result preserve_trx_request_active_drain_reset_impl(
     bool wait_for_runnable) {
   const std::shared_ptr<Preserve_trx_drain_attempt> attempt =
       preserve_trx_active_drain_attempt_snapshot();
@@ -9638,6 +9638,11 @@ class Temp_table_phase1_drain_participant final
 };
 
 }  // namespace
+
+Preserve_trx_reset_drain_result preserve_trx_request_active_drain_reset(
+    bool wait_for_runnable) {
+  return preserve_trx_request_active_drain_reset_impl(wait_for_runnable);
+}
 
 bool preserved_trx_register_physical_resurrection_candidates(
     const std::vector<Preserve_trx_resurrection_index_entry> &entries) {
