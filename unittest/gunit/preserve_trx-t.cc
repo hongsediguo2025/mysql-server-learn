@@ -6057,20 +6057,18 @@ TEST(PreservedTrxTransfer,
   guard.tcp("127.0.0.1", 3307, "transfer_user", "");
   auto reset = create_scope_guard(
       [] { preserve_trx_transfer_reset_runtime_password_for_unit_test(); });
-  const Preserve_trx_ha_control_capability capability =
-      preserve_trx_transfer_make_ha_control_capability_for_unit_test();
   const unsigned char password[] = "runtime-secret";
 
   EXPECT_EQ(Preserve_trx_transfer_artifact_decision::UNSUPPORTED,
             preserve_trx_transfer_artifact_decision());
   ASSERT_EQ(Preserve_trx_transfer_password_status::OK,
             preserved_trx_transfer_set_runtime_password(
-                capability, password, sizeof(password) - 1));
+                password, sizeof(password) - 1));
   EXPECT_EQ(Preserve_trx_transfer_artifact_decision::STANDBY_TRANSFER_SAVE,
             preserve_trx_transfer_artifact_decision());
 
   ASSERT_EQ(Preserve_trx_transfer_password_status::OK,
-            preserved_trx_transfer_clear_runtime_password(capability));
+            preserved_trx_transfer_clear_runtime_password());
   EXPECT_EQ(Preserve_trx_transfer_artifact_decision::UNSUPPORTED,
             preserve_trx_transfer_artifact_decision());
 }
@@ -6505,11 +6503,8 @@ class Transfer_client_ops_guard {
  public:
   explicit Transfer_client_ops_guard(Fake_transfer_client_state *state)
       : m_state(state) {
-    const Preserve_trx_ha_control_capability capability =
-        preserve_trx_transfer_make_ha_control_capability_for_unit_test();
     EXPECT_EQ(Preserve_trx_transfer_password_status::OK,
               preserved_trx_transfer_set_runtime_password(
-                  capability,
                   pointer_cast<const unsigned char *>("unit-transfer-secret"),
                   strlen("unit-transfer-secret")));
     g_fake_transfer_client_state = state;
@@ -6602,11 +6597,8 @@ class Blocking_transfer_client_ops_guard {
  public:
   explicit Blocking_transfer_client_ops_guard(
       Blocking_transfer_client_state *state) {
-    const Preserve_trx_ha_control_capability capability =
-        preserve_trx_transfer_make_ha_control_capability_for_unit_test();
     EXPECT_EQ(Preserve_trx_transfer_password_status::OK,
               preserved_trx_transfer_set_runtime_password(
-                  capability,
                   pointer_cast<const unsigned char *>("unit-transfer-secret"),
                   strlen("unit-transfer-secret")));
     g_blocking_transfer_client_state = state;
@@ -6916,44 +6908,36 @@ TEST(PreservedTrxTransfer, ConfiguredFrameSinkUsesClientOpsByDefault) {
   EXPECT_EQ(1, client_state.disconnect_count);
 }
 
-TEST(PreservedTrxTransfer, RuntimePasswordRejectsInvalidCallerAndInput) {
+TEST(PreservedTrxTransfer, RuntimePasswordRejectsInvalidInputAndWrongRole) {
   Transfer_source_config_guard config;
   config.tcp("127.0.0.1", 3307, "transfer_user",
              "transfer_credential");
   auto reset = create_scope_guard(
       [] { preserve_trx_transfer_reset_runtime_password_for_unit_test(); });
-  const Preserve_trx_ha_control_capability capability =
-      preserve_trx_transfer_make_ha_control_capability_for_unit_test();
   const unsigned char valid_password[] = "runtime-secret";
 
-  EXPECT_EQ(Preserve_trx_transfer_password_status::UNAUTHORIZED,
-            preserved_trx_transfer_set_runtime_password(
-                Preserve_trx_ha_control_capability(), valid_password,
-                sizeof(valid_password) - 1));
   EXPECT_EQ(Preserve_trx_transfer_password_status::INVALID_ARGUMENT,
-            preserved_trx_transfer_set_runtime_password(capability, nullptr,
-                                                        1));
+            preserved_trx_transfer_set_runtime_password(nullptr, 1));
   EXPECT_EQ(Preserve_trx_transfer_password_status::INVALID_ARGUMENT,
-            preserved_trx_transfer_set_runtime_password(capability,
-                                                        valid_password, 0));
+            preserved_trx_transfer_set_runtime_password(valid_password, 0));
   std::array<unsigned char, 257> oversized{};
   EXPECT_EQ(Preserve_trx_transfer_password_status::INVALID_ARGUMENT,
             preserved_trx_transfer_set_runtime_password(
-                capability, oversized.data(), oversized.size()));
+                oversized.data(), oversized.size()));
   const unsigned char embedded_nul[] = {'a', '\0', 'b'};
   EXPECT_EQ(Preserve_trx_transfer_password_status::INVALID_ARGUMENT,
             preserved_trx_transfer_set_runtime_password(
-                capability, embedded_nul, sizeof(embedded_nul)));
+                embedded_nul, sizeof(embedded_nul)));
 
   preserve_trx_set_enable_value(false);
   EXPECT_EQ(Preserve_trx_transfer_password_status::FEATURE_DISABLED,
             preserved_trx_transfer_set_runtime_password(
-                capability, valid_password, sizeof(valid_password) - 1));
+                valid_password, sizeof(valid_password) - 1));
   preserve_trx_set_enable_value(true);
   preserve_trx_transfer_receiver_enable = true;
   EXPECT_EQ(Preserve_trx_transfer_password_status::WRONG_ROLE,
             preserved_trx_transfer_set_runtime_password(
-                capability, valid_password, sizeof(valid_password) - 1));
+                valid_password, sizeof(valid_password) - 1));
 }
 
 TEST(PreservedTrxTransfer,
@@ -6963,13 +6947,9 @@ TEST(PreservedTrxTransfer,
              "transfer_credential");
   Fake_transfer_client_state client_state;
   Transfer_client_ops_guard client_ops(&client_state);
-  const Preserve_trx_ha_control_capability capability =
-      preserve_trx_transfer_make_ha_control_capability_for_unit_test();
-
   std::string password_a = "epoch-password-a";
   ASSERT_EQ(Preserve_trx_transfer_password_status::OK,
             preserved_trx_transfer_set_runtime_password(
-                capability,
                 pointer_cast<const unsigned char *>(password_a.data()),
                 password_a.size()));
   std::unique_ptr<Preserve_trx_transfer_encoded_frame_sink> sink_a;
@@ -6980,7 +6960,6 @@ TEST(PreservedTrxTransfer,
   const std::string password_b = "epoch-password-b";
   ASSERT_EQ(Preserve_trx_transfer_password_status::OK,
             preserved_trx_transfer_set_runtime_password(
-                capability,
                 pointer_cast<const unsigned char *>(password_b.data()),
                 password_b.size()));
   std::unique_ptr<Preserve_trx_transfer_encoded_frame_sink> sink_b;
@@ -7001,7 +6980,7 @@ TEST(PreservedTrxTransfer,
   EXPECT_EQ(password_b, client_state.passwords[2]);
 
   ASSERT_EQ(Preserve_trx_transfer_password_status::OK,
-            preserved_trx_transfer_clear_runtime_password(capability));
+            preserved_trx_transfer_clear_runtime_password());
   std::unique_ptr<Preserve_trx_transfer_encoded_frame_sink> sink_after_clear;
   EXPECT_EQ(Preserve_trx_transfer_status::UNSUPPORTED,
             preserve_trx_transfer_make_configured_frame_sink(

@@ -99,9 +99,9 @@ HA 选择唯一 receiver
   `allowed_source_uuid` 路由参数及 wire 字段已经删除；
 - receiver 使用 MySQL 已认证 principal、receiver process nonce、epoch id 和
   token 绑定当前在线进程内状态；physical-fence lineage UUID 不在删除范围；
-- 已提供 capability-gated 的 source-only runtime password setter/clear API。
-  每次 DRAIN 创建 transfer epoch 时冻结 immutable password snapshot，后续
-  setter 只影响下一次 DRAIN；
+- 已提供参数仅为密码的 source-only runtime password setter/clear API。调用
+  权限由未来物理备机 HA SQL 和 MySQL 原生授权负责；每次 DRAIN 创建 transfer
+  epoch 时冻结 immutable password snapshot，后续 setter 只影响下一次 DRAIN；
 - 当前仓库仍没有外部 HA SQL/caller 可以在 release E2E 中调用 runtime setter。
   因此 source 侧暂时保留 `credential_name` /
   `credential_secret_file` fallback；该路径是明确的
@@ -167,7 +167,7 @@ GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.*
 
 | 入口 | 文件 | 当前作用 |
 |---|---|---|
-| `preserved_trx_transfer_set_runtime_password()` | `sql/preserve_trx_transfer.cc` | capability-gated 更新下一 epoch 的 source runtime slot |
+| `preserved_trx_transfer_set_runtime_password()` | `sql/preserve_trx_transfer.cc` | 校验 source role 和密码参数后更新下一 epoch 的 runtime slot |
 | `snapshot_transfer_epoch_credential()` | `sql/preserve_trx_transfer.cc` | 创建 sink 时冻结本次 epoch 的用户名、plugin 和 password snapshot |
 | `read_transfer_credential_secret_file()` | `sql/preserve_trx_transfer.cc` | 外部 HA caller 接入前，校验并读取 source 过渡密码文件 |
 | `resolve_transfer_credential()` | `sql/preserve_trx_transfer.cc` | source 过渡路径先查 `Rpl_channel_credentials`，再回退 secret file |
@@ -588,19 +588,16 @@ provider。因此可以实现和测试状态机核心，但 production outcome �
 
 本节接口已经在当前源码中实现，但 production HA SQL/caller 尚未接入。该接口
 只存在于 source；receiver 继续使用 MySQL 原生账号认证，不调用 Preserve
-runtime-password setter。当前仓库只能通过 GUnit 验证 capability、set/clear
-和 epoch snapshot；release E2E 在外部 caller 接入前仍使用并标记
+runtime-password setter。当前仓库只能通过 GUnit 验证 set/clear 和 epoch
+snapshot；release E2E 在外部 caller 接入前仍使用并标记
 `TRANSITIONAL_SECRET_FILE`。
 
 目标内部接口冻结为：
 
 ```cpp
-class Preserve_trx_ha_control_capability;
-
 enum class Preserve_trx_transfer_password_status {
   OK,
   INVALID_ARGUMENT,
-  UNAUTHORIZED,
   WRONG_ROLE,
   FEATURE_DISABLED,
   RESOURCE_EXHAUSTED
@@ -608,12 +605,10 @@ enum class Preserve_trx_transfer_password_status {
 
 Preserve_trx_transfer_password_status
 preserved_trx_transfer_set_runtime_password(
-    const Preserve_trx_ha_control_capability &capability,
     const unsigned char *password, size_t password_length);
 
 Preserve_trx_transfer_password_status
-preserved_trx_transfer_clear_runtime_password(
-    const Preserve_trx_ha_control_capability &capability);
+preserved_trx_transfer_clear_runtime_password();
 ```
 
 接口合同：
@@ -633,14 +628,10 @@ preserved_trx_transfer_clear_runtime_password(
   的 password snapshot；
 - clear 只清空 global slot，使后续 DRAIN 在创建 epoch 前 fail closed；
 - mysqld 重启后密码为空，HA 必须重新注入。
-- capability 的 production issuance 只能由未来 HA 集成层提供；普通 SQL、
-  UDF、用户连接和已支持的 plugin API 都不能取得有效实例。GUnit factory 只有
-  friend 声明，定义只存在于测试 binary，并由 source-shape lint 禁止在
-  `sql/storage/plugin/components/router` 生产目录定义或调用；
-- capability 是进程内源码/API 纪律，不是抵御恶意 native extension 的安全
-  沙箱。能够在 mysqld 地址空间执行任意 C++、伪造内部类型或绕过 ABI 的代码
-  已属于受信任部署边界；网络和 SQL 调用权限仍由未来 HA SQL 及 MySQL 原生
-  连接授权承担；
+- runtime password API 是供未来物理备机 HA SQL 执行体调用的内部 C++ 接口，
+  不重复携带 HA capability。SQL 权限、调用身份和链路安全由该 HA SQL 及 MySQL
+  原生授权承担；本仓库不把该内部函数注册为普通用户可直接调用的 SQL、UDF、
+  plugin 或 component service；
 - Preserve 未启用、artifact mode 不是 `STANDBY_TRANSFER_SAVE` 或本机不是
   source role 时，setter/clear 必须在分配密码内存前拒绝；
 - 可观测性只暴露 runtime password 是否已设置，以及 set/clear/snapshot
@@ -1711,8 +1702,8 @@ promotion/fence lineage UUID 不能复用或降级为 online routing identity。
   必须在 source-shape allowlist 中；
 - transfer `MYSQL` handle 必须显式关闭 libmysql automatic reconnect，所有
   重连只走 epoch transport context；
-- runtime password setter 仅能由具备 HA 内部 capability 的入口调用，普通
-  SQL 用户不可构造；
+- runtime password setter 仅由未来物理备机 HA 专用 SQL 执行体调用；普通 SQL
+  用户不能直接访问该内部 C++ 接口；
 - 本仓库不声明一个不存在的 runtime-password SQL；外部入口未接入时，对应
   runtime E2E 必须显示 `HA_BLOCKED`；
 - 未设置密码时 transfer fail closed；

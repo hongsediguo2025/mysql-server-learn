@@ -12644,11 +12644,7 @@ bool Preserve_trx_handoff_resolution_state::matches_context(
 
 Preserve_trx_transfer_password_status
 preserved_trx_transfer_set_runtime_password(
-    const Preserve_trx_ha_control_capability &capability,
     const unsigned char *password, size_t password_length) {
-  if (!capability.valid()) {
-    return Preserve_trx_transfer_password_status::UNAUTHORIZED;
-  }
   const Preserve_trx_transfer_password_status role_status =
       transfer_runtime_password_role_status();
   if (role_status != Preserve_trx_transfer_password_status::OK) {
@@ -12678,11 +12674,7 @@ preserved_trx_transfer_set_runtime_password(
 }
 
 Preserve_trx_transfer_password_status
-preserved_trx_transfer_clear_runtime_password(
-    const Preserve_trx_ha_control_capability &capability) {
-  if (!capability.valid()) {
-    return Preserve_trx_transfer_password_status::UNAUTHORIZED;
-  }
+preserved_trx_transfer_clear_runtime_password() {
   const Preserve_trx_transfer_password_status role_status =
       transfer_runtime_password_role_status();
   if (role_status != Preserve_trx_transfer_password_status::OK) {

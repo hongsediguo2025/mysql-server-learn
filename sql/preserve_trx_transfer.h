@@ -276,7 +276,6 @@ enum class Preserve_trx_transfer_status {
 enum class Preserve_trx_transfer_password_status {
   OK = 0,
   INVALID_ARGUMENT,
-  UNAUTHORIZED,
   WRONG_ROLE,
   FEATURE_DISABLED,
   RESOURCE_EXHAUSTED
@@ -316,13 +315,6 @@ class Preserve_trx_ha_control_capability {
 
   uint64_t m_role_generation{0};
 
-  friend Preserve_trx_transfer_password_status
-  preserved_trx_transfer_set_runtime_password(
-      const Preserve_trx_ha_control_capability &, const unsigned char *,
-      size_t);
-  friend Preserve_trx_transfer_password_status
-  preserved_trx_transfer_clear_runtime_password(
-      const Preserve_trx_ha_control_capability &);
   friend class Preserve_trx_handoff_resolution_state;
   friend Preserve_trx_transfer_status preserved_trx_resolve_handoff_unknown(
       const Preserve_trx_ha_control_capability &,
@@ -357,11 +349,9 @@ class Preserve_trx_handoff_resolution_state {
 
 Preserve_trx_transfer_password_status
 preserved_trx_transfer_set_runtime_password(
-    const Preserve_trx_ha_control_capability &capability,
     const unsigned char *password, size_t password_length);
 Preserve_trx_transfer_password_status
-preserved_trx_transfer_clear_runtime_password(
-    const Preserve_trx_ha_control_capability &capability);
+preserved_trx_transfer_clear_runtime_password();
 Preserve_trx_transfer_status preserved_trx_resolve_handoff_unknown(
     const Preserve_trx_ha_control_capability &capability,
     const Preserve_trx_handoff_resolution_proof &proof);
