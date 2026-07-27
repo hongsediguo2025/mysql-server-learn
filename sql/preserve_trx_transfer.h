@@ -78,7 +78,6 @@ enum class Preserve_trx_transfer_artifact_decision {
   UNSUPPORTED
 };
 
-extern bool preserve_trx_transfer_receiver_enable;
 extern char *preserve_trx_transfer_target_host;
 extern uint preserve_trx_transfer_target_port;
 extern char *preserve_trx_transfer_target_socket;

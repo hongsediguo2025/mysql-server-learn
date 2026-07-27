@@ -23,13 +23,12 @@
 --exec echo fact > "$EPOCH_FACT"
 --exec echo commit > "$EPOCH_COMMIT"
 
-# Receiver artifacts are process-local even if the next process does not start
-# the receiver endpoint. Cleanup must happen before ordinary local recovery.
---let $restart_parameters= restart: --preserve-trx-enable=ON --preserve-trx-transfer-receiver-enable=OFF --skip-log-bin
+# Receiver artifacts are process-local. Cleanup must happen before ordinary
+# local recovery without relying on a configured server role.
+--let $restart_parameters= restart: --preserve-trx-enable=ON --skip-log-bin
 --source include/restart_mysqld.inc
 --let $restart_parameters=
 
-SELECT @@global.preserve_trx_transfer_receiver_enable=0 AS receiver_mode;
 --exec test ! -e "$PRESERVE_TRX_DIR/.transfer"
 --exec test ! -e "$STANDBY_MARKER"
 --exec test ! -e "$SNAPSHOT_FILE"

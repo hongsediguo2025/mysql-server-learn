@@ -29,7 +29,7 @@ CREATE USER active_binlog_prefix_app@localhost;
 GRANT SELECT, UPDATE ON test.* TO active_binlog_prefix_app@localhost;
 GRANT SESSION_VARIABLES_ADMIN ON *.* TO active_binlog_prefix_app@localhost;
 
---let $restart_parameters= restart: --preserve-trx-enable=ON --preserve-trx-transfer-receiver-enable=ON --preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --preserve-trx-transfer-target-socket=$MASTER_MYSOCK --preserve-trx-transfer-target-user=preserve_trx_ha_admin --preserve-trx-transfer-credential-name=active_binlog_prefix --preserve-trx-transfer-credential-secret-file=$credential_file
+--let $restart_parameters= restart: --preserve-trx-enable=ON --preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --preserve-trx-transfer-target-socket=$MASTER_MYSOCK --preserve-trx-transfer-target-user=preserve_trx_ha_admin --preserve-trx-transfer-credential-name=active_binlog_prefix --preserve-trx-transfer-credential-secret-file=$credential_file
 --disable_result_log
 --source include/restart_mysqld.inc
 --enable_result_log

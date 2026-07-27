@@ -38,7 +38,7 @@ RUNNER_VERSION = 1
 OWNERSHIP_MARKER = ".preserve-full-pressure-runner.json"
 MAX_MYSQL_SOCKET_PATH_BYTES = 100
 DEFAULT_FULL_REQUIRED_FREE_BYTES = 20 * 1024**3
-DEFAULT_MIXED_FULL_REQUIRED_FREE_BYTES = 80 * 1024**3
+DEFAULT_MIXED_FULL_REQUIRED_FREE_BYTES = 25 * 1024**3
 DEFAULT_SMOKE_REQUIRED_FREE_BYTES = 2 * 1024**3
 
 
@@ -544,7 +544,6 @@ def build_mysqld_commands(
         f"--server-id={receiver_port}",
         f"--log-bin={paths.receiver_root / 'mysql-bin'}",
         f"--innodb-buffer-pool-size={profile.receiver_buffer_pool_bytes}",
-        "--preserve-trx-transfer-receiver-enable=ON",
         f"--preserve-trx-transfer-receiver-workers={profile.receiver_workers}",
     ]
     return source, receiver

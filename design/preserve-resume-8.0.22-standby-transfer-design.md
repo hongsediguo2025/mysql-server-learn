@@ -384,6 +384,10 @@ chunk 内容一致时可接受；同一 range 内容或 digest 不一致时必�
 digest 校验、target-side re-encode 和 standby-pending publish；但还没有生产
 classic-protocol source client、HELLO/JOIN_EPOCH 握手或真实 worker pool。
 
+Receiver 不设置 Preserve 自有的主备角色开关。物理复制产品的 HA 层在调用前完成
+角色与命令合法性校验；Preserve receiver 入口只校验总特性开关、专用权限和
+transfer 协议的 epoch/object/digest/ownership 合同。
+
 ### 5.3 参数控制
 
 本轮新增参数分为模式、连接、并行和限流四类。它们应同时控制主机并行处理/发送和备机
@@ -392,9 +396,6 @@ classic-protocol source client、HELLO/JOIN_EPOCH 握手或真实 worker pool。
 ```text
 preserve_trx_transfer_enable
   源端是否启用直传保存能力。关闭时现有 LOCAL_CARRIER 路径行为不变。
-
-preserve_trx_transfer_receiver_enable
-  备机是否接受 COM_PRESERVE_TRX_TRANSFER。关闭时直接拒绝 transfer 命令。
 
 preserve_trx_transfer_allowed_source_uuid
   备机允许写入 standby pending artifact 的源端 server UUID 列表。默认空列表应拒绝

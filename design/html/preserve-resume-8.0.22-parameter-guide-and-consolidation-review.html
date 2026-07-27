@@ -643,7 +643,6 @@ commit_timeout_ms 还被用于：
       P("Lock Warmcopy 与恢复", "preserve_trx_recover_lock_page_prefetch", "ON", "GLOBAL 动态", "startup import record locks 前发 best-effort page reads。", "只优化 local cold recovery，不证明 promotion gate。", "保留"),
       P("Lock Warmcopy 与恢复", "preserve_trx_lock_warmcopy_conversion_wait_timeout_ms", "30000ms；0..UINT32_MAX", "GLOBAL 动态", "其它会话等待 implicit-to-explicit conversion thaw 的上限。", "属于业务 wait 保护，不是 warmcopy close deadline。", "保留"),
 
-      P("Transfer 角色与身份", "preserve_trx_transfer_receiver_enable", "OFF", "GLOBAL；startup-only", "允许接受 standby transfer receiver command。", "独立于 source artifact mode；普通 local startup 不应消费 standby token。", "保留"),
       P("Transfer 角色与身份", "preserve_trx_transfer_allowed_source_uuid", "空", "GLOBAL；只读启动配置", "receiver 允许的 source UUID。", "空值拒绝 manifests；与 target UUID 方向不同。", "保留"),
       P("Transfer 角色与身份", "preserve_trx_transfer_target_server_uuid", "空", "GLOBAL；只读启动配置", "source 期望的 receiver server UUID。", "是 source endpoint 完整性的硬条件，并写入 manifest/fact。", "保留"),
       P("Transfer 角色与身份", "preserve_trx_transfer_target_host", "空", "GLOBAL；只读启动配置", "TCP target host。", "必须与 port 同时设置，并与 socket 二选一。", "合并候选"),

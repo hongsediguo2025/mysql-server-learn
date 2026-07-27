@@ -1429,17 +1429,6 @@ static bool update_preserve_trx_transfer_prewarm_paused(
   return false;
 }
 
-static bool check_preserve_trx_transfer_receiver_enable(sys_var *, THD *,
-                                                        set_var *var) {
-  const bool requested_enabled = var->save_result.ulonglong_value != 0;
-  if (requested_enabled != preserve_trx_transfer_receiver_enable) {
-    my_error(ER_WRONG_ARGUMENTS, MYF(0),
-             "preserve_trx_transfer_receiver_enable is a startup-only option");
-    return true;
-  }
-  return false;
-}
-
 static bool check_preserve_trx_transfer_artifact_mode(sys_var *, THD *,
                                                       set_var *var) {
   const ulong requested_mode =
@@ -1451,15 +1440,6 @@ static bool check_preserve_trx_transfer_artifact_mode(sys_var *, THD *,
   }
   return false;
 }
-
-static Sys_var_bool Sys_preserve_trx_transfer_receiver_enable(
-    "preserve_trx_transfer_receiver_enable",
-    "Allow this server to accept Preserve/Resume standby direct-transfer "
-    "receiver traffic. The receiver path is independent from ordinary local "
-    "startup recovery and resume.",
-    GLOBAL_VAR(preserve_trx_transfer_receiver_enable), CMD_LINE(OPT_ARG),
-    DEFAULT(false), NO_MUTEX_GUARD, NOT_IN_BINLOG,
-    ON_CHECK(check_preserve_trx_transfer_receiver_enable));
 
 static Sys_var_charptr Sys_preserve_trx_transfer_target_host(
     "preserve_trx_transfer_target_host",

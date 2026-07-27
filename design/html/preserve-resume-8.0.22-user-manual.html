@@ -798,7 +798,7 @@ SHOW PRESERVED TRANSACTIONS;</code></pre>
 
         <h3>8.2 接收端流程</h3>
         <ol>
-          <li>接收端必须以 <code>preserve_trx_transfer_receiver_enable=ON</code> 启动，并固定 allowed source UUID、target UUID 和凭据。</li>
+          <li>外部 HA 在调用前完成接收端角色准入；Preserve receiver 入口校验总开关、专用权限、epoch/object 状态、摘要与 ownership。</li>
           <li>内部 classic command <code>COM_PRESERVE_TRX_TRANSFER</code> 校验动态权限、HMAC、source/target 身份和帧结构。</li>
           <li>对象写入 <code>.part</code>/<code>.ranges</code>；这只是 staging，不代表 epoch committed。</li>
           <li>最终元数据与摘要通过后写 <code>epoch.fact</code>、<code>epoch.commit</code>，再发布 <code>.standby_pending</code> projection。</li>
@@ -880,7 +880,7 @@ preserved_trx_resume_adopted_for_promotion_on_thd(...)</code></pre>
         </div>
         <div class="callout warn">
           <span class="callout-title">备机上线还有一组不可省略的身份与一致性参数</span>
-          Top 15 是全场景优先级，不是备机配置清单。使用 <code>STANDBY_TRANSFER_SAVE</code> 时，还必须逐项审查 <code>preserve_trx_transfer_receiver_enable</code>、source/target UUID、host/port 或 socket、账号与 credential、inflight/commit timeout，以及三个 <code>preserve_trx_promotion_gate_*</code> 参数。缺少生产 physical fence provider 时，参数配齐也不能完成安全晋升。
+          Top 15 是全场景优先级，不是备机配置清单。使用 <code>STANDBY_TRANSFER_SAVE</code> 时，还必须逐项审查 source/target UUID、host/port 或 socket、账号与 credential、inflight/commit timeout，以及三个 <code>preserve_trx_promotion_gate_*</code> 参数。主备角色由外部 HA 在调用前校验；缺少 production physical fence provider 时，参数配齐也不能完成安全晋升。
         </div>
 
         <h3>10.2 参数联动与调参顺序</h3>
@@ -1468,7 +1468,6 @@ SHOW GLOBAL STATUS LIKE 'Preserve_trx_resume_physical_%';</code></pre>
       ["并行与恢复", "preserve_trx_startup_recovery_threads", "0 (auto)", "GLOBAL 动态；0..1024", "本地 snapshot 启动恢复 worker 数；1 强制 legacy 串行恢复。"],
       ["并行与恢复", "preserve_trx_recover_lock_page_prefetch", "ON", "GLOBAL 动态", "导入 record-lock payload 前，best-effort 异步预读相关 InnoDB page。"],
 
-      ["Transfer 启动身份", "preserve_trx_transfer_receiver_enable", "OFF", "GLOBAL；启动期决定，运行时不可切换", "允许本实例接收 standby direct-transfer；该路径独立于普通本地启动恢复。"],
       ["Transfer 启动身份", "preserve_trx_transfer_allowed_source_uuid", "空", "GLOBAL 只读；启动参数", "receiver 接受的唯一 source server UUID；空值会拒绝 receiver manifest。"],
       ["Transfer 启动身份", "preserve_trx_transfer_target_server_uuid", "空", "GLOBAL 只读；启动参数", "传输协议预期的 target UUID；用于身份和 HMAC/fingerprint 绑定。"],
       ["Transfer 启动身份", "preserve_trx_transfer_target_host", "空", "GLOBAL 只读；启动参数", "源端后台连接使用的 TCP host；与 target_socket 二选一。"],
@@ -1545,7 +1544,6 @@ SHOW GLOBAL STATUS LIKE 'Preserve_trx_resume_physical_%';</code></pre>
       ["preserve_trx_startup_recovery_threads", "在真实 artifact 数量、冷 buffer pool 和存储介质上测量启动恢复总时长及各阶段指标。", "过高会在启动期制造随机 I/O、开表和锁导入竞争；它不改变 token recovery count、grace 或失败处置规则。"],
       ["preserve_trx_recover_lock_page_prefetch", "分别在冷启动和热缓存场景比较同步 page get、prefetch residency、missing pages 与启动总耗时。", "预读是 best effort；开启可能增加启动 I/O 和 buffer pool 压力，关闭则可能把冷页读取留给串行锁导入。"],
 
-      ["preserve_trx_transfer_receiver_enable", "只在承担 standby receiver 的实例启动时开启，并与 allowed source UUID、target UUID、receiver 账号和网络边界一起验收。", "这是启动期身份，运行时不能切换。开启不代表普通 startup recovery 会消费 transfer spool，也不自动完成 promotion。"],
       ["preserve_trx_transfer_allowed_source_uuid", "写入唯一允许的源 server UUID，并在主备重建、换主和克隆流程中明确更新时点。", "空值会拒绝 receiver manifest；错误或过宽的身份管理会导致合法传输失败或削弱来源约束，不能用主机名代替 UUID。"],
       ["preserve_trx_transfer_target_server_uuid", "配置协议预期的目标 server UUID，核对它与实际 receiver、凭据派生和 HA inventory 一致。", "空值或与实际目标不一致会使身份/HMAC/fingerprint 校验失败；备机重建后不能沿用旧身份而不重新评审。"],
       ["preserve_trx_transfer_target_host", "TCP 模式填写可通过证书身份校验的稳定主机名，并验证 DNS、路由、CA 和故障切换行为。", "host/port 与 Unix socket 必须二选一；使用 IP 时证书 SAN 也必须匹配，不能通过降低 TLS 校验绕过。"],

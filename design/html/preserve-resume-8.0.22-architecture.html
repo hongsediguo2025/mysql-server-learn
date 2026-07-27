@@ -1406,21 +1406,21 @@
               <tr><td>Drain 与并行</td><td><code>preserve_trx_drain_mode</code>、<code>drain_grace_ms</code>、<code>batch_max_transactions</code>、<code>parallel_preserve_threads</code></td><td>软/硬 drain、目标数、关闭窗口与 worker 数。</td></tr>
               <tr><td>Warmcopy</td><td><code>preserve_trx_warmcopy_enable</code>、<code>lock_warmcopy_enable</code>、<code>lock_warmcopy_max_memory_bytes</code>、<code>lock_warmcopy_seal_threads</code></td><td>binlog/record-lock phase1、尾部预算、journal 与 seal 并发。</td></tr>
               <tr><td>临时表</td><td><code>preserve_trx_temp_table_enable</code>、<code>max_temp_sidecar_bytes</code></td><td>用户临时表物理 preserve 与 sidecar 容量。</td></tr>
-              <tr><td>Transfer endpoint</td><td><code>preserve_trx_transfer_receiver_enable</code>、<code>allowed_source_uuid</code>、<code>target_server_uuid</code>、<code>target_host/port/socket/user</code></td><td>接收端启用、端点身份、发送目标与连接方式。</td></tr>
+              <tr><td>Transfer endpoint</td><td><code>allowed_source_uuid</code>、<code>target_server_uuid</code>、<code>target_host/port/socket/user</code></td><td>端点身份、发送目标与连接方式。接收端角色由外部 HA 校验，不由 Preserve sysvar 判定。</td></tr>
               <tr><td>Transfer 安全/流控</td><td><code>credential_name</code>、<code>credential_secret_file</code>、<code>chunk_bytes</code>、<code>max_inflight_bytes</code>、<code>commit_timeout_ms</code></td><td>凭据、frame 大小、在途字节与 ACK/commit 超时。</td></tr>
               <tr><td>Receiver / promotion</td><td><code>transfer_receiver_workers</code>、<code>promotion_gate_batch_tokens</code>、<code>promotion_gate_workers</code>、<code>promotion_gate_timeout_ms</code></td><td>异步 apply/prewarm 并发与晋升门批量执行预算。</td></tr>
             </tbody>
           </table>
         </div>
         <p>
-          <code>preserve_trx_transfer_receiver_enable</code> 和 transfer artifact mode 属于 startup-only 选项。接管新环境时应从实际部署配置读取默认值和容量，
+          Transfer artifact mode 属于 startup-only 选项。接管新环境时应从实际部署配置读取默认值和容量，
           不要只凭 sysvar 名称推断生产策略。
         </p>
 
         <h3>15.3 权限与可见性</h3>
         <ul>
           <li>Batch drain 属于 shutdown 级管理动作，走 <code>SHUTDOWN</code> 权限检查。</li>
-          <li>Transfer classic command 只有在总开关和 receiver startup option 都开启时才可用，并要求动态权限 <code>PRESERVE_TRX_TRANSFER_ADMIN</code>。</li>
+          <li>Transfer classic command 在总开关开启时可用，并要求动态权限 <code>PRESERVE_TRX_TRANSFER_ADMIN</code>；主备角色和命令时序由外部 HA 在调用前校验。</li>
           <li>普通 resume 默认要求 token owner；动态权限 <code>RESUME_ANY_PRESERVED_TRANSACTION</code> 可跨账号接管，但仍会重新检查涉及 schema/table/routine/trigger/MDL 对象的权限。</li>
           <li>PFS/SHOW 默认只显示本账号 token；<code>PROCESS</code> 或 resume-any 权限可查看更多行。没有 <code>PROCESS</code> 时 token 在结果中会被脱敏。</li>
           <li>Transfer credential 优先使用命名 credential，后备 secret file；文件读取使用 no-follow，要求普通文件、owner 为当前 euid，且 group/other 无权限。</li>

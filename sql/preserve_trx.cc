@@ -845,6 +845,7 @@ std::atomic<ulonglong> g_batch_generation{0};
 std::atomic<ulonglong> g_reset_drain_wins{0};
 std::atomic<ulonglong> g_reset_drain_too_late{0};
 std::atomic<ulonglong> g_closing_control_connection_commands{0};
+std::mutex g_closing_target_classification_mutex;
 Preserved_trx_manager_state_publication_probe
     g_manager_state_publication_probe{nullptr};
 void *g_manager_state_publication_probe_arg{nullptr};
@@ -6093,8 +6094,13 @@ class Preserve_batch_target_counter final : public Do_THD_Impl {
 
       const bool active_explicit_transaction =
           preserve_trx_has_explicit_active_transaction(candidate);
+      const bool command_packet_before_closing =
+          candidate->preserve_trx_command_packet_before_closing.load(
+              std::memory_order_acquire);
       const bool batch_inflight_statement =
-          preserve_trx_thd_has_batch_inflight_statement(candidate);
+          candidate->preserve_trx_inflight_risky_statement_depth > 0 ||
+          (candidate->preserve_trx_inflight_unknown_query_depth > 0 &&
+           command_packet_before_closing);
       if (preserve_trx_is_ha_control_connection(candidate)) {
         if (active_explicit_transaction ||
             preserve_trx_has_rw_transaction_participant(candidate)) {
@@ -6106,7 +6112,7 @@ class Preserve_batch_target_counter final : public Do_THD_Impl {
       const bool nonidle_explicit_transaction =
           active_explicit_transaction && !candidate->m_server_idle;
       const bool nonidle_unclassified_command_packet =
-          !candidate->m_server_idle && candidate->is_classic_protocol();
+          command_packet_before_closing && candidate->is_classic_protocol();
       if (!active_explicit_transaction && !batch_inflight_statement &&
           !nonidle_unclassified_command_packet) {
         mysql_mutex_unlock(&candidate->LOCK_thd_data);
@@ -6131,7 +6137,7 @@ class Preserve_batch_target_counter final : public Do_THD_Impl {
           preserve_trx_is_unsupported_common_context(candidate);
       const bool unsupported = unstable_unsupported || idle_unsupported;
       const bool idle_target =
-          !unsupported &&
+          !unsupported && !command_packet_before_closing &&
           preserve_trx_batch_candidate_is_idle_target(m_owner, candidate);
       const bool pending_target =
           !unsupported && !idle_target &&
@@ -10173,10 +10179,6 @@ bool preserved_trx_recovery_complete() {
 }
 
 bool preserved_trx_mark_innodb_read_only_recovery_state() {
-  if (preserve_trx_transfer_receiver_enable) {
-    mark_preserved_trx_recovery_complete();
-    return false;
-  }
   if (!preserve_trx_is_enabled()) {
     mark_preserved_trx_recovery_complete();
     return false;
@@ -10542,6 +10544,8 @@ bool preserved_trx_begin_command_read(THD *thd) {
     thd->preserve_trx_inflight_risky_statement_depth = 0;
     thd->preserve_trx_inflight_unknown_query_depth = 0;
     thd->preserve_trx_command_started_monotonic_us = 0;
+    thd->preserve_trx_command_packet_before_closing.store(
+        false, std::memory_order_release);
     assert(thd->preserve_trx_inflight_risky_statement_depth == 0);
     assert(thd->preserve_trx_inflight_unknown_query_depth == 0);
     if (thd->preserve_trx_batch_state ==
@@ -10612,6 +10616,10 @@ bool preserved_trx_end_idle_for_command_packet(THD *thd) {
     if (was_idle) thd->m_server_idle = false;
     return was_idle;
   }
+
+  thd->preserve_trx_command_packet_before_closing.store(
+      !preserve_trx_closing_gate_allows_quiesced_command_read(),
+      std::memory_order_release);
 
   uint64_t hard_deadline_us = 0;
   uint quiesced_wait_loops = 0;
@@ -10799,57 +10807,82 @@ Preserve_trx_command_block_result preserved_trx_protocol_command_block_result(
   if (thd == nullptr) return Preserve_trx_command_block_result::ALLOW;
   if (!preserve_trx_is_enabled())
     return Preserve_trx_command_block_result::ALLOW;
-  if (preserve_trx_batch_state(thd) ==
-      Preserve_trx_batch_thd_state::PRESERVED_DRAINED)
-    return Preserve_trx_command_block_result::BLOCK_SESSION_DRAINED;
+  bool waited_for_initial_target_classification = false;
+  for (;;) {
+    mysql_mutex_lock(&thd->LOCK_thd_data);
+    const Preserve_trx_batch_thd_state batch_state =
+        thd->preserve_trx_batch_state;
+    const bool batch_inflight_statement =
+        preserve_trx_thd_has_batch_inflight_statement(thd);
+    const bool command_packet_before_closing =
+        thd->preserve_trx_command_packet_before_closing.load(
+            std::memory_order_acquire);
+    mysql_mutex_unlock(&thd->LOCK_thd_data);
 
-  const Preserve_trx_manager_state_owner manager_snapshot =
-      preserve_trx_manager_state_owner_snapshot();
-  const Preserve_trx_manager_state state = manager_snapshot.state;
-  if (state == Preserve_trx_manager_state::IDLE)
-    return Preserve_trx_command_block_result::ALLOW;
-  if (state == Preserve_trx_manager_state::DRAIN_CLEANUP_FAILED &&
-      !preserved_trx_has_non_observable_records()) {
-    preserved_trx_clear_cleanup_failed_if_no_records();
-    return Preserve_trx_command_block_result::ALLOW;
-  }
+    if (batch_state == Preserve_trx_batch_thd_state::PRESERVED_DRAINED)
+      return Preserve_trx_command_block_result::BLOCK_SESSION_DRAINED;
 
-  if (preserve_trx_batch_state(thd) ==
-          Preserve_trx_batch_thd_state::PENDING_QUIESCE &&
-      preserve_trx_thd_has_batch_inflight_statement(thd))
-    return Preserve_trx_command_block_result::ALLOW;
-
-  const my_thread_id owner_thread_id = manager_snapshot.owner_thread_id;
-  if (owner_thread_id != 0 && thd->thread_id() == owner_thread_id)
-    return Preserve_trx_command_block_result::ALLOW;
-
-  const bool closing_command_gate_active =
-      preserve_trx_closing_command_gate_active(state);
-  if (preserve_trx_is_ha_control_connection(thd)) {
-    if (closing_command_gate_active) {
-      g_closing_control_connection_commands.fetch_add(
-          1, std::memory_order_relaxed);
-    }
-    return Preserve_trx_command_block_result::ALLOW;
-  }
-  if (closing_command_gate_active) {
-    if (preserve_trx_protocol_command_is_no_response_cleanup(command))
+    const Preserve_trx_manager_state_owner manager_snapshot =
+        preserve_trx_manager_state_owner_snapshot();
+    const Preserve_trx_manager_state state = manager_snapshot.state;
+    if (state == Preserve_trx_manager_state::IDLE)
       return Preserve_trx_command_block_result::ALLOW;
-    return Preserve_trx_command_block_result::BLOCK_CLOSING_DRAINED;
-  }
+    if (state == Preserve_trx_manager_state::DRAIN_CLEANUP_FAILED &&
+        !preserved_trx_has_non_observable_records()) {
+      preserved_trx_clear_cleanup_failed_if_no_records();
+      return Preserve_trx_command_block_result::ALLOW;
+    }
 
-  if (state == Preserve_trx_manager_state::RESET_CLEANUP)
+    const bool closing_command_gate_active =
+        preserve_trx_closing_command_gate_active(state);
+    if (batch_state == Preserve_trx_batch_thd_state::PENDING_QUIESCE &&
+        batch_inflight_statement &&
+        (!closing_command_gate_active || command_packet_before_closing)) {
+      return Preserve_trx_command_block_result::ALLOW;
+    }
+
+    const my_thread_id owner_thread_id = manager_snapshot.owner_thread_id;
+    if (owner_thread_id != 0 && thd->thread_id() == owner_thread_id)
+      return Preserve_trx_command_block_result::ALLOW;
+
+    if (preserve_trx_is_ha_control_connection(thd)) {
+      if (closing_command_gate_active) {
+        g_closing_control_connection_commands.fetch_add(
+            1, std::memory_order_relaxed);
+      }
+      return Preserve_trx_command_block_result::ALLOW;
+    }
+
+    if (closing_command_gate_active) {
+      if (command_packet_before_closing && batch_inflight_statement &&
+          batch_state == Preserve_trx_batch_thd_state::NONE &&
+          !waited_for_initial_target_classification) {
+        DEBUG_SYNC(
+            thd,
+            "preserve_trx_closing_packet_waiting_for_initial_targets");
+        std::lock_guard<std::mutex> lock(
+            g_closing_target_classification_mutex);
+        waited_for_initial_target_classification = true;
+        continue;
+      }
+      if (preserve_trx_protocol_command_is_no_response_cleanup(command))
+        return Preserve_trx_command_block_result::ALLOW;
+      return Preserve_trx_command_block_result::BLOCK_CLOSING_DRAINED;
+    }
+
+    if (state == Preserve_trx_manager_state::RESET_CLEANUP)
+      return Preserve_trx_command_block_result::ALLOW;
+
+    if (state == Preserve_trx_manager_state::WARMCOPY_DRAINING) {
+      return Preserve_trx_command_block_result::ALLOW;
+    }
+
+    if (preserve_trx_protocol_command_may_create_trx_or_lock(command)) {
+      return Preserve_trx_command_block_result::BLOCK_DRAINING;
+    }
+
     return Preserve_trx_command_block_result::ALLOW;
-
-  if (state == Preserve_trx_manager_state::WARMCOPY_DRAINING) {
-    return Preserve_trx_command_block_result::ALLOW;
   }
-
-  if (preserve_trx_protocol_command_may_create_trx_or_lock(command)) {
-    return Preserve_trx_command_block_result::BLOCK_DRAINING;
-  }
-
-  return Preserve_trx_command_block_result::ALLOW;
 }
 
 bool preserved_trx_mark_inflight_risky_statement(THD *thd,
@@ -14092,7 +14125,6 @@ bool preserved_trx_rollback_physical_promotion_adopt(
 }
 
 bool preserved_trx_preflight_recoverability() {
-  if (preserve_trx_transfer_receiver_enable) return false;
   if (!preserve_trx_is_enabled()) {
     if (!preserve_trx_off_artifact_policy_recover() &&
         !preserve_trx_off_artifact_policy_abandon()) {
@@ -14184,7 +14216,6 @@ bool preserved_trx_preflight_recoverability() {
 
 void preserved_trx_resurrection_index_bootstrap_preamble() {
   trx_preserve_startup_resurrection_reset();
-  if (preserve_trx_transfer_receiver_enable) return;
   if ((!preserve_trx_is_enabled() &&
        !preserve_trx_off_artifact_policy_recover()) ||
       srv_force_recovery > 0) {
@@ -14288,7 +14319,6 @@ void preserved_trx_resurrection_index_bootstrap_preamble() {
 }
 
 bool preserved_temp_images_bootstrap_preamble() {
-  if (preserve_trx_transfer_receiver_enable) return false;
   if (!preserve_trx_is_enabled() &&
       !preserve_trx_off_artifact_policy_recover()) {
     return false;
@@ -14553,10 +14583,6 @@ bool preserved_temp_images_bootstrap_preamble() {
 }
 
 bool preserved_trx_recover_all() {
-  if (preserve_trx_transfer_receiver_enable) {
-    preserved_trx_mark_recovery_complete();
-    return false;
-  }
   struct Startup_verified_resurrection_guard {
     ~Startup_verified_resurrection_guard() {
       trx_preserve_startup_resurrection_clear_verified();
@@ -18187,6 +18213,7 @@ bool Preserve_trx_drain_service::execute(
   }
   if (reset_requested())
     return finish_phase1_reset("reset_before_phase1_close");
+  std::unique_lock<std::mutex> closing_target_classification_guard;
   if (two_phase_enabled) {
     /*
       Entering WARMCOPY_CLOSING publishes the manager state first, so command
@@ -18201,6 +18228,8 @@ bool Preserve_trx_drain_service::execute(
       batch_transfer_source_session->set_operation_timeout_ms(
           preserve_trx_transfer_phase2_timeout_ms);
     }
+    closing_target_classification_guard =
+        std::unique_lock<std::mutex>(g_closing_target_classification_mutex);
     if (!draining->transition_to(
             Preserve_trx_manager_state::WARMCOPY_CLOSING)) {
       if (reset_requested())
@@ -18244,6 +18273,8 @@ bool Preserve_trx_drain_service::execute(
   Preserve_batch_target_counter counter(thd, generation,
                                         phase2_metrics.closing_started_us);
   Global_THD_manager::get_instance()->do_for_all_thd_copy(&counter);
+  if (closing_target_classification_guard.owns_lock())
+    closing_target_classification_guard.unlock();
   /*
     Phase-1 readiness is observational: a connection can start a transaction
     after the final phase-1 scan but before CLOSING is published. CLOSING now

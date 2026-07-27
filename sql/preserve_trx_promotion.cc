@@ -3525,7 +3525,7 @@ preserved_trx_prepare_before_trx_sys_init_for_physical_promotion(
     const std::string &preserve_dir,
     const Preserve_trx_physical_bootstrap_request &request,
     Preserve_trx_physical_promotion_bootstrap_attempt *attempt) {
-  if (!preserve_trx_is_enabled() || !preserve_trx_transfer_receiver_enable) {
+  if (!preserve_trx_is_enabled()) {
     return Preserve_trx_physical_promotion_gate_status::NOT_ENABLED;
   }
   if (preserve_dir.empty() || request.epoch_id.empty() ||

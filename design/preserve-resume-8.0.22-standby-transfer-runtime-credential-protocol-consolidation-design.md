@@ -1075,10 +1075,15 @@ preserve_trx_transfer_target_host
 preserve_trx_transfer_target_port
 preserve_trx_transfer_target_socket
 preserve_trx_transfer_target_user
-preserve_trx_transfer_receiver_enable
 preserve_trx_transfer_artifact_mode
 以及真实生效的batch/worker/buffer/timeout参数
 ```
+
+Receiver 不再暴露 Preserve 自有角色开关。外部 HA 已在命令调用前完成主备角色和
+时序校验；Preserve 收到 receiver/promotion 调用后执行请求，并继续强制校验总
+特性开关、专用权限、epoch/object 状态、digest/LSN/final fact、ownership、
+ready cache 和 apply fence。Startup 对本地与 standby 工件的区分以 artifact
+provenance 为准，不以实例角色为准。
 
 `preserve_trx_transfer_target_user` 首版保持只读并在 epoch context 中冻结；本轮
 只解决密码注入和 epoch 快照，不承诺动态设置账号名。

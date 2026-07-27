@@ -454,7 +454,6 @@ class _StandbyTransferEndpointConfigRuntime(_ReceiverTransferCodecConfigRuntime)
         source_target_socket: str = "/tmp/receiver.sock",
         credential_name: str = "transfer_credential",
         target_user: str = "transfer_user",
-        receiver_enabled: bool = True,
         receiver_preserve_dir: str = "/tmp/receiver-data/preserve",
     ):
         super().__init__(credential_name=credential_name, target_user=target_user)
@@ -462,7 +461,6 @@ class _StandbyTransferEndpointConfigRuntime(_ReceiverTransferCodecConfigRuntime)
         self.source_target_host = source_target_host
         self.source_target_port = source_target_port
         self.source_target_socket = source_target_socket
-        self.receiver_enabled = receiver_enabled
         self.receiver_preserve_dir = receiver_preserve_dir
 
     def execute(self, conn, sql, fetch=False):
@@ -479,8 +477,8 @@ class _StandbyTransferEndpointConfigRuntime(_ReceiverTransferCodecConfigRuntime)
                     self.credential_name,
                 )
             ]
-        if fetch and "@@global.preserve_trx_transfer_receiver_enable" in sql:
-            return [(int(self.receiver_enabled), self.receiver_preserve_dir)]
+        if fetch and "@@global.preserve_trx_dir" in sql:
+            return [(self.receiver_preserve_dir,)]
         if fetch and "@@global.preserve_trx_transfer_credential_name" in sql:
             return [(self.credential_name, self.target_user)]
         if fetch:

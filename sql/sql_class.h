@@ -1333,6 +1333,10 @@ class THD : public MDL_context_owner,
     parse classification and for the packet marker between get_command() and
     dispatch. command_sequence and command_started_monotonic_us identify one
     admitted command for the Phase1 tail readiness observer.
+    command_packet_before_closing is atomic because the packet-header callback
+    publishes it before taking LOCK_thd_data; it records whether the current
+    classic-protocol packet reached the server before the drain closing gate
+    became visible.
     quiesce_boundary_monotonic_us freezes the completion boundary of the old
     command selected by one drain generation. batch_generation ties this THD to
     one drain attempt so stale quiesce/drained state is not reused by a later
@@ -1342,6 +1346,7 @@ class THD : public MDL_context_owner,
   uint preserve_trx_inflight_unknown_query_depth{0};
   uint64 preserve_trx_command_sequence{0};
   ulonglong preserve_trx_command_started_monotonic_us{0};
+  std::atomic<bool> preserve_trx_command_packet_before_closing{false};
   ulonglong preserve_trx_quiesce_boundary_monotonic_us{0};
   ulonglong preserve_trx_batch_generation{0};
   Preserve_trx_batch_thd_state preserve_trx_batch_state{

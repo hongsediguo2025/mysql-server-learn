@@ -9552,8 +9552,7 @@ END
             )
             receiver_rows = self.runtime.execute(
                 receiver_conn,
-                "SELECT @@global.preserve_trx_transfer_receiver_enable, "
-                "@@global.preserve_trx_dir",
+                "SELECT @@global.preserve_trx_dir",
                 fetch=True,
             )
             if not source_rows or not receiver_rows:
@@ -9566,8 +9565,7 @@ END
             source_target_socket = str(source_rows[0][3] or "")
             source_target_user = str(source_rows[0][4] or "")
             source_credential_name = str(source_rows[0][5] or "")
-            receiver_enabled = bool(int(receiver_rows[0][0] or 0))
-            receiver_preserve_dir = str(receiver_rows[0][1] or "")
+            receiver_preserve_dir = str(receiver_rows[0][0] or "")
             mismatches = []
             if source_artifact_mode != "STANDBY_TRANSFER_SAVE":
                 mismatches.append(
@@ -9603,10 +9601,6 @@ END
                 mismatches.append(
                     f"source transfer target user {source_target_user!r} "
                     f"!= expected {self.config.standby_transfer_user!r}"
-                )
-            if not receiver_enabled:
-                mismatches.append(
-                    "receiver transfer endpoint is disabled"
                 )
             configured_receiver_preserve_dir = str(
                 Path(self.config.receiver_preserve_dir or "")

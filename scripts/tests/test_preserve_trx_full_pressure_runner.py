@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 from scripts.preserve_trx_full_pressure_runner import (
+    DEFAULT_MIXED_FULL_REQUIRED_FREE_BYTES,
     FULL_PROFILE,
     MIXED_FULL_PROFILE,
     RESET_FULL_PROFILE,
@@ -29,6 +30,11 @@ from scripts.preserve_trx_full_pressure_runner import (
 
 
 class FullPressureProfileTest(unittest.TestCase):
+    def test_mixed_full_requires_25_gib_free_disk_by_default(self):
+        self.assertEqual(
+            25 * 1024**3, DEFAULT_MIXED_FULL_REQUIRED_FREE_BYTES
+        )
+
     def test_full_profile_freezes_release_workload_and_resource_contract(self):
         self.assertEqual(1000, FULL_PROFILE.sessions)
         self.assertEqual(100, FULL_PROFILE.tables)

@@ -82,7 +82,6 @@
 #include "scope_guard.h"
 #include "storage/innobase/include/trx0preserve.h"
 
-bool preserve_trx_transfer_receiver_enable = false;
 char *preserve_trx_transfer_target_host = nullptr;
 uint preserve_trx_transfer_target_port = 0;
 char *preserve_trx_transfer_target_socket = nullptr;
@@ -1566,13 +1565,13 @@ bool preserve_trx_transfer_source_credential_ready() {
       preserve_trx_transfer_credential_name);
 }
 
-Preserve_trx_transfer_password_status transfer_runtime_password_role_status() {
+Preserve_trx_transfer_password_status
+transfer_runtime_password_source_mode_status() {
   if (!preserve_trx_is_enabled()) {
     return Preserve_trx_transfer_password_status::FEATURE_DISABLED;
   }
-  if (preserve_trx_transfer_receiver_enable ||
-      preserve_trx_transfer_artifact_mode !=
-          PRESERVE_TRX_TRANSFER_ARTIFACT_STANDBY_TRANSFER_SAVE) {
+  if (preserve_trx_transfer_artifact_mode !=
+      PRESERVE_TRX_TRANSFER_ARTIFACT_STANDBY_TRANSFER_SAVE) {
     return Preserve_trx_transfer_password_status::WRONG_ROLE;
   }
   return Preserve_trx_transfer_password_status::OK;
@@ -7352,10 +7351,6 @@ Preserve_trx_transfer_status preserve_trx_transfer_verify_frame_ack(
 
 Preserve_trx_transfer_status preserve_trx_transfer_validate_receiver_manifest(
     const Preserve_trx_transfer_manifest &manifest) {
-  if (!preserve_trx_transfer_receiver_enable) {
-    return Preserve_trx_transfer_status::UNSUPPORTED;
-  }
-
   return validate_manifest_components(manifest, false);
 }
 
@@ -12646,7 +12641,7 @@ Preserve_trx_transfer_password_status
 preserved_trx_transfer_set_runtime_password(
     const unsigned char *password, size_t password_length) {
   const Preserve_trx_transfer_password_status role_status =
-      transfer_runtime_password_role_status();
+      transfer_runtime_password_source_mode_status();
   if (role_status != Preserve_trx_transfer_password_status::OK) {
     return role_status;
   }
@@ -12676,7 +12671,7 @@ preserved_trx_transfer_set_runtime_password(
 Preserve_trx_transfer_password_status
 preserved_trx_transfer_clear_runtime_password() {
   const Preserve_trx_transfer_password_status role_status =
-      transfer_runtime_password_role_status();
+      transfer_runtime_password_source_mode_status();
   if (role_status != Preserve_trx_transfer_password_status::OK) {
     return role_status;
   }
@@ -16802,13 +16797,11 @@ static Preserve_trx_transfer_status send_receiver_commit_accepted_ack(
 
 void preserve_trx_transfer_dispatch_command(THD *thd) {
   /*
-    The classic command is intentionally invisible unless Preserve/Resume and
-    the receiver endpoint are enabled at startup. The source-side transfer
-    switch controls artifact generation and sending on a primary; a standby may
-    run as a receiver-only endpoint.
+    The classic command is intentionally invisible unless Preserve/Resume is
+    enabled. HA role admission belongs to the caller; this endpoint still
+    enforces its dedicated global privilege and all transfer protocol checks.
   */
-  if (thd == nullptr || !preserve_trx_is_enabled() ||
-      !preserve_trx_transfer_receiver_enable) {
+  if (thd == nullptr || !preserve_trx_is_enabled()) {
     my_error(ER_UNKNOWN_COM_ERROR, MYF(0));
     return;
   }

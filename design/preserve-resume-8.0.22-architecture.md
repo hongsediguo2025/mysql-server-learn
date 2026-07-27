@@ -706,17 +706,17 @@ DRAIN TRANSACTIONS PRESERVE
 | Drain 与并行 | `preserve_trx_drain_mode`、`drain_grace_ms`、`batch_max_transactions`、`parallel_preserve_threads` | 软/硬 drain、目标数、关闭窗口与 worker 数。 |
 | Warmcopy | `preserve_trx_warmcopy_enable`、`lock_warmcopy_enable`、`lock_warmcopy_max_memory_bytes`、`lock_warmcopy_seal_threads` | binlog/record-lock phase1、尾部预算、journal 与 seal 并发。 |
 | 临时表 | `preserve_trx_temp_table_enable`、`max_temp_sidecar_bytes` | 用户临时表物理 preserve 与 sidecar 容量。 |
-| Transfer endpoint | `preserve_trx_transfer_receiver_enable`、`allowed_source_uuid`、`target_server_uuid`、`target_host/port/socket/user` | 接收端启用、端点身份、发送目标与连接方式。 |
+| Transfer endpoint | `allowed_source_uuid`、`target_server_uuid`、`target_host/port/socket/user` | 端点身份、发送目标与连接方式。接收端角色由外部 HA 校验，不由 Preserve sysvar 判定。 |
 | Transfer 安全/流控 | `credential_name`、`credential_secret_file`、`chunk_bytes`、`max_inflight_bytes`、`commit_timeout_ms` | 凭据、frame 大小、在途字节与 ACK/commit 超时。 |
 | Receiver / promotion | `transfer_receiver_workers`、`promotion_gate_batch_tokens`、`promotion_gate_workers`、`promotion_gate_timeout_ms` | 异步 apply/prewarm 并发与晋升门批量执行预算。 |
 
-`preserve_trx_transfer_receiver_enable` 和 transfer artifact mode 属于 startup-only 选项。
+Transfer artifact mode 属于 startup-only 选项。
 接管新环境时应从实际部署配置读取默认值和容量，不要只凭 sysvar 名称推断生产策略。
 
 ### 15.3 权限与可见性
 
 - Batch drain 属于 shutdown 级管理动作，走 `SHUTDOWN` 权限检查。
-- Transfer classic command 只有在总开关和 receiver startup option 都开启时才可用，并要求动态权限 `PRESERVE_TRX_TRANSFER_ADMIN`。
+- Transfer classic command 在总开关开启时可用，并要求动态权限 `PRESERVE_TRX_TRANSFER_ADMIN`；主备角色和命令时序由外部 HA 在调用前校验。
 - 普通 resume 默认要求 token owner；动态权限 `RESUME_ANY_PRESERVED_TRANSACTION` 可跨账号接管，但仍会重新检查涉及 schema/table/routine/trigger/MDL 对象的权限。
 - PFS/SHOW 默认只显示本账号 token；`PROCESS` 或 resume-any 权限可查看更多行。没有 `PROCESS` 时 token 在结果中会被脱敏。
 - Transfer credential 优先使用命名 credential，后备 secret file；文件读取使用 no-follow，要求普通文件、owner 为当前 euid，且 group/other 无权限。

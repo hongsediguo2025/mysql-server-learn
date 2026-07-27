@@ -1898,7 +1898,7 @@ HA 丢弃并重建 standby/实例；destructive abandon 必须显式授权并留
 | 能力 | 参数/门 |
 |---|---|
 | 总特性 | `preserve_trx_enable`，startup-only |
-| Receiver | `preserve_trx_transfer_receiver_enable` |
+| Receiver | 不设置 Preserve 角色开关；外部 HA 负责角色准入，receiver 入口校验权限、epoch、fact、digest、LSN 与 ownership |
 | Memory | `preserve_trx_memory_budget_bytes` / `_per_token_bytes` |
 | Gate batch/concurrency/deadline | 现有 `preserve_trx_promotion_gate_*` |
 | Strict metadata-only | 非 public sysvar；生产只允许 production physical lease provider + explicit internal policy；测试只允许隔离的 same-instance attach 或 online receiver simulator policy |

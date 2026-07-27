@@ -8,6 +8,12 @@ DROP TABLE IF EXISTS t_batch_packet_before_dispatch;
 
 SET GLOBAL preserve_trx_enable=ON;
 
+--disable_query_log
+CREATE USER preserve_trx_ha_admin@localhost;
+GRANT SHUTDOWN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+--enable_query_log
+
 CREATE TABLE t_batch_packet_before_dispatch(
   id INT PRIMARY KEY,
   v INT
@@ -15,6 +21,10 @@ CREATE TABLE t_batch_packet_before_dispatch(
 
 --connect(batch_packet_app,localhost,root,,test)
 --connection batch_packet_app
+--disable_query_log
+SET DEBUG_SYNC =
+  'preserve_trx_closing_packet_waiting_for_initial_targets SIGNAL batch_packet_waiting';
+--enable_query_log
 SET DEBUG_SYNC =
   'preserve_trx_after_command_read_before_packet_marker SIGNAL batch_packet_read WAIT_FOR continue_batch_packet';
 --send START TRANSACTION; INSERT INTO t_batch_packet_before_dispatch VALUES(1,10)
@@ -22,13 +32,25 @@ SET DEBUG_SYNC =
 --connection default
 SET DEBUG_SYNC = 'now WAIT_FOR batch_packet_read TIMEOUT 10';
 
+--connect(batch_packet_control,localhost,preserve_trx_ha_admin,,test)
 --connect(batch_packet_owner,localhost,root,,test)
 --connection batch_packet_owner
+--disable_query_log
+SET DEBUG_SYNC =
+  'preserve_trx_warmcopy_after_closing_state_before_targets SIGNAL batch_packet_closing WAIT_FOR continue_batch_packet_targets';
+--enable_query_log
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
 
---connection default
+--connection batch_packet_control
+--disable_query_log
+SET DEBUG_SYNC = 'now WAIT_FOR batch_packet_closing TIMEOUT 10';
+--enable_query_log
 SET DEBUG_SYNC = 'now SIGNAL continue_batch_packet';
+--disable_query_log
+SET DEBUG_SYNC = 'now WAIT_FOR batch_packet_waiting TIMEOUT 1';
+SET DEBUG_SYNC = 'now SIGNAL continue_batch_packet_targets';
+--enable_query_log
 
 --connection batch_packet_app
 --reap
@@ -37,6 +59,7 @@ SET DEBUG_SYNC = 'now SIGNAL continue_batch_packet';
 --reap
 --disconnect batch_packet_owner
 --disconnect batch_packet_app
+--disconnect batch_packet_control
 
 --connection default
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
@@ -57,4 +80,7 @@ COMMIT;
 SELECT * FROM t_batch_packet_before_dispatch;
 
 DROP TABLE t_batch_packet_before_dispatch;
+--disable_query_log
+DROP USER preserve_trx_ha_admin@localhost;
+--enable_query_log
 SET GLOBAL preserve_trx_enable=ON;

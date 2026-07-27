@@ -2892,30 +2892,22 @@ std::string test_transfer_token_string(uint64_t token) {
 
 class Transfer_receiver_config_guard {
  public:
-  Transfer_receiver_config_guard()
-      : m_preserve_enable(preserve_trx_enable),
-        m_receiver_enable(preserve_trx_transfer_receiver_enable) {}
+  Transfer_receiver_config_guard() : m_preserve_enable(preserve_trx_enable) {}
 
   ~Transfer_receiver_config_guard() {
     preserve_trx_set_enable_value(m_preserve_enable);
-    preserve_trx_transfer_receiver_enable = m_receiver_enable;
   }
 
-  void allow() {
-    preserve_trx_set_enable_value(true);
-    preserve_trx_transfer_receiver_enable = true;
-  }
+  void allow() { preserve_trx_set_enable_value(true); }
 
  private:
   bool m_preserve_enable;
-  bool m_receiver_enable;
 };
 
 class Transfer_source_config_guard {
  public:
   Transfer_source_config_guard()
       : m_preserve_enable(preserve_trx_enable),
-        m_receiver_enable(preserve_trx_transfer_receiver_enable),
         m_mode(preserve_trx_transfer_artifact_mode),
         m_target_host(preserve_trx_transfer_target_host),
         m_target_port(preserve_trx_transfer_target_port),
@@ -2927,7 +2919,6 @@ class Transfer_source_config_guard {
 
   ~Transfer_source_config_guard() {
     preserve_trx_set_enable_value(m_preserve_enable);
-    preserve_trx_transfer_receiver_enable = m_receiver_enable;
     preserve_trx_transfer_artifact_mode = m_mode;
     preserve_trx_transfer_target_host = m_target_host;
     preserve_trx_transfer_target_port = m_target_port;
@@ -2939,7 +2930,6 @@ class Transfer_source_config_guard {
 
   void standby_mode() {
     preserve_trx_set_enable_value(true);
-    preserve_trx_transfer_receiver_enable = false;
     preserve_trx_transfer_artifact_mode =
         PRESERVE_TRX_TRANSFER_ARTIFACT_STANDBY_TRANSFER_SAVE;
   }
@@ -4181,6 +4171,72 @@ TEST_F(PreservedTrxCommandRead, CommandPacketMarkerConsumeIsIdempotent) {
 
   EXPECT_FALSE(preserved_trx_consume_inflight_command_packet(target, COM_QUERY));
   EXPECT_EQ(0U, target->preserve_trx_inflight_unknown_query_depth);
+}
+
+TEST_F(PreservedTrxCommandRead,
+       PacketReceivedBeforeClosingKeepsPendingCommandAdmission) {
+  THD *target = thd();
+  auto restore_state = create_scope_guard([target] {
+    (void)preserved_trx_consume_inflight_command_packet(target, COM_QUERY);
+    mysql_mutex_lock(&target->LOCK_thd_data);
+    target->preserve_trx_batch_state = Preserve_trx_batch_thd_state::NONE;
+    target->preserve_trx_command_packet_before_closing.store(
+        false, std::memory_order_release);
+    mysql_mutex_unlock(&target->LOCK_thd_data);
+    preserved_trx_set_manager_state_for_unit_test(
+        Preserve_trx_manager_state::IDLE, 0);
+  });
+
+  preserve_trx_set_enable_value(true);
+  preserved_trx_set_manager_state_for_unit_test(
+      Preserve_trx_manager_state::WARMCOPY_DRAINING, 0);
+  ASSERT_TRUE(preserved_trx_begin_command_read(target));
+  ASSERT_TRUE(preserved_trx_end_idle_for_command_packet(target));
+  ASSERT_TRUE(preserved_trx_mark_inflight_command_packet(target, COM_QUERY));
+  EXPECT_TRUE(target->preserve_trx_command_packet_before_closing.load(
+      std::memory_order_acquire));
+
+  mysql_mutex_lock(&target->LOCK_thd_data);
+  target->preserve_trx_batch_state =
+      Preserve_trx_batch_thd_state::PENDING_QUIESCE;
+  mysql_mutex_unlock(&target->LOCK_thd_data);
+  preserved_trx_set_manager_state_for_unit_test(
+      Preserve_trx_manager_state::WARMCOPY_CLOSING, 0);
+
+  EXPECT_EQ(Preserve_trx_command_block_result::ALLOW,
+            preserved_trx_protocol_command_block_result(target, COM_QUERY));
+}
+
+TEST_F(PreservedTrxCommandRead,
+       PacketReceivedAfterClosingCannotUsePendingCommandAdmission) {
+  THD *target = thd();
+  auto restore_state = create_scope_guard([target] {
+    (void)preserved_trx_consume_inflight_command_packet(target, COM_QUERY);
+    mysql_mutex_lock(&target->LOCK_thd_data);
+    target->preserve_trx_batch_state = Preserve_trx_batch_thd_state::NONE;
+    target->preserve_trx_command_packet_before_closing.store(
+        false, std::memory_order_release);
+    mysql_mutex_unlock(&target->LOCK_thd_data);
+    preserved_trx_set_manager_state_for_unit_test(
+        Preserve_trx_manager_state::IDLE, 0);
+  });
+
+  preserve_trx_set_enable_value(true);
+  preserved_trx_set_manager_state_for_unit_test(
+      Preserve_trx_manager_state::WARMCOPY_CLOSING, 0);
+  ASSERT_TRUE(preserved_trx_begin_command_read(target));
+  ASSERT_TRUE(preserved_trx_end_idle_for_command_packet(target));
+  ASSERT_TRUE(preserved_trx_mark_inflight_command_packet(target, COM_QUERY));
+  EXPECT_FALSE(target->preserve_trx_command_packet_before_closing.load(
+      std::memory_order_acquire));
+
+  mysql_mutex_lock(&target->LOCK_thd_data);
+  target->preserve_trx_batch_state =
+      Preserve_trx_batch_thd_state::PENDING_QUIESCE;
+  mysql_mutex_unlock(&target->LOCK_thd_data);
+
+  EXPECT_EQ(Preserve_trx_command_block_result::BLOCK_CLOSING_DRAINED,
+            preserved_trx_protocol_command_block_result(target, COM_QUERY));
 }
 
 TEST_F(PreservedTrxCommandRead,
@@ -6908,7 +6964,8 @@ TEST(PreservedTrxTransfer, ConfiguredFrameSinkUsesClientOpsByDefault) {
   EXPECT_EQ(1, client_state.disconnect_count);
 }
 
-TEST(PreservedTrxTransfer, RuntimePasswordRejectsInvalidInputAndWrongRole) {
+TEST(PreservedTrxTransfer,
+     RuntimePasswordRejectsInvalidInputAndInactiveSourceMode) {
   Transfer_source_config_guard config;
   config.tcp("127.0.0.1", 3307, "transfer_user",
              "transfer_credential");
@@ -6934,7 +6991,8 @@ TEST(PreservedTrxTransfer, RuntimePasswordRejectsInvalidInputAndWrongRole) {
             preserved_trx_transfer_set_runtime_password(
                 valid_password, sizeof(valid_password) - 1));
   preserve_trx_set_enable_value(true);
-  preserve_trx_transfer_receiver_enable = true;
+  preserve_trx_transfer_artifact_mode =
+      PRESERVE_TRX_TRANSFER_ARTIFACT_LOCAL_CARRIER;
   EXPECT_EQ(Preserve_trx_transfer_password_status::WRONG_ROLE,
             preserved_trx_transfer_set_runtime_password(
                 valid_password, sizeof(valid_password) - 1));
@@ -7564,21 +7622,13 @@ TEST(PreservedTrxTransfer, CredentialSecretFileRejectsSymlinkAndDirectory) {
   my_delete(secret_path, MYF(0));
 }
 
-TEST(PreservedTrxTransfer, ReceiverPolicyRequiresEnable) {
+TEST(PreservedTrxTransfer, ReceiverManifestValidationIsRoleAgnostic) {
   Preserve_trx_transfer_manifest manifest;
-  manifest.epoch_id = "epoch-1";
+  manifest.epoch_id = "epoch-role-agnostic";
   manifest.token = 101;
 
-  const bool old_receiver_enable = preserve_trx_transfer_receiver_enable;
-  preserve_trx_transfer_receiver_enable = false;
-  EXPECT_EQ(Preserve_trx_transfer_status::UNSUPPORTED,
-            preserve_trx_transfer_validate_receiver_manifest(manifest));
-
-  preserve_trx_transfer_receiver_enable = true;
   EXPECT_EQ(Preserve_trx_transfer_status::OK,
             preserve_trx_transfer_validate_receiver_manifest(manifest));
-
-  preserve_trx_transfer_receiver_enable = old_receiver_enable;
 }
 
 TEST(PreservedTrxTransfer, ProtocolCommandNameIsRegistered) {

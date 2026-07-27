@@ -1607,9 +1607,15 @@ die "dispatch_command must run preserve protocol command gate before the protoco
          $protocol_gate_pos < $dispatch_switch_pos &&
          $dispatch_command =~ /ER_PRESERVE_TRX_UNSUPPORTED/s &&
          $dispatch_command =~ /ER_PRESERVE_TRX_SESSION_DRAINED/s;
+die "CLOSING protocol gate must admit pending packets only when they arrived before the closing cutoff\n"
+  unless $protocol_command_gate =~
+         /batch_state\s*==\s*Preserve_trx_batch_thd_state::PENDING_QUIESCE[\s\S]*batch_inflight_statement[\s\S]*command_packet_before_closing[\s\S]*return\s+Preserve_trx_command_block_result::ALLOW/s;
+die "CLOSING protocol gate must wait for initial target classification before deciding an unclassified old packet\n"
+  unless $protocol_command_gate =~
+         /command_packet_before_closing[\s\S]*batch_state\s*==\s*Preserve_trx_batch_thd_state::NONE[\s\S]*g_closing_target_classification_mutex[\s\S]*continue\s*;/s;
 die "CLOSING protocol gate must default-deny every command except protocol-defined no-response cleanup\n"
   unless $protocol_command_gate =~
-         /if\s*\(closing_command_gate_active\)\s*\{\s*if\s*\(preserve_trx_protocol_command_is_no_response_cleanup\(command\)\)\s*return\s+Preserve_trx_command_block_result::ALLOW\s*;\s*return\s+Preserve_trx_command_block_result::BLOCK_CLOSING_DRAINED\s*;\s*\}/s;
+         /if\s*\(preserve_trx_protocol_command_is_no_response_cleanup\(command\)\)\s*return\s+Preserve_trx_command_block_result::ALLOW\s*;\s*return\s+Preserve_trx_command_block_result::BLOCK_CLOSING_DRAINED\s*;/s;
 $preserve =~
   /static bool preserve_trx_protocol_command_is_no_response_cleanup\s*\([^\{]*\)\s*\{([\s\S]*?)^}/m
   or die "could not isolate CLOSING no-response cleanup allowlist\n";
@@ -3015,9 +3021,13 @@ die "process-local snapshot removal must propagate deferred directory fsync with
            /delete_snapshot_files_with_status[\s\S]{0,5200}!options\.defer_directory_fsync[\s\S]{0,500}fsync_directory/s;
 die "receiver restart must discard transfer state before ordinary recovery hooks\n"
   unless $mysqld =~
-         /if\s*\(!opt_initialize\s*&&\s*!is_help_or_validate_option\(\)\)[\s\S]{0,500}preserve_trx_transfer_cleanup_receiver_restart_state[\s\S]*preserved_trx_preflight_recoverability/s &&
-         $preserve =~
-         /preserved_trx_recover_all[\s\S]{0,500}preserve_trx_transfer_receiver_enable[\s\S]{0,220}return\s+false/s;
+         /if\s*\(!opt_initialize\s*&&\s*!is_help_or_validate_option\(\)\)[\s\S]{0,500}preserve_trx_transfer_cleanup_receiver_restart_state[\s\S]*preserved_trx_preflight_recoverability/s;
+die "receiver admission must not depend on a Preserve-owned HA role sysvar\n"
+  if $sys_vars =~ /preserve_trx_transfer_receiver_enable/s ||
+     $transfer =~ /preserve_trx_transfer_receiver_enable/s ||
+     $transfer_header =~ /preserve_trx_transfer_receiver_enable/s ||
+     $preserve =~ /preserve_trx_transfer_receiver_enable/s ||
+     $promotion =~ /preserve_trx_transfer_receiver_enable/s;
 die "receiver restart cleanup must run before InnoDB/core storage-engine initialization\n"
   unless $mysqld =~
          /preserve_trx_transfer_cleanup_receiver_restart_state[\s\S]{0,1500}plugin_register_builtin_and_init_core_se/s;
