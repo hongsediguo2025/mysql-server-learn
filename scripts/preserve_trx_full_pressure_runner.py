@@ -713,7 +713,10 @@ def build_e2e_command(
         "--max-phase2-total-ms",
         str(profile.source_phase2_limit_us // 1000),
         "--max-receiver-ready-after-phase2-ms",
-        "0",
+        str(
+            (profile.ready_after_final_spool_ack_limit_us + 999)
+            // 1000
+        ),
         "--source-datadir",
         str(paths.source_datadir),
         "--receiver-datadir",
@@ -733,7 +736,6 @@ def build_e2e_command(
         "--receiver-preserve-dir",
         str(paths.receiver_preserve_dir),
         "--receiver-physical-copy-before-drain",
-        "--standalone-transfer-accept-committed-not-ready",
         "--receiver-read-load-threads",
         str(profile.receiver_read_load_threads),
         "--receiver-read-load-baseline-seconds",
@@ -795,6 +797,7 @@ def build_e2e_command(
             command.remove(flag)
         lockset_index = command.index("--lockset-batch-size")
         del command[lockset_index : lockset_index + 2]
+        command.append("--standalone-transfer-accept-committed-not-ready")
         command.extend(mixed_arguments)
         return command
 
@@ -1152,18 +1155,24 @@ def build_acceptance_contract(
         }
     return {
         "source_phase2_total_us_max": profile.source_phase2_limit_us,
-        "receiver_readiness_contract": "COMMITTED_NOT_READY",
+        "receiver_readiness_contract": "READY",
         "receiver_epoch_storage": "PROCESS_LOCAL",
         "receiver_process_local_epoch_accepted": True,
         "receiver_epoch_fact_count": 0,
         "receiver_epoch_commit_count": 0,
-        "receiver_ready_after_final_spool_ack_us": 0,
-        "ready_tokens": 0,
+        "receiver_ready_after_final_spool_ack_us_max": (
+            profile.ready_after_final_spool_ack_limit_us
+        ),
+        "ready_tokens": profile.sessions,
         "not_ready_tokens": 0,
-        "prewarm_backlog_tokens": profile.sessions,
+        "prewarm_backlog_tokens": 0,
+        "receiver_epoch_ready_bind_attempts": 1,
         "record_lock_count_min": profile.sessions * profile.lockset_batch_size,
         "record_lock_page_count": 0,
         "record_lock_resident_pages": 0,
+        "record_lock_plan_epoch_peak_bytes_min": 1,
+        "record_lock_required_residency_bytes": 0,
+        "record_lock_reserved_residency_bytes": 0,
         "record_lock_cold_gets": 0,
         "phase2_transfer_bulk_bytes": 0,
         "strict_record_index_page_reads": 0,
@@ -1710,7 +1719,7 @@ def validate_e2e_report(
     require_equal("physical_replication", False)
     require_equal("production_provider", False)
     require_equal("write_enable_exercised", False)
-    require_equal("receiver_readiness_contract", "COMMITTED_NOT_READY")
+    require_equal("receiver_readiness_contract", "READY")
     require_equal("workload_sessions", profile.sessions)
     require_equal("workload_table_count", profile.tables)
     require_equal("workload_statements_per_tx", profile.statements_per_tx)
@@ -1719,11 +1728,11 @@ def validate_e2e_report(
         profile.seed_rows_per_table_per_session,
     )
     require_equal("workload_lockset_batch_size", profile.lockset_batch_size)
-    require_equal("standby_tokens", 0)
-    require_equal("receiver_ready_tokens", 0)
+    require_equal("standby_tokens", profile.sessions)
+    require_equal("receiver_ready_tokens", profile.sessions)
     require_equal("receiver_not_ready_tokens", 0)
     require_equal("receiver_record_cold_gets", 0)
-    require_equal("receiver_prewarm_backlog_at_phase2_end", profile.sessions)
+    require_equal("receiver_prewarm_backlog_at_phase2_end", 0)
     require_equal("phase2_transfer_bulk_bytes", 0)
     require_equal("receiver_record_object_prewarm_phase1_overlap", True)
     require_equal("receiver_epoch_fact_bound", True)
@@ -1731,7 +1740,7 @@ def validate_e2e_report(
     require_equal("receiver_process_local_epoch_accepted", True)
     require_equal("receiver_epoch_fact_count", 0)
     require_equal("receiver_epoch_commit_count", 0)
-    require_equal("receiver_epoch_ready_bind_attempts", 0)
+    require_equal("receiver_epoch_ready_bind_attempts", 1)
     require_equal("receiver_seal_prewarm_tokens", profile.sessions)
     require_equal("receiver_seal_prewarm_success_tokens", profile.sessions)
     require_equal("receiver_record_object_prewarm_count", profile.sessions)
@@ -1800,16 +1809,24 @@ def validate_e2e_report(
         failures.append(
             f"source_phase2_total_us: limit={profile.source_phase2_limit_us} actual={phase2_us}"
         )
-    if ready_us != 0:
+    if ready_us <= 0 or (
+        ready_us > profile.ready_after_final_spool_ack_limit_us
+    ):
         failures.append(
             "receiver_ready_after_final_spool_ack_us: "
-            f"expected=0 actual={ready_us}"
+            f"expected_range=(0,{profile.ready_after_final_spool_ack_limit_us}] "
+            f"actual={ready_us}"
         )
     expected_record_locks = profile.sessions * profile.lockset_batch_size
     if record_locks < expected_record_locks:
         failures.append(
             "phase2_record_lock_count_samples: "
             f"minimum={expected_record_locks} actual={record_locks}"
+        )
+    if lock_plan_peak <= 0:
+        failures.append(
+            "receiver_lock_plan_epoch_peak_bytes: "
+            f"expected_positive actual={lock_plan_peak}"
         )
     if lock_plan_peak > lock_plan_cap:
         failures.append(

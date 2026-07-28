@@ -133,6 +133,24 @@ die "could not find Warmcopy_batch_blob_provider::finalize_for_preserve end\n"
   if $finalize_end < 0;
 my $finalize_body = substr($provider_body, $finalize_start,
                            $finalize_end - $finalize_start);
+my $finalizer_admission =
+  index($finalize_body, '++m_active_finalizers');
+my $finalizer_guard =
+  index($finalize_body, 'create_scope_guard', $finalizer_admission);
+my $finalizer_work =
+  index($finalize_body,
+        'mysql_binlog_preserve_warmcopy_finalize_session',
+        $finalizer_admission);
+die "warmcopy finalizer admission must install exception cleanup before work\n"
+  if $finalizer_admission < 0 || $finalizer_guard < 0 ||
+     $finalizer_work < 0 || $finalizer_guard > $finalizer_work;
+my $finalizer_cleanup =
+  substr($finalize_body, $finalizer_guard,
+         $finalizer_work - $finalizer_guard);
+die "warmcopy finalizer exception cleanup must restore state, count, and waiters\n"
+  unless $finalizer_cleanup =~ /finalizing\s*=\s*false/s &&
+         $finalizer_cleanup =~ /--m_active_finalizers/s &&
+         $finalizer_cleanup =~ /m_condition\.notify_all\s*\(\s*\)/s;
 die "tail budget guard must prevent full-copy rebuild during phase2\n"
   if $finalize_body =~ /mysql_binlog_preserve_warmcopy_build_blob\s*\(/s;
 die "tail budget guard must not scan the whole warm blob for digest during phase2\n"

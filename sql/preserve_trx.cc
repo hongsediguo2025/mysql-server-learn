@@ -7243,6 +7243,7 @@ class Warmcopy_batch_blob_provider final : public PreserveBinlogBlobProvider {
     std::string warmcopy_id;
     bool preparing{false};
     bool rebuilding{false};
+    bool finalizing{false};
     bool rebuild_pending{false};
     uint64_t rebuild_incarnation{0};
     uint64_t reserved_size{0};
@@ -7294,7 +7295,8 @@ class Warmcopy_batch_blob_provider final : public PreserveBinlogBlobProvider {
     std::lock_guard<std::mutex> guard(m_mutex);
     const auto it = m_entries.find(thd->thread_id());
     return it != m_entries.end() && !it->second.preparing &&
-           !it->second.rebuilding && it->second.session != nullptr;
+           !it->second.rebuilding && !it->second.finalizing &&
+           it->second.session != nullptr;
   }
 
   bool prepare_quiesced_blob_for_thd(THD *thd, uint64_t epoch) {
@@ -7310,7 +7312,7 @@ class Warmcopy_batch_blob_provider final : public PreserveBinlogBlobProvider {
     std::lock_guard<std::mutex> guard(m_mutex);
     const auto it = m_entries.find(thd->thread_id());
     if (it == m_entries.end() || it->second.preparing ||
-        it->second.rebuilding ||
+        it->second.rebuilding || it->second.finalizing ||
         it->second.session == nullptr) {
       return false;
     }
@@ -7329,7 +7331,8 @@ class Warmcopy_batch_blob_provider final : public PreserveBinlogBlobProvider {
     std::lock_guard<std::mutex> guard(m_mutex);
     const auto it = m_entries.find(thd->thread_id());
     if (it == m_entries.end() || it->second.preparing ||
-        it->second.rebuilding || it->second.session == nullptr) {
+        it->second.rebuilding || it->second.finalizing ||
+        it->second.session == nullptr) {
       return false;
     }
     bool has_blob = false;
@@ -7351,7 +7354,7 @@ class Warmcopy_batch_blob_provider final : public PreserveBinlogBlobProvider {
     std::lock_guard<std::mutex> guard(m_mutex);
     const auto it = m_entries.find(thd->thread_id());
     if (it == m_entries.end() || it->second.preparing ||
-        it->second.rebuilding ||
+        it->second.rebuilding || it->second.finalizing ||
         it->second.session == nullptr || m_carrier == nullptr) {
       return false;
     }
@@ -7436,6 +7439,7 @@ class Warmcopy_batch_blob_provider final : public PreserveBinlogBlobProvider {
           elapsed_us == 0 ? 1 : elapsed_us);
       return status;
     };
+    ulonglong observed_close_deadline_us = 0;
     auto log_provider_failure = [&](const char *reason, uint64_t reserved_size,
                                     uint64_t finalized_size) {
       std::ostringstream message;
@@ -7448,7 +7452,7 @@ class Warmcopy_batch_blob_provider final : public PreserveBinlogBlobProvider {
               << m_total_bytes.load(std::memory_order_relaxed)
               << " max_total_bytes=" << m_max_total_bytes
               << " tail_budget=" << preserve_trx_warmcopy_tail_budget_bytes
-              << " close_deadline_us=" << m_close_deadline_us;
+              << " close_deadline_us=" << observed_close_deadline_us;
       LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG, message.str().c_str());
     };
 
@@ -7456,19 +7460,44 @@ class Warmcopy_batch_blob_provider final : public PreserveBinlogBlobProvider {
       log_provider_failure("invalid argument", 0, 0);
       return finish(Preserve_snapshot_status::INVALID_ARGUMENT);
     }
-    std::lock_guard<std::mutex> guard(m_mutex);
-    auto it = m_entries.find(thd->thread_id());
-    if (it == m_entries.end() || it->second.preparing ||
-        it->second.rebuilding) {
-      log_provider_failure("entry missing or still preparing", 0, 0);
-      return finish(Preserve_snapshot_status::INVALID_ARGUMENT);
+    DEBUG_SYNC(thd, "preserve_trx_warmcopy_before_finalize_admission");
+    Mysql_binlog_warmcopy_session *session = nullptr;
+    uint64_t admitted_reserved_size = 0;
+    {
+      std::lock_guard<std::mutex> guard(m_mutex);
+      observed_close_deadline_us = m_close_deadline_us;
+      auto it = m_entries.find(thd->thread_id());
+      if (it == m_entries.end() || it->second.preparing ||
+          it->second.rebuilding || it->second.finalizing) {
+        log_provider_failure("entry missing or busy", 0, 0);
+        return finish(Preserve_snapshot_status::INVALID_ARGUMENT);
+      }
+      Entry &entry = it->second;
+      session = entry.session;
+      admitted_reserved_size = entry.reserved_size;
+      if (session == nullptr) {
+        log_provider_failure("session missing", admitted_reserved_size, 0);
+        return finish(Preserve_snapshot_status::IO_ERROR);
+      }
+      entry.finalizing = true;
+      ++m_active_finalizers;
     }
-    Entry &entry = it->second;
-    Mysql_binlog_warmcopy_session *session = entry.session;
-    if (session == nullptr) {
-      log_provider_failure("session missing", entry.reserved_size, 0);
-      return finish(Preserve_snapshot_status::IO_ERROR);
-    }
+    bool finalizer_work_completed = false;
+    auto finalizer_cleanup = create_scope_guard([&] {
+      std::lock_guard<std::mutex> guard(m_mutex);
+      auto it = m_entries.find(thd->thread_id());
+      if (it != m_entries.end() && it->second.finalizing) {
+        it->second.finalizing = false;
+      } else {
+        m_error = true;
+      }
+      if (!finalizer_work_completed) m_error = true;
+      assert(m_active_finalizers != 0);
+      --m_active_finalizers;
+      m_condition.notify_all();
+    });
+
+    DEBUG_SYNC(thd, "preserve_trx_warmcopy_after_finalize_admission");
 
     bool has_final_blob = false;
     PrebuiltBinlogCacheBlob finalized;
@@ -7477,24 +7506,45 @@ class Warmcopy_batch_blob_provider final : public PreserveBinlogBlobProvider {
         thd, session, preserve_trx_warmcopy_tail_budget_bytes,
         context.receiver_prefix_published, context.receiver_prefix_bytes,
         &finalized, &has_final_blob, &retained_reservation_bytes);
-    if (finalize_failed || !has_final_blob) {
-      log_provider_failure(finalize_failed ? "session finalize failed"
-                                           : "session produced no final blob",
-                           entry.reserved_size, finalized.size);
-      return finish(Preserve_snapshot_status::IO_ERROR);
-    }
+    const bool finalized_blob_ready = !finalize_failed && has_final_blob;
     /*
       m_close_deadline_us bounds the admission-closing and quiesced-target
       preparation window.  Once phase-2 target preserve has started, rejecting a
-	      ready warmcopy artifact solely because that earlier deadline elapsed can
+      ready warmcopy artifact solely because that earlier deadline elapsed can
       turn a large but otherwise consistent batch into a cleanup failure.  The
       session finalize path itself is bounded by its tail budget and by the
       surrounding batch drain lifecycle.
     */
-    mysql_binlog_preserve_warmcopy_abort_session(session);
-    entry.reserved_size = retained_reservation_bytes;
-    entry.session = nullptr;
-    *blob = finalized;
+    bool ownership_valid = false;
+    {
+      std::lock_guard<std::mutex> guard(m_mutex);
+      auto it = m_entries.find(thd->thread_id());
+      if (it != m_entries.end() && it->second.finalizing &&
+          it->second.session == session) {
+        ownership_valid = true;
+        if (finalized_blob_ready) {
+          mysql_binlog_preserve_warmcopy_abort_session(session);
+          it->second.reserved_size = retained_reservation_bytes;
+          it->second.session = nullptr;
+          *blob = finalized;
+        }
+      } else {
+        m_error = true;
+      }
+    }
+    finalizer_work_completed = true;
+    finalizer_cleanup.rollback();
+    if (!ownership_valid) {
+      log_provider_failure("entry ownership changed during finalize",
+                           admitted_reserved_size, finalized.size);
+      return finish(Preserve_snapshot_status::IO_ERROR);
+    }
+    if (!finalized_blob_ready) {
+      log_provider_failure(finalize_failed ? "session finalize failed"
+                                           : "session produced no final blob",
+                           admitted_reserved_size, finalized.size);
+      return finish(Preserve_snapshot_status::IO_ERROR);
+    }
     return finish(Preserve_snapshot_status::OK);
   }
 
@@ -7538,7 +7588,8 @@ class Warmcopy_batch_blob_provider final : public PreserveBinlogBlobProvider {
   }
 
   void stop_mirroring_for_reset() {
-    std::lock_guard<std::mutex> guard(m_mutex);
+    std::unique_lock<std::mutex> guard(m_mutex);
+    m_condition.wait(guard, [&]() { return m_active_finalizers == 0; });
     for (auto &entry : m_entries) {
       mysql_binlog_preserve_warmcopy_stop_session_mirroring(
           entry.second.session);
@@ -7556,7 +7607,7 @@ class Warmcopy_batch_blob_provider final : public PreserveBinlogBlobProvider {
     std::lock_guard<std::mutex> guard(m_mutex);
     const auto it = m_entries.find(thd->thread_id());
     if (it == m_entries.end() || it->second.preparing ||
-        it->second.rebuilding) {
+        it->second.rebuilding || it->second.finalizing) {
       return false;
     }
     Mysql_binlog_warmcopy_session *const session = it->second.session;
@@ -7570,7 +7621,8 @@ class Warmcopy_batch_blob_provider final : public PreserveBinlogBlobProvider {
     std::lock_guard<std::mutex> guard(m_mutex);
     const auto it = m_entries.find(thd->thread_id());
     return it != m_entries.end() && !it->second.preparing &&
-           !it->second.rebuilding && it->second.session != nullptr &&
+           !it->second.rebuilding && !it->second.finalizing &&
+           it->second.session != nullptr &&
            (it->second.rebuild_pending ||
             mysql_binlog_preserve_warmcopy_session_stale_rebuildable(
                 it->second.session));
@@ -7639,7 +7691,8 @@ class Warmcopy_batch_blob_provider final : public PreserveBinlogBlobProvider {
       std::lock_guard<std::mutex> guard(m_mutex);
       const auto it = m_entries.find(thread_id);
       if (it == m_entries.end() || it->second.preparing ||
-          it->second.rebuilding || it->second.session == nullptr ||
+          it->second.rebuilding || it->second.finalizing ||
+          it->second.session == nullptr ||
           (!it->second.rebuild_pending &&
            !mysql_binlog_preserve_warmcopy_session_stale_rebuildable(
                it->second.session))) {
@@ -7675,7 +7728,7 @@ class Warmcopy_batch_blob_provider final : public PreserveBinlogBlobProvider {
       std::lock_guard<std::mutex> guard(m_mutex);
       auto it = m_entries.find(thread_id);
       if (it == m_entries.end() || it->second.preparing ||
-          it->second.rebuilding) {
+          it->second.rebuilding || it->second.finalizing) {
         return true;
       }
       Entry &entry = it->second;
@@ -7752,7 +7805,8 @@ class Warmcopy_batch_blob_provider final : public PreserveBinlogBlobProvider {
   }
 
   void cleanup_warm_artifacts() {
-    std::lock_guard<std::mutex> guard(m_mutex);
+    std::unique_lock<std::mutex> guard(m_mutex);
+    m_condition.wait(guard, [&]() { return m_active_finalizers == 0; });
     for (auto &entry : m_entries) {
       if (entry.second.session != nullptr) {
         mysql_binlog_preserve_warmcopy_abort_session(entry.second.session);
@@ -7781,6 +7835,7 @@ class Warmcopy_batch_blob_provider final : public PreserveBinlogBlobProvider {
   std::condition_variable m_condition;
   std::unordered_map<my_thread_id, Entry> m_entries;
   std::atomic<uint64_t> m_total_bytes{0};
+  size_t m_active_finalizers{0};
   ulonglong m_close_deadline_us{0};
   bool m_error{false};
   bool m_allow_quiesced_rebuild_fallback{false};
@@ -9111,7 +9166,10 @@ class Warmcopy_batch_drain_participant final
   }
 
   bool prepare_attached_target(THD *target, ulonglong close_deadline_us) {
-    if (!prepare_quiesced_target_impl(target, close_deadline_us, true)) {
+    const bool prepared =
+        prepare_quiesced_target_impl(target, close_deadline_us, true);
+    std::lock_guard<std::mutex> guard(m_observation_mutex);
+    if (!prepared) {
       mark_degraded("warm-copy attached target preparation failed");
       return false;
     }
@@ -9260,6 +9318,7 @@ class Warmcopy_batch_drain_participant final
   std::shared_ptr<Warmcopy_batch_blob_provider> m_provider;
   ulonglong m_closing_deadline_us{0};
   bool m_closed{false};
+  std::mutex m_observation_mutex;
   Preserve_trx_drain_participant_observation m_observation;
 };
 
@@ -17480,7 +17539,6 @@ bool Preserve_trx_drain_service::execute(
   const Preserve_trx_transfer_artifact_decision batch_artifact_decision =
       preserve_trx_transfer_artifact_decision_for_request(
           Preserve_trx_delivery_mode::BATCH_MANAGER_DELIVERY);
-  preserve_trx_transfer_reset_source_phase1_metrics();
   const bool standby_transfer_streaming_enabled =
       batch_artifact_decision ==
       Preserve_trx_transfer_artifact_decision::STANDBY_TRANSFER_SAVE;
@@ -17551,6 +17609,7 @@ bool Preserve_trx_drain_service::execute(
         thd->thread_id());
     if (!draining->active()) return preserve_trx_reject_unsupported();
   }
+  preserve_trx_transfer_reset_source_phase1_metrics();
   preserve_trx_phase1_readiness_reset_latest_metrics();
   const ulonglong phase1_readiness_started_us = preserve_trx_monotonic_us();
   const ulonglong phase1_readiness_deadline_us =
@@ -18688,7 +18747,6 @@ bool Preserve_trx_drain_service::execute(
     std::atomic<bool> worker_abort{false};
     std::atomic<bool> worker_init_failed{false};
     std::atomic<bool> worker_exception_failed{false};
-    std::mutex binlog_prepare_mutex;
     const uint preserve_worker_count =
         preserve_trx_effective_parallel_preserve_threads(target_ids.size(),
                                                          true);
@@ -18783,7 +18841,6 @@ bool Preserve_trx_drain_service::execute(
                         [&](THD *attached_target) -> const char * {
                   if (stop_for_reset()) return "batch_target_attach_reset";
                   if (warmcopy_participant != nullptr) {
-                    std::lock_guard<std::mutex> guard(binlog_prepare_mutex);
                     if (stop_for_reset()) return "batch_target_attach_reset";
                     if (!warmcopy_participant->prepare_attached_target(
                             attached_target, overall_close_deadline_us)) {

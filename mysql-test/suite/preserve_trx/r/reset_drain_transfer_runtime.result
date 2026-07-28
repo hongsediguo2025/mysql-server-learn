@@ -1,3 +1,9 @@
+SELECT @phase1_metrics_nonzero AS phase1_metrics_nonzero;
+phase1_metrics_nonzero
+1
+SELECT @phase1_metrics_preserved AS rejected_drain_kept_phase1_metrics;
+rejected_drain_kept_phase1_metrics
+1
 SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME='Preserve_trx_reset_drain_wins')
 - @reset_wins_before AS reset_winner_delta;

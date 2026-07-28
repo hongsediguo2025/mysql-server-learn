@@ -5792,14 +5792,19 @@ class WorkloadPlanTest(unittest.TestCase):
                 phase2_savepoint_live_export_target_count=0,
             )
         )
-        runner.wait_for_receiver_artifacts = mock.Mock(
+        runner.receiver_preserve_artifact_counts = mock.Mock(
             return_value={
-                "snapshot_tokens": 2,
-                "standby_pending_tokens": 2,
-                "external_blob_tokens": 2,
-                "epoch_fact_count": 1,
-                "epoch_commit_count": 1,
+                "snapshot_tokens": 0,
+                "standby_pending_tokens": 0,
+                "external_blob_tokens": 0,
+                "epoch_fact_count": 0,
+                "epoch_commit_count": 0,
             }
+        )
+        runner.wait_for_receiver_artifacts = mock.Mock(
+            side_effect=AssertionError(
+                "process-local READY must not wait for file-backed epoch facts"
+            )
         )
         runner.wait_for_receiver_readiness = mock.Mock(
             side_effect=lambda **_kwargs: calls.append("receiver_validated")
@@ -5814,7 +5819,8 @@ class WorkloadPlanTest(unittest.TestCase):
             runner.warmcopy_drain_metrics[0].lock_warmcopy_live_fallback_count(),
             3,
         )
-        runner.wait_for_receiver_artifacts.assert_called_once()
+        runner.wait_for_receiver_artifacts.assert_not_called()
+        runner.receiver_preserve_artifact_counts.assert_called_once()
         runner.wait_for_receiver_readiness.assert_called_once()
         self.assertLess(
             calls.index("receiver_validated"),
@@ -5904,7 +5910,12 @@ class WorkloadPlanTest(unittest.TestCase):
                 phase2_savepoint_live_export_target_count=0,
             )
         )
-        runner.wait_for_receiver_artifacts = mock.Mock(return_value={})
+        runner.receiver_preserve_artifact_counts = mock.Mock(return_value={})
+        runner.wait_for_receiver_artifacts = mock.Mock(
+            side_effect=AssertionError(
+                "process-local READY must not wait for file-backed epoch facts"
+            )
+        )
         runner.wait_for_receiver_readiness = mock.Mock()
         runner.write_standby_transfer_receiver_report = mock.Mock()
         runner.join_workers = mock.Mock()
@@ -6542,7 +6553,7 @@ class WorkloadPlanTest(unittest.TestCase):
                 expected_tokens=1
             )
 
-    def test_standby_transfer_process_local_report_does_not_claim_disk_fact(self):
+    def test_standby_transfer_process_local_ready_report_binds_memory_fact(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             report_path = Path(tmpdir) / "standby-transfer-process-local.json"
             runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
@@ -6552,7 +6563,6 @@ class WorkloadPlanTest(unittest.TestCase):
                 receiver_unix_socket="/tmp/receiver.sock",
                 receiver_preserve_dir=str(Path(tmpdir) / "preserve"),
                 report_json=str(report_path),
-                standalone_transfer_accept_committed_not_ready=True,
             ).validate()
             runner.warmcopy_drain_metrics = [
                 WarmcopyDrainMetrics(
@@ -6571,11 +6581,11 @@ class WorkloadPlanTest(unittest.TestCase):
                 "epoch_commit_count": 0,
             }
             runner.receiver_prewarm_metrics = ReceiverPrewarmMetrics(
-                auto_prewarm_tokens=0,
-                auto_prewarm_ready_tokens=0,
+                auto_prewarm_tokens=2,
+                auto_prewarm_ready_tokens=2,
                 auto_prewarm_not_ready_tokens=0,
-                auto_prewarm_last_status=9,
-                ready_monotonic_us=0,
+                auto_prewarm_last_status=0,
+                ready_monotonic_us=1_010_000,
                 first_frame_monotonic_us=1_000_000,
                 last_object_seal_monotonic_us=1_004_000,
                 prewarm_start_monotonic_us=1_001_000,
@@ -6588,8 +6598,9 @@ class WorkloadPlanTest(unittest.TestCase):
                 seal_prewarm_not_ready_tokens=0,
                 seal_prewarm_last_status=0,
                 final_spool_ack_monotonic_us=1_006_000,
-                prewarm_backlog_at_phase2_end=2,
+                prewarm_backlog_at_phase2_end=0,
                 object_prewarm_count=6,
+                epoch_ready_bind_attempts=1,
             )
 
             runner.write_standby_transfer_receiver_report(
@@ -6671,14 +6682,15 @@ class WorkloadPlanTest(unittest.TestCase):
                 full_copy_to_count=0,
                 phase2_total_ms=2.0,
                 phase2_end_monotonic_us=1_000_000,
+                source_phase2_transfer_final_metadata_ack_us=100,
             )
         ]
         runner.receiver_artifact_counts = {
             "snapshot_tokens": 0,
             "standby_pending_tokens": 0,
             "external_blob_tokens": 0,
-            "epoch_fact_count": 1,
-            "epoch_commit_count": 1,
+            "epoch_fact_count": 0,
+            "epoch_commit_count": 0,
         }
         runner.receiver_prewarm_metrics = ReceiverPrewarmMetrics(
             auto_prewarm_tokens=2,
@@ -6691,8 +6703,10 @@ class WorkloadPlanTest(unittest.TestCase):
             prewarm_start_monotonic_us=910_000,
             prewarm_end_monotonic_us=1_020_000,
             record_lock_page_count=4,
-            record_lock_resident_pages=4,
+            record_lock_resident_pages=0,
             record_lock_cold_page_gets=0,
+            record_lock_required_residency_bytes=0,
+            record_lock_reserved_residency_bytes=0,
             committed_epoch_fallback_count=0,
             seal_prewarm_tokens=2,
             seal_prewarm_success_tokens=2,
@@ -6700,6 +6714,8 @@ class WorkloadPlanTest(unittest.TestCase):
             seal_prewarm_last_status=0,
             ready_after_final_metadata_us=9_000,
             ready_after_final_spool_ack_us=240_000,
+            final_spool_ack_monotonic_us=1_001_000,
+            epoch_ready_bind_attempts=1,
         )
         runner.receiver_ready_after_source_phase2_end_us = 240_000
 
@@ -6922,7 +6938,7 @@ class WorkloadPlanTest(unittest.TestCase):
             expected_standby_pending=2
         )
 
-    def test_standby_transfer_receiver_readiness_gate_rejects_lockset_without_record_pages(
+    def test_standby_transfer_receiver_readiness_accepts_metadata_only_lock_plan(
         self,
     ):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
@@ -6967,15 +6983,26 @@ class WorkloadPlanTest(unittest.TestCase):
             record_lock_page_count=0,
             record_lock_resident_pages=0,
             record_lock_cold_page_gets=0,
+            lock_plan_epoch_peak_bytes=8192,
+            lock_plan_subpool_cap_bytes=16384,
             seal_prewarm_tokens=2,
             seal_prewarm_success_tokens=2,
             seal_prewarm_not_ready_tokens=0,
             seal_prewarm_last_status=0,
+            record_object_prewarm_count=2,
             ready_after_final_metadata_us=5_000,
         )
         runner.receiver_ready_after_source_phase2_end_us = 10_000
 
-        with self.assertRaisesRegex(AssertionError, "record-lock page evidence"):
+        runner.validate_standby_transfer_receiver_readiness(
+            expected_standby_pending=2
+        )
+
+        runner.receiver_prewarm_metrics = replace(
+            runner.receiver_prewarm_metrics,
+            lock_plan_epoch_peak_bytes=0,
+        )
+        with self.assertRaisesRegex(AssertionError, "lock-plan evidence"):
             runner.validate_standby_transfer_receiver_readiness(
                 expected_standby_pending=2
             )

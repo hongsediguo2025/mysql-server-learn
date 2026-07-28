@@ -412,6 +412,55 @@ terminal CAS 合同固定为：
 | `CORRUPT` | `CORRUPT` | `CORRUPT` | `CORRUPT` |
 | 同进程 registry 不存在该 epoch | `EPOCH_NOT_FOUND` | `EPOCH_NOT_FOUND` | `EPOCH_NOT_FOUND`，不得直接推导 `NOT_COMMITTED_CLEAN` |
 
+为消除 final sealed 检查与 accepted-epoch 发布之间的并发 mutation 窗口，
+receiver registry 在上述唯一 terminal CAS 内增加一个仅内部可见的过渡态：
+
+```text
+OPEN
+  -> COMMIT_ADMITTED(sequence, encoded_frame_digest)
+  -> COMMITTED
+
+OPEN
+  -> ABANDONING
+  -> NOT_COMMITTED_CLEAN
+
+COMMIT_ADMITTED
+  -> CORRUPT
+  -> COMMITTED
+```
+
+`COMMIT_ADMITTED` 不增加 wire enum、SQL 状态或 GLOBAL STATUS，也不改变
+physical promotion bootstrap/adopt 接口。其合同为：
+
+- COMMIT sequence 准入与 ABANDON 共用 receiver registry 的同一 mutex 和同一
+  `Acknowledged_epoch`；不得建立第二个 terminal map；
+- `OPEN -> COMMIT_ADMITTED` 的 CAS 必须一次冻结 preserve root、receiver
+  process generation/nonce、authenticated principal、final-fact digest、
+  receiver 本地 CAS 时刻和 accepted retention deadline；不得等 semantic apply
+  或 `publish_accepted_epoch()` 时再补写这些 ownership facts；
+- 同 sequence、同 encoded-frame digest 的 retry 是幂等请求；sequence 或 digest
+  不同进入 `CORRUPT`；
+- COMMIT admission 胜出后拒绝 higher-sequence mutating frame；在 cutoff 前已
+  admitted 的 lower-sequence frame 可以完成 apply；
+- lower-sequence apply 完成后，registry 在同一临界区校验全部 required token 和
+  sealed object，并复制唯一 authoritative record snapshot；final fact 只能从该
+  snapshot 构造，不能再次扫描可变 registry；
+- `QUERY_EPOCH_STATUS` 将 `COMMIT_ADMITTED` 投影为 `NOT_COMMITTED`，绝不能
+  投影为 `NOT_COMMITTED_CLEAN`；ABANDON 必须输给已经取得 admission 的 COMMIT；
+- manifest、fact、sequence 或 digest 不一致时进入 `CORRUPT`；临时资源不足保留
+  `COMMIT_ADMITTED`，只允许 exact retry；
+- `publish_accepted_epoch()` 必须再次核对 admission 时冻结的 receiver generation
+  和 final-fact digest，完全一致才允许 `COMMIT_ADMITTED -> COMMITTED`；
+- COMMIT 已经进入 `COMMITTED` 后收到同 sequence、同 frame digest、同
+  final-fact digest 的 exact retry，receiver 不重复 semantic apply，但必须返回
+  同一 `COMMITTED_NOT_READY` ACK；不能因 sequence 已标记 applied 而静默成功；
+- COMMIT token 缺失、状态非法或 authoritative snapshot 失败时，terminal 和该
+  epoch 尚存的 receiver records 必须一起进入 fail-closed/corrupt cleanup，不能
+  留下永远停在 `RECEIVING` 的 sibling token；
+- expiry、cleanup 和 retry 均不得把 `COMMIT_ADMITTED` 重新开放为 `OPEN`；
+  accepted epoch 即使晚于 terminal tombstone retention 仍存活，也禁止再次建立
+  同 epoch 的 COMMIT admission。
+
 COMMIT 与 ABANDON 并发时只有一个 CAS 能胜出：COMMIT 胜出后 cleanup 不得删除
 committed epoch；ABANDON 胜出并完成 cleanup 后，迟到的 COMMIT 不得复活 epoch。
 所有重复请求必须匹配 principal、process nonce、epoch 和 final-fact digest；

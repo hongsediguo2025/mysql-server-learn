@@ -91,6 +91,8 @@ SET @receiver_expired_before=(
 
 --connect(reset_runtime_owner,localhost,root,,test)
 SET DEBUG_SYNC=
+  'preserve_trx_transfer_after_phase1_binlog_stream SIGNAL reset_runtime_phase1_streamed WAIT_FOR reset_runtime_phase1_release';
+SET DEBUG_SYNC=
   'preserve_trx_warmcopy_after_closing_state_before_targets SIGNAL reset_runtime_phase2_entered WAIT_FOR reset_runtime_phase2_release';
 SET DEBUG_SYNC=
   'preserve_trx_batch_after_targets_quiesced_before_attach SIGNAL reset_runtime_targets_quiesced WAIT_FOR reset_runtime_targets_release';
@@ -103,6 +105,34 @@ SET DEBUG_SYNC=
 --send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300 WITH USER VARS
 
 --connection reset_runtime_ha
+SET DEBUG_SYNC='now WAIT_FOR reset_runtime_phase1_streamed TIMEOUT 30';
+SET @phase1_frame_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME='Preserve_trx_transfer_phase1_frame_count');
+SET @phase1_send_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME='Preserve_trx_transfer_phase1_network_send_count');
+SET @phase1_batch_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME='Preserve_trx_transfer_phase1_batch_count');
+--disable_result_log
+--error ER_PRESERVE_TRX_UNSUPPORTED
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+--enable_result_log
+SET @phase1_metrics_nonzero=
+  @phase1_frame_before>0 AND @phase1_send_before>0 AND
+  @phase1_batch_before>0;
+SET @phase1_metrics_preserved=
+  @phase1_frame_before=(
+    SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+    WHERE VARIABLE_NAME='Preserve_trx_transfer_phase1_frame_count') AND
+  @phase1_send_before=(
+    SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+    WHERE VARIABLE_NAME='Preserve_trx_transfer_phase1_network_send_count') AND
+  @phase1_batch_before=(
+    SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+    WHERE VARIABLE_NAME='Preserve_trx_transfer_phase1_batch_count');
+SET DEBUG_SYNC='now SIGNAL reset_runtime_phase1_release';
 SET DEBUG_SYNC='now WAIT_FOR reset_runtime_phase2_entered TIMEOUT 30';
 --let $wait_condition= SELECT COUNT(*)=0 FROM performance_schema.threads WHERE PROCESSLIST_USER='preserve_trx_ha_admin' AND PROCESSLIST_ID<>CONNECTION_ID() AND PROCESSLIST_COMMAND<>'Sleep'
 --source include/wait_condition.inc
@@ -196,6 +226,10 @@ COMMIT;
 --source include/wait_condition.inc
 
 --enable_query_log
+--connection reset_runtime_ha
+SELECT @phase1_metrics_nonzero AS phase1_metrics_nonzero;
+SELECT @phase1_metrics_preserved AS rejected_drain_kept_phase1_metrics;
+--connection default
 SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
         WHERE VARIABLE_NAME='Preserve_trx_reset_drain_wins')
        - @reset_wins_before AS reset_winner_delta;

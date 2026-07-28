@@ -322,6 +322,8 @@ die "standby receiver SEAL_OBJECT path must enqueue object/staged prewarm instea
          $receiver_apply_frame =~ /enqueue_receiver_staged_token_prewarm/s;
 die "standby receiver COMMIT_EPOCH path must not launch committed-epoch cold prewarm\n"
   if $receiver_apply_frame =~ /enqueue_receiver_committed_epoch_prewarm/s;
+die "obsolete committed-epoch automatic prewarm job must not remain compiled\n"
+  if $transfer =~ /Receiver_prewarm_job_kind\s*::\s*COMMITTED_EPOCH|run_receiver_committed_epoch_prewarm_job|enqueue_receiver_committed_epoch_prewarm/s;
 my ($declare_object_apply) =
   $receiver_apply_frame =~ /(if \(frame\.type == Preserve_trx_transfer_frame_type::DECLARE_OBJECT\)[\s\S]*?(?=\n  if \(frame\.type == Preserve_trx_transfer_frame_type::BEGIN\)))/m
   or die "could not isolate receiver DECLARE_OBJECT apply path\n";
@@ -390,22 +392,13 @@ die "standby receiver staged-token publish must not serialize full token publish
   if $receiver_staged_prewarm_job =~ /g_receiver_standby_publish_mutex[\s\S]*preserve_trx_transfer_publish_standby_bundle/s;
 die "standby receiver projection must not use a single global mutex\n"
   if $transfer =~ /static\s+std::mutex\s+g_receiver_standby_publish_mutex\s*;/;
-my ($receiver_projection_helper) =
-  $transfer =~ /(Preserve_trx_transfer_status publish_receiver_standby_bundle_projection[\s\S]*?^}\n\nPreserve_trx_transfer_status write_epoch_fact_file)/m
-  or die "could not isolate standby receiver projection helper\n";
-die "standby receiver projection must use token-sharded locks and lock-wait metrics\n"
-  unless $transfer =~ /kReceiverProjectionLockShardCount\s*=\s*4096/s &&
-         $receiver_projection_helper =~ /receiver_standby_projection_mutex\s*\(\s*manifest\.token\s*\)/s &&
-         $receiver_projection_helper =~ /g_receiver_projection_lock_wait_us/s;
-my ($receiver_projection_options) =
-  $transfer =~ /(Preserve_snapshot_write_options receiver_standby_projection_write_options\(\)[\s\S]*?^}\n\nbool receiver_standby_projection_exists)/m
-  or die "could not isolate standby receiver projection write options\n";
-die "standby receiver projection must not direct-sync token files in the READY path\n"
-  unless $receiver_projection_options =~ /options\.defer_file_fsync\s*=\s*true\s*;/s &&
-         $receiver_projection_options =~ /options\.defer_directory_fsync\s*=\s*true\s*;/s;
-die "standby receiver projection READY path must not fsync the token shard directory directly\n"
-  if $receiver_projection_helper =~ /preserve_trx_fsync_default_store_token_directory/s ||
-     $receiver_projection_helper =~ /preserve_trx_fsync_default_store_directory/s;
+die "obsolete standby projection publish chain must not be restored\n"
+  if $transfer =~ /publish_receiver_standby_bundle_projection|receiver_standby_projection_write_options|g_receiver_standby_publish_mutexes/s;
+die "obsolete standby projection artifact probes must not remain after projection removal\n"
+  if $transfer =~ /epoch_fact_matches_manifest|standby_token_already_published_for_epoch|standby_token_artifact_published\s*\(/s;
+die "receiver staging finalization must retain token-sharded serialization\n"
+  unless $transfer =~ /kReceiverStagingFinalizeLockShardCount\s*=\s*4096/s &&
+         $transfer =~ /receiver_staging_finalize_mutex[\s\S]{0,700}g_receiver_staging_finalize_mutexes/s;
 die "standby receiver staged-token prewarm must deduplicate in-flight and completed token jobs\n"
   unless $transfer =~ /g_receiver_staged_token_prewarm_inflight/s &&
          $transfer =~ /g_receiver_staged_token_prewarm_done/s;
@@ -1733,6 +1726,19 @@ die "DRAIN service must not bypass observation helpers for participant abort/fin
 die "target-counter rejection must log transaction/target/nonidle/unsupported counters before returning generic unsupported\n"
   unless $drain_execute =~
      /target_counter_rejected[\s\S]*transaction_count[\s\S]*target_count[\s\S]*nonidle_transaction_count[\s\S]*has_unsupported_transaction/s;
+my $phase1_transfer_reset_pos =
+  index($drain_execute,
+        'preserve_trx_transfer_reset_source_phase1_metrics()');
+my $phase1_readiness_reset_pos =
+  index($drain_execute,
+        'preserve_trx_phase1_readiness_reset_latest_metrics()');
+my $active_drain_guard_pos =
+  rindex($drain_execute, 'if (!draining->active())',
+         $phase1_readiness_reset_pos);
+die "phase1 transfer metrics reset must follow successful active-drain admission\n"
+  unless $phase1_transfer_reset_pos > $active_drain_guard_pos;
+die "phase1 transfer metrics reset must precede this drain's first metric emission\n"
+  unless $phase1_transfer_reset_pos < $phase1_readiness_reset_pos;
 
 $preserve =~ /bool Sql_cmd_drain_transactions_preserve::execute[\s\S]*?^}/m
   or die "could not isolate DRAIN SQL command execute\n";
@@ -2991,9 +2997,6 @@ die "receiver saved-artifact IO must remain independent from the opportunistic p
      /throttle_receiver_saved_io[\s\S]{0,500}g_receiver_prewarm_paused/s;
 die "process-local transfer receiver artifacts must not execute file or directory fsync\n"
   if $transfer =~ /\bmy_sync\s*\(|\bfsync_directory\s*\(/s;
-die "receiver standby projection writes must defer file and directory fsync\n"
-  unless $transfer =~
-         /receiver_standby_projection_write_options[\s\S]{0,500}defer_file_fsync\s*=\s*true[\s\S]{0,240}defer_directory_fsync\s*=\s*true/s;
 die "process-local promotion markers must defer file and directory fsync\n"
   unless $carrier_file =~
          /create_preserved_trx_process_local_store[\s\S]{0,500}defer_file_fsync\s*=\s*true[\s\S]{0,240}defer_directory_fsync\s*=\s*true/s &&
@@ -3034,11 +3037,18 @@ die "receiver restart cleanup must run before InnoDB/core storage-engine initial
 my $receiver_restart_cleanup_decl =
   index($transfer_header,
         'preserve_trx_transfer_cleanup_receiver_restart_state');
-my $transfer_unit_test_guard = index($transfer_header, '#ifndef NDEBUG');
+my $receiver_restart_cleanup_prefix =
+  $receiver_restart_cleanup_decl >= 0
+    ? substr($transfer_header, 0, $receiver_restart_cleanup_decl)
+    : '';
+my $transfer_unit_test_guard =
+  rindex($receiver_restart_cleanup_prefix, '#ifndef NDEBUG');
+my $transfer_unit_test_guard_end =
+  rindex($receiver_restart_cleanup_prefix, '#endif');
 die "receiver restart cleanup is a production mysqld API and must be declared outside the unit-test guard\n"
   if $receiver_restart_cleanup_decl < 0 ||
      ($transfer_unit_test_guard >= 0 &&
-      $receiver_restart_cleanup_decl > $transfer_unit_test_guard);
+      $transfer_unit_test_guard > $transfer_unit_test_guard_end);
 $promotion =~
   /adopt_prepared_epoch_for_physical_promotion_impl\s*\([\s\S]*?^}/m
   or die "could not isolate strict physical promotion gate\n";
@@ -3158,6 +3168,44 @@ die "HA handoff resolution must wait until quarantine publication and drain tear
 die "source-owns handoff resolution must restore through the guarded batch restore entry\n"
   unless $handoff_resolution_core =~
          /restore_preserved_batch_items_to_original_thds/s;
+die "physical promotion prepare entrypoint missing\n"
+  unless $promotion =~
+         /preserved_trx_prepare_before_trx_sys_init_for_physical_promotion\s*\(/s;
+die "physical promotion adopt entrypoint missing\n"
+  unless $promotion =~
+         /preserved_trx_adopt_prepared_epoch_for_physical_promotion\s*\(/s;
+die "physical promotion attempt must keep private handoff and complete steps\n"
+  unless $promotion_header =~ /prepare_gate_handoff/s &&
+         $promotion_header =~ /complete_gate_handoff/s;
+die "standby transfer attached warmcopy finalize must not be externally serialized\n"
+  if $preserve =~ /\bwarmcopy_participant_mutex\b/s;
+die "standby transfer attached warmcopy finalize must precede catchup without an outer lock\n"
+  unless $preserve =~
+         /Preserve_batch_attached_target_preparer\s+attached_target_preparer\s*=\s*\[&\]\s*\(\s*THD\s*\*attached_target\s*\)\s*->\s*const char\s*\*\s*\{[\s\S]{0,900}warmcopy_participant->prepare_attached_target\s*\([\s\S]{0,500}uint64_t\s+streamed_bytes\s*=\s*0\s*;[\s\S]{0,500}stream_quiesced_transfer_binlog_cache_catchup\s*\(/s;
+die "warmcopy participant must serialize only shared observation updates internally\n"
+  unless $preserve =~
+         /bool\s+prepare_attached_target\s*\([\s\S]{0,900}std::lock_guard<std::mutex>\s+guard\s*\(\s*m_observation_mutex\s*\)/s;
+die "receiver COMMIT must share the existing terminal record rather than add a second terminal registry\n"
+  unless $transfer_header =~
+           /enum\s+class\s+Terminal_phase[\s\S]{0,300}COMMIT_ADMITTED/s &&
+         $transfer_header =~
+           /struct\s+Acknowledged_epoch[\s\S]{0,900}Terminal_phase\s+terminal_phase/s &&
+         $transfer_header !~ /\bm_terminal_epochs\b/s;
+die "receiver frame admission must enforce the COMMIT sequence cutoff\n"
+  unless $transfer =~
+           /admit_frame_sequence\s*\([\s\S]{0,2800}frame_sequence_exceeds_commit_cutoff_locked/s &&
+         $transfer =~
+           /frame_sequence_exceeds_commit_cutoff_locked\s*\([\s\S]{0,500}sequence\s*>\s*terminal\.admitted_commit_sequence/s;
+$transfer =~
+  /case\s+Preserve_trx_transfer_frame_type::COMMIT_EPOCH\s*:\s*\{([\s\S]*?)case\s+Preserve_trx_transfer_frame_type::OPEN_EPOCH\s*:/s
+  or die "could not isolate receiver COMMIT semantic apply path\n";
+my $receiver_commit_apply = $1;
+die "receiver COMMIT must consume one authoritative registry snapshot\n"
+  unless $receiver_commit_apply =~ /snapshot_epoch_for_commit/s &&
+         $receiver_commit_apply =~ /publish_accepted_epoch/s;
+die "receiver COMMIT must not restore non-atomic sealed-record rescans\n"
+  if $receiver_commit_apply =~ /all_receiving_tokens_sealed/s ||
+     $receiver_commit_apply =~ /sealed_receiving_records_for_epoch/s;
 $preserve =~
   /bool\s+Preserve_trx_drain_ownership_state::resolve_not_committed_clean\s*\(\)\s*\{([\s\S]*?)^}/m
   or die "could not isolate NOT_COMMITTED_CLEAN source ownership claim\n";

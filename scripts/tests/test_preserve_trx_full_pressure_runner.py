@@ -15,6 +15,7 @@ from scripts.preserve_trx_full_pressure_runner import (
     SMOKE_PROFILE,
     FullPressurePaths,
     archive_run_evidence,
+    build_acceptance_contract,
     build_e2e_command,
     build_mysqld_commands,
     build_release_command,
@@ -178,7 +179,14 @@ class FullPressureProfileTest(unittest.TestCase):
         self.assertIn("--tables 100", joined)
         self.assertIn("--lockset-batch-size 100000", joined)
         self.assertIn("--receiver-physical-copy-before-drain", command)
-        self.assertIn("--standalone-transfer-accept-committed-not-ready", command)
+        self.assertNotIn(
+            "--standalone-transfer-accept-committed-not-ready", command
+        )
+        ready_limit_option = "--max-receiver-ready-after-phase2-ms"
+        self.assertIn(ready_limit_option, command)
+        self.assertEqual(
+            "500", command[command.index(ready_limit_option) + 1]
+        )
         self.assertIn("--receiver-read-load-threads 8", joined)
         self.assertIn("--receiver-read-load-max-qps-drop-pct 5.0", joined)
         self.assertIn("--receiver-read-load-max-p99-increase-pct 10.0", joined)
@@ -213,6 +221,29 @@ class FullPressureProfileTest(unittest.TestCase):
             "--preserve-trx-promotion-prewarm-workers=8", receiver
         )
         self.assertIn("--warmcopy-required", command)
+
+    def test_transfer_phase2_checklist_requires_process_local_epoch_ready(self):
+        acceptance = build_acceptance_contract(
+            FULL_PROFILE, "transfer-phase2"
+        )
+
+        self.assertEqual("READY", acceptance["receiver_readiness_contract"])
+        self.assertEqual("PROCESS_LOCAL", acceptance["receiver_epoch_storage"])
+        self.assertEqual(0, acceptance["receiver_epoch_fact_count"])
+        self.assertEqual(0, acceptance["receiver_epoch_commit_count"])
+        self.assertEqual(1000, acceptance["ready_tokens"])
+        self.assertEqual(0, acceptance["not_ready_tokens"])
+        self.assertEqual(0, acceptance["prewarm_backlog_tokens"])
+        self.assertEqual(1, acceptance["receiver_epoch_ready_bind_attempts"])
+        self.assertEqual(
+            500_000,
+            acceptance["receiver_ready_after_final_spool_ack_us_max"],
+        )
+        self.assertEqual(0, acceptance["record_lock_page_count"])
+        self.assertEqual(0, acceptance["record_lock_resident_pages"])
+        self.assertGreater(
+            acceptance["record_lock_plan_epoch_peak_bytes_min"], 0
+        )
 
     def test_full_pressure_uses_tcp_for_source_receiver_and_transfer(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -370,22 +401,22 @@ class FullPressureProfileTest(unittest.TestCase):
             "physical_replication": False,
             "production_provider": False,
             "write_enable_exercised": False,
-            "receiver_readiness_contract": "COMMITTED_NOT_READY",
-            "standby_tokens": 0,
-            "receiver_ready_tokens": 0,
+            "receiver_readiness_contract": "READY",
+            "standby_tokens": 1000,
+            "receiver_ready_tokens": 1000,
             "receiver_not_ready_tokens": 0,
             "receiver_record_cold_gets": 0,
-            "receiver_prewarm_backlog_at_phase2_end": 1000,
+            "receiver_prewarm_backlog_at_phase2_end": 0,
             "phase2_transfer_bulk_bytes": 0,
             "receiver_record_object_prewarm_phase1_overlap": True,
             "source_phase2_total_us": [250000],
             "phase2_record_lock_count_samples": [100_000_000],
-            "receiver_ready_after_final_spool_ack_us": 0,
+            "receiver_ready_after_final_spool_ack_us": 250000,
             "receiver_final_metadata_accepted_monotonic_us": 1_000_000,
             "receiver_terminal_commit_admitted_monotonic_us": 1_001_000,
-            "receiver_ready_monotonic_us": 0,
-            "receiver_ready_after_final_metadata_accepted_us": 0,
-            "receiver_ready_after_terminal_commit_admitted_us": 0,
+            "receiver_ready_monotonic_us": 1_250_000,
+            "receiver_ready_after_final_metadata_accepted_us": 250000,
+            "receiver_ready_after_terminal_commit_admitted_us": 249000,
             "receiver_all_prewarm_after_final_ack_us": 450000,
             "receiver_record_lock_page_count": 0,
             "receiver_record_lock_resident_pages": 0,
@@ -396,7 +427,7 @@ class FullPressureProfileTest(unittest.TestCase):
             "receiver_process_local_epoch_accepted": True,
             "receiver_epoch_fact_count": 0,
             "receiver_epoch_commit_count": 0,
-            "receiver_epoch_ready_bind_attempts": 0,
+            "receiver_epoch_ready_bind_attempts": 1,
             "receiver_seal_prewarm_tokens": 1000,
             "receiver_seal_prewarm_success_tokens": 1000,
             "receiver_record_object_prewarm_count": 1000,
@@ -451,27 +482,28 @@ class FullPressureProfileTest(unittest.TestCase):
         )
         for field in required:
             with self.subTest(field=field):
-                report = self._valid_committed_not_ready_report()
+                report = self._valid_ready_report()
                 del report[field]
                 with self.assertRaisesRegex(RuntimeError, field):
                     validate_e2e_report(FULL_PROFILE, report)
 
-    def test_full_report_gate_rejects_strict_side_effects_and_false_ready(self):
-        report = self._valid_committed_not_ready_report()
-        report["receiver_ready_tokens"] = 1
-        report["receiver_epoch_ready_bind_attempts"] = 1
+    def test_full_report_gate_rejects_strict_side_effects_and_missing_ready(self):
+        report = self._valid_ready_report()
+        report["receiver_ready_tokens"] = 999
+        report["receiver_epoch_ready_bind_attempts"] = 0
         report["receiver_strict_target_local_redo_bytes"] = 4096
-        report["receiver_record_lock_page_count"] = 1
+        report["receiver_lock_plan_epoch_peak_bytes"] = 0
 
         with self.assertRaisesRegex(
             RuntimeError,
             "receiver_ready_tokens.*receiver_epoch_ready_bind_attempts.*"
-            "receiver_record_lock_page_count.*receiver_strict_target_local_redo_bytes",
+            "receiver_strict_target_local_redo_bytes.*"
+            "receiver_lock_plan_epoch_peak_bytes",
         ):
             validate_e2e_report(FULL_PROFILE, report)
 
     def test_full_report_gate_rejects_incomplete_early_pipeline(self):
-        report = self._valid_committed_not_ready_report()
+        report = self._valid_ready_report()
         report["source_early_staged_tokens_samples"] = [999]
         report["source_final_dirty_tokens_samples"] = [2]
         report["source_final_replacement_tokens_samples"] = [1]
@@ -531,7 +563,7 @@ class FullPressureProfileTest(unittest.TestCase):
             )
 
     @staticmethod
-    def _valid_committed_not_ready_report():
+    def _valid_ready_report():
         return {
             "status": "success",
             "success": True,
@@ -544,22 +576,22 @@ class FullPressureProfileTest(unittest.TestCase):
             "physical_replication": False,
             "production_provider": False,
             "write_enable_exercised": False,
-            "receiver_readiness_contract": "COMMITTED_NOT_READY",
-            "standby_tokens": 0,
-            "receiver_ready_tokens": 0,
+            "receiver_readiness_contract": "READY",
+            "standby_tokens": 1000,
+            "receiver_ready_tokens": 1000,
             "receiver_not_ready_tokens": 0,
             "receiver_record_cold_gets": 0,
-            "receiver_prewarm_backlog_at_phase2_end": 1000,
+            "receiver_prewarm_backlog_at_phase2_end": 0,
             "phase2_transfer_bulk_bytes": 0,
             "receiver_record_object_prewarm_phase1_overlap": True,
             "source_phase2_total_us": [250000],
             "phase2_record_lock_count_samples": [100_000_000],
-            "receiver_ready_after_final_spool_ack_us": 0,
+            "receiver_ready_after_final_spool_ack_us": 250000,
             "receiver_final_metadata_accepted_monotonic_us": 1_000_000,
             "receiver_terminal_commit_admitted_monotonic_us": 1_001_000,
-            "receiver_ready_monotonic_us": 0,
-            "receiver_ready_after_final_metadata_accepted_us": 0,
-            "receiver_ready_after_terminal_commit_admitted_us": 0,
+            "receiver_ready_monotonic_us": 1_250_000,
+            "receiver_ready_after_final_metadata_accepted_us": 250000,
+            "receiver_ready_after_terminal_commit_admitted_us": 249000,
             "receiver_all_prewarm_after_final_ack_us": 450000,
             "receiver_record_lock_page_count": 0,
             "receiver_record_lock_resident_pages": 0,
@@ -570,7 +602,7 @@ class FullPressureProfileTest(unittest.TestCase):
             "receiver_process_local_epoch_accepted": True,
             "receiver_epoch_fact_count": 0,
             "receiver_epoch_commit_count": 0,
-            "receiver_epoch_ready_bind_attempts": 0,
+            "receiver_epoch_ready_bind_attempts": 1,
             "receiver_seal_prewarm_tokens": 1000,
             "receiver_seal_prewarm_success_tokens": 1000,
             "receiver_record_object_prewarm_count": 1000,

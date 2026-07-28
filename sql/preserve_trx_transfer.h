@@ -443,7 +443,8 @@ enum class Preserve_trx_transfer_strict_eligibility_status : uint8_t {
   WAIT_LOCK_PRESENT,
   EMPTY_EPOCH,
   RESURRECTION_INDEX_MISSING,
-  TOKEN_IDENTITY_MISMATCH
+  TOKEN_IDENTITY_MISMATCH,
+  LOCK_PLAN_CONTRACT_MISSING
 };
 
 enum class Preserve_trx_transfer_frame_type : uint16_t {
@@ -796,11 +797,36 @@ class Preserve_trx_transfer_receiver_registry {
       const std::string &epoch_id, uint64_t token,
       const std::string &object_id);
   Preserve_trx_transfer_status consume_frame_sequence(
-      const std::string &epoch_id, uint64_t sequence);
+      const std::string &epoch_id, uint64_t sequence,
+      Preserve_trx_transfer_frame_type frame_type,
+      const std::array<unsigned char, kPreservedTrxSha256Length> &digest,
+      const std::string *terminal_root_dir = nullptr,
+      const std::array<unsigned char, kPreservedTrxSha256Length>
+          *terminal_fact_digest = nullptr,
+      uint64_t terminal_now_us = 0);
   Preserve_trx_transfer_status admit_frame_sequence(
       const std::string &epoch_id, uint64_t sequence,
       const std::array<unsigned char, kPreservedTrxSha256Length> &digest,
-      Preserve_trx_transfer_sequence_admission *admission);
+      Preserve_trx_transfer_frame_type frame_type,
+      Preserve_trx_transfer_sequence_admission *admission,
+      const std::string *terminal_root_dir = nullptr,
+      const std::array<unsigned char, kPreservedTrxSha256Length>
+          *terminal_fact_digest = nullptr,
+      uint64_t terminal_now_us = 0);
+  Preserve_trx_transfer_status begin_epoch_commit_admission(
+      const std::string &epoch_id, uint64_t sequence,
+      const std::array<unsigned char, kPreservedTrxSha256Length> &frame_digest,
+      bool *duplicate, const std::string *terminal_root_dir = nullptr,
+      const std::array<unsigned char, kPreservedTrxSha256Length>
+          *terminal_fact_digest = nullptr,
+      uint64_t terminal_now_us = 0);
+  Preserve_trx_transfer_status snapshot_epoch_for_commit(
+      const std::string &epoch_id, uint64_t sequence,
+      const std::array<unsigned char, kPreservedTrxSha256Length> &frame_digest,
+      std::vector<Preserve_trx_transfer_receiver_record> *records);
+  void mark_epoch_commit_admission_corrupt(
+      const std::string &epoch_id, uint64_t sequence,
+      const std::array<unsigned char, kPreservedTrxSha256Length> &frame_digest);
   Preserve_trx_transfer_status begin_payload_sequence(
       const std::string &epoch_id, uint64_t first_sequence,
       uint64_t last_sequence, uint64_t timeout_ms);
@@ -830,7 +856,6 @@ class Preserve_trx_transfer_receiver_registry {
                                uint64_t sequence);
   bool all_objects_sealed(const std::string &epoch_id,
                           uint64_t token) const;
-  bool all_receiving_tokens_sealed(const std::string &epoch_id) const;
   std::vector<Preserve_trx_transfer_receiver_record>
   receiving_records_for_epoch(const std::string &epoch_id) const;
   std::vector<Preserve_trx_transfer_receiver_record>
@@ -906,6 +931,14 @@ class Preserve_trx_transfer_receiver_registry {
     uint64_t accepted_terminal_status_retention_us{0};
   };
   std::map<std::string, Online_epoch> m_online_epochs;
+  enum class Terminal_phase : uint8_t {
+    OPEN,
+    COMMIT_ADMITTED,
+    ABANDONING,
+    COMMITTED,
+    NOT_COMMITTED_CLEAN,
+    CORRUPT
+  };
   struct Acknowledged_epoch {
     std::string root_dir;
     std::string receiver_process_generation;
@@ -916,10 +949,27 @@ class Preserve_trx_transfer_receiver_registry {
         Preserve_trx_transfer_epoch_terminal_operation::NONE};
     Preserve_trx_transfer_epoch_terminal_outcome terminal_outcome{
         Preserve_trx_transfer_epoch_terminal_outcome::NOT_COMMITTED};
+    Terminal_phase terminal_phase{Terminal_phase::OPEN};
+    uint64_t admitted_commit_sequence{0};
+    std::array<unsigned char, kPreservedTrxSha256Length>
+        admitted_commit_frame_digest{};
+    bool commit_snapshot_verified{false};
     std::array<unsigned char, kPreservedTrxSha256Length> fact_digest{};
     uint64_t terminal_cas_monotonic_us{0};
     uint64_t retire_after_us{0};
   };
+  Preserve_trx_transfer_status begin_epoch_commit_admission_locked(
+      const std::string &epoch_id, uint64_t sequence,
+      const std::array<unsigned char, kPreservedTrxSha256Length> &frame_digest,
+      bool *duplicate, const std::string *terminal_root_dir,
+      const std::array<unsigned char, kPreservedTrxSha256Length>
+          *terminal_fact_digest,
+      uint64_t terminal_now_us);
+  bool frame_sequence_exceeds_commit_cutoff_locked(
+      const std::string &epoch_id, uint64_t sequence) const;
+  void mark_epoch_commit_admission_corrupt_locked(
+      const std::string &epoch_id, uint64_t sequence,
+      const std::array<unsigned char, kPreservedTrxSha256Length> &frame_digest);
   std::map<std::string, Acknowledged_epoch> m_acknowledged_epochs;
   std::map<std::string, Preserve_trx_transfer_accepted_epoch>
       m_accepted_epochs;
@@ -1141,8 +1191,19 @@ class Preserve_trx_transfer_source_epoch_session {
     std::lock_guard<std::mutex> guard(m_mutex);
     return m_next_sequence;
   }
+#ifndef NDEBUG
+  size_t pending_frame_cleanup_invocations_for_unit_test() const {
+    std::lock_guard<std::mutex> guard(m_mutex);
+    return m_pending_frame_cleanup_invocations;
+  }
+#endif
 
  private:
+  enum class Pending_frame_cleanup : uint8_t {
+    REQUIRED,
+    ALREADY_CLEARED
+  };
+
   bool token_declared(uint64_t transfer_token) const;
   bool token_resolved(uint64_t transfer_token) const;
   Preserve_trx_transfer_status send_token_objects_locked(
@@ -1158,7 +1219,8 @@ class Preserve_trx_transfer_source_epoch_session {
       size_t *acknowledged_frame_count);
   Preserve_trx_transfer_status abort_token_locked(uint64_t transfer_token,
                                                   const std::string &reason,
-                                                  bool allow_finalized);
+                                                  bool allow_finalized,
+                                                  Pending_frame_cleanup cleanup);
 
   std::string m_epoch_id;
   uint32_t m_chunk_bytes{0};
@@ -1199,6 +1261,9 @@ class Preserve_trx_transfer_source_epoch_session {
   std::set<uint64_t> m_final_metadata_tokens;
   std::vector<Preserve_trx_transfer_frame> m_pending_final_metadata_frames;
   std::vector<Preserve_trx_transfer_manifest> m_finalized_manifests;
+#ifndef NDEBUG
+  size_t m_pending_frame_cleanup_invocations{0};
+#endif
 };
 
 Preserve_trx_transfer_status

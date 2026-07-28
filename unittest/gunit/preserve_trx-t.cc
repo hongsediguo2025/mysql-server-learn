@@ -94,6 +94,32 @@ static_assert(
     !std::is_move_assignable<Mysql_binlog_preserve_attach_journal>::value,
     "an active native binlog attach journal must not be move-assigned");
 
+using Physical_prepare_entrypoint =
+    Preserve_trx_physical_promotion_gate_status (*)(
+        const std::string &, const Preserve_trx_physical_bootstrap_request &,
+        Preserve_trx_physical_promotion_bootstrap_attempt *);
+using Physical_adopt_entrypoint =
+    Preserve_trx_physical_promotion_gate_status (*)(
+        const std::string &,
+        Preserve_trx_physical_promotion_bootstrap_attempt *,
+        Preserve_trx_physical_promotion_gate_result *);
+
+static_assert(
+    std::is_same<
+        decltype(
+            &preserved_trx_prepare_before_trx_sys_init_for_physical_promotion),
+        Physical_prepare_entrypoint>::value,
+    "physical promotion prepare ABI changed");
+static_assert(
+    std::is_same<
+        decltype(&preserved_trx_adopt_prepared_epoch_for_physical_promotion),
+        Physical_adopt_entrypoint>::value,
+    "physical promotion adopt ABI changed");
+static_assert(
+    !std::is_copy_constructible<
+        Preserve_trx_physical_promotion_bootstrap_attempt>::value,
+    "physical promotion attempt must remain non-copyable");
+
 Preserve_trx_ha_control_capability
 preserve_trx_transfer_make_ha_control_capability_for_unit_test(
     uint64_t role_generation = 1) {
@@ -5615,6 +5641,24 @@ TEST(PreservedTrxTransfer, StrictEligibilityRejectsUnsupportedSemantics) {
             preserve_trx_transfer_validate_strict_eligibility(
                 manifest, metadata, false, false, 3));
 
+  Preserve_trx_transfer_object_descriptor record_locks;
+  record_locks.object_id = kPreservedTrxBlobRecordLocks;
+  record_locks.kind = Preserve_trx_transfer_object_kind::EXTERNAL_BLOB;
+  record_locks.total_size = 64;
+  record_locks.digest.fill(0x55);
+  manifest.objects.push_back(record_locks);
+  EXPECT_NE(Preserve_trx_transfer_strict_eligibility_status::OK,
+            preserve_trx_transfer_validate_strict_eligibility(
+                manifest, metadata, false, false, 3));
+  manifest.objects.back().lock_plan.version =
+      kPreserveTrxTransferLockPlanContractVersion;
+  manifest.objects.back().lock_plan.source_live_generation = 1;
+  manifest.objects.back().lock_plan.source_live_digest.fill(0x66);
+  manifest.objects.back().lock_plan.record_store_fingerprint.fill(0x77);
+  EXPECT_EQ(Preserve_trx_transfer_strict_eligibility_status::OK,
+            preserve_trx_transfer_validate_strict_eligibility(
+                manifest, metadata, false, false, 3));
+
   metadata.binlog_gtid_next = "AUTOMATIC";
   metadata.has_binlog_gtid_mode = true;
   metadata.binlog_gtid_mode = 0;
@@ -6769,6 +6813,45 @@ void set_test_transfer_commit_proof(Preserve_trx_transfer_frame *commit) {
   commit->chunk_offset = 140;
   ASSERT_TRUE(test_transfer_source_trx_id_store_provider(
       &commit->trx_id_store));
+}
+
+struct Transfer_receiver_terminal_admission_probe {
+  Preserve_trx_transfer_receiver_registry *registry{nullptr};
+  std::string root_dir;
+  std::string epoch_id;
+  std::string authenticated_principal;
+  std::string receiver_process_nonce;
+  std::array<unsigned char, kPreservedTrxSha256Length> fact_digest{};
+  Preserve_trx_transfer_status exact_query_status{
+      Preserve_trx_transfer_status::INVALID_ARGUMENT};
+  Preserve_trx_transfer_status conflicting_query_status{
+      Preserve_trx_transfer_status::INVALID_ARGUMENT};
+  Preserve_trx_transfer_epoch_terminal_status terminal;
+  bool called{false};
+};
+
+static Preserve_trx_transfer_status
+transfer_receiver_terminal_admission_probe(void *context,
+                                           bool contains_commit_epoch) {
+  auto *probe =
+      static_cast<Transfer_receiver_terminal_admission_probe *>(context);
+  if (probe == nullptr || probe->registry == nullptr ||
+      !contains_commit_epoch) {
+    return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+  }
+
+  probe->called = true;
+  probe->exact_query_status =
+      probe->registry->query_epoch_terminal_authenticated(
+          probe->root_dir, probe->epoch_id, probe->authenticated_principal,
+          probe->receiver_process_nonce, probe->fact_digest, &probe->terminal);
+  auto conflicting_digest = probe->fact_digest;
+  conflicting_digest[0] ^= 0x5a;
+  probe->conflicting_query_status =
+      probe->registry->query_epoch_terminal_authenticated(
+          probe->root_dir, probe->epoch_id, probe->authenticated_principal,
+          probe->receiver_process_nonce, conflicting_digest, nullptr);
+  return Preserve_trx_transfer_status::ACK_UNCERTAIN;
 }
 
 bool test_transfer_source_resurrection_provider(
@@ -7995,6 +8078,16 @@ class PreserveSnapshotTest : public ::testing::Test {
     fact_token.source_epoch_commit_lsn = manifest.source_epoch_commit_lsn;
     fact->tokens.push_back(std::move(fact_token));
     fact->fact_digest[0] = 1;
+    const auto commit_frame_digest =
+        test_sha256("commit:" + epoch_id);
+    bool duplicate = false;
+    EXPECT_EQ(Preserve_trx_transfer_status::OK,
+              registry->begin_epoch_commit_admission(
+                  epoch_id, 1, commit_frame_digest, &duplicate));
+    std::vector<Preserve_trx_transfer_receiver_record> records;
+    EXPECT_EQ(Preserve_trx_transfer_status::OK,
+              registry->snapshot_epoch_for_commit(
+                  epoch_id, 1, commit_frame_digest, &records));
     EXPECT_EQ(Preserve_trx_transfer_status::OK,
               registry->publish_accepted_epoch(
                   m_dir, fact, "receiver-generation", now_us,
@@ -15459,6 +15552,48 @@ TEST_F(PreserveSnapshotTest,
                 m_dir, "epoch-ack-lifecycle", &registry, nullptr));
 }
 
+TEST_F(PreserveSnapshotTest,
+       ExpiredTerminalTombstoneCannotReopenAcceptedCommit) {
+  Preserve_trx_transfer_receiver_registry registry;
+  const std::string epoch_id = "epoch-expired-terminal-no-reopen";
+  const auto fact =
+      publish_test_accepted_epoch(&registry, epoch_id, 1919, 1000, 100);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.acknowledge_epoch(m_dir, epoch_id, 1000, 1));
+  Preserve_trx_transfer_epoch_terminal_status terminal;
+  ASSERT_EQ(Preserve_trx_transfer_epoch_terminal_outcome::COMMITTED,
+            registry.query_epoch_terminal(m_dir, epoch_id, &terminal));
+  ASSERT_GT(terminal.retire_after_us, 1000U);
+  ASSERT_EQ(
+      1U, registry.retire_acknowledged_epochs_once(terminal.retire_after_us));
+  ASSERT_EQ(Preserve_trx_transfer_status::COMMITTED_NOT_READY,
+            registry.query_accepted_epoch(m_dir, epoch_id));
+
+  bool duplicate = false;
+  EXPECT_EQ(Preserve_trx_transfer_status::UNSUPPORTED,
+            registry.begin_epoch_commit_admission(
+                epoch_id, 1, test_sha256("commit:" + epoch_id), &duplicate));
+  EXPECT_EQ(Preserve_trx_transfer_epoch_terminal_outcome::NOT_COMMITTED,
+            registry.query_epoch_terminal(m_dir, epoch_id));
+  EXPECT_EQ(Preserve_trx_transfer_status::COMMITTED_NOT_READY,
+            registry.query_accepted_epoch(m_dir, epoch_id));
+
+  Preserve_trx_transfer_epoch_terminal_request abandon;
+  abandon.root_dir = m_dir;
+  abandon.epoch_id = epoch_id;
+  abandon.receiver_process_generation = "receiver-generation";
+  abandon.authenticated_principal = "preserve_transfer";
+  abandon.operation_id = "abandon-expired-terminal";
+  abandon.fact_digest = fact->fact_digest;
+  abandon.now_us = terminal.retire_after_us + 1;
+  abandon.retention_us = 60000000;
+  EXPECT_EQ(Preserve_trx_transfer_epoch_terminal_outcome::COMMITTED,
+            preserve_trx_transfer_abandon_receiver_epoch_if_not_committed(
+                abandon, &registry));
+  EXPECT_EQ(Preserve_trx_transfer_status::COMMITTED_NOT_READY,
+            registry.query_accepted_epoch(m_dir, epoch_id));
+}
+
 TEST_F(PreserveSnapshotTest, ReceiverTerminalCasDuplicateCommitIsIdempotent) {
   Preserve_trx_transfer_receiver_registry registry;
   const auto fact =
@@ -15509,9 +15644,19 @@ TEST_F(PreserveSnapshotTest,
   fact_token.source_epoch_commit_lsn = manifest.source_epoch_commit_lsn;
   fact->tokens.push_back(std::move(fact_token));
   fact->fact_digest[0] = 0x5a;
+  const auto commit_frame_digest = test_sha256("authenticated-commit");
+  bool duplicate = false;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.begin_epoch_commit_admission(
+                epoch_id, 1, commit_frame_digest, &duplicate, &m_dir,
+                &fact->fact_digest, 999));
+  std::vector<Preserve_trx_transfer_receiver_record> records;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.snapshot_epoch_for_commit(
+                epoch_id, 1, commit_frame_digest, &records));
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
             registry.publish_accepted_epoch(
-                m_dir, fact, "receiver-generation", 1000, 1, false));
+                m_dir, fact, nonce, 1000, 1, false));
 
   std::vector<Preserve_trx_transfer_accepted_epoch> expired;
   ASSERT_EQ(1U, registry.expire_accepted_epochs_once(2001, &expired));
@@ -15546,6 +15691,159 @@ TEST_F(PreserveSnapshotTest,
 }
 
 TEST_F(PreserveSnapshotTest,
+       ReceiverTerminalQueryProjectsCommitAdmissionAsNotCommitted) {
+  Preserve_trx_transfer_receiver_registry registry;
+  const std::string epoch_id = "epoch-terminal-commit-admitted";
+  const std::string principal = "17:preserve_transfer|1:%";
+  const std::string nonce = "00112233445566778899aabbccddeeff";
+  uint64_t accepted_retention_us = 0;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.open_online_epoch(epoch_id, principal, 60000000, nonce,
+                                       &accepted_retention_us));
+  const auto commit_frame_digest = test_sha256("commit-admitted-query");
+  std::array<unsigned char, kPreservedTrxSha256Length> final_fact_digest{};
+  final_fact_digest[0] = 0x5a;
+  bool duplicate = false;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.begin_epoch_commit_admission(
+                epoch_id, 1, commit_frame_digest, &duplicate, &m_dir,
+                &final_fact_digest, 1000));
+
+  Preserve_trx_transfer_epoch_terminal_status terminal;
+  EXPECT_EQ(Preserve_trx_transfer_status::OK,
+            registry.query_epoch_terminal_authenticated(
+                m_dir, epoch_id, principal, nonce, final_fact_digest,
+                &terminal));
+  EXPECT_EQ(Preserve_trx_transfer_epoch_terminal_outcome::NOT_COMMITTED,
+            terminal.outcome);
+}
+
+TEST_F(PreserveSnapshotTest,
+       ReceiverCommitAdmissionFreezesAuthenticatedTombstoneAtCas) {
+  Transfer_codec_context_guard codec_guard;
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow();
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+  Preserve_trx_transfer_receiver_registry registry;
+  const std::string epoch_id = "epoch-terminal-admission-identity";
+  const std::string principal = "17:preserve_transfer|1:%";
+  const std::string nonce = "00112233445566778899aabbccddeeff";
+  uint64_t accepted_retention_us = 0;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.open_online_epoch(epoch_id, principal, 60000000, nonce,
+                                       &accepted_retention_us));
+
+  Preserve_trx_transfer_manifest manifest;
+  manifest.epoch_id = epoch_id;
+  manifest.token = 1931;
+  manifest.source_prepare_lsn = 10;
+  manifest.source_epoch_commit_lsn = 20;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.begin_receive(manifest));
+
+  Preserve_trx_transfer_frame commit;
+  commit.type = Preserve_trx_transfer_frame_type::COMMIT_EPOCH;
+  commit.sequence = 1;
+  commit.epoch_id = epoch_id;
+  commit.receiver_process_nonce = nonce;
+  commit.token = manifest.token;
+  set_test_transfer_commit_proof(&commit);
+  commit.terminal_fact_digest = test_sha256("terminal-admission-fact");
+  std::string encoded_commit;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_encode_frame(commit, &encoded_commit));
+
+  Transfer_receiver_terminal_admission_probe probe;
+  probe.registry = &registry;
+  probe.root_dir = m_dir;
+  probe.epoch_id = epoch_id;
+  probe.authenticated_principal = principal;
+  probe.receiver_process_nonce = nonce;
+  probe.fact_digest = commit.terminal_fact_digest;
+  EXPECT_EQ(Preserve_trx_transfer_status::ACK_UNCERTAIN,
+            preserve_trx_transfer_handle_receiver_payload_batch(
+                m_dir, {encoded_commit}, &store, &registry, 300, 1, nullptr,
+                transfer_receiver_terminal_admission_probe, &probe));
+  ASSERT_TRUE(probe.called);
+  EXPECT_EQ(Preserve_trx_transfer_status::OK, probe.exact_query_status);
+  EXPECT_EQ(Preserve_trx_transfer_epoch_terminal_outcome::NOT_COMMITTED,
+            probe.terminal.outcome);
+  EXPECT_EQ(Preserve_trx_transfer_status::CORRUPT,
+            probe.conflicting_query_status);
+
+  registry.mark_epoch_commit_admission_corrupt(
+      epoch_id, commit.sequence, test_sha256(encoded_commit));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.mark_corrupt(epoch_id, manifest.token,
+                                  "terminal_admission_test"));
+  Preserve_trx_transfer_epoch_terminal_status terminal;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.query_epoch_terminal_authenticated(
+                m_dir, epoch_id, principal, nonce, commit.terminal_fact_digest,
+                &terminal));
+  EXPECT_EQ(Preserve_trx_transfer_epoch_terminal_outcome::CORRUPT,
+            terminal.outcome);
+  ASSERT_GT(terminal.retire_after_us, terminal.terminal_cas_monotonic_us);
+  EXPECT_EQ(0U, registry.retire_acknowledged_epochs_once(
+                    terminal.retire_after_us - 1));
+  EXPECT_EQ(1U,
+            registry.retire_acknowledged_epochs_once(terminal.retire_after_us));
+}
+
+TEST_F(PreserveSnapshotTest,
+       ReceiverCommitAdmissionRejectsPublishedFactDigestMismatch) {
+  Preserve_trx_transfer_receiver_registry registry;
+  const std::string epoch_id = "epoch-admission-fact-mismatch";
+  const std::string principal = "17:preserve_transfer|1:%";
+  const std::string nonce = "00112233445566778899aabbccddeeff";
+  uint64_t accepted_retention_us = 0;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.open_online_epoch(epoch_id, principal, 60000000, nonce,
+                                       &accepted_retention_us));
+
+  Preserve_trx_transfer_manifest manifest;
+  manifest.epoch_id = epoch_id;
+  manifest.token = 1932;
+  manifest.source_prepare_lsn = 10;
+  manifest.source_epoch_commit_lsn = 20;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.begin_receive(manifest));
+
+  const auto admitted_fact_digest = test_sha256("admitted-final-fact");
+  const auto commit_frame_digest = test_sha256("admitted-commit-frame");
+  bool duplicate = false;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.begin_epoch_commit_admission(
+                epoch_id, 1, commit_frame_digest, &duplicate, &m_dir,
+                &admitted_fact_digest, 1000));
+  std::vector<Preserve_trx_transfer_receiver_record> records;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.snapshot_epoch_for_commit(
+                epoch_id, 1, commit_frame_digest, &records));
+
+  auto conflicting_fact =
+      std::make_shared<Preserve_trx_transfer_epoch_fact>();
+  conflicting_fact->epoch_id = epoch_id;
+  conflicting_fact->source_fence_lsn = 30;
+  Preserve_trx_transfer_epoch_fact_token token;
+  token.token = manifest.token;
+  token.source_prepare_lsn = manifest.source_prepare_lsn;
+  token.source_epoch_commit_lsn = manifest.source_epoch_commit_lsn;
+  conflicting_fact->tokens.push_back(std::move(token));
+  conflicting_fact->fact_digest = admitted_fact_digest;
+  conflicting_fact->fact_digest[0] ^= 0x5a;
+
+  EXPECT_EQ(Preserve_trx_transfer_status::CORRUPT,
+            registry.publish_accepted_epoch(
+                m_dir, conflicting_fact, nonce, 1001, 100, false));
+  EXPECT_EQ(Preserve_trx_transfer_epoch_terminal_outcome::CORRUPT,
+            registry.query_epoch_terminal(m_dir, epoch_id));
+  EXPECT_EQ(Preserve_trx_transfer_status::IO_ERROR,
+            registry.query_accepted_epoch(m_dir, epoch_id));
+}
+
+TEST_F(PreserveSnapshotTest,
        ReceiverTerminalCasRejectsConflictingCommitDigest) {
   Preserve_trx_transfer_receiver_registry registry;
   const auto fact =
@@ -15563,6 +15861,32 @@ TEST_F(PreserveSnapshotTest,
             registry.query_epoch_terminal(m_dir, "epoch-terminal-conflict"));
   EXPECT_EQ(Preserve_trx_transfer_status::IO_ERROR,
             registry.query_accepted_epoch(m_dir, "epoch-terminal-conflict"));
+}
+
+TEST_F(PreserveSnapshotTest,
+       ReceiverCommittedEpochRejectsConflictingCommitWithoutRewritingWinner) {
+  Preserve_trx_transfer_receiver_registry registry;
+  const std::string epoch_id = "epoch-committed-conflicting-retry";
+  publish_test_accepted_epoch(&registry, epoch_id, 1922, 1000, 100);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.mark_accepted_epoch_ready(m_dir, epoch_id, 1001, 2000));
+
+  bool duplicate = false;
+  EXPECT_EQ(Preserve_trx_transfer_status::CORRUPT,
+            registry.begin_epoch_commit_admission(
+                epoch_id, 2, test_sha256("conflicting-commit"), &duplicate));
+  EXPECT_FALSE(duplicate);
+  EXPECT_EQ(Preserve_trx_transfer_epoch_terminal_outcome::COMMITTED,
+            registry.query_epoch_terminal(m_dir, epoch_id));
+
+  Preserve_trx_transfer_accepted_epoch accepted;
+  ASSERT_EQ(Preserve_trx_transfer_status::COMMITTED_NOT_READY,
+            registry.query_accepted_epoch(m_dir, epoch_id, &accepted));
+  EXPECT_EQ(Preserve_trx_transfer_epoch_lifecycle::READY,
+            accepted.lifecycle);
+  EXPECT_EQ(Preserve_trx_receiver_promotion_lease_status::ACQUIRED,
+            registry.try_acquire_accepted_epoch_promotion_lease(
+                m_dir, epoch_id, 1100, "receiver-generation", &accepted));
 }
 
 TEST_F(PreserveSnapshotTest,
@@ -15607,8 +15931,20 @@ TEST_F(PreserveSnapshotTest,
     std::thread commit([&] {
       while (!start.load(std::memory_order_acquire)) {
       }
-      commit_status = registry.publish_accepted_epoch(
-          m_dir, fact, "receiver-generation", 1000, 100, false);
+      const auto commit_frame_digest =
+          test_sha256("terminal-race-commit");
+      bool duplicate = false;
+      commit_status = registry.begin_epoch_commit_admission(
+          epoch_id, 1, commit_frame_digest, &duplicate);
+      if (commit_status == Preserve_trx_transfer_status::OK) {
+        std::vector<Preserve_trx_transfer_receiver_record> records;
+        commit_status = registry.snapshot_epoch_for_commit(
+            epoch_id, 1, commit_frame_digest, &records);
+      }
+      if (commit_status == Preserve_trx_transfer_status::OK) {
+        commit_status = registry.publish_accepted_epoch(
+            m_dir, fact, "receiver-generation", 1000, 100, false);
+      }
     });
     std::thread abandon_thread([&] {
       while (!start.load(std::memory_order_acquire)) {
@@ -15628,8 +15964,11 @@ TEST_F(PreserveSnapshotTest,
     if (commit_won) {
       EXPECT_EQ(Preserve_trx_transfer_epoch_terminal_outcome::COMMITTED,
                 registry.query_epoch_terminal(m_dir, epoch_id));
-      EXPECT_EQ(Preserve_trx_transfer_epoch_terminal_outcome::COMMITTED,
-                abandon_status);
+      EXPECT_TRUE(
+          abandon_status ==
+              Preserve_trx_transfer_epoch_terminal_outcome::NOT_COMMITTED ||
+          abandon_status ==
+              Preserve_trx_transfer_epoch_terminal_outcome::COMMITTED);
     } else {
       ASSERT_TRUE(abandon_won);
       EXPECT_EQ(Preserve_trx_transfer_epoch_terminal_outcome::
@@ -15804,6 +16143,15 @@ TEST_F(PreserveSnapshotTest,
   fact->tokens.push_back(std::move(fact_token));
   fact->fact_digest[0] = 1;
 
+  const auto commit_frame_digest = test_sha256("wrong-root-commit");
+  bool duplicate = false;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.begin_epoch_commit_admission(
+                epoch_id, 1, commit_frame_digest, &duplicate));
+  std::vector<Preserve_trx_transfer_receiver_record> records;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.snapshot_epoch_for_commit(
+                epoch_id, 1, commit_frame_digest, &records));
   EXPECT_EQ(Preserve_trx_transfer_status::CORRUPT,
             registry.publish_accepted_epoch(
                 m_dir, fact, "receiver-generation", 1001, 100, false));
@@ -16444,6 +16792,8 @@ TEST_F(PreserveSnapshotTest,
 TEST_F(PreserveSnapshotTest,
        TransferReceiverStrictRecordLockPrewarmUsesMetadataOnly) {
   Transfer_codec_context_guard codec_guard;
+  preserve_trx_transfer_set_terminal_lock_proof_provider_for_unit_test(
+      nullptr);
   const uint64_t transfer_token = 1025;
   Preserve_snapshot_metadata meta = metadata();
   meta.token = test_transfer_token_string(transfer_token);
@@ -16471,6 +16821,11 @@ TEST_F(PreserveSnapshotTest,
     }
   }
   ASSERT_NE(nullptr, record_object);
+  EXPECT_FALSE(record_object->descriptor.lock_plan.simulated_terminal_proof);
+  EXPECT_TRUE(std::all_of(
+      record_object->descriptor.lock_plan.terminal_proof.begin(),
+      record_object->descriptor.lock_plan.terminal_proof.end(),
+      [](unsigned char value) { return value == 0; }));
 
   Capturing_transfer_frame_sink sink;
   Preserve_trx_transfer_source_epoch_session session(
@@ -16896,6 +17251,7 @@ TEST_F(PreserveSnapshotTest,
   input.externalize_record_locks_payload = true;
   ASSERT_EQ(Preserve_snapshot_status::OK,
             build_preserved_trx_bundle(input, &bundle));
+  ASSERT_TRUE(set_test_transfer_record_lock_contract(&bundle));
 
   Preserve_trx_transfer_manifest manifest;
   std::vector<Preserve_trx_transfer_object_payload> objects;
@@ -20835,6 +21191,8 @@ struct Transfer_receiver_commit_accepted_probe {
   std::string root_dir;
   std::string epoch_id;
   Preserve_trx_transfer_receiver_registry *registry{nullptr};
+  std::vector<Preserve_trx_transfer_status> return_statuses;
+  size_t call_count{0};
   bool called{false};
   bool saw_commit_marker{false};
   bool saw_current_process_accepted{false};
@@ -20856,7 +21214,10 @@ static Preserve_trx_transfer_status transfer_receiver_commit_accepted_probe(
                                                       epoch_id,
                                                       probe->registry) ==
           Preserve_trx_transfer_status::COMMITTED_NOT_READY;
-  return Preserve_trx_transfer_status::OK;
+  const size_t call = probe->call_count++;
+  return call < probe->return_statuses.size()
+             ? probe->return_statuses[call]
+             : Preserve_trx_transfer_status::OK;
 }
 
 static Preserve_trx_transfer_status transfer_receiver_after_admission_probe(
@@ -21790,22 +22151,413 @@ TEST(PreservedTrxTransfer, TransferSequenceRetryRequiresMatchingDigest) {
 
   EXPECT_EQ(Preserve_trx_transfer_status::OK,
             registry.admit_frame_sequence("epoch-retry", 1, first_digest,
+                                          Preserve_trx_transfer_frame_type::
+                                              DECLARE_TOKEN,
                                           &admission));
   EXPECT_EQ(Preserve_trx_transfer_sequence_admission::NEW_FRAME, admission);
   EXPECT_EQ(Preserve_trx_transfer_status::OK,
             registry.admit_frame_sequence("epoch-retry", 1, first_digest,
+                                          Preserve_trx_transfer_frame_type::
+                                              DECLARE_TOKEN,
                                           &admission));
   EXPECT_EQ(Preserve_trx_transfer_sequence_admission::RETRY_PENDING,
             admission);
   registry.mark_frame_sequence_applied("epoch-retry", 1);
   EXPECT_EQ(Preserve_trx_transfer_status::OK,
             registry.admit_frame_sequence("epoch-retry", 1, first_digest,
+                                          Preserve_trx_transfer_frame_type::
+                                              DECLARE_TOKEN,
                                           &admission));
   EXPECT_EQ(Preserve_trx_transfer_sequence_admission::ALREADY_APPLIED,
             admission);
   EXPECT_EQ(Preserve_trx_transfer_status::CORRUPT,
             registry.admit_frame_sequence("epoch-retry", 1,
-                                          conflicting_digest, &admission));
+                                          conflicting_digest,
+                                          Preserve_trx_transfer_frame_type::
+                                              DECLARE_TOKEN,
+                                          &admission));
+}
+
+TEST_F(PreserveSnapshotTest,
+       ReceiverCommitAdmissionRejectsHigherSequenceMutation) {
+  Preserve_trx_transfer_receiver_registry registry;
+  const std::string epoch_id = "epoch-commit-admission-cutoff";
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.acknowledge_epoch(m_dir, epoch_id, 1000, 60000000));
+  const auto commit_digest = test_sha256("commit-frame");
+  bool duplicate = true;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.begin_epoch_commit_admission(
+                epoch_id, 2, commit_digest, &duplicate));
+  EXPECT_FALSE(duplicate);
+
+  Preserve_trx_transfer_sequence_admission admission =
+      Preserve_trx_transfer_sequence_admission::NEW_FRAME;
+  EXPECT_EQ(Preserve_trx_transfer_status::CORRUPT,
+            registry.admit_frame_sequence(
+                epoch_id, 3, test_sha256("late-declare"),
+                Preserve_trx_transfer_frame_type::DECLARE_TOKEN, &admission));
+  Preserve_trx_transfer_epoch_terminal_status terminal;
+  EXPECT_EQ(Preserve_trx_transfer_epoch_terminal_outcome::CORRUPT,
+            registry.query_epoch_terminal(m_dir, epoch_id, &terminal));
+  EXPECT_EQ(Preserve_trx_transfer_epoch_terminal_operation::COMMIT,
+            terminal.operation);
+  Preserve_trx_transfer_receiver_record record;
+  EXPECT_FALSE(registry.lookup(epoch_id, 1001, &record));
+}
+
+TEST_F(PreserveSnapshotTest,
+       ReceiverCommitAdmissionAllowsLowerSequenceApplyToFinish) {
+  Preserve_trx_transfer_receiver_registry registry;
+  const std::string epoch_id = "epoch-commit-admission-lower-apply";
+  Preserve_trx_transfer_manifest manifest;
+  manifest.epoch_id = epoch_id;
+  manifest.token = 1002;
+  manifest.source_prepare_lsn = 10;
+  manifest.source_epoch_commit_lsn = 20;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.begin_receive(manifest));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.acknowledge_epoch(m_dir, epoch_id, 1000, 60000000));
+
+  Preserve_trx_transfer_sequence_admission admission =
+      Preserve_trx_transfer_sequence_admission::NEW_FRAME;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.admit_frame_sequence(
+                epoch_id, 1, test_sha256("lower-begin"),
+                Preserve_trx_transfer_frame_type::BEGIN, &admission));
+  const auto commit_digest = test_sha256("commit-after-lower");
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.admit_frame_sequence(
+                epoch_id, 2, commit_digest,
+                Preserve_trx_transfer_frame_type::COMMIT_EPOCH, &admission));
+
+  registry.mark_frame_sequence_applied(epoch_id, 1);
+  EXPECT_EQ(Preserve_trx_transfer_status::OK,
+            registry.wait_for_frame_sequence_applied_through(epoch_id, 1,
+                                                             1000));
+  std::vector<Preserve_trx_transfer_receiver_record> records;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.snapshot_epoch_for_commit(epoch_id, 2, commit_digest,
+                                               &records));
+  ASSERT_EQ(1U, records.size());
+  EXPECT_EQ(manifest.token, records.front().token);
+  EXPECT_EQ(Preserve_trx_transfer_epoch_terminal_outcome::NOT_COMMITTED,
+            registry.query_epoch_terminal(m_dir, epoch_id));
+}
+
+TEST_F(PreserveSnapshotTest,
+       ReceiverCommitAdmissionRejectsManifestReplacement) {
+  Preserve_trx_transfer_receiver_registry registry;
+  const std::string epoch_id = "epoch-commit-admission-replacement";
+  Preserve_trx_transfer_manifest manifest;
+  manifest.epoch_id = epoch_id;
+  manifest.token = 1003;
+  manifest.source_prepare_lsn = 10;
+  manifest.source_epoch_commit_lsn = 20;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.begin_receive(manifest));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.acknowledge_epoch(m_dir, epoch_id, 1000, 60000000));
+  Preserve_trx_transfer_sequence_admission admission =
+      Preserve_trx_transfer_sequence_admission::NEW_FRAME;
+  const auto commit_digest = test_sha256("commit-before-replacement");
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.admit_frame_sequence(
+                epoch_id, 1, commit_digest,
+                Preserve_trx_transfer_frame_type::COMMIT_EPOCH, &admission));
+
+  EXPECT_EQ(Preserve_trx_transfer_status::CORRUPT,
+            registry.admit_frame_sequence(
+                epoch_id, 2, test_sha256("replacement-begin"),
+                Preserve_trx_transfer_frame_type::BEGIN, &admission));
+  Preserve_trx_transfer_receiver_record record;
+  ASSERT_TRUE(registry.lookup(epoch_id, manifest.token, &record));
+  EXPECT_EQ(manifest.source_prepare_lsn, record.source_prepare_lsn);
+  EXPECT_EQ(Preserve_trx_transfer_epoch_terminal_outcome::CORRUPT,
+            registry.query_epoch_terminal(m_dir, epoch_id));
+}
+
+TEST_F(PreserveSnapshotTest,
+       ReceiverCommitAdmissionRetryRequiresSameSequenceAndDigest) {
+  Preserve_trx_transfer_receiver_registry registry;
+  const std::string epoch_id = "epoch-commit-admission-retry";
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.acknowledge_epoch(m_dir, epoch_id, 1000, 60000000));
+  const auto commit_digest = test_sha256("commit-retry");
+  bool duplicate = true;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.begin_epoch_commit_admission(
+                epoch_id, 7, commit_digest, &duplicate));
+  EXPECT_FALSE(duplicate);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.begin_epoch_commit_admission(
+                epoch_id, 7, commit_digest, &duplicate));
+  EXPECT_TRUE(duplicate);
+  EXPECT_EQ(Preserve_trx_transfer_status::CORRUPT,
+            registry.begin_epoch_commit_admission(
+                epoch_id, 7, test_sha256("different-commit"), &duplicate));
+  EXPECT_EQ(Preserve_trx_transfer_epoch_terminal_outcome::CORRUPT,
+            registry.query_epoch_terminal(m_dir, epoch_id));
+}
+
+TEST_F(PreserveSnapshotTest,
+       ReceiverCommitAdmissionAndAbandonHaveOneWinner) {
+  for (uint iteration = 0; iteration < 100; ++iteration) {
+    Preserve_trx_transfer_receiver_registry registry;
+    const std::string epoch_id =
+        "epoch-commit-admission-abandon-" + std::to_string(iteration);
+    Preserve_trx_transfer_manifest manifest;
+    manifest.epoch_id = epoch_id;
+    manifest.token = 1100 + iteration;
+    ASSERT_EQ(Preserve_trx_transfer_status::OK,
+              registry.begin_receive(manifest));
+    ASSERT_EQ(Preserve_trx_transfer_status::OK,
+              registry.acknowledge_epoch(m_dir, epoch_id, 1000, 60000000));
+    const auto commit_digest = test_sha256("commit-race");
+
+    Preserve_trx_transfer_epoch_terminal_request abandon;
+    abandon.root_dir = m_dir;
+    abandon.epoch_id = epoch_id;
+    abandon.receiver_process_generation = "receiver-generation";
+    abandon.authenticated_principal = "preserve_transfer";
+    abandon.operation_id = "abandon-" + std::to_string(iteration);
+    abandon.fact_digest[0] = 1;
+    abandon.now_us = 1000;
+    abandon.retention_us = 60000000;
+
+    std::atomic<bool> start{false};
+    Preserve_trx_transfer_status commit_status =
+        Preserve_trx_transfer_status::INVALID_ARGUMENT;
+    Preserve_trx_transfer_epoch_terminal_outcome abandon_status =
+        Preserve_trx_transfer_epoch_terminal_outcome::EPOCH_NOT_FOUND;
+    std::thread commit([&] {
+      while (!start.load(std::memory_order_acquire)) {
+      }
+      bool duplicate = false;
+      commit_status = registry.begin_epoch_commit_admission(
+          epoch_id, 1, commit_digest, &duplicate);
+    });
+    std::thread abandon_thread([&] {
+      while (!start.load(std::memory_order_acquire)) {
+      }
+      abandon_status = registry.try_begin_epoch_abandon(abandon);
+    });
+    start.store(true, std::memory_order_release);
+    commit.join();
+    abandon_thread.join();
+
+    const bool commit_won =
+        commit_status == Preserve_trx_transfer_status::OK;
+    const bool abandon_won =
+        abandon_status ==
+        Preserve_trx_transfer_epoch_terminal_outcome::ABANDONING;
+    EXPECT_NE(commit_won, abandon_won);
+    if (commit_won) {
+      EXPECT_EQ(Preserve_trx_transfer_epoch_terminal_outcome::NOT_COMMITTED,
+                abandon_status);
+      EXPECT_EQ(Preserve_trx_transfer_epoch_terminal_outcome::NOT_COMMITTED,
+                registry.query_epoch_terminal(m_dir, epoch_id));
+    } else {
+      ASSERT_TRUE(abandon_won);
+      EXPECT_EQ(Preserve_trx_transfer_status::UNSUPPORTED, commit_status);
+      EXPECT_EQ(Preserve_trx_transfer_epoch_terminal_outcome::ABANDONING,
+                registry.query_epoch_terminal(m_dir, epoch_id));
+    }
+  }
+}
+
+TEST_F(PreserveSnapshotTest,
+       ReceiverCommitAdmissionFailureCannotLeaveReopenedEpoch) {
+  Preserve_trx_transfer_receiver_registry registry;
+  const std::string epoch_id = "epoch-commit-admission-corrupt";
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.acknowledge_epoch(m_dir, epoch_id, 1000, 60000000));
+  const auto commit_digest = test_sha256("commit-corrupt");
+  bool duplicate = false;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.begin_epoch_commit_admission(
+                epoch_id, 1, commit_digest, &duplicate));
+  registry.mark_epoch_commit_admission_corrupt(epoch_id, 1, commit_digest);
+  EXPECT_EQ(Preserve_trx_transfer_epoch_terminal_outcome::CORRUPT,
+            registry.query_epoch_terminal(m_dir, epoch_id));
+  EXPECT_EQ(Preserve_trx_transfer_status::CORRUPT,
+            registry.begin_epoch_commit_admission(
+                epoch_id, 1, commit_digest, &duplicate));
+  Preserve_trx_transfer_sequence_admission admission =
+      Preserve_trx_transfer_sequence_admission::NEW_FRAME;
+  EXPECT_EQ(Preserve_trx_transfer_status::CORRUPT,
+            registry.admit_frame_sequence(
+                epoch_id, 2, test_sha256("late-after-corrupt"),
+                Preserve_trx_transfer_frame_type::DECLARE_TOKEN, &admission));
+}
+
+TEST_F(PreserveSnapshotTest,
+       ReceiverCommitAdmissionCannotBeRetiredBeforeFinalAck) {
+  Preserve_trx_transfer_receiver_registry registry;
+  const std::string epoch_id = "epoch-commit-admission-not-retired";
+  Preserve_trx_transfer_manifest manifest;
+  manifest.epoch_id = epoch_id;
+  manifest.token = 1199;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.begin_receive(manifest));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.mark_saved_online(epoch_id, manifest.token));
+  const auto commit_digest = test_sha256("commit-before-final-ack");
+  bool duplicate = false;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.begin_epoch_commit_admission(
+                epoch_id, 1, commit_digest, &duplicate));
+
+  EXPECT_EQ(0U, registry.retire_acknowledged_epochs_once(1000));
+  EXPECT_EQ(Preserve_trx_transfer_epoch_terminal_outcome::NOT_COMMITTED,
+            registry.query_epoch_terminal(m_dir, epoch_id));
+  Preserve_trx_transfer_receiver_record record;
+  EXPECT_TRUE(registry.lookup(epoch_id, manifest.token, &record));
+}
+
+TEST_F(PreserveSnapshotTest,
+       ReceiverCommitApplyMissingTokenCannotLeaveAdmissionPending) {
+  Transfer_codec_context_guard codec_guard;
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow();
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+  Preserve_trx_transfer_receiver_registry registry;
+  const std::string epoch_id = "epoch-commit-admission-missing-token";
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.acknowledge_epoch(m_dir, epoch_id, 1000, 60000000));
+  Preserve_trx_transfer_manifest sibling;
+  sibling.epoch_id = epoch_id;
+  sibling.token = 1201;
+  sibling.source_prepare_lsn = 10;
+  sibling.source_epoch_commit_lsn = 20;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.begin_receive(sibling));
+
+  Preserve_trx_transfer_frame commit;
+  commit.type = Preserve_trx_transfer_frame_type::COMMIT_EPOCH;
+  commit.sequence = 1;
+  commit.epoch_id = epoch_id;
+  commit.token = 1200;
+  set_test_transfer_commit_proof(&commit);
+  std::string encoded_commit;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_encode_frame(commit, &encoded_commit));
+
+  EXPECT_EQ(Preserve_trx_transfer_status::INVALID_ARGUMENT,
+            preserve_trx_transfer_handle_receiver_payload_batch(
+                m_dir, {encoded_commit}, &store, &registry, 300, 1));
+  Preserve_trx_transfer_epoch_terminal_status terminal;
+  EXPECT_EQ(Preserve_trx_transfer_epoch_terminal_outcome::CORRUPT,
+            registry.query_epoch_terminal(m_dir, epoch_id, &terminal));
+  EXPECT_EQ(Preserve_trx_transfer_epoch_terminal_operation::COMMIT,
+            terminal.operation);
+  Preserve_trx_transfer_receiver_record sibling_record;
+  ASSERT_TRUE(registry.lookup(epoch_id, sibling.token, &sibling_record));
+  EXPECT_EQ(Preserve_trx_transfer_receiver_state::CORRUPT,
+            sibling_record.state);
+}
+
+TEST_F(PreserveSnapshotTest,
+       ReceiverPrecommitApplyFailureConvergesAdmittedCommit) {
+  Transfer_codec_context_guard codec_guard;
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow();
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+  Preserve_trx_transfer_receiver_registry registry;
+  const std::string epoch_id = "epoch-precommit-apply-failure";
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.acknowledge_epoch(m_dir, epoch_id, 1000, 60000000));
+
+  Preserve_trx_transfer_manifest sibling;
+  sibling.epoch_id = epoch_id;
+  sibling.token = 1203;
+  sibling.source_prepare_lsn = 10;
+  sibling.source_epoch_commit_lsn = 20;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.begin_receive(sibling));
+
+  Preserve_trx_transfer_frame missing_chunk;
+  missing_chunk.type = Preserve_trx_transfer_frame_type::OBJECT_CHUNK;
+  missing_chunk.sequence = 1;
+  missing_chunk.epoch_id = epoch_id;
+  missing_chunk.token = 1202;
+  missing_chunk.object_id = "missing_object";
+  missing_chunk.chunk_payload = "x";
+
+  Preserve_trx_transfer_frame commit;
+  commit.type = Preserve_trx_transfer_frame_type::COMMIT_EPOCH;
+  commit.sequence = 2;
+  commit.epoch_id = epoch_id;
+  commit.token = sibling.token;
+  set_test_transfer_commit_proof(&commit);
+
+  std::vector<std::string> encoded_frames;
+  for (const Preserve_trx_transfer_frame *frame : {&missing_chunk, &commit}) {
+    std::string encoded;
+    ASSERT_EQ(Preserve_trx_transfer_status::OK,
+              preserve_trx_transfer_encode_frame(*frame, &encoded));
+    encoded_frames.push_back(std::move(encoded));
+  }
+
+  EXPECT_EQ(Preserve_trx_transfer_status::INVALID_ARGUMENT,
+            preserve_trx_transfer_handle_receiver_payload_batch(
+                m_dir, encoded_frames, &store, &registry, 300, 1));
+  EXPECT_EQ(Preserve_trx_transfer_epoch_terminal_outcome::CORRUPT,
+            registry.query_epoch_terminal(m_dir, epoch_id));
+  Preserve_trx_transfer_receiver_record sibling_record;
+  ASSERT_TRUE(registry.lookup(epoch_id, sibling.token, &sibling_record));
+  EXPECT_EQ(Preserve_trx_transfer_receiver_state::CORRUPT,
+            sibling_record.state);
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferReceiverBatchRejectsMutatingFrameAfterCommit) {
+  Transfer_codec_context_guard codec_guard;
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow();
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+  Preserve_trx_transfer_receiver_registry registry;
+  const std::string epoch_id = "epoch-batch-commit-cutoff";
+  Preserve_trx_transfer_manifest manifest;
+  manifest.epoch_id = epoch_id;
+  manifest.token = 1201;
+  manifest.source_prepare_lsn = 10;
+  manifest.source_epoch_commit_lsn = 20;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.begin_receive(manifest));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.acknowledge_epoch(m_dir, epoch_id, 1000, 60000000));
+
+  Preserve_trx_transfer_frame commit;
+  commit.type = Preserve_trx_transfer_frame_type::COMMIT_EPOCH;
+  commit.sequence = 1;
+  commit.epoch_id = epoch_id;
+  commit.token = manifest.token;
+  set_test_transfer_commit_proof(&commit);
+  Preserve_trx_transfer_frame late_declare;
+  late_declare.type = Preserve_trx_transfer_frame_type::DECLARE_TOKEN;
+  late_declare.sequence = 2;
+  late_declare.epoch_id = epoch_id;
+  late_declare.token = 1202;
+  std::vector<std::string> encoded_frames;
+  for (const Preserve_trx_transfer_frame *frame : {&commit, &late_declare}) {
+    std::string encoded;
+    ASSERT_EQ(Preserve_trx_transfer_status::OK,
+              preserve_trx_transfer_encode_frame(*frame, &encoded));
+    encoded_frames.push_back(std::move(encoded));
+  }
+
+  EXPECT_EQ(Preserve_trx_transfer_status::CORRUPT,
+            preserve_trx_transfer_handle_receiver_payload_batch(
+                m_dir, encoded_frames, &store, &registry, 300, 2));
+  Preserve_trx_transfer_receiver_record record;
+  EXPECT_FALSE(registry.lookup(epoch_id, late_declare.token, &record));
+  EXPECT_EQ(Preserve_trx_transfer_epoch_terminal_outcome::CORRUPT,
+            registry.query_epoch_terminal(m_dir, epoch_id));
 }
 
 TEST(PreservedTrxTransfer,
@@ -21823,7 +22575,10 @@ TEST(PreservedTrxTransfer,
     if (status == Preserve_trx_transfer_status::OK) {
       Preserve_trx_transfer_sequence_admission admission;
       status = registry.admit_frame_sequence("epoch-order-gate", 2,
-                                             second_digest, &admission);
+                                             second_digest,
+                                             Preserve_trx_transfer_frame_type::
+                                                 DECLARE_TOKEN,
+                                             &admission);
       registry.end_payload_sequence("epoch-order-gate");
     }
     second_status.store(static_cast<int>(status));
@@ -21840,7 +22595,10 @@ TEST(PreservedTrxTransfer,
     Preserve_trx_transfer_sequence_admission admission;
     EXPECT_EQ(Preserve_trx_transfer_status::OK,
               registry.admit_frame_sequence("epoch-order-gate", 1,
-                                            first_digest, &admission));
+                                            first_digest,
+                                            Preserve_trx_transfer_frame_type::
+                                                DECLARE_TOKEN,
+                                            &admission));
     registry.end_payload_sequence("epoch-order-gate");
   }
   second.join();
@@ -21854,10 +22612,16 @@ TEST(PreservedTrxTransfer,
   Preserve_trx_transfer_sequence_admission admission;
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
             registry.admit_frame_sequence("epoch-applied-watermark", 1,
-                                          test_sha256("frame-1"), &admission));
+                                          test_sha256("frame-1"),
+                                          Preserve_trx_transfer_frame_type::
+                                              DECLARE_TOKEN,
+                                          &admission));
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
             registry.admit_frame_sequence("epoch-applied-watermark", 2,
-                                          test_sha256("frame-2"), &admission));
+                                          test_sha256("frame-2"),
+                                          Preserve_trx_transfer_frame_type::
+                                              DECLARE_TOKEN,
+                                          &admission));
   registry.mark_frame_sequence_applied("epoch-applied-watermark", 2);
 
   std::atomic<int> wait_status{
@@ -21882,7 +22646,10 @@ TEST(PreservedTrxTransfer,
   Preserve_trx_transfer_sequence_admission admission;
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
             registry.admit_frame_sequence("epoch-applied-failure", 1,
-                                          test_sha256("frame-1"), &admission));
+                                          test_sha256("frame-1"),
+                                          Preserve_trx_transfer_frame_type::
+                                              DECLARE_TOKEN,
+                                          &admission));
   registry.mark_frame_sequence_apply_failed(
       "epoch-applied-failure", 1,
       Preserve_trx_transfer_status::RESOURCE_EXHAUSTED);
@@ -21898,6 +22665,8 @@ TEST(PreservedTrxTransfer,
   const auto digest = test_sha256("retry-frame");
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
             registry.admit_frame_sequence("epoch-retry-success", 1, digest,
+                                          Preserve_trx_transfer_frame_type::
+                                              DECLARE_TOKEN,
                                           &admission));
   registry.mark_frame_sequence_apply_failed(
       "epoch-retry-success", 1,
@@ -21908,6 +22677,8 @@ TEST(PreservedTrxTransfer,
 
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
             registry.admit_frame_sequence("epoch-retry-success", 1, digest,
+                                          Preserve_trx_transfer_frame_type::
+                                              DECLARE_TOKEN,
                                           &admission));
   ASSERT_EQ(Preserve_trx_transfer_sequence_admission::RETRY_PENDING,
             admission);
@@ -21924,10 +22695,14 @@ TEST(PreservedTrxTransfer,
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
             registry.admit_frame_sequence("epoch-retry-next-failure", 1,
                                           test_sha256("retry-frame-1"),
+                                          Preserve_trx_transfer_frame_type::
+                                              DECLARE_TOKEN,
                                           &admission));
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
             registry.admit_frame_sequence("epoch-retry-next-failure", 2,
                                           test_sha256("retry-frame-2"),
+                                          Preserve_trx_transfer_frame_type::
+                                              DECLARE_TOKEN,
                                           &admission));
   registry.mark_frame_sequence_apply_failed(
       "epoch-retry-next-failure", 1,
@@ -24750,6 +25525,87 @@ TEST_F(PreserveSnapshotTest,
 }
 
 TEST_F(PreserveSnapshotTest,
+       TransferReceiverExactCommitRetryResendsAcceptedAck) {
+  Transfer_codec_context_guard codec_guard;
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow();
+
+  Preserve_snapshot_metadata meta = metadata();
+  meta.token = test_transfer_token_string(916);
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = meta;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  Capturing_transfer_frame_sink sink;
+  Preserve_trx_transfer_source_epoch_session session(
+      "epoch-source-session-commit-ack-retry", 11, &sink);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK, session.declare_token(916));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.send_token_bundle(bundle, 916));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK, session.commit_epoch());
+
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+  Preserve_trx_transfer_receiver_registry registry;
+  Transfer_receiver_commit_accepted_probe probe;
+  probe.root_dir = m_dir;
+  probe.epoch_id = "epoch-source-session-commit-ack-retry";
+  probe.registry = &registry;
+  probe.return_statuses = {Preserve_trx_transfer_status::ACK_UNCERTAIN,
+                           Preserve_trx_transfer_status::OK};
+
+  ASSERT_GT(sink.frames().size(), 1U);
+  const uint64_t seal_ready_before =
+      preserve_trx_transfer_receiver_seal_prewarm_success_tokens_status();
+  const std::vector<std::string> phase1_frames(sink.frames().begin(),
+                                                sink.frames().end() - 1);
+  const std::vector<std::string> commit_frame{sink.frames().back()};
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_handle_receiver_payload_batch(
+                m_dir, phase1_frames, &store, &registry, 300, 3));
+  for (uint attempt = 0; attempt < 100; ++attempt) {
+    if (preserve_trx_transfer_receiver_seal_prewarm_success_tokens_status() >
+        seal_ready_before) {
+      break;
+    }
+    my_sleep(10000);
+  }
+  ASSERT_GT(preserve_trx_transfer_receiver_seal_prewarm_success_tokens_status(),
+            seal_ready_before);
+
+  EXPECT_EQ(Preserve_trx_transfer_status::ACK_UNCERTAIN,
+            preserve_trx_transfer_handle_receiver_payload_batch(
+                m_dir, commit_frame, &store, &registry, 300, 3, nullptr,
+                nullptr, nullptr, transfer_receiver_commit_accepted_probe,
+                &probe));
+  EXPECT_EQ(Preserve_trx_transfer_epoch_terminal_outcome::COMMITTED,
+            registry.query_epoch_terminal(
+                m_dir, "epoch-source-session-commit-ack-retry"));
+  Preserve_trx_transfer_accepted_epoch accepted;
+  ASSERT_EQ(Preserve_trx_transfer_status::COMMITTED_NOT_READY,
+            registry.query_accepted_epoch(
+                m_dir, "epoch-source-session-commit-ack-retry", &accepted));
+  EXPECT_EQ(Preserve_trx_transfer_epoch_lifecycle::PREWARMING,
+            accepted.lifecycle);
+
+  EXPECT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_handle_receiver_payload_batch(
+                m_dir, commit_frame, &store, &registry, 300, 3, nullptr,
+                nullptr, nullptr, transfer_receiver_commit_accepted_probe,
+                &probe));
+  EXPECT_EQ(2U, probe.call_count);
+  EXPECT_EQ(Preserve_trx_transfer_epoch_terminal_outcome::COMMITTED,
+            registry.query_epoch_terminal(
+                m_dir, "epoch-source-session-commit-ack-retry"));
+  ASSERT_EQ(Preserve_trx_transfer_status::COMMITTED_NOT_READY,
+            registry.query_accepted_epoch(
+                m_dir, "epoch-source-session-commit-ack-retry", &accepted));
+  EXPECT_EQ(Preserve_trx_transfer_epoch_lifecycle::READY, accepted.lifecycle);
+}
+
+TEST_F(PreserveSnapshotTest,
        TransferReceiverCommitWaitsForPriorSavedPayloadSemanticApply) {
   Transfer_receiver_config_guard receiver_config;
   receiver_config.allow();
@@ -24812,6 +25668,79 @@ TEST_F(PreserveSnapshotTest,
             declare_status.load());
   EXPECT_EQ(static_cast<int>(Preserve_trx_transfer_status::CORRUPT),
             commit_status.load());
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferReceiverAbandonWaitsForInFlightPayloadSemanticApply) {
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow();
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+  Preserve_trx_transfer_receiver_registry registry;
+  const std::string epoch_id = "epoch-abandon-apply-barrier";
+  const std::string principal = "17:preserve_transfer|1:%";
+  const std::string nonce = "00112233445566778899aabbccddeeff";
+  uint64_t accepted_retention_us = 0;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.open_online_epoch(epoch_id, principal, 60000000, nonce,
+                                       &accepted_retention_us));
+
+  Preserve_trx_transfer_manifest existing;
+  existing.epoch_id = epoch_id;
+  existing.token = 1918;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.begin_receive(existing));
+
+  Preserve_trx_transfer_frame declare;
+  declare.type = Preserve_trx_transfer_frame_type::DECLARE_TOKEN;
+  declare.sequence = 1;
+  declare.epoch_id = epoch_id;
+  declare.receiver_process_nonce = nonce;
+  declare.token = 1919;
+  std::string encoded_declare;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_encode_frame(declare, &encoded_declare));
+
+  Transfer_receiver_blocking_after_admission_probe probe;
+  std::atomic<int> declare_status{
+      static_cast<int>(Preserve_trx_transfer_status::ACK_UNCERTAIN)};
+  std::thread declare_thread([&] {
+    declare_status.store(static_cast<int>(
+        preserve_trx_transfer_handle_receiver_payload_batch(
+            m_dir, {encoded_declare}, &store, &registry, 1, 1, nullptr,
+            transfer_receiver_blocking_after_admission_probe, &probe)));
+  });
+  {
+    std::unique_lock<std::mutex> lock(probe.mutex);
+    ASSERT_TRUE(probe.condition.wait_for(
+        lock, std::chrono::seconds(1), [&] { return probe.entered; }));
+  }
+
+  Preserve_trx_transfer_epoch_terminal_request abandon;
+  abandon.root_dir = m_dir;
+  abandon.epoch_id = epoch_id;
+  abandon.receiver_process_generation = nonce;
+  abandon.authenticated_principal = principal;
+  abandon.operation_id = "abandon-inflight-apply";
+  abandon.fact_digest = test_sha256("abandon-inflight-apply");
+  abandon.now_us = 1000;
+  abandon.retention_us = accepted_retention_us;
+  EXPECT_EQ(Preserve_trx_transfer_epoch_terminal_outcome::NOT_COMMITTED,
+            preserve_trx_transfer_abandon_receiver_epoch_if_not_committed(
+                abandon, &registry));
+
+  {
+    std::lock_guard<std::mutex> lock(probe.mutex);
+    probe.released = true;
+  }
+  probe.condition.notify_all();
+  declare_thread.join();
+  EXPECT_EQ(static_cast<int>(Preserve_trx_transfer_status::OK),
+            declare_status.load());
+
+  Preserve_trx_transfer_receiver_record record;
+  EXPECT_TRUE(registry.lookup(epoch_id, existing.token, &record));
+  EXPECT_TRUE(registry.lookup(epoch_id, declare.token, &record));
 }
 
 TEST_F(PreserveSnapshotTest,
@@ -26882,6 +27811,27 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_GT(preserve_trx_receiver_lock_plan_capacity_bytes_status(), 0U);
   EXPECT_GT(preserve_trx_receiver_lock_plan_epoch_peak_bytes_status(), 0U);
   EXPECT_GT(preserve_trx_receiver_lock_plan_subpool_cap_bytes_status(), 0U);
+  Preserve_trx_gate_adopt_lease semantic_probe;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            strict_registry.begin_gate_adopt(
+                strict_key, strict_key.generation, &semantic_probe));
+  std::unique_ptr<Preserved_trx_bundle> semantic_bundle;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            semantic_probe.take_semantic_bundle(&semantic_bundle));
+  ASSERT_NE(nullptr, semantic_bundle);
+  EXPECT_EQ(test_transfer_token_string(transfer_token),
+            semantic_bundle->metadata.token);
+  EXPECT_TRUE(semantic_bundle->metadata.binlog_cache_payload.empty());
+  EXPECT_EQ(std::string().capacity(),
+            semantic_bundle->metadata.binlog_cache_payload.capacity());
+  EXPECT_TRUE(semantic_bundle->external_blobs.empty());
+  EXPECT_EQ(0U, semantic_bundle->external_blobs.capacity());
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            semantic_probe.restore_semantic_bundle(&semantic_bundle));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            strict_registry.abort_gate_adopt(
+                &semantic_probe,
+                Preserve_trx_gate_abort_outcome::ABANDONED_ROLLED_BACK));
   strict_registry.purge_epoch(strict_key.epoch_scope, strict_key.epoch_id);
 }
 
@@ -27886,6 +28836,60 @@ TEST_F(PreserveSnapshotTest,
       << "single-token abort must not skip queued final metadata sequence; "
          "the batch owner must abort the epoch instead";
 }
+
+#ifndef NDEBUG
+TEST_F(PreserveSnapshotTest,
+       TransferAbortEpochDoesNotRescanClearedPendingFrames) {
+  Transfer_codec_context_guard codec_guard;
+  constexpr uint64_t kToken = 707;
+  Preserve_snapshot_metadata meta = metadata();
+  meta.token = test_transfer_token_string(kToken);
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = meta;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  Capturing_transfer_frame_sink sink;
+  Preserve_trx_transfer_source_epoch_session session(
+      "epoch-abort-no-cleared-frame-rescan", 17, &sink);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK, session.declare_token(kToken));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.send_token_bundle(bundle, kToken));
+  ASSERT_EQ(0U,
+            session.pending_frame_cleanup_invocations_for_unit_test());
+
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.abort_epoch("source_epoch_abort"));
+  EXPECT_EQ(0U, session.pending_frame_cleanup_invocations_for_unit_test());
+  Preserve_trx_transfer_frame abort;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_decode_frame(sink.frames().back(), &abort));
+  EXPECT_EQ(Preserve_trx_transfer_frame_type::ABORT, abort.type);
+  EXPECT_EQ(kToken, abort.token);
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferAbortTokenStillRunsPendingFrameCleanup) {
+  Transfer_codec_context_guard codec_guard;
+  constexpr uint64_t kToken = 708;
+  Capturing_transfer_frame_sink sink;
+  Preserve_trx_transfer_source_epoch_session session(
+      "epoch-token-abort-pending-frame-cleanup", 17, &sink);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK, session.declare_token(kToken));
+  ASSERT_EQ(0U,
+            session.pending_frame_cleanup_invocations_for_unit_test());
+
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.abort_token(kToken, "source_token_removed"));
+  EXPECT_EQ(1U, session.pending_frame_cleanup_invocations_for_unit_test());
+  Preserve_trx_transfer_frame abort;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_decode_frame(sink.frames().back(), &abort));
+  EXPECT_EQ(Preserve_trx_transfer_frame_type::ABORT, abort.type);
+  EXPECT_EQ(kToken, abort.token);
+}
+#endif
 
 TEST_F(PreserveSnapshotTest, LocalFileTaintMarkerPreservesRootCause) {
   const std::string token = metadata().token;

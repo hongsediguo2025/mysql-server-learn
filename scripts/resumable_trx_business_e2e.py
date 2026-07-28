@@ -5794,9 +5794,8 @@ class BusinessE2ERunner:
                     connection_factory=self._receiver_admin_connection,
                 )
             else:
-                self.receiver_artifact_counts = self.wait_for_receiver_artifacts(
-                    expected_standby_pending=expected_receiver_tokens,
-                    timeout_s=self.config.resume_timeout_s,
+                self.receiver_artifact_counts = (
+                    self.receiver_preserve_artifact_counts()
                 )
                 self.wait_for_receiver_readiness(
                     expected_standby_pending=expected_receiver_tokens,
@@ -7655,15 +7654,18 @@ class BusinessE2ERunner:
                     0,
                     receiver_all_prewarm_complete_monotonic_us - final_ack_us,
                 )
-        process_local_epoch = (
-            self.config.standalone_transfer_accept_committed_not_ready
-        )
         receiver_process_local_epoch_accepted = (
-            process_local_epoch
-            and self.receiver_process_local_epoch_accepted()
+            self.receiver_process_local_epoch_accepted()
+        )
+        process_local_epoch = (
+            receiver_process_local_epoch_accepted
+            and artifact_counts.get("epoch_fact_count", 0) == 0
+            and artifact_counts.get("epoch_commit_count", 0) == 0
         )
         receiver_epoch_fact_bound = (
-            receiver_process_local_epoch_accepted
+            receiver_prewarm_metrics is not None
+            and receiver_prewarm_metrics.epoch_ready_bind_attempts > 0
+            and receiver_prewarm_metrics.ready_monotonic_us > 0
             if process_local_epoch
             else artifact_counts.get("epoch_fact_count", 0) > 0
             and artifact_counts.get("epoch_commit_count", 0) > 0
@@ -8347,16 +8349,26 @@ class BusinessE2ERunner:
             getattr(self, "receiver_artifact_counts", {})
             or self.receiver_preserve_artifact_counts()
         )
-        if artifact_counts.get("epoch_fact_count", 0) < 1 or artifact_counts.get(
-            "epoch_commit_count", 0
-        ) < 1:
-            raise AssertionError(
-                "receiver not ready: epoch fact/commit marker is not bound"
-            )
-
         receiver_prewarm_metrics = getattr(self, "receiver_prewarm_metrics", None)
         if receiver_prewarm_metrics is None:
             raise AssertionError("receiver not ready: prewarm status unavailable")
+        process_local_epoch = (
+            self.receiver_process_local_epoch_accepted()
+            and artifact_counts.get("epoch_fact_count", 0) == 0
+            and artifact_counts.get("epoch_commit_count", 0) == 0
+        )
+        if process_local_epoch:
+            if receiver_prewarm_metrics.epoch_ready_bind_attempts == 0:
+                raise AssertionError(
+                    "receiver not ready: process-local epoch READY bind was not "
+                    "executed"
+                )
+        elif artifact_counts.get("epoch_fact_count", 0) < 1 or (
+            artifact_counts.get("epoch_commit_count", 0) < 1
+        ):
+            raise AssertionError(
+                "receiver not ready: epoch fact/commit marker is not bound"
+            )
         self._validate_transfer_strict_zero_side_effects(receiver_prewarm_metrics)
         phase2_end_us = self.latest_source_phase2_end_monotonic_us()
         if phase2_end_us is None:
@@ -8393,7 +8405,8 @@ class BusinessE2ERunner:
                 f"count={receiver_prewarm_metrics.committed_epoch_fallback_count}"
             )
         if (
-            receiver_prewarm_metrics.record_lock_resident_pages
+            receiver_prewarm_metrics.record_lock_required_residency_bytes > 0
+            and receiver_prewarm_metrics.record_lock_resident_pages
             < receiver_prewarm_metrics.record_lock_page_count
         ):
             raise AssertionError(
@@ -8406,14 +8419,32 @@ class BusinessE2ERunner:
                 "receiver not ready: record-lock ready cache would cold-read "
                 f"pages={receiver_prewarm_metrics.record_lock_cold_page_gets}"
             )
-        if (
-            self.config.lockset_batch_size > 0
-            and receiver_prewarm_metrics.record_lock_page_count <= 0
-        ):
-            raise AssertionError(
-                "receiver not ready: lockset workload produced no record-lock page "
-                "evidence"
-            )
+        if self.config.lockset_batch_size > 0:
+            if (
+                receiver_prewarm_metrics.record_object_prewarm_count
+                < expected_standby_pending
+                or receiver_prewarm_metrics.lock_plan_epoch_peak_bytes <= 0
+            ):
+                raise AssertionError(
+                    "receiver not ready: lockset workload produced incomplete "
+                    "metadata-only lock-plan evidence "
+                    f"record_objects="
+                    f"{receiver_prewarm_metrics.record_object_prewarm_count} "
+                    f"expected={expected_standby_pending} "
+                    f"plan_peak_bytes="
+                    f"{receiver_prewarm_metrics.lock_plan_epoch_peak_bytes}"
+                )
+            if (
+                receiver_prewarm_metrics.lock_plan_subpool_cap_bytes > 0
+                and receiver_prewarm_metrics.lock_plan_epoch_peak_bytes
+                > receiver_prewarm_metrics.lock_plan_subpool_cap_bytes
+            ):
+                raise AssertionError(
+                    "receiver not ready: metadata-only lock plan exceeded its "
+                    "subpool "
+                    f"peak={receiver_prewarm_metrics.lock_plan_epoch_peak_bytes} "
+                    f"cap={receiver_prewarm_metrics.lock_plan_subpool_cap_bytes}"
+                )
 
         ready_lag_us = receiver_prewarm_metrics.ready_after_final_spool_ack_us
         ready_lag_label = "receiver_ready_after_final_spool_ack_us"
