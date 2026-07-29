@@ -797,7 +797,6 @@ def build_e2e_command(
             command.remove(flag)
         lockset_index = command.index("--lockset-batch-size")
         del command[lockset_index : lockset_index + 2]
-        command.append("--standalone-transfer-accept-committed-not-ready")
         command.extend(mixed_arguments)
         return command
 
@@ -1116,7 +1115,7 @@ def build_acceptance_contract(
         return {
             "evidence_kind": "STANDALONE_TRANSFER_E2E",
             "source_phase2_total_us_max": profile.source_phase2_limit_us,
-            "receiver_readiness_contract": "COMMITTED_NOT_READY",
+            "receiver_readiness_contract": "READY",
             "receiver_epoch_storage": "PROCESS_LOCAL",
             "receiver_process_local_epoch_accepted": True,
             "receiver_final_ack_required": True,
@@ -1559,10 +1558,36 @@ def validate_mixed_pressure_report(
         require_equal("mixed_receiver_log_bin_enabled", True)
         require_equal("mixed_receiver_binlog_format", "ROW")
         require_equal("mixed_restart_fresh_connection_count", 0)
-        require_equal("receiver_readiness_contract", "COMMITTED_NOT_READY")
+        require_equal("receiver_readiness_contract", "READY")
         require_equal("receiver_epoch_storage", "PROCESS_LOCAL")
         require_equal("receiver_process_local_epoch_accepted", True)
         require_equal("receiver_epoch_fact_bound", True)
+        for key, expected in (
+            ("receiver_ready_tokens", survivor_count),
+            ("receiver_not_ready_tokens", 0),
+            ("receiver_auto_prewarm_ready_tokens", survivor_count),
+            ("receiver_auto_prewarm_not_ready_tokens", 0),
+            ("receiver_epoch_ready_bind_attempts", 1),
+            ("receiver_prewarm_backlog_at_phase2_end", 0),
+        ):
+            actual = int(report.get(key) or 0)
+            if actual != expected:
+                failures.append(
+                    f"{key}: expected={expected} actual={actual}"
+                )
+        ready_after_ack_us = int(
+            report.get("receiver_ready_after_final_spool_ack_us") or 0
+        )
+        if (
+            ready_after_ack_us <= 0
+            or ready_after_ack_us
+            >= profile.ready_after_final_spool_ack_limit_us
+        ):
+            failures.append(
+                "receiver_ready_after_final_spool_ack_us exceeded or missing: "
+                f"actual_us={ready_after_ack_us} "
+                f"limit_us={profile.ready_after_final_spool_ack_limit_us}"
+            )
         phase2_us = _metric_max(report, "source_phase2_total_us")
         if phase2_us > profile.source_phase2_limit_us:
             failures.append(
@@ -1589,15 +1614,6 @@ def validate_mixed_pressure_report(
         except (RuntimeError, TypeError, ValueError) as exc:
             failures.append(str(exc))
             all_prewarm_after_ack_us = 0
-        if (
-            all_prewarm_after_ack_us
-            >= profile.ready_after_final_spool_ack_limit_us
-        ):
-            failures.append(
-                "receiver_all_prewarm_after_final_ack_us exceeded: "
-                f"actual_us={all_prewarm_after_ack_us} "
-                f"limit_us={profile.ready_after_final_spool_ack_limit_us}"
-            )
         expected_prewarm_tokens = int(
             report.get("receiver_expected_prewarm_tokens") or 0
         )
@@ -1644,6 +1660,7 @@ def validate_mixed_pressure_report(
         mode_metrics = {
             "source_phase2_total_us": phase2_us,
             "source_post_command_tail_us": post_command_tail_us,
+            "receiver_ready_after_final_spool_ack_us": ready_after_ack_us,
             "receiver_all_prewarm_after_final_ack_us": (
                 all_prewarm_after_ack_us
             ),

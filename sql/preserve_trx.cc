@@ -5947,7 +5947,15 @@ preserve_trx_wait_for_phase1_readiness(
   assert(metrics != nullptr);
 
   DEBUG_SYNC(owner, "preserve_trx_phase1_readiness_before_wait");
+  if (preserve_trx_active_drain_reset_requested(active_drain_attempt))
+    return Preserve_trx_phase1_readiness_result::RESET_REQUESTED;
+  if (owner->killed) return Preserve_trx_phase1_readiness_result::OWNER_KILLED;
+
   const ulonglong sampled_us = preserve_trx_monotonic_us();
+  if (preserve_trx_monotonic_deadline_expired_at(phase1_deadline_us,
+                                                 sampled_us)) {
+    return Preserve_trx_phase1_readiness_result::DEADLINE;
+  }
   const ulonglong long_command_age_us =
       static_cast<ulonglong>(preserve_trx_drain_closing_command_timeout_ms) *
       1000ULL;
@@ -5971,6 +5979,11 @@ preserve_trx_wait_for_phase1_readiness(
     if (preserve_trx_active_drain_reset_requested(active_drain_attempt))
       return Preserve_trx_phase1_readiness_result::RESET_REQUESTED;
     if (owner->killed) return Preserve_trx_phase1_readiness_result::OWNER_KILLED;
+    const ulonglong now_us = preserve_trx_monotonic_us();
+    if (preserve_trx_monotonic_deadline_expired_at(phase1_deadline_us,
+                                                   now_us)) {
+      return Preserve_trx_phase1_readiness_result::DEADLINE;
+    }
     if (progress && progress()) {
       return Preserve_trx_phase1_readiness_result::PROGRESS_FAILED;
     }
@@ -5985,11 +5998,6 @@ preserve_trx_wait_for_phase1_readiness(
     ++metrics->samples;
     if (!offender_active) return Preserve_trx_phase1_readiness_result::READY;
 
-    const ulonglong now_us = preserve_trx_monotonic_us();
-    if (preserve_trx_monotonic_deadline_expired_at(phase1_deadline_us,
-                                                   now_us)) {
-      return Preserve_trx_phase1_readiness_result::DEADLINE;
-    }
     DEBUG_SYNC(owner, "preserve_trx_phase1_readiness_before_poll_sleep");
     my_sleep(10000);
   }

@@ -660,10 +660,17 @@ class MixedPressureCommandTest(unittest.TestCase):
             "mixed_receiver_log_bin_enabled": True,
             "mixed_receiver_binlog_format": "ROW",
             "mixed_restart_fresh_connection_count": 0,
-            "receiver_readiness_contract": "COMMITTED_NOT_READY",
+            "receiver_readiness_contract": "READY",
             "receiver_epoch_storage": "PROCESS_LOCAL",
             "receiver_process_local_epoch_accepted": True,
             "receiver_epoch_fact_bound": True,
+            "receiver_ready_tokens": profile.sessions,
+            "receiver_not_ready_tokens": 0,
+            "receiver_auto_prewarm_ready_tokens": profile.sessions,
+            "receiver_auto_prewarm_not_ready_tokens": 0,
+            "receiver_epoch_ready_bind_attempts": 1,
+            "receiver_ready_after_final_spool_ack_us": 400_000,
+            "receiver_prewarm_backlog_at_phase2_end": 0,
             "source_phase2_total_us": [20_000_000],
             "source_phase2_post_command_tail_us": [400_000],
             "receiver_all_prewarm_after_final_ack_us": 400_000,
@@ -745,9 +752,7 @@ class MixedPressureCommandTest(unittest.TestCase):
         self.assertEqual("LOCAL_STARTUP_E2E", local["evidence_kind"])
         self.assertEqual(100_000, local["sql_resume_max_us"])
         self.assertNotIn("receiver_readiness_contract", local)
-        self.assertEqual(
-            "COMMITTED_NOT_READY", transfer["receiver_readiness_contract"]
-        )
+        self.assertEqual("READY", transfer["receiver_readiness_contract"])
         self.assertNotIn("sql_resume_max_us", transfer)
 
     def test_transfer_command_uses_same_workload_over_tcp(self):
@@ -776,7 +781,9 @@ class MixedPressureCommandTest(unittest.TestCase):
         self.assertIn("standby_transfer_receiver_drain_metrics", joined)
         self.assertIn("--receiver-start-command", command)
         self.assertIn("--receiver-physical-copy-before-drain", command)
-        self.assertIn("--standalone-transfer-accept-committed-not-ready", command)
+        self.assertNotIn(
+            "--standalone-transfer-accept-committed-not-ready", command
+        )
         self.assertIn("--allow-partial-tokens", command)
         self.assertIn("--preserve-trx-transfer-target-host=127.0.0.1", source)
         self.assertTrue(any(value.startswith("--log-bin=") for value in source))
@@ -793,7 +800,7 @@ class MixedPressureCommandTest(unittest.TestCase):
             "--preserve-trx-promotion-prewarm-workers=2", receiver
         )
 
-    def test_mixed_transfer_requires_truthful_post_command_and_prewarm_tails(self):
+    def test_mixed_transfer_requires_truthful_post_command_and_cleanup_metrics(self):
         report = self._valid_transfer_report()
 
         metrics = validate_mixed_pressure_report(
@@ -803,6 +810,16 @@ class MixedPressureCommandTest(unittest.TestCase):
         self.assertEqual(400_000, metrics["source_post_command_tail_us"])
         self.assertEqual(
             400_000, metrics["receiver_all_prewarm_after_final_ack_us"]
+        )
+        cleanup_after_ready = dict(report)
+        cleanup_after_ready["receiver_all_prewarm_after_final_ack_us"] = (
+            1_600_000
+        )
+        metrics = validate_mixed_pressure_report(
+            MIXED_SMOKE_PROFILE, cleanup_after_ready, "mixed-transfer"
+        )
+        self.assertEqual(
+            1_600_000, metrics["receiver_all_prewarm_after_final_ack_us"]
         )
 
         for key in (
@@ -818,11 +835,8 @@ class MixedPressureCommandTest(unittest.TestCase):
 
         too_slow = dict(report)
         too_slow["source_phase2_post_command_tail_us"] = [500_001]
-        too_slow["receiver_all_prewarm_after_final_ack_us"] = 500_001
         with self.assertRaisesRegex(
-            RuntimeError,
-            "source_phase2_post_command_tail_us.*"
-            "receiver_all_prewarm_after_final_ack_us",
+            RuntimeError, "source_phase2_post_command_tail_us"
         ):
             validate_mixed_pressure_report(
                 MIXED_SMOKE_PROFILE, too_slow, "mixed-transfer"
@@ -830,14 +844,20 @@ class MixedPressureCommandTest(unittest.TestCase):
 
         at_limit = dict(report)
         at_limit["source_phase2_post_command_tail_us"] = [500_000]
-        at_limit["receiver_all_prewarm_after_final_ack_us"] = 500_000
         with self.assertRaisesRegex(
-            RuntimeError,
-            "source_phase2_post_command_tail_us.*"
-            "receiver_all_prewarm_after_final_ack_us",
+            RuntimeError, "source_phase2_post_command_tail_us"
         ):
             validate_mixed_pressure_report(
                 MIXED_SMOKE_PROFILE, at_limit, "mixed-transfer"
+            )
+
+        ready_too_slow = dict(report)
+        ready_too_slow["receiver_ready_after_final_spool_ack_us"] = 500_000
+        with self.assertRaisesRegex(
+            RuntimeError, "receiver_ready_after_final_spool_ack_us"
+        ):
+            validate_mixed_pressure_report(
+                MIXED_SMOKE_PROFILE, ready_too_slow, "mixed-transfer"
             )
 
     def test_mixed_transfer_prewarm_count_must_close_actual_survivor_set(self):
@@ -849,6 +869,17 @@ class MixedPressureCommandTest(unittest.TestCase):
         with self.assertRaisesRegex(
             RuntimeError, "receiver_expected_prewarm_tokens"
         ):
+            validate_mixed_pressure_report(
+                MIXED_SMOKE_PROFILE, report, "mixed-transfer"
+            )
+
+    def test_mixed_transfer_ready_count_must_close_actual_survivor_set(self):
+        report = self._valid_transfer_report()
+        report["receiver_ready_tokens"] = report[
+            "mixed_preserved_survivor_count"
+        ] - 1
+
+        with self.assertRaisesRegex(RuntimeError, "receiver_ready_tokens"):
             validate_mixed_pressure_report(
                 MIXED_SMOKE_PROFILE, report, "mixed-transfer"
             )

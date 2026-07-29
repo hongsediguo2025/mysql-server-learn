@@ -33,6 +33,7 @@ from scripts.resumable_trx_business_e2e import (
     DrainTargetCounterRejectionMetrics,
     Phase2PauseSample,
     ReceiverPrewarmMetrics,
+    ReceiverReadLoadProbe,
     ResetDrainCoordinator,
     ResetDrainWorker,
     ResumeCoordinator,
@@ -59,6 +60,25 @@ from scripts.resumable_trx_business_e2e import (
     _expect_single_non_null_row,
     parse_args,
 )
+
+
+class _ReceiverReadProbeCursor:
+    def execute(self, _query):
+        return None
+
+    def fetchall(self):
+        return [(1,)]
+
+    def close(self):
+        return None
+
+
+class _ReceiverReadProbeConnection:
+    def cursor(self):
+        return _ReceiverReadProbeCursor()
+
+    def close(self):
+        return None
 
 
 class _FakeConnection:
@@ -5403,9 +5423,38 @@ class WorkloadPlanTest(unittest.TestCase):
         validate_receiver_read_load_report(
             report, max_qps_drop_pct=5.0, max_p99_increase_pct=10.0
         )
-
         self.assertEqual(report["receiver_read_load_qps_drop_pct"], 4.0)
         self.assertEqual(report["receiver_read_load_p99_increase_pct"], 9.0)
+
+    def test_receiver_read_load_baseline_waits_for_first_query(self):
+        allow_connection = threading.Event()
+        baseline_started = threading.Event()
+
+        def connection_factory():
+            allow_connection.wait(1.0)
+            return _ReceiverReadProbeConnection()
+
+        probe = ReceiverReadLoadProbe(
+            threads=1,
+            connection_factory=connection_factory,
+            query="SELECT 1",
+        )
+
+        starter = threading.Thread(
+            target=lambda: (probe.start_baseline(), baseline_started.set()),
+            daemon=True,
+        )
+        starter.start()
+        returned_before_query = baseline_started.wait(0.05)
+        allow_connection.set()
+        self.assertTrue(baseline_started.wait(1.0))
+        time.sleep(0.01)
+        probe.begin_transfer()
+        report = probe.stop()
+        starter.join(1.0)
+
+        self.assertFalse(returned_before_query)
+        self.assertGreater(report["receiver_read_load_baseline_query_count"], 0)
 
     def test_receiver_read_load_report_rejects_qps_and_p99_regression(self):
         report = build_receiver_read_load_report(

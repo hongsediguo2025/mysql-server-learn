@@ -4576,6 +4576,7 @@ class ReceiverReadLoadProbe:
     """Run bounded, read-only point queries across baseline and transfer phases."""
 
     _MAX_SAMPLES_PER_THREAD = 50_000
+    _STARTUP_TIMEOUT_S = 30.0
 
     def __init__(
         self,
@@ -4588,6 +4589,7 @@ class ReceiverReadLoadProbe:
         self._connection_factory = connection_factory
         self._query = query
         self._lock = threading.Lock()
+        self._condition = threading.Condition(self._lock)
         self._stop_event = threading.Event()
         self._phase = "idle"
         self._baseline_start = 0.0
@@ -4607,6 +4609,7 @@ class ReceiverReadLoadProbe:
             ],
         }
         self._errors: List[str] = []
+        self._failed_workers = 0
         self._report: Optional[Dict[str, object]] = None
 
     def start_baseline(self) -> None:
@@ -4614,7 +4617,6 @@ class ReceiverReadLoadProbe:
             if self._phase != "idle":
                 raise RuntimeError("receiver read-load probe was already started")
             self._phase = "baseline"
-            self._baseline_start = time.monotonic()
         for worker_id in range(self._thread_count):
             worker = threading.Thread(
                 target=self._run_worker,
@@ -4624,6 +4626,26 @@ class ReceiverReadLoadProbe:
             )
             self._workers.append(worker)
             worker.start()
+        deadline = time.monotonic() + self._STARTUP_TIMEOUT_S
+        with self._condition:
+            while (
+                self._counts["baseline"] == 0
+                and self._failed_workers < self._thread_count
+            ):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._condition.wait(remaining)
+            if self._counts["baseline"] == 0:
+                detail = self._errors[0] if self._errors else "startup timeout"
+                raise RuntimeError(
+                    "receiver read-load probe produced no startup sample: "
+                    f"{detail}"
+                )
+            self._counts["baseline"] = 0
+            for samples in self._samples["baseline"]:
+                samples.clear()
+            self._baseline_start = time.monotonic()
 
     def begin_transfer(self) -> None:
         now = time.monotonic()
@@ -4705,12 +4727,15 @@ class ReceiverReadLoadProbe:
                         "receiver read-load point query returned "
                         f"{len(rows)} rows"
                     )
-                with self._lock:
+                with self._condition:
                     self._counts[phase] += 1
                     self._samples[phase][worker_id].append(int(elapsed_us))
+                    self._condition.notify_all()
         except BaseException as exc:
-            with self._lock:
+            with self._condition:
                 self._errors.append(f"{type(exc).__name__}: {exc}")
+                self._failed_workers += 1
+                self._condition.notify_all()
         finally:
             if cursor is not None:
                 try:

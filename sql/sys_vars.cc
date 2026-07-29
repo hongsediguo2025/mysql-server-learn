@@ -1252,8 +1252,9 @@ static Sys_var_bool Sys_preserve_trx_drain_command_timeout_fail_batch(
 static Sys_var_uint Sys_preserve_trx_transfer_phase1_timeout_ms(
     "preserve_trx_transfer_phase1_timeout_ms",
     "Classic-protocol operation timeout in milliseconds for source "
-    "standby-transfer phase 1. The same value also bounds phase-1 readiness "
-    "observation before command quiesce.",
+    "standby-transfer phase 1. The same value is the absolute phase-1 "
+    "readiness deadline; after it expires readiness stops observing commands "
+    "and proceeds to WARMCOPY_CLOSING.",
     GLOBAL_VAR(preserve_trx_transfer_phase1_timeout_ms),
     CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, UINT_MAX32), DEFAULT(600000),
     BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);

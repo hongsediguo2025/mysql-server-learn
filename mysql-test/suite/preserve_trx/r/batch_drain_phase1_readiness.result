@@ -66,6 +66,36 @@ FROM performance_schema.global_status
 WHERE VARIABLE_NAME='Preserve_trx_phase1_readiness_wait_us';
 readiness_waited
 1
+SET GLOBAL preserve_trx_transfer_phase1_timeout_ms=50;
+SET GLOBAL preserve_trx_drain_closing_command_timeout_ms=5000;
+SET DEBUG_SYNC=
+'before_execute_sql_command SIGNAL phase1_deadline_old_running WAIT_FOR phase1_deadline_old_continue';
+SELECT 3 AS deadline_command;
+SET DEBUG_SYNC='now WAIT_FOR phase1_deadline_old_running TIMEOUT 10';
+SET SESSION debug='+d,preserve_trx_drain_skip_shutdown_after_audit_no_targets';
+SET DEBUG_SYNC=
+'preserve_trx_phase1_readiness_before_wait SIGNAL phase1_deadline_tail WAIT_FOR phase1_deadline_continue';
+SET DEBUG_SYNC=
+'preserve_trx_warmcopy_after_closing_state_before_targets SIGNAL phase1_deadline_closing WAIT_FOR phase1_deadline_closing_continue';
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+SET DEBUG_SYNC='now WAIT_FOR phase1_deadline_tail TIMEOUT 10';
+SET DEBUG_SYNC='now SIGNAL phase1_deadline_continue';
+SET DEBUG_SYNC='now WAIT_FOR phase1_deadline_closing TIMEOUT 10';
+SELECT VARIABLE_VALUE=0 AS expired_readiness_did_not_scan
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_phase1_readiness_samples';
+expired_readiness_did_not_scan
+1
+SELECT VARIABLE_VALUE=0 AS expired_readiness_did_not_wait
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_phase1_readiness_wait_us';
+expired_readiness_did_not_wait
+1
+SET DEBUG_SYNC='now SIGNAL phase1_deadline_old_continue';
+deadline_command
+3
+SET DEBUG_SYNC='now SIGNAL phase1_deadline_closing_continue';
+SET SESSION debug='';
 DROP USER phase1_readiness_app@localhost;
 SET GLOBAL preserve_trx_transfer_phase1_timeout_ms=600000;
 SET GLOBAL preserve_trx_drain_closing_command_timeout_ms=1000;
