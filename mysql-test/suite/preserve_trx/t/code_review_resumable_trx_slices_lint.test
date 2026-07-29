@@ -103,6 +103,7 @@ my $xa_path = File::Spec->catfile($source_root, 'sql', 'xa.cc');
 my $gunit_path = File::Spec->catfile($source_root, 'unittest', 'gunit',
                                      'preserve_trx-t.cc');
 my $sql_parse_path = File::Spec->catfile($source_root, 'sql', 'sql_parse.cc');
+my $sql_yacc_path = File::Spec->catfile($source_root, 'sql', 'sql_yacc.yy');
 my $sql_class_path = File::Spec->catfile($source_root, 'sql', 'sql_class.cc');
 my $sys_vars_path = File::Spec->catfile($source_root, 'sql', 'sys_vars.cc');
 my $transfer_path = File::Spec->catfile($source_root, 'sql',
@@ -117,6 +118,8 @@ my $promotion_header_path = File::Spec->catfile($source_root, 'sql',
                                                 'preserve_trx_promotion.h');
 my $promotion_prepared_path = File::Spec->catfile(
   $source_root, 'sql', 'preserve_trx_promotion_prepared.cc');
+my $promotion_prepared_header_path = File::Spec->catfile(
+  $source_root, 'sql', 'preserve_trx_promotion_prepared.h');
 my $standby_transfer_doc_path = File::Spec->catfile(
   $source_root, 'design', 'preserve-resume-8.0.22-standby-transfer-design.md');
 
@@ -160,6 +163,7 @@ my $handler = read_source($handler_path);
 my $xa = read_source($xa_path);
 my $gunit = read_source($gunit_path);
 my $sql_parse = read_source($sql_parse_path);
+my $sql_yacc = read_source($sql_yacc_path);
 my $sql_class = read_source($sql_class_path);
 my $sys_vars = read_source($sys_vars_path);
 my $transfer = read_source($transfer_path);
@@ -168,6 +172,7 @@ my $sql_lock_warmcopy = read_source($sql_lock_warmcopy_path);
 my $promotion = read_source($promotion_path);
 my $promotion_header = read_source($promotion_header_path);
 my $promotion_prepared = read_source($promotion_prepared_path);
+my $promotion_prepared_header = read_source($promotion_prepared_header_path);
 my $standby_transfer_doc = read_optional_source($standby_transfer_doc_path);
 
 my ($trx_id_store_fact_capture) =
@@ -3224,6 +3229,27 @@ my $resolution_ready_publish =
 die "COMMIT_UNKNOWN must publish HA resolution readiness only after source drain teardown\n"
   unless $unknown_finalize >= 0 &&
          $resolution_ready_publish > $unknown_finalize;
+die "partial READY must not change transfer protocol v1\n"
+  unless $transfer_header =~
+         /kPreserveTrxTransferProtocolVersion\s*=\s*1\s*;/s;
+die "partial READY must not add SQL grammar tokens\n"
+  if $sql_yacc =~
+     /\b(?:PARTIAL_READY|SOURCE_EXCLUDED|RECEIVER_EXCLUDED)\b/s;
+die "partial READY must not add a selection sysvar\n"
+  if $sys_vars =~
+     /Sys_var_[A-Za-z0-9_]*[\s\S]{0,300}
+      preserve_trx_[A-Za-z0-9_]*(?:partial_ready|receiver_selection|
+      source_exclusion)/sx;
+my $partial_ready_production_headers =
+    $preserve_header . $transfer_header . $promotion_header .
+    $promotion_prepared_header . $trx_preserve_header;
+die "partial READY must not add a production unit-test interface\n"
+  if $partial_ready_production_headers =~
+     /\b(?:partial_ready|receiver_excluded|source_excluded|selection)
+      [A-Za-z0-9_]*_for_unit_test\b/six ||
+     $partial_ready_production_headers =~
+     /\b[A-Za-z0-9_]*_for_unit_test[A-Za-z0-9_]*
+      (?:partial_ready|receiver_excluded|source_excluded|selection)\b/six;
 EOF
 
 SELECT 'ok' AS code_review_resumable_trx_slices_lint;

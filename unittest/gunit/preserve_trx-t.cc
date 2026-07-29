@@ -16917,6 +16917,10 @@ TEST_F(PreserveSnapshotTest,
   }
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
             session.finalize_token_manifest(transfer_token));
+  EXPECT_EQ(Preserve_trx_transfer_status::UNSUPPORTED,
+            session.abort_token(transfer_token, "late_failure"))
+      << "a finalized token cannot be removed without renumbering the "
+         "terminal epoch sequence";
   ASSERT_EQ(Preserve_trx_transfer_status::OK, session.commit_epoch());
   ASSERT_EQ(Preserve_trx_transfer_status::OK, apply_new_frames());
 
@@ -23523,6 +23527,105 @@ TEST_F(PreserveSnapshotTest,
             preserve_trx_transfer_receiver_admitted_frames_status());
   EXPECT_EQ(admitted_bytes_before + expected_admitted_bytes,
             preserve_trx_transfer_receiver_admitted_bytes_status());
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferReceiverReadyCurrentlyRequiresEveryAcceptedToken) {
+  Transfer_codec_context_guard codec_guard;
+  constexpr uint64_t kReadyToken = 623;
+  constexpr uint64_t kPausedToken = 624;
+  auto build_bundle = [&](uint64_t transfer_token) {
+    Preserve_snapshot_metadata meta = metadata();
+    meta.token = test_transfer_token_string(transfer_token);
+    Preserved_trx_bundle bundle;
+    Preserved_trx_bundle_build_input input;
+    input.metadata = meta;
+    EXPECT_EQ(Preserve_snapshot_status::OK,
+              build_preserved_trx_bundle(input, &bundle));
+    return bundle;
+  };
+
+  std::vector<Preserved_trx_bundle> bundles;
+  bundles.push_back(build_bundle(kReadyToken));
+  bundles.push_back(build_bundle(kPausedToken));
+  Capturing_transfer_frame_sink source_sink;
+  std::vector<Preserve_trx_transfer_manifest> manifests;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_send_epoch_bundles(
+                "epoch-all-token-ready-contract", bundles,
+                {kReadyToken, kPausedToken}, 7, &source_sink, &manifests));
+  ASSERT_EQ(2U, manifests.size());
+
+  std::vector<Preserve_trx_transfer_frame> frames;
+  for (const std::string &encoded : source_sink.frames()) {
+    Preserve_trx_transfer_frame frame;
+    ASSERT_EQ(Preserve_trx_transfer_status::OK,
+              preserve_trx_transfer_decode_frame(encoded, &frame));
+    frames.push_back(std::move(frame));
+  }
+
+  const auto last_ready_frame = std::find_if(
+      frames.rbegin(), frames.rend(),
+      [](const Preserve_trx_transfer_frame &frame) {
+        return frame.token == kReadyToken &&
+               frame.type != Preserve_trx_transfer_frame_type::DECLARE_TOKEN &&
+               frame.type != Preserve_trx_transfer_frame_type::COMMIT_EPOCH;
+      });
+  ASSERT_NE(frames.rend(), last_ready_frame);
+  const auto pause_boundary = last_ready_frame.base();
+  ASSERT_NE(frames.end(), pause_boundary);
+
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow();
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+  Preserve_trx_transfer_receiver_registry registry;
+  auto apply_frame = [&](const Preserve_trx_transfer_frame &frame) {
+    return preserve_trx_transfer_apply_receiver_frame(
+        m_dir, frame, &store, &registry, 300, nullptr);
+  };
+
+  for (auto frame = frames.begin(); frame != pause_boundary; ++frame) {
+    ASSERT_EQ(Preserve_trx_transfer_status::OK, apply_frame(*frame));
+  }
+
+  Preserve_trx_prepared_token_key ready_key;
+  ASSERT_TRUE(preserve_trx_transfer_strict_prepared_key_for_unit_test(
+      m_dir, manifests[0], bundles[0].metadata.token, &ready_key));
+  Preserve_trx_prepared_token_snapshot ready_snapshot;
+  for (uint attempt = 0; attempt < 200; ++attempt) {
+    if (preserved_trx_strict_prepared_token_registry().snapshot(
+            ready_key, &ready_snapshot) == Preserve_trx_prepared_status::OK &&
+        ready_snapshot.state ==
+            Preserve_trx_prepared_token_state::PREWARMED_PENDING_FINAL_FACT) {
+      break;
+    }
+    my_sleep(1000);
+  }
+  ASSERT_EQ(Preserve_trx_prepared_token_state::PREWARMED_PENDING_FINAL_FACT,
+            ready_snapshot.state);
+
+  preserve_trx_transfer_set_prewarm_paused_for_unit_test(true);
+  auto resume_prewarm = create_scope_guard([] {
+    preserve_trx_transfer_set_prewarm_paused_for_unit_test(false);
+  });
+  for (auto frame = pause_boundary; frame != frames.end(); ++frame) {
+    ASSERT_EQ(Preserve_trx_transfer_status::OK, apply_frame(*frame));
+  }
+
+  Preserve_trx_transfer_accepted_epoch accepted;
+  ASSERT_EQ(Preserve_trx_transfer_status::COMMITTED_NOT_READY,
+            registry.query_accepted_epoch(
+                m_dir, "epoch-all-token-ready-contract", &accepted));
+  // Task 3 intentionally reverses this baseline into a partial selection.
+  EXPECT_EQ(Preserve_trx_transfer_epoch_lifecycle::PREWARMING,
+            accepted.lifecycle);
+
+  preserve_trx_transfer_set_prewarm_paused_for_unit_test(false);
+  resume_prewarm.commit();
+  Preserve_trx_promotion_ready_summary ready_summary;
+  EXPECT_TRUE(wait_for_epoch_ready("epoch-all-token-ready-contract", 2,
+                                   &ready_summary));
 }
 
 TEST_F(PreserveSnapshotTest,
