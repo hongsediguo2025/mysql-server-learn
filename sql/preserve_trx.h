@@ -278,6 +278,7 @@ enum class Preserve_trx_manager_state {
       RESET_CLEANUP             reset owns source transaction restoration
       DRAIN_CLEANUP_FAILED      cleanup left observable state for operators
       SHUTDOWN_REQUESTED        shutdown/token-delivery handoff is in progress
+      TRANSFER_HANDOFF_COMPLETE transfer ownership is terminal; source fenced
 
     HARD_DRAINING and SNAPSHOTTING are retained for state compatibility and
     diagnostics; current batch preserve does not use them as manager-level
@@ -294,7 +295,8 @@ enum class Preserve_trx_manager_state {
   EXPIRED_ROLLBACK,
   RESET_CLEANUP,
   DRAIN_CLEANUP_FAILED,
-  SHUTDOWN_REQUESTED
+  SHUTDOWN_REQUESTED,
+  TRANSFER_HANDOFF_COMPLETE
 };
 
 enum class Preserve_trx_reset_drain_result : uint8_t {

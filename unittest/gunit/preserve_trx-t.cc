@@ -4419,6 +4419,31 @@ TEST_F(PreservedTrxCommandRead,
 }
 
 TEST_F(PreservedTrxCommandRead,
+       TransferHandoffCompleteFencesSourceWithoutRequestingShutdown) {
+  THD *target = thd();
+  preserve_trx_set_enable_value(true);
+  preserved_trx_set_manager_state_for_unit_test(
+      Preserve_trx_manager_state::TRANSFER_HANDOFF_COMPLETE, 0);
+
+  EXPECT_FALSE(preserved_trx_shutdown_requested());
+  EXPECT_EQ(Preserve_trx_command_block_result::BLOCK_CLOSING_DRAINED,
+            preserved_trx_command_block_result(target, SQLCOM_SELECT));
+  EXPECT_EQ(Preserve_trx_command_block_result::BLOCK_CLOSING_DRAINED,
+            preserved_trx_protocol_command_block_result(target, COM_QUERY));
+  EXPECT_EQ(Preserve_trx_command_block_result::BLOCK_CLOSING_DRAINED,
+            preserved_trx_protocol_command_block_result(
+                target, COM_STMT_SEND_LONG_DATA));
+  EXPECT_EQ(Preserve_trx_command_block_result::ALLOW,
+            preserved_trx_protocol_command_block_result(target, COM_QUIT));
+  EXPECT_EQ(Preserve_trx_command_block_result::ALLOW,
+            preserved_trx_protocol_command_block_result(target,
+                                                        COM_STMT_CLOSE));
+
+  preserved_trx_set_manager_state_for_unit_test(Preserve_trx_manager_state::IDLE,
+                                                0);
+}
+
+TEST_F(PreservedTrxCommandRead,
        DrainCleanupFailedWithoutRecordsAllowsNewTransactions) {
   THD *target = thd();
   preserve_trx_set_enable_value(true);
@@ -4464,6 +4489,7 @@ TEST_F(PreservedTrxCommandRead, FeatureDisableAllowedOnlyWhenManagerIsIdle) {
       Preserve_trx_manager_state::SNAPSHOTTING,
       Preserve_trx_manager_state::DISABLING,
       Preserve_trx_manager_state::EXPIRED_ROLLBACK,
+      Preserve_trx_manager_state::TRANSFER_HANDOFF_COMPLETE,
       Preserve_trx_manager_state::SHUTDOWN_REQUESTED};
   for (const Preserve_trx_manager_state state : blocked_states) {
     preserved_trx_set_manager_state_for_unit_test(state, 0);
@@ -9406,6 +9432,8 @@ TEST_F(PreserveSnapshotTest, PromotionEpochCommitMarkerSatisfiesGate) {
   ASSERT_EQ("PTRXFER_COMMIT_V1\nepoch-committed\n",
             read_file(m_dir + ".transfer/epoch-committed/epoch.commit"));
   ASSERT_TRUE(preserve_trx_transfer_epoch_committed(m_dir, manifest.epoch_id));
+  // This legacy-path test intentionally omits strict receiver identity.
+  preserve_trx_transfer_shutdown_receiver_prewarm_workers();
   ASSERT_EQ(Preserve_trx_promotion_adopt_status::OK,
             preserved_trx_promotion_prewarm_standby_pending_token(
                 m_dir, manifest.epoch_id, transfer_token,
@@ -9519,6 +9547,8 @@ TEST_F(PreserveSnapshotTest, PromotionRejectsReadyCacheFactDigestDrift) {
             preserve_trx_transfer_apply_receiver_frame(
                 m_dir, commit, &store, &registry, 300, nullptr));
   ASSERT_TRUE(preserve_trx_transfer_epoch_committed(m_dir, manifest.epoch_id));
+  // This legacy-path test intentionally omits strict receiver identity.
+  preserve_trx_transfer_shutdown_receiver_prewarm_workers();
   ASSERT_EQ(Preserve_trx_promotion_adopt_status::OK,
             preserved_trx_promotion_prewarm_standby_pending_token(
                 m_dir, manifest.epoch_id, transfer_token,

@@ -310,6 +310,12 @@ SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 SET DEBUG_SYNC='now SIGNAL reset_runtime_handoff_release';
+--connection reset_runtime_handoff_owner
+--disable_result_log
+--reap
+--enable_result_log
+--connection reset_runtime_ha
+SHUTDOWN;
 --connection default
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 

@@ -122,6 +122,9 @@ SET DEBUG_SYNC='now SIGNAL closing_exclusion_shutdown';
 --replace_column 1 GENERATION 6 CLOSING_STARTED_US 7 CLOSING_DEADLINE_US
 --reap
 
+--connection closing_exclusion_ha
+SHUTDOWN;
+
 --connection default
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 --exec echo "restart: --preserve-trx-enable=ON --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect

@@ -199,14 +199,16 @@ void Preserve_trx_drain_orchestrator::finalize_participants() {
   }
 }
 
-void Preserve_trx_drain_orchestrator::finalize_participants_for_shutdown() {
+void Preserve_trx_drain_orchestrator::
+    finalize_participants_for_terminal_handoff() {
   /*
-    Shutdown finalization may intentionally defer process-local cleanup. The
-    durable snapshot remains the ownership boundary; in-memory stores can be
-    abandoned because the server is exiting.
+    Terminal handoff finalization may intentionally defer process-local
+    cleanup. The durable snapshot or accepted receiver epoch remains the
+    ownership boundary; large in-memory stores are not part of the synchronous
+    DRAIN completion path.
   */
   for (Preserve_trx_drain_participant *participant : m_participants) {
-    participant->finalize_phase_for_shutdown();
+    participant->finalize_phase_for_terminal_handoff();
   }
 }
 

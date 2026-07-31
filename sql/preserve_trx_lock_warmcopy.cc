@@ -2402,14 +2402,14 @@ void Preserve_trx_lock_warmcopy_drain_participant::finalize_phase() {
 }
 
 void Preserve_trx_lock_warmcopy_drain_participant::
-    finalize_phase_for_shutdown() {
+    finalize_phase_for_terminal_handoff() {
   lock_warmcopy_close_epoch();
   cleanup_spill_paths(&m_spill_paths);
   /*
-    On the successful DRAIN ... PRESERVE path the server immediately enters
-	    shutdown after finalize. The record warmcopy store is process-local and
-    no longer part of the durable preserve artifact, so walking huge per-target
-    maps here only extends phase-2 pause. Keep abort/failure paths explicit.
+    The record warmcopy store is process-local and no longer part of the
+    durable preserve artifact or accepted receiver epoch. Walking huge
+    per-target maps here only extends the terminal handoff pause. Keep
+    abort/failure paths explicit.
   */
   m_record_store_cleanup_deferred_for_shutdown = !m_target_thread_ids.empty();
   m_observation.state = Preserve_trx_drain_participant_state::FINALIZED;

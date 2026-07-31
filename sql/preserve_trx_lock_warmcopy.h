@@ -317,7 +317,7 @@ class Preserve_trx_lock_warmcopy_drain_participant final
   bool phase2_preflight(Preserve_trx_drain_phase_mode mode) override;
   void abort_phase() override;
   void finalize_phase() override;
-  void finalize_phase_for_shutdown() override;
+  void finalize_phase_for_terminal_handoff() override;
   void cleanup_after_failed_shutdown() override;
   Preserve_trx_drain_participant_observation observation() const override;
 

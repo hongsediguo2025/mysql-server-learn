@@ -1717,17 +1717,20 @@ my $drain_execute = $&;
 die "DRAIN abort paths must consume participant observations\n"
   unless $drain_execute =~ /abort_drain_participants[\s\S]*log_preserve_trx_drain_participant_observations/s;
 die "DRAIN finalize path must consume participant observations\n"
-  unless $drain_execute =~ /finalize_drain_participants[\s\S]*log_preserve_trx_drain_participant_observations/s;
+  unless $drain_execute =~
+         /finalize_drain_participants_for_terminal_handoff[\s\S]*log_preserve_trx_drain_participant_observations/s;
 my $drain_execute_without_observation_helpers = $drain_execute;
 $drain_execute_without_observation_helpers =~
   s/auto abort_drain_participants = \[\&\]\(const char \*stage\) \{[\s\S]*?\n  \};\n\n//s
   or die "could not remove DRAIN abort observation helper\n";
 $drain_execute_without_observation_helpers =~
-  s/auto finalize_drain_participants = \[\&\]\(const char \*stage\) \{[\s\S]*?\n  \};\n\n//s
+  s/auto\s+finalize_drain_participants_for_terminal_handoff\s*=\s*
+    \[\&\]\(const\s+char\s+\*stage\)\s*\{[\s\S]*?\n[ \t]*\};\n\n//sx
   or die "could not remove DRAIN finalize observation helper\n";
 die "DRAIN service must not bypass observation helpers for participant abort/finalize\n"
   if $drain_execute_without_observation_helpers =~
-     /drain_orchestrator\.(?:abort_participants|finalize_participants)\s*\(/s;
+     /drain_orchestrator\.(?:abort_participants|
+       finalize_participants(?:_for_terminal_handoff)?)\s*\(/sx;
 die "target-counter rejection must log transaction/target/nonidle/unsupported counters before returning generic unsupported\n"
   unless $drain_execute =~
      /target_counter_rejected[\s\S]*transaction_count[\s\S]*target_count[\s\S]*nonidle_transaction_count[\s\S]*has_unsupported_transaction/s;
@@ -3221,9 +3224,11 @@ die "NOT_COMMITTED_CLEAN must claim SOURCE_RESTORE_PENDING before guarded restor
 die "online NOT_COMMITTED_CLEAN restore must publish SOURCE_RESTORED only after guarded restore succeeds\n"
   unless $preserve =~
          /standby_transfer_not_committed_clean_restore_failed[\s\S]{0,500}complete_source_restore\(\)[\s\S]{0,300}standby_transfer_not_committed_clean_state_failed/s;
-my $unknown_finalize =
-    index($preserve,
-          'finalize_drain_participants("standby_transfer_commit_unknown")');
+$preserve =~
+  /finalize_drain_participants_for_terminal_handoff\s*\(
+     \s*"standby_transfer_commit_unknown"\s*\)/sx
+  or die "COMMIT_UNKNOWN must use terminal-handoff participant finalization\n";
+my $unknown_finalize = index($preserve, $&);
 my $resolution_ready_publish =
     index($preserve, 'handoff_resolution_ready.store');
 die "COMMIT_UNKNOWN must publish HA resolution readiness only after source drain teardown\n"

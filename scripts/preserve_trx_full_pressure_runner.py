@@ -40,6 +40,7 @@ MAX_MYSQL_SOCKET_PATH_BYTES = 100
 DEFAULT_FULL_REQUIRED_FREE_BYTES = 20 * 1024**3
 DEFAULT_MIXED_FULL_REQUIRED_FREE_BYTES = 25 * 1024**3
 DEFAULT_SMOKE_REQUIRED_FREE_BYTES = 2 * 1024**3
+MIXED_PRESSURE_LONG_COMMAND_PREFIX_STATEMENTS = 8
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1433,7 +1434,30 @@ def validate_mixed_pressure_report(
     minimum_per_session = int(
         readiness.get("minimum_completed_statements_per_session", 0)
     )
-    if minimum_per_session < required_per_session:
+    long_command_inflight = bool(
+        readiness.get("designated_long_command_inflight", False)
+    )
+    long_command_prefix = int(
+        readiness.get(
+            "designated_long_command_started_after_statements", 0
+        )
+    )
+    if (
+        long_command_inflight
+        and long_command_prefix
+        >= MIXED_PRESSURE_LONG_COMMAND_PREFIX_STATEMENTS
+    ):
+        minimum_non_long = int(
+            readiness.get(
+                "minimum_completed_statements_per_non_long_session", 0
+            )
+        )
+        if profile.sessions > 1 and minimum_non_long < required_per_session:
+            failures.append(
+                "mixed pre-drain non-long per-session SQL volume is too small: "
+                f"actual={minimum_non_long} required={required_per_session}"
+            )
+    elif minimum_per_session < required_per_session:
         failures.append(
             "mixed pre-drain per-session SQL volume is too small: "
             f"actual={minimum_per_session} required={required_per_session}"
@@ -1464,6 +1488,8 @@ def validate_mixed_pressure_report(
         if int(operations.get(key, 0)) <= 0:
             failures.append(f"mixed pre-drain operation is missing: {key}")
     for key in ("short", "hundreds_ms", "seconds", "tens_seconds"):
+        if key == "tens_seconds" and long_command_inflight:
+            continue
         if int(durations.get(key, 0)) <= 0:
             failures.append(f"mixed pre-drain duration class is missing: {key}")
     duration_min_us = report.get("mixed_duration_class_min_us", {})
@@ -1555,6 +1581,7 @@ def validate_mixed_pressure_report(
         }
     elif evidence == "mixed-transfer":
         require_equal("evidence_kind", "STANDALONE_TRANSFER_E2E")
+        require_equal("source_remained_online_after_transfer", True)
         require_equal("mixed_receiver_log_bin_enabled", True)
         require_equal("mixed_receiver_binlog_format", "ROW")
         require_equal("mixed_restart_fresh_connection_count", 0)

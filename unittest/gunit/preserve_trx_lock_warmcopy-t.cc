@@ -1565,7 +1565,7 @@ TEST(PreserveTrxLockWarmcopyDrainParticipant,
 }
 
 TEST(PreserveTrxLockWarmcopyDrainParticipant,
-     ShutdownFinalizeDefersRecordStoreClearUntilShutdownFailure) {
+     TerminalHandoffFinalizeDefersRecordStoreClearUntilRecovery) {
   lock_warmcopy_reset_for_unit_test();
   lock_warmcopy_record_shard_key_t key;
   key.table_id = 100;
@@ -1589,7 +1589,7 @@ TEST(PreserveTrxLockWarmcopyDrainParticipant,
   ASSERT_TRUE(participant.phase2_preflight(
       Preserve_trx_drain_phase_mode::TWO_PHASE));
 
-  participant.finalize_phase_for_shutdown();
+  participant.finalize_phase_for_terminal_handoff();
 
   lock_warmcopy_record_shard_snapshot_t snapshot;
   EXPECT_TRUE(lock_warmcopy_record_shard_snapshot_for_target_for_unit_test(

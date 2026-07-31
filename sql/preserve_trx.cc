@@ -5824,7 +5824,10 @@ static bool preserve_trx_is_ha_control_connection(THD *thd) {
 
 static bool preserve_trx_closing_command_gate_active(
     Preserve_trx_manager_state state) {
-  if (state == Preserve_trx_manager_state::WARMCOPY_CLOSING) return true;
+  if (state == Preserve_trx_manager_state::WARMCOPY_CLOSING ||
+      state == Preserve_trx_manager_state::TRANSFER_HANDOFF_COMPLETE) {
+    return true;
+  }
   if (state != Preserve_trx_manager_state::BATCH_DRAINING) return false;
 
   const std::shared_ptr<Preserve_trx_drain_attempt> attempt =
@@ -17650,8 +17653,9 @@ bool Preserve_trx_drain_service::execute(
     if (lock_warmcopy_participant != nullptr) lock_warmcopy_close_epoch();
   };
 
-  auto finalize_drain_participants = [&](const char *stage) {
-    drain_orchestrator.finalize_participants_for_shutdown();
+  auto finalize_drain_participants_for_terminal_handoff =
+      [&](const char *stage) {
+    drain_orchestrator.finalize_participants_for_terminal_handoff();
     log_preserve_trx_drain_participant_observations(
         drain_orchestrator, stage, INFORMATION_LEVEL);
   };
@@ -18367,6 +18371,7 @@ bool Preserve_trx_drain_service::execute(
   bool batch_provenance_started = false;
   std::vector<Preserve_batch_target_execution> target_results;
   std::vector<Preserve_trx_batch_item> preserved_batch_items;
+  bool transfer_final_ack_accepted = false;
   bool debug_fail_ha_prepare_low = false;
   bool debug_fail_temp_only_prepare = false;
   bool debug_fail_after_one_target = false;
@@ -18504,6 +18509,17 @@ bool Preserve_trx_drain_service::execute(
       DEBUG_SYNC(thd, "preserve_trx_drain_after_shutdown_handoff");
     }
 #endif
+    if (transfer_final_ack_accepted) {
+      finalize_drain_participants_for_terminal_handoff("finish");
+      if (!draining->transition_to(
+              Preserve_trx_manager_state::TRANSFER_HANDOFF_COMPLETE, 0)) {
+        LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+               "PRESERVE: transfer handoff could not publish terminal source "
+               "command fence; source remains fail-closed");
+        return preserve_trx_reject_unsupported();
+      }
+      draining->dismiss();
+    }
     bool drain_result_attempted = false;
     if (standby_transfer_streaming_enabled) {
       drain_result_attempted = true;
@@ -18513,7 +18529,7 @@ bool Preserve_trx_drain_service::execute(
               closing_command_deadline_us)) {
         LogErr(WARNING_LEVEL, ER_LOG_PRINTF_MSG,
                "PRESERVE: transfer DRAIN result delivery failed after terminal "
-               "handoff; source shutdown will continue");
+               "handoff; source remains fenced");
       }
     }
     publish_phase2_metrics();
@@ -18522,12 +18538,13 @@ bool Preserve_trx_drain_service::execute(
         static_cast<longlong>(preserved_token_count));
     DBUG_EXECUTE_IF("preserve_trx_drain_skip_shutdown_after_audit_no_targets", {
       if (counter.target_count() == 0) {
-        finalize_drain_participants("finish_no_targets");
+        finalize_drain_participants_for_terminal_handoff("finish_no_targets");
         if (!drain_result_attempted) my_ok(thd);
         return false;
       }
     });
-    finalize_drain_participants("finish");
+    if (transfer_final_ack_accepted) return false;
+    finalize_drain_participants_for_terminal_handoff("finish");
     if (!draining->transition_to(
             Preserve_trx_manager_state::SHUTDOWN_REQUESTED)) {
       if (reset_requested())
@@ -20597,7 +20614,8 @@ bool Preserve_trx_drain_service::execute(
       release_batch_transfer_frame_sink();
       batch_transfer_binlog_blob_provider.reset();
       batch_transfer_phase1_declared_tokens.clear();
-      finalize_drain_participants("standby_transfer_commit_unknown");
+      finalize_drain_participants_for_terminal_handoff(
+          "standby_transfer_commit_unknown");
 
       active_drain_attempt_cleanup.commit();
       draining->dismiss();
@@ -20678,6 +20696,16 @@ bool Preserve_trx_drain_service::execute(
       }
       abort_drain_participants("standby_transfer_commit_failed");
       return preserve_trx_reject_unsupported();
+    }
+
+    transfer_final_ack_accepted =
+        active_drain_attempt != nullptr &&
+        active_drain_attempt->ownership.state() ==
+            Preserve_trx_drain_terminal::SHUTDOWN_HANDOFF;
+    if (!transfer_final_ack_accepted) {
+      LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+             "PRESERVE: receiver accepted transfer without terminal source "
+             "ownership; source shutdown will continue");
     }
 
     const ulonglong final_ack_us = preserve_trx_monotonic_us();

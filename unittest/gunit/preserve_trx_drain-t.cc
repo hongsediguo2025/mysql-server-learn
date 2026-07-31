@@ -72,8 +72,8 @@ class RecordingDrainParticipant final : public Preserve_trx_drain_participant {
     observation_value.state = Preserve_trx_drain_participant_state::FINALIZED;
   }
 
-  void finalize_phase_for_shutdown() override {
-    m_events->push_back(m_name + ".finalize_shutdown");
+  void finalize_phase_for_terminal_handoff() override {
+    m_events->push_back(m_name + ".finalize_terminal_handoff");
     observation_value.state = Preserve_trx_drain_participant_state::FINALIZED;
   }
 
@@ -280,16 +280,17 @@ TEST(PreserveTrxDrainOrchestrator, AbortAndFinalizeUpdateParticipantState) {
 }
 
 TEST(PreserveTrxDrainOrchestrator,
-     ShutdownFinalizeUsesExplicitParticipantHook) {
+     TerminalHandoffFinalizeUsesExplicitParticipantHook) {
   std::vector<std::string> events;
   RecordingDrainParticipant participant(&events, "lock");
 
   Preserve_trx_drain_orchestrator orchestrator(
       Preserve_trx_drain_phase_mode::TWO_PHASE);
   orchestrator.add_participant(&participant);
-  orchestrator.finalize_participants_for_shutdown();
+  orchestrator.finalize_participants_for_terminal_handoff();
 
-  const std::vector<std::string> expected{"lock.finalize_shutdown"};
+  const std::vector<std::string> expected{
+      "lock.finalize_terminal_handoff"};
   EXPECT_EQ(expected, events);
   EXPECT_EQ(Preserve_trx_drain_participant_state::FINALIZED,
             participant.observation().state);

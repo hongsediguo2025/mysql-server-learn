@@ -512,6 +512,7 @@ MIXED_PRESSURE_REQUIRED_DURATION_CLASSES = (
     "seconds",
     "tens_seconds",
 )
+MIXED_PRESSURE_LONG_COMMAND_PREFIX_STATEMENTS = 8
 
 
 @dataclasses.dataclass(frozen=True)
@@ -4774,6 +4775,8 @@ class BusinessWorker(threading.Thread):
         self.duration_class_total_us: Counter = Counter()
         self.duration_class_max_us: Counter = Counter()
         self.duration_class_min_us: Dict[str, int] = {}
+        self.mixed_tens_seconds_command_inflight = threading.Event()
+        self.mixed_tens_seconds_command_started_after_statements = 0
         self.drained_command_rejections = 0
         self.unsupported_handoff_rejections = 0
 
@@ -4980,32 +4983,54 @@ class BusinessWorker(threading.Thread):
                         self.sid, shutdown_gap_replay_generation, op.sql
                     )
                 operation_started_ns = time.monotonic_ns()
+                is_mixed_tens_seconds_command = (
+                    self.plan.config.mixed_pressure_workload
+                    and op.duration_class == "tens_seconds"
+                )
+                if is_mixed_tens_seconds_command:
+                    self.mixed_tens_seconds_command_started_after_statements = (
+                        self.statements_completed
+                    )
+                    LOG.info(
+                        "mixed long command in-flight before DRAIN: "
+                        "sid=%s tx=%s stmt=%s completed_before=%s",
+                        self.sid,
+                        tx_id,
+                        stmt_index,
+                        self.statements_completed,
+                    )
+                    self.mixed_tens_seconds_command_inflight.set()
                 try:
-                    if op.discard_result:
-                        self.runtime.execute_discarding_result(conn, op.sql)
-                        rows = ()
-                    else:
-                        rows = self.runtime.execute(
-                            conn, op.sql, fetch=op.validator is not None
-                        )
-                except BaseException as exc:
-                    if self._consume_expected_drain_handoff_error(exc):
-                        LOG.info(
-                            "worker sid=%s received drained-session response "
-                            "at tx=%s stmt=%s; waiting for local RESUME or "
-                            "transfer cleanup",
-                            self.sid,
-                            tx_id,
-                            stmt_index,
-                        )
-                        conn = self._wait_for_resume_or_transfer_completion()
-                        continue
-                    if not self.runtime.is_connection_error(exc):
-                        raise RuntimeError(
-                            f"worker sid={self.sid} tx={tx_id} stmt={stmt_index} "
-                            f"op={op.kind.value} table={op.table} failed: {op.sql}"
-                        ) from exc
-                    raise
+                    try:
+                        if op.discard_result:
+                            self.runtime.execute_discarding_result(conn, op.sql)
+                            rows = ()
+                        else:
+                            rows = self.runtime.execute(
+                                conn, op.sql, fetch=op.validator is not None
+                            )
+                    except BaseException as exc:
+                        if self._consume_expected_drain_handoff_error(exc):
+                            LOG.info(
+                                "worker sid=%s received drained-session response "
+                                "at tx=%s stmt=%s; waiting for local RESUME or "
+                                "transfer cleanup",
+                                self.sid,
+                                tx_id,
+                                stmt_index,
+                            )
+                            conn = self._wait_for_resume_or_transfer_completion()
+                            continue
+                        if not self.runtime.is_connection_error(exc):
+                            raise RuntimeError(
+                                f"worker sid={self.sid} tx={tx_id} "
+                                f"stmt={stmt_index} op={op.kind.value} "
+                                f"table={op.table} failed: {op.sql}"
+                            ) from exc
+                        raise
+                finally:
+                    if is_mixed_tens_seconds_command:
+                        self.mixed_tens_seconds_command_inflight.clear()
                 if op.validator is not None:
                     if tx_expected is not None:
                         tx_expected.validate_query_result(tx_id, stmt_index, rows)
@@ -5696,6 +5721,7 @@ class BusinessE2ERunner:
             self.materialize_receiver_physical_copy_before_drain()
         self.verify_mixed_pressure_binlog_contract(include_receiver=True)
         self.configure_standby_transfer_credentials()
+        self.configure_source_ha_control_credentials()
         self.configure_preserve_globals()
         self.validate_standby_transfer_endpoint_config()
         self.prewarm_receiver_dictionary_for_transfer()
@@ -5723,6 +5749,9 @@ class BusinessE2ERunner:
                         "WHERE sid=1 AND k=0"
                     ),
                 )
+                if self.config.mixed_pressure_workload:
+                    read_load_probe.start_baseline()
+                    time.sleep(self.config.receiver_read_load_baseline_s)
             self.start_workers()
             if self.config.business_run_before_drain_s > 0:
                 self._run_business_before_drain(cycle=1)
@@ -5742,7 +5771,10 @@ class BusinessE2ERunner:
                     work_units=self.config.source_tiered_load_work_units,
                 )
                 source_tiered_load_probe.start()
-            if read_load_probe is not None:
+            if (
+                read_load_probe is not None
+                and not self.config.mixed_pressure_workload
+            ):
                 read_load_probe.start_baseline()
                 time.sleep(self.config.receiver_read_load_baseline_s)
             if source_tiered_load_probe is not None:
@@ -5828,9 +5860,16 @@ class BusinessE2ERunner:
                     connection_factory=self._receiver_admin_connection,
                 )
             self.source_transfer_ownership_metrics = (
-                self.read_source_transfer_ownership_metrics_from_status()
+                self.read_source_transfer_ownership_metrics_from_status(
+                    connection_factory=self._source_ha_control_connection
+                )
             )
-            self.runtime.wait_until_down(self.config.shutdown_timeout_s)
+            if self.source_transfer_ownership_metrics is None:
+                raise AssertionError(
+                    "standby transfer source was not queryable through the "
+                    "HA control connection after DRAIN"
+                )
+            self.source_remained_online_after_transfer = True
             if source_tiered_load_probe is not None:
                 self.source_tiered_load_report = (
                     source_tiered_load_probe.stop(
@@ -7737,6 +7776,11 @@ class BusinessE2ERunner:
                 self, "standby_transfer_source_workload_user", None
             ),
             "source_workload_has_shutdown_acl": False,
+            "source_remained_online_after_transfer": bool(
+                getattr(
+                    self, "source_remained_online_after_transfer", False
+                )
+            ),
             "timeout_exclusion_enabled": (
                 self.config.standby_transfer_timeout_exclusion
             ),
@@ -10286,9 +10330,13 @@ END
             if not failures:
                 LOG.info(
                     "mixed workload ready before DRAIN: started=%s statements=%s "
-                    "operations=%s durations=%s",
+                    "long_inflight=%s long_prefix=%s operations=%s durations=%s",
                     snapshot["started_sessions"],
                     snapshot["completed_statements"],
+                    snapshot["designated_long_command_inflight"],
+                    snapshot[
+                        "designated_long_command_started_after_statements"
+                    ],
                     snapshot["operation_counts"],
                     snapshot["duration_class_counts"],
                 )
@@ -10309,6 +10357,10 @@ END
         completed_statements = 0
         started_sessions = 0
         per_session_statements: List[int] = []
+        non_long_session_statements: List[int] = []
+        designated_long_worker_statements = 0
+        designated_long_command_inflight = False
+        designated_long_command_started_after_statements = 0
         for worker in getattr(self, "workers", []):
             statements = int(getattr(worker, "statements_completed", 0))
             per_session_statements.append(statements)
@@ -10319,6 +10371,22 @@ END
             duration_class_counts.update(
                 getattr(worker, "duration_class_counts", {})
             )
+            if int(getattr(worker, "sid", 0)) == self.config.sessions:
+                designated_long_worker_statements = statements
+                inflight = getattr(
+                    worker, "mixed_tens_seconds_command_inflight", None
+                )
+                if inflight is not None:
+                    designated_long_command_inflight = bool(inflight.is_set())
+                designated_long_command_started_after_statements = int(
+                    getattr(
+                        worker,
+                        "mixed_tens_seconds_command_started_after_statements",
+                        0,
+                    )
+                )
+            else:
+                non_long_session_statements.append(statements)
         return {
             "started_sessions": started_sessions,
             "completed_statements": completed_statements,
@@ -10327,6 +10395,20 @@ END
             ),
             "maximum_completed_statements_per_session": (
                 max(per_session_statements) if per_session_statements else 0
+            ),
+            "minimum_completed_statements_per_non_long_session": (
+                min(non_long_session_statements)
+                if non_long_session_statements
+                else 0
+            ),
+            "designated_long_worker_completed_statements": (
+                designated_long_worker_statements
+            ),
+            "designated_long_command_inflight": (
+                designated_long_command_inflight
+            ),
+            "designated_long_command_started_after_statements": (
+                designated_long_command_started_after_statements
             ),
             "operation_counts": dict(sorted(operation_counts.items())),
             "duration_class_counts": dict(
@@ -10362,7 +10444,38 @@ END
         minimum_per_session = int(
             snapshot.get("minimum_completed_statements_per_session", 0)
         )
-        if minimum_per_session < required_per_session:
+        long_command_inflight = bool(
+            snapshot.get("designated_long_command_inflight", False)
+        )
+        if long_command_inflight:
+            minimum_non_long = int(
+                snapshot.get(
+                    "minimum_completed_statements_per_non_long_session", 0
+                )
+            )
+            if (
+                self.config.sessions > 1
+                and minimum_non_long < required_per_session
+            ):
+                failures.append(
+                    "minimum_completed_statements_per_non_long_session="
+                    f"{minimum_non_long} required={required_per_session}"
+                )
+            completed_before_long = int(
+                snapshot.get(
+                    "designated_long_command_started_after_statements", 0
+                )
+            )
+            if (
+                completed_before_long
+                < MIXED_PRESSURE_LONG_COMMAND_PREFIX_STATEMENTS
+            ):
+                failures.append(
+                    "designated_long_command_started_after_statements="
+                    f"{completed_before_long} required="
+                    f"{MIXED_PRESSURE_LONG_COMMAND_PREFIX_STATEMENTS}"
+                )
+        elif minimum_per_session < required_per_session:
             failures.append(
                 "minimum_completed_statements_per_session="
                 f"{minimum_per_session} required={required_per_session}"
@@ -10398,6 +10511,8 @@ END
             if int(operations.get(kind.value, 0)) <= 0:
                 failures.append(f"no {kind.value} operation completed")
         for duration_class in MIXED_PRESSURE_REQUIRED_DURATION_CLASSES:
+            if duration_class == "tens_seconds" and long_command_inflight:
+                continue
             if int(durations.get(duration_class, 0)) <= 0:
                 failures.append(f"no {duration_class} SQL completed")
         return failures

@@ -28,6 +28,7 @@ from scripts.resumable_trx_business_e2e import (
     COM_PRESERVE_TRX_TRANSFER,
     ExpectedDatabaseState,
     HarnessConfig,
+    MIXED_PRESSURE_REQUIRED_OPERATION_KINDS,
     MySQLRuntime,
     OperationKind,
     DrainTargetCounterRejectionMetrics,
@@ -5808,7 +5809,9 @@ class WorkloadPlanTest(unittest.TestCase):
         runner.runtime = mock.Mock()
         runner.runtime.wait_until_up = mock.Mock()
         runner.runtime.wait_until_down = mock.Mock(
-            side_effect=lambda _timeout: calls.append("source_down")
+            side_effect=AssertionError(
+                "standby transfer source must remain online after DRAIN"
+            )
         )
         runner.coordinator = mock.Mock()
         runner.coordinator.request_drain_checkpoint.return_value = 1
@@ -5821,6 +5824,9 @@ class WorkloadPlanTest(unittest.TestCase):
         runner._receiver_admin_connection = mock.Mock(return_value=_FakeConnection())
         runner.materialize_receiver_physical_copy_before_drain = mock.Mock()
         runner.configure_standby_transfer_credentials = mock.Mock()
+        runner.configure_source_ha_control_credentials = mock.Mock(
+            side_effect=lambda: calls.append("source_ha_credentials")
+        )
         runner.configure_preserve_globals = mock.Mock()
         runner.validate_standby_transfer_endpoint_config = mock.Mock()
         runner.start_workers = mock.Mock()
@@ -5858,6 +5864,23 @@ class WorkloadPlanTest(unittest.TestCase):
         runner.wait_for_receiver_readiness = mock.Mock(
             side_effect=lambda **_kwargs: calls.append("receiver_validated")
         )
+        runner._source_ha_control_connection = mock.Mock(
+            return_value=_FakeConnection()
+        )
+        runner.read_source_transfer_ownership_metrics_from_status = mock.Mock(
+            side_effect=lambda **_kwargs: (
+                calls.append("source_online")
+                or SourceTransferOwnershipMetrics(
+                    handoff_pending_epochs=1,
+                    commit_unknown_epochs=0,
+                    restore_guard_rejects=0,
+                    quarantine_epochs=0,
+                    quarantine_tokens=0,
+                    quarantine_bytes=0,
+                    quarantine_oldest_age_us=0,
+                )
+            )
+        )
         runner.write_standby_transfer_receiver_report = mock.Mock()
         runner.join_workers = mock.Mock()
 
@@ -5873,14 +5896,20 @@ class WorkloadPlanTest(unittest.TestCase):
         runner.wait_for_receiver_readiness.assert_called_once()
         self.assertLess(
             calls.index("receiver_validated"),
-            calls.index("source_down"),
+            calls.index("source_online"),
         )
+        self.assertLess(
+            calls.index("source_ha_credentials"),
+            calls.index("receiver_validated"),
+        )
+        runner.runtime.wait_until_down.assert_not_called()
+        self.assertTrue(runner.source_remained_online_after_transfer)
         runner.write_standby_transfer_receiver_report.assert_called_with(
             status="success",
             completed_stmt_total=0,
         )
 
-    def test_receiver_read_load_baseline_starts_after_workers_pause_for_drain(self):
+    def test_receiver_read_load_baseline_precedes_mixed_business_readiness(self):
         calls = []
 
         class FakeReadLoadProbe:
@@ -5911,12 +5940,20 @@ class WorkloadPlanTest(unittest.TestCase):
         runner.config = HarnessConfig(
             scenario="standby_transfer_receiver_drain_metrics",
             sessions=1,
+            statements_per_tx=10,
             receiver_unix_socket="/tmp/receiver.sock",
             receiver_preserve_dir="/tmp/rx/data/preserve",
             receiver_read_load_threads=1,
             receiver_read_load_baseline_s=0.001,
             receiver_read_load_max_qps_drop_pct=5.0,
             receiver_read_load_max_p99_increase_pct=10.0,
+            mixed_pressure_workload=True,
+            mixed_seed_rows_per_table=1,
+            mixed_transaction_sizes=[10],
+            mixed_transaction_weights=[1],
+            mixed_min_started_sessions=1,
+            mixed_min_completed_statements=1,
+            business_run_before_drain_s=0.001,
             setup_schema=False,
         ).validate()
         runner.runtime = mock.Mock()
@@ -5937,11 +5974,15 @@ class WorkloadPlanTest(unittest.TestCase):
         runner._receiver_admin_connection = mock.Mock(return_value=_FakeConnection())
         runner.materialize_receiver_physical_copy_before_drain = mock.Mock()
         runner.configure_standby_transfer_credentials = mock.Mock()
+        runner.configure_source_ha_control_credentials = mock.Mock(
+            side_effect=lambda: calls.append("source_ha_credentials")
+        )
         runner.configure_preserve_globals = mock.Mock()
         runner.validate_standby_transfer_endpoint_config = mock.Mock()
+        runner.verify_mixed_pressure_binlog_contract = mock.Mock()
         runner.start_workers = lambda: calls.append("workers_started")
-        runner._wait_all_paused_for_drain_or_raise = (
-            lambda _generation, _timeout: calls.append("workers_paused")
+        runner._run_business_before_drain = (
+            lambda cycle: calls.append(f"business_ready_{cycle}")
         )
         runner.warmcopy_error_log_offset = mock.Mock(return_value=0)
         runner._execute_drain_preserve = lambda: calls.append("drain") or True
@@ -5966,6 +6007,20 @@ class WorkloadPlanTest(unittest.TestCase):
             )
         )
         runner.wait_for_receiver_readiness = mock.Mock()
+        runner._source_ha_control_connection = mock.Mock(
+            return_value=_FakeConnection()
+        )
+        runner.read_source_transfer_ownership_metrics_from_status = mock.Mock(
+            return_value=SourceTransferOwnershipMetrics(
+                handoff_pending_epochs=1,
+                commit_unknown_epochs=0,
+                restore_guard_rejects=0,
+                quarantine_epochs=0,
+                quarantine_tokens=0,
+                quarantine_bytes=0,
+                quarantine_oldest_age_us=0,
+            )
+        )
         runner.write_standby_transfer_receiver_report = mock.Mock()
         runner.join_workers = mock.Mock()
 
@@ -5975,9 +6030,12 @@ class WorkloadPlanTest(unittest.TestCase):
         ):
             runner.run_standby_transfer_receiver_drain_metrics()
 
-        self.assertLess(calls.index("workers_started"), calls.index("checkpoint"))
-        self.assertLess(calls.index("checkpoint"), calls.index("workers_paused"))
-        self.assertLess(calls.index("workers_paused"), calls.index("baseline"))
+        self.assertLess(calls.index("baseline"), calls.index("workers_started"))
+        self.assertLess(
+            calls.index("workers_started"), calls.index("business_ready_1")
+        )
+        self.assertLess(calls.index("business_ready_1"), calls.index("transfer"))
+        self.assertLess(calls.index("source_ha_credentials"), calls.index("transfer"))
         self.assertLess(calls.index("baseline"), calls.index("transfer"))
         self.assertLess(calls.index("transfer"), calls.index("drain"))
 
@@ -6174,6 +6232,7 @@ class WorkloadPlanTest(unittest.TestCase):
                     quarantine_oldest_age_us=7,
                 )
             )
+            runner.source_remained_online_after_transfer = True
 
             runner.write_standby_transfer_receiver_report(
                 status="success",
@@ -6193,6 +6252,7 @@ class WorkloadPlanTest(unittest.TestCase):
                 "preserve_transfer_receiver_workload",
             )
             self.assertFalse(report["source_workload_has_shutdown_acl"])
+            self.assertTrue(report["source_remained_online_after_transfer"])
             self.assertFalse(report["timeout_exclusion_enabled"])
             self.assertEqual(len(report["drain_result_rows"]), 2)
             self.assertEqual(report["drain_result_outcome"], "SUCCESS")
@@ -8802,6 +8862,140 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
         ]
         self.assertEqual(len(total_settings), 1)
         self.assertEqual(int(total_settings[0].split("=")[1]), 2 * 1024**3)
+
+    def test_mixed_long_command_is_visible_before_execute_completes(self):
+        class BlockingLongCommandRuntime(_FakeRuntime):
+            def __init__(self):
+                super().__init__()
+                self.long_command_entered = threading.Event()
+                self.release_long_command = threading.Event()
+
+            def execute(self, conn, sql, fetch=False):
+                if fetch and sql.startswith(
+                    "SELECT tx_size FROM rtx_e2e_tx_audit"
+                ):
+                    self.sql.append(sql)
+                    self.calls.append((sql, fetch))
+                    return [(10,)]
+                if fetch and "COUNT(*),COALESCE(SUM(v),0)" in sql:
+                    self.sql.append(sql)
+                    self.calls.append((sql, fetch))
+                    return [(1, 1)]
+                return super().execute(conn, sql, fetch=fetch)
+
+            def execute_discarding_result(self, conn, sql):
+                self.sql.append(sql)
+                self.calls.append((sql, False))
+                if "CALL rtx_e2e_mixed_step" not in sql:
+                    return ()
+                self.long_command_entered.set()
+                if not self.release_long_command.wait(2):
+                    raise TimeoutError("test did not release mixed long command")
+                return ()
+
+        cfg = HarnessConfig(
+            sessions=1,
+            table_count=1,
+            statements_per_tx=10,
+            mixed_pressure_workload=True,
+            mixed_seed_rows_per_table=1,
+            mixed_transaction_sizes=[10],
+            mixed_transaction_weights=[1],
+            mixed_min_started_sessions=1,
+            mixed_min_completed_statements=1,
+            business_run_before_drain_s=0.001,
+        ).validate()
+        runtime = BlockingLongCommandRuntime()
+        worker = BusinessWorker(
+            1,
+            WorkloadPlan(cfg),
+            runtime,
+            ResumeCoordinator(cfg.sessions),
+            threading.Event(),
+        )
+        errors = []
+
+        def run_worker():
+            try:
+                worker._run_transaction(_FakeConnection(), tx_id=1)
+            except BaseException as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=run_worker)
+        thread.start()
+        self.assertTrue(runtime.long_command_entered.wait(1), errors)
+        self.assertTrue(worker.mixed_tens_seconds_command_inflight.is_set())
+        self.assertEqual(
+            worker.mixed_tens_seconds_command_started_after_statements, 8
+        )
+        self.assertEqual(worker.statements_completed, 8)
+
+        runtime.release_long_command.set()
+        thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertFalse(worker.mixed_tens_seconds_command_inflight.is_set())
+        self.assertEqual(worker.statements_completed, 10)
+
+    def test_mixed_readiness_accepts_only_designated_inflight_long_worker(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            sessions=3,
+            statements_per_tx=10,
+            mixed_pressure_workload=True,
+            mixed_seed_rows_per_table=3,
+            mixed_transaction_sizes=[10],
+            mixed_transaction_weights=[1],
+            mixed_min_started_sessions=3,
+            mixed_min_completed_statements=30,
+            business_run_before_drain_s=0.001,
+        ).validate()
+        required_operations = {
+            kind.value: 1 for kind in MIXED_PRESSURE_REQUIRED_OPERATION_KINDS
+        }
+        long_inflight = threading.Event()
+        long_inflight.set()
+        runner.workers = [
+            mock.Mock(
+                sid=1,
+                statements_completed=11,
+                operation_counts=required_operations,
+                duration_class_counts={
+                    "short": 1,
+                    "hundreds_ms": 1,
+                    "seconds": 1,
+                },
+            ),
+            mock.Mock(
+                sid=2,
+                statements_completed=11,
+                operation_counts={},
+                duration_class_counts={},
+            ),
+            mock.Mock(
+                sid=3,
+                statements_completed=8,
+                operation_counts={},
+                duration_class_counts={},
+                mixed_tens_seconds_command_inflight=long_inflight,
+                mixed_tens_seconds_command_started_after_statements=8,
+            ),
+        ]
+
+        snapshot = runner.mixed_pressure_readiness_snapshot()
+        self.assertEqual(runner._mixed_pressure_readiness_failures(snapshot), [])
+        self.assertTrue(snapshot["designated_long_command_inflight"])
+        self.assertEqual(
+            snapshot["minimum_completed_statements_per_non_long_session"], 11
+        )
+
+        runner.workers[1].statements_completed = 9
+        runner.workers[0].statements_completed = 13
+        snapshot = runner.mixed_pressure_readiness_snapshot()
+        self.assertIn(
+            "minimum_completed_statements_per_non_long_session=9 required=10",
+            runner._mixed_pressure_readiness_failures(snapshot),
+        )
 
     def test_no_preserve_baseline_globals_require_startup_disabled_preserve(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
