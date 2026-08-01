@@ -4777,6 +4777,7 @@ class BusinessWorker(threading.Thread):
         self.duration_class_min_us: Dict[str, int] = {}
         self.mixed_tens_seconds_command_inflight = threading.Event()
         self.mixed_tens_seconds_command_started_after_statements = 0
+        self.mixed_tens_seconds_command_observed_us_max = 0
         self.drained_command_rejections = 0
         self.unsupported_handoff_rejections = 0
 
@@ -5030,6 +5031,15 @@ class BusinessWorker(threading.Thread):
                         raise
                 finally:
                     if is_mixed_tens_seconds_command:
+                        observed_us = max(
+                            1,
+                            (time.monotonic_ns() - operation_started_ns)
+                            // 1000,
+                        )
+                        self.mixed_tens_seconds_command_observed_us_max = max(
+                            self.mixed_tens_seconds_command_observed_us_max,
+                            int(observed_us),
+                        )
                         self.mixed_tens_seconds_command_inflight.clear()
                 if op.validator is not None:
                     if tx_expected is not None:
@@ -10538,6 +10548,19 @@ END
         row_counts = dict(
             getattr(self, "mixed_pressure_final_row_counts", {})
         )
+        tens_seconds_observed_us_max = max(
+            (
+                int(
+                    getattr(
+                        worker,
+                        "mixed_tens_seconds_command_observed_us_max",
+                        0,
+                    )
+                )
+                for worker in getattr(self, "workers", [])
+            ),
+            default=0,
+        )
         return {
             "mixed_pressure_workload": True,
             "mixed_seed_rows_per_table": (
@@ -10584,6 +10607,9 @@ END
             "mixed_duration_class_total_us": dict(sorted(total_us.items())),
             "mixed_duration_class_min_us": dict(sorted(min_us.items())),
             "mixed_duration_class_max_us": dict(sorted(max_us.items())),
+            "mixed_tens_seconds_command_observed_us_max": (
+                tens_seconds_observed_us_max
+            ),
             "mixed_drained_command_rejections": sum(
                 int(getattr(worker, "drained_command_rejections", 0))
                 for worker in getattr(self, "workers", [])

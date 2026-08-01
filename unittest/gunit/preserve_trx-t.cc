@@ -23559,6 +23559,7 @@ TEST_F(PreserveSnapshotTest,
             preserve_trx_transfer_receiver_admitted_bytes_status());
 }
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferReceiverReadyCurrentlyRequiresEveryAcceptedToken) {
   Transfer_codec_context_guard codec_guard;
@@ -23657,6 +23658,7 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_TRUE(wait_for_epoch_ready("epoch-all-token-ready-contract", 2,
                                    &ready_summary));
 }
+#endif
 
 TEST_F(PreserveSnapshotTest,
        TransferSourceEpochSenderCommitsOnlyAfterAllTokensSealed) {

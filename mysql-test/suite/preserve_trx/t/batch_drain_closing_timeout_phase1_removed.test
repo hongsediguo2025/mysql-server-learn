@@ -1,0 +1,142 @@
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+--disable_query_log
+
+--let $initial_log_bin= query_get_value(SELECT @@GLOBAL.log_bin AS value, value, 1)
+
+--let $credential_file= $MYSQL_TMP_DIR/closing-timeout-phase1-removed.secret
+--write_file $credential_file
+closing-timeout-phase1-removed-secret
+EOF
+--exec chmod 600 $credential_file
+
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+DROP USER IF EXISTS closing_phase1_removed_app@localhost;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'closing-timeout-phase1-removed-secret';
+GRANT SHUTDOWN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.*
+  TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+CREATE USER closing_phase1_removed_app@localhost;
+GRANT SELECT, UPDATE ON test.* TO closing_phase1_removed_app@localhost;
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO closing_phase1_removed_app@localhost;
+
+--let $restart_parameters= restart: --preserve-trx-enable=ON --preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --preserve-trx-transfer-target-socket=$MASTER_MYSOCK --preserve-trx-transfer-target-user=preserve_trx_ha_admin --preserve-trx-transfer-credential-name=closing_timeout_phase1_removed --preserve-trx-transfer-credential-secret-file=$credential_file
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--let $restart_parameters=
+--disable_query_log
+
+CALL mtr.add_suppression(
+  "PRESERVE: rolled back prepared transaction without snapshot during recovery");
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_transfer_prewarm_paused=ON;
+SET GLOBAL preserve_trx_transfer_pipeline_enable=ON;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_transfer_phase1_timeout_ms=1000;
+SET GLOBAL preserve_trx_drain_closing_command_timeout_ms=100;
+SET GLOBAL preserve_trx_drain_command_timeout_fail_batch=OFF;
+
+CREATE TABLE t_closing_timeout_phase1_removed(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_closing_timeout_phase1_removed VALUES(1,10),(2,20);
+
+--connect(closing_phase1_removed_ha,localhost,preserve_trx_ha_admin,closing-timeout-phase1-removed-secret,test)
+
+--connect(closing_phase1_removed_survivor,localhost,closing_phase1_removed_app,,test)
+--let $survivor_id= query_get_value(SELECT CONNECTION_ID() AS id, id, 1)
+START TRANSACTION;
+UPDATE t_closing_timeout_phase1_removed SET v=11 WHERE id=1;
+
+--connect(closing_phase1_removed_old_token,localhost,closing_phase1_removed_app,,test)
+--let $removed_id= query_get_value(SELECT CONNECTION_ID() AS id, id, 1)
+START TRANSACTION;
+UPDATE t_closing_timeout_phase1_removed SET v=21 WHERE id=2;
+
+--connection default
+SET DEBUG_SYNC=
+  'preserve_trx_transfer_after_phase1_binlog_stream SIGNAL closing_phase1_removed_scanned WAIT_FOR closing_phase1_removed_continue';
+SET DEBUG_SYNC=
+  'preserve_trx_drain_after_shutdown_handoff SIGNAL closing_phase1_removed_handoff WAIT_FOR closing_phase1_removed_handoff_continue';
+--send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+
+--connection closing_phase1_removed_ha
+SET DEBUG_SYNC='now WAIT_FOR closing_phase1_removed_scanned TIMEOUT 30';
+
+# This token was legitimately declared in Phase1. Its transaction commits
+# before CLOSING, then the same THD runs a long non-transactional command.
+--connection closing_phase1_removed_old_token
+COMMIT;
+SET DEBUG_SYNC=
+  'before_execute_sql_command SIGNAL closing_phase1_removed_running WAIT_FOR closing_phase1_removed_command_continue';
+--send SELECT 2 AS old_command_after_committed_transaction
+
+--connection closing_phase1_removed_ha
+SET DEBUG_SYNC='now WAIT_FOR closing_phase1_removed_running TIMEOUT 10';
+SET DEBUG_SYNC='now SIGNAL closing_phase1_removed_continue';
+SET DEBUG_SYNC='now WAIT_FOR closing_phase1_removed_handoff TIMEOUT 60';
+
+SELECT VARIABLE_VALUE=1 AS one_survivor_epoch
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs';
+SELECT VARIABLE_VALUE=1 AS one_survivor_token
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens';
+SELECT VARIABLE_VALUE=1 AS one_removed_token_excluded
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_closing_excluded_tokens';
+--replace_result $removed_id REMOVED_ID
+SELECT VARIABLE_VALUE AS removed_token
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_closing_last_excluded_token';
+
+SET DEBUG_SYNC='now SIGNAL closing_phase1_removed_command_continue';
+--connection closing_phase1_removed_old_token
+--reap
+
+--connection closing_phase1_removed_ha
+SET DEBUG_SYNC='now SIGNAL closing_phase1_removed_handoff_continue';
+
+--connection default
+--replace_result $survivor_id SURVIVOR_ID $removed_id REMOVED_ID
+--replace_column 1 GENERATION 6 CLOSING_STARTED_US 7 CLOSING_DEADLINE_US
+--reap
+
+--connection closing_phase1_removed_ha
+SHUTDOWN;
+
+--connection default
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+--exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+--disable_query_log
+
+--eval SELECT @@GLOBAL.log_bin=$initial_log_bin AS binlog_mode_restored
+
+--enable_query_log
+SELECT GROUP_CONCAT(CONCAT(id, ':', v) ORDER BY id) AS recovered_values
+  FROM t_closing_timeout_phase1_removed;
+--disable_query_log
+
+DROP TABLE t_closing_timeout_phase1_removed;
+DROP USER preserve_trx_ha_admin@localhost;
+DROP USER closing_phase1_removed_app@localhost;
+SET GLOBAL preserve_trx_drain_closing_command_timeout_ms=1000;
+SET GLOBAL preserve_trx_transfer_phase1_timeout_ms=600000;
+SET DEBUG_SYNC='RESET';
+--remove_file $credential_file
+
+--enable_query_log

@@ -8935,6 +8935,7 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
         self.assertFalse(thread.is_alive())
         self.assertEqual(errors, [])
         self.assertFalse(worker.mixed_tens_seconds_command_inflight.is_set())
+        self.assertGreater(worker.mixed_tens_seconds_command_observed_us_max, 0)
         self.assertEqual(worker.statements_completed, 10)
 
     def test_mixed_readiness_accepts_only_designated_inflight_long_worker(self):

@@ -1247,7 +1247,15 @@ static Sys_var_bool Sys_preserve_trx_drain_command_timeout_fail_batch(
     "does not finish by the shared command deadline. OFF permits timeout "
     "exclusion only for standby-transfer drains.",
     GLOBAL_VAR(preserve_trx_drain_command_timeout_fail_batch),
-    CMD_LINE(OPT_ARG), DEFAULT(true), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+    CMD_LINE(OPT_ARG), DEFAULT(false), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_bool Sys_preserve_trx_transfer_pipeline_enable(
+    "preserve_trx_transfer_pipeline_enable",
+    "Enable standby-transfer Phase 1 active binlog progress and per-token "
+    "early Preserve overlap during WARMCOPY_CLOSING. This controls performance "
+    "orchestration only and does not change command-timeout failure policy.",
+    GLOBAL_VAR(preserve_trx_transfer_pipeline_enable), CMD_LINE(OPT_ARG),
+    DEFAULT(true), NO_MUTEX_GUARD, NOT_IN_BINLOG);
 
 static Sys_var_uint Sys_preserve_trx_transfer_phase1_timeout_ms(
     "preserve_trx_transfer_phase1_timeout_ms",

@@ -37,7 +37,10 @@ GRANT SESSION_VARIABLES_ADMIN ON *.* TO closing_early_app@localhost;
 
 SET GLOBAL preserve_trx_enable=ON;
 SET GLOBAL preserve_trx_batch_max_transactions=2;
-SET GLOBAL preserve_trx_drain_command_timeout_fail_batch=ON;
+--let $old_pipeline_enable= `SELECT @@GLOBAL.preserve_trx_transfer_pipeline_enable`
+--let $old_fail_batch= `SELECT @@GLOBAL.preserve_trx_drain_command_timeout_fail_batch`
+SET GLOBAL preserve_trx_transfer_pipeline_enable=ON;
+SET GLOBAL preserve_trx_drain_command_timeout_fail_batch=OFF;
 SET GLOBAL preserve_trx_drain_closing_command_timeout_ms=60000;
 SET GLOBAL preserve_trx_transfer_prewarm_paused=ON;
 SET GLOBAL preserve_trx_parallel_preserve_threads=1;
@@ -98,8 +101,6 @@ SET DEBUG_SYNC=
   'preserve_trx_warmcopy_after_closing_state_before_targets SIGNAL closing_early_entered';
 SET DEBUG_SYNC=
   'preserve_trx_batch_after_one_target_preserved SIGNAL closing_early_first_staged';
-SET DEBUG_SYNC=
-  'preserve_trx_batch_final_attach_observed_rejection_inflight SIGNAL closing_early_attach_observed_busy WAIT_FOR closing_early_attach_retry';
 --send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
 
 --connection closing_early_ha
@@ -116,17 +117,11 @@ SET DEBUG_SYNC='now SIGNAL closing_early_probe_continue';
 --send SELECT 1
 
 # The command following the old in-flight command is admitted only far enough
-# to return 4020. While that response is in flight the early worker must retain
-# the target and wait for its next idle boundary instead of failing the epoch.
+# to return 4020. The timeout-exclusion test owns the response-in-flight race;
+# this test keeps only the independent early-seal ordering contract.
 --connection closing_early_ha
 SET DEBUG_SYNC='now WAIT_FOR closing_early_app_1_rejected TIMEOUT 10';
-# Keep the response boundary closed for one bounded Debug Sync interval so the
-# early worker must observe the non-idle target before it can attach.
---disable_warnings
-SET DEBUG_SYNC='now WAIT_FOR closing_early_attach_observed_busy TIMEOUT 1';
---enable_warnings
 SET DEBUG_SYNC='now SIGNAL closing_early_app_1_reject_continue';
-SET DEBUG_SYNC='now SIGNAL closing_early_attach_retry';
 
 --connection closing_early_app_1
 --error ER_PRESERVE_TRX_SESSION_DRAINED
@@ -189,8 +184,12 @@ SELECT GROUP_CONCAT(CONCAT(id, ':', v) ORDER BY id) AS committed_values
 --connection default
 DROP PROCEDURE p_closing_early_pipeline;
 DROP TABLE t_closing_early_pipeline;
+--eval SET GLOBAL preserve_trx_transfer_pipeline_enable=$old_pipeline_enable
+--eval SET GLOBAL preserve_trx_drain_command_timeout_fail_batch=$old_fail_batch
 DROP USER closing_early_app@localhost;
 DROP USER preserve_trx_ha_admin@localhost;
 SET GLOBAL preserve_trx_enable=ON;
 SET GLOBAL preserve_trx_parallel_preserve_threads=DEFAULT;
+SET GLOBAL preserve_trx_transfer_prewarm_paused=OFF;
+# force_restart.inc restores STANDBY_TRANSFER_SAVE at the test boundary.
 --remove_file $credential_file

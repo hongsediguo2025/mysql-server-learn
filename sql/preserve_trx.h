@@ -100,6 +100,7 @@ extern uint preserve_trx_drain_grace_ms;
 extern uint preserve_trx_drain_hard_timeout_ms;
 extern uint preserve_trx_drain_closing_command_timeout_ms;
 extern bool preserve_trx_drain_command_timeout_fail_batch;
+extern bool preserve_trx_transfer_pipeline_enable;
 extern uint preserve_trx_transfer_phase1_timeout_ms;
 extern uint preserve_trx_transfer_phase2_timeout_ms;
 extern bool preserve_trx_warmcopy_enable;

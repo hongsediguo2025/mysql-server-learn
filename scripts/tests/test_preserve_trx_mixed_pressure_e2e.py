@@ -290,9 +290,13 @@ class MixedPressureContractTest(unittest.TestCase):
 
     def test_readiness_snapshot_counts_started_connections_and_real_sql_mix(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(sessions=8)
         runner.workers = [
             mock.Mock(
+                sid=sid,
                 statements_completed=20,
+                mixed_tens_seconds_command_inflight=threading.Event(),
+                mixed_tens_seconds_command_started_after_statements=0,
                 operation_counts=Counter(
                     {
                         OperationKind.UPDATE.value: 3,
@@ -309,7 +313,7 @@ class MixedPressureContractTest(unittest.TestCase):
                     }
                 ),
             )
-            for _ in range(8)
+            for sid in range(1, 9)
         ]
         snapshot = runner.mixed_pressure_readiness_snapshot()
         self.assertEqual(8, snapshot["started_sessions"])
@@ -363,7 +367,10 @@ class MixedPressureContractTest(unittest.TestCase):
         )
         runner.workers = [
             mock.Mock(
+                sid=sid,
                 statements_completed=(9 if sid == 1 else 20),
+                mixed_tens_seconds_command_inflight=threading.Event(),
+                mixed_tens_seconds_command_started_after_statements=0,
                 operation_counts=operations,
                 duration_class_counts=Counter(
                     {
@@ -671,6 +678,7 @@ class MixedPressureCommandTest(unittest.TestCase):
             "receiver_epoch_ready_bind_attempts": 1,
             "receiver_ready_after_final_spool_ack_us": 400_000,
             "receiver_prewarm_backlog_at_phase2_end": 0,
+            "source_remained_online_after_transfer": True,
             "source_phase2_total_us": [20_000_000],
             "source_phase2_post_command_tail_us": [400_000],
             "receiver_all_prewarm_after_final_ack_us": 400_000,
@@ -859,6 +867,28 @@ class MixedPressureCommandTest(unittest.TestCase):
             validate_mixed_pressure_report(
                 MIXED_SMOKE_PROFILE, ready_too_slow, "mixed-transfer"
             )
+
+    def test_mixed_transfer_accepts_measured_inflight_long_command_duration(self):
+        report = self._valid_transfer_report()
+        readiness = dict(report["mixed_pre_drain_readiness"])
+        durations = dict(readiness["duration_class_counts"])
+        durations.pop("tens_seconds")
+        readiness["duration_class_counts"] = durations
+        readiness["designated_long_command_inflight"] = True
+        readiness["designated_long_command_started_after_statements"] = 8
+        readiness["minimum_completed_statements_per_non_long_session"] = 10
+        report["mixed_pre_drain_readiness"] = readiness
+        duration_max = dict(report["mixed_duration_class_max_us"])
+        duration_max.pop("tens_seconds")
+        report["mixed_duration_class_max_us"] = duration_max
+        report["mixed_tens_seconds_command_observed_us_max"] = 10_500_000
+        report["source_remained_online_after_transfer"] = True
+
+        metrics = validate_mixed_pressure_report(
+            MIXED_SMOKE_PROFILE, report, "mixed-transfer"
+        )
+
+        self.assertEqual(10_500_000, metrics["tens_seconds_observed_us"])
 
     def test_mixed_transfer_prewarm_count_must_close_actual_survivor_set(self):
         report = self._valid_transfer_report()

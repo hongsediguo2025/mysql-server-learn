@@ -1,0 +1,192 @@
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+--disable_query_log
+
+--let $credential_file= $MYSQL_TMP_DIR/closing-timeout-exclusion-reset.secret
+--write_file $credential_file
+closing-timeout-exclusion-reset-secret
+EOF
+--exec chmod 600 $credential_file
+
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+DROP USER IF EXISTS closing_exclusion_reset_app@localhost;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'closing-timeout-exclusion-reset-secret';
+GRANT SHUTDOWN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.*
+  TO preserve_trx_ha_admin@localhost;
+CREATE USER closing_exclusion_reset_app@localhost;
+GRANT SELECT, UPDATE ON test.* TO closing_exclusion_reset_app@localhost;
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO closing_exclusion_reset_app@localhost;
+
+--let $restart_parameters= restart: --preserve-trx-enable=ON --preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --preserve-trx-transfer-target-socket=$MASTER_MYSOCK --preserve-trx-transfer-target-user=preserve_trx_ha_admin --preserve-trx-transfer-credential-name=closing_timeout_exclusion_reset --preserve-trx-transfer-credential-secret-file=$credential_file
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--let $restart_parameters=
+--disable_query_log
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_transfer_prewarm_paused=ON;
+SET GLOBAL preserve_trx_transfer_pipeline_enable=ON;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_transfer_phase1_timeout_ms=200;
+SET GLOBAL preserve_trx_drain_closing_command_timeout_ms=100;
+SET GLOBAL preserve_trx_drain_command_timeout_fail_batch=OFF;
+
+CREATE TABLE t_closing_timeout_exclusion_reset(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_closing_timeout_exclusion_reset VALUES(1,10),(2,20);
+
+--connect(closing_exclusion_reset_ha,localhost,preserve_trx_ha_admin,closing-timeout-exclusion-reset-secret,test)
+
+--connect(closing_exclusion_reset_survivor,localhost,closing_exclusion_reset_app,,test)
+START TRANSACTION;
+UPDATE t_closing_timeout_exclusion_reset SET v=11 WHERE id=1;
+
+--connect(closing_exclusion_reset_timeout,localhost,closing_exclusion_reset_app,,test)
+START TRANSACTION;
+UPDATE t_closing_timeout_exclusion_reset SET v=21 WHERE id=2;
+SET DEBUG_SYNC=
+  'before_execute_sql_command SIGNAL closing_exclusion_reset_running WAIT_FOR closing_exclusion_reset_command_continue';
+--send SELECT 2 AS excluded_old_command
+
+--connection default
+SET DEBUG_SYNC='now WAIT_FOR closing_exclusion_reset_running TIMEOUT 10';
+SET DEBUG_SYNC=
+  'preserve_trx_early_timeout_after_exclusion SIGNAL closing_exclusion_reset_classified WAIT_FOR closing_exclusion_reset_drain_continue';
+--send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+
+--connection closing_exclusion_reset_ha
+SET DEBUG_SYNC='now WAIT_FOR closing_exclusion_reset_classified TIMEOUT 30';
+SELECT VARIABLE_VALUE=1 AS one_timeout_token_aborted
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_failed_tokens';
+SELECT VARIABLE_VALUE='closing_command_timeout' AS timeout_abort_reason
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_last_failed_reason';
+SELECT VARIABLE_VALUE+0 >= 1 AS survivor_was_staged
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens';
+--let $reset_wins_before= query_get_value(SELECT VARIABLE_VALUE+0 AS value FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_reset_drain_wins', value, 1)
+
+--connect(closing_exclusion_reset_admin,localhost,preserve_trx_ha_admin,closing-timeout-exclusion-reset-secret,test)
+--send RESET DRAIN
+
+--connection closing_exclusion_reset_ha
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_reset_drain_wins')>$reset_wins_before
+--source include/wait_condition.inc
+SET DEBUG_SYNC='now SIGNAL closing_exclusion_reset_command_continue';
+SET DEBUG_SYNC='now SIGNAL closing_exclusion_reset_drain_continue';
+
+--connection closing_exclusion_reset_timeout
+--reap
+
+--connection closing_exclusion_reset_admin
+--reap
+
+--connection default
+--error 4021
+--reap
+
+# RESET restores the detached survivor. The excluded token never left source
+# ownership, so its original transaction remains usable as well.
+--connection closing_exclusion_reset_survivor
+UPDATE t_closing_timeout_exclusion_reset SET v=v+100 WHERE id=1;
+COMMIT;
+--connection closing_exclusion_reset_timeout
+UPDATE t_closing_timeout_exclusion_reset SET v=v+200 WHERE id=2;
+COMMIT;
+
+--connection default
+--enable_query_log
+SELECT GROUP_CONCAT(CONCAT(id, ':', v) ORDER BY id) AS committed_values
+  FROM t_closing_timeout_exclusion_reset;
+--disable_query_log
+SELECT VARIABLE_VALUE=0 AS no_receiver_epoch_after_reset
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs';
+
+# O=OFF uses the legacy target wait loop. RESET must still win if it arrives
+# after timeout classification but before the token-local receiver ABORT.
+SET GLOBAL preserve_trx_transfer_pipeline_enable=OFF;
+--connect(closing_legacy_reset_signal,localhost,preserve_trx_ha_admin,closing-timeout-exclusion-reset-secret,test)
+
+CREATE TABLE t_closing_timeout_legacy_reset(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_closing_timeout_legacy_reset VALUES(1,10),(2,20);
+
+--connect(closing_legacy_reset_survivor,localhost,closing_exclusion_reset_app,,test)
+START TRANSACTION;
+UPDATE t_closing_timeout_legacy_reset SET v=11 WHERE id=1;
+
+--connect(closing_legacy_reset_timeout,localhost,closing_exclusion_reset_app,,test)
+START TRANSACTION;
+UPDATE t_closing_timeout_legacy_reset SET v=21 WHERE id=2;
+SET DEBUG_SYNC=
+  'before_execute_sql_command SIGNAL closing_legacy_reset_running WAIT_FOR closing_legacy_reset_command_continue';
+--send SELECT 2 AS legacy_excluded_old_command
+
+--connection closing_exclusion_reset_ha
+SET DEBUG_SYNC='now WAIT_FOR closing_legacy_reset_running TIMEOUT 10';
+SET DEBUG_SYNC=
+  'preserve_trx_legacy_timeout_before_abort SIGNAL closing_legacy_reset_before_abort WAIT_FOR closing_legacy_reset_drain_continue';
+--send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+
+--connection closing_exclusion_reset_admin
+SET DEBUG_SYNC='now WAIT_FOR closing_legacy_reset_before_abort TIMEOUT 30';
+--send RESET DRAIN
+
+--connection closing_legacy_reset_signal
+SET DEBUG_SYNC='now SIGNAL closing_legacy_reset_command_continue';
+SET DEBUG_SYNC='now SIGNAL closing_legacy_reset_drain_continue';
+
+--connection closing_legacy_reset_timeout
+--reap
+
+--connection closing_exclusion_reset_admin
+--reap
+
+--connection closing_exclusion_reset_ha
+--error 4021
+--reap
+
+--connection closing_legacy_reset_survivor
+UPDATE t_closing_timeout_legacy_reset SET v=v+100 WHERE id=1;
+COMMIT;
+--connection closing_legacy_reset_timeout
+UPDATE t_closing_timeout_legacy_reset SET v=v+200 WHERE id=2;
+COMMIT;
+
+--connection default
+--enable_query_log
+SELECT GROUP_CONCAT(CONCAT(id, ':', v) ORDER BY id) AS legacy_committed_values
+  FROM t_closing_timeout_legacy_reset;
+--disable_query_log
+SELECT VARIABLE_VALUE=0 AS no_receiver_epoch_after_legacy_reset
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs';
+
+DROP TABLE t_closing_timeout_exclusion_reset;
+DROP TABLE t_closing_timeout_legacy_reset;
+DROP USER preserve_trx_ha_admin@localhost;
+DROP USER closing_exclusion_reset_app@localhost;
+SET GLOBAL preserve_trx_transfer_prewarm_paused=OFF;
+SET GLOBAL preserve_trx_transfer_pipeline_enable=ON;
+SET GLOBAL preserve_trx_drain_closing_command_timeout_ms=1000;
+SET GLOBAL preserve_trx_transfer_phase1_timeout_ms=600000;
+SET DEBUG_SYNC='RESET';
+# force_restart.inc restores STANDBY_TRANSFER_SAVE at the test boundary.
+--remove_file $credential_file
+
+--enable_query_log

@@ -1,0 +1,19 @@
+one_survivor_epoch
+1
+one_survivor_token
+1
+one_removed_token_excluded
+1
+removed_token
+REMOVED_ID
+old_command_after_committed_transaction
+2
+generation	outcome	source_connection_id	token_role	reason	closing_started_us	closing_deadline_us
+GENERATION	SUCCESS_WITH_EXCLUSIONS	SURVIVOR_ID	SURVIVOR	NONE	CLOSING_STARTED_US	CLOSING_DEADLINE_US
+GENERATION	SUCCESS_WITH_EXCLUSIONS	REMOVED_ID	EXCLUDED	CLOSING_COMMAND_TIMEOUT	CLOSING_STARTED_US	CLOSING_DEADLINE_US
+binlog_mode_restored
+1
+SELECT GROUP_CONCAT(CONCAT(id, ':', v) ORDER BY id) AS recovered_values
+FROM t_closing_timeout_phase1_removed;
+recovered_values
+1:10,2:21

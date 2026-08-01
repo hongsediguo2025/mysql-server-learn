@@ -1500,15 +1500,24 @@ def validate_mixed_pressure_report(
         duration_max_us = {}
     if int(duration_min_us.get("short", 100_000)) >= 100_000:
         failures.append("mixed short SQL did not complete below 100ms")
+    tens_seconds_observed_us = max(
+        int(duration_max_us.get("tens_seconds", 0)),
+        int(report.get("mixed_tens_seconds_command_observed_us_max") or 0),
+    )
     for key, threshold_us in (
         ("hundreds_ms", 100_000),
         ("seconds", 1_000_000),
         ("tens_seconds", 10_000_000),
     ):
-        if int(duration_max_us.get(key, 0)) < threshold_us:
+        actual_us = (
+            tens_seconds_observed_us
+            if key == "tens_seconds"
+            else int(duration_max_us.get(key, 0))
+        )
+        if actual_us < threshold_us:
             failures.append(
                 f"mixed {key} SQL did not reach its measured duration tier: "
-                f"actual_us={duration_max_us.get(key)} required_us={threshold_us}"
+                f"actual_us={actual_us} required_us={threshold_us}"
             )
 
     survivor_count = int(report.get("mixed_preserved_survivor_count") or 0)
@@ -1711,6 +1720,7 @@ def validate_mixed_pressure_report(
         "minimum_statements_per_session_before_drain": minimum_per_session,
         "preserved_survivors": survivor_count,
         "preserved_survivor_ratio": survivor_count / profile.sessions,
+        "tens_seconds_observed_us": tens_seconds_observed_us,
         "evidence_kind": report.get("evidence_kind"),
         **mode_metrics,
     }

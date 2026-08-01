@@ -1,4 +1,6 @@
 SELECT @@global.preserve_trx_lock_warmcopy_enable AS lock_warmcopy_enable_default_on;
+SELECT @@global.preserve_trx_transfer_pipeline_enable AS transfer_pipeline_default_on;
+SELECT @@global.preserve_trx_drain_command_timeout_fail_batch AS command_timeout_fail_batch_default_off;
 SELECT @@global.preserve_trx_lock_warmcopy_fallback_to_live_export AS lock_warmcopy_fallback_default_on;
 SELECT @@global.preserve_trx_lock_warmcopy_max_memory_bytes AS lock_warmcopy_max_memory_default;
 SELECT @@global.preserve_trx_lock_warmcopy_max_journal_bytes AS lock_warmcopy_max_journal_default;

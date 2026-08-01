@@ -1,25 +1,13 @@
-ERROR HY000: Preserve drain is active; this command was not executed
 one_accepted_epoch
 1
-two_survivors_receiving
+one_survivor_receiving
 1
-closing_inflight_commands
-2
-closing_completed_before_deadline
-1
-closing_excluded_tokens
-1
-closing_last_excluded_token
-EXCLUDED_ID
-transfer_tail_measured
-1
-closing_to_final_ack_measured
+one_timeout_exclusion
 1
 excluded_old_command
 2
 generation	outcome	source_connection_id	token_role	reason	closing_started_us	closing_deadline_us
 GENERATION	SUCCESS_WITH_EXCLUSIONS	SURVIVOR_ID	SURVIVOR	NONE	CLOSING_STARTED_US	CLOSING_DEADLINE_US
-GENERATION	SUCCESS_WITH_EXCLUSIONS	RACE_ID	SURVIVOR	NONE	CLOSING_STARTED_US	CLOSING_DEADLINE_US
 GENERATION	SUCCESS_WITH_EXCLUSIONS	EXCLUDED_ID	EXCLUDED	CLOSING_COMMAND_TIMEOUT	CLOSING_STARTED_US	CLOSING_DEADLINE_US
 binlog_mode_restored
 1

@@ -146,7 +146,8 @@ ulong preserve_trx_off_artifact_policy =
 uint preserve_trx_drain_grace_ms = 30000;
 uint preserve_trx_drain_hard_timeout_ms = 30000;
 uint preserve_trx_drain_closing_command_timeout_ms = 1000;
-bool preserve_trx_drain_command_timeout_fail_batch = true;
+bool preserve_trx_drain_command_timeout_fail_batch = false;
+bool preserve_trx_transfer_pipeline_enable = true;
 uint preserve_trx_transfer_phase1_timeout_ms = 600000;
 uint preserve_trx_transfer_phase2_timeout_ms = 3000;
 bool preserve_trx_warmcopy_enable = true;
@@ -6779,9 +6780,9 @@ class Preserve_batch_timeout_target_decision final : public Do_THD_Impl {
       m_temp_unsupported_boundary_seen =
           preserve_trx_temp_table_has_untracked_change(candidate) ||
           preserve_trx_temp_table_has_batch_unsupported_boundary(candidate);
-      if (m_state == Preserve_trx_batch_thd_state::PENDING_QUIESCE ||
-          (m_state == Preserve_trx_batch_thd_state::QUIESCED &&
-           !candidate->m_server_idle)) {
+      m_boundary_observed_us =
+          candidate->preserve_trx_quiesce_boundary_monotonic_us;
+      if (m_state == Preserve_trx_batch_thd_state::PENDING_QUIESCE) {
         candidate->preserve_trx_batch_generation = 0;
         candidate->preserve_trx_batch_state =
             Preserve_trx_batch_thd_state::NONE;
@@ -6800,6 +6801,7 @@ class Preserve_batch_timeout_target_decision final : public Do_THD_Impl {
   bool temp_unsupported_boundary_seen() const {
     return m_temp_unsupported_boundary_seen;
   }
+  ulonglong boundary_observed_us() const { return m_boundary_observed_us; }
 
  private:
   ulonglong m_generation;
@@ -6808,6 +6810,7 @@ class Preserve_batch_timeout_target_decision final : public Do_THD_Impl {
   bool m_timed_out{false};
   Preserve_trx_batch_thd_state m_state{Preserve_trx_batch_thd_state::NONE};
   bool m_temp_unsupported_boundary_seen{false};
+  ulonglong m_boundary_observed_us{0};
 };
 
 enum class Preserve_trx_batch_wait_result {
@@ -17531,10 +17534,10 @@ bool Preserve_trx_drain_service::execute(
     warmcopy participants while target sessions may still run, then publishes
     WARMCOPY_CLOSING to block every new ordinary client command. After target
     enumeration and quiesce, participant preflight/seal and per-target preserve
-    run inside the blocked window. The command succeeds only after all selected
-    targets are preserved and audited, and the final shutdown request is
-    accepted. Partial preserve failures or shutdown failure route through
-    participant cleanup and fail closed instead of publishing a mixed batch.
+    run inside the blocked window. The command succeeds only after every
+    survivor is preserved and audited; command-timeout exclusions require an
+    explicit receiver ABORT. Other partial failures route through participant
+    cleanup and fail closed instead of publishing a mixed batch.
   */
   const Preserve_trx_options &options = request.options;
 
@@ -17575,6 +17578,10 @@ bool Preserve_trx_drain_service::execute(
   const bool two_phase_enabled =
       standby_transfer_streaming_enabled || temp_table_phase1_enabled ||
       preserve_trx_lock_warmcopy_requires_two_phase(binlog_warmcopy_enabled);
+  const bool transfer_pipeline_enabled =
+      preserve_trx_transfer_pipeline_enable;
+  const bool command_timeout_fail_batch =
+      preserve_trx_drain_command_timeout_fail_batch;
   Preserve_trx_drain_orchestrator drain_orchestrator(
       two_phase_enabled ? Preserve_trx_drain_phase_mode::TWO_PHASE
                         : Preserve_trx_drain_phase_mode::SINGLE_PHASE);
@@ -17605,11 +17612,11 @@ bool Preserve_trx_drain_service::execute(
   }
   const bool active_binlog_progress_policy_enabled =
       standby_transfer_streaming_enabled && two_phase_enabled &&
-      preserve_trx_drain_command_timeout_fail_batch &&
+      transfer_pipeline_enabled &&
       warmcopy_participant != nullptr;
   const bool early_pipeline_policy_enabled =
       standby_transfer_streaming_enabled && two_phase_enabled &&
-      preserve_trx_drain_command_timeout_fail_batch &&
+      transfer_pipeline_enabled &&
       lock_warmcopy_participant != nullptr &&
       preserve_trx_lock_warmcopy_current_options().fallback_to_live_export;
   PreserveBinlogBlobProvider *warmcopy_provider = nullptr;
@@ -18717,7 +18724,7 @@ bool Preserve_trx_drain_service::execute(
       preserved_trx_batch_has_capacity(counter.account_counts());
   const bool timeout_exclusion_enabled =
       standby_transfer_streaming_enabled &&
-      !preserve_trx_drain_command_timeout_fail_batch;
+      !command_timeout_fail_batch;
 
   if (early_pipeline_enabled) {
     const ulonglong provenance_begin_started_us =
@@ -19034,6 +19041,108 @@ bool Preserve_trx_drain_service::execute(
       early_wait_result = preserve_trx_batch_observe_targets_ready_joint(
           thd, generation, &pending, &ready_targets, target_wait_deadline_us,
           active_drain_attempt);
+      if (early_wait_result == Preserve_trx_batch_wait_result::DEADLINE &&
+          timeout_exclusion_enabled) {
+        DEBUG_SYNC(thd, "preserve_trx_early_timeout_before_recheck");
+        if (reset_requested()) {
+          early_wait_result =
+              Preserve_trx_batch_wait_result::RESET_REQUESTED;
+          worker_abort.store(true, std::memory_order_release);
+          queue_condition.notify_all();
+          break;
+        }
+        const std::vector<my_thread_id> deadline_targets(pending.begin(),
+                                                         pending.end());
+        ready_targets.clear();
+        bool exclusion_failed = false;
+        bool reset_during_exclusion = false;
+        for (const my_thread_id target_thread_id : deadline_targets) {
+          if (reset_requested()) {
+            reset_during_exclusion = true;
+            break;
+          }
+          Preserve_batch_timeout_target_decision decision(generation,
+                                                          target_thread_id);
+          Global_THD_manager::get_instance()->do_for_all_thd_copy(&decision);
+          if (!decision.seen()) {
+            exclusion_failed = true;
+            break;
+          }
+
+          if (!decision.timed_out()) {
+            ready_targets.push_back(
+                {target_thread_id, decision.state(),
+                 decision.temp_unsupported_boundary_seen(),
+                 decision.boundary_observed_us()});
+            pending.erase(target_thread_id);
+            continue;
+          }
+
+          ++phase2_metrics.closing_command_timed_out_count;
+          const bool declared =
+              batch_transfer_phase1_declared_tokens.count(target_thread_id) !=
+              0;
+          const auto execution_it =
+              execution_by_thread_id.find(target_thread_id);
+          const bool has_execution =
+              execution_it != execution_by_thread_id.end();
+          if (has_execution && !declared) {
+            exclusion_failed = true;
+            break;
+          }
+          if (declared) {
+            if (reset_requested()) {
+              reset_during_exclusion = true;
+              break;
+            }
+            if (batch_transfer_source_session->abort_token(
+                    static_cast<uint64_t>(target_thread_id),
+                    "closing_command_timeout") !=
+                Preserve_trx_transfer_status::OK) {
+              exclusion_failed = true;
+              break;
+            }
+            batch_transfer_phase1_declared_tokens.erase(target_thread_id);
+          }
+          if (has_execution) {
+            std::lock_guard<std::mutex> guard(queue_mutex);
+            Preserve_batch_target_execution &execution =
+                target_results[execution_it->second];
+            execution.no_token_target = true;
+            execution.visited_target = true;
+            execution.result.failure_reason = "closing_command_timeout";
+            ++completed_workers;
+          }
+          excluded_timeout_thread_ids.push_back(target_thread_id);
+          pending.erase(target_thread_id);
+        }
+        if (reset_during_exclusion) {
+          early_wait_result =
+              Preserve_trx_batch_wait_result::RESET_REQUESTED;
+          worker_abort.store(true, std::memory_order_release);
+          queue_condition.notify_all();
+          break;
+        }
+        if (exclusion_failed) {
+          early_wait_result =
+              Preserve_trx_batch_wait_result::TARGET_NOT_FOUND;
+          worker_abort.store(true, std::memory_order_release);
+          queue_condition.notify_all();
+          break;
+        }
+        DEBUG_SYNC(thd, "preserve_trx_early_timeout_after_exclusion");
+        if (reset_requested()) {
+          early_wait_result =
+              Preserve_trx_batch_wait_result::RESET_REQUESTED;
+          worker_abort.store(true, std::memory_order_release);
+          queue_condition.notify_all();
+          break;
+        }
+        early_wait_result = Preserve_trx_batch_wait_result::READY;
+      }
+      if (early_wait_result == Preserve_trx_batch_wait_result::DEADLINE) {
+        phase2_metrics.closing_command_timed_out_count += pending.size();
+      }
       if (early_wait_result != Preserve_trx_batch_wait_result::READY) break;
 
       std::set<my_thread_id> ready_binlog_targets;
@@ -19376,11 +19485,18 @@ bool Preserve_trx_drain_service::execute(
               batch_transfer_phase1_declared_tokens.count(target_thread_id) !=
               0;
           if (declared) {
+            DEBUG_SYNC(thd, "preserve_trx_legacy_timeout_before_abort");
+            if (reset_requested())
+              return finish_phase2_reset(
+                  nullptr, "reset_before_legacy_timeout_abort");
             const Preserve_trx_transfer_status abort_status =
                 batch_transfer_source_session->abort_token(
                     static_cast<uint64_t>(target_thread_id),
                     "closing_command_timeout");
             if (abort_status != Preserve_trx_transfer_status::OK) {
+              if (reset_requested())
+                return finish_phase2_reset(
+                    nullptr, "reset_during_legacy_timeout_abort");
               Preserve_batch_clear_generation clear(generation);
               Global_THD_manager::get_instance()->do_for_all_thd_copy(&clear);
               abort_batch_transfer_epoch("closing_timeout_abort_failed");
@@ -19390,6 +19506,9 @@ bool Preserve_trx_drain_service::execute(
             batch_transfer_phase1_declared_tokens.erase(target_thread_id);
           }
           excluded_timeout_thread_ids.push_back(target_thread_id);
+          if (reset_requested())
+            return finish_phase2_reset(
+                nullptr, "reset_after_legacy_timeout_exclusion");
           continue;
         } else {
           target_wait_result = Preserve_trx_batch_wait_result::READY;
