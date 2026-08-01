@@ -13868,6 +13868,8 @@ bool g_receiver_prewarm_workers_started = false;
 bool g_receiver_prewarm_workers_starting = false;
 bool g_receiver_prewarm_workers_stopping = false;
 bool g_receiver_prewarm_shutdown = false;
+bool g_receiver_prewarm_runtime_stop = false;
+bool g_receiver_prewarm_idle_stop_requested = false;
 size_t g_receiver_prewarm_worker_init_reports = 0;
 size_t g_receiver_prewarm_worker_init_failures = 0;
 std::atomic<uint> g_receiver_prewarm_worker_init_index{0};
@@ -13879,6 +13881,64 @@ void subtract_receiver_queued_bytes(uint64_t bytes) {
   while (!g_receiver_queued_bytes.compare_exchange_weak(
       current, current >= bytes ? current - bytes : 0)) {
   }
+}
+
+bool receiver_prewarm_work_idle_locked() {
+  return g_receiver_staged_token_prewarm_jobs.empty() &&
+         g_receiver_prewarm_jobs.empty() &&
+         g_receiver_staged_token_prewarm_inflight.empty() &&
+         g_receiver_staged_token_prewarm_deferred.empty() &&
+         g_receiver_object_prewarm_inflight.empty() &&
+         g_receiver_record_plan_deferred.empty() &&
+         g_receiver_prewarm_active_by_registry.empty() &&
+         g_receiver_prewarm_retiring_registries.empty() &&
+         g_receiver_worker_active.load() == 0;
+}
+
+void request_receiver_prewarm_idle_stop() {
+  bool requested = false;
+  {
+    std::lock_guard<std::mutex> guard(g_receiver_prewarm_mutex);
+    if (g_receiver_prewarm_workers_started &&
+        !g_receiver_prewarm_workers_starting &&
+        !g_receiver_prewarm_workers_stopping &&
+        !g_receiver_prewarm_runtime_stop &&
+        receiver_prewarm_work_idle_locked()) {
+      g_receiver_prewarm_idle_stop_requested = true;
+      requested = true;
+    }
+  }
+  if (requested) preserved_trx_request_expired_reaper_scan();
+}
+
+void retire_receiver_prewarm_workers_if_idle() {
+  std::vector<std::thread> workers;
+  {
+    std::lock_guard<std::mutex> guard(g_receiver_prewarm_mutex);
+    if (!g_receiver_prewarm_idle_stop_requested ||
+        !g_receiver_prewarm_workers_started ||
+        g_receiver_prewarm_workers_starting ||
+        g_receiver_prewarm_workers_stopping ||
+        !receiver_prewarm_work_idle_locked()) {
+      return;
+    }
+    g_receiver_prewarm_workers_stopping = true;
+    g_receiver_prewarm_runtime_stop = true;
+    g_receiver_prewarm_idle_stop_requested = false;
+    workers.swap(g_receiver_prewarm_workers);
+    g_receiver_prewarm_workers_started = false;
+    g_receiver_worker_count.store(0);
+  }
+  g_receiver_prewarm_cv.notify_all();
+  for (std::thread &worker : workers) {
+    if (worker.joinable()) worker.join();
+  }
+  {
+    std::lock_guard<std::mutex> guard(g_receiver_prewarm_mutex);
+    g_receiver_prewarm_runtime_stop = false;
+    g_receiver_prewarm_workers_stopping = false;
+  }
+  g_receiver_prewarm_cv.notify_all();
 }
 
 bool receiver_prewarm_job_matches_epoch(
@@ -13950,6 +14010,7 @@ void purge_receiver_epoch_prewarm_queues(const std::string &root_dir,
   }
   erase_receiver_binlog_prepared(root_dir, epoch_id);
   g_receiver_prewarm_cv.notify_all();
+  request_receiver_prewarm_idle_stop();
 }
 
 void purge_receiver_epoch_derived_state(const std::string &root_dir,
@@ -14126,6 +14187,7 @@ void finish_receiver_staged_token_prewarm_job(
                g_receiver_prewarm_retiring_registries.count(job.registry) ==
                    0) {
       g_receiver_staged_token_prewarm_inflight.insert(key);
+      g_receiver_queued_bytes.fetch_add(job.estimated_io_bytes);
       g_receiver_prewarm_jobs.push_back(job);
       notify_retry = true;
     }
@@ -14308,6 +14370,7 @@ preserve_trx_transfer_destroy_receiver_epoch_process_local(
 
 void preserve_trx_transfer_receiver_reaper_scan_once(uint64_t now_us) {
   receiver_reaper_scan_once(now_us, &default_receiver_registry());
+  retire_receiver_prewarm_workers_if_idle();
 }
 
 Preserve_trx_receiver_promotion_lease_status
@@ -14848,13 +14911,15 @@ void receiver_prewarm_worker_main() {
     {
       std::unique_lock<std::mutex> guard(g_receiver_prewarm_mutex);
       for (;;) {
-        if (g_receiver_prewarm_shutdown) return;
+        if (g_receiver_prewarm_shutdown || g_receiver_prewarm_runtime_stop)
+          return;
 
-        if (!g_receiver_prewarm_shutdown &&
+        if (!g_receiver_prewarm_shutdown && !g_receiver_prewarm_runtime_stop &&
             g_receiver_prewarm_paused.load(std::memory_order_acquire)) {
           const uint64_t pause_started_us = transfer_monotonic_us();
           g_receiver_prewarm_cv.wait(guard, [] {
             return g_receiver_prewarm_shutdown ||
+                   g_receiver_prewarm_runtime_stop ||
                    !g_receiver_prewarm_paused.load(std::memory_order_acquire);
           });
           const uint64_t pause_finished_us = transfer_monotonic_us();
@@ -14880,16 +14945,16 @@ void receiver_prewarm_worker_main() {
         if (runnable_staged != g_receiver_staged_token_prewarm_jobs.end()) {
           job = std::move(*runnable_staged);
           g_receiver_staged_token_prewarm_jobs.erase(runnable_staged);
-          g_receiver_queued_bytes.fetch_sub(job.estimated_io_bytes);
+          subtract_receiver_queued_bytes(job.estimated_io_bytes);
           break;
         }
         if (!g_receiver_prewarm_jobs.empty()) {
           job = std::move(g_receiver_prewarm_jobs.front());
           g_receiver_prewarm_jobs.pop_front();
-          g_receiver_queued_bytes.fetch_sub(job.estimated_io_bytes);
+          subtract_receiver_queued_bytes(job.estimated_io_bytes);
           break;
         }
-        if (g_receiver_prewarm_shutdown) {
+        if (g_receiver_prewarm_shutdown || g_receiver_prewarm_runtime_stop) {
           return;
         }
         g_receiver_prewarm_cv.wait(guard);
@@ -14901,6 +14966,10 @@ void receiver_prewarm_worker_main() {
 
     auto finish_registry_job = create_scope_guard([&] {
       if (job.registry == nullptr) return;
+      const bool accepted_epoch_live =
+          job.registry->query_accepted_epoch(job.root_dir,
+                                             job.manifest.epoch_id) ==
+          Preserve_trx_transfer_status::COMMITTED_NOT_READY;
       {
         std::lock_guard<std::mutex> guard(g_receiver_prewarm_mutex);
         const auto active =
@@ -14912,6 +14981,9 @@ void receiver_prewarm_worker_main() {
         }
       }
       g_receiver_prewarm_cv.notify_all();
+      if (accepted_epoch_live) {
+        request_receiver_prewarm_idle_stop();
+      }
     });
     g_receiver_worker_active.fetch_add(1);
     auto finish_worker_active = create_scope_guard(
@@ -15331,6 +15403,7 @@ void preserve_trx_transfer_shutdown_receiver_prewarm_workers() {
     });
     g_receiver_prewarm_workers_stopping = true;
     g_receiver_prewarm_shutdown = true;
+    g_receiver_prewarm_idle_stop_requested = false;
     workers.swap(g_receiver_prewarm_workers);
     g_receiver_prewarm_workers_started = false;
     g_receiver_worker_count.store(0);
@@ -15354,6 +15427,8 @@ void preserve_trx_transfer_shutdown_receiver_prewarm_workers() {
     g_receiver_queued_bytes.store(0);
     g_receiver_worker_active.store(0);
     g_receiver_prewarm_shutdown = false;
+    g_receiver_prewarm_runtime_stop = false;
+    g_receiver_prewarm_idle_stop_requested = false;
     g_receiver_prewarm_workers_stopping = false;
   }
   g_receiver_prewarm_cv.notify_all();
@@ -15402,7 +15477,7 @@ void retire_receiver_prewarm_registry(
         ++job;
         continue;
       }
-      g_receiver_queued_bytes.fetch_sub(job->estimated_io_bytes);
+      subtract_receiver_queued_bytes(job->estimated_io_bytes);
       if (job->kind == Receiver_prewarm_job_kind::STAGED_TOKEN) {
         const Receiver_staged_token_prewarm_key key =
             receiver_staged_token_prewarm_key(job->root_dir, job->manifest);
@@ -15427,6 +15502,8 @@ void retire_receiver_prewarm_registry(
     return g_receiver_prewarm_active_by_registry.count(registry) == 0;
   });
   g_receiver_prewarm_retiring_registries.erase(registry);
+  guard.unlock();
+  request_receiver_prewarm_idle_stop();
 }
 
 Preserve_trx_transfer_receiver_registry::
@@ -16278,6 +16355,7 @@ preserve_trx_transfer_apply_receiver_frame_internal(
             status = Preserve_trx_transfer_status::OK;
           }
         }
+        request_receiver_prewarm_idle_stop();
         return Preserve_trx_transfer_status::OK;
       }
       break;

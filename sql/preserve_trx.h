@@ -710,6 +710,7 @@ bool preserved_trx_adopt_ready_bundle_for_promotion(
     uint64_t deadline_us = 0);
 bool preserved_trx_start_expired_reaper();
 void preserved_trx_start_expired_reaper_if_ready();
+void preserved_trx_request_expired_reaper_scan();
 void preserved_trx_stop_expired_reaper();
 bool preserved_trx_start_expired_reaper_for_unit_test(bool fail_thread_init);
 bool preserved_trx_expired_reaper_started_for_unit_test();

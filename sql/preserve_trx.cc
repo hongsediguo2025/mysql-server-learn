@@ -1163,6 +1163,7 @@ bool g_preserved_trx_reaper_started = false;
 bool g_preserved_trx_reaper_starting = false;
 bool g_preserved_trx_reaper_stopping = false;
 bool g_preserved_trx_reaper_stop = false;
+bool g_preserved_trx_reaper_scan_requested = false;
 bool g_preserved_trx_reaper_init_reported = false;
 bool g_preserved_trx_reaper_init_failed = false;
 bool g_preserved_trx_reaper_pause_init_report_for_unit_test = false;
@@ -12048,12 +12049,24 @@ static void preserved_trx_expired_reaper_thread() {
 
   std::unique_lock<std::mutex> lock(g_preserved_trx_reaper_mutex);
   while (!g_preserved_trx_reaper_stop) {
-    g_preserved_trx_reaper_cond.wait_for(lock, std::chrono::seconds(1));
+    g_preserved_trx_reaper_cond.wait_for(lock, std::chrono::seconds(1), [] {
+      return g_preserved_trx_reaper_stop ||
+             g_preserved_trx_reaper_scan_requested;
+    });
     if (g_preserved_trx_reaper_stop) break;
+    g_preserved_trx_reaper_scan_requested = false;
     lock.unlock();
     preserved_trx_expired_reaper_scan_once();
     lock.lock();
   }
+}
+
+void preserved_trx_request_expired_reaper_scan() {
+  {
+    std::lock_guard<std::mutex> lock(g_preserved_trx_reaper_mutex);
+    g_preserved_trx_reaper_scan_requested = true;
+  }
+  g_preserved_trx_reaper_cond.notify_one();
 }
 
 bool preserved_trx_start_expired_reaper() {
@@ -12115,7 +12128,10 @@ void preserved_trx_stop_expired_reaper() {
       return !g_preserved_trx_reaper_starting &&
              !g_preserved_trx_reaper_stopping;
     });
-    if (!g_preserved_trx_reaper_started) return;
+    if (!g_preserved_trx_reaper_started) {
+      g_preserved_trx_reaper_scan_requested = false;
+      return;
+    }
     g_preserved_trx_reaper_stopping = true;
     g_preserved_trx_reaper_stop = true;
     reaper = std::move(g_preserved_trx_reaper_thread);
@@ -12126,6 +12142,7 @@ void preserved_trx_stop_expired_reaper() {
   {
     std::lock_guard<std::mutex> lock(g_preserved_trx_reaper_mutex);
     g_preserved_trx_reaper_stop = false;
+    g_preserved_trx_reaper_scan_requested = false;
     g_preserved_trx_reaper_stopping = false;
   }
   g_preserved_trx_reaper_cond.notify_all();

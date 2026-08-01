@@ -1,0 +1,12 @@
+generation	outcome	source_connection_id	token_role	reason	closing_started_us	closing_deadline_us
+GENERATION	SUCCESS	SOURCE_ID	SURVIVOR	NONE	CLOSING_STARTED_US	CLOSING_DEADLINE_US
+epoch_retained
+1
+workers_stopped
+1
+workers_restarted
+1
+workers_restopped
+1
+two_epochs_retained
+1
