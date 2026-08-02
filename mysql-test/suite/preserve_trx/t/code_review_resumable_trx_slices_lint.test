@@ -363,7 +363,7 @@ die "receiver native binlog preparation must stream from the sealed staging file
 die "receiver native binlog path must not use the test-only capability factory\n"
   if $transfer =~ /preserved_trx_make_binlog_capability_for_unit_test/s;
 $transfer =~
-  /bool\s+prepare_strict_bundle_for_receiver\s*\([\s\S]*?(?=\nstd::string\s+strict_empty_set_digest)/m
+  /Receiver_staged_token_prewarm_result\s+prepare_strict_bundle_for_receiver\s*\([\s\S]*?(?=\nstd::string\s+strict_empty_set_digest)/m
   or die "could not isolate prepare_strict_bundle_for_receiver\n";
 my $strict_receiver_prepare = $&;
 die "strict receiver resources must support lock plan and native binlog handle together\n"
@@ -377,7 +377,7 @@ die "standby receiver frame apply path must not synchronously prewarm staged or 
   if $receiver_apply_frame =~ /preserved_trx_promotion_prewarm_staged_bundle_for_receiver/s ||
      $receiver_apply_frame =~ /note_receiver_sync_prewarm_wait/s;
 my ($receiver_staged_prewarm_job) =
-  $transfer =~ /(Preserve_trx_promotion_adopt_status run_receiver_staged_token_prewarm_job\([\s\S]*?^}\n\nstatic (?:void|bool) run_receiver_object_prewarm_job)/m
+  $transfer =~ /(Receiver_staged_token_prewarm_result run_receiver_staged_token_prewarm_job\([\s\S]*?^}\n\nstatic (?:void|bool) run_receiver_object_prewarm_job)/m
   or die "could not isolate standby receiver staged-token prewarm job\n";
 die "online standby receiver staged-token READY must not publish local carrier projection\n"
   if $receiver_staged_prewarm_job =~ /publish_receiver_standby_bundle_projection/s;
@@ -496,9 +496,29 @@ die "standby phase1 sender must snapshot batch, chunk, and inflight limits into 
   unless $preserve =~ /Preserve_trx_transfer_source_epoch_options[\s\S]*chunk_bytes[\s\S]*max_inflight_bytes[\s\S]*phase1_batch_bytes/s;
 die "standby phase1 sender thread must initialize and release MySQL thread state\n"
   unless $transfer =~ /Preserve_trx_transfer_phase1_batch_sender::Impl[\s\S]*my_thread_init\s*\(\s*\)[\s\S]*my_thread_end\s*\(\s*\)/s;
-die "receiver staged-token prewarm must preserve a retry requested while the token job is still inflight\n"
+die "receiver staged-token prewarm must classify recoverable and terminal outcomes\n"
   unless $transfer =~
-         /g_receiver_staged_token_prewarm_deferred[\s\S]*finish_receiver_staged_token_prewarm_job[\s\S]*g_receiver_prewarm_jobs\.push_back\s*\(\s*job\s*\)/s;
+         /enum class Receiver_staged_token_prewarm_outcome[\s\S]*WAIT_DEPENDENCY[\s\S]*RETRYABLE_NOT_READY[\s\S]*TERMINAL_TOKEN_FAILURE[\s\S]*GLOBAL_FAILURE[\s\S]*EXPIRED/s;
+my ($receiver_staged_finish) =
+  $transfer =~ /(void finish_receiver_staged_token_prewarm_job[\s\S]*?^})/m
+  or die "could not isolate receiver staged-token completion helper\n";
+die "recoverable staged-token prewarm must return to the staged queue\n"
+  unless $receiver_staged_finish =~
+         /WAIT_DEPENDENCY[\s\S]*RETRYABLE_NOT_READY[\s\S]*g_receiver_staged_token_prewarm_jobs\.push_back/s;
+die "staged-token retry must not bypass dependency gating through the object queue\n"
+  if $receiver_staged_finish =~ /g_receiver_prewarm_jobs\.push_back/s;
+die "receiver token-local failure injection state must be compiled only with DBUG\n"
+  unless $transfer =~
+         /#ifndef DBUG_OFF\s+bool debug_failure_injected\{false\};\s+bool debug_retry_injected\{false\};\s+#endif/s;
+die "receiver partial selection must use O(1) classified and failed token counters\n"
+  unless $transfer =~ /classified_fact_token_count/s &&
+         $transfer =~ /failed_fact_token_count/s;
+my ($receiver_staged_token_prewarm) =
+  $transfer =~ /(Receiver_staged_token_prewarm_result run_receiver_staged_token_prewarm_job[\s\S]*?^})/m
+  or die "could not isolate receiver staged-token prewarm helper\n";
+die "receiver staged-token prewarm must gate full epoch selection behind an O(1) completion result\n"
+  unless $receiver_staged_token_prewarm =~
+         /selection_complete_with_failures[\s\S]*if\s*\(\s*selection_complete_with_failures\s*\)[\s\S]*publish_receiver_epoch_selection_if_possible/s;
 die "standby phase1 control frames must use batch source-session APIs\n"
   unless $preserve =~ /declare_tokens_batch/s &&
          $preserve =~ /begin_token_prewarm_manifests_batch/s;

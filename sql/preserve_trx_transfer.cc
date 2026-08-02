@@ -214,20 +214,24 @@ static std::atomic<uint64_t> g_receiver_final_spool_ack_monotonic_us{0};
 static std::atomic<uint64_t> g_receiver_ready_after_final_spool_ack_us{0};
 static std::atomic<uint64_t> g_receiver_object_prewarm_start_monotonic_us{0};
 static std::atomic<uint64_t> g_receiver_prewarm_backlog_at_phase2_end{0};
-static std::mutex g_receiver_seal_prewarm_state_mutex;
-static std::map<std::pair<std::string, uint64_t>,
-                Preserve_trx_promotion_adopt_status>
-    g_receiver_seal_prewarm_state;
 struct Receiver_epoch_ready_state {
   std::set<uint64_t> fact_tokens;
-  std::set<uint64_t> ready_tokens;
+  std::map<uint64_t, Preserve_trx_receiver_failure_reason> token_results;
   std::map<uint64_t, size_t> fact_token_indexes;
   std::shared_ptr<const Preserve_trx_transfer_epoch_fact> fact;
   size_t ready_fact_token_count{0};
+  size_t classified_fact_token_count{0};
+  size_t failed_fact_token_count{0};
   uint64_t fact_loaded_monotonic_us{0};
   bool fact_loaded{false};
   bool binding{false};
   bool bound{false};
+  bool selection_published{false};
+  bool global_failure{false};
+#ifndef DBUG_OFF
+  bool debug_failure_injected{false};
+  bool debug_retry_injected{false};
+#endif
   uint64_t binding_generation{0};
 };
 static std::mutex g_receiver_ready_epoch_mutex;
@@ -1436,6 +1440,8 @@ preserve_trx_transfer_artifact_decision_for_request(
 void purge_receiver_epoch_derived_state(const std::string &root_dir,
                                         const std::string &epoch_id,
                                         const std::string &source_uuid);
+void purge_receiver_epoch_prewarm_queues(const std::string &root_dir,
+                                         const std::string &epoch_id);
 
 namespace {
 
@@ -4715,7 +4721,87 @@ bool resurrection_index_matches_receiver_bundle(
   return true;
 }
 
-bool prepare_strict_bundle_for_receiver(
+enum class Receiver_staged_token_prewarm_outcome {
+  READY,
+  WAIT_DEPENDENCY,
+  RETRYABLE_NOT_READY,
+  TERMINAL_TOKEN_FAILURE,
+  GLOBAL_FAILURE,
+  EXPIRED
+};
+
+enum class Receiver_staged_token_prewarm_stage {
+  NONE,
+  READY_CACHE_RECORD_LOCK_PROOF,
+  READY_CACHE_BUNDLE,
+  STRICT_BINLOG_PREPARED,
+  STRICT_RECORD_LOCK_PREPARED,
+  STRICT_REGISTRY_BEGIN_PREPARE,
+  DEBUG_RETRYABLE_NOT_READY
+};
+
+const char *receiver_staged_token_prewarm_outcome_name(
+    Receiver_staged_token_prewarm_outcome outcome) {
+  switch (outcome) {
+    case Receiver_staged_token_prewarm_outcome::READY:
+      return "READY";
+    case Receiver_staged_token_prewarm_outcome::WAIT_DEPENDENCY:
+      return "WAIT_DEPENDENCY";
+    case Receiver_staged_token_prewarm_outcome::RETRYABLE_NOT_READY:
+      return "RETRYABLE_NOT_READY";
+    case Receiver_staged_token_prewarm_outcome::TERMINAL_TOKEN_FAILURE:
+      return "TERMINAL_TOKEN_FAILURE";
+    case Receiver_staged_token_prewarm_outcome::GLOBAL_FAILURE:
+      return "GLOBAL_FAILURE";
+    case Receiver_staged_token_prewarm_outcome::EXPIRED:
+      return "EXPIRED";
+  }
+  return "UNKNOWN";
+}
+
+const char *receiver_staged_token_prewarm_stage_name(
+    Receiver_staged_token_prewarm_stage stage) {
+  switch (stage) {
+    case Receiver_staged_token_prewarm_stage::NONE:
+      return "NONE";
+    case Receiver_staged_token_prewarm_stage::READY_CACHE_RECORD_LOCK_PROOF:
+      return "READY_CACHE_RECORD_LOCK_PROOF";
+    case Receiver_staged_token_prewarm_stage::READY_CACHE_BUNDLE:
+      return "READY_CACHE_BUNDLE";
+    case Receiver_staged_token_prewarm_stage::STRICT_BINLOG_PREPARED:
+      return "STRICT_BINLOG_PREPARED";
+    case Receiver_staged_token_prewarm_stage::STRICT_RECORD_LOCK_PREPARED:
+      return "STRICT_RECORD_LOCK_PREPARED";
+    case Receiver_staged_token_prewarm_stage::STRICT_REGISTRY_BEGIN_PREPARE:
+      return "STRICT_REGISTRY_BEGIN_PREPARE";
+    case Receiver_staged_token_prewarm_stage::DEBUG_RETRYABLE_NOT_READY:
+      return "DEBUG_RETRYABLE_NOT_READY";
+  }
+  return "UNKNOWN";
+}
+
+struct Receiver_staged_token_prewarm_result {
+  Receiver_staged_token_prewarm_outcome outcome{
+      Receiver_staged_token_prewarm_outcome::GLOBAL_FAILURE};
+  Preserve_trx_promotion_adopt_status status{
+      Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT};
+  Preserve_trx_receiver_failure_reason failure_reason{
+      Preserve_trx_receiver_failure_reason::NONE};
+  Receiver_staged_token_prewarm_stage stage{
+      Receiver_staged_token_prewarm_stage::NONE};
+};
+
+Receiver_staged_token_prewarm_result receiver_staged_token_result(
+    Receiver_staged_token_prewarm_outcome outcome,
+    Preserve_trx_promotion_adopt_status status,
+    Preserve_trx_receiver_failure_reason failure_reason =
+        Preserve_trx_receiver_failure_reason::NONE,
+    Receiver_staged_token_prewarm_stage stage =
+        Receiver_staged_token_prewarm_stage::NONE) {
+  return {outcome, status, failure_reason, stage};
+}
+
+Receiver_staged_token_prewarm_result prepare_strict_bundle_for_receiver(
     const std::string &root_dir,
     const Preserve_trx_transfer_manifest &manifest,
     Preserved_trx_bundle &&bundle,
@@ -4723,13 +4809,19 @@ bool prepare_strict_bundle_for_receiver(
   if (preserve_trx_transfer_validate_strict_eligibility(
           manifest, bundle.metadata, false, false, 1) !=
       Preserve_trx_transfer_strict_eligibility_status::OK) {
-    return false;
+    return receiver_staged_token_result(
+        Receiver_staged_token_prewarm_outcome::TERMINAL_TOKEN_FAILURE,
+        Preserve_trx_promotion_adopt_status::UNSUPPORTED_ARTIFACT,
+        Preserve_trx_receiver_failure_reason::UNSUPPORTED_TOKEN_SEMANTICS);
   }
   Preserve_trx_resurrection_index_entry resurrection_entry;
   if (!resurrection_index_matches_receiver_bundle(root_dir, manifest, bundle,
                                                   receiver_registry,
                                                   &resurrection_entry)) {
-    return false;
+    return receiver_staged_token_result(
+        Receiver_staged_token_prewarm_outcome::TERMINAL_TOKEN_FAILURE,
+        Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT,
+        Preserve_trx_receiver_failure_reason::UNSUPPORTED_TOKEN_SEMANTICS);
   }
   const bool has_record_locks =
       find_object(manifest, kPreservedTrxBlobRecordLocks) != nullptr;
@@ -4738,7 +4830,12 @@ bool prepare_strict_bundle_for_receiver(
   const bool has_binlog_cache =
       bundle.metadata.binlog_state ==
       Preserve_snapshot_binlog_state::LOGGED_WITH_CACHE;
-  if (has_binlog_cache != (binlog_object != nullptr)) return false;
+  if (has_binlog_cache != (binlog_object != nullptr)) {
+    return receiver_staged_token_result(
+        Receiver_staged_token_prewarm_outcome::TERMINAL_TOKEN_FAILURE,
+        Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT,
+        Preserve_trx_receiver_failure_reason::UNSUPPORTED_TOKEN_SEMANTICS);
+  }
 
   Receiver_record_lock_prepared prepared;
   uint64_t plan_capacity_bytes = 0;
@@ -4746,12 +4843,17 @@ bool prepare_strict_bundle_for_receiver(
   Preserve_trx_prepared_token_key key;
   if (!strict_prepared_key_for_receiver(root_dir, manifest,
                                         bundle.metadata.token, &key)) {
-    return false;
+    return receiver_staged_token_result(
+        Receiver_staged_token_prewarm_outcome::TERMINAL_TOKEN_FAILURE,
+        Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT,
+        Preserve_trx_receiver_failure_reason::UNSUPPORTED_TOKEN_SEMANTICS);
   }
   std::string encoded_manifest;
   if (preserve_trx_transfer_encode_manifest(manifest, &encoded_manifest) !=
       Preserve_trx_transfer_status::OK) {
-    return false;
+    return receiver_staged_token_result(
+        Receiver_staged_token_prewarm_outcome::GLOBAL_FAILURE,
+        Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT);
   }
   const std::string object_set_digest =
       digest_hex(sha256_digest(encoded_manifest));
@@ -4764,7 +4866,9 @@ bool prepare_strict_bundle_for_receiver(
        existing.state ==
            Preserve_trx_prepared_token_state::READY_FACTS_PENDING_LEASE ||
        existing.state == Preserve_trx_prepared_token_state::READY_FOR_GATE)) {
-    return true;
+    return receiver_staged_token_result(
+        Receiver_staged_token_prewarm_outcome::READY,
+        Preserve_trx_promotion_adopt_status::OK);
   }
 
   Mysql_binlog_preserve_cache_facts binlog_facts;
@@ -4790,7 +4894,10 @@ bool prepare_strict_bundle_for_receiver(
     if (!preserved_trx_build_native_binlog_cache_facts(
             bundle.metadata, identity, descriptor, binlog_incarnation,
             key.generation, &binlog_facts)) {
-      return false;
+      return receiver_staged_token_result(
+          Receiver_staged_token_prewarm_outcome::TERMINAL_TOKEN_FAILURE,
+          Preserve_trx_promotion_adopt_status::UNSUPPORTED_ARTIFACT,
+          Preserve_trx_receiver_failure_reason::UNSUPPORTED_TOKEN_SEMANTICS);
     }
     native_binlog_bytes =
         mysql_binlog_preserve_native_memory_bytes_required(binlog_facts);
@@ -4798,25 +4905,51 @@ bool prepare_strict_bundle_for_receiver(
         mysql_binlog_preserve_native_fd_count_required(binlog_facts);
     native_binlog_tmpdir_bytes =
         mysql_binlog_preserve_native_tmpdir_bytes_required(binlog_facts);
-    if (native_binlog_bytes == 0) return false;
+    if (native_binlog_bytes == 0) {
+      return receiver_staged_token_result(
+          Receiver_staged_token_prewarm_outcome::TERMINAL_TOKEN_FAILURE,
+          Preserve_trx_promotion_adopt_status::UNSUPPORTED_ARTIFACT,
+          Preserve_trx_receiver_failure_reason::UNSUPPORTED_TOKEN_SEMANTICS);
+    }
     const Receiver_binlog_take_status prepared_status =
         take_receiver_binlog_prepared(root_dir, manifest, key, *binlog_object,
                                       binlog_facts, &resources);
-    if (prepared_status == Receiver_binlog_take_status::PENDING) return false;
+    if (prepared_status == Receiver_binlog_take_status::PENDING) {
+      return receiver_staged_token_result(
+          Receiver_staged_token_prewarm_outcome::WAIT_DEPENDENCY,
+          Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY,
+          Preserve_trx_receiver_failure_reason::NONE,
+          Receiver_staged_token_prewarm_stage::STRICT_BINLOG_PREPARED);
+    }
+    if (prepared_status == Receiver_binlog_take_status::MISMATCH) {
+      return receiver_staged_token_result(
+          Receiver_staged_token_prewarm_outcome::TERMINAL_TOKEN_FAILURE,
+          Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT,
+          Preserve_trx_receiver_failure_reason::UNSUPPORTED_TOKEN_SEMANTICS);
+    }
     native_binlog_prepared =
         prepared_status == Receiver_binlog_take_status::READY;
     if (!native_binlog_prepared) {
       binlog_reader = std::make_unique<Receiver_binlog_staging_payload_reader>(
           transfer_object_path(root_dir, manifest, *binlog_object),
           binlog_object->total_size);
-      if (!binlog_reader->opened()) return false;
+      if (!binlog_reader->opened()) {
+        return receiver_staged_token_result(
+            Receiver_staged_token_prewarm_outcome::TERMINAL_TOKEN_FAILURE,
+            Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT,
+            Preserve_trx_receiver_failure_reason::UNSUPPORTED_TOKEN_SEMANTICS);
+      }
     }
   }
 
   if (has_record_locks &&
       (!take_receiver_record_lock_prepared(root_dir, manifest, &prepared) ||
        prepared.plan == nullptr || !prepared.plan->ready())) {
-    return false;
+    return receiver_staged_token_result(
+        Receiver_staged_token_prewarm_outcome::WAIT_DEPENDENCY,
+        Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY,
+        Preserve_trx_receiver_failure_reason::NONE,
+        Receiver_staged_token_prewarm_stage::STRICT_RECORD_LOCK_PREPARED);
   }
   plan_capacity_bytes =
       prepared.plan == nullptr ? 0 : prepared.plan->capacity_bytes();
@@ -4830,9 +4963,19 @@ bool prepare_strict_bundle_for_receiver(
 
   auto &registry = preserved_trx_strict_prepared_token_registry();
   Preserve_trx_prepare_lease prepare;
-  if (registry.begin_prepare(key, key.generation, &prepare) !=
-      Preserve_trx_prepared_status::OK) {
-    return false;
+  const Preserve_trx_prepared_status begin_status =
+      registry.begin_prepare(key, key.generation, &prepare);
+  if (begin_status != Preserve_trx_prepared_status::OK) {
+    if (begin_status == Preserve_trx_prepared_status::ALREADY_CLAIMED) {
+      return receiver_staged_token_result(
+          Receiver_staged_token_prewarm_outcome::RETRYABLE_NOT_READY,
+          Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY,
+          Preserve_trx_receiver_failure_reason::NONE,
+          Receiver_staged_token_prewarm_stage::STRICT_REGISTRY_BEGIN_PREPARE);
+    }
+    return receiver_staged_token_result(
+        Receiver_staged_token_prewarm_outcome::GLOBAL_FAILURE,
+        Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT);
   }
   auto semantic_bundle =
       std::make_unique<Preserved_trx_bundle>(std::move(bundle));
@@ -4842,28 +4985,44 @@ bool prepare_strict_bundle_for_receiver(
   const uint64_t lock_plan_bytes_to_acquire =
       prepared.memory_lease.acquired() ? 0 : plan_capacity_bytes;
   if (!native_binlog_prepared) {
-    if (preserved_trx_acquire_prepared_token_resources(
+    const Preserve_trx_prepared_status acquire_status =
+        preserved_trx_acquire_prepared_token_resources(
             key, lock_plan_bytes_to_acquire, native_binlog_bytes,
-            native_binlog_fd_count, native_binlog_tmpdir_bytes, &resources) !=
-        Preserve_trx_prepared_status::OK) {
-      return false;
+            native_binlog_fd_count, native_binlog_tmpdir_bytes, &resources);
+    if (acquire_status != Preserve_trx_prepared_status::OK) {
+      if (acquire_status == Preserve_trx_prepared_status::RESOURCE_EXHAUSTED) {
+        return receiver_staged_token_result(
+            Receiver_staged_token_prewarm_outcome::TERMINAL_TOKEN_FAILURE,
+            Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY,
+            Preserve_trx_receiver_failure_reason::TOKEN_RESOURCE_LIMIT);
+      }
+      return receiver_staged_token_result(
+          Receiver_staged_token_prewarm_outcome::GLOBAL_FAILURE,
+          Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT);
     }
     if (binlog_reader != nullptr &&
         resources.prepare_native_binlog_handle_for_receiver(
             binlog_facts, binlog_reader.get()) !=
             Mysql_binlog_preserve_cache_status::OK) {
-      return false;
+      return receiver_staged_token_result(
+          Receiver_staged_token_prewarm_outcome::TERMINAL_TOKEN_FAILURE,
+          Preserve_trx_promotion_adopt_status::UNSUPPORTED_ARTIFACT,
+          Preserve_trx_receiver_failure_reason::UNSUPPORTED_TOKEN_SEMANTICS);
     }
   }
   if (resources.install_semantic_bundle(std::move(semantic_bundle)) !=
       Preserve_trx_prepared_status::OK) {
-    return false;
+    return receiver_staged_token_result(
+        Receiver_staged_token_prewarm_outcome::GLOBAL_FAILURE,
+        Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT);
   }
   if (resources.install_resurrection_entry(
           std::make_unique<Preserve_trx_resurrection_index_entry>(
               std::move(resurrection_entry))) !=
       Preserve_trx_prepared_status::OK) {
-    return false;
+    return receiver_staged_token_result(
+        Receiver_staged_token_prewarm_outcome::GLOBAL_FAILURE,
+        Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT);
   }
   if (prepared.plan != nullptr) {
     const Preserve_trx_prepared_status install_status =
@@ -4872,16 +5031,24 @@ bool prepare_strict_bundle_for_receiver(
                   std::move(prepared.plan),
                   std::move(prepared.memory_lease))
             : resources.install_record_lock_plan(std::move(prepared.plan));
-    if (install_status != Preserve_trx_prepared_status::OK) return false;
+    if (install_status != Preserve_trx_prepared_status::OK) {
+      return receiver_staged_token_result(
+          Receiver_staged_token_prewarm_outcome::GLOBAL_FAILURE,
+          Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT);
+    }
   }
   if (!resources.acquired()) {
-    return false;
+    return receiver_staged_token_result(
+        Receiver_staged_token_prewarm_outcome::GLOBAL_FAILURE,
+        Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT);
   }
   const auto status = registry.publish_prewarmed(
       &prepare, object_set_digest, std::move(resources));
   if (status != Preserve_trx_prepared_status::OK &&
       status != Preserve_trx_prepared_status::IDEMPOTENT) {
-    return false;
+    return receiver_staged_token_result(
+        Receiver_staged_token_prewarm_outcome::GLOBAL_FAILURE,
+        Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT);
   }
   if (has_record_locks) {
     preserved_trx_promotion_prepared_note_lock_plan_metrics(
@@ -4911,7 +5078,9 @@ bool prepare_strict_bundle_for_receiver(
     g_receiver_strict_binlog_facts[{root_dir, manifest.epoch_id,
                                     manifest.token}] = std::move(pending);
   }
-  return true;
+  return receiver_staged_token_result(
+      Receiver_staged_token_prewarm_outcome::READY,
+      Preserve_trx_promotion_adopt_status::OK);
 }
 
 std::string strict_empty_set_digest(const char *domain) {
@@ -5139,9 +5308,15 @@ void cache_receiver_epoch_fact(
     state.fact_token_indexes.emplace(token, index);
   }
   state.ready_fact_token_count = 0;
-  for (uint64_t ready_token : state.ready_tokens) {
-    if (state.fact_tokens.count(ready_token) != 0) {
+  state.classified_fact_token_count = 0;
+  state.failed_fact_token_count = 0;
+  for (const auto &result : state.token_results) {
+    if (state.fact_tokens.count(result.first) == 0) continue;
+    ++state.classified_fact_token_count;
+    if (result.second == Preserve_trx_receiver_failure_reason::NONE) {
       ++state.ready_fact_token_count;
+    } else {
+      ++state.failed_fact_token_count;
     }
   }
   state.fact = std::move(fact);
@@ -5353,20 +5528,116 @@ void note_receiver_seal_prewarm_status(
   }
 }
 
-void note_receiver_seal_prewarm_token_status(
-    const std::string &epoch_id, uint64_t token,
-    Preserve_trx_promotion_adopt_status status) {
-  std::lock_guard<std::mutex> guard(g_receiver_seal_prewarm_state_mutex);
-  g_receiver_seal_prewarm_state[std::make_pair(epoch_id, token)] = status;
+bool note_receiver_epoch_token_result(
+    const std::string &root_dir, const std::string &epoch_id, uint64_t token,
+    Preserve_trx_receiver_failure_reason reason) {
+  std::lock_guard<std::mutex> guard(g_receiver_ready_epoch_mutex);
+  Receiver_epoch_ready_state &state =
+      g_receiver_ready_epoch_state[{root_dir, epoch_id}];
+  if (state.selection_published || state.binding) {
+    return false;
+  }
+  const auto existing = state.token_results.find(token);
+  if (existing != state.token_results.end() && existing->second != reason) {
+    state.global_failure = true;
+    return false;
+  }
+  const bool inserted = existing == state.token_results.end();
+  const bool is_ready = reason == Preserve_trx_receiver_failure_reason::NONE;
+  state.token_results[token] = reason;
+  if (inserted && state.fact_loaded && state.fact_tokens.count(token) != 0) {
+    ++state.classified_fact_token_count;
+    if (is_ready) {
+      ++state.ready_fact_token_count;
+    } else {
+      ++state.failed_fact_token_count;
+    }
+  }
+  return state.fact_loaded && !state.global_failure &&
+         state.classified_fact_token_count == state.fact_tokens.size() &&
+         state.failed_fact_token_count != 0;
 }
 
-bool receiver_seal_prewarm_token_ok(const std::string &epoch_id,
+void note_receiver_epoch_global_failure(const std::string &root_dir,
+                                        const std::string &epoch_id) {
+  std::lock_guard<std::mutex> guard(g_receiver_ready_epoch_mutex);
+  Receiver_epoch_ready_state &state =
+      g_receiver_ready_epoch_state[{root_dir, epoch_id}];
+  state.global_failure = true;
+}
+
+bool consume_receiver_token_local_failure_injection(
+    const std::string &root_dir, const std::string &epoch_id) {
+#ifdef DBUG_OFF
+  (void)root_dir;
+  (void)epoch_id;
+  return false;
+#else
+  bool inject = false;
+  const auto key = std::make_pair(root_dir, epoch_id);
+  DBUG_EXECUTE_IF("preserve_trx_receiver_fail_one_token_prewarm", {
+    std::lock_guard<std::mutex> guard(g_receiver_ready_epoch_mutex);
+    Receiver_epoch_ready_state &state = g_receiver_ready_epoch_state[key];
+    if (!state.selection_published && !state.debug_failure_injected) {
+      state.debug_failure_injected = true;
+      inject = true;
+    }
+  });
+  return inject;
+#endif
+}
+
+bool consume_receiver_token_retryable_not_ready_injection(
+    const std::string &root_dir, const std::string &epoch_id) {
+#ifdef DBUG_OFF
+  (void)root_dir;
+  (void)epoch_id;
+  return false;
+#else
+  bool inject = false;
+  const auto key = std::make_pair(root_dir, epoch_id);
+  DBUG_EXECUTE_IF("preserve_trx_receiver_retry_one_token_prewarm", {
+    std::lock_guard<std::mutex> guard(g_receiver_ready_epoch_mutex);
+    Receiver_epoch_ready_state &state = g_receiver_ready_epoch_state[key];
+    if (!state.selection_published && !state.debug_retry_injected) {
+      state.debug_retry_injected = true;
+      inject = true;
+    }
+  });
+  return inject;
+#endif
+}
+
+bool receiver_epoch_selection_complete_with_failures(
+    const std::string &root_dir, const std::string &epoch_id) {
+  std::lock_guard<std::mutex> guard(g_receiver_ready_epoch_mutex);
+  const auto found = g_receiver_ready_epoch_state.find({root_dir, epoch_id});
+  if (found == g_receiver_ready_epoch_state.end()) return false;
+  const Receiver_epoch_ready_state &state = found->second;
+  return state.fact_loaded && !state.global_failure && !state.binding &&
+         !state.selection_published &&
+         state.classified_fact_token_count == state.fact_tokens.size() &&
+         state.failed_fact_token_count != 0;
+}
+
+bool receiver_epoch_token_result_known(const std::string &root_dir,
+                                       const std::string &epoch_id,
+                                       uint64_t token) {
+  std::lock_guard<std::mutex> guard(g_receiver_ready_epoch_mutex);
+  const auto epoch = g_receiver_ready_epoch_state.find({root_dir, epoch_id});
+  return epoch != g_receiver_ready_epoch_state.end() &&
+         epoch->second.token_results.count(token) != 0;
+}
+
+bool receiver_seal_prewarm_token_ok(const std::string &root_dir,
+                                    const std::string &epoch_id,
                                     uint64_t token) {
-  std::lock_guard<std::mutex> guard(g_receiver_seal_prewarm_state_mutex);
-  const auto found = g_receiver_seal_prewarm_state.find(
-      std::make_pair(epoch_id, token));
-  return found != g_receiver_seal_prewarm_state.end() &&
-         found->second == Preserve_trx_promotion_adopt_status::OK;
+  std::lock_guard<std::mutex> guard(g_receiver_ready_epoch_mutex);
+  const auto epoch = g_receiver_ready_epoch_state.find({root_dir, epoch_id});
+  if (epoch == g_receiver_ready_epoch_state.end()) return false;
+  const auto result = epoch->second.token_results.find(token);
+  return result != epoch->second.token_results.end() &&
+         result->second == Preserve_trx_receiver_failure_reason::NONE;
 }
 
 bool receiver_strict_token_ready(
@@ -5425,26 +5696,14 @@ bool synchronize_receiver_epoch_ready_deadline(
   if (accepted.lifecycle == Preserve_trx_transfer_epoch_lifecycle::READY) {
     return true;
   }
-  return registry->mark_accepted_epoch_ready(
-             root_dir, fact.epoch_id, now_us, ready_deadline_us) ==
+  return registry->mark_accepted_epoch_ready(root_dir, fact.epoch_id, now_us,
+                                             ready_deadline_us) ==
          Preserve_trx_transfer_status::OK;
 }
 
 bool publish_receiver_epoch_ready_from_fact_if_possible(
     const std::string &root_dir, const std::string &epoch_id,
     Preserve_trx_transfer_receiver_registry *registry);
-
-void note_receiver_epoch_token_ready(const std::string &root_dir,
-                                     const std::string &epoch_id,
-                                     uint64_t token) {
-  std::lock_guard<std::mutex> guard(g_receiver_ready_epoch_mutex);
-  Receiver_epoch_ready_state &state =
-      g_receiver_ready_epoch_state[{root_dir, epoch_id}];
-  const bool inserted = state.ready_tokens.insert(token).second;
-  if (inserted && state.fact_loaded && state.fact_tokens.count(token) != 0) {
-    ++state.ready_fact_token_count;
-  }
-}
 
 bool publish_receiver_epoch_ready_from_seal_prewarm(
     const std::string &root_dir,
@@ -5477,7 +5736,9 @@ bool publish_receiver_epoch_ready_from_fact_if_possible_impl(
       already_bound = true;
       fact = state.fact;
     }
-    if (state.binding) return false;
+    if (state.binding || state.selection_published) {
+      return false;
+    }
     if (!already_bound && state.fact_loaded) {
       if (state.fact == nullptr ||
           state.ready_fact_token_count != state.fact_tokens.size()) {
@@ -5513,7 +5774,9 @@ bool publish_receiver_epoch_ready_from_fact_if_possible_impl(
       already_bound = true;
       fact = state.fact;
     }
-    if (state.binding) return false;
+    if (state.binding || state.selection_published) {
+      return false;
+    }
     if (!already_bound &&
         (state.fact == nullptr ||
          state.ready_fact_token_count != state.fact_tokens.size())) {
@@ -5583,6 +5846,7 @@ bool publish_receiver_epoch_ready_from_fact_if_possible_impl(
     state.binding = false;
     if (state.bound) return true;
     state.bound = true;
+    state.selection_published = true;
   }
   binding_guard.commit();
   const uint64_t total_tokens = tokens.size();
@@ -5608,6 +5872,133 @@ bool publish_receiver_epoch_ready_from_fact_if_possible(
   } catch (...) {
     return false;
   }
+}
+
+bool publish_receiver_epoch_selection_if_possible(
+    const std::string &root_dir, const std::string &epoch_id,
+    Preserve_trx_transfer_receiver_registry *registry, uint64_t now_us,
+    bool deadline_reached) {
+  if (registry == nullptr) return false;
+
+  Preserve_trx_transfer_accepted_epoch accepted;
+  if (registry->query_accepted_epoch(root_dir, epoch_id, &accepted) !=
+          Preserve_trx_transfer_status::COMMITTED_NOT_READY ||
+      accepted.fact == nullptr || accepted.selection_published ||
+      accepted.lifecycle !=
+          Preserve_trx_transfer_epoch_lifecycle::PREWARMING ||
+      accepted.receiver_process_generation != receiver_boot_incarnation() ||
+      accepted.fact_digest != accepted.fact->fact_digest) {
+    return false;
+  }
+  deadline_reached = deadline_reached ||
+                     accepted.deadline_monotonic_us <= now_us;
+
+  std::vector<uint64_t> ready_tokens;
+  std::vector<Preserve_trx_receiver_failed_token> failed_tokens;
+  uint64_t classification_generation = 0;
+  {
+    std::lock_guard<std::mutex> guard(g_receiver_ready_epoch_mutex);
+    const auto found =
+        g_receiver_ready_epoch_state.find({root_dir, epoch_id});
+    if (found == g_receiver_ready_epoch_state.end() ||
+        !found->second.fact_loaded || found->second.fact == nullptr ||
+        found->second.fact_tokens.size() != accepted.tokens.size() ||
+        !std::equal(found->second.fact_tokens.begin(),
+                    found->second.fact_tokens.end(), accepted.tokens.begin()) ||
+        found->second.global_failure || found->second.binding ||
+        found->second.selection_published) {
+      return false;
+    }
+
+    try {
+      ready_tokens.reserve(accepted.tokens.size());
+      failed_tokens.reserve(accepted.tokens.size());
+      for (uint64_t token : accepted.tokens) {
+        const auto result = found->second.token_results.find(token);
+        if (result == found->second.token_results.end()) {
+          if (!deadline_reached) return false;
+          failed_tokens.push_back(
+              {token, Preserve_trx_receiver_failure_reason::PREWARM_DEADLINE});
+          continue;
+        }
+        if (result->second == Preserve_trx_receiver_failure_reason::NONE) {
+          ready_tokens.push_back(token);
+        } else {
+          failed_tokens.push_back({token, result->second});
+        }
+      }
+    } catch (const std::bad_alloc &) {
+      return false;
+    }
+    if (failed_tokens.empty()) return false;
+    found->second.binding = true;
+    classification_generation = ++found->second.binding_generation;
+  }
+
+  bool published = false;
+  auto finish_classification = create_scope_guard([&] {
+    std::lock_guard<std::mutex> guard(g_receiver_ready_epoch_mutex);
+    const auto found =
+        g_receiver_ready_epoch_state.find({root_dir, epoch_id});
+    if (found == g_receiver_ready_epoch_state.end() ||
+        found->second.binding_generation != classification_generation) {
+      return;
+    }
+    found->second.binding = false;
+    if (published) found->second.selection_published = true;
+  });
+
+  for (const auto &fact_token : accepted.fact->tokens) {
+    const bool ready = std::binary_search(ready_tokens.begin(),
+                                          ready_tokens.end(), fact_token.token);
+    Preserve_trx_transfer_manifest manifest;
+    manifest.epoch_id = accepted.epoch_id;
+    manifest.token = fact_token.token;
+    manifest.source_prepare_lsn = fact_token.source_prepare_lsn;
+    manifest.source_epoch_commit_lsn = fact_token.source_epoch_commit_lsn;
+    manifest.objects = fact_token.objects;
+    if (ready) {
+      if (!receiver_strict_token_ready(root_dir, manifest)) return false;
+      continue;
+    }
+    if (deadline_reached) continue;
+    Preserve_trx_prepared_token_key key;
+    if (!strict_prepared_key_for_receiver(
+            root_dir, manifest, transfer_token_component(fact_token.token),
+            &key)) {
+      return false;
+    }
+    const auto purge_status =
+        preserved_trx_strict_prepared_token_registry().purge_token(key);
+    if (purge_status != Preserve_trx_prepared_status::OK &&
+        purge_status != Preserve_trx_prepared_status::NOT_FOUND) {
+      return false;
+    }
+  }
+
+  const uint64_t ready_deadline_us = receiver_epoch_deadline_after_ms(
+      now_us, preserve_trx_transfer_receiver_ready_timeout_ms);
+  if (!deadline_reached && !ready_tokens.empty() &&
+      preserved_trx_strict_prepared_token_registry()
+              .update_epoch_prepare_deadline(receiver_boot_incarnation(),
+                                             epoch_id, ready_tokens.size(),
+                                             ready_deadline_us) !=
+          Preserve_trx_prepared_status::OK) {
+    return false;
+  }
+  if (registry->publish_accepted_epoch_selection(
+          root_dir, epoch_id, now_us, ready_deadline_us, ready_tokens,
+          failed_tokens) != Preserve_trx_transfer_status::OK) {
+    return false;
+  }
+  published = true;
+
+  g_receiver_auto_prewarm_tokens.fetch_add(accepted.tokens.size());
+  g_receiver_auto_prewarm_ready_tokens.fetch_add(ready_tokens.size());
+  g_receiver_auto_prewarm_not_ready_tokens.fetch_add(failed_tokens.size());
+  g_receiver_prewarm_backlog_at_phase2_end.store(0);
+  purge_receiver_epoch_prewarm_queues(root_dir, epoch_id);
+  return true;
 }
 
 bool receiver_epoch_ready_is_bound(const std::string &root_dir,
@@ -8422,39 +8813,96 @@ Preserve_trx_transfer_status
 Preserve_trx_transfer_receiver_registry::mark_accepted_epoch_ready(
     const std::string &root_dir, const std::string &epoch_id, uint64_t now_us,
     uint64_t ready_deadline_monotonic_us) {
+  Preserve_trx_transfer_accepted_epoch accepted;
+  const auto status =
+      query_accepted_epoch(root_dir, epoch_id, &accepted);
+  if (status != Preserve_trx_transfer_status::COMMITTED_NOT_READY) {
+    return status;
+  }
+  if (accepted.lifecycle == Preserve_trx_transfer_epoch_lifecycle::READY) {
+    return Preserve_trx_transfer_status::OK;
+  }
+  if (accepted.deadline_monotonic_us <= now_us) {
+    return Preserve_trx_transfer_status::IO_ERROR;
+  }
+  return publish_accepted_epoch_selection(
+      root_dir, epoch_id, now_us, ready_deadline_monotonic_us,
+      std::move(accepted.tokens), {});
+}
+
+Preserve_trx_transfer_status
+Preserve_trx_transfer_receiver_registry::publish_accepted_epoch_selection(
+    const std::string &root_dir, const std::string &epoch_id, uint64_t now_us,
+    uint64_t ready_deadline_monotonic_us,
+    std::vector<uint64_t> ready_tokens,
+    std::vector<Preserve_trx_receiver_failed_token> failed_tokens) {
   if (root_dir.empty() || !transfer_component_safe(epoch_id) ||
       ready_deadline_monotonic_us <= now_us) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
+
   std::lock_guard<std::mutex> guard(m_mutex);
   const auto found = m_accepted_epochs.find(epoch_id);
   if (found == m_accepted_epochs.end() || found->second.root_dir != root_dir) {
     return Preserve_trx_transfer_status::IO_ERROR;
   }
   Preserve_trx_transfer_accepted_epoch &accepted = found->second;
-  if (accepted.lifecycle ==
-          Preserve_trx_transfer_epoch_lifecycle::ABANDONING ||
-      accepted.lifecycle == Preserve_trx_transfer_epoch_lifecycle::EXPIRED) {
-    return Preserve_trx_transfer_status::IO_ERROR;
-  }
-  if (accepted.lifecycle == Preserve_trx_transfer_epoch_lifecycle::ADOPT_LEASED) {
-    return Preserve_trx_transfer_status::UNSUPPORTED;
-  }
-  if (accepted.lifecycle == Preserve_trx_transfer_epoch_lifecycle::READY) {
-    return Preserve_trx_transfer_status::OK;
-  }
+  if (accepted.selection_published) return Preserve_trx_transfer_status::OK;
   if (accepted.lifecycle !=
       Preserve_trx_transfer_epoch_lifecycle::PREWARMING) {
     return Preserve_trx_transfer_status::UNSUPPORTED;
   }
-  if (accepted.deadline_monotonic_us <= now_us) {
-    accepted.lifecycle = Preserve_trx_transfer_epoch_lifecycle::EXPIRED;
-    ++m_expired_epoch_count;
-    return Preserve_trx_transfer_status::IO_ERROR;
+  if (ready_tokens.size() + failed_tokens.size() != accepted.tokens.size()) {
+    return Preserve_trx_transfer_status::CORRUPT;
   }
-  accepted.lifecycle = Preserve_trx_transfer_epoch_lifecycle::READY;
+  size_t ready_index = 0;
+  size_t failed_index = 0;
+  for (uint64_t token : accepted.tokens) {
+    const bool ready = ready_index < ready_tokens.size() &&
+                       ready_tokens[ready_index] == token;
+    const bool failed = failed_index < failed_tokens.size() &&
+                        failed_tokens[failed_index].token == token;
+    if (ready == failed ||
+        (failed && failed_tokens[failed_index].reason ==
+                       Preserve_trx_receiver_failure_reason::NONE)) {
+      return Preserve_trx_transfer_status::CORRUPT;
+    }
+    ready_index += ready ? 1 : 0;
+    failed_index += failed ? 1 : 0;
+  }
+  if (ready_index != ready_tokens.size() ||
+      failed_index != failed_tokens.size()) {
+    return Preserve_trx_transfer_status::CORRUPT;
+  }
+
+  accepted.ready_tokens = std::move(ready_tokens);
+  accepted.failed_tokens = std::move(failed_tokens);
+  accepted.selection_published = true;
   accepted.deadline_monotonic_us = ready_deadline_monotonic_us;
+  accepted.lifecycle = accepted.failed_tokens.empty()
+                           ? Preserve_trx_transfer_epoch_lifecycle::READY
+                           : Preserve_trx_transfer_epoch_lifecycle::CLASSIFIED;
   return Preserve_trx_transfer_status::OK;
+}
+
+std::vector<std::pair<std::string, std::string>>
+Preserve_trx_transfer_receiver_registry::prewarming_epochs_due(
+    uint64_t now_us) const {
+  std::vector<std::pair<std::string, std::string>> due;
+  std::lock_guard<std::mutex> guard(m_mutex);
+  try {
+    for (const auto &item : m_accepted_epochs) {
+      if (item.second.lifecycle ==
+              Preserve_trx_transfer_epoch_lifecycle::PREWARMING &&
+          item.second.deadline_monotonic_us != 0 &&
+          item.second.deadline_monotonic_us <= now_us) {
+        due.emplace_back(item.second.root_dir, item.first);
+      }
+    }
+  } catch (const std::bad_alloc &) {
+    due.clear();
+  }
+  return due;
 }
 
 Preserve_trx_receiver_promotion_lease_status
@@ -11326,9 +11774,27 @@ Preserve_trx_transfer_source_epoch_session::send_token_objects_batch(
   }
 
   if (queue_final_metadata) {
-    for (Preserve_trx_transfer_frame &frame : frames) {
-      status = emit_frame_locked(std::move(frame), true);
-      if (status != Preserve_trx_transfer_status::OK) return status;
+    if (m_ack_uncertain) return Preserve_trx_transfer_status::ACK_UNCERTAIN;
+    if (frames.size() >
+        std::numeric_limits<uint64_t>::max() - m_next_sequence) {
+      return Preserve_trx_transfer_status::RESOURCE_EXHAUSTED;
+    }
+    const size_t original_size = m_pending_final_metadata_frames.size();
+    try {
+      uint64_t sequence = m_next_sequence;
+      for (Preserve_trx_transfer_frame &frame : frames) {
+        stamp_online_epoch_context_locked(&frame);
+        frame.sequence = sequence++;
+      }
+      m_pending_final_metadata_frames.reserve(
+          m_pending_final_metadata_frames.size() + frames.size());
+      for (Preserve_trx_transfer_frame &frame : frames) {
+        m_pending_final_metadata_frames.push_back(std::move(frame));
+      }
+      m_next_sequence = sequence;
+    } catch (...) {
+      m_pending_final_metadata_frames.resize(original_size);
+      return Preserve_trx_transfer_status::RESOURCE_EXHAUSTED;
     }
   } else {
     const uint64_t first_sequence = m_next_sequence;
@@ -12368,6 +12834,34 @@ Preserve_trx_transfer_source_epoch_session::abort_token_locked(
   DBUG_EXECUTE_IF("preserve_trx_transfer_fail_abort_token", {
     return Preserve_trx_transfer_status::UNSUPPORTED;
   });
+
+  /*
+    Deferred final frames already own their sequence numbers. A later token
+    failure cannot send ABORT past that unsent range, otherwise the receiver
+    waits forever for the missing sequence. This is a failure-only slow path;
+    flush survivor frames in order before requesting the exact token abort.
+  */
+  if (!m_pending_final_metadata_frames.empty()) {
+    for (const Preserve_trx_transfer_frame &pending :
+         m_pending_final_metadata_frames) {
+      std::string encoded_frame;
+      Preserve_trx_transfer_status pending_status =
+          preserve_trx_transfer_encode_frame(pending, &encoded_frame);
+      if (pending_status != Preserve_trx_transfer_status::OK) {
+        return pending_status;
+      }
+      pending_status = m_sink->send_encoded_frame(encoded_frame);
+      if (pending_status == Preserve_trx_transfer_status::ACK_UNCERTAIN) {
+        m_ack_uncertain = true;
+      }
+      if (pending_status != Preserve_trx_transfer_status::OK) {
+        return pending_status;
+      }
+    }
+    g_transfer_phase2_final_metadata_frame_count.fetch_add(
+        m_pending_final_metadata_frames.size());
+    m_pending_final_metadata_frames.clear();
+  }
 
   Preserve_trx_transfer_frame abort;
   abort.type = Preserve_trx_transfer_frame_type::ABORT;
@@ -13829,9 +14323,12 @@ struct Receiver_prewarm_job {
   Preserve_trx_transfer_receiver_registry *registry{nullptr};
   bool objects_already_sealed{false};
   bool retry_stale_record_lock_proof{false};
+  uint staged_retry_attempts{0};
   uint object_retry_attempts{0};
   uint64_t estimated_io_bytes{0};
 };
+
+constexpr uint kReceiverStagedTokenRetryLimit = 3;
 
 struct Receiver_staged_token_prewarm_key {
   std::string root_dir;
@@ -14018,15 +14515,6 @@ void purge_receiver_epoch_derived_state(const std::string &root_dir,
                                         const std::string &epoch_scope) {
   purge_receiver_epoch_prewarm_queues(root_dir, epoch_id);
   {
-    std::lock_guard<std::mutex> guard(g_receiver_seal_prewarm_state_mutex);
-    for (auto token = g_receiver_seal_prewarm_state.begin();
-         token != g_receiver_seal_prewarm_state.end();) {
-      token = token->first.first == epoch_id
-                  ? g_receiver_seal_prewarm_state.erase(token)
-                  : std::next(token);
-    }
-  }
-  {
     std::lock_guard<std::mutex> guard(g_receiver_ready_epoch_mutex);
     g_receiver_ready_epoch_state.erase({root_dir, epoch_id});
   }
@@ -14165,31 +14653,103 @@ bool receiver_staged_token_prewarm_job_runnable(
     publish its metadata-only proof first so readiness never depends on which
     queue an eligible worker observes first.
   */
-  return receiver_object_prewarm_proof_state(key, true) ==
-         Receiver_object_prewarm_proof_state::READY;
+  if (receiver_object_prewarm_proof_state(key, true) !=
+      Receiver_object_prewarm_proof_state::READY) {
+    return false;
+  }
+  return receiver_record_lock_prepared_exists(job.root_dir, job.manifest);
+}
+
+const char *receiver_object_prewarm_proof_state_name(
+    Receiver_object_prewarm_proof_state state) {
+  switch (state) {
+    case Receiver_object_prewarm_proof_state::MISSING:
+      return "MISSING";
+    case Receiver_object_prewarm_proof_state::STALE:
+      return "STALE";
+    case Receiver_object_prewarm_proof_state::READY:
+      return "READY";
+  }
+  return "UNKNOWN";
+}
+
+void log_receiver_staged_token_prewarm_deferred(
+    const Receiver_prewarm_job &job,
+    const Receiver_staged_token_prewarm_result &result) {
+  if (result.outcome !=
+          Receiver_staged_token_prewarm_outcome::WAIT_DEPENDENCY &&
+      result.outcome !=
+          Receiver_staged_token_prewarm_outcome::RETRYABLE_NOT_READY) {
+    return;
+  }
+
+  const bool binlog_pending =
+      receiver_binlog_prepare_pending(job.root_dir, job.manifest);
+  Receiver_object_prewarm_key record_lock_key;
+  const bool has_record_lock_object = receiver_object_prewarm_key(
+      job.root_dir, job.manifest, kPreservedTrxBlobRecordLocks,
+      &record_lock_key);
+  const char *record_lock_proof =
+      has_record_lock_object
+          ? receiver_object_prewarm_proof_state_name(
+                receiver_object_prewarm_proof_state(record_lock_key, true))
+          : "NOT_APPLICABLE";
+  const bool record_lock_plan_prepared =
+      has_record_lock_object &&
+      receiver_record_lock_prepared_exists(job.root_dir, job.manifest);
+
+  std::ostringstream message;
+  message << "PRESERVE: receiver staged-token prewarm deferred"
+          << " epoch=" << job.manifest.epoch_id
+          << " token=" << job.manifest.token
+          << " outcome="
+          << receiver_staged_token_prewarm_outcome_name(result.outcome)
+          << " stage=" << receiver_staged_token_prewarm_stage_name(result.stage)
+          << " retry_attempt=" << job.staged_retry_attempts
+          << " status="
+          << preserve_trx_promotion_adopt_status_name(result.status)
+          << " failure_reason="
+          << static_cast<unsigned int>(result.failure_reason)
+          << " binlog_pending=" << binlog_pending
+          << " record_lock_object=" << has_record_lock_object
+          << " record_lock_proof=" << record_lock_proof
+          << " record_lock_plan_prepared=" << record_lock_plan_prepared;
+  LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG, message.str().c_str());
 }
 
 void finish_receiver_staged_token_prewarm_job(
-    const Receiver_prewarm_job &job, bool terminal, bool expired_or_removed) {
+    const Receiver_prewarm_job &job,
+    Receiver_staged_token_prewarm_outcome outcome,
+    bool expired_or_removed) {
   Receiver_staged_token_prewarm_key key =
       receiver_staged_token_prewarm_key(job.root_dir, job.manifest);
   bool notify_retry = false;
   {
     std::lock_guard<std::mutex> guard(g_receiver_prewarm_mutex);
     g_receiver_staged_token_prewarm_inflight.erase(key);
-    const bool deferred =
-        g_receiver_staged_token_prewarm_deferred.erase(key) != 0;
+    g_receiver_staged_token_prewarm_deferred.erase(key);
+    const bool dependency_wait =
+        outcome == Receiver_staged_token_prewarm_outcome::WAIT_DEPENDENCY;
+    const bool retryable_not_ready =
+        outcome ==
+        Receiver_staged_token_prewarm_outcome::RETRYABLE_NOT_READY;
+    const bool retry_budget_available =
+        job.staged_retry_attempts < kReceiverStagedTokenRetryLimit;
+    const bool requeue =
+        dependency_wait || (retryable_not_ready && retry_budget_available);
     if (expired_or_removed) {
       g_receiver_staged_token_prewarm_deferred.erase(key);
-    } else if (terminal) {
-      g_receiver_staged_token_prewarm_done.insert(std::move(key));
-    } else if (deferred &&
+    } else if (requeue &&
                g_receiver_prewarm_retiring_registries.count(job.registry) ==
                    0) {
+      Receiver_prewarm_job retry_job = job;
+      if (retryable_not_ready) ++retry_job.staged_retry_attempts;
       g_receiver_staged_token_prewarm_inflight.insert(key);
       g_receiver_queued_bytes.fetch_add(job.estimated_io_bytes);
-      g_receiver_prewarm_jobs.push_back(job);
+      g_receiver_staged_token_prewarm_jobs.push_back(std::move(retry_job));
       notify_retry = true;
+    } else {
+      g_receiver_staged_token_prewarm_done.insert(std::move(key));
     }
   }
   if (notify_retry) g_receiver_prewarm_cv.notify_all();
@@ -14221,7 +14781,8 @@ Preserve_trx_transfer_status finalize_receiver_ready_token_staging(
       !preserve_trx_transfer_epoch_committed(root_dir, manifest.epoch_id)) {
     return Preserve_trx_transfer_status::OK;
   }
-  if (!receiver_seal_prewarm_token_ok(manifest.epoch_id, manifest.token)) {
+  if (!receiver_seal_prewarm_token_ok(root_dir, manifest.epoch_id,
+                                      manifest.token)) {
     return Preserve_trx_transfer_status::OK;
   }
   if (!receiver_epoch_ready_is_bound(root_dir, manifest.epoch_id)) {
@@ -14296,6 +14857,10 @@ preserve_trx_transfer_acknowledge_epoch_for_unit_test(
 void receiver_reaper_scan_once(
     uint64_t now_us, Preserve_trx_transfer_receiver_registry *registry) {
   if (registry == nullptr) return;
+  for (const auto &epoch : registry->prewarming_epochs_due(now_us)) {
+    (void)publish_receiver_epoch_selection_if_possible(
+        epoch.first, epoch.second, registry, now_us, true);
+  }
   std::vector<Preserve_trx_transfer_accepted_epoch> expired;
   (void)registry->expire_accepted_epochs_once(now_us, &expired);
   for (const Preserve_trx_transfer_accepted_epoch &accepted : expired) {
@@ -14416,7 +14981,7 @@ void preserve_trx_transfer_receiver_reaper_scan_for_unit_test(
   receiver_reaper_scan_once(now_us, registry);
 }
 
-Preserve_trx_promotion_adopt_status run_receiver_staged_token_prewarm_job(
+Receiver_staged_token_prewarm_result run_receiver_staged_token_prewarm_job(
     const std::string &root_dir,
     const Preserve_trx_transfer_manifest &manifest,
     Preserve_trx_transfer_receiver_registry *registry,
@@ -14425,15 +14990,43 @@ Preserve_trx_promotion_adopt_status run_receiver_staged_token_prewarm_job(
   auto finish_active = create_scope_guard(
       [] { note_receiver_staged_token_job_finished(); });
   const uint64_t staged_started_us = transfer_monotonic_us();
+  auto finish_total = create_scope_guard([&] {
+    note_receiver_staged_token_total_us(transfer_monotonic_us() -
+                                        staged_started_us);
+  });
+  const auto record_token_failure =
+      [&](Preserve_trx_receiver_failure_reason reason) {
+    const bool selection_complete_with_failures =
+        note_receiver_epoch_token_result(root_dir, manifest.epoch_id,
+                                         manifest.token, reason);
+    if (selection_complete_with_failures) {
+      (void)publish_receiver_epoch_selection_if_possible(
+          root_dir, manifest.epoch_id, registry, transfer_monotonic_us(),
+          false);
+    }
+  };
   if (receiver_epoch_expired_or_removed(root_dir, registry, manifest)) {
-    return Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY;
+    return receiver_staged_token_result(
+        Receiver_staged_token_prewarm_outcome::EXPIRED,
+        Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY);
   }
+  DBUG_EXECUTE_IF("preserve_trx_receiver_fail_epoch_prewarm", {
+    note_receiver_epoch_global_failure(root_dir, manifest.epoch_id);
+    return receiver_staged_token_result(
+        Receiver_staged_token_prewarm_outcome::GLOBAL_FAILURE,
+        Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT);
+  });
   const uint64_t estimated_bytes = receiver_manifest_object_bytes(manifest);
   const auto limits = preserve_trx_transfer_current_runtime_limits();
   if (estimated_bytes > limits.prewarm_max_bytes) {
     note_receiver_seal_prewarm_status(
         Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY);
-    return Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY;
+    record_token_failure(
+        Preserve_trx_receiver_failure_reason::TOKEN_RESOURCE_LIMIT);
+    return receiver_staged_token_result(
+        Receiver_staged_token_prewarm_outcome::TERMINAL_TOKEN_FAILURE,
+        Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY,
+        Preserve_trx_receiver_failure_reason::TOKEN_RESOURCE_LIMIT);
   }
   throttle_receiver_prewarm_io(
       receiver_staged_token_file_read_bytes(manifest));
@@ -14444,11 +15037,15 @@ Preserve_trx_promotion_adopt_status run_receiver_staged_token_prewarm_job(
   if (load_status != Preserve_trx_transfer_status::OK) {
     note_receiver_seal_prewarm_status(
         Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT);
-    return Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT;
+    note_receiver_epoch_global_failure(root_dir, manifest.epoch_id);
+    return receiver_staged_token_result(
+        Receiver_staged_token_prewarm_outcome::GLOBAL_FAILURE,
+        Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT);
   }
 
   const uint64_t ready_started_us = transfer_monotonic_us();
   note_receiver_prewarm_start();
+  auto finish_prewarm = create_scope_guard([] { note_receiver_prewarm_end(); });
   Preserve_trx_promotion_adopt_status prewarm_status =
       Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY;
   const bool has_record_lock_object =
@@ -14476,57 +15073,124 @@ Preserve_trx_promotion_adopt_status run_receiver_staged_token_prewarm_job(
   if (receiver_epoch_expired_or_removed(root_dir, registry, manifest)) {
     purge_receiver_epoch_derived_state(
         root_dir, manifest.epoch_id, receiver_boot_incarnation());
-    return Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY;
+    return receiver_staged_token_result(
+        Receiver_staged_token_prewarm_outcome::EXPIRED,
+        Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY);
   }
   g_receiver_staged_token_ready_cache_us.fetch_add(transfer_monotonic_us() -
                                                    ready_started_us);
   const uint delay_ms =
       receiver_staged_prewarm_delay_ms_for_unit_test().load();
   if (delay_ms != 0) my_sleep(delay_ms * 1000ULL);
-  const bool strict_prepared = prepare_strict_bundle_for_receiver(
-      root_dir, manifest, std::move(staged_bundle), registry);
-  if (strict_prepared) {
-    bind_strict_prepared_token_from_cached_epoch_fact(
-        root_dir, manifest.epoch_id, manifest.token, registry);
+
+  if (prewarm_status != Preserve_trx_promotion_adopt_status::OK) {
+    Receiver_staged_token_prewarm_result result;
+    if (prewarm_status ==
+        Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY) {
+      result = receiver_staged_token_result(
+          has_record_lock_object
+              ? Receiver_staged_token_prewarm_outcome::WAIT_DEPENDENCY
+              : Receiver_staged_token_prewarm_outcome::RETRYABLE_NOT_READY,
+          prewarm_status, Preserve_trx_receiver_failure_reason::NONE,
+          has_record_lock_object
+              ? Receiver_staged_token_prewarm_stage::
+                    READY_CACHE_RECORD_LOCK_PROOF
+              : Receiver_staged_token_prewarm_stage::READY_CACHE_BUNDLE);
+    } else if (prewarm_status ==
+                   Preserve_trx_promotion_adopt_status::UNSUPPORTED_ARTIFACT ||
+               prewarm_status ==
+                   Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT) {
+      result = receiver_staged_token_result(
+          Receiver_staged_token_prewarm_outcome::TERMINAL_TOKEN_FAILURE,
+          prewarm_status,
+          Preserve_trx_receiver_failure_reason::UNSUPPORTED_TOKEN_SEMANTICS);
+      record_token_failure(result.failure_reason);
+    } else {
+      result = receiver_staged_token_result(
+          Receiver_staged_token_prewarm_outcome::GLOBAL_FAILURE,
+          prewarm_status);
+      note_receiver_epoch_global_failure(root_dir, manifest.epoch_id);
+    }
+    note_receiver_seal_prewarm_status(result.status);
+    return result;
   }
+
+  if (consume_receiver_token_retryable_not_ready_injection(
+          root_dir, manifest.epoch_id)) {
+    note_receiver_seal_prewarm_status(
+        Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY);
+    return receiver_staged_token_result(
+        Receiver_staged_token_prewarm_outcome::RETRYABLE_NOT_READY,
+        Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY,
+        Preserve_trx_receiver_failure_reason::NONE,
+        Receiver_staged_token_prewarm_stage::DEBUG_RETRYABLE_NOT_READY);
+  }
+
+  Receiver_staged_token_prewarm_result strict_result =
+      prepare_strict_bundle_for_receiver(root_dir, manifest,
+                                         std::move(staged_bundle), registry);
   if (receiver_epoch_expired_or_removed(root_dir, registry, manifest)) {
     purge_receiver_epoch_derived_state(
         root_dir, manifest.epoch_id, receiver_boot_incarnation());
-    return Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY;
+    return receiver_staged_token_result(
+        Receiver_staged_token_prewarm_outcome::EXPIRED,
+        Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY);
   }
-  const Preserve_trx_promotion_adopt_status authoritative_status =
-      prewarm_status == Preserve_trx_promotion_adopt_status::OK &&
-              strict_prepared
-          ? Preserve_trx_promotion_adopt_status::OK
-          : Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY;
-  note_receiver_seal_prewarm_status(authoritative_status);
-  note_receiver_seal_prewarm_token_status(
-      manifest.epoch_id, manifest.token, authoritative_status);
-  if (authoritative_status == Preserve_trx_promotion_adopt_status::OK) {
-    note_receiver_epoch_token_ready(root_dir, manifest.epoch_id,
-                                    manifest.token);
-    const bool epoch_bound = publish_receiver_epoch_ready_from_fact_if_possible(
-        root_dir, manifest.epoch_id, registry);
-    if (epoch_bound && registry != nullptr) {
-      /*
-        A worker can bind the whole epoch after sibling token workers already
-        finished before COMMIT_EPOCH. Finalize every sealed token here so those
-        siblings do not remain RECEIVING until the periodic reaper runs.
-      */
-      const auto records =
-          registry->sealed_receiving_records_for_epoch(manifest.epoch_id);
-      for (const auto &record : records) {
-        (void)finalize_receiver_ready_token_staging(
-            root_dir, receiver_record_manifest(record), registry);
-      }
-    } else {
-      (void)finalize_receiver_ready_token_staging(root_dir, manifest, registry);
+  if (strict_result.outcome !=
+      Receiver_staged_token_prewarm_outcome::READY) {
+    if (strict_result.outcome ==
+        Receiver_staged_token_prewarm_outcome::TERMINAL_TOKEN_FAILURE) {
+      record_token_failure(strict_result.failure_reason);
+    } else if (strict_result.outcome ==
+               Receiver_staged_token_prewarm_outcome::GLOBAL_FAILURE) {
+      note_receiver_epoch_global_failure(root_dir, manifest.epoch_id);
     }
+    note_receiver_seal_prewarm_status(strict_result.status);
+    return strict_result;
   }
-  note_receiver_prewarm_end();
-  note_receiver_staged_token_total_us(transfer_monotonic_us() -
-                                      staged_started_us);
-  return authoritative_status;
+
+  bind_strict_prepared_token_from_cached_epoch_fact(
+      root_dir, manifest.epoch_id, manifest.token, registry);
+  if (consume_receiver_token_local_failure_injection(root_dir,
+                                                     manifest.epoch_id)) {
+    const auto result = receiver_staged_token_result(
+        Receiver_staged_token_prewarm_outcome::TERMINAL_TOKEN_FAILURE,
+        Preserve_trx_promotion_adopt_status::UNSUPPORTED_ARTIFACT,
+        Preserve_trx_receiver_failure_reason::UNSUPPORTED_TOKEN_SEMANTICS);
+    note_receiver_seal_prewarm_status(result.status);
+    record_token_failure(result.failure_reason);
+    return result;
+  }
+
+  note_receiver_seal_prewarm_status(Preserve_trx_promotion_adopt_status::OK);
+  const bool selection_complete_with_failures =
+      note_receiver_epoch_token_result(
+          root_dir, manifest.epoch_id, manifest.token,
+          Preserve_trx_receiver_failure_reason::NONE);
+  const bool epoch_bound = publish_receiver_epoch_ready_from_fact_if_possible(
+      root_dir, manifest.epoch_id, registry);
+  if (epoch_bound && registry != nullptr) {
+    /*
+      A worker can bind the whole epoch after sibling token workers already
+      finished before COMMIT_EPOCH. Finalize every sealed token here so those
+      siblings do not remain RECEIVING until the periodic reaper runs.
+    */
+    const auto records =
+        registry->sealed_receiving_records_for_epoch(manifest.epoch_id);
+    for (const auto &record : records) {
+      (void)finalize_receiver_ready_token_staging(
+          root_dir, receiver_record_manifest(record), registry);
+    }
+  } else {
+    (void)finalize_receiver_ready_token_staging(root_dir, manifest, registry);
+  }
+  if (selection_complete_with_failures) {
+    (void)publish_receiver_epoch_selection_if_possible(
+        root_dir, manifest.epoch_id, registry, transfer_monotonic_us(), false);
+  }
+  return receiver_staged_token_result(
+      Receiver_staged_token_prewarm_outcome::READY,
+      Preserve_trx_promotion_adopt_status::OK);
 }
 
 uint64_t receiver_residency_deadline(uint64_t now_us, uint64_t timeout_us) {
@@ -14989,11 +15653,13 @@ void receiver_prewarm_worker_main() {
     auto finish_worker_active = create_scope_guard(
         [] { g_receiver_worker_active.fetch_sub(1); });
     const uint64_t job_started_us = transfer_monotonic_us();
-    Preserve_trx_promotion_adopt_status staged_status =
-        Preserve_trx_promotion_adopt_status::OK;
+    Receiver_staged_token_prewarm_result staged_result =
+        receiver_staged_token_result(
+            Receiver_staged_token_prewarm_outcome::READY,
+            Preserve_trx_promotion_adopt_status::OK);
     try {
       if (job.kind == Receiver_prewarm_job_kind::STAGED_TOKEN) {
-        staged_status =
+        staged_result =
             run_receiver_staged_token_prewarm_job(job.root_dir, job.manifest,
                                                   job.registry,
                                                   job.objects_already_sealed);
@@ -15014,10 +15680,13 @@ void receiver_prewarm_worker_main() {
       }
     } catch (...) {
       if (job.kind == Receiver_prewarm_job_kind::STAGED_TOKEN) {
-        staged_status =
-            Preserve_trx_promotion_adopt_status::UNSUPPORTED_ARTIFACT;
+        staged_result = receiver_staged_token_result(
+            Receiver_staged_token_prewarm_outcome::GLOBAL_FAILURE,
+            Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT);
+        note_receiver_epoch_global_failure(job.root_dir,
+                                           job.manifest.epoch_id);
         note_receiver_seal_prewarm_status(
-            Preserve_trx_promotion_adopt_status::UNSUPPORTED_ARTIFACT);
+            Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT);
       } else {
         g_receiver_object_prewarm_miss_count.fetch_add(1);
       }
@@ -15026,9 +15695,8 @@ void receiver_prewarm_worker_main() {
       const bool expired_or_removed = receiver_epoch_expired_or_removed(
           job.root_dir, job.registry, job.manifest);
       finish_receiver_staged_token_prewarm_job(
-          job, staged_status !=
-                   Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY,
-          expired_or_removed);
+          job, staged_result.outcome, expired_or_removed);
+      log_receiver_staged_token_prewarm_deferred(job, staged_result);
     }
     g_receiver_worker_active.fetch_sub(1);
     finish_worker_active.commit();
@@ -15432,10 +16100,6 @@ void preserve_trx_transfer_shutdown_receiver_prewarm_workers() {
     g_receiver_prewarm_workers_stopping = false;
   }
   g_receiver_prewarm_cv.notify_all();
-  {
-    std::lock_guard<std::mutex> guard(g_receiver_seal_prewarm_state_mutex);
-    g_receiver_seal_prewarm_state.clear();
-  }
   {
     std::lock_guard<std::mutex> guard(g_receiver_ready_epoch_mutex);
     g_receiver_ready_epoch_state.clear();
@@ -16099,8 +16763,16 @@ preserve_trx_transfer_apply_receiver_frame_internal(
               cache_receiver_epoch_fact(root_dir, accepted.fact);
               bind_strict_prepared_tokens_from_epoch_fact(
                   root_dir, *accepted.fact, registry);
-              (void)publish_receiver_epoch_ready_from_fact_if_possible(
-                  root_dir, frame.epoch_id, registry);
+              const bool ready_published =
+                  publish_receiver_epoch_ready_from_fact_if_possible(
+                      root_dir, frame.epoch_id, registry);
+              if (!ready_published &&
+                  receiver_epoch_selection_complete_with_failures(
+                      root_dir, frame.epoch_id)) {
+                (void)publish_receiver_epoch_selection_if_possible(
+                    root_dir, frame.epoch_id, registry,
+                    transfer_monotonic_us(), false);
+              }
             }
           }
           return callback_status;
@@ -16298,15 +16970,25 @@ preserve_trx_transfer_apply_receiver_frame_internal(
             prewarm job would redo the full token scan after source phase 2 and
             turn receiver readiness into a gate tail.
           */
-          if (!publish_receiver_epoch_ready_from_seal_prewarm(
-                  root_dir, epoch_manifests, registry)) {
+          const bool ready_published =
+              publish_receiver_epoch_ready_from_seal_prewarm(
+                  root_dir, epoch_manifests, registry);
+          const bool selection_published =
+              !ready_published &&
+              receiver_epoch_selection_complete_with_failures(
+                  root_dir, frame.epoch_id) &&
+              publish_receiver_epoch_selection_if_possible(
+                  root_dir, frame.epoch_id, registry, transfer_monotonic_us(),
+                  false);
+          if (!ready_published && !selection_published) {
             note_receiver_epoch_pending_without_cold_fallback(
                 epoch_manifests,
                 Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY);
             for (const Preserve_trx_transfer_manifest &epoch_manifest :
                  epoch_manifests) {
-              if (receiver_seal_prewarm_token_ok(epoch_manifest.epoch_id,
-                                                 epoch_manifest.token)) {
+              if (receiver_epoch_token_result_known(
+                      root_dir, epoch_manifest.epoch_id,
+                      epoch_manifest.token)) {
                 continue;
               }
               const Preserve_trx_transfer_status enqueue_status =
@@ -16336,8 +17018,9 @@ preserve_trx_transfer_apply_receiver_frame_internal(
              commit_records) {
           const Preserve_trx_transfer_manifest epoch_manifest =
               receiver_record_manifest(epoch_record);
-          if (!receiver_seal_prewarm_token_ok(epoch_manifest.epoch_id,
-                                              epoch_manifest.token) ||
+          if (!receiver_seal_prewarm_token_ok(
+                  root_dir, epoch_manifest.epoch_id,
+                  epoch_manifest.token) ||
               !receiver_strict_token_ready(root_dir, epoch_manifest)) {
             continue;
           }

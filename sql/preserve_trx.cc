@@ -9338,7 +9338,14 @@ class Warmcopy_batch_drain_participant final
 };
 
 struct Preserve_batch_target_execution {
+  enum class Failure_reason : uint8_t {
+    NONE,
+    LOCK_PLAN_REPLACEMENT_FAILED,
+    FINAL_METADATA_BUILD_FAILED
+  };
+
   my_thread_id target_thread_id{0};
+  Failure_reason failure_reason{Failure_reason::NONE};
   bool pin_error{false};
   bool visited_target{false};
   bool error{false};
@@ -9358,6 +9365,21 @@ struct Preserve_batch_target_execution {
   Preserve_trx_deferred_transfer_candidate deferred_candidate;
   Preserve_trx_preserve_result result;
 };
+
+const char *preserve_trx_source_failure_reason_name(
+    Preserve_batch_target_execution::Failure_reason reason) {
+  switch (reason) {
+    case Preserve_batch_target_execution::Failure_reason::NONE:
+      return "NONE";
+    case Preserve_batch_target_execution::Failure_reason::
+        LOCK_PLAN_REPLACEMENT_FAILED:
+      return "LOCK_PLAN_REPLACEMENT_FAILED";
+    case Preserve_batch_target_execution::Failure_reason::
+        FINAL_METADATA_BUILD_FAILED:
+      return "FINAL_METADATA_BUILD_FAILED";
+  }
+  return "UNKNOWN";
+}
 
 bool preserve_trx_early_lock_fence_matches(
     const lock_warmcopy_trx_lock_fence_t &initial,
@@ -12018,8 +12040,8 @@ static void preserved_trx_expired_reaper_scan_once() {
   (void)preserved_trx_gc_failed_observable_records();
   try {
     const uint64_t now_us = preserve_trx_monotonic_us();
-    (void)preserved_trx_strict_prepared_token_registry().expire_once(now_us);
     preserve_trx_transfer_receiver_reaper_scan_once(now_us);
+    (void)preserved_trx_strict_prepared_token_registry().expire_once(now_us);
   } catch (...) {
     LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
            "PRESERVE: strict receiver resource reaper pass failed");
@@ -17460,6 +17482,9 @@ static bool send_preserve_trx_transfer_drain_result(
     THD *thd, ulonglong generation,
     const std::vector<my_thread_id> &survivor_thread_ids,
     const std::vector<my_thread_id> &excluded_timeout_thread_ids,
+    const std::vector<std::pair<my_thread_id,
+                               Preserve_batch_target_execution::Failure_reason>>
+        &failed_tokens,
     ulonglong closing_started_us, ulonglong closing_deadline_us) {
   if (thd == nullptr) return true;
 
@@ -17483,8 +17508,9 @@ static bool send_preserve_trx_transfer_drain_result(
   const char *outcome =
       survivor_thread_ids.empty()
           ? "NO_PRESERVABLE_TOKENS"
-          : (excluded_timeout_thread_ids.empty() ? "SUCCESS"
-                                                 : "SUCCESS_WITH_EXCLUSIONS");
+          : (excluded_timeout_thread_ids.empty() && failed_tokens.empty()
+                 ? "SUCCESS"
+                 : "SUCCESS_WITH_EXCLUSIONS");
   Protocol *protocol = thd->get_protocol();
   auto send_row = [&](bool has_token, my_thread_id source_connection_id,
                       const char *token_role, const char *reason) {
@@ -17503,7 +17529,8 @@ static bool send_preserve_trx_transfer_drain_result(
     return protocol->end_row();
   };
 
-  if (survivor_thread_ids.empty() && excluded_timeout_thread_ids.empty()) {
+  if (survivor_thread_ids.empty() && excluded_timeout_thread_ids.empty() &&
+      failed_tokens.empty()) {
     if (send_row(false, 0, "SUMMARY", "NONE")) return true;
   } else {
     for (my_thread_id thread_id : survivor_thread_ids) {
@@ -17512,6 +17539,12 @@ static bool send_preserve_trx_transfer_drain_result(
     for (my_thread_id thread_id : excluded_timeout_thread_ids) {
       if (send_row(true, thread_id, "EXCLUDED",
                    "CLOSING_COMMAND_TIMEOUT")) {
+        return true;
+      }
+    }
+    for (const auto &failed : failed_tokens) {
+      if (send_row(true, failed.first, "EXCLUDED",
+                   preserve_trx_source_failure_reason_name(failed.second))) {
         return true;
       }
     }
@@ -18387,6 +18420,9 @@ bool Preserve_trx_drain_service::execute(
   std::vector<my_thread_id> quiesced_target_thread_ids;
   quiesced_target_thread_ids.reserve(counter.target_thread_ids().size());
   std::vector<my_thread_id> excluded_timeout_thread_ids;
+  std::vector<std::pair<my_thread_id,
+                        Preserve_batch_target_execution::Failure_reason>>
+      source_failed_tokens;
   ulonglong phase2_transfer_tail_started_us = 0;
   ulonglong latest_command_boundary_us = phase2_metrics.closing_started_us;
   bool command_boundary_sample_missing = false;
@@ -18549,8 +18585,8 @@ bool Preserve_trx_drain_service::execute(
       drain_result_attempted = true;
       if (send_preserve_trx_transfer_drain_result(
               thd, generation, quiesced_target_thread_ids,
-              excluded_timeout_thread_ids, phase2_metrics.closing_started_us,
-              closing_command_deadline_us)) {
+              excluded_timeout_thread_ids, source_failed_tokens,
+              phase2_metrics.closing_started_us, closing_command_deadline_us)) {
         LogErr(WARNING_LEVEL, ER_LOG_PRINTF_MSG,
                "PRESERVE: transfer DRAIN result delivery failed after terminal "
                "handoff; source remains fenced");
@@ -20199,6 +20235,8 @@ bool Preserve_trx_drain_service::execute(
                 current_fence)) {
           ++phase2_metrics.final_validation_rejects;
           execution.error = true;
+          execution.failure_reason = Preserve_batch_target_execution::
+              Failure_reason::LOCK_PLAN_REPLACEMENT_FAILED;
           execution.result.failure_reason = "early_lock_replacement_failed";
           continue;
         }
@@ -20206,8 +20244,11 @@ bool Preserve_trx_drain_service::execute(
         DEBUG_SYNC(thd, "preserve_trx_early_after_dirty_replacement");
       }
       const ulonglong finalize_started_us = preserve_trx_monotonic_us();
+      const bool inject_finalize_failure =
+          debug_fail_early_candidate_finalize;
+      debug_fail_early_candidate_finalize = false;
       const Preserve_trx_transfer_status finalize_status =
-          debug_fail_early_candidate_finalize
+          inject_finalize_failure
               ? Preserve_trx_transfer_status::UNSUPPORTED
               : preserve_trx_transfer_finalize_deferred_candidate(
                     batch_transfer_source_session.get(),
@@ -20220,6 +20261,8 @@ bool Preserve_trx_drain_service::execute(
       }
       if (finalize_status != Preserve_trx_transfer_status::OK) {
         execution.error = true;
+        execution.failure_reason = Preserve_batch_target_execution::
+            Failure_reason::FINAL_METADATA_BUILD_FAILED;
         execution.result.failure_reason = "early_candidate_finalize_failed";
       }
     }
@@ -20236,6 +20279,103 @@ bool Preserve_trx_drain_service::execute(
          std::to_string(static_cast<unsigned long long>(
              final_candidate_finalize_max_target)))
             .c_str());
+
+    const size_t token_local_failure_count = static_cast<size_t>(std::count_if(
+        target_results.begin(), target_results.end(),
+        [](const Preserve_batch_target_execution &execution) {
+          return execution.failure_reason !=
+                 Preserve_batch_target_execution::Failure_reason::NONE;
+        }));
+    std::set<my_thread_id> restored_failed_targets;
+    if (token_local_failure_count != 0 &&
+        token_local_failure_count < target_results.size()) {
+      for (Preserve_batch_target_execution &execution : target_results) {
+        if (execution.failure_reason ==
+            Preserve_batch_target_execution::Failure_reason::NONE) {
+          continue;
+        }
+        const bool exact_local_failure =
+            execution.result.stage == Preserve_trx_preserve_stage::COMPLETE &&
+            !execution.result.token.empty() &&
+            !execution.result.cleanup_failed_after_reattach &&
+            !execution.result.left_preserved_after_cleanup_failure &&
+            batch_transfer_phase1_declared_tokens.count(
+                execution.target_thread_id) != 0;
+        if (!exact_local_failure ||
+            batch_transfer_source_session->abort_token(
+                static_cast<uint64_t>(execution.target_thread_id),
+                preserve_trx_source_failure_reason_name(
+                    execution.failure_reason)) !=
+                Preserve_trx_transfer_status::OK) {
+          break;
+        }
+        batch_transfer_phase1_declared_tokens.erase(
+            execution.target_thread_id);
+
+        Preserve_trx_batch_item failed_item;
+        failed_item.original_thread_id = execution.target_thread_id;
+        failed_item.token = execution.result.token;
+        failed_item.logged_binlog_cache = execution.result.logged_binlog_cache;
+        failed_item.source_rollback_image =
+            std::move(execution.result.source_rollback_image);
+        std::vector<Preserve_trx_batch_item> failed_items;
+        failed_items.push_back(std::move(failed_item));
+        if (restore_preserved_batch_items_to_original_thds(
+                generation, failed_items, active_drain_attempt)) {
+          abort_batch_transfer_epoch("source_token_restore_failed");
+          batch_provenance_cleanup.commit();
+          return finish_cleanup_failure_without_shutdown(
+              "source_token_restore_failed");
+        }
+
+        const auto provenance_it = batch_provenance_tokens_by_thread_id.find(
+            execution.target_thread_id);
+        if (provenance_it == batch_provenance_tokens_by_thread_id.end()) {
+          abort_batch_transfer_epoch("source_token_provenance_missing");
+          batch_provenance_cleanup.commit();
+          return finish_cleanup_failure_without_shutdown(
+              "source_token_provenance_missing");
+        }
+        const std::string provenance_token = provenance_it->second;
+        batch_provenance_tokens_by_thread_id.erase(provenance_it);
+        batch_provenance_tokens.erase(
+            std::remove(batch_provenance_tokens.begin(),
+                        batch_provenance_tokens.end(), provenance_token),
+            batch_provenance_tokens.end());
+        restored_failed_targets.insert(execution.target_thread_id);
+        source_failed_tokens.push_back(
+            {execution.target_thread_id, execution.failure_reason});
+        LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
+               ("PRESERVE: source token excluded target_thread_id=" +
+                std::to_string(static_cast<unsigned long long>(
+                    execution.target_thread_id)) +
+                " reason=" +
+                preserve_trx_source_failure_reason_name(
+                    execution.failure_reason))
+                   .c_str());
+      }
+    }
+    if (!restored_failed_targets.empty()) {
+      quiesced_target_thread_ids.erase(
+          std::remove_if(quiesced_target_thread_ids.begin(),
+                         quiesced_target_thread_ids.end(),
+                         [&](my_thread_id target_thread_id) {
+                           return restored_failed_targets.count(
+                                      target_thread_id) != 0;
+                         }),
+          quiesced_target_thread_ids.end());
+      target_results.erase(
+          std::remove_if(target_results.begin(), target_results.end(),
+                         [&](const Preserve_batch_target_execution &execution) {
+                           return restored_failed_targets.count(
+                                      execution.target_thread_id) != 0;
+                         }),
+          target_results.end());
+      std::sort(source_failed_tokens.begin(), source_failed_tokens.end(),
+                [](const auto &left, const auto &right) {
+                  return left.first < right.first;
+                });
+    }
   }
 
   preserved_batch_items.reserve(quiesced_target_thread_ids.size());

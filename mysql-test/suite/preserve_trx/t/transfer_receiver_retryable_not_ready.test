@@ -1,0 +1,103 @@
+--source include/have_debug.inc
+--source include/not_windows.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_query_log
+--let $credential_file= $MYSQL_TMP_DIR/receiver-retryable-not-ready.secret
+--write_file $credential_file
+receiver-retryable-not-ready-secret
+EOF
+--exec chmod 600 $credential_file
+
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+DROP USER IF EXISTS receiver_retry_app@localhost;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'receiver-retryable-not-ready-secret';
+GRANT SHUTDOWN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.*
+  TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+CREATE USER receiver_retry_app@localhost;
+GRANT SELECT, UPDATE ON test.* TO receiver_retry_app@localhost;
+
+--let $restart_parameters= restart: --preserve-trx-enable=ON --preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --preserve-trx-transfer-target-socket=$MASTER_MYSOCK --preserve-trx-transfer-target-user=preserve_trx_ha_admin --preserve-trx-transfer-credential-name=receiver_retryable_not_ready --preserve-trx-transfer-credential-secret-file=$credential_file
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--let $restart_parameters=
+--disable_query_log
+CALL mtr.add_suppression(
+  "PRESERVE: rolled back prepared transaction without snapshot during recovery");
+
+SET GLOBAL preserve_trx_batch_max_transactions=1;
+SET GLOBAL preserve_trx_transfer_pipeline_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_transfer_prewarm_paused=OFF;
+SET GLOBAL preserve_trx_transfer_receiver_prewarm_timeout_ms=30000;
+SET GLOBAL preserve_trx_transfer_receiver_ready_timeout_ms=120000;
+
+CREATE TABLE t_receiver_retryable_not_ready(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_receiver_retryable_not_ready VALUES(1,10);
+
+--connect(receiver_retry_ha,localhost,preserve_trx_ha_admin,receiver-retryable-not-ready-secret,test)
+SET GLOBAL debug='+d,preserve_trx_receiver_retry_one_token_prewarm';
+
+--connect(receiver_retry_app,localhost,receiver_retry_app,,test)
+--let $app_id= query_get_value(SELECT CONNECTION_ID() AS id, id, 1)
+START TRANSACTION;
+UPDATE t_receiver_retryable_not_ready SET v=11 WHERE id=1;
+
+--connection default
+--replace_result $app_id APP_ID
+--replace_column 1 GENERATION 6 CLOSING_STARTED_US 7 CLOSING_DEADLINE_US
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+
+--connection receiver_retry_ha
+SET GLOBAL debug='-d,preserve_trx_receiver_retry_one_token_prewarm';
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_tokens')=1
+--source include/wait_condition.inc
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_worker_active')=0 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_queued_bytes')=0
+--source include/wait_condition.inc
+
+SELECT VARIABLE_VALUE=1 AS one_ready_token
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens';
+SELECT VARIABLE_VALUE=0 AS no_failed_tokens
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens';
+SELECT VARIABLE_VALUE>0 AS retryable_not_ready_observed
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_seal_prewarm_not_ready_tokens';
+SELECT VARIABLE_VALUE=2 AS exactly_one_retry
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_seal_prewarm_tokens';
+
+--let SEARCH_FILE= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--let SEARCH_PATTERN= PRESERVE: receiver staged-token prewarm deferred .*outcome=RETRYABLE_NOT_READY.*stage=DEBUG_RETRYABLE_NOT_READY.*retry_attempt=0
+--source include/search_pattern.inc
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+SHUTDOWN;
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+
+--exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+--disable_query_log
+
+--connect(receiver_retry_cleanup,localhost,root,,test)
+DROP TABLE t_receiver_retryable_not_ready;
+DROP USER receiver_retry_app@localhost;
+DROP USER preserve_trx_ha_admin@localhost;
+--remove_file $credential_file
+
+--enable_query_log

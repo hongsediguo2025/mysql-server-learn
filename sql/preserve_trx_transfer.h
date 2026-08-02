@@ -620,9 +620,23 @@ struct Preserve_trx_transfer_receiver_status_counts {
 enum class Preserve_trx_transfer_epoch_lifecycle : uint8_t {
   PREWARMING,
   READY,
+  CLASSIFIED,
   ADOPT_LEASED,
   ABANDONING,
   EXPIRED
+};
+
+enum class Preserve_trx_receiver_failure_reason : uint8_t {
+  NONE,
+  UNSUPPORTED_TOKEN_SEMANTICS,
+  TOKEN_RESOURCE_LIMIT,
+  PREWARM_DEADLINE
+};
+
+struct Preserve_trx_receiver_failed_token {
+  uint64_t token{0};
+  Preserve_trx_receiver_failure_reason reason{
+      Preserve_trx_receiver_failure_reason::NONE};
 };
 
 enum class Preserve_trx_receiver_promotion_lease_status : uint8_t {
@@ -643,6 +657,9 @@ struct Preserve_trx_transfer_accepted_epoch {
       Preserve_trx_transfer_epoch_lifecycle::PREWARMING};
   uint64_t deadline_monotonic_us{0};
   bool flat_projection_published{false};
+  std::vector<uint64_t> ready_tokens;
+  std::vector<Preserve_trx_receiver_failed_token> failed_tokens;
+  bool selection_published{false};
 };
 
 enum class Preserve_trx_transfer_epoch_terminal_operation : uint8_t {
@@ -770,6 +787,13 @@ class Preserve_trx_transfer_receiver_registry {
   Preserve_trx_transfer_status mark_accepted_epoch_ready(
       const std::string &root_dir, const std::string &epoch_id, uint64_t now_us,
       uint64_t ready_deadline_monotonic_us);
+  Preserve_trx_transfer_status publish_accepted_epoch_selection(
+      const std::string &root_dir, const std::string &epoch_id, uint64_t now_us,
+      uint64_t ready_deadline_monotonic_us,
+      std::vector<uint64_t> ready_tokens,
+      std::vector<Preserve_trx_receiver_failed_token> failed_tokens);
+  std::vector<std::pair<std::string, std::string>> prewarming_epochs_due(
+      uint64_t now_us) const;
   Preserve_trx_receiver_promotion_lease_status
   try_acquire_accepted_epoch_promotion_lease(
       const std::string &root_dir, const std::string &epoch_id, uint64_t now_us,

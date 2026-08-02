@@ -1,0 +1,90 @@
+--source include/have_debug.inc
+--source include/not_windows.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_query_log
+--let $credential_file= $MYSQL_TMP_DIR/receiver-selection-global.secret
+--write_file $credential_file
+receiver-selection-global-secret
+EOF
+--exec chmod 600 $credential_file
+
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+DROP USER IF EXISTS receiver_global_app@localhost;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'receiver-selection-global-secret';
+GRANT SHUTDOWN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.*
+  TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+CREATE USER receiver_global_app@localhost;
+GRANT SELECT, UPDATE ON test.* TO receiver_global_app@localhost;
+
+--let $restart_parameters= restart: --preserve-trx-enable=ON --preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --preserve-trx-transfer-target-socket=$MASTER_MYSOCK --preserve-trx-transfer-target-user=preserve_trx_ha_admin --preserve-trx-transfer-credential-name=receiver_selection_global --preserve-trx-transfer-credential-secret-file=$credential_file
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--let $restart_parameters=
+--disable_query_log
+CALL mtr.add_suppression(
+  "PRESERVE: rolled back prepared transaction without snapshot during recovery");
+
+SET GLOBAL preserve_trx_batch_max_transactions=2;
+SET GLOBAL preserve_trx_transfer_pipeline_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_transfer_receiver_prewarm_timeout_ms=1000;
+
+CREATE TABLE t_receiver_selection_global(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_receiver_selection_global VALUES(1,10),(2,20);
+
+--connect(receiver_global_ha,localhost,preserve_trx_ha_admin,receiver-selection-global-secret,test)
+SET GLOBAL debug='+d,preserve_trx_receiver_fail_epoch_prewarm';
+
+--connect(receiver_global_app1,localhost,receiver_global_app,,test)
+--let $app1_id= query_get_value(SELECT CONNECTION_ID() AS id, id, 1)
+START TRANSACTION;
+UPDATE t_receiver_selection_global SET v=11 WHERE id=1;
+
+--connect(receiver_global_app2,localhost,receiver_global_app,,test)
+--let $app2_id= query_get_value(SELECT CONNECTION_ID() AS id, id, 1)
+START TRANSACTION;
+UPDATE t_receiver_selection_global SET v=21 WHERE id=2;
+
+--connection default
+--replace_result $app1_id APP1_ID $app2_id APP2_ID
+--replace_column 1 GENERATION 6 CLOSING_STARTED_US 7 CLOSING_DEADLINE_US
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+
+--connection receiver_global_ha
+SET GLOBAL debug='-d,preserve_trx_receiver_fail_epoch_prewarm';
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')=0
+--source include/wait_condition.inc
+SELECT VARIABLE_VALUE=0 AS no_classified_tokens
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_tokens';
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+SHUTDOWN;
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+
+--exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+--disable_query_log
+
+--connect(receiver_global_cleanup,localhost,root,,test)
+DROP TABLE t_receiver_selection_global;
+DROP USER receiver_global_app@localhost;
+DROP USER preserve_trx_ha_admin@localhost;
+--remove_file $credential_file
+
+--enable_query_log

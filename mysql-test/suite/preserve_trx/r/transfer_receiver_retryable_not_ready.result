@@ -1,0 +1,11 @@
+generation	outcome	source_connection_id	token_role	reason	closing_started_us	closing_deadline_us
+GENERATION	SUCCESS	APP_ID	SURVIVOR	NONE	CLOSING_STARTED_US	CLOSING_DEADLINE_US
+one_ready_token
+1
+no_failed_tokens
+1
+retryable_not_ready_observed
+1
+exactly_one_retry
+1
+Pattern "PRESERVE: receiver staged-token prewarm deferred .*outcome=RETRYABLE_NOT_READY.*stage=DEBUG_RETRYABLE_NOT_READY.*retry_attempt=0" found

@@ -16537,7 +16537,7 @@ TEST_F(PreserveSnapshotTest,
 }
 
 TEST_F(PreserveSnapshotTest,
-       TransferReceiverExpiryCancelsActivePrewarmWithoutReadyResurrection) {
+       TransferReceiverDeadlineClassifiesActivePrewarmWithoutReadyResurrection) {
   Transfer_codec_context_guard codec_guard;
   const uint64_t transfer_token = 1039;
   Preserve_snapshot_metadata meta = metadata();
@@ -16639,11 +16639,27 @@ TEST_F(PreserveSnapshotTest,
   }
   EXPECT_EQ(0U,
             preserve_trx_transfer_receiver_staged_token_active_status());
+  ASSERT_EQ(Preserve_trx_transfer_status::COMMITTED_NOT_READY,
+            registry.query_accepted_epoch(m_dir, manifest.epoch_id,
+                                          &accepted));
+  EXPECT_EQ(Preserve_trx_transfer_epoch_lifecycle::CLASSIFIED,
+            accepted.lifecycle);
+  EXPECT_TRUE(accepted.selection_published);
+  EXPECT_TRUE(accepted.ready_tokens.empty());
+  ASSERT_EQ(1U, accepted.failed_tokens.size());
+  EXPECT_EQ(transfer_token, accepted.failed_tokens[0].token);
+  EXPECT_EQ(Preserve_trx_receiver_failure_reason::PREWARM_DEADLINE,
+            accepted.failed_tokens[0].reason);
+  EXPECT_EQ(1U, registry.size());
+  EXPECT_FALSE(preserve_trx_transfer_epoch_bound_for_unit_test(
+      m_dir, manifest.epoch_id));
+  EXPECT_GT(preserve_trx_promotion_ready_cache_bytes_status(), 0U);
+
+  preserve_trx_transfer_receiver_reaper_scan_for_unit_test(
+      accepted.deadline_monotonic_us, &registry);
   EXPECT_EQ(Preserve_trx_transfer_status::IO_ERROR,
             registry.query_accepted_epoch(m_dir, manifest.epoch_id));
   EXPECT_EQ(0U, registry.size());
-  EXPECT_FALSE(preserve_trx_transfer_epoch_bound_for_unit_test(
-      m_dir, manifest.epoch_id));
   EXPECT_EQ(0U, preserve_trx_promotion_ready_cache_bytes_status());
 
   Preserve_trx_promotion_ready_summary ready_summary;
