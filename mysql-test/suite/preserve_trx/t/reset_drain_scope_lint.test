@@ -47,6 +47,8 @@ sub assert_tree_has_no_reset_drain_hook {
 
 my $preserve = read_source(source_path('sql', 'preserve_trx.cc'));
 my $preserve_header = read_source(source_path('sql', 'preserve_trx.h'));
+my $kernel_header =
+  read_source(source_path('sql', 'preserve_trx_kernel.h'));
 my $transfer = read_source(source_path('sql', 'preserve_trx_transfer.cc'));
 my $transfer_header =
   read_source(source_path('sql', 'preserve_trx_transfer.h'));
@@ -161,6 +163,49 @@ die "RESET batch restore must replay targets in reverse preserve order\n"
 die "receiver COMMIT status query must use the epoch terminal tombstone, not accepted lifecycle alone\n"
   unless $transfer =~
          /preserve_trx_transfer_query_epoch_commit_status\([\s\S]*query_epoch_terminal\s*\(\s*root_dir,\s*epoch_id\s*\)/s;
+
+die "single-token preserve kernel request must carry only the existing drain ownership state\n"
+  unless $kernel_header =~
+         /const Preserve_trx_drain_ownership_state\s*\*drain_ownership\s*\{\s*nullptr\s*\}/s;
+die "ordinary preserve calls must keep drain ownership optional and disabled by default\n"
+  unless $preserve_header =~
+         /Preserve_trx_deferred_transfer_candidate\s*\*deferred_transfer_candidate\s*=\s*nullptr,\s*const Preserve_trx_drain_ownership_state\s*\*drain_ownership\s*=\s*nullptr/s;
+die "batch target preserve must pass the active attempt ownership without creating another cancel flag\n"
+  unless $preserve =~
+         /m_drain_attempt\s*==\s*nullptr\s*\?\s*nullptr\s*:\s*&m_drain_attempt->ownership/s;
+
+my ($preserve_kernel) =
+  $preserve =~
+    /(bool preserve_trx_kernel_preserve_attached_transaction\([\s\S]*?^})/m
+  or die "could not isolate single-token preserve kernel\n";
+die "kernel RESET polling must remain batch-only and use RESET_REQUESTED ownership\n"
+  unless $preserve_kernel =~
+           /return batch_delivery\s*&&\s*request\.drain_ownership\s*!=\s*nullptr\s*&&[\s\S]*Preserve_trx_drain_terminal::RESET_REQUESTED/s;
+die "preflight RESET must reuse the attached pre-prepare recovery branch\n"
+  unless $preserve_kernel =~
+         /if \(reset_requested\(\)\)\s*return reject_after_binlog_export\("batch_target_preserve_reset"\)/s;
+die "RESET before engine prepare must reuse the complete unprepared restore branch\n"
+  unless $preserve_kernel =~
+         /preserve_trx_batch_cancel_before_prepare[\s\S]*set_failure_reason\("batch_target_preserve_reset"\)[\s\S]*return restore_unprepared_batch_prepare_failure_or_rollback\(\)/s;
+die "RESET after engine prepare must thaw and reuse the prepared restore branch\n"
+  unless $preserve_kernel =~
+         /preserve_trx_batch_cancel_after_prepare[\s\S]*thaw_lock_warmcopy_conversion\(\)[\s\S]*return restore_prepared_batch_or_rollback\(\)/s;
+die "RESET after detach must reuse the detached reattach-or-rollback branch\n"
+  unless $preserve_kernel =~
+         /preserve_trx_after_detach_before_claim[\s\S]*preserve_trx_batch_cancel_after_detach[\s\S]*return reject_after_detach_failure_or_rollback\(\)/s;
+die "RESET before artifact publication must discard warm blobs and reuse snapshot cleanup\n"
+  unless $preserve_kernel =~
+         /preserve_trx_before_artifact_publish[\s\S]*preserve_trx_batch_cancel_before_publish[\s\S]*discard_prebuilt_binlog_blob_if_needed\(\)[\s\S]*return reject_after_snapshot_failure\(false\)/s;
+
+die "early workers must enter RESET completion after join/result collection\n"
+  unless $preserve =~
+         /const size_t expected_completed_workers[\s\S]*if \(reset_requested\(\)\)[\s\S]*finish_reset_with_provenance\([\s\S]*reset_during_early_target_pipeline/s;
+die "phase-2 workers must enter RESET completion before ordinary target failure handling\n"
+  unless $preserve =~
+         /const Preserve_batch_target_execution \*failed_execution[\s\S]*if \(reset_requested\(\)\)\s*return finish_reset_with_provenance\(&preserved_batch_items,\s*"reset_after_phase2_workers"\);\s*if \(failed_execution != nullptr\)/s;
+die "RESET provenance wrapper must delegate transaction restoration to finish_phase2_reset\n"
+  unless $preserve =~
+         /auto finish_reset_with_provenance\s*=[\s\S]*return finish_phase2_reset\(items, stage\)[\s\S]*return finish_phase2_reset\(items, stage, &batch_provenance_tokens\)/s;
 
 my ($reset_participant_stop) =
   $preserve =~

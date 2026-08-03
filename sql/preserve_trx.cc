@@ -8921,7 +8921,9 @@ class Preserve_batch_quiesced_idle_target final {
               m_defer_snapshot_directory_fsync,
               m_transfer_source_epoch_session, m_transfer_preserve_dir,
               m_preselected_token, true, true,
-              m_deferred_transfer_candidate);
+              m_deferred_transfer_candidate,
+              m_drain_attempt == nullptr ? nullptr
+                                         : &m_drain_attempt->ownership);
         }
       }
       break;
@@ -15486,6 +15488,11 @@ bool preserve_trx_kernel_preserve_attached_transaction(
 
   const bool batch_delivery =
       delivery_mode == Preserve_trx_delivery_mode::BATCH_MANAGER_DELIVERY;
+  auto reset_requested = [&]() {
+    return batch_delivery && request.drain_ownership != nullptr &&
+           request.drain_ownership->state() ==
+               Preserve_trx_drain_terminal::RESET_REQUESTED;
+  };
   auto reject_unsupported_for_delivery = [&](const char *reason = "unsupported") {
     set_failure_reason(reason);
     if (batch_delivery) {
@@ -15494,6 +15501,9 @@ bool preserve_trx_kernel_preserve_attached_transaction(
     }
     return preserve_trx_reject_unsupported();
   };
+
+  if (reset_requested())
+    return reject_unsupported_for_delivery("batch_target_preserve_reset");
 
   if (timeout_seconds == 0)
     return reject_unsupported_for_delivery("timeout_zero");
@@ -15604,6 +15614,8 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   DBUG_EXECUTE_IF("preserve_trx_fail_after_binlog_mode_validation",
                   return reject_after_binlog_export(
                       "debug_after_binlog_mode_validation"););
+  if (reset_requested())
+    return reject_after_binlog_export("batch_target_preserve_reset");
 
   set_stage(Preserve_trx_preserve_stage::LOCK_PREFLIGHT);
   const Preserve_trx_lock_warmcopy_options lock_warmcopy_options =
@@ -15809,6 +15821,8 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   if (result != nullptr && use_lock_warmcopy_artifact && savepoint_count != 0) {
     result->phase2_savepoint_live_export_target_count = 1;
   }
+  if (reset_requested())
+    return reject_after_binlog_export("batch_target_preserve_reset");
 
   /*
     Record-lock image export may reject row shapes that are not yet part of the
@@ -16195,6 +16209,11 @@ bool preserve_trx_kernel_preserve_attached_transaction(
     thd->send_kill_message();
     return restore_unprepared_batch_prepare_failure_or_rollback();
   }
+  if (reset_requested()) {
+    DEBUG_SYNC(thd, "preserve_trx_batch_cancel_before_prepare");
+    set_failure_reason("batch_target_preserve_reset");
+    return restore_unprepared_batch_prepare_failure_or_rollback();
+  }
 
   *thd->get_transaction()->xid_state()->get_xid() = xid;
   bool prepare_failed =
@@ -16470,6 +16489,12 @@ bool preserve_trx_kernel_preserve_attached_transaction(
         true, "single_kill_connection_after_prepare_cleanup");
   }
   if (thd->killed == THD::KILL_QUERY) thd->killed = THD::NOT_KILLED;
+  if (reset_requested()) {
+    DEBUG_SYNC(thd, "preserve_trx_batch_cancel_after_prepare");
+    set_failure_reason("batch_target_preserve_reset");
+    thaw_lock_warmcopy_conversion();
+    return restore_prepared_batch_or_rollback();
+  }
 
   set_stage(Preserve_trx_preserve_stage::DETACH);
   trx_preserve_thd_transition_failure detach_failure =
@@ -16550,6 +16575,14 @@ bool preserve_trx_kernel_preserve_attached_transaction(
       return reject_unsupported_for_delivery();
     return rollback_claimed_after_detach_failure();
   };
+
+  DEBUG_SYNC(thd, "preserve_trx_after_detach_before_claim");
+  if (reset_requested()) {
+    DEBUG_SYNC(thd, "preserve_trx_batch_cancel_after_detach");
+    set_failure_reason("batch_target_preserve_reset");
+    thaw_lock_warmcopy_conversion();
+    return reject_after_detach_failure_or_rollback();
+  }
 
   if (trx_preserve_claim_detached_prepared(trx) != DB_SUCCESS) {
     thaw_lock_warmcopy_conversion();
@@ -16859,6 +16892,11 @@ bool preserve_trx_kernel_preserve_attached_transaction(
     return reject_unsupported_for_delivery();
   };
 
+  if (reset_requested()) {
+    set_failure_reason("batch_target_preserve_reset");
+    return reject_after_snapshot_failure(false);
+  }
+
   set_stage(Preserve_trx_preserve_stage::SNAPSHOT_WRITE);
   Preserved_trx_observable_state_guard snapshotting_state(
       metadata, trx, Preserved_trx_lifecycle_state::SNAPSHOTTING);
@@ -17052,6 +17090,14 @@ bool preserve_trx_kernel_preserve_attached_transaction(
         !preserve_trx_build_resurrection_index_entry(
             static_cast<uint64_t>(thd->thread_id()), resurrection_facts,
             &local_resurrection_entry);
+  }
+
+  DEBUG_SYNC(thd, "preserve_trx_before_artifact_publish");
+  if (reset_requested()) {
+    DEBUG_SYNC(thd, "preserve_trx_batch_cancel_before_publish");
+    set_failure_reason("batch_target_preserve_reset");
+    discard_prebuilt_binlog_blob_if_needed();
+    return reject_after_snapshot_failure(false);
   }
 
   Preserve_snapshot_write_options snapshot_write_options;
@@ -17279,7 +17325,8 @@ bool preserve_trx_preserve_attached_transaction(
     const std::string &preselected_token,
     bool xid_provenance_intent_prepared,
     bool defer_xid_provenance_bind,
-    Preserve_trx_deferred_transfer_candidate *deferred_transfer_candidate) {
+    Preserve_trx_deferred_transfer_candidate *deferred_transfer_candidate,
+    const Preserve_trx_drain_ownership_state *drain_ownership) {
   const bool batch_delivery =
       delivery_mode == Preserve_trx_delivery_mode::BATCH_MANAGER_DELIVERY;
   if (target_thd == nullptr) {
@@ -17327,7 +17374,8 @@ bool preserve_trx_preserve_attached_transaction(
                                       transfer_preserve_dir, preselected_token,
                                       xid_provenance_intent_prepared,
                                       defer_xid_provenance_bind,
-                                      deferred_transfer_candidate};
+                                      deferred_transfer_candidate,
+                                      drain_ownership};
   const bool error = preserve_trx_kernel_preserve_attached_transaction(request);
   if (error || batch_delivery) return error;
 

@@ -53,6 +53,9 @@ SET DEBUG_SYNC = 'now SIGNAL continue_drain_token';
 
 --connection default
 SET DEBUG_SYNC = 'RESET';
+--let $wait_condition= SELECT COUNT(*)=0 FROM performance_schema.threads WHERE PROCESSLIST_ID=$preserve_conn_id
+--let $wait_timeout= 10
+--source include/wait_condition.inc
 SELECT * FROM t_preserve_drain_inflight ORDER BY a;
 SELECT COUNT(*) AS preserved_count
   FROM performance_schema.preserved_transactions;

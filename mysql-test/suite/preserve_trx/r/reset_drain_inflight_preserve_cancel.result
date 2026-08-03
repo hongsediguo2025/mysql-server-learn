@@ -1,0 +1,20 @@
+SELECT 'before_prepare' AS scenario,
+CONNECTION_ID()=@original_connection_id AS same_connection;
+scenario	same_connection
+before_prepare	1
+SELECT 'after_prepare' AS scenario,
+CONNECTION_ID()=@original_connection_id AS same_connection;
+scenario	same_connection
+after_prepare	1
+SELECT 'after_detach' AS scenario,
+CONNECTION_ID()=@original_connection_id AS same_connection;
+scenario	same_connection
+after_detach	1
+SELECT 'before_publish' AS scenario,
+CONNECTION_ID()=@original_connection_id AS same_connection;
+scenario	same_connection
+before_publish	1
+SELECT GROUP_CONCAT(CONCAT(id, ':', v) ORDER BY id) AS committed_values
+FROM t_reset_inflight_cancel;
+committed_values
+1:21,2:31,3:41,4:51

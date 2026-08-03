@@ -746,7 +746,8 @@ bool preserve_trx_preserve_attached_transaction(
     bool xid_provenance_intent_prepared = false,
     bool defer_xid_provenance_bind = false,
     Preserve_trx_deferred_transfer_candidate *deferred_transfer_candidate =
-        nullptr);
+        nullptr,
+    const Preserve_trx_drain_ownership_state *drain_ownership = nullptr);
 
 /*
   SQL command for preserving the current transaction before shutdown.

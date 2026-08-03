@@ -1,0 +1,308 @@
+# RESET must be observed by a phase-2 worker already inside the single-token
+# Preserve kernel. Each scenario pauses at a distinct ownership boundary,
+# publishes RESET, then verifies that the original connection and transaction
+# continue without waiting for receiver cleanup.
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_query_log
+
+--let $credential_file= $MYSQL_TMP_DIR/reset_drain_inflight_cancel.secret
+--write_file $credential_file
+reset-drain-inflight-cancel-secret
+EOF
+--exec chmod 600 $credential_file
+
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+DROP USER IF EXISTS reset_drain_app@localhost;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'reset-drain-inflight-cancel-secret';
+GRANT SHUTDOWN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.*
+  TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+CREATE USER reset_drain_app@localhost;
+GRANT SELECT, UPDATE ON test.* TO reset_drain_app@localhost;
+GRANT SESSION_VARIABLES_ADMIN ON *.* TO reset_drain_app@localhost;
+
+--let $restart_parameters= restart: --preserve-trx-enable=ON --preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --preserve-trx-transfer-target-socket=$MASTER_MYSOCK --preserve-trx-transfer-target-user=preserve_trx_ha_admin --preserve-trx-transfer-credential-name=reset_drain_inflight_cancel_mtr --preserve-trx-transfer-credential-secret-file=$credential_file
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--let $restart_parameters=
+--disable_query_log
+
+CALL mtr.add_suppression(
+  "PRESERVE: rolled back prepared transaction without snapshot during recovery");
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_transfer_pipeline_enable=ON;
+SET GLOBAL preserve_trx_transfer_prewarm_paused=ON;
+SET GLOBAL preserve_trx_transfer_receiver_prewarm_timeout_ms=1000;
+SET GLOBAL preserve_trx_transfer_receiver_ready_timeout_ms=1000;
+
+--disable_warnings
+DROP TABLE IF EXISTS t_reset_inflight_cancel;
+--enable_warnings
+CREATE TABLE t_reset_inflight_cancel(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_reset_inflight_cancel VALUES (1,10),(2,20),(3,30),(4,40);
+
+--connect(reset_cancel_control,localhost,preserve_trx_ha_admin,reset-drain-inflight-cancel-secret,test)
+SET @receiver_active_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs');
+
+# UNDO_PREPARE stage entered, engine prepare not called.
+--connect(reset_cancel_before_prepare_app,localhost,reset_drain_app,,test)
+SET @original_connection_id=CONNECTION_ID();
+START TRANSACTION;
+UPDATE t_reset_inflight_cancel SET v=v+1 WHERE id=1;
+SET DEBUG_SYNC=
+  'preserve_trx_before_undo_prepare SIGNAL cancel_before_prepare_waiting WAIT_FOR cancel_before_prepare_release';
+SET DEBUG_SYNC=
+  'preserve_trx_batch_cancel_before_prepare SIGNAL cancel_before_prepare_observed';
+
+--connect(reset_cancel_before_prepare_owner,localhost,root,,test)
+--send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300 WITH USER VARS
+
+--connection reset_cancel_control
+SET DEBUG_SYNC='now WAIT_FOR cancel_before_prepare_waiting TIMEOUT 30';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die before-prepare pause point was not reached
+}
+--connect(reset_cancel_before_prepare_reset,localhost,preserve_trx_ha_admin,reset-drain-inflight-cancel-secret,test)
+--send RESET DRAIN
+--connection reset_cancel_control
+--let $wait_timeout= 10
+--let $wait_condition= SELECT COUNT(*)=1 FROM performance_schema.threads WHERE PROCESSLIST_INFO='RESET DRAIN'
+--source include/wait_condition.inc
+SET DEBUG_SYNC='now SIGNAL cancel_before_prepare_release';
+SET DEBUG_SYNC='now WAIT_FOR cancel_before_prepare_observed TIMEOUT 3';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die before-prepare RESET was not observed
+}
+
+--connection reset_cancel_before_prepare_reset
+--reap
+--connection reset_cancel_before_prepare_app
+--enable_query_log
+SELECT 'before_prepare' AS scenario,
+  CONNECTION_ID()=@original_connection_id AS same_connection;
+--disable_query_log
+UPDATE t_reset_inflight_cancel SET v=v+10 WHERE id=1;
+COMMIT;
+--connection reset_cancel_before_prepare_owner
+--disable_result_log
+--error 4021
+--reap
+--enable_result_log
+--connection reset_cancel_control
+--let $wait_timeout= 30
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')=@receiver_active_before
+--source include/wait_condition.inc
+--connection default
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+--disconnect reset_cancel_before_prepare_app
+--disconnect reset_cancel_before_prepare_owner
+--disconnect reset_cancel_before_prepare_reset
+
+# Engine prepare completed, transaction still attached to the original THD.
+--connect(reset_cancel_after_prepare_app,localhost,reset_drain_app,,test)
+SET @original_connection_id=CONNECTION_ID();
+START TRANSACTION;
+UPDATE t_reset_inflight_cancel SET v=v+1 WHERE id=2;
+SET DEBUG_SYNC=
+  'preserve_trx_after_undo_prepared SIGNAL cancel_after_prepare_waiting WAIT_FOR cancel_after_prepare_release';
+SET DEBUG_SYNC=
+  'preserve_trx_batch_cancel_after_prepare SIGNAL cancel_after_prepare_observed';
+
+--connect(reset_cancel_after_prepare_owner,localhost,root,,test)
+--send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300 WITH USER VARS
+
+--connection reset_cancel_control
+SET DEBUG_SYNC='now WAIT_FOR cancel_after_prepare_waiting TIMEOUT 30';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die after-prepare pause point was not reached
+}
+--connect(reset_cancel_after_prepare_reset,localhost,preserve_trx_ha_admin,reset-drain-inflight-cancel-secret,test)
+--send RESET DRAIN
+--connection reset_cancel_control
+--let $wait_timeout= 10
+--let $wait_condition= SELECT COUNT(*)=1 FROM performance_schema.threads WHERE PROCESSLIST_INFO='RESET DRAIN'
+--source include/wait_condition.inc
+SET DEBUG_SYNC='now SIGNAL cancel_after_prepare_release';
+SET DEBUG_SYNC='now WAIT_FOR cancel_after_prepare_observed TIMEOUT 3';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die after-prepare RESET was not observed
+}
+
+--connection reset_cancel_after_prepare_reset
+--reap
+--connection reset_cancel_after_prepare_app
+--enable_query_log
+SELECT 'after_prepare' AS scenario,
+  CONNECTION_ID()=@original_connection_id AS same_connection;
+--disable_query_log
+UPDATE t_reset_inflight_cancel SET v=v+10 WHERE id=2;
+COMMIT;
+--connection reset_cancel_after_prepare_owner
+--disable_result_log
+--error 4021
+--reap
+--enable_result_log
+--connection reset_cancel_control
+--let $wait_timeout= 30
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')=@receiver_active_before
+--source include/wait_condition.inc
+--connection default
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+--disconnect reset_cancel_after_prepare_app
+--disconnect reset_cancel_after_prepare_owner
+--disconnect reset_cancel_after_prepare_reset
+
+# Transaction detached from the original THD, before detached claim.
+--connect(reset_cancel_after_detach_app,localhost,reset_drain_app,,test)
+SET @original_connection_id=CONNECTION_ID();
+START TRANSACTION;
+UPDATE t_reset_inflight_cancel SET v=v+1 WHERE id=3;
+SET DEBUG_SYNC=
+  'preserve_trx_after_detach_before_claim SIGNAL cancel_after_detach_waiting WAIT_FOR cancel_after_detach_release';
+SET DEBUG_SYNC=
+  'preserve_trx_batch_cancel_after_detach SIGNAL cancel_after_detach_observed';
+
+--connect(reset_cancel_after_detach_owner,localhost,root,,test)
+--send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300 WITH USER VARS
+
+--connection reset_cancel_control
+SET DEBUG_SYNC='now WAIT_FOR cancel_after_detach_waiting TIMEOUT 30';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die after-detach pause point was not reached
+}
+--connect(reset_cancel_after_detach_reset,localhost,preserve_trx_ha_admin,reset-drain-inflight-cancel-secret,test)
+--send RESET DRAIN
+--connection reset_cancel_control
+--let $wait_timeout= 10
+--let $wait_condition= SELECT COUNT(*)=1 FROM performance_schema.threads WHERE PROCESSLIST_INFO='RESET DRAIN'
+--source include/wait_condition.inc
+SET DEBUG_SYNC='now SIGNAL cancel_after_detach_release';
+SET DEBUG_SYNC='now WAIT_FOR cancel_after_detach_observed TIMEOUT 3';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die after-detach RESET was not observed
+}
+
+--connection reset_cancel_after_detach_reset
+--reap
+--connection reset_cancel_after_detach_app
+--enable_query_log
+SELECT 'after_detach' AS scenario,
+  CONNECTION_ID()=@original_connection_id AS same_connection;
+--disable_query_log
+UPDATE t_reset_inflight_cancel SET v=v+10 WHERE id=3;
+COMMIT;
+--connection reset_cancel_after_detach_owner
+--disable_result_log
+--error 4021
+--reap
+--enable_result_log
+--connection reset_cancel_control
+--let $wait_timeout= 30
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')=@receiver_active_before
+--source include/wait_condition.inc
+--connection default
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+--disconnect reset_cancel_after_detach_app
+--disconnect reset_cancel_after_detach_owner
+--disconnect reset_cancel_after_detach_reset
+
+# Snapshot bundle built, before the artifact sink publishes it.
+--connect(reset_cancel_before_publish_app,localhost,reset_drain_app,,test)
+SET @original_connection_id=CONNECTION_ID();
+START TRANSACTION;
+UPDATE t_reset_inflight_cancel SET v=v+1 WHERE id=4;
+SET DEBUG_SYNC=
+  'preserve_trx_before_artifact_publish SIGNAL cancel_before_publish_waiting WAIT_FOR cancel_before_publish_release';
+SET DEBUG_SYNC=
+  'preserve_trx_batch_cancel_before_publish SIGNAL cancel_before_publish_observed';
+
+--connect(reset_cancel_before_publish_owner,localhost,root,,test)
+--send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300 WITH USER VARS
+
+--connection reset_cancel_control
+SET DEBUG_SYNC='now WAIT_FOR cancel_before_publish_waiting TIMEOUT 30';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die before-publish pause point was not reached
+}
+--connect(reset_cancel_before_publish_reset,localhost,preserve_trx_ha_admin,reset-drain-inflight-cancel-secret,test)
+--send RESET DRAIN
+--connection reset_cancel_control
+--let $wait_timeout= 10
+--let $wait_condition= SELECT COUNT(*)=1 FROM performance_schema.threads WHERE PROCESSLIST_INFO='RESET DRAIN'
+--source include/wait_condition.inc
+SET DEBUG_SYNC='now SIGNAL cancel_before_publish_release';
+SET DEBUG_SYNC='now WAIT_FOR cancel_before_publish_observed TIMEOUT 3';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die before-publish RESET was not observed
+}
+
+--connection reset_cancel_before_publish_reset
+--reap
+--connection reset_cancel_before_publish_app
+--enable_query_log
+SELECT 'before_publish' AS scenario,
+  CONNECTION_ID()=@original_connection_id AS same_connection;
+--disable_query_log
+UPDATE t_reset_inflight_cancel SET v=v+10 WHERE id=4;
+COMMIT;
+--connection reset_cancel_before_publish_owner
+--disable_result_log
+--error 4021
+--reap
+--enable_result_log
+--connection reset_cancel_control
+--let $wait_timeout= 30
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')=@receiver_active_before
+--source include/wait_condition.inc
+--connection default
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+--disconnect reset_cancel_before_publish_app
+--disconnect reset_cancel_before_publish_owner
+--disconnect reset_cancel_before_publish_reset
+
+--enable_query_log
+SELECT GROUP_CONCAT(CONCAT(id, ':', v) ORDER BY id) AS committed_values
+FROM t_reset_inflight_cancel;
+--disable_query_log
+
+--disconnect reset_cancel_control
+DROP TABLE t_reset_inflight_cancel;
+DROP USER preserve_trx_ha_admin@localhost;
+DROP USER reset_drain_app@localhost;
+SET DEBUG_SYNC='RESET';
+--remove_file $credential_file
+
+--enable_query_log

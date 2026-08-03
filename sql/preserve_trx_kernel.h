@@ -52,6 +52,7 @@ struct Preserve_trx_kernel_request {
   bool defer_xid_provenance_bind{false};
   Preserve_trx_deferred_transfer_candidate *deferred_transfer_candidate{
       nullptr};
+  const Preserve_trx_drain_ownership_state *drain_ownership{nullptr};
 };
 
 struct Preserve_trx_kernel_result {

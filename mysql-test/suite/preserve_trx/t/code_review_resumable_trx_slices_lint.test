@@ -2194,7 +2194,7 @@ die "lock warmcopy conversion freeze must cover detach, claim, lock metadata, an
          $lock_warmcopy_guarded_metadata =~ /trx_preserve_table_locks_payload_has_autoinc[\s\S]*preserve_trx_lock_warmcopy_after_lock_metadata_guarded[\s\S]*verify_lock_warmcopy_frozen_fence\s*\(\s*\)/s;
 die "lock warmcopy conversion freeze must not be released before snapshot metadata is built\n"
   if $preserve =~ /lock_warmcopy_trx_lock_fence_equal\s*\(\s*lock_warmcopy_frozen_fence[\s\S]{0,700}thaw_lock_warmcopy_conversion\s*\(\s*\)\s*;\s*metadata\.has_read_view/s;
-$preserve =~ /auto reject_after_snapshot_failure\s*=\s*\[\&\]\([\s\S]*?\)\s*\{([\s\S]*?)\n\s*\};\n\n\s*set_stage\s*\(\s*Preserve_trx_preserve_stage::SNAPSHOT_WRITE\s*\)/m
+$preserve =~ /auto reject_after_snapshot_failure\s*=\s*\[\&\]\([\s\S]*?\)\s*\{([\s\S]*?)\n\s*\};\n\n(?:\s*if\s*\(\s*reset_requested\(\)\s*\)\s*\{[\s\S]*?\n\s*\}\n\n)?\s*set_stage\s*\(\s*Preserve_trx_preserve_stage::SNAPSHOT_WRITE\s*\)/m
   or die "could not isolate snapshot failure cleanup helper\n";
 my $lock_warmcopy_snapshot_failure_cleanup = $1;
 die "snapshot failure cleanup must thaw lock warmcopy conversion waiters before rollback or reattach\n"
