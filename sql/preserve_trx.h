@@ -328,10 +328,17 @@ enum class Preserve_trx_drain_terminal : uint8_t {
   SHUTDOWN_HANDOFF
 };
 
+enum class Preserve_trx_drain_reset_request : uint8_t {
+  WON,
+  JOINED,
+  ALREADY_RESTORED,
+  INVALID
+};
+
 class Preserve_trx_drain_ownership_state {
  public:
   Preserve_trx_drain_terminal state() const;
-  bool request_reset();
+  Preserve_trx_drain_reset_request request_reset();
   bool begin_commit_send();
   bool mark_commit_unknown();
   bool resolve_not_committed_clean();

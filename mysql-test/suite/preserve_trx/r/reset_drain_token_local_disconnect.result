@@ -1,0 +1,7 @@
+SELECT CONNECTION_ID()=@keep_connection_id AS surviving_connection_resumed;
+surviving_connection_resumed
+1
+SELECT id,v FROM t_reset_drain_token_local ORDER BY id;
+id	v
+1	21
+2	20

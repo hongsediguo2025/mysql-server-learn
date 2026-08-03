@@ -1,0 +1,118 @@
+# A disconnected source THD is a token-local RESET outcome. Its transaction
+# rolls back independently while other preserved source sessions resume.
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_query_log
+--let $credential_file= $MYSQL_TMP_DIR/reset_drain_token_local.secret
+--write_file $credential_file
+reset-drain-token-local-secret
+EOF
+--exec chmod 600 $credential_file
+
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+DROP USER IF EXISTS reset_drain_token_app@localhost;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'reset-drain-token-local-secret';
+GRANT SHUTDOWN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.*
+  TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+CREATE USER reset_drain_token_app@localhost;
+GRANT SELECT, UPDATE ON test.* TO reset_drain_token_app@localhost;
+GRANT SESSION_VARIABLES_ADMIN ON *.* TO reset_drain_token_app@localhost;
+
+--let $restart_parameters= restart: --preserve-trx-enable=ON --preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --preserve-trx-transfer-target-socket=$MASTER_MYSOCK --preserve-trx-transfer-target-user=preserve_trx_ha_admin --preserve-trx-transfer-credential-name=reset_drain_token_local_mtr --preserve-trx-transfer-credential-secret-file=$credential_file
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--let $restart_parameters=
+--disable_query_log
+
+CALL mtr.add_suppression(
+  "PRESERVE: rolled back prepared transaction without snapshot during recovery");
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_transfer_prewarm_paused=ON;
+SET GLOBAL preserve_trx_transfer_receiver_prewarm_timeout_ms=1000;
+SET GLOBAL preserve_trx_transfer_receiver_ready_timeout_ms=1000;
+
+--disable_warnings
+DROP TABLE IF EXISTS t_reset_drain_token_local;
+--enable_warnings
+CREATE TABLE t_reset_drain_token_local(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_reset_drain_token_local VALUES (1,10),(2,20);
+
+--connect(reset_token_ha,localhost,preserve_trx_ha_admin,reset-drain-token-local-secret,test)
+SET @receiver_active_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs');
+
+--connect(reset_token_keep,localhost,reset_drain_token_app,,test)
+SET @keep_connection_id=CONNECTION_ID();
+START TRANSACTION;
+UPDATE t_reset_drain_token_local SET v=v+1 WHERE id=1;
+
+--connect(reset_token_drop,localhost,reset_drain_token_app,,test)
+--let $drop_connection_id= `SELECT CONNECTION_ID()`
+START TRANSACTION;
+UPDATE t_reset_drain_token_local SET v=v+1 WHERE id=2;
+
+--connect(reset_token_owner,localhost,root,,test)
+--disable_result_log
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300 WITH USER VARS;
+--enable_result_log
+
+--connection reset_token_keep
+--disable_result_log
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+UPDATE t_reset_drain_token_local SET v=v WHERE id=1;
+--enable_result_log
+
+--disconnect reset_token_drop
+--connection reset_token_ha
+--let $wait_timeout= 30
+--let $wait_condition= SELECT COUNT(*)=0 FROM performance_schema.threads WHERE PROCESSLIST_ID=$drop_connection_id
+--source include/wait_condition.inc
+RESET DRAIN;
+
+--connection reset_token_keep
+UPDATE t_reset_drain_token_local SET v=v+10 WHERE id=1;
+COMMIT;
+--enable_query_log
+SELECT CONNECTION_ID()=@keep_connection_id AS surviving_connection_resumed;
+--disable_query_log
+
+--connection reset_token_ha
+--let $wait_timeout= 30
+--let $wait_condition= SELECT v=20 FROM t_reset_drain_token_local WHERE id=2
+--source include/wait_condition.inc
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')=@receiver_active_before
+--source include/wait_condition.inc
+
+--connection default
+--enable_query_log
+SELECT id,v FROM t_reset_drain_token_local ORDER BY id;
+--disable_query_log
+# Receiver lock-plan warm artifacts have their own TTL and are outside source
+# RESET. Snapshot rows, source artifacts, XID provenance and XA exposure must
+# already be gone.
+--let $allow_warmcopy_artifacts= 1
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+
+--disconnect reset_token_keep
+--disconnect reset_token_owner
+--disconnect reset_token_ha
+DROP TABLE t_reset_drain_token_local;
+DROP USER reset_drain_token_app@localhost;
+DROP USER preserve_trx_ha_admin@localhost;
+--remove_file $credential_file
+--enable_query_log

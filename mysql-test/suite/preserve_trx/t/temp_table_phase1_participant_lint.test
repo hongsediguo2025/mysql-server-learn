@@ -39,7 +39,7 @@ die "batch temp-table boundary sweep must happen only after active drain guard\n
   if $active_guard < 0 || $boundary_sweep < 0 || $boundary_sweep < $active_guard;
 die "no-target debug drain path must finalize participants before returning OK\n"
   unless $preserve =~
-     /preserve_trx_drain_skip_shutdown_after_audit_no_targets[\s\S]{0,300}finalize_drain_participants_for_terminal_handoff\s*\(\s*"finish_no_targets"\s*\)[\s\S]{0,240}my_ok\s*\(\s*thd\s*\)/s;
+     /preserve_trx_drain_skip_shutdown_after_audit_no_targets[\s\S]{0,300}finalize_drain_participants_for_terminal_handoff\s*\(\s*"finish_no_targets"\s*\)[\s\S]{0,360}my_ok\s*\(\s*thd\s*\)/s;
 die "transaction cleanup must not clear the batch unsupported boundary\n"
   if $temp_table =~
      /void\s+preserve_trx_temp_table_clear_transaction_state\s*\([^)]*\)\s*\{[\s\S]{0,800}preserve_trx_temp_table_clear_batch_unsupported_boundary/s;

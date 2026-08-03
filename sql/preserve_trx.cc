@@ -245,11 +245,34 @@ Preserve_trx_drain_terminal Preserve_trx_drain_ownership_state::state() const {
   return m_state.load(std::memory_order_acquire);
 }
 
-bool Preserve_trx_drain_ownership_state::request_reset() {
-  Preserve_trx_drain_terminal expected =
-      Preserve_trx_drain_terminal::RUNNING;
-  return m_state.compare_exchange_strong(
-      expected, Preserve_trx_drain_terminal::RESET_REQUESTED);
+Preserve_trx_drain_reset_request
+Preserve_trx_drain_ownership_state::request_reset() {
+  for (;;) {
+    Preserve_trx_drain_terminal current = state();
+    Preserve_trx_drain_terminal desired;
+    Preserve_trx_drain_reset_request result;
+    switch (current) {
+      case Preserve_trx_drain_terminal::RUNNING:
+      case Preserve_trx_drain_terminal::FINAL_METADATA_ACCEPTED_LOCAL:
+        desired = Preserve_trx_drain_terminal::RESET_REQUESTED;
+        result = Preserve_trx_drain_reset_request::WON;
+        break;
+      case Preserve_trx_drain_terminal::HANDOFF_PENDING:
+      case Preserve_trx_drain_terminal::COMMIT_UNKNOWN:
+      case Preserve_trx_drain_terminal::SHUTDOWN_HANDOFF:
+        desired = Preserve_trx_drain_terminal::SOURCE_RESTORE_PENDING;
+        result = Preserve_trx_drain_reset_request::WON;
+        break;
+      case Preserve_trx_drain_terminal::RESET_REQUESTED:
+      case Preserve_trx_drain_terminal::SOURCE_RESTORE_PENDING:
+        return Preserve_trx_drain_reset_request::JOINED;
+      case Preserve_trx_drain_terminal::SOURCE_RESTORED:
+        return Preserve_trx_drain_reset_request::ALREADY_RESTORED;
+      default:
+        return Preserve_trx_drain_reset_request::INVALID;
+    }
+    if (m_state.compare_exchange_strong(current, desired)) return result;
+  }
 }
 
 bool Preserve_trx_drain_ownership_state::begin_commit_send() {
@@ -258,6 +281,8 @@ bool Preserve_trx_drain_ownership_state::begin_commit_send() {
   if (m_state.compare_exchange_strong(
           expected,
           Preserve_trx_drain_terminal::FINAL_METADATA_ACCEPTED_LOCAL)) {
+    DEBUG_SYNC(current_thd,
+               "preserve_trx_after_final_metadata_accepted_local");
     expected = Preserve_trx_drain_terminal::FINAL_METADATA_ACCEPTED_LOCAL;
   } else if (expected == Preserve_trx_drain_terminal::HANDOFF_PENDING) {
     return true;
@@ -296,7 +321,12 @@ bool Preserve_trx_drain_ownership_state::resolve_not_committed_clean() {
 }
 
 bool Preserve_trx_drain_ownership_state::begin_source_restore() {
-  return resolve_not_committed_clean();
+  if (resolve_not_committed_clean()) return true;
+  Preserve_trx_drain_terminal expected =
+      Preserve_trx_drain_terminal::RESET_REQUESTED;
+  return m_state.compare_exchange_strong(
+             expected, Preserve_trx_drain_terminal::SOURCE_RESTORE_PENDING) ||
+         expected == Preserve_trx_drain_terminal::SOURCE_RESTORE_PENDING;
 }
 
 bool Preserve_trx_drain_ownership_state::complete_source_restore() {
@@ -851,11 +881,22 @@ Preserved_trx_manager_state_publication_probe
     g_manager_state_publication_probe{nullptr};
 void *g_manager_state_publication_probe_arg{nullptr};
 
+enum class Preserve_trx_reset_disposition : uint8_t {
+  RESTORED_RUNNABLE,
+  CONNECTION_TEARDOWN_PENDING
+};
+
 struct Preserve_trx_batch_item {
   my_thread_id original_thread_id{0};
   std::string token;
   bool logged_binlog_cache{false};
   std::unique_ptr<Preserve_trx_source_rollback_image> source_rollback_image;
+  Preserve_trx_reset_disposition reset_disposition{
+      Preserve_trx_reset_disposition::RESTORED_RUNNABLE};
+};
+
+struct Preserve_trx_batch_reset_cleanup {
+  std::string token;
 };
 
 struct Preserve_trx_drain_attempt {
@@ -868,8 +909,9 @@ struct Preserve_trx_drain_attempt {
   my_thread_id owner_thread_id{0};
   Preserve_trx_drain_ownership_state ownership;
   std::atomic<bool> closing_command_gate_published{false};
-  std::atomic<bool> all_transactions_runnable{false};
-  std::atomic<bool> reset_failed{false};
+  std::atomic<bool> reset_release_barrier_complete{false};
+  std::atomic<bool> source_restore_context_ready{false};
+  std::atomic<bool> drain_scope_released{false};
   std::mutex sink_mutex;
   Preserve_trx_transfer_encoded_frame_sink *sink{nullptr};
   std::mutex quarantine_mutex;
@@ -883,6 +925,29 @@ struct Preserve_trx_drain_attempt {
 std::mutex g_active_drain_attempt_mutex;
 std::shared_ptr<Preserve_trx_drain_attempt> g_active_drain_attempt;
 std::shared_ptr<Preserve_trx_drain_attempt> g_last_resolved_drain_attempt;
+
+[[noreturn]] void preserve_trx_reset_invariant_failure(
+    const char *reason,
+    const std::shared_ptr<Preserve_trx_drain_attempt> &attempt = nullptr) {
+  const Preserve_trx_manager_state_owner manager =
+      preserve_trx_unpack_manager_state_owner(g_manager_state_owner.load());
+  char message[512];
+  snprintf(message, sizeof(message),
+           "PRESERVE: RESET DRAIN invariant failure reason=%s generation=%llu "
+           "manager=%d manager_owner=%llu ownership=%d",
+           reason == nullptr ? "unknown" : reason,
+           attempt == nullptr ? 0 : attempt->generation,
+           static_cast<int>(manager.state),
+           static_cast<unsigned long long>(manager.owner_thread_id),
+           attempt == nullptr ? -1
+                              : static_cast<int>(attempt->ownership.state()));
+  LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG, message);
+  std::abort();
+}
+
+static bool preserve_trx_try_restore_quarantined_reset(
+    const std::shared_ptr<Preserve_trx_drain_attempt> &attempt);
+static void preserved_trx_reset_attempt_reaper_scan_once();
 
 void preserve_trx_notify_manager_state_published_for_unit_test() {
   Preserved_trx_manager_state_publication_probe probe =
@@ -936,22 +1001,29 @@ bool preserve_trx_publish_reset_cleanup(
     const Preserve_trx_manager_state_owner snapshot =
         preserve_trx_manager_state_owner_snapshot();
     if (snapshot.state == Preserve_trx_manager_state::RESET_CLEANUP &&
-        snapshot.owner_thread_id == attempt.owner_thread_id) {
+        (snapshot.owner_thread_id == attempt.owner_thread_id ||
+         snapshot.owner_thread_id == 0)) {
       return true;
     }
-    if (snapshot.owner_thread_id != attempt.owner_thread_id) return false;
+    Preserve_trx_manager_state desired_from = snapshot.state;
+    my_thread_id desired_owner = attempt.owner_thread_id;
     switch (snapshot.state) {
       case Preserve_trx_manager_state::WARMCOPY_DRAINING:
       case Preserve_trx_manager_state::WARMCOPY_CLOSING:
       case Preserve_trx_manager_state::BATCH_DRAINING:
+      case Preserve_trx_manager_state::SHUTDOWN_REQUESTED:
+        if (snapshot.owner_thread_id != attempt.owner_thread_id) return false;
+        break;
+      case Preserve_trx_manager_state::TRANSFER_HANDOFF_COMPLETE:
+        if (snapshot.owner_thread_id != 0) return false;
+        desired_owner = 0;
         break;
       default:
         return false;
     }
     if (preserve_trx_compare_exchange_manager_state_owner(
-            snapshot.state, snapshot.owner_thread_id,
-            Preserve_trx_manager_state::RESET_CLEANUP,
-            attempt.owner_thread_id)) {
+            desired_from, snapshot.owner_thread_id,
+            Preserve_trx_manager_state::RESET_CLEANUP, desired_owner)) {
       return true;
     }
   }
@@ -987,58 +1059,74 @@ void preserve_trx_unregister_active_drain_sink(
 
 bool preserve_trx_active_drain_reset_requested(
     const std::shared_ptr<Preserve_trx_drain_attempt> &attempt) {
-  return attempt != nullptr &&
-         attempt->ownership.state() ==
-             Preserve_trx_drain_terminal::RESET_REQUESTED;
+  if (attempt == nullptr) return false;
+  const Preserve_trx_drain_terminal state = attempt->ownership.state();
+  return state == Preserve_trx_drain_terminal::RESET_REQUESTED ||
+         state == Preserve_trx_drain_terminal::SOURCE_RESTORE_PENDING;
 }
 
-void preserve_trx_mark_active_drain_transactions_runnable(
+void preserve_trx_publish_active_drain_reset_barrier(
     const std::shared_ptr<Preserve_trx_drain_attempt> &attempt) {
   if (attempt != nullptr)
-    attempt->all_transactions_runnable.store(true, std::memory_order_release);
-}
-
-void preserve_trx_mark_active_drain_reset_failed(
-    const std::shared_ptr<Preserve_trx_drain_attempt> &attempt) {
-  if (attempt != nullptr)
-    attempt->reset_failed.store(true, std::memory_order_release);
+    attempt->reset_release_barrier_complete.store(true,
+                                                   std::memory_order_release);
 }
 
 Preserve_trx_reset_drain_result preserve_trx_request_active_drain_reset_impl(
     bool wait_for_runnable) {
+  std::unique_lock<std::mutex> active_guard(g_active_drain_attempt_mutex);
   const std::shared_ptr<Preserve_trx_drain_attempt> attempt =
-      preserve_trx_active_drain_attempt_snapshot();
+      g_active_drain_attempt;
   if (attempt == nullptr) {
-    const Preserve_trx_manager_state state =
-        preserve_trx_manager_state_owner_snapshot().state;
-    if (state == Preserve_trx_manager_state::IDLE) {
-      return Preserve_trx_reset_drain_result::NO_ACTIVE;
+    const Preserve_trx_manager_state_owner manager =
+        preserve_trx_manager_state_owner_snapshot();
+    switch (manager.state) {
+      case Preserve_trx_manager_state::IDLE:
+        return Preserve_trx_reset_drain_result::NO_ACTIVE;
+      case Preserve_trx_manager_state::WARMCOPY_DRAINING:
+      case Preserve_trx_manager_state::WARMCOPY_CLOSING:
+      case Preserve_trx_manager_state::BATCH_DRAINING:
+      case Preserve_trx_manager_state::SHUTDOWN_REQUESTED:
+        return Preserve_trx_reset_drain_result::UNSUPPORTED;
+      case Preserve_trx_manager_state::TRANSFER_HANDOFF_COMPLETE:
+      case Preserve_trx_manager_state::RESET_CLEANUP:
+        preserve_trx_reset_invariant_failure(
+            "terminal_manager_without_transfer_attempt");
+      default:
+        return Preserve_trx_reset_drain_result::UNSUPPORTED;
     }
-    return Preserve_trx_reset_drain_result::UNSUPPORTED;
   }
 
-  Preserve_trx_reset_drain_result result;
-  if (attempt->ownership.request_reset()) {
-    result = Preserve_trx_reset_drain_result::RESET_WON;
-    if (!preserve_trx_publish_reset_cleanup(*attempt))
-      return Preserve_trx_reset_drain_result::UNSUPPORTED;
-    g_reset_drain_wins.fetch_add(1);
-  } else if (attempt->ownership.state() ==
-             Preserve_trx_drain_terminal::RESET_REQUESTED) {
-    result = Preserve_trx_reset_drain_result::RESET_JOINED;
-  } else {
-    g_reset_drain_too_late.fetch_add(1);
-    return Preserve_trx_reset_drain_result::TOO_LATE;
+  const Preserve_trx_drain_reset_request request =
+      attempt->ownership.request_reset();
+  Preserve_trx_reset_drain_result result =
+      Preserve_trx_reset_drain_result::RESET_JOINED;
+  switch (request) {
+    case Preserve_trx_drain_reset_request::WON:
+      result = Preserve_trx_reset_drain_result::RESET_WON;
+      if (!preserve_trx_publish_reset_cleanup(*attempt)) {
+        preserve_trx_reset_invariant_failure(
+            "reset_manager_publication_failed", attempt);
+      }
+      g_reset_drain_wins.fetch_add(1);
+      break;
+    case Preserve_trx_drain_reset_request::JOINED:
+    case Preserve_trx_drain_reset_request::ALREADY_RESTORED:
+      break;
+    case Preserve_trx_drain_reset_request::INVALID:
+      preserve_trx_reset_invariant_failure("invalid_reset_ownership", attempt);
   }
 
   preserve_trx_cancel_active_drain_sink(attempt);
+  active_guard.unlock();
+  if (request != Preserve_trx_drain_reset_request::ALREADY_RESTORED) {
+    (void)preserve_trx_try_restore_quarantined_reset(attempt);
+  }
   while (wait_for_runnable &&
-         !attempt->all_transactions_runnable.load(std::memory_order_acquire) &&
-         !attempt->reset_failed.load(std::memory_order_acquire)) {
+         !attempt->reset_release_barrier_complete.load(
+             std::memory_order_acquire)) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
-  if (attempt->reset_failed.load(std::memory_order_acquire))
-    return Preserve_trx_reset_drain_result::UNSUPPORTED;
   return result;
 }
 
@@ -12045,6 +12133,7 @@ static void preserved_trx_expired_reaper_scan_once() {
   DBUG_EXECUTE_IF("preserve_trx_expired_reaper_skip", return;);
 
   preserved_trx_cleanup_deferred_source_warm_blobs_once();
+  preserved_trx_reset_attempt_reaper_scan_once();
   (void)preserved_trx_gc_failed_observable_records();
   try {
     const uint64_t now_us = preserve_trx_monotonic_us();
@@ -12380,10 +12469,6 @@ static void rollback_pending_token_delivery_record(const std::string &token) {
         "failed to delete snapshot files after rollback");
 }
 
-struct Preserve_trx_batch_reset_cleanup {
-  std::string token;
-};
-
 static bool cleanup_reset_batch_record_artifacts(
     const Preserve_trx_batch_reset_cleanup &cleanup) {
   if (cleanup.token.empty()) return false;
@@ -12662,6 +12747,9 @@ class Preserve_batch_restore_target_collector final : public Do_THD_Impl {
     const auto target_it = m_target_indexes.find(candidate->thread_id());
     const bool same_generation =
         candidate->preserve_trx_batch_generation == m_generation;
+    if (target_it != m_target_indexes.end() && !same_generation) {
+      m_error = true;
+    }
     const bool target =
         target_it != m_target_indexes.end() && same_generation &&
         candidate->preserve_trx_batch_state ==
@@ -12749,6 +12837,238 @@ static bool restore_preserved_batch_items_to_original_thds(
   }
   return false;
 }
+
+namespace {
+
+static void preserve_trx_kill_reset_target(THD *thd) {
+  if (thd == nullptr) return;
+  mysql_mutex_lock(&thd->LOCK_thd_data);
+  if (thd->killed != THD::KILL_CONNECTION) thd->awake(THD::KILL_CONNECTION);
+  mysql_mutex_unlock(&thd->LOCK_thd_data);
+}
+
+static void restore_preserved_batch_items_for_reset(
+    ulonglong generation, std::vector<Preserve_trx_batch_item> items,
+    const std::shared_ptr<Preserve_trx_drain_attempt> &attempt,
+    const std::vector<std::string> *extra_cleanup_tokens = nullptr) {
+  if (attempt == nullptr || !attempt->ownership.restore_allowed()) {
+    preserve_trx_transfer_note_source_restore_guard_reject();
+    preserve_trx_reset_invariant_failure("reset_restore_not_allowed", attempt);
+  }
+
+  std::vector<my_thread_id> thread_ids;
+  thread_ids.reserve(items.size());
+  std::unordered_set<std::string> unique_tokens;
+  for (const Preserve_trx_batch_item &item : items) {
+    if (item.original_thread_id == 0 || item.token.empty() ||
+        !unique_tokens.insert(item.token).second) {
+      preserve_trx_reset_invariant_failure("duplicate_reset_batch_identity",
+                                           attempt);
+    }
+    thread_ids.push_back(item.original_thread_id);
+  }
+
+  Preserve_batch_restore_target_collector collector(generation, thread_ids);
+  Global_THD_manager::get_instance()->do_for_all_thd_copy(&collector);
+  if (collector.error()) {
+    preserve_trx_reset_invariant_failure("reset_target_collection_failed",
+                                         attempt);
+  }
+
+  std::vector<Preserve_trx_pinned_thd> &targets = collector.targets();
+  for (size_t i = items.size(); i != 0; --i) {
+    Preserve_trx_batch_item &item = items[i - 1];
+    Preserve_trx_pinned_thd &target = targets[i - 1];
+
+    if (target.thd == nullptr) {
+      Preserved_trx_record record;
+      if (preserved_trx_find_record(item.token, &record) &&
+          (record.trx == nullptr || record.metadata.token != item.token ||
+           !record.metadata.temp_table_manifest_payload.empty())) {
+        preserve_trx_reset_invariant_failure(
+            "invalid_detached_record_for_reset", attempt);
+      }
+      item.reset_disposition =
+          Preserve_trx_reset_disposition::CONNECTION_TEARDOWN_PENDING;
+      continue;
+    }
+
+    Preserve_trx_batch_reset_cleanup cleanup;
+    if (!restore_batch_record_semantics_to_original_thd(target.thd, item,
+                                                        &cleanup)) {
+      continue;
+    }
+
+    preserve_trx_kill_reset_target(target.thd);
+    Preserved_trx_record record;
+    if (preserved_trx_find_record(item.token, &record) &&
+        (record.trx == nullptr || record.metadata.token != item.token ||
+         !record.metadata.temp_table_manifest_payload.empty())) {
+      preserve_trx_reset_invariant_failure(
+          "invalid_record_after_reset_restore_failure", attempt);
+    }
+    item.reset_disposition =
+        Preserve_trx_reset_disposition::CONNECTION_TEARDOWN_PENDING;
+  }
+
+  if (extra_cleanup_tokens != nullptr) {
+    for (const std::string &token : *extra_cleanup_tokens) {
+      if (token.empty() || !unique_tokens.insert(token).second) continue;
+      Preserve_trx_batch_item cleanup;
+      cleanup.token = token;
+      items.push_back(std::move(cleanup));
+    }
+  }
+
+  std::lock_guard<std::mutex> lock(attempt->quarantine_mutex);
+  if (!attempt->quarantined_items.empty()) {
+    preserve_trx_reset_invariant_failure("duplicate_reset_restore_executor",
+                                         attempt);
+  }
+  attempt->quarantined_items = std::move(items);
+}
+
+static bool preserve_trx_try_restore_quarantined_reset(
+    const std::shared_ptr<Preserve_trx_drain_attempt> &attempt) {
+  if (attempt == nullptr) return false;
+  bool expected = true;
+  if (!attempt->source_restore_context_ready.compare_exchange_strong(
+          expected, false, std::memory_order_acq_rel)) {
+    return false;
+  }
+  if (!attempt->ownership.begin_source_restore()) {
+    preserve_trx_reset_invariant_failure(
+        "quarantined_reset_source_restore_transition_failed", attempt);
+  }
+
+  std::vector<Preserve_trx_batch_item> items;
+  {
+    std::lock_guard<std::mutex> lock(attempt->quarantine_mutex);
+    items = std::move(attempt->quarantined_items);
+  }
+  restore_preserved_batch_items_for_reset(attempt->generation,
+                                          std::move(items), attempt);
+  preserve_trx_publish_active_drain_reset_barrier(attempt);
+  preserved_trx_request_expired_reaper_scan();
+  return true;
+}
+
+class Preserve_reset_live_thread_ids final : public Do_THD_Impl {
+ public:
+  void operator()(THD *candidate) override {
+    if (candidate != nullptr) m_thread_ids.insert(candidate->thread_id());
+  }
+
+  bool contains(my_thread_id thread_id) const {
+    return m_thread_ids.count(thread_id) != 0;
+  }
+
+ private:
+  std::unordered_set<my_thread_id> m_thread_ids;
+};
+
+static void preserved_trx_reset_attempt_reaper_scan_once() {
+  const std::shared_ptr<Preserve_trx_drain_attempt> attempt =
+      preserve_trx_active_drain_attempt_snapshot();
+  if (attempt == nullptr ||
+      !attempt->reset_release_barrier_complete.load(std::memory_order_acquire) ||
+      preserve_trx_manager_state_owner_snapshot().state !=
+          Preserve_trx_manager_state::RESET_CLEANUP) {
+    return;
+  }
+
+  Preserve_reset_live_thread_ids live_threads;
+  Global_THD_manager::get_instance()->do_for_all_thd_copy(&live_threads);
+  {
+    std::lock_guard<std::mutex> lock(attempt->quarantine_mutex);
+    constexpr size_t kMaxResetTokensPerPass = 16;
+    size_t processed = 0;
+    for (auto it = attempt->quarantined_items.begin();
+         it != attempt->quarantined_items.end() &&
+         processed < kMaxResetTokensPerPass;) {
+      bool ready_for_artifact_cleanup = false;
+      switch (it->reset_disposition) {
+        case Preserve_trx_reset_disposition::RESTORED_RUNNABLE:
+          ready_for_artifact_cleanup = true;
+          break;
+        case Preserve_trx_reset_disposition::CONNECTION_TEARDOWN_PENDING:
+          if (live_threads.contains(it->original_thread_id)) {
+            ++it;
+            ++processed;
+            continue;
+          }
+          {
+            Preserved_trx_record record;
+            if (preserved_trx_take_record(it->token, &record)) {
+              if (record.trx == nullptr || record.metadata.token != it->token ||
+                  !record.metadata.temp_table_manifest_payload.empty()) {
+                preserve_trx_reset_invariant_failure(
+                    "reset_reaper_invalid_teardown_record", attempt);
+              }
+              if (trx_preserve_rollback_claimed(record.trx) != DB_SUCCESS) {
+                if (preserved_trx_add_record_with_error(
+                        record, "RESET DRAIN deferred rollback failed")) {
+                  preserve_trx_reset_invariant_failure(
+                      "reset_reaper_could_not_restore_failed_record", attempt);
+                }
+                ++it;
+                ++processed;
+                continue;
+              }
+            }
+          }
+          ready_for_artifact_cleanup = true;
+          break;
+      }
+
+      if (ready_for_artifact_cleanup &&
+          !cleanup_reset_batch_record_artifacts({it->token})) {
+        it = attempt->quarantined_items.erase(it);
+      } else {
+        ++it;
+      }
+      ++processed;
+    }
+
+    if (!attempt->quarantined_source_warmcopy_ids.empty()) {
+      auto carrier =
+          create_preserved_trx_process_local_warm_external_blob_carrier(
+              preserve_trx_default_dir());
+      if (carrier != nullptr &&
+          carrier->remove_warm_external_blobs(
+              attempt->quarantined_source_warmcopy_ids,
+              kPreservedTrxBlobBinlogCache) ==
+              Preserved_trx_carrier_status::OK) {
+        attempt->quarantined_source_warmcopy_ids.clear();
+      }
+    }
+
+    if (!attempt->quarantined_items.empty() ||
+        !attempt->quarantined_source_warmcopy_ids.empty() ||
+        !attempt->drain_scope_released.load(std::memory_order_acquire)) {
+      return;
+    }
+  }
+
+  if (!attempt->ownership.complete_source_restore()) {
+    preserve_trx_reset_invariant_failure(
+        "reset_reaper_source_restore_completion_failed", attempt);
+  }
+  const Preserve_trx_manager_state_owner manager =
+      preserve_trx_manager_state_owner_snapshot();
+  if (manager.state != Preserve_trx_manager_state::RESET_CLEANUP ||
+      (manager.owner_thread_id != 0 &&
+       manager.owner_thread_id != attempt->owner_thread_id) ||
+      !preserve_trx_compare_exchange_manager_state_owner(
+          manager.state, manager.owner_thread_id,
+          Preserve_trx_manager_state::IDLE, 0)) {
+    preserve_trx_reset_invariant_failure("reset_reaper_manager_retire_failed",
+                                         attempt);
+  }
+  preserve_trx_clear_active_drain_attempt(attempt);
+}
+
+}  // namespace
 
 static bool preserve_trx_transition_manager_after_handoff_resolution(
     const Preserve_trx_drain_attempt &attempt,
@@ -12839,7 +13159,7 @@ Preserve_trx_transfer_status preserved_trx_resolve_handoff_unknown(
       return result;
     }
     result = Preserve_trx_transfer_status::NOT_COMMITTED_CLEAN;
-    preserve_trx_mark_active_drain_transactions_runnable(attempt);
+    preserve_trx_publish_active_drain_reset_barrier(attempt);
   } else {
     if (!attempt->ownership.acknowledge_commit() ||
         !preserve_trx_transition_manager_after_handoff_resolution(
@@ -17740,10 +18060,11 @@ bool Preserve_trx_drain_service::execute(
           preserve_trx_transfer_phase1_timeout_ms);
   auto active_drain_attempt_cleanup = create_scope_guard([&] {
     if (preserve_trx_active_drain_reset_requested(active_drain_attempt) &&
-        !active_drain_attempt->all_transactions_runnable.load(
-            std::memory_order_acquire) &&
-        !active_drain_attempt->reset_failed.load(std::memory_order_acquire)) {
-      preserve_trx_mark_active_drain_reset_failed(active_drain_attempt);
+        !active_drain_attempt->reset_release_barrier_complete.load(
+            std::memory_order_acquire)) {
+      preserve_trx_reset_invariant_failure(
+          "drain_scope_exited_before_reset_release_barrier",
+          active_drain_attempt);
     }
     preserve_trx_clear_active_drain_attempt(active_drain_attempt);
   });
@@ -17825,9 +18146,7 @@ bool Preserve_trx_drain_service::execute(
       batch_transfer_phase1_sender->abort();
       batch_transfer_phase1_sender.reset();
     }
-    if (active_drain_attempt != nullptr &&
-        active_drain_attempt->ownership.state() ==
-            Preserve_trx_drain_terminal::RESET_REQUESTED) {
+    if (preserve_trx_active_drain_reset_requested(active_drain_attempt)) {
       return;
     }
     const Preserve_trx_transfer_status abort_status =
@@ -17845,6 +18164,19 @@ bool Preserve_trx_drain_service::execute(
   auto reset_requested = [&]() {
     return preserve_trx_active_drain_reset_requested(active_drain_attempt);
   };
+  auto retain_reset_source_warmcopy_ids = [&]() {
+    if (batch_transfer_binlog_blob_provider == nullptr ||
+        active_drain_attempt == nullptr) {
+      return;
+    }
+    std::set<std::string> warmcopy_ids =
+        batch_transfer_binlog_blob_provider
+            ->release_phase1_blobs_for_deferred_cleanup();
+    std::lock_guard<std::mutex> lock(
+        active_drain_attempt->quarantine_mutex);
+    active_drain_attempt->quarantined_source_warmcopy_ids.insert(
+        warmcopy_ids.begin(), warmcopy_ids.end());
+  };
   auto release_reset_source_resources = [&]() {
     if (batch_transfer_phase1_sender != nullptr) {
       batch_transfer_phase1_sender->abort();
@@ -17853,22 +18185,24 @@ bool Preserve_trx_drain_service::execute(
     batch_transfer_phase1_flush_context.session = nullptr;
     batch_transfer_source_session.reset();
     release_batch_transfer_frame_sink();
+    retain_reset_source_warmcopy_ids();
     batch_transfer_binlog_blob_provider.reset();
     batch_transfer_phase1_declared_tokens.clear();
     if (warmcopy_status_guard.owns_lock()) warmcopy_status_guard.unlock();
   };
   auto finish_reset_manager = [&]() {
-    const bool returned_to_idle =
-        preserve_trx_compare_exchange_manager_state_owner(
-            Preserve_trx_manager_state::RESET_CLEANUP, thd->thread_id(),
-            Preserve_trx_manager_state::IDLE, 0);
-    if (!returned_to_idle) {
-      LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
-             "PRESERVE: RESET DRAIN cleanup could not return manager to IDLE");
-    } else {
-      draining->dismiss();
+    if (active_drain_attempt == nullptr ||
+        !active_drain_attempt->reset_release_barrier_complete.load(
+            std::memory_order_acquire)) {
+      preserve_trx_reset_invariant_failure(
+          "drain_owner_finished_reset_without_release_barrier",
+          active_drain_attempt);
     }
-    preserve_trx_clear_active_drain_attempt(active_drain_attempt);
+    draining->dismiss();
+    active_drain_attempt_cleanup.commit();
+    active_drain_attempt->drain_scope_released.store(true,
+                                                     std::memory_order_release);
+    preserved_trx_request_expired_reaper_scan();
     /*
       Cancelling the source-to-receiver client can leave its network error in
       the DRAIN owner's diagnostics. RESET has already restored the source
@@ -17881,9 +18215,15 @@ bool Preserve_trx_drain_service::execute(
     if (batch_transfer_phase1_sender != nullptr)
       batch_transfer_phase1_sender->abort();
     stop_reset_participant_admission();
+    if (active_drain_attempt == nullptr ||
+        !active_drain_attempt->ownership.begin_source_restore()) {
+      preserve_trx_reset_invariant_failure(
+          "phase1_reset_source_restore_transition_failed",
+          active_drain_attempt);
+    }
     Preserve_batch_clear_generation clear(generation);
     Global_THD_manager::get_instance()->do_for_all_thd_copy(&clear);
-    preserve_trx_mark_active_drain_transactions_runnable(active_drain_attempt);
+    preserve_trx_publish_active_drain_reset_barrier(active_drain_attempt);
     abort_drain_participants(stage);
     release_reset_source_resources();
     return finish_reset_manager();
@@ -18521,77 +18861,69 @@ bool Preserve_trx_drain_service::execute(
   });
 
   auto finish_phase2_reset =
-      [&](const std::vector<Preserve_trx_batch_item> *items,
+      [&](std::vector<Preserve_trx_batch_item> *items,
           const char *stage,
           const std::vector<std::string> *provenance_tokens = nullptr) {
         if (batch_transfer_phase1_sender != nullptr)
           batch_transfer_phase1_sender->abort();
         stop_reset_participant_admission();
 
-        std::vector<Preserve_trx_batch_reset_cleanup> deferred_cleanup;
-        const bool semantic_restore_failed =
-            items != nullptr && !items->empty()
-                ? restore_preserved_batch_items_to_original_thds(
-                      generation, *items, active_drain_attempt,
-                      &deferred_cleanup)
-                : [&]() {
-                    Preserve_batch_clear_generation clear(generation);
-                    Global_THD_manager::get_instance()->do_for_all_thd_copy(
-                        &clear);
-                    return false;
-                  }();
-        if (semantic_restore_failed) {
-          preserve_trx_mark_active_drain_reset_failed(active_drain_attempt);
-          abort_drain_participants(stage);
-          release_reset_source_resources();
-          LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
-                 "PRESERVE: RESET DRAIN semantic restore failed");
-          return preserve_trx_reject_batch_cleanup_failed();
+        if (active_drain_attempt == nullptr) {
+          preserve_trx_reset_invariant_failure(
+              "phase2_reset_without_transfer_attempt");
         }
-
-        preserve_trx_mark_active_drain_transactions_runnable(
-            active_drain_attempt);
+        if (!active_drain_attempt->reset_release_barrier_complete.load(
+                std::memory_order_acquire)) {
+          if (items != nullptr) {
+            if (!active_drain_attempt->ownership.begin_source_restore()) {
+              preserve_trx_reset_invariant_failure(
+                  "phase2_reset_source_restore_transition_failed",
+                  active_drain_attempt);
+            }
+            if (items->empty()) {
+              Preserve_batch_clear_generation clear(generation);
+              Global_THD_manager::get_instance()->do_for_all_thd_copy(&clear);
+            }
+            restore_preserved_batch_items_for_reset(
+                generation, std::move(*items), active_drain_attempt,
+                provenance_tokens);
+            preserve_trx_publish_active_drain_reset_barrier(
+                active_drain_attempt);
+          } else {
+            (void)preserve_trx_try_restore_quarantined_reset(
+                active_drain_attempt);
+            while (!active_drain_attempt->reset_release_barrier_complete.load(
+                std::memory_order_acquire)) {
+              std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+          }
+        }
         abort_drain_participants(stage);
         release_reset_source_resources();
-
-        std::vector<Preserve_trx_batch_reset_cleanup> pending_cleanup =
-            std::move(deferred_cleanup);
-        while (!pending_cleanup.empty()) {
-          std::vector<Preserve_trx_batch_reset_cleanup> retry;
-          retry.reserve(pending_cleanup.size());
-          for (const Preserve_trx_batch_reset_cleanup &cleanup :
-               pending_cleanup) {
-            if (cleanup_reset_batch_record_artifacts(cleanup))
-              retry.push_back(cleanup);
-          }
-          pending_cleanup = std::move(retry);
-          if (!pending_cleanup.empty()) {
-            LogErr(WARNING_LEVEL, ER_LOG_PRINTF_MSG,
-                   "PRESERVE: RESET DRAIN process-local cleanup will retry");
-            my_sleep(1000000);
-          }
-        }
-        if (provenance_tokens != nullptr) {
-          while (preserve_trx_xid_provenance_remove_many(
-              *provenance_tokens)) {
-            LogErr(WARNING_LEVEL, ER_LOG_PRINTF_MSG,
-                   "PRESERVE: RESET DRAIN provenance cleanup will retry");
-            my_sleep(1000000);
-          }
-        }
         return finish_reset_manager();
       };
+
+  auto finish_reset_from_current_items = [&](const char *stage) {
+    const std::vector<std::string> *provenance_tokens = nullptr;
+    if (batch_provenance_started) {
+      batch_provenance_cleanup.commit();
+      provenance_tokens = &batch_provenance_tokens;
+    }
+    return finish_phase2_reset(&preserved_batch_items, stage,
+                               provenance_tokens);
+  };
 
   auto finish_with_shutdown = [&]() {
     if (active_drain_attempt != nullptr) {
       if (reset_requested())
-        return finish_phase2_reset(nullptr, "reset_before_shutdown");
+        return finish_reset_from_current_items("reset_before_shutdown");
       if (active_drain_attempt->ownership.state() ==
               Preserve_trx_drain_terminal::RUNNING &&
           !preserve_trx_try_active_drain_shutdown_handoff(
               active_drain_attempt.get())) {
         if (reset_requested())
-          return finish_phase2_reset(nullptr, "reset_before_shutdown_handoff");
+          return finish_reset_from_current_items(
+              "reset_before_shutdown_handoff");
         return preserve_trx_reject_unsupported();
       }
     }
@@ -18624,13 +18956,44 @@ bool Preserve_trx_drain_service::execute(
     }
 #endif
     if (transfer_final_ack_accepted) {
+      if (reset_requested())
+        return finish_reset_from_current_items(
+            "reset_after_shutdown_handoff");
+      if (active_drain_attempt == nullptr) {
+        preserve_trx_reset_invariant_failure(
+            "final_ack_without_transfer_attempt");
+      }
+      {
+        std::lock_guard<std::mutex> lock(
+            active_drain_attempt->quarantine_mutex);
+        if (!active_drain_attempt->quarantined_items.empty()) {
+          preserve_trx_reset_invariant_failure(
+              "final_ack_duplicate_rollback_context", active_drain_attempt);
+        }
+        active_drain_attempt->quarantine_started_monotonic_us =
+            preserve_trx_monotonic_us();
+        active_drain_attempt->quarantined_items =
+            std::move(preserved_batch_items);
+      }
+      active_drain_attempt_cleanup.commit();
+      active_drain_attempt->source_restore_context_ready.store(
+          true, std::memory_order_release);
+      if (reset_requested()) {
+        (void)preserve_trx_try_restore_quarantined_reset(active_drain_attempt);
+        return finish_phase2_reset(nullptr,
+                                   "reset_after_source_context_publication");
+      }
       finalize_drain_participants_for_terminal_handoff("finish");
       if (!draining->transition_to(
               Preserve_trx_manager_state::TRANSFER_HANDOFF_COMPLETE, 0)) {
-        LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
-               "PRESERVE: transfer handoff could not publish terminal source "
-               "command fence; source remains fail-closed");
-        return preserve_trx_reject_unsupported();
+        if (reset_requested()) {
+          (void)preserve_trx_try_restore_quarantined_reset(
+              active_drain_attempt);
+          return finish_phase2_reset(
+              nullptr, "reset_during_terminal_manager_publication");
+        }
+        preserve_trx_reset_invariant_failure(
+            "terminal_manager_publication_failed", active_drain_attempt);
       }
       draining->dismiss();
     }
@@ -18653,16 +19016,27 @@ bool Preserve_trx_drain_service::execute(
     DBUG_EXECUTE_IF("preserve_trx_drain_skip_shutdown_after_audit_no_targets", {
       if (counter.target_count() == 0) {
         finalize_drain_participants_for_terminal_handoff("finish_no_targets");
+        if (transfer_final_ack_accepted && active_drain_attempt != nullptr) {
+          active_drain_attempt->drain_scope_released.store(
+              true, std::memory_order_release);
+          preserved_trx_request_expired_reaper_scan();
+        }
         if (!drain_result_attempted) my_ok(thd);
         return false;
       }
     });
-    if (transfer_final_ack_accepted) return false;
+    if (transfer_final_ack_accepted) {
+      active_drain_attempt->drain_scope_released.store(
+          true, std::memory_order_release);
+      preserved_trx_request_expired_reaper_scan();
+      return false;
+    }
     finalize_drain_participants_for_terminal_handoff("finish");
     if (!draining->transition_to(
             Preserve_trx_manager_state::SHUTDOWN_REQUESTED)) {
       if (reset_requested())
-        return finish_phase2_reset(nullptr, "reset_during_shutdown_transition");
+        return finish_reset_from_current_items(
+            "reset_during_shutdown_transition");
       return preserve_trx_reject_unsupported();
     }
 
@@ -18724,7 +19098,7 @@ bool Preserve_trx_drain_service::execute(
         return token_selection_failed || begin_failed;
       };
   auto finish_reset_with_provenance =
-      [&](const std::vector<Preserve_trx_batch_item> *items,
+      [&](std::vector<Preserve_trx_batch_item> *items,
           const char *stage) {
         if (!batch_provenance_started)
           return finish_phase2_reset(items, stage);
@@ -18779,7 +19153,7 @@ bool Preserve_trx_drain_service::execute(
   if (counter.nonidle_transaction_count() != 0 ||
       counter.has_unsupported_transaction()) {
     if (reset_requested())
-      return finish_phase2_reset(nullptr, "reset_during_target_validation");
+      return finish_reset_from_current_items("reset_during_target_validation");
     sql_print_information(
         "PRESERVE: batch target counter rejected "
         "stage=target_counter_rejected transaction_count=%u target_count=%u "
@@ -18798,8 +19172,8 @@ bool Preserve_trx_drain_service::execute(
   if (counter.target_count() == 0) {
     if (close_warmcopy_participants_for_shutdown("no_targets_close_failed")) {
       if (reset_requested())
-        return finish_phase2_reset(nullptr,
-                                   "reset_during_no_target_phase1_close");
+        return finish_reset_from_current_items(
+            "reset_during_no_target_phase1_close");
       return preserve_trx_reject_unsupported();
     }
     abort_batch_transfer_epoch("no_targets");
@@ -19560,7 +19934,7 @@ bool Preserve_trx_drain_service::execute(
               &temp_unsupported_boundary_seen, target_wait_deadline_us,
               active_drain_attempt, active_binlog_progress);
       if (reset_requested())
-        return finish_phase2_reset(nullptr, "reset_during_target_wait");
+        return finish_reset_from_current_items("reset_during_target_wait");
       if (target_wait_result == Preserve_trx_batch_wait_result::DEADLINE &&
           timeout_exclusion_enabled) {
         Preserve_batch_timeout_target_decision decision(generation,
@@ -19577,16 +19951,16 @@ bool Preserve_trx_drain_service::execute(
           if (declared) {
             DEBUG_SYNC(thd, "preserve_trx_legacy_timeout_before_abort");
             if (reset_requested())
-              return finish_phase2_reset(
-                  nullptr, "reset_before_legacy_timeout_abort");
+              return finish_reset_from_current_items(
+                  "reset_before_legacy_timeout_abort");
             const Preserve_trx_transfer_status abort_status =
                 batch_transfer_source_session->abort_token(
                     static_cast<uint64_t>(target_thread_id),
                     "closing_command_timeout");
             if (abort_status != Preserve_trx_transfer_status::OK) {
               if (reset_requested())
-                return finish_phase2_reset(
-                    nullptr, "reset_during_legacy_timeout_abort");
+                return finish_reset_from_current_items(
+                    "reset_during_legacy_timeout_abort");
               Preserve_batch_clear_generation clear(generation);
               Global_THD_manager::get_instance()->do_for_all_thd_copy(&clear);
               abort_batch_transfer_epoch("closing_timeout_abort_failed");
@@ -19597,8 +19971,8 @@ bool Preserve_trx_drain_service::execute(
           }
           excluded_timeout_thread_ids.push_back(target_thread_id);
           if (reset_requested())
-            return finish_phase2_reset(
-                nullptr, "reset_after_legacy_timeout_exclusion");
+            return finish_reset_from_current_items(
+                "reset_after_legacy_timeout_exclusion");
           continue;
         } else {
           target_wait_result = Preserve_trx_batch_wait_result::READY;
@@ -19623,8 +19997,8 @@ bool Preserve_trx_drain_service::execute(
 
       if (temp_unsupported_boundary_seen) {
         if (reset_requested())
-          return finish_phase2_reset(nullptr,
-                                     "reset_during_temp_boundary_validation");
+          return finish_reset_from_current_items(
+              "reset_during_temp_boundary_validation");
         Preserve_batch_clear_generation clear(generation);
         Global_THD_manager::get_instance()->do_for_all_thd_copy(&clear);
         abort_batch_transfer_epoch("temp_unsupported_boundary");
@@ -19642,8 +20016,8 @@ bool Preserve_trx_drain_service::execute(
 
       if (target_state != Preserve_trx_batch_thd_state::QUIESCED) {
         if (reset_requested())
-          return finish_phase2_reset(nullptr,
-                                     "reset_during_target_state_validation");
+          return finish_reset_from_current_items(
+              "reset_during_target_state_validation");
         Preserve_batch_clear_generation clear(generation);
         Global_THD_manager::get_instance()->do_for_all_thd_copy(&clear);
         abort_batch_transfer_epoch("target_state_rejected");
@@ -19662,8 +20036,8 @@ bool Preserve_trx_drain_service::execute(
   if (quiesced_target_thread_ids.empty()) {
     if (close_warmcopy_participants_for_shutdown("no_quiesced_close_failed")) {
       if (reset_requested())
-        return finish_phase2_reset(nullptr,
-                                   "reset_during_no_quiesced_phase1_close");
+        return finish_reset_from_current_items(
+            "reset_during_no_quiesced_phase1_close");
       return preserve_trx_reject_unsupported();
     }
     abort_batch_transfer_epoch("no_quiesced_targets");
@@ -19685,8 +20059,8 @@ bool Preserve_trx_drain_service::execute(
         ready_counter.has_unsupported_transaction() ||
         !preserved_trx_batch_has_capacity(ready_counter.account_counts())) {
       if (reset_requested())
-        return finish_phase2_reset(nullptr,
-                                   "reset_during_quiesced_target_validation");
+        return finish_reset_from_current_items(
+            "reset_during_quiesced_target_validation");
       Preserve_batch_clear_generation clear(generation);
       Global_THD_manager::get_instance()->do_for_all_thd_copy(&clear);
       abort_batch_transfer_epoch("quiesced_counter_rejected");
@@ -19705,8 +20079,8 @@ bool Preserve_trx_drain_service::execute(
               quiesced_target_thread_ids, overall_close_deadline_us)) {
         phase2_metrics.participant_prepare_us += elapsed_since(timed_started_us);
         if (reset_requested())
-          return finish_phase2_reset(
-              nullptr, "reset_during_warmcopy_participant_prepare");
+          return finish_reset_from_current_items(
+              "reset_during_warmcopy_participant_prepare");
         Preserve_batch_clear_generation clear(generation);
         Global_THD_manager::get_instance()->do_for_all_thd_copy(&clear);
         abort_batch_transfer_epoch("participant_phase2_prepare_rejected");
@@ -19734,8 +20108,8 @@ bool Preserve_trx_drain_service::execute(
               lock_warmcopy_target_thread_ids)) {
         phase2_metrics.participant_prepare_us += elapsed_since(timed_started_us);
         if (reset_requested())
-          return finish_phase2_reset(
-              nullptr, "reset_during_lock_participant_prepare");
+          return finish_reset_from_current_items(
+              "reset_during_lock_participant_prepare");
         Preserve_batch_clear_generation clear(generation);
         Global_THD_manager::get_instance()->do_for_all_thd_copy(&clear);
         abort_batch_transfer_epoch("lock_warmcopy_phase2_prepare_rejected");
@@ -19751,8 +20125,8 @@ bool Preserve_trx_drain_service::execute(
         Preserve_trx_drain_status::OK) {
       phase2_metrics.participant_close_us += elapsed_since(timed_started_us);
       if (reset_requested())
-        return finish_phase2_reset(nullptr,
-                                   "reset_during_phase1_participant_close");
+        return finish_reset_from_current_items(
+            "reset_during_phase1_participant_close");
       Preserve_batch_clear_generation clear(generation);
       Global_THD_manager::get_instance()->do_for_all_thd_copy(&clear);
       abort_batch_transfer_epoch("close_phase1_failed");
@@ -19772,8 +20146,8 @@ bool Preserve_trx_drain_service::execute(
     if (ready_status != Preserve_trx_drain_status::OK ||
         preflight_status != Preserve_trx_drain_status::OK) {
       if (reset_requested())
-        return finish_phase2_reset(nullptr,
-                                   "reset_during_phase1_participant_preflight");
+        return finish_reset_from_current_items(
+            "reset_during_phase1_participant_preflight");
       Preserve_batch_clear_generation clear(generation);
       Global_THD_manager::get_instance()->do_for_all_thd_copy(&clear);
       abort_batch_transfer_epoch("phase1_not_ready");
@@ -19786,8 +20160,8 @@ bool Preserve_trx_drain_service::execute(
     if (!warmcopy_participant->tail_budget_within_limits(
             quiesced_target_thread_ids, overall_close_deadline_us)) {
       if (reset_requested())
-        return finish_phase2_reset(nullptr,
-                                   "reset_during_phase2_tail_budget");
+        return finish_reset_from_current_items(
+            "reset_during_phase2_tail_budget");
       Preserve_batch_clear_generation clear(generation);
       Global_THD_manager::get_instance()->do_for_all_thd_copy(&clear);
       abort_batch_transfer_epoch("participant_phase2_budget_rejected");
@@ -19798,20 +20172,20 @@ bool Preserve_trx_drain_service::execute(
   if (two_phase_enabled) {
     if (!draining->transition_to(Preserve_trx_manager_state::BATCH_DRAINING)) {
       if (reset_requested())
-        return finish_phase2_reset(nullptr,
-                                   "reset_before_batch_draining_transition");
+        return finish_reset_from_current_items(
+            "reset_before_batch_draining_transition");
       return preserve_trx_reject_unsupported();
     }
   }
   if (reset_requested())
-    return finish_phase2_reset(nullptr, "reset_before_phase2_catchup");
+    return finish_reset_from_current_items("reset_before_phase2_catchup");
 
   DEBUG_SYNC(thd, "preserve_trx_batch_after_targets_quiesced_before_attach");
 
   if (abort_phase1_transfer_targets_not_quiesced(quiesced_target_thread_ids)) {
     if (reset_requested())
-      return finish_phase2_reset(nullptr,
-                                 "reset_during_phase1_target_abort");
+      return finish_reset_from_current_items(
+          "reset_during_phase1_target_abort");
     Preserve_batch_clear_generation clear(generation);
     Global_THD_manager::get_instance()->do_for_all_thd_copy(&clear);
     return preserve_trx_reject_unsupported();
@@ -20188,24 +20562,24 @@ bool Preserve_trx_drain_service::execute(
   if (!early_pipeline_enabled) {
     if (stream_phase2_transfer_record_lock_catchup_blobs()) {
       if (reset_requested())
-        return finish_phase2_reset(nullptr,
-                                   "reset_during_phase2_record_catchup");
+        return finish_reset_from_current_items(
+            "reset_during_phase2_record_catchup");
       Preserve_batch_clear_generation clear(generation);
       Global_THD_manager::get_instance()->do_for_all_thd_copy(&clear);
       return preserve_trx_reject_unsupported();
     }
     if (stream_phase2_transfer_binlog_cache_catchup_blobs()) {
       if (reset_requested())
-        return finish_phase2_reset(nullptr,
-                                   "reset_during_phase2_binlog_catchup");
+        return finish_reset_from_current_items(
+            "reset_during_phase2_binlog_catchup");
       Preserve_batch_clear_generation clear(generation);
       Global_THD_manager::get_instance()->do_for_all_thd_copy(&clear);
       return preserve_trx_reject_unsupported();
     }
     if (!validate_batch_transfer_final_target_coverage()) {
       if (reset_requested())
-        return finish_phase2_reset(nullptr,
-                                   "reset_during_final_target_coverage");
+        return finish_reset_from_current_items(
+            "reset_during_final_target_coverage");
       Preserve_batch_clear_generation clear(generation);
       Global_THD_manager::get_instance()->do_for_all_thd_copy(&clear);
       abort_batch_transfer_epoch(
@@ -20217,7 +20591,7 @@ bool Preserve_trx_drain_service::execute(
   }
   DEBUG_SYNC(thd, "preserve_trx_batch_after_final_transfer_catchup");
   if (reset_requested())
-    return finish_phase2_reset(nullptr, "reset_before_xid_provenance");
+    return finish_reset_from_current_items("reset_before_xid_provenance");
 
   bool provenance_begin_failed = false;
   if (!batch_provenance_started) {
@@ -20234,8 +20608,8 @@ bool Preserve_trx_drain_service::execute(
   }
   if (provenance_begin_failed) {
     if (reset_requested())
-      return finish_phase2_reset(nullptr,
-                                 "reset_during_xid_provenance_begin");
+      return finish_reset_from_current_items(
+          "reset_during_xid_provenance_begin");
     Preserve_batch_clear_generation clear(generation);
     Global_THD_manager::get_instance()->do_for_all_thd_copy(&clear);
     abort_batch_transfer_epoch("xid_provenance_batch_intent_write_failed");
@@ -20947,8 +21321,18 @@ bool Preserve_trx_drain_service::execute(
       finalize_drain_participants_for_terminal_handoff(
           "standby_transfer_commit_unknown");
 
+      active_drain_attempt->source_restore_context_ready.store(
+          true, std::memory_order_release);
+      if (reset_requested()) {
+        (void)preserve_trx_try_restore_quarantined_reset(
+            active_drain_attempt);
+        return finish_phase2_reset(nullptr,
+                                   "reset_during_commit_unknown_publication");
+      }
       active_drain_attempt_cleanup.commit();
       draining->dismiss();
+      active_drain_attempt->drain_scope_released.store(
+          true, std::memory_order_release);
       active_drain_attempt->handoff_resolution_ready.store(
           resolution_armed && commit_unknown_published,
           std::memory_order_release);
@@ -21071,15 +21455,8 @@ bool Preserve_trx_drain_service::execute(
                .c_str());
 
     teardown_started_us = preserve_trx_monotonic_us();
-    std::set<std::string> deferred_source_warm_cleanup;
-    if (batch_transfer_binlog_blob_provider != nullptr) {
-      deferred_source_warm_cleanup =
-          batch_transfer_binlog_blob_provider
-              ->release_phase1_blobs_for_deferred_cleanup();
-    }
+    retain_reset_source_warmcopy_ids();
     batch_transfer_binlog_blob_provider.reset();
-    preserve_trx_defer_source_warm_blob_cleanup(
-        preserve_trx_default_dir(), std::move(deferred_source_warm_cleanup));
     LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
            ("PRESERVE: standby transfer source post-ack teardown component="
             "binlog_blob_provider elapsed_us=" +
@@ -21472,10 +21849,6 @@ static bool preserve_trx_execute_reset_drain(THD *thd) {
     return true;
   }
   if (check_global_access(thd, SHUTDOWN_ACL)) return true;
-  if (preserve_trx_has_explicit_active_transaction(thd)) {
-    my_error(ER_PRESERVE_TRX_INVALID_STATE, MYF(0));
-    return true;
-  }
   switch (preserve_trx_request_active_drain_reset(true)) {
     case Preserve_trx_reset_drain_result::NO_ACTIVE:
     case Preserve_trx_reset_drain_result::RESET_WON:

@@ -57,8 +57,9 @@ Preserve_trx_transfer_receiver_expired_epochs	0
 RESET DRAIN;
 # restart: --preserve-trx-enable=ON
 START TRANSACTION;
+SAVEPOINT ha_reset_guard;
 RESET DRAIN;
-ERROR HY000: Invalid preserved transaction state
+ROLLBACK TO SAVEPOINT ha_reset_guard;
 ROLLBACK;
 CREATE USER preserve_reset_denied@localhost;
 GRANT SHUTDOWN ON *.* TO preserve_reset_denied@localhost;

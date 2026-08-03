@@ -24258,9 +24258,10 @@ TEST(PreservedTrxDrainResetApi, PublicHeaderExposesStableSignature) {
 }
 
 TEST(PreservedTrxDrainHandoff,
-     ResetAndFirstCommitSendHaveOnlyOneWinner) {
+     ResetSelectsCoordinatorOrSourceRestoreByHandoffStage) {
   Preserve_trx_drain_ownership_state reset_wins;
-  EXPECT_TRUE(reset_wins.request_reset());
+  EXPECT_EQ(Preserve_trx_drain_reset_request::WON,
+            reset_wins.request_reset());
   EXPECT_FALSE(reset_wins.begin_commit_send());
   EXPECT_EQ(Preserve_trx_drain_terminal::RESET_REQUESTED,
             reset_wins.state());
@@ -24268,10 +24269,11 @@ TEST(PreservedTrxDrainHandoff,
 
   Preserve_trx_drain_ownership_state commit_wins;
   EXPECT_TRUE(commit_wins.begin_commit_send());
-  EXPECT_FALSE(commit_wins.request_reset());
-  EXPECT_EQ(Preserve_trx_drain_terminal::HANDOFF_PENDING,
+  EXPECT_EQ(Preserve_trx_drain_reset_request::WON,
+            commit_wins.request_reset());
+  EXPECT_EQ(Preserve_trx_drain_terminal::SOURCE_RESTORE_PENDING,
             commit_wins.state());
-  EXPECT_FALSE(commit_wins.restore_allowed());
+  EXPECT_TRUE(commit_wins.restore_allowed());
 }
 
 TEST(PreservedTrxDrainHandoff,
@@ -24285,7 +24287,8 @@ TEST(PreservedTrxDrainHandoff,
   EXPECT_EQ(Preserve_trx_drain_terminal::SOURCE_RESTORE_PENDING,
             ownership.state());
   EXPECT_TRUE(ownership.restore_allowed());
-  EXPECT_FALSE(ownership.request_reset());
+  EXPECT_EQ(Preserve_trx_drain_reset_request::JOINED,
+            ownership.request_reset());
   EXPECT_TRUE(ownership.resolve_not_committed_clean());
   ASSERT_TRUE(ownership.complete_source_restore());
   EXPECT_EQ(Preserve_trx_drain_terminal::SOURCE_RESTORED, ownership.state());
@@ -24300,12 +24303,14 @@ TEST(PreservedTrxDrainHandoff,
   EXPECT_EQ(Preserve_trx_drain_terminal::SOURCE_RESTORE_PENDING,
             ownership.state());
   EXPECT_TRUE(ownership.restore_allowed());
-  EXPECT_FALSE(ownership.request_reset());
+  EXPECT_EQ(Preserve_trx_drain_reset_request::JOINED,
+            ownership.request_reset());
 
   ASSERT_TRUE(ownership.complete_source_restore());
   EXPECT_EQ(Preserve_trx_drain_terminal::SOURCE_RESTORED, ownership.state());
   EXPECT_FALSE(ownership.restore_allowed());
-  EXPECT_FALSE(ownership.request_reset());
+  EXPECT_EQ(Preserve_trx_drain_reset_request::ALREADY_RESTORED,
+            ownership.request_reset());
 }
 
 TEST(PreservedTrxHandoffResolution,

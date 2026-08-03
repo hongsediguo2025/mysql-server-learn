@@ -225,16 +225,16 @@ my $phase1_stop_pos =
   index($phase1_reset, 'stop_reset_participant_admission()');
 my $phase1_clear_pos =
   index($phase1_reset, 'Preserve_batch_clear_generation');
-my $phase1_runnable_pos =
+my $phase1_barrier_pos =
   index($phase1_reset,
-        'preserve_trx_mark_active_drain_transactions_runnable');
+        'preserve_trx_publish_active_drain_reset_barrier');
 my $phase1_abort_pos =
   index($phase1_reset, 'abort_drain_participants(stage)');
-die "phase-1 RESET must stop participant admission, clear session state, publish runnable, then perform physical participant cleanup\n"
+die "phase-1 RESET must stop participant admission, clear session state, publish the release barrier, then perform physical participant cleanup\n"
   unless $phase1_stop_pos >= 0 &&
          $phase1_clear_pos > $phase1_stop_pos &&
-         $phase1_runnable_pos > $phase1_clear_pos &&
-         $phase1_abort_pos > $phase1_runnable_pos;
+         $phase1_barrier_pos > $phase1_clear_pos &&
+         $phase1_abort_pos > $phase1_barrier_pos;
 
 my ($phase2_reset) =
   $preserve =~
@@ -243,17 +243,40 @@ my ($phase2_reset) =
 my $phase2_stop_pos =
   index($phase2_reset, 'stop_reset_participant_admission()');
 my $phase2_restore_pos =
-  index($phase2_reset, 'restore_preserved_batch_items_to_original_thds');
-my $phase2_runnable_pos =
+  index($phase2_reset, 'restore_preserved_batch_items_for_reset');
+my $phase2_barrier_pos =
   index($phase2_reset,
-        'preserve_trx_mark_active_drain_transactions_runnable');
+        'preserve_trx_publish_active_drain_reset_barrier');
 my $phase2_abort_pos =
   rindex($phase2_reset, 'abort_drain_participants(stage)');
-die "phase-2 RESET must stop participant admission, restore transaction semantics, publish runnable, then perform physical participant cleanup\n"
+die "phase-2 RESET must stop participant admission, classify every token, publish the release barrier, then perform physical participant cleanup\n"
   unless $phase2_stop_pos >= 0 &&
          $phase2_restore_pos > $phase2_stop_pos &&
-         $phase2_runnable_pos > $phase2_restore_pos &&
-         $phase2_abort_pos > $phase2_runnable_pos;
+         $phase2_barrier_pos > $phase2_restore_pos &&
+         $phase2_abort_pos > $phase2_barrier_pos;
+
+die "RESET must not retain the obsolete all-runnable/reset-failed binary contract\n"
+  if $preserve =~ /all_transactions_runnable|reset_failed/;
+die "RESET request must accept post-COMMIT ownership and converge on source restore\n"
+  unless $preserve =~
+         /request_reset\s*\(\)[\s\S]*HANDOFF_PENDING[\s\S]*COMMIT_UNKNOWN[\s\S]*SHUTDOWN_HANDOFF[\s\S]*SOURCE_RESTORE_PENDING/s;
+die "RESET must not send receiver ABORT after source restore ownership wins\n"
+  unless $preserve =~
+         /auto abort_batch_transfer_epoch[\s\S]{0,800}preserve_trx_active_drain_reset_requested\(active_drain_attempt\)[\s\S]{0,120}return;/s;
+die "post-ACK RESET context must be published before terminal manager handoff\n"
+  unless $preserve =~
+         /quarantined_items\s*=\s*std::move\(preserved_batch_items\)[\s\S]{0,500}source_restore_context_ready\.store[\s\S]{0,1200}TRANSFER_HANDOFF_COMPLETE/s;
+die "RESET cleanup must use the existing reaper with bounded token work\n"
+  unless $preserve =~
+         /preserved_trx_expired_reaper_scan_once[\s\S]{0,300}preserved_trx_reset_attempt_reaper_scan_once/s &&
+         $preserve =~
+         /kMaxResetTokensPerPass\s*=\s*16[\s\S]*complete_source_restore\(\)[\s\S]*Preserve_trx_manager_state::IDLE/s;
+die "active local-carrier DRAIN without an attempt must remain unsupported, not fatal\n"
+  unless $preserve =~
+         /attempt\s*==\s*nullptr[\s\S]{0,900}WARMCOPY_DRAINING[\s\S]{0,300}SHUTDOWN_REQUESTED[\s\S]{0,120}UNSUPPORTED/s;
+die "RESET scope exit must publish the release barrier or fail-stop\n"
+  unless $preserve =~
+         /drain_scope_exited_before_reset_release_barrier[\s\S]{0,120}active_drain_attempt/s;
 
 EOF
 

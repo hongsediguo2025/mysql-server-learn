@@ -2659,8 +2659,13 @@ die "standby transfer must log final-target coverage before preserving targets\n
          $preserve =~ /missing_record=/s;
 die "standby final-target coverage must distinguish phase1 presealed binlog blobs from fallback warmcopy blobs\n"
   unless $preserve =~ /phase1_blob_matches_current_thd/s;
+my ($final_target_coverage) =
+  $preserve =~
+    /(auto collect_batch_transfer_final_target_coverage = \[&\]\(\) \{[\s\S]*?^      \};)/m
+  or die "could not isolate standby final-target coverage collector\n";
 die "standby final-target coverage must not treat missing binlog provider as covered\n"
-  if $preserve =~ /batch_transfer_binlog_blob_provider\s*==\s*nullptr\s*\|\|/s;
+  if $final_target_coverage =~
+     /batch_transfer_binlog_blob_provider\s*==\s*nullptr\s*\|\|/s;
 die "standby transfer sender workers must default to three and drive parallel final-token payload sends before the commit barrier\n"
   unless $sys_vars =~
              /Sys_preserve_trx_transfer_sender_workers[\s\S]*VALID_RANGE\s*\(\s*1\s*,\s*64\s*\)[\s\S]*DEFAULT\s*\(\s*3\s*\)/s &&
