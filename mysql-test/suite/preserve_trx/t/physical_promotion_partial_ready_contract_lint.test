@@ -1,0 +1,67 @@
+--echo # Lint-only source-shape guard. Physical promotion behavior requires
+--echo # integration E2E in the physical-standby project.
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $root = File::Spec->rel2abs(File::Spec->catdir($mysql_test_dir, '..'));
+
+sub read_file {
+  my ($path) = @_;
+  my $full_path = File::Spec->catfile($root, split('/', $path));
+  open(my $fh, '<', $full_path) or die "open $path: $!\n";
+  my $contents = do { local $/; <$fh> };
+  close($fh);
+  return $contents;
+}
+
+my $promotion = read_file('sql/preserve_trx_promotion.cc');
+my $trx = read_file('storage/innobase/trx/trx0trx.cc');
+my $trx_preserve = read_file('storage/innobase/trx/trx0preserve.cc');
+
+my ($trx_list_init) =
+  $trx =~ /(void\s+trx_lists_init_at_db_start\s*\([^)]*\)\s*\{[\s\S]*?^\})/m
+  or die "could not isolate trx_lists_init_at_db_start\n";
+die "native trx-list initialization must not understand receiver token selection\n"
+  if $trx_list_init =~ /ready_tokens|failed_tokens|CLASSIFIED|receiver|promotion/i;
+
+my ($bootstrap) =
+  $promotion =~ /(preserved_trx_prepare_before_trx_sys_init_for_physical_promotion\s*\([\s\S]*?^\})/m
+  or die "could not isolate physical promotion bootstrap\n";
+die "physical bootstrap must validate the immutable receiver partition\n"
+  unless $bootstrap =~ /selection_published/s &&
+         $bootstrap =~ /accepted\.ready_tokens/s &&
+         $bootstrap =~ /accepted\.failed_tokens/s;
+die "physical bootstrap must register only READY resurrection candidates\n"
+  unless $bootstrap =~ /if\s*\(ready\)[\s\S]*ready_entries\.push_back/s &&
+         $bootstrap =~ /register_physical_resurrection_candidates\(ready_entries\)/s;
+
+my ($resolver) =
+  $trx_preserve =~ /(trx_preserve_resolve_recovered_prepared_batch\s*\([\s\S]*?^\})/m
+  or die "could not isolate recovered PREPARED batch resolver\n";
+die "batch resolver must scan the native rw transaction list once\n"
+  unless $resolver =~ /UT_LIST_GET_FIRST\(trx_sys->rw_trx_list\)/s;
+
+my ($handoff) =
+  $trx_preserve =~ /(trx_preserve_handoff_recovered_prepared_to_native_rollback\s*\([\s\S]*?^\})/m
+  or die "could not isolate native rollback handoff\n";
+die "native rollback handoff must consume exact transaction pointers only\n"
+  if $handoff =~ /UT_LIST_GET_(?:FIRST|NEXT)|rollback_prepared_without_snapshot|xid_token_in/s;
+die "native rollback handoff must restore ACTIVE state without synchronous rollback\n"
+  unless $handoff =~ /TRX_STATE_ACTIVE/s &&
+         $handoff !~ /trx_preserve_rollback_claimed|trx_rollback_for_mysql/s;
+
+my ($adopt) =
+  $promotion =~ /(preserved_trx_adopt_prepared_epoch_for_physical_promotion\s*\([\s\S]*?^\})/m
+  or die "could not isolate physical promotion adopt wrapper\n";
+die "clean failure before READY mutation must hand off the whole accepted set\n"
+  unless $adopt =~ /all_accepted_recovery_transactions/s &&
+         $adopt =~ /rolled_back_count\s*==\s*0/s &&
+         $adopt =~ /recovery_transactions\s*=\s*&all_accepted_recovery_transactions/s &&
+         $adopt =~ /handoff_recovered_prepared_to_native_rollback\s*\(\s*\*recovery_transactions/s;
+EOF
+
+SELECT 'ok' AS physical_promotion_partial_ready_contract_lint;

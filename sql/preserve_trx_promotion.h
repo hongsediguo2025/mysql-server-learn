@@ -340,6 +340,8 @@ struct Preserve_trx_physical_promotion_gate_result {
   uint64_t rolled_back_count{0};
   uint64_t tainted_count{0};
   uint64_t elapsed_us{0};
+  std::vector<uint64_t> adopted_tokens;
+  std::vector<uint64_t> ordinary_recovery_tokens;
   std::string message;
 };
 
@@ -406,6 +408,7 @@ class Preserve_trx_physical_promotion_bootstrap_attempt {
   bool prepare_gate_handoff(
       const Preserve_trx_physical_promotion_gate_request **request,
       std::vector<trx_t *> *verified_transactions,
+      std::vector<trx_t *> *ordinary_recovery_transactions,
       const Preserve_trx_transfer_accepted_epoch **accepted_epoch,
       const Preserve_trx_physical_promotion_pin_lease **prepared_token_pin);
   bool complete_gate_handoff();

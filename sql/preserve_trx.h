@@ -52,6 +52,7 @@ class Preserve_trx_physical_fence_lease;
 struct Preserve_trx_prepared_token_key;
 struct Preserve_trx_deferred_transfer_candidate;
 struct Preserve_trx_resurrection_index_entry;
+struct trx_preserve_resurrection_facts;
 struct Mysql_binlog_preserve_cache_facts;
 struct Mysql_binlog_preserve_token_identity;
 
@@ -695,6 +696,9 @@ preserved_trx_adopt_prepared_for_physical_promotion(
 
 bool preserved_trx_register_physical_resurrection_candidates(
     const std::vector<Preserve_trx_resurrection_index_entry> &entries);
+bool preserved_trx_resurrection_entry_to_engine_facts(
+    const Preserve_trx_resurrection_index_entry &entry,
+    trx_preserve_resurrection_facts *facts);
 
 bool preserved_trx_reverse_simulated_promotion_adopt(
     const Preserve_trx_prepared_token_key &key,

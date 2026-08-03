@@ -1,0 +1,5 @@
+# Lint-only source-shape guard. Physical promotion behavior requires
+# integration E2E in the physical-standby project.
+SELECT 'ok' AS physical_promotion_partial_ready_contract_lint;
+physical_promotion_partial_ready_contract_lint
+ok

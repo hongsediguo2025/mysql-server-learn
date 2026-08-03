@@ -1410,7 +1410,8 @@ TEST(TempResumeMaterializerContractTest,
   const std::string activate_body =
       extract_function_body_after_signature_for_temp_table_test(
           trx_preserve_impl,
-          "static dberr_t trx_preserve_activate_undo_ptr_state(");
+          "static dberr_t "
+          "trx_preserve_activate_undo_ptr_state_deferred_flush(");
   ASSERT_FALSE(activate_body.empty());
 
   EXPECT_NE(std::string::npos,

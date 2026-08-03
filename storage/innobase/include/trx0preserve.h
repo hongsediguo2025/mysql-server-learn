@@ -220,6 +220,11 @@ bool trx_preserve_token_has_any_owner(const char *token);
 dberr_t trx_preserve_rollback_prepared_without_snapshot(
     const std::vector<std::string> &snapshot_tokens, uint32_t *rolled_back,
     std::vector<std::string> *rolled_back_tokens = nullptr);
+dberr_t trx_preserve_resolve_recovered_prepared_batch(
+    const std::vector<trx_preserve_resurrection_facts> &expected,
+    std::vector<trx_t *> *transactions);
+dberr_t trx_preserve_handoff_recovered_prepared_to_native_rollback(
+    const std::vector<trx_t *> &transactions);
 dberr_t trx_preserve_prepare_resumed_rollback_gtid(trx_t *trx);
 dberr_t trx_preserve_activate_resumed(trx_t *trx);
 dberr_t trx_preserve_reactivate_prepared_in_original_thd(THD *thd);

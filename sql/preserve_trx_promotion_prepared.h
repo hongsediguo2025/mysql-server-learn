@@ -564,6 +564,10 @@ class Preserve_trx_prepared_token_registry {
       const std::vector<Preserve_trx_prepared_token_key> &keys,
       uint64_t now_monotonic_us,
       Preserve_trx_physical_promotion_pin_lease *lease);
+  Preserve_trx_prepared_status pin_epoch_for_physical_promotion(
+      const std::vector<Preserve_trx_prepared_token_key> &keys,
+      uint64_t now_monotonic_us, uint64_t renewed_deadline_monotonic_us,
+      Preserve_trx_physical_promotion_pin_lease *lease);
   Preserve_trx_prepared_status mark_ready_for_gate(
       const Preserve_trx_prepared_token_key &key,
       uint64_t expected_generation);

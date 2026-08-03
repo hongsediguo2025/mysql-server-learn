@@ -960,6 +960,52 @@ TEST(PreservedTrxPreparedRegistry,
 }
 
 TEST(PreservedTrxPreparedRegistry,
+     PhysicalBootstrapRenewsAndPinsOnlyExactReadyKeys) {
+  preserve_trx_resource_manager_reset_for_unit_test();
+  Preserve_trx_prepared_token_registry registry;
+  auto ready_key = make_prepared_token_key(22);
+  ready_key.token = "31";
+  auto failed_key = ready_key;
+  failed_key.token = "32";
+
+  for (const auto *key : {&ready_key, &failed_key}) {
+    Preserve_trx_prepare_lease prepare;
+    ASSERT_EQ(Preserve_trx_prepared_status::OK,
+              registry.begin_prepare(*key, key->generation, &prepare));
+    ASSERT_EQ(Preserve_trx_prepared_status::OK,
+              registry.publish_ready(
+                  &prepare, make_final_token_facts(100),
+                  acquire_strict_prepared_resources(*key, 100)));
+  }
+
+  Preserve_trx_prepared_token_snapshot failed_before;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.snapshot(failed_key, &failed_before));
+  const uint64_t now_us =
+      preserved_trx_promotion_prepared_monotonic_us_for_unit_test();
+  const uint64_t renewed_deadline_us = now_us + 4ULL * 3600ULL * 1000000ULL;
+  Preserve_trx_physical_promotion_pin_lease pin_lease;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.pin_epoch_for_physical_promotion(
+                {ready_key}, now_us, renewed_deadline_us, &pin_lease));
+
+  Preserve_trx_prepared_token_snapshot ready_after;
+  Preserve_trx_prepared_token_snapshot failed_after;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.snapshot(ready_key, &ready_after));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.snapshot(failed_key, &failed_after));
+  EXPECT_EQ(renewed_deadline_us,
+            ready_after.facts.epoch_prepare_deadline_us);
+  EXPECT_EQ(failed_before.facts.epoch_prepare_deadline_us,
+            failed_after.facts.epoch_prepare_deadline_us);
+
+  pin_lease.release_for_abandon();
+  registry.purge_epoch(ready_key.epoch_scope, ready_key.epoch_id);
+  preserve_trx_resource_manager_reset_for_unit_test();
+}
+
+TEST(PreservedTrxPreparedRegistry,
      PhysicalBootstrapAbandonPinReleaseIsIdempotent) {
   preserve_trx_resource_manager_reset_for_unit_test();
   Preserve_trx_prepared_token_registry registry;
@@ -15480,6 +15526,116 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_EQ("epoch-lease", expired.front().epoch_id);
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
             registry.erase_abandoning_epoch(m_dir, "epoch-lease"));
+}
+
+TEST_F(PreserveSnapshotTest,
+       AcceptedEpochPromotionLeaseAcceptsPublishedClassifiedPartition) {
+  Preserve_trx_transfer_receiver_registry registry;
+  const std::string epoch_id = "epoch-classified-lease";
+  constexpr uint64_t token = 1913;
+  publish_test_accepted_epoch(&registry, epoch_id, token, 1000, 10);
+
+  Preserve_trx_receiver_failed_token failed;
+  failed.token = token;
+  failed.reason = Preserve_trx_receiver_failure_reason::PREWARM_DEADLINE;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.publish_accepted_epoch_selection(
+                m_dir, epoch_id, 2000, 32000, {}, {failed}));
+
+  Preserve_trx_transfer_accepted_epoch accepted;
+  ASSERT_EQ(Preserve_trx_receiver_promotion_lease_status::ACQUIRED,
+            registry.try_acquire_accepted_epoch_promotion_lease(
+                m_dir, epoch_id, 3000, "receiver-generation", &accepted));
+  EXPECT_EQ(Preserve_trx_transfer_epoch_lifecycle::ADOPT_LEASED,
+            accepted.lifecycle);
+  EXPECT_TRUE(accepted.selection_published);
+  EXPECT_TRUE(accepted.ready_tokens.empty());
+  ASSERT_EQ(1U, accepted.failed_tokens.size());
+  EXPECT_EQ(token, accepted.failed_tokens.front().token);
+
+  EXPECT_EQ(Preserve_trx_transfer_status::OK,
+            registry.abandon_accepted_epoch_promotion_lease(accepted));
+}
+
+TEST_F(PreserveSnapshotTest,
+       AcceptedEpochCopiesFailedTokenIdentityFromSealedResurrectionIndex) {
+  Transfer_codec_context_guard codec_guard;
+  constexpr uint64_t token = 1914;
+  const std::string epoch_id = "epoch-classified-resurrection-index";
+
+  Preserve_snapshot_metadata meta = metadata();
+  meta.token = test_transfer_token_string(token);
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = meta;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  Preserve_trx_transfer_manifest manifest;
+  std::vector<Preserve_trx_transfer_object_payload> objects;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_build_portable_objects(
+                epoch_id, bundle, token, &manifest, &objects));
+
+  Preserve_trx_transfer_receiver_registry registry;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.begin_receive(manifest));
+  for (const auto &object : objects) {
+    if (object.descriptor.kind !=
+        Preserve_trx_transfer_object_kind::RESURRECTION_INDEX) {
+      continue;
+    }
+    ASSERT_EQ(Preserve_trx_transfer_status::OK,
+              registry.stage_strict_v1_object_chunk(
+                  manifest, object.descriptor.object_id, 0, object.payload));
+    ASSERT_EQ(Preserve_trx_transfer_status::OK,
+              registry.seal_strict_v1_object(manifest,
+                                             object.descriptor.object_id));
+  }
+
+  std::string encoded_manifest;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_encode_manifest(manifest,
+                                                  &encoded_manifest));
+  auto fact = std::make_shared<Preserve_trx_transfer_epoch_fact>();
+  fact->epoch_id = epoch_id;
+  fact->source_fence_lsn = manifest.source_epoch_commit_lsn;
+  Preserve_trx_transfer_epoch_fact_token fact_token;
+  fact_token.token = token;
+  fact_token.source_prepare_lsn = manifest.source_prepare_lsn;
+  fact_token.source_epoch_commit_lsn = manifest.source_epoch_commit_lsn;
+  fact_token.manifest_digest = test_sha256(encoded_manifest);
+  fact_token.objects = manifest.objects;
+  fact->tokens.push_back(fact_token);
+
+  Preserve_trx_transfer_accepted_epoch accepted;
+  accepted.root_dir = m_dir;
+  accepted.epoch_id = epoch_id;
+  accepted.receiver_process_generation = "receiver-generation";
+  accepted.source_fence_lsn = fact->source_fence_lsn;
+  accepted.tokens = {token};
+  accepted.fact = fact;
+  accepted.lifecycle = Preserve_trx_transfer_epoch_lifecycle::ADOPT_LEASED;
+  accepted.failed_tokens = {
+      {token, Preserve_trx_receiver_failure_reason::PREWARM_DEADLINE}};
+  accepted.selection_published = true;
+
+  Preserve_trx_resurrection_index_entry copied;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_copy_accepted_resurrection_entry(
+                m_dir, accepted, token, &registry, &copied));
+  EXPECT_EQ(token, copied.token);
+  EXPECT_EQ(manifest.source_prepare_lsn, copied.prepare_lsn);
+  EXPECT_EQ(1000U + token, copied.trx_id);
+  EXPECT_FALSE(copied.undo_anchors.empty());
+
+  auto mismatched_fact =
+      std::make_shared<Preserve_trx_transfer_epoch_fact>(*fact);
+  mismatched_fact->tokens.front().manifest_digest[0] ^= 0x5a;
+  accepted.fact = mismatched_fact;
+  EXPECT_EQ(Preserve_trx_transfer_status::CORRUPT,
+            preserve_trx_transfer_copy_accepted_resurrection_entry(
+                m_dir, accepted, token, &registry, &copied));
 }
 
 TEST_F(PreserveSnapshotTest,

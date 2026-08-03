@@ -1821,12 +1821,24 @@ Preserve_trx_prepared_token_registry::pin_epoch_for_physical_promotion(
     const std::vector<Preserve_trx_prepared_token_key> &keys,
     uint64_t now_monotonic_us,
     Preserve_trx_physical_promotion_pin_lease *lease) {
+  return pin_epoch_for_physical_promotion(keys, now_monotonic_us, 0, lease);
+}
+
+Preserve_trx_prepared_status
+Preserve_trx_prepared_token_registry::pin_epoch_for_physical_promotion(
+    const std::vector<Preserve_trx_prepared_token_key> &keys,
+    uint64_t now_monotonic_us, uint64_t renewed_deadline_monotonic_us,
+    Preserve_trx_physical_promotion_pin_lease *lease) {
   if (keys.empty() || now_monotonic_us == 0 || lease == nullptr ||
-      lease->active()) {
+      lease->active() ||
+      (renewed_deadline_monotonic_us != 0 &&
+       renewed_deadline_monotonic_us <= now_monotonic_us)) {
     return Preserve_trx_prepared_status::INVALID_ARGUMENT;
   }
   std::vector<std::shared_ptr<Preserve_trx_prepared_token_entry>> entries;
   std::vector<std::unique_lock<std::mutex>> guards;
+  std::vector<std::shared_ptr<const Preserve_trx_prepared_token_publication>>
+      publications;
   try {
     {
       std::lock_guard<std::mutex> registry_guard(m_state->mutex);
@@ -1855,6 +1867,7 @@ Preserve_trx_prepared_token_registry::pin_epoch_for_physical_promotion(
     }
     guards.reserve(entries.size());
     for (const auto &entry : entries) guards.emplace_back(entry->mutex);
+    publications.reserve(entries.size());
     for (const auto &entry : entries) {
       const auto state = entry->state.load(std::memory_order_acquire);
       const auto publication = std::atomic_load_explicit(
@@ -1865,11 +1878,33 @@ Preserve_trx_prepared_token_registry::pin_epoch_for_physical_promotion(
            state != Preserve_trx_prepared_token_state::READY_FOR_GATE) ||
           publication == nullptr ||
           !prepared_token_keys_match(publication->key, entry->key) ||
-          publication->facts.epoch_prepare_deadline_us <= now_monotonic_us ||
+          (renewed_deadline_monotonic_us == 0 &&
+           publication->facts.epoch_prepare_deadline_us <= now_monotonic_us) ||
           entry->physical_promotion_pins ==
               std::numeric_limits<uint32_t>::max()) {
         return Preserve_trx_prepared_status::INVALID_STATE;
       }
+      if (renewed_deadline_monotonic_us == 0 ||
+          publication->facts.epoch_prepare_deadline_us ==
+              renewed_deadline_monotonic_us) {
+        publications.push_back(publication);
+        continue;
+      }
+      Preserve_trx_final_token_facts facts = publication->facts;
+      facts.epoch_prepare_deadline_us = renewed_deadline_monotonic_us;
+      facts.canonical_digest.clear();
+      if (!preserved_trx_finalize_token_facts(&facts)) {
+        return Preserve_trx_prepared_status::INVALID_STATE;
+      }
+      publications.push_back(
+          std::make_shared<const Preserve_trx_prepared_token_publication>(
+              Preserve_trx_prepared_token_publication{publication->key,
+                                                      std::move(facts)}));
+    }
+    for (size_t index = 0; index < entries.size(); ++index) {
+      std::atomic_store_explicit(&entries[index]->publication,
+                                 std::move(publications[index]),
+                                 std::memory_order_release);
     }
     for (const auto &entry : entries) ++entry->physical_promotion_pins;
     lease->m_entries = std::move(entries);

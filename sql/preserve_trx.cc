@@ -9741,6 +9741,12 @@ class Temp_table_phase1_drain_participant final
 
 }  // namespace
 
+bool preserved_trx_resurrection_entry_to_engine_facts(
+    const Preserve_trx_resurrection_index_entry &entry,
+    trx_preserve_resurrection_facts *facts) {
+  return preserve_trx_resurrection_entry_to_engine_facts(entry, facts);
+}
+
 Preserve_trx_reset_drain_result preserve_trx_request_active_drain_reset(
     bool wait_for_runnable) {
   return preserve_trx_request_active_drain_reset_impl(wait_for_runnable);

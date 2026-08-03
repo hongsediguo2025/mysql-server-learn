@@ -1374,6 +1374,12 @@ Preserve_trx_transfer_status
 preserve_trx_transfer_destroy_receiver_epoch_process_local(
     const Preserve_trx_transfer_accepted_epoch &accepted,
     Preserve_trx_transfer_receiver_registry *registry);
+Preserve_trx_transfer_status
+preserve_trx_transfer_copy_accepted_resurrection_entry(
+    const std::string &root_dir,
+    const Preserve_trx_transfer_accepted_epoch &accepted, uint64_t token,
+    Preserve_trx_transfer_receiver_registry *registry,
+    Preserve_trx_resurrection_index_entry *entry);
 bool preserve_trx_transfer_frame_batch_count_fits_payload(
     uint32_t count, size_t remaining_bytes);
 

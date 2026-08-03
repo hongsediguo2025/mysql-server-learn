@@ -4664,10 +4664,9 @@ Preserve_trx_transfer_status read_receiver_sealed_object_payload(
   return Preserve_trx_transfer_status::OK;
 }
 
-bool resurrection_index_matches_receiver_bundle(
+bool decode_receiver_resurrection_index(
     const std::string &root_dir,
     const Preserve_trx_transfer_manifest &manifest,
-    const Preserved_trx_bundle &bundle,
     Preserve_trx_transfer_receiver_registry *registry,
     Preserve_trx_resurrection_index_entry *verified_entry) {
   constexpr uint64_t kStrictResurrectionIndexMaxBytes = 1024 * 1024;
@@ -4707,7 +4706,6 @@ bool resurrection_index_matches_receiver_bundle(
   if (entry.token != manifest.token ||
       entry.prepare_lsn != manifest.source_prepare_lsn ||
       entry.snapshot_digest != snapshot_object->digest ||
-      entry.modified_table_ids.size() != bundle.metadata.mod_tables_count ||
       entry.xid.format_id != PRESERVE_TRX_XID_FORMAT_ID ||
       entry.xid.gtrid_length != PRESERVE_TRX_XID_GTRID_LENGTH ||
       entry.xid.bqual_length != token.size() ||
@@ -4719,6 +4717,18 @@ bool resurrection_index_matches_receiver_bundle(
   }
   *verified_entry = entry;
   return true;
+}
+
+bool resurrection_index_matches_receiver_bundle(
+    const std::string &root_dir,
+    const Preserve_trx_transfer_manifest &manifest,
+    const Preserved_trx_bundle &bundle,
+    Preserve_trx_transfer_receiver_registry *registry,
+    Preserve_trx_resurrection_index_entry *verified_entry) {
+  return decode_receiver_resurrection_index(root_dir, manifest, registry,
+                                            verified_entry) &&
+         verified_entry->modified_table_ids.size() ==
+             bundle.metadata.mod_tables_count;
 }
 
 enum class Receiver_staged_token_prewarm_outcome {
@@ -6177,6 +6187,47 @@ Preserve_memory_lease acquire_transfer_decode_memory_lease(
 }
 
 }  // namespace
+
+Preserve_trx_transfer_status
+preserve_trx_transfer_copy_accepted_resurrection_entry(
+    const std::string &root_dir,
+    const Preserve_trx_transfer_accepted_epoch &accepted, uint64_t token,
+    Preserve_trx_transfer_receiver_registry *registry,
+    Preserve_trx_resurrection_index_entry *entry) {
+  if (root_dir.empty() || accepted.fact == nullptr || token == 0 ||
+      entry == nullptr || accepted.root_dir != root_dir ||
+      accepted.epoch_id.empty() ||
+      accepted.fact->epoch_id != accepted.epoch_id ||
+      accepted.fact->source_fence_lsn != accepted.source_fence_lsn) {
+    return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+  }
+  if (registry == nullptr) registry = &default_receiver_registry();
+
+  const auto fact_token = std::find_if(
+      accepted.fact->tokens.begin(), accepted.fact->tokens.end(),
+      [token](const auto &candidate) { return candidate.token == token; });
+  if (fact_token == accepted.fact->tokens.end()) {
+    return Preserve_trx_transfer_status::CORRUPT;
+  }
+
+  Preserve_trx_transfer_receiver_record record;
+  if (!registry->lookup(accepted.epoch_id, token, &record)) {
+    return Preserve_trx_transfer_status::CORRUPT;
+  }
+  const Preserve_trx_transfer_manifest manifest = receiver_record_manifest(record);
+  std::string encoded_manifest;
+  if (manifest.epoch_id != accepted.epoch_id || manifest.token != token ||
+      manifest.source_prepare_lsn != fact_token->source_prepare_lsn ||
+      manifest.source_epoch_commit_lsn !=
+          fact_token->source_epoch_commit_lsn ||
+      preserve_trx_transfer_encode_manifest(manifest, &encoded_manifest) !=
+          Preserve_trx_transfer_status::OK ||
+      sha256_digest(encoded_manifest) != fact_token->manifest_digest ||
+      !decode_receiver_resurrection_index(root_dir, manifest, registry, entry)) {
+    return Preserve_trx_transfer_status::CORRUPT;
+  }
+  return Preserve_trx_transfer_status::OK;
+}
 
 Preserve_trx_transfer_status
 preserve_trx_transfer_cleanup_receiver_restart_state(
@@ -8943,7 +8994,11 @@ Preserve_trx_transfer_receiver_registry::
     return Preserve_trx_receiver_promotion_lease_status::
         NOT_FOUND_OR_EXPIRED;
   }
-  if (accepted.lifecycle != Preserve_trx_transfer_epoch_lifecycle::READY) {
+  const bool classified_partition =
+      accepted.lifecycle == Preserve_trx_transfer_epoch_lifecycle::CLASSIFIED &&
+      accepted.selection_published;
+  if (accepted.lifecycle != Preserve_trx_transfer_epoch_lifecycle::READY &&
+      !classified_partition) {
     return Preserve_trx_receiver_promotion_lease_status::NOT_READY;
   }
   try {
