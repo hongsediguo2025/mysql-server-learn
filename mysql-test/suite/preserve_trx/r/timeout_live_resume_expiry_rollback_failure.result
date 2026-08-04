@@ -8,7 +8,7 @@ ENGINE=InnoDB;
 INSERT INTO t_timeout_resume_rollback_failure VALUES(1,10);
 START TRANSACTION;
 UPDATE t_timeout_resume_rollback_failure SET b=11 WHERE a=1;
-PREPARE SHUTDOWN PRESERVE TRANSACTION;
+DRAIN TRANSACTIONS PRESERVE;
 SET SESSION debug="+d,preserve_trx_fail_resume_timeout_rollback";
 RESUME PRESERVED TRANSACTION 'TOKEN';
 ERROR HY000: Resumable transactions across shutdown do not support this operation

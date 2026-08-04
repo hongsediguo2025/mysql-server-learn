@@ -1,7 +1,10 @@
 DROP TABLE IF EXISTS t_batch_drained;
+DROP PROCEDURE IF EXISTS p_batch_drained_update;
 SET GLOBAL preserve_trx_enable=ON;
 CREATE TABLE t_batch_drained(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_batch_drained VALUES(1,10);
+CREATE PROCEDURE p_batch_drained_update()
+UPDATE t_batch_drained SET b=50 WHERE a=1;
 START TRANSACTION;
 UPDATE t_batch_drained SET b=20 WHERE a=1;
 PREPARE drained_existing_stmt FROM 'UPDATE t_batch_drained SET b=40 WHERE a=1';
@@ -25,6 +28,10 @@ PREPARE drained_stmt FROM 'UPDATE t_batch_drained SET b=40 WHERE a=1';
 ERROR HY000: Preserve drain is active; this command was not executed
 EXECUTE drained_existing_stmt;
 ERROR HY000: Preserve drain is active; this command was not executed
+CALL p_batch_drained_update();
+ERROR HY000: Preserve drain is active; this command was not executed
+LOCK TABLES t_batch_drained WRITE;
+ERROR HY000: Preserve drain is active; this command was not executed
 SELECT * FROM t_batch_drained WHERE a=1 FOR UPDATE;
 ERROR HY000: Preserve drain is active; this command was not executed
 RESUME PRESERVED TRANSACTION 'not-a-token';
@@ -36,4 +43,5 @@ SELECT * FROM t_batch_drained;
 a	b
 1	10
 DROP TABLE t_batch_drained;
+DROP PROCEDURE p_batch_drained_update;
 SET GLOBAL preserve_trx_enable=ON;

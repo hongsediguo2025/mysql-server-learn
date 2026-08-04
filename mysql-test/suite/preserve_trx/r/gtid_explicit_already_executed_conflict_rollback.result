@@ -11,7 +11,7 @@ RESET MASTER;
 SET GTID_NEXT='SERVER_UUID:7';
 START TRANSACTION;
 UPDATE t_gtid_conflict_preserved SET b=11 WHERE a=1;
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 SELECT COUNT(*) AS preserved_count_before_gtid_conflict
 FROM performance_schema.preserved_transactions;
 preserved_count_before_gtid_conflict

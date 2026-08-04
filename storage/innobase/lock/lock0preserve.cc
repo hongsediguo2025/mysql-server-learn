@@ -9,7 +9,7 @@ as published by the Free Software Foundation.
 *****************************************************************************/
 
 /** @file lock/lock0preserve.cc
- Low-intrusion preserve/resume lock payload and materialization helpers.
+ Low-intrusion preserve/resume lock payload helpers.
 
  Heavy preserve payload parsing, record-image construction and import/export
  helpers live here so lock0lock.cc remains focused on native lock mutations and
@@ -22,7 +22,6 @@ as published by the Free Software Foundation.
 
 #include <algorithm>
 #include <chrono>
-#include <functional>
 #include <limits>
 #include <memory>
 #include <set>
@@ -34,7 +33,6 @@ as published by the Free Software Foundation.
 #include <vector>
 
 #include "btr0btr.h"
-#include "btr0pcur.h"
 #include "buf0buf.h"
 #include "buf0rea.h"
 #include "current_thd.h"
@@ -78,19 +76,11 @@ void lock_preserve_remove_record_bitmap_from_metadata(lock_t *lock);
 dberr_t lock_preserve_create_table_lock_for_import(dict_table_t *table,
                                                    trx_t *trx,
                                                    lock_mode mode);
-dberr_t lock_preserve_convert_impl_to_expl_for_materialize(
-    const buf_block_t *block, const rec_t *rec, dict_index_t *index,
-    const ulint *offsets, trx_t *trx, ulint heap_no, bool *converted,
-    bool allow_conversion);
 const lock_t *lock_preserve_record_lock_has_conflict(
     ulint precise_mode, const buf_block_t *block, ulint heap_no, trx_t *trx);
 bool lock_preserve_record_lock_object_has_conflict(
     ulint precise_mode, const lock_t *lock, bool lock_is_on_supremum,
     trx_t *trx);
-trx_t *lock_preserve_secondary_record_implicit_owner(const rec_t *rec,
-                                                     dict_index_t *index,
-                                                     const ulint *offsets);
-
 static thread_local const char *lock_preserve_record_export_error = nullptr;
 
 static void lock_preserve_set_record_export_error(const char *reason) {
@@ -3222,211 +3212,4 @@ static dberr_t lock_preserve_import_one_table_lock(
 
   const auto mode = static_cast<lock_mode>(entry.lock_mode);
   return lock_preserve_create_table_lock_for_import(table, trx, mode);
-}
-
-/** Owner-of-implicit-lock predicate for a single index record. */
-static bool lock_preserve_record_belongs_to_trx(const rec_t *rec,
-                                                dict_index_t *index,
-                                                const ulint *offsets,
-                                                trx_t *trx,
-                                                bool *owns_trx_reference) {
-  ut_ad(owns_trx_reference != nullptr);
-  *owns_trx_reference = false;
-
-  if (index->is_clustered()) {
-    return rec_get_trx_id(rec, index) == trx->id;
-  }
-
-  trx_t *impl_owner =
-      lock_preserve_secondary_record_implicit_owner(rec, index, offsets);
-  if (impl_owner == nullptr) {
-    return false;
-  }
-
-  if (impl_owner != trx) {
-    trx_release_reference(impl_owner);
-    return false;
-  }
-
-  *owns_trx_reference = true;
-  return true;
-}
-
-/**
-  Scan one index and convert implicit X-locks owned by trx into explicit record
-  locks for the live-export path.
-
-  This is not native implicit-lock warmcopy. It is the fallback/preflight path
-  that makes the current InnoDB lock state serializable before record locks are
-  exported. The scan is bounded by table/page/lock/time limits and fails closed
-  on unsupported shapes, conversion conflicts, or timeout so preserve never
-  writes a snapshot missing implicit X-lock ownership.
-*/
-static dberr_t lock_preserve_materialize_one_index(
-    trx_t *trx, dict_index_t *index, const Preserve_lock_limits &limits,
-    bool *materialized_any, uint32_t *materialized_locks,
-    uint32_t *scanned_pages,
-    const std::function<bool()> &timed_out) {
-  if (*scanned_pages == limits.max_scan_pages) {
-    return DB_UNSUPPORTED;
-  }
-  ++(*scanned_pages);
-
-  mtr_t mtr;
-  btr_pcur_t pcur;
-  mtr_start(&mtr);
-  pcur.open_at_side(true, index, BTR_SEARCH_LEAF, true, 0, &mtr);
-  if (index->is_clustered()) {
-    DEBUG_SYNC_C("preserve_trx_materialize_after_first_page_open");
-  } else {
-    DEBUG_SYNC_C("preserve_trx_materialize_after_first_secondary_page_open");
-  }
-
-  for (;;) {
-    if (timed_out()) {
-      pcur.close();
-      mtr_commit(&mtr);
-      return DB_UNSUPPORTED;
-    }
-
-    if (pcur.is_after_last_on_page()) {
-      if (pcur.is_after_last_in_tree(&mtr)) {
-        break;
-      }
-      if (*scanned_pages == limits.max_scan_pages) {
-        pcur.close();
-        mtr_commit(&mtr);
-        return DB_UNSUPPORTED;
-      }
-      ++(*scanned_pages);
-      pcur.move_to_next_page(&mtr);
-      continue;
-    }
-
-    pcur.move_to_next_on_page();
-    if (!pcur.is_on_user_rec()) {
-      continue;
-    }
-
-    const rec_t *rec = pcur.get_rec();
-    ulint offsets_[REC_OFFS_NORMAL_SIZE];
-    rec_offs_init(offsets_);
-    mem_heap_t *heap = nullptr;
-    ulint *offsets =
-        rec_get_offsets(rec, index, offsets_, ULINT_UNDEFINED, &heap);
-
-    bool owns_trx_reference = false;
-    if (lock_preserve_record_belongs_to_trx(rec, index, offsets, trx,
-                                            &owns_trx_reference)) {
-      const bool allow_conversion =
-          *materialized_locks < limits.max_lock_count;
-      bool converted = false;
-      if (!owns_trx_reference) {
-        trx_reference(trx, true);
-      }
-      const dberr_t err = lock_preserve_convert_impl_to_expl_for_materialize(
-          pcur.get_block(), rec, index, offsets, trx,
-          page_rec_get_heap_no(rec), &converted, allow_conversion);
-      if (err != DB_SUCCESS) {
-        if (heap != nullptr) {
-          mem_heap_free(heap);
-        }
-        pcur.close();
-        mtr_commit(&mtr);
-        return err;
-      }
-      if (converted) {
-        ++(*materialized_locks);
-        if (materialized_any != nullptr) {
-          *materialized_any = true;
-        }
-        if (*materialized_locks >= limits.max_lock_count) {
-          if (heap != nullptr) {
-            mem_heap_free(heap);
-          }
-          pcur.close();
-          mtr_commit(&mtr);
-          return DB_UNSUPPORTED;
-        }
-      }
-    }
-
-    if (heap != nullptr) {
-      mem_heap_free(heap);
-    }
-  }
-
-  pcur.close();
-  mtr_commit(&mtr);
-  return DB_SUCCESS;
-}
-
-dberr_t lock_preserve_materialize_implicit_locks(
-    trx_t *trx, const Preserve_lock_limits &limits, bool *materialized_any) {
-  if (trx == nullptr) {
-    return DB_ERROR;
-  }
-  if (materialized_any != nullptr) {
-    *materialized_any = false;
-  }
-
-  DBUG_EXECUTE_IF("preserve_trx_fail_materialize_implicit_locks",
-                  return DB_OUT_OF_MEMORY;);
-
-  if (trx->mod_tables.size() > limits.max_modified_tables) {
-    return DB_UNSUPPORTED;
-  }
-
-  using Clock = std::chrono::steady_clock;
-  const auto started_at = Clock::now();
-  const auto timed_out = [&]() {
-    if (limits.materialize_timeout_ms == 0) {
-      return true;
-    }
-    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-        Clock::now() - started_at);
-    return elapsed.count() >
-           static_cast<int64_t>(limits.materialize_timeout_ms);
-  };
-
-  uint32_t materialized_locks = 0;
-  uint32_t scanned_pages = 0;
-
-  for (dict_table_t *table : trx->mod_tables) {
-    if (table == nullptr || table->is_temporary() || table->ibd_file_missing) {
-      return DB_UNSUPPORTED;
-    }
-
-    dict_index_t *clust = table->first_index();
-    if (clust == nullptr || !clust->is_clustered() ||
-        dict_index_is_spatial(clust)) {
-      return DB_UNSUPPORTED;
-    }
-
-    const dberr_t clust_err = lock_preserve_materialize_one_index(
-        trx, clust, limits, materialized_any, &materialized_locks,
-        &scanned_pages, timed_out);
-    if (clust_err != DB_SUCCESS) {
-      return clust_err;
-    }
-
-    for (dict_index_t *sec = clust->next(); sec != nullptr;
-         sec = sec->next()) {
-      if (dict_index_is_spatial(sec) || (sec->type & DICT_FTS)) {
-        continue;
-      }
-      if (!sec->is_committed() || dict_index_is_online_ddl(sec)) {
-        return DB_UNSUPPORTED;
-      }
-
-      const dberr_t sec_err = lock_preserve_materialize_one_index(
-          trx, sec, limits, materialized_any, &materialized_locks,
-          &scanned_pages, timed_out);
-      if (sec_err != DB_SUCCESS) {
-        return sec_err;
-      }
-    }
-  }
-
-  return DB_SUCCESS;
 }

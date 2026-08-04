@@ -1,116 +1,78 @@
 --source include/not_log_bin.inc
---source include/force_restart.inc
 
 --disable_warnings
-DROP TABLE IF EXISTS t_preserve_scan_limit;
-DROP TABLE IF EXISTS t_preserve_lock_limit;
 DROP TABLE IF EXISTS t_preserve_explicit_update_limit;
 DROP TABLE IF EXISTS t_preserve_export_lock_limit;
-DROP TABLE IF EXISTS t_preserve_timeout_limit;
 DROP TABLE IF EXISTS t_preserve_table_limit_a;
 DROP TABLE IF EXISTS t_preserve_table_limit_b;
 DROP TABLE IF EXISTS t_preserve_shared_lock_budget;
-DROP TABLE IF EXISTS t_preserve_sec_scan_budget;
 --enable_warnings
 
 SET GLOBAL preserve_trx_enable=ON;
-SET @saved_preserve_trx_max_scan_pages=@@GLOBAL.preserve_trx_max_scan_pages;
 SET @saved_preserve_trx_max_lock_count=@@GLOBAL.preserve_trx_max_lock_count;
-SET @saved_preserve_trx_materialize_timeout_ms=@@GLOBAL.preserve_trx_materialize_timeout_ms;
 SET @saved_preserve_trx_max_modified_tables=@@GLOBAL.preserve_trx_max_modified_tables;
---disable_query_log
-CALL mtr.add_suppression("PRESERVE rejected.*record_lock_export_count_limit");
---enable_query_log
 
-CREATE TABLE t_preserve_scan_limit(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
-SET GLOBAL preserve_trx_max_scan_pages=0;
-START TRANSACTION;
-INSERT INTO t_preserve_scan_limit VALUES(1,10);
---error ER_PRESERVE_TRX_UNSUPPORTED
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
-SELECT COUNT(*) AS visible_before_rollback FROM t_preserve_scan_limit;
-ROLLBACK;
-SELECT COUNT(*) AS visible_after_rollback FROM t_preserve_scan_limit;
-SET GLOBAL preserve_trx_max_scan_pages=@saved_preserve_trx_max_scan_pages;
-
-CREATE TABLE t_preserve_lock_limit(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
-SET GLOBAL preserve_trx_max_lock_count=1;
-START TRANSACTION;
-INSERT INTO t_preserve_lock_limit VALUES(1,10),(2,20);
---error ER_PRESERVE_TRX_UNSUPPORTED
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
---replace_column 2 ####
-SHOW WARNINGS;
-SELECT COUNT(*) AS visible_before_rollback FROM t_preserve_lock_limit;
-ROLLBACK;
-SELECT COUNT(*) AS visible_after_rollback FROM t_preserve_lock_limit;
-SET GLOBAL preserve_trx_max_lock_count=@saved_preserve_trx_max_lock_count;
-
+# Explicit record locks over the shared lock-count budget must reject DRAIN
+# without releasing or rolling back the business transaction.
 CREATE TABLE t_preserve_explicit_update_limit(id INT PRIMARY KEY, v INT)
   ENGINE=InnoDB;
 INSERT INTO t_preserve_explicit_update_limit VALUES(1,10),(2,20);
 SET GLOBAL preserve_trx_max_lock_count=1;
 START TRANSACTION;
 UPDATE t_preserve_explicit_update_limit SET v=v+100;
---error ER_PRESERVE_TRX_UNSUPPORTED
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
---replace_column 2 ####
-SHOW WARNINGS;
+--let $preserve_trx_drain_clause= WITH TIMEOUT 300
+--let $preserve_trx_drain_error= ER_PRESERVE_TRX_UNSUPPORTED
+--let $preserve_trx_drain_show_warnings= 1
+--source suite/preserve_trx/include/drain_transaction_from_control_expect_error.inc
 
 --connect(explicit_update_waiter, localhost, root,,test)
-connection explicit_update_waiter;
 SET innodb_lock_wait_timeout=1;
 --error ER_LOCK_WAIT_TIMEOUT
 UPDATE t_preserve_explicit_update_limit SET v=11 WHERE id=1;
-disconnect explicit_update_waiter;
+--disconnect explicit_update_waiter
 
-connection default;
+--connection default
 SELECT * FROM t_preserve_explicit_update_limit ORDER BY id;
 ROLLBACK;
 SELECT * FROM t_preserve_explicit_update_limit ORDER BY id;
 SET GLOBAL preserve_trx_max_lock_count=@saved_preserve_trx_max_lock_count;
 
-CREATE TABLE t_preserve_export_lock_limit(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+# UPDATE plus SELECT FOR UPDATE uses both modified and read record locks. The
+# failed DRAIN must leave both locks owned by the original business THD.
+CREATE TABLE t_preserve_export_lock_limit(id INT PRIMARY KEY, v INT)
+  ENGINE=InnoDB;
 INSERT INTO t_preserve_export_lock_limit VALUES(1,10),(2,20);
 SET GLOBAL preserve_trx_max_lock_count=1;
 START TRANSACTION;
 UPDATE t_preserve_export_lock_limit SET v=11 WHERE id=1;
 SELECT id FROM t_preserve_export_lock_limit WHERE id=2 FOR UPDATE;
---error ER_PRESERVE_TRX_UNSUPPORTED
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+--let $preserve_trx_drain_clause= WITH TIMEOUT 300
+--let $preserve_trx_drain_error= ER_PRESERVE_TRX_UNSUPPORTED
+--source suite/preserve_trx/include/drain_transaction_from_control_expect_error.inc
 
 --connect(export_lock_waiter, localhost, root,,test)
-connection export_lock_waiter;
 SET innodb_lock_wait_timeout=1;
 --error ER_LOCK_WAIT_TIMEOUT
 UPDATE t_preserve_export_lock_limit SET v=21 WHERE id=2;
-disconnect export_lock_waiter;
+--disconnect export_lock_waiter
 
-connection default;
+--connection default
 SELECT * FROM t_preserve_export_lock_limit ORDER BY id;
 ROLLBACK;
 SELECT * FROM t_preserve_export_lock_limit ORDER BY id;
 SET GLOBAL preserve_trx_max_lock_count=@saved_preserve_trx_max_lock_count;
 
-CREATE TABLE t_preserve_timeout_limit(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
-SET GLOBAL preserve_trx_materialize_timeout_ms=0;
-START TRANSACTION;
-INSERT INTO t_preserve_timeout_limit VALUES(1,10);
---error ER_PRESERVE_TRX_UNSUPPORTED
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
-SELECT COUNT(*) AS visible_before_rollback FROM t_preserve_timeout_limit;
-ROLLBACK;
-SELECT COUNT(*) AS visible_after_rollback FROM t_preserve_timeout_limit;
-SET GLOBAL preserve_trx_materialize_timeout_ms=@saved_preserve_trx_materialize_timeout_ms;
-
+# The modified-table limit is shared by DRAIN and remains relevant after the
+# legacy implicit-lock materializer is removed.
 CREATE TABLE t_preserve_table_limit_a(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
 CREATE TABLE t_preserve_table_limit_b(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
 SET GLOBAL preserve_trx_max_modified_tables=1;
 START TRANSACTION;
 INSERT INTO t_preserve_table_limit_a VALUES(1,10);
 INSERT INTO t_preserve_table_limit_b VALUES(1,20);
---error ER_PRESERVE_TRX_UNSUPPORTED
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+--let $preserve_trx_drain_clause= WITH TIMEOUT 300
+--let $preserve_trx_drain_error= ER_PRESERVE_TRX_UNSUPPORTED
+--source suite/preserve_trx/include/drain_transaction_from_control_expect_error.inc
 SELECT COUNT(*) AS visible_before_rollback FROM t_preserve_table_limit_a;
 SELECT COUNT(*) AS visible_before_rollback FROM t_preserve_table_limit_b;
 ROLLBACK;
@@ -118,9 +80,7 @@ SELECT COUNT(*) AS visible_after_rollback FROM t_preserve_table_limit_a;
 SELECT COUNT(*) AS visible_after_rollback FROM t_preserve_table_limit_b;
 SET GLOBAL preserve_trx_max_modified_tables=@saved_preserve_trx_max_modified_tables;
 
-# The max lock-count budget is shared by record locks and table locks. Updating
-# two rows consumes two record-lock units; the transaction also owns an IX table
-# lock, so max_lock_count=2 must reject preserve and keep the transaction live.
+# Two record locks plus the IX table lock exceed a max_lock_count of two.
 CREATE TABLE t_preserve_shared_lock_budget(
   id INT PRIMARY KEY,
   v INT
@@ -129,42 +89,17 @@ INSERT INTO t_preserve_shared_lock_budget VALUES(1,10),(2,20);
 SET GLOBAL preserve_trx_max_lock_count=2;
 START TRANSACTION;
 UPDATE t_preserve_shared_lock_budget SET v=v+1 WHERE id IN (1,2);
---error ER_PRESERVE_TRX_UNSUPPORTED
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+--let $preserve_trx_drain_clause= WITH TIMEOUT 300
+--let $preserve_trx_drain_error= ER_PRESERVE_TRX_UNSUPPORTED
+--source suite/preserve_trx/include/drain_transaction_from_control_expect_error.inc
 SELECT SUM(v) AS visible_before_rollback FROM t_preserve_shared_lock_budget;
 ROLLBACK;
 SELECT SUM(v) AS visible_after_rollback FROM t_preserve_shared_lock_budget;
 SET GLOBAL preserve_trx_max_lock_count=@saved_preserve_trx_max_lock_count;
 
 DROP TABLE t_preserve_shared_lock_budget;
-
-# Page scan budget is shared between the clustered index and any secondary
-# indexes. With max_scan_pages=1 the budget is exhausted by the cluster scan
-# before secondary indexes can be visited, so PRESERVE must reject the
-# transaction with ER_PRESERVE_TRX_UNSUPPORTED instead of silently skipping
-# the secondary index.
-CREATE TABLE t_preserve_sec_scan_budget(
-  id INT PRIMARY KEY,
-  k INT,
-  v INT,
-  KEY k_idx(k)
-) ENGINE=InnoDB;
-SET GLOBAL preserve_trx_max_scan_pages=1;
-START TRANSACTION;
-INSERT INTO t_preserve_sec_scan_budget VALUES(1,100,10);
---error ER_PRESERVE_TRX_UNSUPPORTED
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
-SELECT COUNT(*) AS visible_before_rollback FROM t_preserve_sec_scan_budget;
-ROLLBACK;
-SELECT COUNT(*) AS visible_after_rollback FROM t_preserve_sec_scan_budget;
-SET GLOBAL preserve_trx_max_scan_pages=@saved_preserve_trx_max_scan_pages;
-
-DROP TABLE t_preserve_sec_scan_budget;
 DROP TABLE t_preserve_table_limit_b;
 DROP TABLE t_preserve_table_limit_a;
-DROP TABLE t_preserve_timeout_limit;
 DROP TABLE t_preserve_export_lock_limit;
 DROP TABLE t_preserve_explicit_update_limit;
-DROP TABLE t_preserve_lock_limit;
-DROP TABLE t_preserve_scan_limit;
 SET GLOBAL preserve_trx_enable=ON;

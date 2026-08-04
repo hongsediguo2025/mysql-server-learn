@@ -60,8 +60,9 @@ for my $i (1 .. 100) {
             ($i * 10) . ", NULL);\n";
   print $fh "--exec echo \"wait\" > " .
             "$vardir/tmp/mysqld.1.expect\n";
-  print $fh "PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 86400;\n";
-  print $fh "--source include/wait_until_disconnected.inc\n";
+  print $fh "--let \$preserve_trx_drain_clause= WITH TIMEOUT 86400\n";
+  print $fh "--source suite/preserve_trx/include/drain_transaction_from_control.inc\n";
+  print $fh "--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc\n";
   print $fh "--exec echo \"restart: --preserve-trx-enable=ON " .
             "--preserve-trx-recovery-max-count=200\" > " .
             "$vardir/tmp/mysqld.1.expect\n";

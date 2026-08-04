@@ -9,7 +9,7 @@ SET @overlap_user_var = 'preserved-overlap';
 SET @preserved_null = NULL;
 START TRANSACTION;
 INSERT INTO t_resume_replaces_user_vars VALUES(1,10);
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300 WITH USER VARS;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300 WITH USER VARS;
 SET @overlap_user_var = 'current-overlap';
 SET @current_only = 'must-be-cleared-by-resume';
 RESUME PRESERVED TRANSACTION 'TOKEN';

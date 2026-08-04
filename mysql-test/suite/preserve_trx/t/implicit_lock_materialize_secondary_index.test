@@ -26,10 +26,6 @@ START TRANSACTION;
 # Updates the cluster row and the k_idx secondary-index entry for id=2.
 UPDATE t_implicit_sec SET k=250, v=21 WHERE id=2;
 
-# This injection would reject preserve if the legacy full-index implicit-lock
-# materializer were reached. Native continuity must bypass it.
-SET SESSION debug="+d,preserve_trx_fail_materialize_implicit_locks";
-
 --connection default
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;

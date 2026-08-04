@@ -22,8 +22,9 @@ UPDATE t_binlog_compress_resume_failure
  WHERE id=1;
 
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
---source include/wait_until_disconnected.inc
+--let $preserve_trx_drain_clause= WITH TIMEOUT 300
+--source suite/preserve_trx/include/drain_transaction_from_control.inc
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 
 --exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect

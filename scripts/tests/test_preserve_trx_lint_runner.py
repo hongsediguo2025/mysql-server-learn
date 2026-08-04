@@ -66,6 +66,8 @@ class PreserveTrxLintRunnerTest(unittest.TestCase):
                       LEGACY_LINT_RULE_IDS)
         self.assertIn("preserve_sql_command_flags_lint",
                       SOURCE_LINT_RULE_IDS)
+        self.assertIn("removed_single_preserve_sql_lint",
+                      SOURCE_LINT_RULE_IDS)
 
     def test_source_shape_debt_allowlist_is_empty(self):
         self.assertEqual((), SOURCE_SHAPE_DEBT_ALLOWLIST)
@@ -148,6 +150,23 @@ class PreserveTrxLintRunnerTest(unittest.TestCase):
         self.assertEqual("fail", summary["status"])
         self.assertTrue(any(item["rule"] == "wide_error_masks_lint"
                             for item in summary["findings"]))
+
+    def test_drain_sql_does_not_trigger_removed_single_preserve_sql_lint(self):
+        tmp = self.make_repo()
+        self.addCleanup(tmp.cleanup)
+        drain_test = (Path(tmp.name) /
+                      "mysql-test/suite/preserve_trx/t/drain_surface.test")
+        drain_test.write_text(
+            "DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;\n"
+        )
+
+        summary = run_lint_checks(Path(tmp.name))
+
+        self.assertEqual("pass", summary["status"])
+        self.assertFalse(any(
+            item["rule"] == "removed_single_preserve_sql_lint"
+            for item in summary["findings"]
+        ))
 
     def test_preserve_show_command_flags_are_registered(self):
         tmp = self.make_repo()

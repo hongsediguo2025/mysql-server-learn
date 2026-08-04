@@ -12,8 +12,9 @@ START TRANSACTION;
 UPDATE t_snapshot_header_corrupt_matrix SET v=11 WHERE id=1;
 
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
---source include/wait_until_disconnected.inc
+--let $preserve_trx_drain_clause= WITH TIMEOUT 300
+--source suite/preserve_trx/include/drain_transaction_from_control.inc
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 --source suite/preserve_trx/include/assert_one_snapshot_file.inc
 
 --perl
@@ -22,12 +23,13 @@ use warnings;
 use File::Spec;
 
 my $dir = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve');
-opendir(my $dh, $dir) or die "cannot open preserve dir $dir: $!";
-my @snapshots = grep { /\.bin$/ } readdir($dh);
-closedir($dh);
+require File::Spec->catfile($ENV{'MYSQL_TEST_DIR'}, 'suite',
+                            'preserve_trx', 'include',
+                            'preserve_snapshot_files.pl');
+my @snapshots = PreserveSnapshotFiles::preserve_snapshot_bin_files($dir);
 die "expected one snapshot, found " . scalar(@snapshots) . "\n"
   unless @snapshots == 1;
-my $token = $snapshots[0];
+my (undef, undef, $token) = File::Spec->splitpath($snapshots[0]);
 $token =~ s/\.bin\z//;
 my $inc = File::Spec->catfile($ENV{'MYSQLTEST_VARDIR'}, 'tmp',
                               'snapshot_header_corrupt_token.inc');

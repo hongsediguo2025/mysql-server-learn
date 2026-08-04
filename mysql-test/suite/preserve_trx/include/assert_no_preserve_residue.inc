@@ -31,24 +31,24 @@ if ($_pnr_rows != $allow_preserved_rows)
 --let _PNR_ALLOW_TAINTED= $allow_tainted
 --let _PNR_ALLOW_TEMP_SIDECARS= $allow_temp_sidecars
 --let _PNR_ALLOW_WARMCOPY_ARTIFACTS= $allow_warmcopy_artifacts
+--let _PNR_MYSQLD_DATADIR= $MYSQLD_DATADIR
 --perl
 use strict;
 use warnings;
 use File::Spec;
+require File::Spec->catfile($ENV{'MYSQL_TEST_DIR'}, 'suite', 'preserve_trx',
+                            'include', 'preserve_snapshot_files.pl');
 
-my $dir = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve');
+my $dir = File::Spec->catdir($ENV{'_PNR_MYSQLD_DATADIR'}, 'preserve');
 exit 0 unless -d $dir;
 
 my $allow_tainted = ($ENV{'_PNR_ALLOW_TAINTED'} || 0) + 0;
 my $allow_temp = ($ENV{'_PNR_ALLOW_TEMP_SIDECARS'} || 0) + 0;
 my $allow_warm = ($ENV{'_PNR_ALLOW_WARMCOPY_ARTIFACTS'} || 0) + 0;
 
-opendir(my $dh, $dir) or die "cannot open preserve dir $dir: $!";
 my @bad;
-while (defined(my $name = readdir($dh))) {
-  next if $name eq '.' || $name eq '..';
-  my $path = File::Spec->catfile($dir, $name);
-  next unless -f $path;
+for my $path (PreserveSnapshotFiles::preserve_all_files($dir)) {
+  my $name = (File::Spec->splitpath($path))[2];
 
   my $is_tainted = $name =~ /\.tainted$/;
   my $is_consume_state = $name =~ /\.consume_state(?:\.tmp)?$/;
@@ -71,7 +71,6 @@ while (defined(my $name = readdir($dh))) {
                       $is_consume_state ||
                       $is_temp || $is_warm || $is_xid_provenance;
 }
-closedir($dh);
 
 die "expected no disallowed preserve residue in $dir, found: " .
     join(", ", sort @bad) . "\n"
@@ -102,4 +101,5 @@ EOF
 --let _PNR_ALLOW_TAINTED=
 --let _PNR_ALLOW_TEMP_SIDECARS=
 --let _PNR_ALLOW_WARMCOPY_ARTIFACTS=
+--let _PNR_MYSQLD_DATADIR=
 --let _PNR_XA_FILE=

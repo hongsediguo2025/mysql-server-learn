@@ -39,8 +39,9 @@ START TRANSACTION;
 CALL p_preserve_obj_priv_update();
 
 --connection obj_user_con
---error ER_PRESERVE_TRX_UNSUPPORTED
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+--let $preserve_trx_drain_clause= WITH TIMEOUT 300
+--let $preserve_trx_drain_error= ER_PRESERVE_TRX_UNSUPPORTED
+--source suite/preserve_trx/include/drain_transaction_from_control_expect_error.inc
 --connection default
 SELECT COUNT(*) AS preserved_count
   FROM performance_schema.preserved_transactions;
@@ -54,8 +55,9 @@ GRANT UPDATE ON preserve_obj_db.t_preserve_obj_priv2 TO preserve_obj_user@localh
 --connection obj_user_con
 START TRANSACTION;
 CALL p_preserve_obj_priv_update();
---error ER_PRESERVE_TRX_UNSUPPORTED
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+--let $preserve_trx_drain_clause= WITH TIMEOUT 300
+--let $preserve_trx_drain_error= ER_PRESERVE_TRX_UNSUPPORTED
+--source suite/preserve_trx/include/drain_transaction_from_control_expect_error.inc
 --connection default
 SELECT COUNT(*) AS preserved_count
   FROM performance_schema.preserved_transactions;
@@ -70,8 +72,9 @@ GRANT UPDATE ON preserve_obj_db.t_preserve_obj_priv2 TO preserve_obj_role;
 SET ROLE NONE;
 START TRANSACTION;
 CALL p_preserve_obj_priv_update();
---error ER_PRESERVE_TRX_UNSUPPORTED
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+--let $preserve_trx_drain_clause= WITH TIMEOUT 300
+--let $preserve_trx_drain_error= ER_PRESERVE_TRX_UNSUPPORTED
+--source suite/preserve_trx/include/drain_transaction_from_control_expect_error.inc
 --connection default
 SELECT COUNT(*) AS preserved_count
   FROM performance_schema.preserved_transactions;

@@ -7,14 +7,14 @@ resumed_by INT DEFAULT NULL
 ) ENGINE=InnoDB;
 START TRANSACTION;
 INSERT INTO t_same_page_multi_preserved VALUES(10,10,NULL);
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 86400;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 86400;
 SELECT COUNT(*) AS preserved_count_after_first_generation
 FROM performance_schema.preserved_transactions;
 preserved_count_after_first_generation
 1
 START TRANSACTION;
 INSERT INTO t_same_page_multi_preserved VALUES(20,20,NULL);
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 86400;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 86400;
 SELECT COUNT(*) AS preserved_count_after_second_generation
 FROM performance_schema.preserved_transactions;
 preserved_count_after_second_generation

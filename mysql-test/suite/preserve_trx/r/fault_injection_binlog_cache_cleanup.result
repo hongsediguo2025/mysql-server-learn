@@ -1,5 +1,7 @@
 DROP TABLE IF EXISTS t_preserve_fault_binlog_cache;
 SET GLOBAL preserve_trx_enable=ON;
+SET @saved_preserve_trx_warmcopy_enable=@@GLOBAL.preserve_trx_warmcopy_enable;
+SET GLOBAL preserve_trx_warmcopy_enable=OFF;
 CREATE TABLE t_preserve_fault_binlog_cache(a INT PRIMARY KEY, b INT)
 ENGINE=InnoDB;
 INSERT INTO t_preserve_fault_binlog_cache VALUES(1,10);
@@ -7,9 +9,13 @@ RESET MASTER;
 SET SESSION debug="+d,preserve_trx_fail_before_binlog_cache_payload_rename,preserve_trx_assert_original_binlog_cache_clean_after_detach";
 START TRANSACTION;
 UPDATE t_preserve_fault_binlog_cache SET b=11 WHERE a=1;
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 SET SESSION debug="-d,preserve_trx_fail_before_binlog_cache_payload_rename,preserve_trx_assert_original_binlog_cache_clean_after_detach";
+SELECT * FROM t_preserve_fault_binlog_cache WHERE a=1;
+a	b
+1	11
+ROLLBACK;
 SELECT * FROM t_preserve_fault_binlog_cache WHERE a=1;
 a	b
 1	10
@@ -28,9 +34,13 @@ include/assert_grep.inc [Rolled back detached transaction is discarded from binl
 SET SESSION debug="+d,preserve_trx_fail_binlog_cache_directory_fsync,preserve_trx_assert_original_binlog_cache_clean_after_detach";
 START TRANSACTION;
 UPDATE t_preserve_fault_binlog_cache SET b=13 WHERE a=1;
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 SET SESSION debug="-d,preserve_trx_fail_binlog_cache_directory_fsync,preserve_trx_assert_original_binlog_cache_clean_after_detach";
+SELECT * FROM t_preserve_fault_binlog_cache WHERE a=1;
+a	b
+1	13
+ROLLBACK;
 SELECT * FROM t_preserve_fault_binlog_cache WHERE a=1;
 a	b
 1	12
@@ -47,4 +57,5 @@ a	b
 include/assert_grep.inc [New transaction remains in binlog after binlog cache directory fsync failure cleanup]
 include/assert_grep.inc [Rolled back detached transaction is discarded after binlog cache directory fsync failure]
 DROP TABLE t_preserve_fault_binlog_cache;
+SET GLOBAL preserve_trx_warmcopy_enable=@saved_preserve_trx_warmcopy_enable;
 SET GLOBAL preserve_trx_enable=ON;

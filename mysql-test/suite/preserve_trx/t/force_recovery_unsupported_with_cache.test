@@ -24,8 +24,9 @@ START TRANSACTION;
 UPDATE t_force_recovery_cache SET b=11 WHERE a=1;
 
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
---source include/wait_until_disconnected.inc
+--let $preserve_trx_drain_clause= WITH TIMEOUT 300
+--source suite/preserve_trx/include/drain_transaction_from_control.inc
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 
 --exec echo "restart: --preserve-trx-enable=ON --innodb-force-recovery=1" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
@@ -40,33 +41,31 @@ SELECT COUNT(*) AS preserved_count_during_force_recovery
 use strict;
 use warnings;
 use File::Spec;
+require File::Spec->catfile($ENV{'MYSQL_TEST_DIR'}, 'suite', 'preserve_trx',
+                            'include', 'preserve_snapshot_files.pl');
 
 my $dir = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve');
-opendir(my $dh, $dir) or die "cannot open preserve dir: $dir: $!";
-my @bins = readdir($dh);
-closedir($dh);
-my @snapshots = grep { /\.bin$/ } @bins;
-my @caches = grep { /\.binlog_cache$/ } @bins;
-my @tainted = grep { /\.tainted$/ } @bins;
+my @snapshots = PreserveSnapshotFiles::preserve_snapshot_bin_files($dir);
+my @files = PreserveSnapshotFiles::preserve_all_files($dir);
+my @caches = grep { /\.binlog_cache$/ } @files;
+my @tainted = grep { /\.tainted$/ } @files;
 die "expected one preserved snapshot in $dir, found " . scalar(@snapshots) . "\n"
   unless scalar(@snapshots) == 1;
 die "expected one preserved binlog cache in $dir, found " . scalar(@caches) . "\n"
   unless scalar(@caches) == 1;
 die "expected one preserved tainted marker in $dir, found " . scalar(@tainted) . "\n"
   unless scalar(@tainted) == 1;
-(my $token = $snapshots[0]) =~ s/\.bin$//;
+(my $token = (File::Spec->splitpath($snapshots[0]))[2]) =~ s/\.bin$//;
+my $tainted_name = (File::Spec->splitpath($tainted[0]))[2];
 die "tainted marker token mismatch in $dir\n"
-  unless $tainted[0] eq "$token.tainted";
+  unless $tainted_name eq "$token.tainted";
 open(my $out, '>', File::Spec->catfile($ENV{'MYSQLTEST_VARDIR'}, 'tmp',
                                        'force_recovery_cache_token.inc'))
   or die "cannot write token include: $!";
 print {$out} "--let \$force_recovery_cache_token= $token\n";
-print {$out} "--let \$force_recovery_cache_snapshot= " .
-             File::Spec->catfile($dir, "$token.bin") . "\n";
-print {$out} "--let \$force_recovery_cache_binlog= " .
-             File::Spec->catfile($dir, "$token.binlog_cache") . "\n";
-print {$out} "--let \$force_recovery_cache_tainted= " .
-             File::Spec->catfile($dir, "$token.tainted") . "\n";
+print {$out} "--let \$force_recovery_cache_snapshot= $snapshots[0]\n";
+print {$out} "--let \$force_recovery_cache_binlog= $caches[0]\n";
+print {$out} "--let \$force_recovery_cache_tainted= $tainted[0]\n";
 close($out);
 EOF
 
@@ -78,8 +77,9 @@ EOF
 --eval RESUME PRESERVED TRANSACTION '$force_recovery_cache_token'
 
 START TRANSACTION;
---error ER_PRESERVE_TRX_UNSUPPORTED
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+--let $preserve_trx_drain_clause= WITH TIMEOUT 300
+--let $preserve_trx_drain_error= ER_PRESERVE_TRX_UNSUPPORTED
+--source suite/preserve_trx/include/drain_transaction_from_control_expect_error.inc
 ROLLBACK;
 
 --error ER_PRESERVE_TRX_UNSUPPORTED

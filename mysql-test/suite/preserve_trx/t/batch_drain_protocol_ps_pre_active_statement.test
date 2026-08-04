@@ -1,0 +1,86 @@
+--source include/have_debug_sync.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_query_log
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost;
+GRANT SHUTDOWN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT CONNECTION_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SYSTEM_USER ON *.* TO preserve_trx_ha_admin@localhost;
+--enable_query_log
+
+--disable_warnings
+DROP TABLE IF EXISTS t_batch_drain_protocol_ps;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+
+CREATE TABLE t_batch_drain_protocol_ps(a INT PRIMARY KEY, b INT)
+  ENGINE=InnoDB;
+INSERT INTO t_batch_drain_protocol_ps VALUES(1,10),(2,20);
+
+--connect(batch_drain_protocol_ps_target,localhost,root,,test)
+START TRANSACTION;
+UPDATE t_batch_drain_protocol_ps SET b=11 WHERE a=1;
+
+--let $protocol_ps_writer_input= $MYSQLTEST_VARDIR/tmp/batch_drain_protocol_ps_writer.test
+--let $protocol_ps_writer_output= $MYSQLTEST_VARDIR/tmp/batch_drain_protocol_ps_writer.out
+--write_file $protocol_ps_writer_input
+SET DEBUG_SYNC =
+  'after_protocol_ps_inflight_mark SIGNAL protocol_ps_after_gate WAIT_FOR continue_protocol_ps';
+UPDATE t_batch_drain_protocol_ps SET b=21 WHERE a=2;
+--echo protocol_ps_writer_done
+EOF
+--exec echo "protocol_ps_writer_start" > $protocol_ps_writer_output
+--exec_in_background $MYSQL_TEST --ps-protocol < $protocol_ps_writer_input >> $protocol_ps_writer_output 2>&1
+
+--connect(batch_drain_protocol_ps_control,localhost,preserve_trx_ha_admin,,test)
+SET DEBUG_SYNC = 'now WAIT_FOR protocol_ps_after_gate TIMEOUT 10';
+
+--connect(batch_drain_protocol_ps_owner,localhost,root,,test)
+SET DEBUG_SYNC =
+  'preserve_trx_warmcopy_after_closing_state_before_targets SIGNAL protocol_ps_closing WAIT_FOR continue_protocol_ps_closing';
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+
+--connection batch_drain_protocol_ps_control
+SET DEBUG_SYNC = 'now WAIT_FOR protocol_ps_closing TIMEOUT 10';
+SET DEBUG_SYNC = 'now SIGNAL continue_protocol_ps';
+SET DEBUG_SYNC = 'now SIGNAL continue_protocol_ps_closing';
+
+--let $grep_file= $protocol_ps_writer_output
+--let $grep_pattern= protocol_ps_writer_done
+--let $wait_timeout= 10
+--source include/wait_for_pattern_in_file.inc
+
+--connection batch_drain_protocol_ps_owner
+--reap
+--disconnect batch_drain_protocol_ps_owner
+
+--connection default
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+--exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+--source suite/preserve_trx/include/get_preserved_token.inc
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+ROLLBACK;
+
+SELECT * FROM t_batch_drain_protocol_ps ORDER BY a;
+
+DROP TABLE t_batch_drain_protocol_ps;
+--disable_query_log
+DROP USER preserve_trx_ha_admin@localhost;
+--enable_query_log
+SET GLOBAL preserve_trx_enable=ON;
+SET DEBUG_SYNC = 'RESET';
+
+--remove_file $protocol_ps_writer_input
+--remove_file $protocol_ps_writer_output

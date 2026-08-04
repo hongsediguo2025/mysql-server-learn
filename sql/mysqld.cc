@@ -3488,11 +3488,6 @@ extern "C" void *signal_hand(void *arg MY_ATTRIBUTE((unused))) {
                    ("Got signal: %d  connection_events_loop_aborted: %d", sig,
                     connection_events_loop_aborted()));
         if (!connection_events_loop_aborted()) {
-          if (preserved_trx_defer_shutdown_signal()) {
-            query_logger.set_handlers(log_output_options);
-            break;
-          }
-
           // Mark abort for threads.
           set_connection_events_loop_aborted(true);
 #ifdef HAVE_PSI_THREAD_INTERFACE
@@ -4005,10 +4000,6 @@ SHOW_VAR com_status_vars[] = {
      SHOW_LONG_STATUS, SHOW_SCOPE_ALL},
     {"preload_keys",
      (char *)offsetof(System_status_var, com_stat[(uint)SQLCOM_PRELOAD_KEYS]),
-     SHOW_LONG_STATUS, SHOW_SCOPE_ALL},
-    {"prepare_shutdown_preserve",
-     (char *)offsetof(System_status_var,
-                      com_stat[(uint)SQLCOM_PREPARE_SHUTDOWN_PRESERVE]),
      SHOW_LONG_STATUS, SHOW_SCOPE_ALL},
     {"prepare_sql",
      (char *)offsetof(System_status_var, com_stat[(uint)SQLCOM_PREPARE]),

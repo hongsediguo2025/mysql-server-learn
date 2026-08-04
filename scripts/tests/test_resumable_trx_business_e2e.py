@@ -1580,7 +1580,7 @@ class _TempRetryableScenarioRuntime(_FakeRuntime):
         if sql == "SET GLOBAL preserve_trx_temp_table_enable=OFF":
             self.temp_enabled = False
             return ()
-        if sql == "PREPARE SHUTDOWN PRESERVE TRANSACTION":
+        if sql.startswith("DRAIN TRANSACTIONS PRESERVE"):
             raise _FakeConnectionLost()
         if sql.startswith("RESUME PRESERVED TRANSACTION"):
             if not self.temp_enabled:
@@ -1606,7 +1606,7 @@ class _TempRetryableScenarioRuntime(_FakeRuntime):
         return isinstance(exc, _PreserveDrainRejected)
 
 
-class _TempPrepareUnsupportedScenarioRuntime(_FakeRuntime):
+class _TempDrainUnsupportedScenarioRuntime(_FakeRuntime):
     def __init__(self):
         super().__init__()
         self.rollback_seen = False
@@ -1614,7 +1614,7 @@ class _TempPrepareUnsupportedScenarioRuntime(_FakeRuntime):
     def execute(self, conn, sql, fetch=False):
         self.sql.append(sql)
         self.calls.append((sql, fetch))
-        if sql == "PREPARE SHUTDOWN PRESERVE TRANSACTION":
+        if sql.startswith("DRAIN TRANSACTIONS PRESERVE"):
             raise _PreserveDrainRejected()
         if sql == "ROLLBACK":
             self.rollback_seen = True
@@ -1637,7 +1637,7 @@ class _PurgeReadviewScenarioRuntime(_FakeRuntime):
     def execute(self, conn, sql, fetch=False):
         self.sql.append(sql)
         self.calls.append((sql, fetch))
-        if sql == "PREPARE SHUTDOWN PRESERVE TRANSACTION":
+        if sql.startswith("DRAIN TRANSACTIONS PRESERVE"):
             raise _FakeConnectionLost()
         if sql.startswith("RESUME PRESERVED TRANSACTION"):
             return ()
@@ -3758,7 +3758,7 @@ class WorkloadPlanTest(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.assertIs(result["conn"], fresh)
 
-    def test_release_e2e_configures_large_preserve_materialization_budget(self):
+    def test_release_e2e_configures_shared_preserve_limits_only(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
         runner.config = HarnessConfig()
         runner.runtime = _FakeRuntime()
@@ -3766,9 +3766,11 @@ class WorkloadPlanTest(unittest.TestCase):
         runner.configure_preserve_globals()
 
         sql_text = "\n".join(runner.runtime.sql)
-        self.assertIn("SET GLOBAL preserve_trx_materialize_timeout_ms=60000", sql_text)
-        self.assertIn("SET GLOBAL preserve_trx_max_scan_pages=1000000", sql_text)
         self.assertIn("SET GLOBAL preserve_trx_max_lock_count=1000000", sql_text)
+        self.assertIn("SET GLOBAL preserve_trx_max_modified_tables=512", sql_text)
+        self.assertNotIn("preserve_trx_drain_grace_ms", sql_text)
+        self.assertNotIn("preserve_trx_max_scan_pages", sql_text)
+        self.assertNotIn("preserve_trx_materialize_timeout_ms", sql_text)
 
     def test_temp_table_workload_configures_preserve_gate(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
@@ -4312,16 +4314,18 @@ class WorkloadPlanTest(unittest.TestCase):
         self.assertIn("DROP TEMPORARY TABLE tmp_retryable_resume", runner.runtime.sql)
         self.assertLess(
             runner.runtime.sql.index("SET GLOBAL preserve_trx_warmcopy_enable=OFF"),
-            runner.runtime.sql.index("PREPARE SHUTDOWN PRESERVE TRANSACTION"),
+            runner.runtime.sql.index(
+                "DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 86400 WITH USER VARS"
+            ),
         )
 
-    def test_temp_table_retryable_unsupported_prepare_rejection_keeps_base_row(self):
+    def test_temp_table_retryable_unsupported_drain_rejection_keeps_base_row(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
         runner.config = HarnessConfig(
             scenario="temp_table_retryable_unsupported",
             database="retryable_db",
         )
-        runner.runtime = _TempPrepareUnsupportedScenarioRuntime()
+        runner.runtime = _TempDrainUnsupportedScenarioRuntime()
         runner.restart_server = mock.Mock(side_effect=AssertionError("no restart"))
 
         runner.run_temp_table_retryable_unsupported()
@@ -4335,7 +4339,9 @@ class WorkloadPlanTest(unittest.TestCase):
         self.assertIn("SELECT v FROM t_temp_retryable_base WHERE id=1", runner.runtime.sql)
         self.assertLess(
             runner.runtime.sql.index("SET GLOBAL preserve_trx_warmcopy_enable=OFF"),
-            runner.runtime.sql.index("PREPARE SHUTDOWN PRESERVE TRANSACTION"),
+            runner.runtime.sql.index(
+                "DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 86400 WITH USER VARS"
+            ),
         )
 
     def test_purge_readview_visibility_uses_old_version_after_resume(self):
@@ -4354,7 +4360,9 @@ class WorkloadPlanTest(unittest.TestCase):
         runner.restart_server.assert_called_once()
         self.assertLess(
             runner.runtime.sql.index("SET GLOBAL preserve_trx_warmcopy_enable=OFF"),
-            runner.runtime.sql.index("PREPARE SHUTDOWN PRESERVE TRANSACTION"),
+            runner.runtime.sql.index(
+                "DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 86400 WITH USER VARS"
+            ),
         )
 
     def test_non_temp_unsupported_drain_still_fails(self):
@@ -5240,15 +5248,11 @@ class WorkloadPlanTest(unittest.TestCase):
 
         self.assertTrue(worker.join_called)
 
-    def test_cli_preserve_budget_overrides_are_applied(self):
+    def test_cli_shared_preserve_budget_overrides_are_applied(self):
         cfg = parse_args(
             [
                 "--preserve-max-lock-count",
                 "1234",
-                "--preserve-max-scan-pages",
-                "5678",
-                "--preserve-materialize-timeout-ms",
-                "9012",
                 "--preserve-max-modified-tables",
                 "345",
             ]
@@ -5261,9 +5265,9 @@ class WorkloadPlanTest(unittest.TestCase):
 
         sql_text = "\n".join(runner.runtime.sql)
         self.assertIn("SET GLOBAL preserve_trx_max_lock_count=1234", sql_text)
-        self.assertIn("SET GLOBAL preserve_trx_max_scan_pages=5678", sql_text)
-        self.assertIn("SET GLOBAL preserve_trx_materialize_timeout_ms=9012", sql_text)
         self.assertIn("SET GLOBAL preserve_trx_max_modified_tables=345", sql_text)
+        self.assertNotIn("preserve_trx_max_scan_pages", sql_text)
+        self.assertNotIn("preserve_trx_materialize_timeout_ms", sql_text)
 
     def test_cli_inflight_drain_probe_flags_are_applied(self):
         cfg = parse_args(

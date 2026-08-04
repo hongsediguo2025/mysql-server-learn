@@ -1,11 +1,13 @@
+CALL mtr.add_suppression(
+"Preserved transaction batch cleanup failed after target preserve error");
 DROP TABLE IF EXISTS t_preserve_fault_cleanup;
 SET GLOBAL preserve_trx_enable=ON;
 CREATE TABLE t_preserve_fault_cleanup(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_preserve_fault_cleanup VALUES(1,10);
-SET SESSION debug="+d,preserve_trx_fail_after_lock_materialization";
 START TRANSACTION;
 UPDATE t_preserve_fault_cleanup SET b=b+1 WHERE a=1;
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+SET SESSION debug="+d,preserve_trx_fail_after_lock_materialization";
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 SET SESSION debug="-d,preserve_trx_fail_after_lock_materialization";
 SELECT * FROM t_preserve_fault_cleanup WHERE a=1;
@@ -19,10 +21,10 @@ preserved_count
 SELECT * FROM t_preserve_fault_cleanup WHERE a=1;
 a	b
 1	10
-SET SESSION debug="+d,preserve_trx_fail_after_undo_prepared";
 START TRANSACTION;
 UPDATE t_preserve_fault_cleanup SET b=b+1 WHERE a=1;
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+SET SESSION debug="+d,preserve_trx_fail_after_undo_prepared";
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 SET SESSION debug="-d,preserve_trx_fail_after_undo_prepared";
 SELECT * FROM t_preserve_fault_cleanup WHERE a=1;
@@ -36,15 +38,15 @@ preserved_count
 SELECT * FROM t_preserve_fault_cleanup WHERE a=1;
 a	b
 1	10
-SET SESSION debug="+d,preserve_trx_fail_before_snapshot_fsync";
 START TRANSACTION;
 UPDATE t_preserve_fault_cleanup SET b=b+1 WHERE a=1;
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+SET SESSION debug="+d,preserve_trx_fail_before_snapshot_fsync";
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 SET SESSION debug="-d,preserve_trx_fail_before_snapshot_fsync";
 SELECT * FROM t_preserve_fault_cleanup WHERE a=1;
 a	b
-1	10
+1	11
 ROLLBACK;
 SELECT COUNT(*) AS preserved_count
 FROM performance_schema.preserved_transactions;
@@ -53,15 +55,15 @@ preserved_count
 SELECT * FROM t_preserve_fault_cleanup WHERE a=1;
 a	b
 1	10
-SET SESSION debug="+d,preserve_trx_simulate_short_write";
 START TRANSACTION;
 UPDATE t_preserve_fault_cleanup SET b=b+1 WHERE a=1;
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+SET SESSION debug="+d,preserve_trx_simulate_short_write";
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 SET SESSION debug="-d,preserve_trx_simulate_short_write";
 SELECT * FROM t_preserve_fault_cleanup WHERE a=1;
 a	b
-1	10
+1	11
 ROLLBACK;
 SELECT COUNT(*) AS preserved_count
 FROM performance_schema.preserved_transactions;
@@ -70,15 +72,15 @@ preserved_count
 SELECT * FROM t_preserve_fault_cleanup WHERE a=1;
 a	b
 1	10
-SET SESSION debug="+d,preserve_trx_simulate_enospc_write";
 START TRANSACTION;
 UPDATE t_preserve_fault_cleanup SET b=b+1 WHERE a=1;
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+SET SESSION debug="+d,preserve_trx_simulate_enospc_write";
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 SET SESSION debug="-d,preserve_trx_simulate_enospc_write";
 SELECT * FROM t_preserve_fault_cleanup WHERE a=1;
 a	b
-1	10
+1	11
 ROLLBACK;
 SELECT COUNT(*) AS preserved_count
 FROM performance_schema.preserved_transactions;
@@ -87,15 +89,15 @@ preserved_count
 SELECT * FROM t_preserve_fault_cleanup WHERE a=1;
 a	b
 1	10
-SET SESSION debug="+d,preserve_trx_fail_after_snapshot_rename";
 START TRANSACTION;
 UPDATE t_preserve_fault_cleanup SET b=b+1 WHERE a=1;
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
-ERROR HY000: Resumable transactions across shutdown do not support this operation
+SET SESSION debug="+d,preserve_trx_fail_after_snapshot_rename";
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+ERROR HY000: DRAIN TRANSACTIONS PRESERVE batch cleanup failed; inspect preserved_transactions and target sessions before retry
 SET SESSION debug="-d,preserve_trx_fail_after_snapshot_rename";
 SELECT * FROM t_preserve_fault_cleanup WHERE a=1;
 a	b
-1	10
+1	11
 ROLLBACK;
 SELECT COUNT(*) AS preserved_count
 FROM performance_schema.preserved_transactions;
@@ -104,15 +106,15 @@ preserved_count
 SELECT * FROM t_preserve_fault_cleanup WHERE a=1;
 a	b
 1	10
-SET SESSION debug="+d,preserve_trx_fail_snapshot_directory_fsync";
 START TRANSACTION;
 UPDATE t_preserve_fault_cleanup SET b=b+1 WHERE a=1;
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
-ERROR HY000: Resumable transactions across shutdown do not support this operation
+SET SESSION debug="+d,preserve_trx_fail_snapshot_directory_fsync";
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+ERROR HY000: DRAIN TRANSACTIONS PRESERVE batch cleanup failed; inspect preserved_transactions and target sessions before retry
 SET SESSION debug="-d,preserve_trx_fail_snapshot_directory_fsync";
 SELECT * FROM t_preserve_fault_cleanup WHERE a=1;
 a	b
-1	10
+1	11
 ROLLBACK;
 SELECT COUNT(*) AS preserved_count
 FROM performance_schema.preserved_transactions;
@@ -121,10 +123,10 @@ preserved_count
 SELECT * FROM t_preserve_fault_cleanup WHERE a=1;
 a	b
 1	10
-SET SESSION debug="+d,preserve_trx_fail_after_binlog_mode_validation";
 START TRANSACTION;
 UPDATE t_preserve_fault_cleanup SET b=b+1 WHERE a=1;
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+SET SESSION debug="+d,preserve_trx_fail_after_binlog_mode_validation";
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 SET SESSION debug="-d,preserve_trx_fail_after_binlog_mode_validation";
 SELECT * FROM t_preserve_fault_cleanup WHERE a=1;

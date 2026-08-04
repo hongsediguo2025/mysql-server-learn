@@ -9,7 +9,7 @@ SET @preserve_null_decimal_var = CAST(NULL AS DECIMAL(10,2));
 SET @preserve_string_var = 'restored-value';
 START TRANSACTION;
 INSERT INTO t_resume_user_vars_decimal VALUES(1,10);
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300 WITH USER VARS;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300 WITH USER VARS;
 RESUME PRESERVED TRANSACTION 'TOKEN';
 SELECT @preserve_decimal_var AS decimal_var,
 @preserve_int_var AS int_var,

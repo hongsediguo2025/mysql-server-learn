@@ -101,6 +101,9 @@ SET DEBUG_SYNC = 'now SIGNAL lock_wc_interrupt_conn_continue';
 --disconnect lock_wc_interrupt_drain_conn
 
 --connection lock_wc_interrupt_ha
+--let $wait_timeout= 30
+--let $wait_condition= SELECT COUNT(*)=0 FROM performance_schema.threads WHERE PROCESSLIST_ID=$drain_conn_id
+--source include/wait_condition.inc
 SELECT COUNT(*) AS preserved_count_after_kill_connection
   FROM performance_schema.preserved_transactions;
 --disable_query_log

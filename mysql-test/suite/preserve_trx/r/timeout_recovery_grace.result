@@ -8,7 +8,7 @@ SELECT * FROM t_recovery_grace WHERE a=1 FOR UPDATE;
 a	b
 1	10
 UPDATE t_recovery_grace SET b=11 WHERE a=1;
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 1;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 1;
 SELECT @@global.preserve_trx_recovery_grace_seconds AS recovery_grace_seconds;
 recovery_grace_seconds
 30

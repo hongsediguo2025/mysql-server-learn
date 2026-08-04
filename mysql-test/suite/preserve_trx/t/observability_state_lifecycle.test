@@ -17,29 +17,12 @@ INSERT INTO t_preserve_state VALUES(1,10);
 
 --connect(state_preserve_con,localhost,root,,test)
 --connection state_preserve_con
-SET DEBUG_SYNC =
-  'preserve_trx_before_token_delivery SIGNAL state_snapshotting WAIT_FOR continue_state_snapshotting';
 START TRANSACTION;
 UPDATE t_preserve_state SET b=11 WHERE a=1;
---send PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300
 
 --connection default
---sleep 2
-SET DEBUG_SYNC = 'now WAIT_FOR state_snapshotting TIMEOUT 10';
-SELECT COUNT(*) AS snapshotting_rows
-  FROM performance_schema.preserved_transactions
- WHERE STATE = 'SNAPSHOTTING';
---replace_column 1 TOKEN 5 CREATED_AT 6 EXPIRES_AT 8 AGE_SECONDS
-SHOW PRESERVED TRANSACTIONS;
-
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
-SET DEBUG_SYNC = 'now SIGNAL continue_state_snapshotting';
-
---connection state_preserve_con
---reap
---disconnect state_preserve_con
-
---connection default
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 --exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
@@ -72,10 +55,14 @@ ROLLBACK;
 TRUNCATE TABLE t_preserve_state;
 INSERT INTO t_preserve_state VALUES(1,10);
 
+--connect(state_retry_app,localhost,root,,test)
+--connection state_retry_app
 START TRANSACTION;
 UPDATE t_preserve_state SET b=12 WHERE a=1;
+
+--connection default
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 --exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect

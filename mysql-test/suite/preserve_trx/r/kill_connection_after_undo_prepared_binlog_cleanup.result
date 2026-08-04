@@ -8,11 +8,13 @@ SET DEBUG_SYNC =
 'preserve_trx_after_undo_prepared_before_kill_check SIGNAL after_undo_prepared WAIT_FOR continue_after_undo_prepared';
 START TRANSACTION;
 UPDATE t_preserve_kill_after_undo_binlog SET b=11 WHERE a=1;
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 SET DEBUG_SYNC = 'now WAIT_FOR after_undo_prepared TIMEOUT 10';
 KILL CONNECTION CONN_ID;
 SET DEBUG_SYNC = 'now SIGNAL continue_after_undo_prepared';
-ERROR HY000: Lost connection to MySQL server during query
+SELECT 1;
+ERROR HY000: MySQL server has gone away
+ERROR HY000: Resumable transactions across shutdown do not support this operation
 SELECT * FROM t_preserve_kill_after_undo_binlog WHERE a=1;
 a	b
 1	10

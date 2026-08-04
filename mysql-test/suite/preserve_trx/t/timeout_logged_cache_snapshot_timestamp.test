@@ -7,6 +7,7 @@ DROP TABLE IF EXISTS t_timeout_logged_cache_timestamp;
 --enable_warnings
 
 SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=OFF;
 SET SESSION preserve_trx_min_timeout=1;
 SET SESSION preserve_trx_default_timeout=1;
 SET SESSION preserve_trx_max_timeout=86400;
@@ -19,28 +20,31 @@ INSERT INTO t_timeout_logged_cache_timestamp VALUES(1, REPEAT('a', 1024));
 
 --connect(preserve_logged_cache_timestamp,localhost,root,,test)
 --connection preserve_logged_cache_timestamp
-SET SESSION preserve_trx_min_timeout=1;
-SET SESSION preserve_trx_default_timeout=1;
-SET SESSION preserve_trx_max_timeout=86400;
 SET DEBUG_SYNC =
   'preserve_trx_before_binlog_cache_rename SIGNAL before_binlog_cache_rename WAIT_FOR continue_binlog_cache_rename';
 START TRANSACTION;
 UPDATE t_timeout_logged_cache_timestamp
   SET b = REPEAT('b', 1024) WHERE a = 1;
---send PREPARE SHUTDOWN PRESERVE TRANSACTION
+
+--connect(preserve_logged_cache_timestamp_drain,localhost,root,,test)
+SET SESSION preserve_trx_min_timeout=1;
+SET SESSION preserve_trx_default_timeout=1;
+SET SESSION preserve_trx_max_timeout=86400;
+--send DRAIN TRANSACTIONS PRESERVE
 
 --connection default
 --sleep 2
 SET DEBUG_SYNC = 'now WAIT_FOR before_binlog_cache_rename TIMEOUT 5';
 --exec perl -MTime::HiRes=time -e 'printf "%s %.6f\n", "--let " . chr(36) . "marker_epoch=", time' > $MYSQLTEST_VARDIR/tmp/timeout_logged_cache_snapshot_marker.inc
 --exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
-SET DEBUG_SYNC = 'now SIGNAL continue_binlog_cache_rename';
+--send SET DEBUG_SYNC = 'now SIGNAL continue_binlog_cache_rename'
 
---connection preserve_logged_cache_timestamp
+--connection preserve_logged_cache_timestamp_drain
 --reap
 --source include/wait_until_disconnected.inc
 
 --connection default
+--reap
 --sleep 2
 --enable_reconnect
 --source include/wait_until_connected_again.inc

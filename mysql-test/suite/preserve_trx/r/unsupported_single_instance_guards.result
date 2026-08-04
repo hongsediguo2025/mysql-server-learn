@@ -10,7 +10,7 @@ CREATE TABLE t_myisam(a INT PRIMARY KEY, b INT) ENGINE=MyISAM;
 CREATE TABLE t_trigger(a INT PRIMARY KEY) ENGINE=InnoDB;
 XA START 'msp_xa_active';
 INSERT INTO t_innodb VALUES(1,1);
-PREPARE SHUTDOWN PRESERVE TRANSACTION;
+DRAIN TRANSACTIONS PRESERVE;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 XA END 'msp_xa_active';
 XA ROLLBACK 'msp_xa_active';
@@ -18,33 +18,33 @@ XA START 'msp_xa_prepared';
 INSERT INTO t_innodb VALUES(2,2);
 XA END 'msp_xa_prepared';
 XA PREPARE 'msp_xa_prepared';
-PREPARE SHUTDOWN PRESERVE TRANSACTION;
+DRAIN TRANSACTIONS PRESERVE;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 XA ROLLBACK 'msp_xa_prepared';
 XA START 'msp_xa_detached_other';
 INSERT INTO t_innodb VALUES(3,3);
 XA END 'msp_xa_detached_other';
 XA PREPARE 'msp_xa_detached_other';
-PREPARE SHUTDOWN PRESERVE TRANSACTION;
-ERROR HY000: Invalid preserved transaction state
+DRAIN TRANSACTIONS PRESERVE;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
 XA ROLLBACK 'msp_xa_detached_other';
 START TRANSACTION;
 INSERT INTO t_myisam VALUES(1,1);
-PREPARE SHUTDOWN PRESERVE TRANSACTION;
-ERROR HY000: Resumable transactions across shutdown do not support this operation
+DRAIN TRANSACTIONS PRESERVE;
+ERROR HY000: Invalid preserved transaction state
 ROLLBACK;
 Warnings:
 Warning	1196	Some non-transactional changed tables couldn't be rolled back
 DELETE FROM t_myisam WHERE a=1;
 LOCK TABLES t_innodb WRITE;
-PREPARE SHUTDOWN PRESERVE TRANSACTION;
+DRAIN TRANSACTIONS PRESERVE;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 UNLOCK TABLES;
 START TRANSACTION;
 SELECT GET_LOCK('preserve_trx_user_lock', 0);
 GET_LOCK('preserve_trx_user_lock', 0)
 1
-PREPARE SHUTDOWN PRESERVE TRANSACTION;
+DRAIN TRANSACTIONS PRESERVE;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 SELECT RELEASE_LOCK('preserve_trx_user_lock');
 RELEASE_LOCK('preserve_trx_user_lock')
@@ -52,7 +52,7 @@ RELEASE_LOCK('preserve_trx_user_lock')
 ROLLBACK;
 HANDLER t_innodb OPEN;
 START TRANSACTION;
-PREPARE SHUTDOWN PRESERVE TRANSACTION;
+DRAIN TRANSACTIONS PRESERVE;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 ROLLBACK;
 HANDLER t_innodb CLOSE;
@@ -60,7 +60,7 @@ CREATE PROCEDURE preserve_proc()
 BEGIN
 START TRANSACTION;
 INSERT INTO t_innodb VALUES(10,10);
-PREPARE SHUTDOWN PRESERVE TRANSACTION;
+DRAIN TRANSACTIONS PRESERVE;
 END|
 CALL preserve_proc();
 ERROR HY000: Resumable transactions across shutdown do not support this operation
@@ -68,18 +68,18 @@ ROLLBACK;
 CREATE TRIGGER preserve_trigger_bi BEFORE INSERT ON t_trigger
 FOR EACH ROW
 BEGIN
-PREPARE SHUTDOWN PRESERVE TRANSACTION;
+DRAIN TRANSACTIONS PRESERVE;
 END|
 INSERT INTO t_trigger VALUES(1);
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 CREATE FUNCTION preserve_func() RETURNS INT
 BEGIN
-PREPARE SHUTDOWN PRESERVE TRANSACTION;
+DRAIN TRANSACTIONS PRESERVE;
 RETURN 1;
 END|
 SELECT preserve_func();
 ERROR HY000: Resumable transactions across shutdown do not support this operation
-SET @preserve_stmt='PREPARE SHUTDOWN PRESERVE TRANSACTION';
+SET @preserve_stmt='DRAIN TRANSACTIONS PRESERVE';
 PREPARE preserve_ps FROM @preserve_stmt;
 ERROR HY000: This command is not supported in the prepared statement protocol yet
 DROP FUNCTION preserve_func;

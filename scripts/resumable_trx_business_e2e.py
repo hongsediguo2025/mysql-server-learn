@@ -622,8 +622,6 @@ class HarnessConfig:
     preserve_max_binlog_cache_bytes: int = 1_073_741_824
     preserve_warmcopy_max_total_bytes: int = 0
     preserve_max_lock_count: int = 1_000_000
-    preserve_max_scan_pages: int = 1_000_000
-    preserve_materialize_timeout_ms: int = 60_000
     preserve_max_modified_tables: int = 512
     preserve_lock_warmcopy_max_journal_bytes: int = 1_073_741_824
     preserve_lock_warmcopy_seal_threads: int = 0
@@ -1058,10 +1056,6 @@ class HarnessConfig:
             )
         if self.preserve_max_lock_count <= 0:
             raise ValueError("preserve_max_lock_count must be positive")
-        if self.preserve_max_scan_pages <= 0:
-            raise ValueError("preserve_max_scan_pages must be positive")
-        if self.preserve_materialize_timeout_ms <= 0:
-            raise ValueError("preserve_materialize_timeout_ms must be positive")
         if self.preserve_max_modified_tables <= 0:
             raise ValueError("preserve_max_modified_tables must be positive")
         if self.preserve_lock_warmcopy_max_journal_bytes <= 0:
@@ -8727,14 +8721,10 @@ class BusinessE2ERunner:
                     conn,
                     "UPDATE t_temp_retryable_base SET v=11 WHERE id=1",
                 )
-                try:
-                    self._prepare_shutdown_preserve_current_transaction(conn)
-                except BaseException as exc:
-                    if not self.runtime.is_preserve_drain_rejection(exc):
-                        raise
+                if not self._execute_drain_preserve():
                     self.runtime.execute(conn, "ROLLBACK")
                     self._assert_preserved_count(
-                        0, "after unsupported temp-table PREPARE"
+                        0, "after unsupported temp-table DRAIN"
                     )
                     rows = self.runtime.execute(
                         conn,
@@ -8743,7 +8733,7 @@ class BusinessE2ERunner:
                     )
                     if rows != [(10,)]:
                         raise AssertionError(
-                            "unsupported temp-table PREPARE mutated base table "
+                            "unsupported temp-table DRAIN mutated base table "
                             f"unexpectedly: {rows!r}"
                         )
                     completed_successfully = True
@@ -8883,7 +8873,10 @@ class BusinessE2ERunner:
                     raise AssertionError(
                         f"RR read view was not stable before preserve: {rows!r}"
                     )
-                self._prepare_shutdown_preserve_current_transaction(rr_conn)
+                if not self._execute_drain_preserve():
+                    raise AssertionError(
+                        "purge read-view DRAIN unexpectedly rejected the target"
+                    )
             finally:
                 try:
                     rr_conn.close()
@@ -8972,13 +8965,6 @@ class BusinessE2ERunner:
             self.runtime.execute(conn, "INSERT INTO t_purge_readview VALUES(1,10),(2,20)")
         finally:
             conn.close()
-
-    def _prepare_shutdown_preserve_current_transaction(self, conn) -> None:
-        try:
-            self.runtime.execute(conn, "PREPARE SHUTDOWN PRESERVE TRANSACTION")
-        except BaseException as exc:
-            if not self.runtime.is_connection_error(exc):
-                raise
 
     def _assert_preserved_count(self, expected: int, phase: str) -> None:
         conn = self.runtime.connect(database=False)
@@ -9211,7 +9197,6 @@ END
             commands = [
                 "SET GLOBAL preserve_trx_enable=ON",
                 f"SET GLOBAL preserve_trx_recovery_max_count={max(200, self.config.sessions * 2)}",
-                "SET GLOBAL preserve_trx_drain_grace_ms=60000",
                 f"SET GLOBAL preserve_trx_drain_hard_timeout_ms={drain_hard_timeout_ms}",
                 f"SET GLOBAL preserve_trx_max_total={batch_capacity}",
                 f"SET GLOBAL preserve_trx_max_pending_per_user={batch_capacity}",
@@ -9219,8 +9204,6 @@ END
                 f"SET GLOBAL preserve_trx_max_binlog_cache_bytes={self.config.preserve_max_binlog_cache_bytes}",
                 f"SET GLOBAL preserve_trx_max_modified_tables={self.config.preserve_max_modified_tables}",
                 f"SET GLOBAL preserve_trx_max_lock_count={self.config.preserve_max_lock_count}",
-                f"SET GLOBAL preserve_trx_max_scan_pages={self.config.preserve_max_scan_pages}",
-                f"SET GLOBAL preserve_trx_materialize_timeout_ms={self.config.preserve_materialize_timeout_ms}",
             ]
             mixed_global_budget = 0
             if self.config.mixed_pressure_workload:
@@ -13652,8 +13635,6 @@ command is used after each DRAIN command shuts that server down.
     parser.add_argument("--preserve-max-binlog-cache-bytes", dest="preserve_max_binlog_cache_bytes", type=int, default=1_073_741_824, help="preserve_trx_max_binlog_cache_bytes for high-cardinality preserve artifacts")
     parser.add_argument("--preserve-warmcopy-max-total-bytes", dest="preserve_warmcopy_max_total_bytes", type=int, default=0, help="explicit source warm external-artifact byte budget; 0 keeps workload-derived sizing")
     parser.add_argument("--preserve-max-lock-count", dest="preserve_max_lock_count", type=int, default=1_000_000, help="preserve_trx_max_lock_count for this high-cardinality E2E")
-    parser.add_argument("--preserve-max-scan-pages", dest="preserve_max_scan_pages", type=int, default=1_000_000, help="preserve_trx_max_scan_pages for this high-cardinality E2E")
-    parser.add_argument("--preserve-materialize-timeout-ms", dest="preserve_materialize_timeout_ms", type=int, default=60_000, help="preserve_trx_materialize_timeout_ms for this high-cardinality E2E")
     parser.add_argument("--preserve-max-modified-tables", dest="preserve_max_modified_tables", type=int, default=512, help="preserve_trx_max_modified_tables for this high-cardinality E2E")
     parser.add_argument("--preserve-lock-warmcopy-max-journal-bytes", dest="preserve_lock_warmcopy_max_journal_bytes", type=int, default=1_073_741_824, help="preserve_trx_lock_warmcopy_max_journal_bytes for high-cardinality lock warmcopy gates")
     parser.add_argument("--preserve-lock-warmcopy-seal-threads", dest="preserve_lock_warmcopy_seal_threads", type=int, default=0, help="preserve_trx_lock_warmcopy_seal_threads for lock warmcopy seal tuning; 0 keeps server auto")
@@ -13846,8 +13827,6 @@ command is used after each DRAIN command shuts that server down.
         preserve_max_binlog_cache_bytes=args.preserve_max_binlog_cache_bytes,
         preserve_warmcopy_max_total_bytes=args.preserve_warmcopy_max_total_bytes,
         preserve_max_lock_count=args.preserve_max_lock_count,
-        preserve_max_scan_pages=args.preserve_max_scan_pages,
-        preserve_materialize_timeout_ms=args.preserve_materialize_timeout_ms,
         preserve_max_modified_tables=args.preserve_max_modified_tables,
         preserve_lock_warmcopy_max_journal_bytes=args.preserve_lock_warmcopy_max_journal_bytes,
         preserve_lock_warmcopy_seal_threads=args.preserve_lock_warmcopy_seal_threads,

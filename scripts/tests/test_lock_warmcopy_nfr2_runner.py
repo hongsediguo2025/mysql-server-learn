@@ -39,6 +39,8 @@ class LockWarmcopyNfr2RunnerTest(unittest.TestCase):
         self.assertIn("preserve-trx-enable=ON", rendered)
         self.assertIn("preserve-trx-lock-warmcopy-enable=ON", rendered)
         self.assertIn("max-connections=17", rendered)
+        self.assertNotIn("preserve-trx-max-scan-pages", rendered)
+        self.assertNotIn("preserve-trx-materialize-timeout-ms", rendered)
 
     def test_render_my_cnf_supports_startup_recovery_thread_override(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -49,13 +49,6 @@ bool trx_preserve_feature_enabled();
 bool trx_preserve_xid_is_magic_active(const XID &xid);
 bool trx_preserve_xid_should_be_protected(const XID &xid);
 
-struct Preserve_lock_limits {
-  uint32_t max_lock_count;
-  uint32_t max_modified_tables;
-  uint32_t max_scan_pages;
-  uint32_t materialize_timeout_ms;
-};
-
 struct Preserve_modified_table_name {
   std::string schema_name;
   std::string table_name;
@@ -306,8 +299,6 @@ bool trx_preserve_validate_trx_id_store_fact(uint64_t store_value,
                                              uint64_t safe_next_floor,
                                              uint64_t source_fence_lsn);
 void trx_preserve_close_read_views_for_shutdown();
-dberr_t trx_preserve_materialize_implicit_locks(
-    THD *thd, const Preserve_lock_limits &limits, bool *materialized_any);
 dberr_t trx_preserve_export_read_view(THD *thd, std::string *payload,
                                       uint64_t *low_limit_no);
 dberr_t trx_preserve_import_read_view(trx_t *trx, const std::string &payload);

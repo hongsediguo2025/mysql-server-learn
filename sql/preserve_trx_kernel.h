@@ -36,8 +36,6 @@ struct Preserve_trx_kernel_request {
   THD *target_thd{nullptr};
   const Preserve_trx_options &options;
   ulonglong timeout_seconds{0};
-  Preserve_trx_delivery_mode delivery_mode{
-      Preserve_trx_delivery_mode::CLIENT_TOKEN_DELIVERY};
   Preserve_trx_preserve_result *result{nullptr};
   PreserveBinlogBlobProvider *binlog_blob_provider{nullptr};
   bool debug_fail_ha_prepare_low{false};

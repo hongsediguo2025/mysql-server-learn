@@ -3,52 +3,20 @@ DROP USER IF EXISTS preserve_resume_any@localhost;
 DROP USER IF EXISTS preserve_u@localhost;
 DROP TABLE IF EXISTS t_priv;
 SET GLOBAL preserve_trx_enable=ON;
-SELECT @@global.preserve_trx_drain_mode AS default_drain_mode;
-default_drain_mode
-SOFT
-SELECT @@global.preserve_trx_drain_grace_ms AS default_drain_grace_ms;
-default_drain_grace_ms
-30000
-SET GLOBAL preserve_trx_drain_mode=HARD;
-SELECT @@global.preserve_trx_drain_mode AS hard_drain_mode;
-hard_drain_mode
-HARD
-SET GLOBAL preserve_trx_drain_mode=SOFT;
-SET GLOBAL preserve_trx_drain_grace_ms=1;
-SELECT @@global.preserve_trx_drain_grace_ms AS updated_drain_grace_ms;
-updated_drain_grace_ms
-1
-SET GLOBAL preserve_trx_drain_grace_ms=30000;
-PREPARE SHUTDOWN PRESERVE TRANSACTION;
-ERROR HY000: Invalid preserved transaction state
 START TRANSACTION;
 CREATE TEMPORARY TABLE tmp_preserve_reject(a INT) ENGINE=InnoDB;
-PREPARE SHUTDOWN PRESERVE TRANSACTION;
+DRAIN TRANSACTIONS PRESERVE;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 ROLLBACK;
 Warnings:
 Warning	1751	The creation of some temporary tables could not be rolled back.
 DROP TEMPORARY TABLE IF EXISTS tmp_preserve_reject;
 CREATE TABLE t_priv(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
-SET autocommit=0;
-INSERT INTO t_priv VALUES(10,10);
-PREPARE SHUTDOWN PRESERVE TRANSACTION;
-ERROR HY000: Invalid preserved transaction state
-ROLLBACK;
-SET autocommit=1;
-START TRANSACTION;
-INSERT INTO t_priv VALUES(11,11);
-SET @saved_preserve_trx_max_scan_pages=@@GLOBAL.preserve_trx_max_scan_pages;
-SET GLOBAL preserve_trx_max_scan_pages=0;
-PREPARE SHUTDOWN PRESERVE TRANSACTION;
-ERROR HY000: Resumable transactions across shutdown do not support this operation
-ROLLBACK;
-SET GLOBAL preserve_trx_max_scan_pages=@saved_preserve_trx_max_scan_pages;
 CREATE USER preserve_u@localhost;
 GRANT SELECT, INSERT, UPDATE ON test.t_priv TO preserve_u@localhost;
 START TRANSACTION;
 INSERT INTO t_priv VALUES(1,1);
-PREPARE SHUTDOWN PRESERVE TRANSACTION;
+DRAIN TRANSACTIONS PRESERVE;
 ERROR 42000: Access denied; you need (at least one of) the SHUTDOWN privilege(s) for this operation
 ROLLBACK;
 CREATE USER preserve_resume_denied@localhost;

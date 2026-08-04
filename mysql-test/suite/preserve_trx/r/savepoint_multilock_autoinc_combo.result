@@ -24,7 +24,7 @@ SELECT LAST_INSERT_ID() AS second_generated_id;
 second_generated_id
 4
 UPDATE t_savepoint_multilock_autoinc SET v=22 WHERE id=2;
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 SELECT SAVEPOINT_COUNT, LOCKS_COUNT >= 1 AS has_preserved_locks
 FROM performance_schema.preserved_transactions;
 SAVEPOINT_COUNT	has_preserved_locks

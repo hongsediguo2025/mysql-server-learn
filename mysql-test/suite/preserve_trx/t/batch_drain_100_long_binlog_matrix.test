@@ -402,8 +402,6 @@ EOF
 SET GLOBAL preserve_trx_enable=ON;
 --let $old_preserve_trx_recovery_max_count= `SELECT @@GLOBAL.preserve_trx_recovery_max_count`
 SET GLOBAL preserve_trx_recovery_max_count=200;
---let $old_preserve_trx_drain_grace_ms= `SELECT @@GLOBAL.preserve_trx_drain_grace_ms`
-SET GLOBAL preserve_trx_drain_grace_ms=60000;
 
 --let $batch_long_prefix= batch_long_binlog
 --let $batch_long_setup_file= $MYSQLTEST_VARDIR/tmp/batch_long_binlog_setup.inc
@@ -425,6 +423,5 @@ DROP PROCEDURE IF EXISTS p_batch_long_apply_end_action;
 SET SESSION sql_log_bin=1;
 RESET MASTER;
 --eval SET GLOBAL preserve_trx_recovery_max_count=$old_preserve_trx_recovery_max_count
---eval SET GLOBAL preserve_trx_drain_grace_ms=$old_preserve_trx_drain_grace_ms
 --enable_result_log
 --enable_query_log

@@ -60,6 +60,8 @@ SOURCE_LINT_RULE_IDS: Sequence[str] = (
     "carrier_read_no_follow_lint",
     "preserve_trx_off_path_invasive_surface_lint",
     "preserve_sql_command_flags_lint",
+    "removed_single_preserve_sql_lint",
+    "removed_single_preserve_production_surface_lint",
 )
 
 SOURCE_SHAPE_DEBT_ALLOWLIST: Sequence[str] = ()
@@ -380,6 +382,82 @@ def _check_wide_error_masks(repo_root: Path,
                     ))
 
 
+def _check_removed_single_preserve_sql(repo_root: Path,
+                                       findings: List[LintFinding]) -> None:
+    legacy_sql = re.compile(
+        r"PREPARE\s+" + r"SHUTDOWN\s+PRESERVE\s+TRANSACTION",
+        re.IGNORECASE,
+    )
+    legacy_enum = re.compile("SQLCOM_" + "PREPARE_SHUTDOWN_PRESERVE")
+    roots_and_suffixes = (
+        (repo_root / "mysql-test/t", (".test",)),
+        (repo_root / "mysql-test/include", (".inc",)),
+        (repo_root / "mysql-test/r", (".result",)),
+        (repo_root / "mysql-test/suite", (".test", ".inc", ".result")),
+        (repo_root / "unittest", (".cc", ".h")),
+        (repo_root / "scripts", (".py",)),
+    )
+    for root, suffixes in roots_and_suffixes:
+        for path in _iter_files(root, suffixes):
+            _collect_pattern_findings(
+                findings,
+                rule="removed_single_preserve_sql_lint",
+                repo_root=repo_root,
+                path=path,
+                text=_read_text(path),
+                patterns=(legacy_sql, legacy_enum),
+                message="tests must use DRAIN TRANSACTIONS PRESERVE instead "
+                        "of the removed single-session preserve SQL surface",
+            )
+
+
+def _check_removed_single_preserve_production_surface(
+        repo_root: Path, findings: List[LintFinding]) -> None:
+    patterns = (
+        re.compile("SQLCOM_" + "PREPARE_SHUTDOWN_PRESERVE"),
+        re.compile("prepare_shutdown_" + "preserve", re.IGNORECASE),
+        re.compile(r"\bPending_token_delivery\b"),
+        re.compile(r"\bpending_token_delivery\b"),
+        re.compile(r"\bpreserved_trx_defer_shutdown_signal\b"),
+        re.compile(r"\bpreserved_trx_note_statement_response\b"),
+        re.compile(r"\bpreserved_trx_finalize_statement_response\b"),
+        re.compile(r"\bpreserved_trx_release_resources\b"),
+        re.compile(r"\bPreserve_trx_delivery_mode\b"),
+        re.compile(r"\bTOKEN_DELIVERY\b"),
+        re.compile(r"\bCLIENT_TOKEN_DELIVERY\b"),
+        re.compile(r"\bBATCH_MANAGER_DELIVERY\b"),
+        re.compile(r"\bPreserve_trx_drain_mode\b"),
+        re.compile(r"\bpreserve_trx_drain_mode\b"),
+        re.compile(r"\bpreserve_trx_drain_grace_ms\b"),
+        re.compile(r"\bPreserve_drain_active_transactions\b"),
+        re.compile(r"\bpreserve_trx_drain_other_active_transactions\b"),
+        re.compile(r"\bSOFT_DRAINING\b"),
+        re.compile(r"\bHARD_DRAINING\b"),
+        re.compile(r"\bpreserve_trx_max_scan_pages\b"),
+        re.compile(r"\bpreserve_trx_materialize_timeout_ms\b"),
+        re.compile(r"\bPreserve_lock_limits\b"),
+        re.compile(r"\btrx_preserve_materialize_implicit_locks\b"),
+        re.compile(r"\block_preserve_materialize_implicit_locks\b"),
+    )
+    roots_and_suffixes = (
+        (repo_root / "include", (".h",)),
+        (repo_root / "sql", (".cc", ".h", ".yy")),
+        (repo_root / "storage/innobase", (".cc", ".h")),
+    )
+    for root, suffixes in roots_and_suffixes:
+        for path in _iter_files(root, suffixes):
+            _collect_pattern_findings(
+                findings,
+                rule="removed_single_preserve_production_surface_lint",
+                repo_root=repo_root,
+                path=path,
+                text=_read_text(path),
+                patterns=patterns,
+                message="removed single-session preserve SQL production "
+                        "surface must not remain",
+            )
+
+
 def _check_preserve_sql_command_flags(repo_root: Path,
                                       findings: List[LintFinding]) -> None:
     sql_parse = repo_root / "sql/sql_parse.cc"
@@ -543,6 +621,8 @@ def run_lint_checks(repo_root: Path,
     _check_legacy_lint_bodies(repo_root, findings)
     _check_test_layering(repo_root, findings)
     _check_wide_error_masks(repo_root, findings)
+    _check_removed_single_preserve_sql(repo_root, findings)
+    _check_removed_single_preserve_production_surface(repo_root, findings)
     _check_carrier_read_no_follow(repo_root, findings)
     _check_off_path_invasive_surface(repo_root, findings)
     _check_preserve_sql_command_flags(repo_root, findings)

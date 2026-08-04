@@ -23,7 +23,7 @@ preserve_resume_any_reader@localhost;
 GRANT SELECT ON performance_schema.* TO preserve_resume_any_reader@localhost;
 START TRANSACTION;
 UPDATE t_preserve_token_visibility SET b=11 WHERE a=1;
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 SELECT TOKEN LIKE '****____' AND TOKEN <> '****' AS owner_token_is_redacted
 FROM performance_schema.preserved_transactions;
 owner_token_is_redacted

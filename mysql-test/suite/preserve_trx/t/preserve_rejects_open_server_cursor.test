@@ -12,6 +12,11 @@ INSERT INTO t_preserve_open_cursor VALUES(1,10),(2,20),(3,30);
 
 --let $raw_cursor_client= $MYSQLTEST_VARDIR/tmp/preserve_open_cursor_client.pl
 --let $raw_cursor_output= $MYSQLTEST_VARDIR/tmp/preserve_open_cursor.out
+--let $raw_cursor_ready= $MYSQLTEST_VARDIR/tmp/preserve_open_cursor.ready
+--let $raw_cursor_continue= $MYSQLTEST_VARDIR/tmp/preserve_open_cursor.continue
+--let _OPEN_CURSOR_OUTPUT= $raw_cursor_output
+--let _OPEN_CURSOR_READY= $raw_cursor_ready
+--let _OPEN_CURSOR_CONTINUE= $raw_cursor_continue
 
 --write_file $raw_cursor_client
 use strict;
@@ -20,7 +25,7 @@ use IO::Socket::UNIX;
 
 $| = 1;
 
-my ($socket_path) = @ARGV;
+my ($socket_path, $ready_file, $continue_file) = @ARGV;
 
 use constant CLIENT_LONG_PASSWORD => 0x00000001;
 use constant CLIENT_LONG_FLAG => 0x00000004;
@@ -172,26 +177,38 @@ my $execute_payload = pack('VCV', $stmt_id, $cursor_type_read_only, 1);
 my $execute = command($sock, 0x17, $execute_payload);
 read_result_metadata($sock, $execute, 'COM_STMT_EXECUTE cursor');
 
-my $preserve = command($sock, 0x03,
-                       'PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300');
-if (my ($code, $message) = error_packet($preserve)) {
-  print "preserve_error_code=$code\n";
-  print "preserve_error_message=$message\n";
-  write_packet($sock, 0, chr(0x19) . pack('V', $stmt_id));
-  query_ok($sock, 'ROLLBACK');
-  print "preserve_rejects_open_server_cursor_done\n";
-  exit 0;
+open(my $ready, '>', $ready_file) or die "cannot create $ready_file: $!\n";
+print {$ready} "ready\n";
+close($ready);
+print "server_cursor_open=1\n";
+
+while (!-e $continue_file) {
+  select(undef, undef, undef, 0.05);
 }
 
-print "preserve_unexpected_success\n";
-exit 1;
+write_packet($sock, 0, chr(0x19) . pack('V', $stmt_id));
+query_ok($sock, 'ROLLBACK');
+print "preserve_rejects_open_server_cursor_done\n";
 EOF
 
---exec perl $raw_cursor_client $MASTER_MYSOCK > $raw_cursor_output 2>&1
+--perl
+unlink $ENV{'_OPEN_CURSOR_READY'} if -e $ENV{'_OPEN_CURSOR_READY'};
+unlink $ENV{'_OPEN_CURSOR_CONTINUE'} if -e $ENV{'_OPEN_CURSOR_CONTINUE'};
+unlink $ENV{'_OPEN_CURSOR_OUTPUT'} if -e $ENV{'_OPEN_CURSOR_OUTPUT'};
+EOF
+
+--exec perl $raw_cursor_client $MASTER_MYSOCK $raw_cursor_ready $raw_cursor_continue > $raw_cursor_output 2>&1 &
 
 --let $grep_file= $raw_cursor_output
---let $grep_pattern= preserve_error_code=4013
+--let $grep_pattern= server_cursor_open=1
 --let $wait_timeout= 10
+--source include/wait_for_pattern_in_file.inc
+
+--error ER_PRESERVE_TRX_UNSUPPORTED
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+
+--exec echo continue > $raw_cursor_continue
+--let $grep_pattern= preserve_rejects_open_server_cursor_done
 --source include/wait_for_pattern_in_file.inc
 --cat_file $raw_cursor_output
 
@@ -202,3 +219,8 @@ SET GLOBAL preserve_trx_enable=ON;
 
 --remove_file $raw_cursor_client
 --remove_file $raw_cursor_output
+--remove_file $raw_cursor_ready
+--remove_file $raw_cursor_continue
+--let _OPEN_CURSOR_OUTPUT=
+--let _OPEN_CURSOR_READY=
+--let _OPEN_CURSOR_CONTINUE=

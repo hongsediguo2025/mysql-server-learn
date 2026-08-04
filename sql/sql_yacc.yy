@@ -1470,7 +1470,7 @@ void warn_about_deprecated_binary(THD *thd)
         preserve_trx_timeout_num
 
 %type <preserve_trx_options>
-        opt_preserve_trx_with_clauses preserve_trx_with_clause
+        preserve_trx_with_clause
         opt_drain_preserve_trx_clauses drain_preserve_trx_clause
 
 %type <lock_type>
@@ -2252,7 +2252,6 @@ simple_statement:
         | drain_transactions_preserve_stmt { $$= nullptr; }
         | reset_drain_stmt              { $$= nullptr; }
         | preload_stmt
-        | prepare_shutdown_preserve_stmt { $$= nullptr; }
         | prepare                       { $$= nullptr; }
         | purge                         { $$= nullptr; }
         | release                       { $$= nullptr; }
@@ -2298,18 +2297,6 @@ deallocate_or_drop:
         | DROP
         ;
 
-prepare_shutdown_preserve_stmt:
-          PREPARE_SYM SHUTDOWN PRESERVE_SYM TRANSACTION_SYM
-          opt_preserve_trx_with_clauses
-          {
-            Lex->sql_command= SQLCOM_PREPARE_SHUTDOWN_PRESERVE;
-            Lex->preserve_trx_has_timeout= $5.has_timeout;
-            Lex->preserve_trx_timeout_seconds= $5.timeout_seconds;
-            Lex->preserve_trx_user_vars_mode=
-              static_cast<uint>($5.user_vars_mode);
-          }
-        ;
-
 drain_transactions_preserve_stmt:
           DRAIN_SYM TRANSACTIONS_SYM PRESERVE_SYM
           opt_drain_preserve_trx_clauses
@@ -2326,19 +2313,6 @@ reset_drain_stmt:
           RESET_SYM DRAIN_SYM
           {
             Lex->sql_command= SQLCOM_RESET_DRAIN;
-          }
-        ;
-
-opt_preserve_trx_with_clauses:
-          /* empty */ { $$.init(); }
-        | opt_preserve_trx_with_clauses preserve_trx_with_clause
-          {
-            $$= $1;
-            if ($$.merge($2))
-            {
-              YYTHD->syntax_error_at(@2);
-              MYSQL_YYABORT;
-            }
           }
         ;
 

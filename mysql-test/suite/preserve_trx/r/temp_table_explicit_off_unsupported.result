@@ -8,7 +8,7 @@ CREATE TEMPORARY TABLE tmp_t(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
 START TRANSACTION;
 INSERT INTO t_base VALUES(1, 1);
 INSERT INTO tmp_t VALUES(1, 10);
-PREPARE SHUTDOWN PRESERVE TRANSACTION;
+DRAIN TRANSACTIONS PRESERVE;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 ROLLBACK;
 DROP TEMPORARY TABLE tmp_t;
@@ -21,7 +21,7 @@ updated_base_rows
 1
 INSERT INTO tmp_t_dropped VALUES(2, 20);
 DROP TEMPORARY TABLE tmp_t_dropped;
-PREPARE SHUTDOWN PRESERVE TRANSACTION;
+DRAIN TRANSACTIONS PRESERVE;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 ROLLBACK;
 Warnings:

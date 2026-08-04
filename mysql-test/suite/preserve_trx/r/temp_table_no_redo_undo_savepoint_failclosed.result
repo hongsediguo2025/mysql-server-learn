@@ -9,7 +9,7 @@ INSERT INTO tmp_preserve_savepoint VALUES(1, 10);
 SAVEPOINT s1;
 INSERT INTO tmp_preserve_savepoint VALUES(2, 20);
 UPDATE tmp_preserve_savepoint SET v = 21 WHERE id = 2;
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 SELECT COUNT(*) AS preserved_count
 FROM performance_schema.preserved_transactions;

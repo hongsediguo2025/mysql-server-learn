@@ -2,27 +2,33 @@ DROP TABLE IF EXISTS t_mixed_stale_snapshot;
 SET GLOBAL preserve_trx_enable=ON;
 SET GLOBAL preserve_trx_temp_table_enable=ON;
 CREATE TABLE t_mixed_stale_snapshot(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
-INSERT INTO t_mixed_stale_snapshot VALUES(1, 10);
+INSERT INTO t_mixed_stale_snapshot VALUES(1, 10), (2, 20);
 CREATE TEMPORARY TABLE tmp_mixed_stale_snapshot(
 id INT PRIMARY KEY,
 v INT
 ) ENGINE=InnoDB;
 INSERT INTO tmp_mixed_stale_snapshot VALUES(1, 100);
-SET SESSION debug="+d,preserve_trx_fail_delete_snapshot_files";
-SET DEBUG_SYNC =
-'preserve_trx_before_token_delivery SIGNAL mixed_token_ready WAIT_FOR mixed_continue';
 START TRANSACTION;
 UPDATE t_mixed_stale_snapshot SET v=11 WHERE id=1;
 UPDATE tmp_mixed_stale_snapshot SET v=101 WHERE id=1;
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
-SET DEBUG_SYNC = 'now WAIT_FOR mixed_token_ready TIMEOUT 10';
-KILL CONNECTION CONN_ID;
-SET DEBUG_SYNC = 'now SIGNAL mixed_continue';
-ERROR HY000: Lost connection to MySQL server during query
+START TRANSACTION;
+UPDATE t_mixed_stale_snapshot SET v=21 WHERE id=2;
+SET SESSION debug="+d,preserve_trx_batch_fail_after_one_target,preserve_trx_fail_delete_snapshot_files";
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+ERROR HY000: DRAIN TRANSACTIONS PRESERVE batch cleanup failed; inspect preserved_transactions and target sessions before retry
+SET SESSION debug="-d,preserve_trx_batch_fail_after_one_target,preserve_trx_fail_delete_snapshot_files";
 SELECT COUNT(*) AS preserved_count_before_restart
 FROM performance_schema.preserved_transactions;
 preserved_count_before_restart
 0
+SELECT v AS target_value_before_disconnect
+FROM t_mixed_stale_snapshot WHERE id=1;
+target_value_before_disconnect
+11
+SELECT v AS second_target_value_before_disconnect
+FROM t_mixed_stale_snapshot WHERE id=2;
+second_target_value_before_disconnect
+21
 # restart: --preserve-trx-enable=ON --preserve-trx-temp-table-enable=ON
 SELECT COUNT(*) AS preserved_count_after_restart
 FROM performance_schema.preserved_transactions;
@@ -31,6 +37,7 @@ preserved_count_after_restart
 SELECT * FROM t_mixed_stale_snapshot ORDER BY id;
 id	v
 1	10
+2	20
 DROP TABLE t_mixed_stale_snapshot;
 SET GLOBAL preserve_trx_enable=ON;
 SET GLOBAL preserve_trx_temp_table_enable=ON;

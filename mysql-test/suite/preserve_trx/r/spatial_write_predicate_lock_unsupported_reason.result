@@ -22,7 +22,7 @@ UPDATE t_spatial_write_predicate FORCE INDEX(pos)
 SET v = v + 1
 WHERE MBRWithin(pos, @g);
 SET SESSION debug='+d,preserve_trx_simulate_unsupported_spatial_write_predicate_lock';
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 SET SESSION debug='-d,preserve_trx_simulate_unsupported_spatial_write_predicate_lock';
 SELECT * FROM t_spatial_write_predicate_anchor ORDER BY id;

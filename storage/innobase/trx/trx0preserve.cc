@@ -2069,21 +2069,6 @@ void trx_preserve_close_read_views_for_shutdown() {
   trx_sys_mutex_exit();
 }
 
-dberr_t trx_preserve_materialize_implicit_locks(
-    THD *thd, const Preserve_lock_limits &limits, bool *materialized_any) {
-  if (thd == nullptr) {
-    return DB_ERROR;
-  }
-
-  trx_t *trx = thd_to_trx(thd);
-  if (trx == nullptr) {
-    return DB_ERROR;
-  }
-
-  return lock_preserve_materialize_implicit_locks(trx, limits,
-                                                 materialized_any);
-}
-
 /*
   Serialize the active ReadView as low/up/creator limits plus the active rw-trx
   id array captured in the view. low_limit_no is returned separately for

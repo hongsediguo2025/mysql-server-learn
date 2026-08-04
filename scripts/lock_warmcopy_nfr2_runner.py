@@ -108,9 +108,7 @@ class ServerOptions:
     innodb_log_file_size: str = "512M"
     preserve_recovery_max_count: int = 2500
     preserve_max_lock_count: int = 200_000_000
-    preserve_max_scan_pages: int = 200_000_000
     preserve_max_modified_tables: int = 2000
-    preserve_materialize_timeout_ms: int = 300_000
     preserve_startup_recovery_threads: int = 0
     preserve_lock_warmcopy_max_memory_bytes: int = 1_073_741_824
     preserve_lock_warmcopy_max_journal_bytes: int = 4_294_967_296
@@ -179,9 +177,7 @@ def render_my_cnf(paths: Nfr2Paths, options: ServerOptions) -> str:
         "preserve-trx-enable=ON",
         f"preserve-trx-recovery-max-count={options.preserve_recovery_max_count}",
         f"preserve-trx-max-lock-count={options.preserve_max_lock_count}",
-        f"preserve-trx-max-scan-pages={options.preserve_max_scan_pages}",
         f"preserve-trx-max-modified-tables={options.preserve_max_modified_tables}",
-        f"preserve-trx-materialize-timeout-ms={options.preserve_materialize_timeout_ms}",
         f"preserve-trx-startup-recovery-threads={options.preserve_startup_recovery_threads}",
         "preserve-trx-lock-warmcopy-enable=ON",
         f"preserve-trx-lock-warmcopy-max-memory-bytes={options.preserve_lock_warmcopy_max_memory_bytes}",

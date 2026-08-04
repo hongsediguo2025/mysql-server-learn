@@ -22,7 +22,7 @@ DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 START TRANSACTION;
 INSERT INTO t_warmcopy_new VALUES(3,30,'control',REPEAT('d',32));
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 ROLLBACK;
 START TRANSACTION;

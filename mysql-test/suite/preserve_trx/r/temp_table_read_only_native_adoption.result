@@ -8,7 +8,7 @@ v INT NOT NULL
 SET SESSION transaction_read_only=ON;
 START TRANSACTION;
 INSERT INTO tmp_preserve_temp_read_only VALUES(1, 10), (2, 20);
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 SET SESSION transaction_read_only=OFF;
 SELECT @@session.transaction_read_only AS session_read_only_before_resume;
 session_read_only_before_resume

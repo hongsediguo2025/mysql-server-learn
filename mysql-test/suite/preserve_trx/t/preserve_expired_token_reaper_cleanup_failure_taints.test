@@ -25,8 +25,10 @@ START TRANSACTION;
 UPDATE t_expired_reaper_cleanup_failure SET b=11 WHERE a=1;
 
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
-PREPARE SHUTDOWN PRESERVE TRANSACTION;
---source include/wait_until_disconnected.inc
+--let $preserve_trx_drain_one_second_timeout= 1
+--let $preserve_trx_drain_clause=
+--source suite/preserve_trx/include/drain_transaction_from_control.inc
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 
 --sleep 2
 
@@ -51,10 +53,16 @@ use strict;
 use warnings;
 use File::Spec;
 
+require File::Spec->catfile($ENV{'MYSQL_TEST_DIR'}, 'suite',
+                            'preserve_trx', 'include',
+                            'preserve_snapshot_files.pl');
+
 my $token = $ENV{'_EXPIRED_CLEANUP_TOKEN'} or die "missing token";
 my $dir = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve');
+my @snapshots = grep { /\Q$token\E\.bin\z/ }
+  PreserveSnapshotFiles::preserve_snapshot_bin_files($dir);
 die "missing retained snapshot"
-  unless -f File::Spec->catfile($dir, "$token.bin");
+  unless @snapshots == 1;
 die "missing tainted marker after expired reaper cleanup failure"
   unless -f File::Spec->catfile($dir, "$token.tainted");
 EOF

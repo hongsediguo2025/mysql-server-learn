@@ -7,11 +7,11 @@ v INT
 INSERT INTO t_implicit_lock_after_resume VALUES(1,10),(2,20);
 START TRANSACTION;
 INSERT INTO t_implicit_lock_after_resume VALUES(3,30);
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 SELECT TOKEN, LOCKS_COUNT
 FROM performance_schema.preserved_transactions;
 TOKEN	LOCKS_COUNT
-TOKEN	2
+TOKEN	1
 SET innodb_lock_wait_timeout=1;
 INSERT INTO t_implicit_lock_after_resume VALUES(3,31);
 ERROR HY000: Lock wait timeout exceeded; try restarting transaction

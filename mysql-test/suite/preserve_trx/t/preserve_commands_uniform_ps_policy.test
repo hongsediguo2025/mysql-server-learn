@@ -125,7 +125,6 @@ if (length($auth) > 0 && ord(substr($auth, 0, 1)) == 0x01) {
 expect_ok($auth, 'auth');
 
 my @commands = (
-  ['preserve', 'PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300'],
   ['drain', 'DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300'],
   ['resume', "RESUME PRESERVED TRANSACTION 'msp_missing_token'"],
   ['show', 'SHOW PRESERVED TRANSACTIONS'],
@@ -150,11 +149,6 @@ EOF
 
 --exec perl $raw_ps_policy_client $MASTER_MYSOCK
 --remove_file $raw_ps_policy_client
-
---error ER_UNSUPPORTED_PS
-PREPARE preserve_stmt FROM 'PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300';
---error ER_UNKNOWN_STMT_HANDLER
-DEALLOCATE PREPARE preserve_stmt;
 
 --error ER_UNSUPPORTED_PS
 PREPARE drain_stmt FROM 'DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300';

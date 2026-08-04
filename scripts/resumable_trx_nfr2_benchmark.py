@@ -261,8 +261,6 @@ def _base_config(
         preserve_timeout_s=args.preserve_timeout,
         preserve_max_binlog_cache_bytes=args.preserve_max_binlog_cache_bytes,
         preserve_max_lock_count=args.preserve_max_lock_count,
-        preserve_max_scan_pages=args.preserve_max_scan_pages,
-        preserve_materialize_timeout_ms=args.preserve_materialize_timeout_ms,
         preserve_max_modified_tables=args.preserve_max_modified_tables,
         preserve_lock_warmcopy_max_journal_bytes=(
             args.preserve_lock_warmcopy_max_journal_bytes
@@ -350,10 +348,6 @@ def _large_lockset_config(args: argparse.Namespace, lock_warmcopy_mode: str) -> 
             args.preserve_max_lock_count,
             LARGE_LOCKSET_PRESERVE_MAX_LOCK_COUNT,
         ),
-        preserve_max_scan_pages=max(
-            args.preserve_max_scan_pages,
-            LARGE_LOCKSET_PRESERVE_MAX_LOCK_COUNT,
-        ),
         preserve_max_modified_tables=max(
             args.preserve_max_modified_tables,
             LARGE_LOCKSET_PRESERVE_MAX_MODIFIED_TABLES,
@@ -387,7 +381,6 @@ def _scaled_lockset_config(args: argparse.Namespace, lock_warmcopy_mode: str) ->
             seed_rows,
         ),
         preserve_max_lock_count=max(args.preserve_max_lock_count, minimum_lock_count),
-        preserve_max_scan_pages=max(args.preserve_max_scan_pages, minimum_lock_count),
         preserve_max_modified_tables=max(
             args.preserve_max_modified_tables,
             minimum_modified_tables,
@@ -983,7 +976,6 @@ def run_scenario(scenario: BenchmarkScenario) -> Dict[str, object]:
         "lock_warmcopy_mode": scenario.config.lock_warmcopy_mode,
         "preserve_max_binlog_cache_bytes": scenario.config.preserve_max_binlog_cache_bytes,
         "preserve_max_lock_count": scenario.config.preserve_max_lock_count,
-        "preserve_max_scan_pages": scenario.config.preserve_max_scan_pages,
         "preserve_max_modified_tables": scenario.config.preserve_max_modified_tables,
         "preserve_lock_warmcopy_max_journal_bytes": (
             scenario.config.preserve_lock_warmcopy_max_journal_bytes
@@ -1302,8 +1294,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--preserve-timeout", type=int, default=86400)
     parser.add_argument("--preserve-max-binlog-cache-bytes", type=int, default=1_073_741_824)
     parser.add_argument("--preserve-max-lock-count", type=int, default=1_000_000)
-    parser.add_argument("--preserve-max-scan-pages", type=int, default=1_000_000)
-    parser.add_argument("--preserve-materialize-timeout-ms", type=int, default=60_000)
     parser.add_argument("--preserve-max-modified-tables", type=int, default=512)
     parser.add_argument(
         "--preserve-lock-warmcopy-max-journal-bytes",

@@ -21,13 +21,16 @@ CREATE TEMPORARY TABLE tmp_temp_sidecar_write_failure(
 ) ENGINE=InnoDB;
 INSERT INTO tmp_temp_sidecar_write_failure VALUES(1, 100), (2, 200);
 
-SET SESSION debug="+d,preserve_trx_fail_before_snapshot_fsync";
 START TRANSACTION;
 UPDATE t_temp_sidecar_write_failure SET v=11 WHERE id=1;
 
+--connect(temp_sidecar_failure_control,localhost,root,,test)
+SET SESSION debug="+d,preserve_trx_fail_before_snapshot_fsync";
 --error ER_PRESERVE_TRX_UNSUPPORTED
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 SET SESSION debug="-d,preserve_trx_fail_before_snapshot_fsync";
+--disconnect temp_sidecar_failure_control
+--connection default
 
 SELECT COUNT(*) AS preserved_count
   FROM performance_schema.preserved_transactions;

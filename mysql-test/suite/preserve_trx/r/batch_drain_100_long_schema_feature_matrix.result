@@ -1,6 +1,5 @@
 SET GLOBAL preserve_trx_enable=ON;
 SET GLOBAL preserve_trx_recovery_max_count=200;
-SET GLOBAL preserve_trx_drain_grace_ms=60000;
 SET GLOBAL preserve_trx_max_modified_tables=512;
 SELECT COUNT(*) AS session_count
 FROM t_batch_long_control;

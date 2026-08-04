@@ -7,7 +7,7 @@ CREATE TABLE t_timeout_live_resume_expiry(a INT PRIMARY KEY, b INT) ENGINE=InnoD
 INSERT INTO t_timeout_live_resume_expiry VALUES(1,10);
 START TRANSACTION;
 UPDATE t_timeout_live_resume_expiry SET b=11 WHERE a=1;
-PREPARE SHUTDOWN PRESERVE TRANSACTION;
+DRAIN TRANSACTIONS PRESERVE;
 SELECT COUNT(*) AS preserved_count_during_grace
 FROM performance_schema.preserved_transactions;
 preserved_count_during_grace

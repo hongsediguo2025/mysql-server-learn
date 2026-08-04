@@ -1079,8 +1079,7 @@ static Sys_var_uint Sys_preserve_trx_batch_max_transactions(
 
 static Sys_var_uint Sys_preserve_trx_default_timeout(
     "preserve_trx_default_timeout",
-    "Default wall-clock timeout in seconds for PREPARE SHUTDOWN PRESERVE "
-    "TRANSACTION and DRAIN TRANSACTIONS PRESERVE when WITH TIMEOUT is omitted.",
+    "Default DRAIN TRANSACTIONS PRESERVE timeout in seconds.",
     SESSION_VAR(preserve_trx_default_timeout), CMD_LINE(REQUIRED_ARG),
     VALID_RANGE(1, UINT_MAX32), DEFAULT(300), BLOCK_SIZE(1), NO_MUTEX_GUARD,
     NOT_IN_BINLOG);
@@ -1175,7 +1174,7 @@ static Sys_var_ulonglong Sys_preserve_trx_single_phase_max_binlog_cache_bytes(
 
 static Sys_var_uint Sys_preserve_trx_max_lock_count(
     "preserve_trx_max_lock_count",
-    "Maximum number of record locks that preserve may materialize or export "
+    "Maximum number of record locks that preserve may export "
     "before rejecting the transaction.",
     GLOBAL_VAR(preserve_trx_max_lock_count), CMD_LINE(REQUIRED_ARG),
     VALID_RANGE(0, UINT_MAX32), DEFAULT(2000), BLOCK_SIZE(1), NO_MUTEX_GUARD,
@@ -1183,51 +1182,14 @@ static Sys_var_uint Sys_preserve_trx_max_lock_count(
 
 static Sys_var_uint Sys_preserve_trx_max_modified_tables(
     "preserve_trx_max_modified_tables",
-    "Maximum number of modified InnoDB tables that preserve may scan for "
-    "implicit locks before rejecting the transaction.",
+    "Maximum modified InnoDB tables exported per preserved transaction.",
     GLOBAL_VAR(preserve_trx_max_modified_tables), CMD_LINE(REQUIRED_ARG),
     VALID_RANGE(0, UINT_MAX32), DEFAULT(64), BLOCK_SIZE(1), NO_MUTEX_GUARD,
     NOT_IN_BINLOG);
 
-static Sys_var_uint Sys_preserve_trx_max_scan_pages(
-    "preserve_trx_max_scan_pages",
-    "Maximum number of clustered index pages that preserve may scan while "
-    "materializing implicit locks before rejecting the transaction.",
-    GLOBAL_VAR(preserve_trx_max_scan_pages), CMD_LINE(REQUIRED_ARG),
-    VALID_RANGE(0, UINT_MAX32), DEFAULT(20000), BLOCK_SIZE(1), NO_MUTEX_GUARD,
-    NOT_IN_BINLOG);
-
-static Sys_var_uint Sys_preserve_trx_materialize_timeout_ms(
-    "preserve_trx_materialize_timeout_ms",
-    "Maximum wall-clock time in milliseconds that preserve may spend "
-    "materializing implicit locks before rejecting the transaction.",
-    GLOBAL_VAR(preserve_trx_materialize_timeout_ms), CMD_LINE(REQUIRED_ARG),
-    VALID_RANGE(0, UINT_MAX32), DEFAULT(5000), BLOCK_SIZE(1), NO_MUTEX_GUARD,
-    NOT_IN_BINLOG);
-
-static const char *preserve_trx_drain_mode_names[] = {"SOFT", "HARD", nullptr};
-static Sys_var_enum Sys_preserve_trx_drain_mode(
-    "preserve_trx_drain_mode",
-    "Shutdown drain mode for preserved transactions. SOFT blocks new risky "
-    "statements and waits for existing active transactions until "
-    "preserve_trx_drain_grace_ms before escalating to HARD. HARD immediately "
-    "kills other active user transactions.",
-    GLOBAL_VAR(preserve_trx_drain_mode), CMD_LINE(REQUIRED_ARG),
-    preserve_trx_drain_mode_names, DEFAULT(PRESERVE_TRX_DRAIN_MODE_SOFT),
-    NO_MUTEX_GUARD, NOT_IN_BINLOG);
-
-static Sys_var_uint Sys_preserve_trx_drain_grace_ms(
-    "preserve_trx_drain_grace_ms",
-    "Maximum wall-clock time in milliseconds that SOFT preserved transaction "
-    "shutdown drain waits before escalating to HARD.",
-    GLOBAL_VAR(preserve_trx_drain_grace_ms), CMD_LINE(REQUIRED_ARG),
-    VALID_RANGE(0, UINT_MAX32), DEFAULT(30000), BLOCK_SIZE(1), NO_MUTEX_GUARD,
-    NOT_IN_BINLOG);
-
 static Sys_var_uint Sys_preserve_trx_drain_hard_timeout_ms(
     "preserve_trx_drain_hard_timeout_ms",
-    "Maximum wall-clock time in milliseconds that HARD preserved transaction "
-    "shutdown drain waits for active transactions before failing.",
+    "Maximum DRAIN quiesce and shutdown coordination time in milliseconds.",
     GLOBAL_VAR(preserve_trx_drain_hard_timeout_ms), CMD_LINE(REQUIRED_ARG),
     VALID_RANGE(1, UINT_MAX32), DEFAULT(30000), BLOCK_SIZE(1), NO_MUTEX_GUARD,
     NOT_IN_BINLOG);

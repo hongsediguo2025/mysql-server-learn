@@ -2,14 +2,9 @@
 # Preserve/resume maintenance commands must not be prepared.
 #
 SET GLOBAL preserve_trx_enable=ON;
-binary_ps_prepare_preserve_unsupported
 binary_ps_prepare_drain_unsupported
 binary_ps_prepare_resume_unsupported
 binary_ps_prepare_show_unsupported
-PREPARE preserve_stmt FROM 'PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300';
-ERROR HY000: This command is not supported in the prepared statement protocol yet
-DEALLOCATE PREPARE preserve_stmt;
-ERROR HY000: Unknown prepared statement handler (preserve_stmt) given to DEALLOCATE PREPARE
 PREPARE drain_stmt FROM 'DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300';
 ERROR HY000: This command is not supported in the prepared statement protocol yet
 DEALLOCATE PREPARE drain_stmt;

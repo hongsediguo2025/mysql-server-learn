@@ -164,10 +164,10 @@ die "receiver COMMIT status query must use the epoch terminal tombstone, not acc
   unless $transfer =~
          /preserve_trx_transfer_query_epoch_commit_status\([\s\S]*query_epoch_terminal\s*\(\s*root_dir,\s*epoch_id\s*\)/s;
 
-die "single-token preserve kernel request must carry only the existing drain ownership state\n"
+die "batch target preserve kernel request must carry only the existing drain ownership state\n"
   unless $kernel_header =~
          /const Preserve_trx_drain_ownership_state\s*\*drain_ownership\s*\{\s*nullptr\s*\}/s;
-die "ordinary preserve calls must keep drain ownership optional and disabled by default\n"
+die "batch target helper must keep drain ownership optional and disabled by default\n"
   unless $preserve_header =~
          /Preserve_trx_deferred_transfer_candidate\s*\*deferred_transfer_candidate\s*=\s*nullptr,\s*const Preserve_trx_drain_ownership_state\s*\*drain_ownership\s*=\s*nullptr/s;
 die "batch target preserve must pass the active attempt ownership without creating another cancel flag\n"
@@ -177,10 +177,12 @@ die "batch target preserve must pass the active attempt ownership without creati
 my ($preserve_kernel) =
   $preserve =~
     /(bool preserve_trx_kernel_preserve_attached_transaction\([\s\S]*?^})/m
-  or die "could not isolate single-token preserve kernel\n";
-die "kernel RESET polling must remain batch-only and use RESET_REQUESTED ownership\n"
+  or die "could not isolate batch target preserve kernel\n";
+die "kernel RESET polling must use the active drain ownership and RESET_REQUESTED\n"
   unless $preserve_kernel =~
-           /return batch_delivery\s*&&\s*request\.drain_ownership\s*!=\s*nullptr\s*&&[\s\S]*Preserve_trx_drain_terminal::RESET_REQUESTED/s;
+           /return request\.drain_ownership\s*!=\s*nullptr\s*&&[\s\S]*Preserve_trx_drain_terminal::RESET_REQUESTED/s;
+die "kernel must not retain the removed single-delivery mode\n"
+  if $preserve_kernel =~ /batch_delivery|Preserve_trx_delivery_mode/s;
 die "preflight RESET must reuse the attached pre-prepare recovery branch\n"
   unless $preserve_kernel =~
          /if \(reset_requested\(\)\)\s*return reject_after_binlog_export\("batch_target_preserve_reset"\)/s;

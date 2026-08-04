@@ -1,4 +1,5 @@
 --source include/not_log_bin.inc
+--source include/force_restart.inc
 
 SET GLOBAL preserve_trx_enable=ON;
 SET GLOBAL preserve_trx_temp_table_enable=ON;
@@ -19,21 +20,23 @@ START TRANSACTION;
 UPDATE t_temp_no_redo_truncate_anchor SET v=11 WHERE id=1;
 TRUNCATE TABLE tmp_temp_no_redo_truncate_only;
 
---error ER_PRESERVE_TRX_INVALID_STATE
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--let $preserve_trx_drain_clause= WITH TIMEOUT 300
+--source suite/preserve_trx/include/drain_transaction_from_control.inc
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+
+--exec echo "restart: --preserve-trx-enable=ON --preserve-trx-temp-table-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+# TRUNCATE commits the persistent update before DRAIN. With no active target,
+# DRAIN shuts down cleanly and must not fabricate a resume token or artifact.
 SELECT COUNT(*) AS preserved_count
   FROM performance_schema.preserved_transactions;
+SELECT * FROM t_temp_no_redo_truncate_anchor ORDER BY id;
 --source suite/preserve_trx/include/assert_no_preserve_residue.inc
 
-SELECT * FROM tmp_temp_no_redo_truncate_only ORDER BY id;
-INSERT INTO tmp_temp_no_redo_truncate_only VALUES(4, 40);
-UPDATE t_temp_no_redo_truncate_anchor SET v=12 WHERE id=1;
-COMMIT;
-SELECT COUNT(*) AS temp_rows, SUM(v) AS temp_sum
-  FROM tmp_temp_no_redo_truncate_only;
-SELECT * FROM t_temp_no_redo_truncate_anchor ORDER BY id;
-
-DROP TEMPORARY TABLE tmp_temp_no_redo_truncate_only;
 DROP TABLE t_temp_no_redo_truncate_anchor;
 SET GLOBAL preserve_trx_temp_table_enable=ON;
 SET GLOBAL preserve_trx_enable=ON;

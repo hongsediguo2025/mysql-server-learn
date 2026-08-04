@@ -6,14 +6,14 @@ v INT
 ) ENGINE=InnoDB;
 INSERT INTO t_preserve_gap_prepare VALUES(10,10),(20,20),(30,30);
 SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
-SET SESSION debug="+d,ib_force_release_gap_lock_prepare";
 START TRANSACTION;
 UPDATE t_preserve_gap_prepare SET v=11 WHERE id=10;
 SELECT * FROM t_preserve_gap_prepare
 WHERE id > 10 AND id <= 20 FOR UPDATE;
 id	v
 20	20
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+SET SESSION debug="+d,ib_force_release_gap_lock_prepare";
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 SET SESSION innodb_lock_wait_timeout=1;
 UPDATE t_preserve_gap_prepare SET v=21 WHERE id=20;
 ERROR HY000: Lock wait timeout exceeded; try restarting transaction

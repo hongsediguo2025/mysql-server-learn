@@ -407,8 +407,6 @@ EOF
 SET GLOBAL preserve_trx_enable=ON;
 --let $old_preserve_trx_recovery_max_count= `SELECT @@GLOBAL.preserve_trx_recovery_max_count`
 SET GLOBAL preserve_trx_recovery_max_count=200;
---let $old_preserve_trx_drain_grace_ms= `SELECT @@GLOBAL.preserve_trx_drain_grace_ms`
-SET GLOBAL preserve_trx_drain_grace_ms=60000;
 
 --let $batch_long_prefix= batch_long_locking
 --let $batch_long_setup_file= $MYSQLTEST_VARDIR/tmp/batch_long_locking_setup.inc
@@ -424,6 +422,5 @@ SET GLOBAL preserve_trx_enable=ON;
 --disable_query_log
 --disable_result_log
 --eval SET GLOBAL preserve_trx_recovery_max_count=$old_preserve_trx_recovery_max_count
---eval SET GLOBAL preserve_trx_drain_grace_ms=$old_preserve_trx_drain_grace_ms
 --enable_result_log
 --enable_query_log

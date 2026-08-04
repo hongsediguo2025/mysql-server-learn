@@ -2235,11 +2235,6 @@ done:
   thd->update_slow_query_status();
   if (thd->killed) thd->send_kill_message();
   thd->send_statement_status();
-  preserved_trx_note_statement_response(thd);
-  bool skip_preserve_finalize = false;
-  DBUG_EXECUTE_IF("preserve_trx_skip_dispatch_finalize_statement_response",
-                  skip_preserve_finalize = true;);
-  if (!skip_preserve_finalize) preserved_trx_finalize_statement_response(thd);
 
   /* After sending response, switch to clone protocol */
   if (clone_cmd != nullptr) {
@@ -4434,7 +4429,6 @@ int mysql_execute_command(THD *thd, bool first_level) {
     case SQLCOM_CLONE:
     case SQLCOM_LOCK_INSTANCE:
     case SQLCOM_UNLOCK_INSTANCE:
-    case SQLCOM_PREPARE_SHUTDOWN_PRESERVE:
     case SQLCOM_DRAIN_TRANSACTIONS_PRESERVE:
     case SQLCOM_RESET_DRAIN:
     case SQLCOM_RESUME_PRESERVED_TRX:
@@ -4444,8 +4438,7 @@ int mysql_execute_command(THD *thd, bool first_level) {
     case SQLCOM_RESTART_SERVER:
     case SQLCOM_CREATE_SRS:
     case SQLCOM_DROP_SRS: {
-      if (lex->sql_command == SQLCOM_PREPARE_SHUTDOWN_PRESERVE ||
-          lex->sql_command == SQLCOM_DRAIN_TRANSACTIONS_PRESERVE ||
+      if (lex->sql_command == SQLCOM_DRAIN_TRANSACTIONS_PRESERVE ||
           lex->sql_command == SQLCOM_RESET_DRAIN) {
         res = preserve_trx_execute_command(thd);
         break;

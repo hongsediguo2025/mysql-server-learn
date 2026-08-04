@@ -1040,18 +1040,17 @@ die "batch prepare failure reactivation must accept active or prepared magic tra
 $preserve =~ /auto restore_batch_prepare_failure_or_rollback = \[\&\]\(\) \{[\s\S]*?^\s*\};/m
   or die "could not isolate restore_batch_prepare_failure_or_rollback\n";
 my $batch_prepare_restore = $&;
-$batch_prepare_restore =~
-  /if\s*\(\s*batch_delivery\s*\)\s*\{([\s\S]*?)return\s+reject_unsupported_for_delivery\s*\(\s*\);\s*\}\s*return\s+reject_single_after_attached_cleanup/ms
-  or die "could not isolate batch branch in restore_batch_prepare_failure_or_rollback\n";
-my $batch_prepare_restore_branch = $1;
-die "batch prepare failure branch must not rollback the user transaction\n"
-  if $batch_prepare_restore_branch =~ /ha_rollback_trans/s;
-die "batch prepare failure branch must restore InnoDB and binlog state before rejecting\n"
-  unless $batch_prepare_restore_branch =~
+die "batch prepare failure helper must not retain single-delivery branching\n"
+  if $batch_prepare_restore =~
+       /batch_delivery|reject_single_after_attached_cleanup/s;
+die "batch prepare failure helper must not rollback the user transaction\n"
+  if $batch_prepare_restore =~ /ha_rollback_trans/s;
+die "batch prepare failure helper must restore InnoDB and binlog state before rejecting\n"
+  unless $batch_prepare_restore =~
          /reactivate_current_batch_prepared_failure_to_original_thd/s &&
-         $batch_prepare_restore_branch =~
+         $batch_prepare_restore =~
          /mysql_binlog_preserve_reactivate_after_prepare_failure/s &&
-         $batch_prepare_restore_branch =~ /reattached_to_original_thd/s;
+         $batch_prepare_restore =~ /reattached_to_original_thd/s;
 $preserve =~ /DBUG_EXECUTE_IF\s*\(\s*"pfx_prepare_low"[\s\S]*?prepare_failed\s*=\s*true[\s\S]*?if\s*\(\s*prepare_failed\s*\)\s*\{[\s\S]*?return\s+restore_unprepared_batch_prepare_failure_or_rollback\s*\(\s*\)\s*;/m
   or die "pre-engine-prepare failure hook must route through unprepared batch restore helper\n";
 $preserve =~ /trx_preserve_prepare_current\s*\(\s*thd\s*,\s*xid\s*\)[\s\S]*?return\s+restore_batch_prepare_failure_or_rollback\s*\(\s*\)\s*;/m
@@ -1073,18 +1072,16 @@ die "non-ROW binlog format must fail before binlog export and preserve prepare\n
      $prepare_low_pos < 0 ||
      $kernel_row_format_guard_pos > $binlog_preflight_pos ||
      $kernel_row_format_guard_pos > $prepare_low_pos;
-my $single_wrapper_pos =
+my $target_wrapper_pos =
   index($preserve, 'bool preserve_trx_preserve_attached_transaction(');
-my $single_row_format_guard_pos =
+my $target_row_format_guard_pos =
   index($preserve, 'if (!preserved_trx_binlog_format_is_supported(',
-        $single_wrapper_pos);
-my $single_drain_pos =
-  index($preserve, 'preserve_trx_drain_other_active_transactions(target_thd)',
-        $single_wrapper_pos);
-die "single non-ROW preflight must run before draining other sessions\n"
-  if $single_wrapper_pos < 0 || $single_row_format_guard_pos < 0 ||
-     $single_drain_pos < 0 ||
-     $single_row_format_guard_pos > $single_drain_pos;
+        $target_wrapper_pos);
+die "batch target wrapper must reject non-ROW format before kernel preserve\n"
+  if $target_wrapper_pos < 0 || $target_row_format_guard_pos < 0;
+die "removed single-session wrapper must not drain other sessions\n"
+  if index($preserve,
+           'preserve_trx_drain_other_active_transactions(target_thd)') >= 0;
 die "batch non-ROW validation must use the final quiesced target state\n"
   unless $preserve =~
          /class\s+Preserve_batch_quiesced_target_counter[\s\S]*preserve_trx_batch_state\s*!=[\s\S]*QUIESCED[\s\S]*preserved_trx_binlog_format_is_supported\s*\(\s*candidate->variables\.binlog_format\s*\)/s;
@@ -1092,12 +1089,11 @@ die "batch non-ROW validation must use the final quiesced target state\n"
 $preserve =~ /auto restore_prepared_batch_or_rollback = \[\&\]\(\) \{[\s\S]*?^\s*\};/m
   or die "could not isolate restore_prepared_batch_or_rollback\n";
 my $prepared_batch_restore = $&;
-die "post-prepare batch cleanup must not fall through to single-session cleanup when batch reactivation fails\n"
-  if $prepared_batch_restore =~
-     /if\s*\(\s*batch_delivery\s*&&\s*!\s*reactivate_current_batch_prepared_failure_to_original_thd\s*\(\s*thd\s*\)\s*\)/s;
-die "post-prepare batch cleanup must handle batch reactivation failure before the single-session fallback\n"
+die "post-prepare cleanup must not retain a single-session fallback\n"
+  if $prepared_batch_restore =~ /batch_delivery|reject_single_after_attached_cleanup/s;
+die "post-prepare batch cleanup must handle reactivation failure immediately\n"
   unless $prepared_batch_restore =~
-         /if\s*\(\s*batch_delivery\s*\)\s*\{[\s\S]*?if\s*\(\s*reactivate_current_batch_prepared_failure_to_original_thd\s*\(\s*thd\s*,\s*&reactivate_failure\s*\)\s*\)[\s\S]*?cleanup_failed_after_reattach\s*=\s*true[\s\S]*?return\s+reject_unsupported_for_delivery\s*\(\s*\)/s;
+         /if\s*\(\s*reactivate_current_batch_prepared_failure_to_original_thd\s*\(\s*thd\s*,\s*&reactivate_failure\s*\)\s*\)[\s\S]*?cleanup_failed_after_reattach\s*=\s*true[\s\S]*?return\s+reject_unsupported_for_delivery\s*\(\s*\)/s;
 
 $preserve =~ /auto reject_after_binlog_export = \[\&\]\(const char \*reason\) \{[\s\S]*?^\s*\};/m
   or die "could not isolate reject_after_binlog_export\n";
@@ -1339,32 +1335,23 @@ die "temp undo cache reuse must be disabled only by an active preserve capture p
          $undo_reuse_cached !~
          /preserve_trx_temp_table_enable\s*&&\s*fsp_is_system_temporary/s;
 
-$preserve =~ /class Preserve_drain_active_transactions[\s\S]*?^};/m
-  or die "could not isolate Preserve_drain_active_transactions\n";
-my $single_drain = $&;
-die "single-trx drain must fail closed on system-thread RW transactions\n"
-  unless $single_drain =~ /is_system_thread[\s\S]*m_has_unsupported_thread/s;
-die "single-trx hard drain timeout test must be able to keep active transactions alive deterministically\n"
-  unless $single_drain =~ /preserve_trx_drain_skip_kill_active/s;
-
-$preserve =~ /bool preserve_trx_drain_other_active_transactions[\s\S]*?^}/m
-  or die "could not isolate preserve_trx_drain_other_active_transactions\n";
-my $single_drain_loop = $&;
-die "single-trx hard drain must have a configurable absolute timeout\n"
-  unless $single_drain_loop =~ /preserve_trx_drain_hard_timeout_ms/s &&
-         $single_drain_loop =~ /hard_deadline_us/s &&
-         $single_drain_loop =~ /ER_PRESERVE_TRX_DRAIN_TIMEOUT/s;
-die "single-trx hard drain must arm its deadline when hard mode begins\n"
-  unless $single_drain_loop =~ /auto\s+arm_hard_deadline/s &&
-         $single_drain_loop =~ /if\s*\(\s*hard_drain\s*\)\s*arm_hard_deadline/s &&
-         $single_drain_loop =~ /hard_drain\s*=\s*true\s*;[\s\S]*arm_hard_deadline/s;
-$preserve =~
-  /if\s*\(preserve_trx_drain_other_active_transactions\(target_thd\)\)\s*\{[\s\S]*?return preserve_trx_reject_unsupported\(\);/m
-  or die "could not isolate single-trx drain failure branch\n";
-my $single_drain_failure_branch = $&;
-die "single-trx drain failure must preserve a specific hard-timeout error\n"
-  unless $single_drain_failure_branch =~
-         /target_thd->is_error\s*\(\s*\)[\s\S]*return\s+true/s;
+for my $removed_single_drain_symbol (
+  'Preserve_drain_active_transactions',
+  'preserve_trx_drain_other_active_transactions',
+  'SOFT_DRAINING',
+  'HARD_DRAINING') {
+  die "removed single-transaction drain symbol remains: $removed_single_drain_symbol\n"
+    if index($preserve, $removed_single_drain_symbol) >= 0 ||
+       index($preserve_header, $removed_single_drain_symbol) >= 0;
+}
+for my $removed_single_drain_sysvar (
+  'preserve_trx_drain_mode',
+  'preserve_trx_drain_grace_ms') {
+  die "removed single-transaction drain sysvar remains: $removed_single_drain_sysvar\n"
+    if index($preserve, $removed_single_drain_sysvar) >= 0 ||
+       index($preserve_header, $removed_single_drain_sysvar) >= 0 ||
+       index($sys_vars, $removed_single_drain_sysvar) >= 0;
+}
 
 $preserve =~
   /bool preserve_trx_kernel_preserve_attached_transaction\([\s\S]*?^}/m
@@ -1413,7 +1400,7 @@ my $deadline_pos = index($resume_core,
 my $not_resumable_pos = index($resume_core, "if (!record.resumable)");
 my $temp_preclaim_pos = index($resume_core,
                               "preserve_trx_temp_table_preclaim_decision");
-die "resume deadline cleanup must run before non-resumable pending-token rejection\n"
+die "resume deadline cleanup must run before non-resumable record rejection\n"
   unless $deadline_pos >= 0 &&
          $not_resumable_pos >= 0 &&
          $deadline_pos < $not_resumable_pos;
@@ -1443,13 +1430,6 @@ $preserve =~ /static bool restore_record_after_resume_failure[\s\S]*?^}/m
 my $restore_record_after_resume_failure = $&;
 die "resume failure record restore must atomically publish LAST_ERROR with the record\n"
   if $restore_record_after_resume_failure =~
-     /preserved_trx_add_record[\s\S]*preserved_trx_update_record_error/s;
-
-$preserve =~ /static void rollback_pending_token_delivery_record[\s\S]*?^}/m
-  or die "could not isolate rollback_pending_token_delivery_record\n";
-my $rollback_pending_token_delivery_record = $&;
-die "token delivery rollback failure must atomically publish LAST_ERROR with the record\n"
-  if $rollback_pending_token_delivery_record =~
      /preserved_trx_add_record[\s\S]*preserved_trx_update_record_error/s;
 
 my $resume_execute_for_failure_guards = $resume_core;
@@ -1623,6 +1603,13 @@ $mysqld =~ /if\s*\([\s\S]{0,240}preserved_trx_preflight_recoverability\s*\(\s*\)
 my $preflight_window = $&;
 die "startup preserve-trx preflight must run even when --skip-log-bin is used\n"
   if $preflight_window =~ /\bopt_bin_log\b/s;
+
+$preserve =~ /Preserve_trx_command_block_result preserved_trx_command_block_result\([\s\S]*?^}/m
+  or die "could not isolate preserved_trx_command_block_result\n";
+my $sql_command_gate = $&;
+die "CLOSING SQL gate must wait for initial target classification before deciding an unclassified old command\n"
+  unless $sql_command_gate =~
+         /preserve_trx_closing_command_gate_active[\s\S]*Preserve_trx_batch_thd_state::NONE[\s\S]*preserve_trx_command_packet_before_closing[\s\S]*g_closing_target_classification_mutex/s;
 
 $preserve =~ /Preserve_trx_command_block_result preserved_trx_protocol_command_block_result[\s\S]*?^}/m
   or die "could not isolate preserved_trx_protocol_command_block_result\n";
@@ -1983,9 +1970,8 @@ die "preserve public helper must route object construction through kernel\n"
 die "preserve public helper must not directly export objects or write snapshots\n"
   if $preserve_attached =~
      /create_preserved_trx_default_store|build_preserved_trx_bundle|trx_preserve_export_record_locks|trx_preserve_export_table_locks|trx_preserve_export_read_view/s;
-die "preserve public helper must own client token delivery after kernel success\n"
-  unless $preserve_attached =~ /preserved_trx_register_pending_token_delivery/s &&
-         $preserve_attached =~ /\bmy_ok\s*\(/s;
+die "batch preserve public helper must not own SQL response delivery\n"
+  if $preserve_attached =~ /preserved_trx_register_pending_token_delivery|\bmy_ok\s*\(/s;
 
 my $preserve_kernel_start =
   index($preserve, 'bool preserve_trx_kernel_preserve_attached_transaction(');
@@ -2000,22 +1986,19 @@ my $preserve_kernel =
   substr($preserve, $preserve_kernel_start,
          $preserve_kernel_end - $preserve_kernel_start);
 die "batch drain must preserve native implicit-lock continuity instead of scanning indexes to materialize lock_t objects\n"
-  unless $preserve_kernel =~
-           /use_native_implicit_lock_continuity\s*=\s*batch_delivery/s &&
-         $preserve_kernel =~
-           /!use_lock_warmcopy_artifact\s*&&\s*!use_native_implicit_lock_continuity[\s\S]*materialize_implicit_locks_for_live_export/s;
+  if $preserve_kernel =~
+     /trx_preserve_materialize_implicit_locks|lock_preserve_materialize_implicit_locks|materialize_implicit_locks_for_live_export/s;
 die "preserve kernel path must publish snapshots through the default store factory and artifact-sink factory\n"
   unless $preserve_kernel =~ /create_preserved_trx_default_store/s &&
          $preserve_kernel =~ /preserve_trx_transfer_make_configured_frame_sink/s &&
          $preserve_kernel =~ /preserve_trx_make_artifact_sink_for_decision\s*\(/s &&
          $preserve_kernel =~ /artifact_sink->publish_bundle\s*\(/s;
 my $transfer_decision_pos =
-  index($preserve_kernel,
-        'preserve_trx_transfer_artifact_decision_for_request');
+  index($preserve_kernel, 'preserve_trx_transfer_artifact_decision()');
 my $token_select_pos =
   index($preserve_kernel, 'preserve_trx_select_token_for_request');
 my $xid_pos = index($preserve_kernel, 'preserve_trx_token_to_xid');
-die "standby-transfer artifact decision must be request-aware and happen before token/XID selection\n"
+die "standby-transfer artifact decision must happen before token/XID selection\n"
   unless $transfer_decision_pos >= 0 && $token_select_pos > $transfer_decision_pos &&
          $xid_pos > $token_select_pos;
 die "standby-transfer sink factory must receive the selected numeric transfer token\n"
@@ -2088,26 +2071,24 @@ die "preserve-trx audit helper must include action, token, and result fields\n"
 die "preserve-trx audit helper must allow null THD global dispatch for startup recovery\n"
   if $audit_helper =~ /thd\s*==\s*nullptr[\s\S]*return/s;
 
-$preserve =~ /void preserved_trx_note_statement_response[\s\S]*?^}/m
-  or die "could not isolate preserved_trx_note_statement_response\n";
-my $token_delivery_note = $&;
-die "statement response note wrapper must be inert when preserve_trx_enable is OFF\n"
-  unless $token_delivery_note =~
-         /\{\s*if\s*\(\s*!preserve_trx_is_enabled\s*\(\s*\)\s*\)\s*return\s*;/s;
-
-$preserve =~ /void preserved_trx_finalize_statement_response[\s\S]*?^}/m
-  or die "could not isolate preserved_trx_finalize_statement_response\n";
-my $token_delivery_finalization = $&;
-die "statement response finalize wrapper must be inert when preserve_trx_enable is OFF\n"
-  unless $token_delivery_finalization =~
-         /\{\s*if\s*\(\s*!preserve_trx_is_enabled\s*\(\s*\)\s*\)\s*return\s*;/s;
-die "successful live PRESERVE token delivery must emit an audit event\n"
-  unless $token_delivery_finalization =~
-         /audit_preserved_trx_event\s*\(\s*thd\s*,\s*token\s*,\s*"preserve"\s*,\s*"success"\s*\)/s;
+for my $removed_token_delivery_symbol (
+  'Pending_token_delivery',
+  'pending_token_delivery',
+  'preserved_trx_note_statement_response',
+  'preserved_trx_finalize_statement_response',
+  'g_pending_token_delivery_count',
+  'g_token_delivery_mutex') {
+  die "removed client token-delivery symbol remains: $removed_token_delivery_symbol\n"
+    if index($preserve, $removed_token_delivery_symbol) >= 0 ||
+       index($preserve_header, $removed_token_delivery_symbol) >= 0 ||
+       index($sql_parse, $removed_token_delivery_symbol) >= 0 ||
+       index($sql_class, $removed_token_delivery_symbol) >= 0 ||
+       index($mysqld, $removed_token_delivery_symbol) >= 0;
+}
 
 die "batch preserve target success must emit an audit event\n"
-  unless $preserve =~
-         /batch_delivery[\s\S]*?audit_preserved_trx_event\s*\(\s*thd\s*,\s*token\s*,\s*"preserve"\s*,\s*"success"\s*\)/s;
+  unless $preserve_kernel =~
+         /audit_preserved_trx_event\s*\(\s*thd\s*,\s*token\s*,\s*"preserve"\s*,\s*"success"\s*\)/s;
 $preserve =~ /std::atomic<bool>\s+worker_init_failed[\s\S]*?join_workers\.rollback\s*\(\s*\)/m
   or die "could not isolate parallel preserve worker pool\n";
 my $parallel_preserve_worker_pool = $&;
@@ -2504,13 +2485,6 @@ die "RESUME must not full-read durable carrier before claiming the record\n"
      substr($resume_execute_audit, 0, $resume_take_pos) =~
        /store->read\s*\(\s*token\s*,\s*true\s*,\s*&/s;
 
-$preserve =~ /static void rollback_pending_token_delivery_record[\s\S]*?^}/m
-  or die "could not isolate rollback_pending_token_delivery_record\n";
-my $token_delivery_rollback = $&;
-die "token-delivery failure rollback must emit an audit event\n"
-  unless $token_delivery_rollback =~
-         /audit_preserved_trx_event\s*\(\s*current_thd\s*,\s*token\s*,\s*"rollback"/s;
-
 die "recovery failure rollback must emit an audit event\n"
   unless $preserve =~
          /static bool rollback_preserved_snapshot_or_log[\s\S]*?audit_preserved_trx_event\s*\(\s*current_thd\s*,\s*token\s*,\s*"rollback"/s &&
@@ -2544,13 +2518,9 @@ die "online standby transfer must not expose source/target routing UUID sysvars\
          /preserve_trx_transfer_(?:allowed_source_uuid|target_server_uuid)/s ||
      $transfer_header =~
          /preserve_trx_transfer_(?:allowed_source_uuid|target_server_uuid)/s;
-$transfer =~
-  /Preserve_trx_transfer_artifact_decision\s+preserve_trx_transfer_artifact_decision_for_request[\s\S]*?^}/m
-  or die "could not isolate preserve_trx_transfer_artifact_decision_for_request\n";
-my $transfer_artifact_decision_for_request = $&;
-die "standby-transfer request decision must allow STANDBY_TRANSFER_SAVE only for batch manager delivery\n"
-  unless $transfer_artifact_decision_for_request =~
-         /STANDBY_TRANSFER_SAVE[\s\S]*BATCH_MANAGER_DELIVERY[\s\S]*UNSUPPORTED/s;
+die "removed delivery-mode transfer decision wrapper must not remain\n"
+  if $transfer =~ /preserve_trx_transfer_artifact_decision_for_request|BATCH_MANAGER_DELIVERY|CLIENT_TOKEN_DELIVERY/s ||
+     $transfer_header =~ /preserve_trx_transfer_artifact_decision_for_request|BATCH_MANAGER_DELIVERY|CLIENT_TOKEN_DELIVERY/s;
 die "portable transfer manifest must use the explicit numeric transfer token, not bundle metadata token\n"
   if $transfer =~ /built_manifest\.token\s*=\s*bundle\.metadata\.token/s;
 die "portable transfer manifest must assign the caller-selected transfer token\n"
@@ -2950,11 +2920,6 @@ die "preserve eligibility must inspect every SESSION and STMT participant withou
          /preserve_trx_has_only_supported_transaction_engines[\s\S]*ha_trx_info\s*\(\s*scope\s*\)/s &&
          $preserve !~
          /preserve_trx_has_only_supported_transaction_engines[\s\S]{0,900}is_trx_read_write\s*\(\s*\)\s*\)\s*continue/s;
-die "ordinary response paths must use the pending-token atomic zero fast path before taking its mutex\n"
-  unless $preserve =~
-         /preserved_trx_has_pending_token_delivery[\s\S]{0,240}g_pending_token_delivery_count\.load[\s\S]{0,180}g_token_delivery_mutex/s &&
-         $preserve =~
-         /note_pending_token_delivery_statement_response[\s\S]{0,240}g_pending_token_delivery_count\.load[\s\S]{0,180}g_token_delivery_mutex/s;
 die "resume savepoint restore must rebuild the authenticated SESSION order and exact suffix ordinal\n"
   unless $preserve =~ /restore_session_participant_topology/s &&
          $preserve =~ /savepoint_ha_list_for_suffix/s &&

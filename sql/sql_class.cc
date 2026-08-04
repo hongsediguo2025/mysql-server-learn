@@ -1046,7 +1046,6 @@ void THD::release_resources() {
   mysql_mutex_unlock(&LOCK_thd_query);
 
   stmt_map.reset(); /* close all prepared statements */
-  preserved_trx_release_resources(this);
   if (!cleanup_done) cleanup();
 
   mdl_context.destroy();

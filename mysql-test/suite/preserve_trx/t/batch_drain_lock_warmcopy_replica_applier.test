@@ -90,7 +90,6 @@ die "attached batch preserve must recheck unsupported common context after conte
 die "existing runtime MTR must still exercise command-level replication debug fail-closed paths\n"
   unless $existing_mtr =~ /preserve_trx_simulate_replication_context/s &&
          $existing_mtr =~ /preserve_trx_simulate_group_replication_context/s &&
-         $existing_mtr =~ /PREPARE SHUTDOWN PRESERVE TRANSACTION/s &&
          $existing_mtr =~ /DRAIN TRANSACTIONS PRESERVE/s &&
          $existing_mtr =~ /ER_PRESERVE_TRX_UNSUPPORTED/s;
 

@@ -37,7 +37,12 @@ my $offset = parse_int($offset_text);
 my $xor = parse_int($xor_text) & 0xff;
 
 my $dir = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve');
-my $path = File::Spec->catfile($dir, "$token.bin");
+require File::Spec->catfile($ENV{'MYSQL_TEST_DIR'}, 'suite',
+                            'preserve_trx', 'include',
+                            'preserve_snapshot_files.pl');
+my $path = PreserveSnapshotFiles::preserve_snapshot_path_for_token($dir,
+                                                                   $token);
+defined($path) or die "cannot find snapshot for token $token";
 
 sysopen(my $fh, $path, O_RDWR) or die "cannot open $path: $!";
 binmode($fh);

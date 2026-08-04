@@ -6,7 +6,7 @@ v INT
 ) ENGINE=InnoDB;
 START TRANSACTION;
 INSERT INTO t_resume_replaces_empty_user_vars VALUES(1,10);
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300 WITH USER VARS;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300 WITH USER VARS;
 SET @current_only = 'must-be-cleared-by-empty-user-vars-snapshot';
 RESUME PRESERVED TRANSACTION 'TOKEN';
 SELECT @current_only IS NULL AS current_only_was_cleared;

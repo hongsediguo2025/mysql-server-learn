@@ -40,44 +40,6 @@ INSERT INTO t_kernel_equiv VALUES
   (3,30,REPEAT('c',64));
 RESET MASTER;
 
-SET @kernel_equiv_var='single';
-START TRANSACTION;
-UPDATE t_kernel_equiv SET v=101, payload=REPEAT('x',64) WHERE id=1;
-SAVEPOINT s_kernel;
-INSERT INTO t_kernel_equiv VALUES(101,1001,REPEAT('s',64));
-
---exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300 WITH USER VARS;
---source include/wait_until_disconnected.inc
-
---exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=10" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
---enable_reconnect
---source include/wait_until_connected_again.inc
---disable_reconnect
-
-INSERT INTO t_kernel_equiv_observed
-SELECT 'single', BINLOG_STATE, WROTE_TO_CACHE, BINLOG_CACHE_SIZE > 0,
-       SESSION_SQL_LOG_BIN, GLOBAL_LOG_BIN, ISOLATION, MOD_TABLES_COUNT,
-       SAVEPOINT_COUNT, BINLOG_WARMCOPY_STATE
-  FROM performance_schema.preserved_transactions;
-SELECT COUNT(*) AS single_preserved_count
-  FROM performance_schema.preserved_transactions;
---source suite/preserve_trx/include/get_preserved_token.inc
---connect(kernel_equiv_resume_single, localhost, root,,test)
---connection kernel_equiv_resume_single
---replace_result $preserved_token TOKEN
---eval RESUME PRESERVED TRANSACTION '$preserved_token'
-SELECT @kernel_equiv_var AS resumed_var;
-ROLLBACK TO SAVEPOINT s_kernel;
-UPDATE t_kernel_equiv SET v=v+1 WHERE id=1;
-COMMIT;
---disconnect kernel_equiv_resume_single
-
---connection default
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_enable=OFF;
-SET GLOBAL preserve_trx_single_phase_max_binlog_cache_bytes=1048576;
-
 --connect(kernel_equiv_single_phase_app, localhost, root,,test)
 SET @kernel_equiv_var='batch_single_phase';
 START TRANSACTION;

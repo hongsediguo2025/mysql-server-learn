@@ -14,7 +14,7 @@ WHERE id >= 10 AND id <= 20;
 id	v
 10	10
 20	20
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 SELECT ISOLATION, LOCKS_COUNT >= 1 AS has_preserved_locks
 FROM performance_schema.preserved_transactions;
 ISOLATION	has_preserved_locks

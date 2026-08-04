@@ -4,6 +4,7 @@
 
 --disable_warnings
 DROP TABLE IF EXISTS t_batch_drained;
+DROP PROCEDURE IF EXISTS p_batch_drained_update;
 --disable_query_log
 DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
 --enable_query_log
@@ -19,6 +20,8 @@ SET GLOBAL preserve_trx_enable=ON;
 
 CREATE TABLE t_batch_drained(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_batch_drained VALUES(1,10);
+CREATE PROCEDURE p_batch_drained_update()
+  UPDATE t_batch_drained SET b=50 WHERE a=1;
 
 --connect(batch_drained_app,localhost,root,,test)
 --connection batch_drained_app
@@ -62,6 +65,10 @@ PREPARE drained_stmt FROM 'UPDATE t_batch_drained SET b=40 WHERE a=1';
 --error ER_PRESERVE_TRX_SESSION_DRAINED
 EXECUTE drained_existing_stmt;
 --error ER_PRESERVE_TRX_SESSION_DRAINED
+CALL p_batch_drained_update();
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+LOCK TABLES t_batch_drained WRITE;
+--error ER_PRESERVE_TRX_SESSION_DRAINED
 SELECT * FROM t_batch_drained WHERE a=1 FOR UPDATE;
 --error ER_PRESERVE_TRX_SESSION_DRAINED
 RESUME PRESERVED TRANSACTION 'not-a-token';
@@ -92,6 +99,7 @@ ROLLBACK;
 SELECT * FROM t_batch_drained;
 
 DROP TABLE t_batch_drained;
+DROP PROCEDURE p_batch_drained_update;
 --disable_query_log
 DROP USER preserve_trx_ha_admin@localhost;
 --enable_query_log

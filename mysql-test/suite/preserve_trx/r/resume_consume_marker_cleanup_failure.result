@@ -4,7 +4,7 @@ CREATE TABLE t_resume_consume_cleanup(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
 INSERT INTO t_resume_consume_cleanup VALUES(1, 10);
 START TRANSACTION;
 UPDATE t_resume_consume_cleanup SET v=11 WHERE id=1;
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 SET SESSION debug="+d,preserve_trx_fail_delete_snapshot_files,preserve_trx_fail_write_tainted_marker";
 RESUME PRESERVED TRANSACTION 'TOKEN';
 SET SESSION debug="-d,preserve_trx_fail_delete_snapshot_files,preserve_trx_fail_write_tainted_marker";

@@ -7,7 +7,7 @@ SELECT * FROM t_resume_activate_crash WHERE a=1 FOR UPDATE;
 a	b
 1	10
 UPDATE t_resume_activate_crash SET b=11 WHERE a=1;
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 SET SESSION debug="+d,preserve_trx_crash_after_resume_activate_before_snapshot_delete";
 RESUME PRESERVED TRANSACTION 'TOKEN';
 ERROR HY000: Lost connection to MySQL server during query

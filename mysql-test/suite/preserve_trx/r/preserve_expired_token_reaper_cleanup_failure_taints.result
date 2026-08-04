@@ -8,7 +8,7 @@ ENGINE=InnoDB;
 INSERT INTO t_expired_reaper_cleanup_failure VALUES(1,10);
 START TRANSACTION;
 UPDATE t_expired_reaper_cleanup_failure SET b=11 WHERE a=1;
-PREPARE SHUTDOWN PRESERVE TRANSACTION;
+DRAIN TRANSACTIONS PRESERVE;
 include/wait_for_pattern_in_file.inc [Preserved transaction .* expired-token reaper forced rollback: recovery timeout expired]
 SELECT TOKEN, STATE, LAST_ERROR IS NOT NULL AS has_last_error
 FROM performance_schema.preserved_transactions;

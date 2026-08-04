@@ -925,12 +925,6 @@ bool lock_preserve_record_lock_object_has_conflict(
   return lock_rec_has_to_wait(trx, precise_mode, lock, lock_is_on_supremum);
 }
 
-trx_t *lock_preserve_secondary_record_implicit_owner(const rec_t *rec,
-                                                    dict_index_t *index,
-                                                    const ulint *offsets) {
-  return lock_sec_rec_some_has_impl(rec, index, offsets);
-}
-
 #ifdef UNIV_DEBUG
 /** Checks if some transaction, other than given trx_id, has an explicit
  lock on the given rec, in the given precise_mode.
@@ -5835,14 +5829,6 @@ static dberr_t lock_rec_convert_impl_to_expl_for_trx(
 
   DEBUG_SYNC_C("after_lock_rec_convert_impl_to_expl_for_trx");
   return err;
-}
-
-dberr_t lock_preserve_convert_impl_to_expl_for_materialize(
-    const buf_block_t *block, const rec_t *rec, dict_index_t *index,
-    const ulint *offsets, trx_t *trx, ulint heap_no, bool *converted,
-    bool allow_conversion) {
-  return lock_rec_convert_impl_to_expl_for_trx(
-      block, rec, index, offsets, trx, heap_no, converted, allow_conversion);
 }
 
 /** If a transaction has an implicit x-lock on a record, but no explicit x-lock

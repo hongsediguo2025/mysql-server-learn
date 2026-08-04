@@ -1427,18 +1427,6 @@ preserve_trx_transfer_artifact_decision() {
   return Preserve_trx_transfer_artifact_decision::UNSUPPORTED;
 }
 
-Preserve_trx_transfer_artifact_decision
-preserve_trx_transfer_artifact_decision_for_request(
-    Preserve_trx_delivery_mode delivery_mode) {
-  const Preserve_trx_transfer_artifact_decision decision =
-      preserve_trx_transfer_artifact_decision();
-  if (decision != Preserve_trx_transfer_artifact_decision::STANDBY_TRANSFER_SAVE)
-    return decision;
-  return delivery_mode == Preserve_trx_delivery_mode::BATCH_MANAGER_DELIVERY
-             ? decision
-             : Preserve_trx_transfer_artifact_decision::UNSUPPORTED;
-}
-
 void purge_receiver_epoch_derived_state(const std::string &root_dir,
                                         const std::string &epoch_id,
                                         const std::string &source_uuid);

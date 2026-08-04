@@ -20,11 +20,6 @@ DROP TABLE IF EXISTS t_gr_preserve_apply;
 CREATE TABLE t_gr_preserve_apply(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_gr_preserve_apply VALUES(1, 10), (2, 20);
 include/rpl_sync.inc
-START TRANSACTION;
-UPDATE t_gr_preserve_apply SET b=11 WHERE a=1;
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
-ERROR HY000: Resumable transactions across shutdown do not support this operation
-ROLLBACK;
 DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 RESUME PRESERVED TRANSACTION 'invalid-token';

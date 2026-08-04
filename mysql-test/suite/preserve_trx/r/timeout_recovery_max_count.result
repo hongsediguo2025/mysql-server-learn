@@ -7,7 +7,7 @@ SELECT * FROM t_recovery_max_count WHERE a=1 FOR UPDATE;
 a	b
 1	10
 UPDATE t_recovery_max_count SET b=11 WHERE a=1;
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 SELECT TOKEN, RECOVERED_COUNT AS recovered_count_after_first_restart
 FROM performance_schema.preserved_transactions;
 TOKEN	recovered_count_after_first_restart

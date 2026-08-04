@@ -72,8 +72,6 @@ extern uint preserve_trx_spill_chunk_bytes;
 extern ulonglong preserve_trx_single_phase_max_binlog_cache_bytes;
 extern uint preserve_trx_max_lock_count;
 extern uint preserve_trx_max_modified_tables;
-extern uint preserve_trx_max_scan_pages;
-extern uint preserve_trx_materialize_timeout_ms;
 
 bool preserved_trx_build_native_binlog_cache_facts(
     const Preserve_snapshot_metadata &metadata,
@@ -81,10 +79,6 @@ bool preserved_trx_build_native_binlog_cache_facts(
     const Preserved_trx_external_blob_descriptor &descriptor,
     uint64_t binlog_incarnation, uint64_t key_generation,
     Mysql_binlog_preserve_cache_facts *facts);
-enum Preserve_trx_drain_mode {
-  PRESERVE_TRX_DRAIN_MODE_SOFT = 0,
-  PRESERVE_TRX_DRAIN_MODE_HARD = 1
-};
 enum Preserve_trx_off_artifact_policy {
   PRESERVE_TRX_OFF_ARTIFACT_POLICY_FAIL_IF_PRESENT = 0,
   PRESERVE_TRX_OFF_ARTIFACT_POLICY_IGNORE = 1,
@@ -96,8 +90,6 @@ enum class Preserved_trx_recover_load_profile {
   WITH_SEMANTIC_EXTERNAL_BLOBS
 };
 extern ulong preserve_trx_off_artifact_policy;
-extern ulong preserve_trx_drain_mode;
-extern uint preserve_trx_drain_grace_ms;
 extern uint preserve_trx_drain_hard_timeout_ms;
 extern uint preserve_trx_drain_closing_command_timeout_ms;
 extern bool preserve_trx_drain_command_timeout_fail_batch;
@@ -272,7 +264,6 @@ enum class Preserve_trx_manager_state {
     Active states:
       IDLE                      no preserve/drain owner
       DISABLING                 preserve feature is being disabled
-      SOFT_DRAINING             single preserve is draining other active trx
       WARMCOPY_DRAINING         phase-1 participants may capture live work
       WARMCOPY_CLOSING          command admission is closing for phase 2
       BATCH_DRAINING            batch admission/target-quiesce/preserve window
@@ -281,15 +272,9 @@ enum class Preserve_trx_manager_state {
       DRAIN_CLEANUP_FAILED      cleanup left observable state for operators
       SHUTDOWN_REQUESTED        shutdown/token-delivery handoff is in progress
       TRANSFER_HANDOFF_COMPLETE transfer ownership is terminal; source fenced
-
-    HARD_DRAINING and SNAPSHOTTING are retained for state compatibility and
-    diagnostics; current batch preserve does not use them as manager-level
-    transition points.
   */
   IDLE,
   DISABLING,
-  SOFT_DRAINING,
-  HARD_DRAINING,
   WARMCOPY_DRAINING,
   WARMCOPY_CLOSING,
   BATCH_DRAINING,
@@ -369,11 +354,6 @@ struct Preserve_trx_options {
       Preserve_trx_user_vars_mode::DEFAULT};
 };
 
-enum class Preserve_trx_delivery_mode {
-  CLIENT_TOKEN_DELIVERY,
-  BATCH_MANAGER_DELIVERY
-};
-
 /*
   High-level stage of a single target preserve.
 
@@ -390,7 +370,6 @@ enum class Preserve_trx_preserve_stage {
   DETACH,
   SNAPSHOT_WRITE,
   RECORD_REGISTER,
-  TOKEN_DELIVERY,
   COMPLETE
 };
 
@@ -544,10 +523,6 @@ void preserved_trx_set_manager_state_publication_probe_for_unit_test(
 void preserved_trx_set_manager_state_for_unit_test(
     Preserve_trx_manager_state state, my_thread_id owner_thread_id);
 void preserved_trx_set_recovery_complete_for_unit_test(bool complete);
-size_t preserved_trx_pending_token_delivery_count_for_unit_test();
-void preserved_trx_register_pending_token_delivery_for_unit_test(
-    THD *thd, const char *token);
-void preserved_trx_erase_pending_token_delivery_for_unit_test(THD *thd);
 bool preserve_trx_participant_type_is_supported_for_unit_test(
     int legacy_type, Preserve_snapshot_binlog_state binlog_state);
 bool preserved_trx_probe_manager_state_guard_for_unit_test(
@@ -729,18 +704,13 @@ bool preserved_trx_expired_reaper_started_for_unit_test();
 void preserved_trx_set_expired_reaper_init_pause_for_unit_test(bool pause);
 bool preserved_trx_expired_reaper_starting_for_unit_test();
 bool preserved_trx_shutdown_requested();
-bool preserved_trx_defer_shutdown_signal();
-void preserved_trx_note_statement_response(THD *thd);
-void preserved_trx_finalize_statement_response(THD *thd);
-void preserved_trx_release_resources(THD *thd);
 void preserved_trx_begin_external_thd_teardown(THD *thd);
 void preserved_trx_end_external_thd_teardown(THD *thd);
 void preserved_trx_wait_for_external_thd_use(THD *thd);
 bool preserved_trx_thd_has_external_use(THD *thd);
 bool preserve_trx_preserve_attached_transaction(
     THD *target_thd, const Preserve_trx_options &options,
-    ulonglong timeout_seconds, Preserve_trx_delivery_mode delivery_mode,
-    Preserve_trx_preserve_result *result,
+    ulonglong timeout_seconds, Preserve_trx_preserve_result *result,
     PreserveBinlogBlobProvider *binlog_blob_provider = nullptr,
     const Preserve_trx_lock_warmcopy_artifact *lock_warmcopy_artifact = nullptr,
     bool debug_fail_ha_prepare_low = false,
@@ -757,35 +727,10 @@ bool preserve_trx_preserve_attached_transaction(
     const Preserve_trx_drain_ownership_state *drain_ownership = nullptr);
 
 /*
-  SQL command for preserving the current transaction before shutdown.
-
-  The command stores parser options only. Validation, timeout resolution,
-  binlog/lock/temp-table export, engine prepare, and token delivery all happen
-  in the preserve service so batch drain and single-transaction preserve share
-  one correctness path.
-*/
-class Sql_cmd_prepare_shutdown_preserve_transaction final : public Sql_cmd {
- public:
-  explicit Sql_cmd_prepare_shutdown_preserve_transaction(
-      const Preserve_trx_options &options)
-      : m_options(options) {}
-
-  enum_sql_command sql_command_code() const override {
-    return SQLCOM_PREPARE_SHUTDOWN_PRESERVE;
-  }
-
-  bool execute(THD *thd) override;
-
- private:
-  Preserve_trx_options m_options;
-};
-
-/*
   SQL command for batch drain preserve.
 
   The command starts the drain service, which enumerates eligible sessions,
   opens optional warmcopy participants, quiesces targets, preserves each target,
-  records token outcomes through BATCH_MANAGER_DELIVERY for post-restart visibility,
   and requests shutdown after auditing the preserved records. Tokens are not
   returned to each target client connection by this command.
 */

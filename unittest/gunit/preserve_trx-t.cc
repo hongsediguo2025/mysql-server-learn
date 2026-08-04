@@ -4219,28 +4219,6 @@ TEST(PreserveTransactionParticipants, ReadOnlyUnsupportedEngineIsRejected) {
       DB_TYPE_MYISAM, Preserve_snapshot_binlog_state::LOGGED_WITH_CACHE));
 }
 
-TEST(PreservePendingTokenDelivery, AtomicCountTracksUniqueThds) {
-  THD *first = reinterpret_cast<THD *>(static_cast<uintptr_t>(0x1000));
-  THD *second = reinterpret_cast<THD *>(static_cast<uintptr_t>(0x2000));
-  const size_t baseline =
-      preserved_trx_pending_token_delivery_count_for_unit_test();
-
-  preserved_trx_register_pending_token_delivery_for_unit_test(first, "one");
-  EXPECT_EQ(baseline + 1,
-            preserved_trx_pending_token_delivery_count_for_unit_test());
-  preserved_trx_register_pending_token_delivery_for_unit_test(first, "new");
-  EXPECT_EQ(baseline + 1,
-            preserved_trx_pending_token_delivery_count_for_unit_test());
-  preserved_trx_register_pending_token_delivery_for_unit_test(second, "two");
-  EXPECT_EQ(baseline + 2,
-            preserved_trx_pending_token_delivery_count_for_unit_test());
-
-  preserved_trx_erase_pending_token_delivery_for_unit_test(first);
-  preserved_trx_erase_pending_token_delivery_for_unit_test(second);
-  EXPECT_EQ(baseline,
-            preserved_trx_pending_token_delivery_count_for_unit_test());
-}
-
 TEST_F(PreservedTrxCommandRead,
        DisabledFeatureAllowsSyntheticPreservedDrainedDispatch) {
   THD *target = thd();
@@ -4431,10 +4409,6 @@ TEST_F(PreservedTrxCommandRead,
   EXPECT_EQ(
       Preserve_trx_command_block_result::BLOCK_DRAINING,
       preserved_trx_command_block_result(
-          target, SQLCOM_PREPARE_SHUTDOWN_PRESERVE));
-  EXPECT_EQ(
-      Preserve_trx_command_block_result::BLOCK_DRAINING,
-      preserved_trx_command_block_result(
           target, SQLCOM_DRAIN_TRANSACTIONS_PRESERVE));
   EXPECT_EQ(Preserve_trx_command_block_result::BLOCK_DRAINING,
             preserved_trx_command_block_result(
@@ -4556,8 +4530,6 @@ TEST_F(PreservedTrxCommandRead, FeatureDisableAllowedOnlyWhenManagerIsIdle) {
   preserved_trx_remove_record_for_unit_test("unit-disable-observable-token");
 
   const Preserve_trx_manager_state blocked_states[] = {
-      Preserve_trx_manager_state::SOFT_DRAINING,
-      Preserve_trx_manager_state::HARD_DRAINING,
       Preserve_trx_manager_state::WARMCOPY_DRAINING,
       Preserve_trx_manager_state::WARMCOPY_CLOSING,
       Preserve_trx_manager_state::BATCH_DRAINING,
@@ -6248,12 +6220,6 @@ TEST(PreservedTrxTransfer, ArtifactDecisionUsesArtifactModeAsSourceMode) {
             "transfer_credential");
   EXPECT_EQ(Preserve_trx_transfer_artifact_decision::STANDBY_TRANSFER_SAVE,
             preserve_trx_transfer_artifact_decision());
-  EXPECT_EQ(Preserve_trx_transfer_artifact_decision::UNSUPPORTED,
-            preserve_trx_transfer_artifact_decision_for_request(
-                Preserve_trx_delivery_mode::CLIENT_TOKEN_DELIVERY));
-  EXPECT_EQ(Preserve_trx_transfer_artifact_decision::STANDBY_TRANSFER_SAVE,
-            preserve_trx_transfer_artifact_decision_for_request(
-                Preserve_trx_delivery_mode::BATCH_MANAGER_DELIVERY));
 }
 
 TEST(PreservedTrxTransfer, ArtifactDecisionRequiresMainPreserveEnable) {
@@ -6264,9 +6230,6 @@ TEST(PreservedTrxTransfer, ArtifactDecisionRequiresMainPreserveEnable) {
 
   EXPECT_EQ(Preserve_trx_transfer_artifact_decision::UNSUPPORTED,
             preserve_trx_transfer_artifact_decision());
-  EXPECT_EQ(Preserve_trx_transfer_artifact_decision::UNSUPPORTED,
-            preserve_trx_transfer_artifact_decision_for_request(
-                Preserve_trx_delivery_mode::BATCH_MANAGER_DELIVERY));
 }
 
 TEST(PreservedTrxTransfer,

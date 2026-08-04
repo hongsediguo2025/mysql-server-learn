@@ -7,7 +7,7 @@ CREATE TABLE t_timeout_wallclock(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_timeout_wallclock VALUES(1,10);
 START TRANSACTION;
 UPDATE t_timeout_wallclock SET b=11 WHERE a=1;
-PREPARE SHUTDOWN PRESERVE TRANSACTION;
+DRAIN TRANSACTIONS PRESERVE;
 SELECT @@global.preserve_trx_recovery_grace_seconds AS recovery_grace_seconds;
 recovery_grace_seconds
 30

@@ -138,12 +138,8 @@ ulonglong preserve_trx_max_temp_sidecar_bytes = 1073741824;
 ulonglong preserve_trx_single_phase_max_binlog_cache_bytes = ULLONG_MAX;
 uint preserve_trx_max_lock_count = 2000;
 uint preserve_trx_max_modified_tables = 64;
-uint preserve_trx_max_scan_pages = 20000;
-uint preserve_trx_materialize_timeout_ms = 5000;
-ulong preserve_trx_drain_mode = PRESERVE_TRX_DRAIN_MODE_SOFT;
 ulong preserve_trx_off_artifact_policy =
     PRESERVE_TRX_OFF_ARTIFACT_POLICY_FAIL_IF_PRESENT;
-uint preserve_trx_drain_grace_ms = 30000;
 uint preserve_trx_drain_hard_timeout_ms = 30000;
 uint preserve_trx_drain_closing_command_timeout_ms = 1000;
 bool preserve_trx_drain_command_timeout_fail_batch = false;
@@ -1216,20 +1212,6 @@ struct Preserve_batch_account_count {
   uint count{0};
 };
 
-struct Pending_token_delivery {
-  /*
-    Single-transaction preserve does not expose a resumable token until the OK
-    packet carrying that token is known to have been delivered. The statement
-    finalizer flips the preserved record to resumable after OK delivery, or
-    rolls it back if delivery failed. finalizing prevents duplicate finalizers
-    from racing with shutdown/resource cleanup.
-  */
-  std::string token;
-  bool response_observed{false};
-  bool ok_delivered{false};
-  bool finalizing{false};
-};
-
 struct Preserve_user_var_snapshot_entry {
   std::string name;
   std::string value;
@@ -1469,11 +1451,6 @@ struct Preserve_trx_pinned_thd {
   THD *thd{nullptr};
   std::unique_ptr<Preserve_trx_external_thd_pin> pin;
 };
-std::mutex g_token_delivery_mutex;
-std::unordered_map<THD *, Pending_token_delivery> g_pending_token_delivery;
-std::atomic<size_t> g_pending_token_delivery_count{0};
-std::atomic<bool> g_deferred_shutdown_signal_requested{false};
-
 std::string lex_cstring_to_string(LEX_CSTRING value) {
   return value.str == nullptr ? std::string()
                               : std::string(value.str, value.length);
@@ -1975,81 +1952,6 @@ bool preserved_trx_batch_has_capacity(
   }
 
   return true;
-}
-
-bool preserved_trx_mark_resumable(const std::string &token) {
-  std::lock_guard<std::mutex> lock(g_preserved_trx_mutex);
-  for (Preserved_trx_record &record : g_preserved_trx_records) {
-    if (!record.observable_only && record.metadata.token == token) {
-      record.resumable = true;
-      record.state = Preserved_trx_lifecycle_state::PRESERVED;
-      return false;
-    }
-  }
-  return true;
-}
-
-void preserved_trx_register_pending_token_delivery(THD *thd,
-                                                   const std::string &token) {
-  std::lock_guard<std::mutex> lock(g_token_delivery_mutex);
-  const auto inserted = g_pending_token_delivery.emplace(
-      thd, Pending_token_delivery{token, false, false, false});
-  if (inserted.second) {
-    g_pending_token_delivery_count.fetch_add(1, std::memory_order_release);
-  } else {
-    inserted.first->second = {token, false, false, false};
-  }
-}
-
-bool preserved_trx_has_pending_token_delivery(THD *thd) {
-  if (g_pending_token_delivery_count.load(std::memory_order_acquire) == 0)
-    return false;
-  std::lock_guard<std::mutex> lock(g_token_delivery_mutex);
-  return g_pending_token_delivery.find(thd) != g_pending_token_delivery.end();
-}
-
-void note_pending_token_delivery_statement_response(THD *thd) {
-  if (thd == nullptr) return;
-  if (g_pending_token_delivery_count.load(std::memory_order_acquire) == 0)
-    return;
-
-  std::lock_guard<std::mutex> lock(g_token_delivery_mutex);
-  auto it = g_pending_token_delivery.find(thd);
-  if (it == g_pending_token_delivery.end()) return;
-
-  Diagnostics_area *da = thd->get_stmt_da();
-  it->second.response_observed = true;
-  it->second.ok_delivered = da->is_sent() && da->is_ok();
-}
-
-bool preserved_trx_begin_pending_token_delivery_finalization(THD *thd,
-                                                             std::string *token,
-                                                             bool *ok_delivered) {
-  std::lock_guard<std::mutex> lock(g_token_delivery_mutex);
-  auto it = g_pending_token_delivery.find(thd);
-  if (it == g_pending_token_delivery.end() || it->second.finalizing)
-    return false;
-
-  if (!it->second.response_observed && thd != nullptr) {
-    Diagnostics_area *da = thd->get_stmt_da();
-    it->second.response_observed = true;
-    it->second.ok_delivered = da->is_sent() && da->is_ok();
-  }
-
-  it->second.finalizing = true;
-  if (token != nullptr) *token = it->second.token;
-  if (ok_delivered != nullptr) *ok_delivered = it->second.ok_delivered;
-  return true;
-}
-
-void preserved_trx_erase_pending_token_delivery(THD *thd) {
-  std::lock_guard<std::mutex> lock(g_token_delivery_mutex);
-  if (g_pending_token_delivery.erase(thd) != 0) {
-    const size_t previous =
-        g_pending_token_delivery_count.fetch_sub(1, std::memory_order_acq_rel);
-    assert(previous != 0);
-    (void)previous;
-  }
 }
 
 void mark_preserved_trx_recovery_complete() {
@@ -5413,17 +5315,6 @@ void log_redacted_resume_failure(const std::string &token, const char *reason) {
   LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG, message.c_str());
 }
 
-void log_redacted_token_delivery_cleanup_failure(const std::string &token,
-                                                 const char *reason) {
-  std::string message = redacted_preserved_trx_log_subject(token) +
-                        " token delivery cleanup failed";
-  if (reason != nullptr && reason[0] != '\0') {
-    message.append(": ");
-    message.append(reason);
-  }
-  LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG, message.c_str());
-}
-
 void audit_preserved_trx_event(THD *thd, const std::string &token,
                                const char *action, const char *result,
                                const char *reason = nullptr) {
@@ -5642,141 +5533,6 @@ bool preserve_trx_has_resume_any_privilege(THD *thd) {
       .first;
 }
 
-bool preserve_trx_thd_has_batch_inflight_statement(THD *candidate);
-
-class Preserve_drain_active_transactions final : public Do_THD_Impl {
- public:
-  Preserve_drain_active_transactions(THD *owner, bool kill_active)
-      : m_owner(owner), m_kill_active(kill_active) {}
-
-  void operator()(THD *candidate) override {
-    if (candidate == nullptr || candidate == m_owner) return;
-
-    mysql_mutex_lock(&candidate->LOCK_thd_data);
-    const bool active_transaction =
-        candidate->in_active_multi_stmt_transaction() ||
-        candidate->get_transaction()->is_active(Transaction_ctx::SESSION) ||
-        candidate->get_transaction()->is_active(Transaction_ctx::STMT);
-    const bool inflight_statement =
-        preserve_trx_thd_has_batch_inflight_statement(candidate);
-    if (candidate->is_system_thread() &&
-        (active_transaction || inflight_statement)) {
-      m_has_unsupported_thread = true;
-      mysql_mutex_unlock(&candidate->LOCK_thd_data);
-      return;
-    }
-    const bool active_user_statement =
-        active_transaction || inflight_statement;
-
-    if (active_user_statement) {
-      ++m_active_count;
-      if (m_kill_active) {
-        /*
-          Do not wait at the debug sync point while holding a candidate THD's
-          LOCK_thd_data. Test controller sessions may need their own THD lock to
-          signal the sync point back to the drain owner.
-        */
-        mysql_mutex_unlock(&candidate->LOCK_thd_data);
-        DEBUG_SYNC(m_owner, "preserve_trx_drain_before_kill_active");
-        mysql_mutex_lock(&candidate->LOCK_thd_data);
-        const bool still_active_transaction =
-            candidate->in_active_multi_stmt_transaction() ||
-            candidate->get_transaction()->is_active(Transaction_ctx::SESSION) ||
-            candidate->get_transaction()->is_active(Transaction_ctx::STMT);
-        const bool still_inflight_statement =
-            preserve_trx_thd_has_batch_inflight_statement(candidate);
-        if (candidate->is_system_thread() &&
-            (still_active_transaction || still_inflight_statement)) {
-          m_has_unsupported_thread = true;
-          mysql_mutex_unlock(&candidate->LOCK_thd_data);
-          return;
-        }
-        if (!still_active_transaction && !still_inflight_statement) {
-          mysql_mutex_unlock(&candidate->LOCK_thd_data);
-          return;
-        }
-        bool debug_skip_kill_active = false;
-        DBUG_EXECUTE_IF("preserve_trx_drain_skip_kill_active",
-                        debug_skip_kill_active = true;);
-        if (debug_skip_kill_active) {
-          mysql_mutex_unlock(&candidate->LOCK_thd_data);
-          return;
-        }
-        if (m_owner->killed) {
-          m_owner_killed = true;
-        } else if (!candidate->is_killable) {
-          m_has_unsupported_thread = true;
-        } else if (candidate->killed != THD::KILL_CONNECTION) {
-          candidate->awake(THD::KILL_CONNECTION);
-        }
-      }
-    }
-    mysql_mutex_unlock(&candidate->LOCK_thd_data);
-  }
-
-  uint active_count() const { return m_active_count; }
-  bool has_unsupported_thread() const { return m_has_unsupported_thread; }
-  bool owner_killed() const { return m_owner_killed; }
-
- private:
-  THD *m_owner;
-  bool m_kill_active;
-  uint m_active_count{0};
-  bool m_has_unsupported_thread{false};
-  bool m_owner_killed{false};
-};
-
-/*
-  Single-transaction preserve must first make the rest of the server quiet enough
-  that the owner can be prepared without concurrent user transactions changing
-  shared state. The soft interval gives active sessions time to finish; after it
-  expires, or immediately in HARD mode, the drain visitor starts killing active
-  user sessions until either no active transaction remains, an unsupported thread
-  is found, the owner is killed, or the hard timeout expires.
-*/
-bool preserve_trx_drain_other_active_transactions(THD *thd) {
-  const bool hard_configured =
-      preserve_trx_drain_mode == PRESERVE_TRX_DRAIN_MODE_HARD;
-  const uint64_t now_us = preserve_trx_monotonic_us();
-  const uint64_t soft_deadline_us = preserve_trx_monotonic_deadline_after_us(
-      now_us, static_cast<uint64_t>(preserve_trx_drain_grace_ms) * 1000ULL);
-  bool hard_drain = hard_configured || preserve_trx_drain_grace_ms == 0;
-  uint64_t hard_deadline_us = 0;
-
-  auto arm_hard_deadline = [&]() {
-    if (hard_deadline_us == 0) {
-      hard_deadline_us = preserve_trx_monotonic_deadline_after_us(
-          preserve_trx_monotonic_us(),
-          static_cast<uint64_t>(preserve_trx_drain_hard_timeout_ms) * 1000ULL);
-    }
-  };
-  if (hard_drain) arm_hard_deadline();
-
-  for (;;) {
-    if (thd->killed) return true;
-    if (!hard_drain && preserve_trx_monotonic_deadline_expired_at(
-                           soft_deadline_us, preserve_trx_monotonic_us())) {
-      DEBUG_SYNC(thd, "preserve_trx_drain_before_hard");
-      hard_drain = true;
-      arm_hard_deadline();
-    }
-    Preserve_drain_active_transactions drain(thd, hard_drain);
-    Global_THD_manager::get_instance()->do_for_all_thd_copy(&drain);
-    if (drain.owner_killed() || thd->killed) return true;
-    if (drain.has_unsupported_thread()) {
-      return true;
-    }
-    if (drain.active_count() == 0) return false;
-    if (hard_drain && hard_deadline_us != 0 &&
-        preserve_trx_monotonic_deadline_expired_at(
-            hard_deadline_us, preserve_trx_monotonic_us())) {
-      my_error(ER_PRESERVE_TRX_DRAIN_TIMEOUT, MYF(0));
-      return true;
-    }
-    my_sleep(10000);
-  }
-}
-
 bool preserve_trx_table_ref_uses_locking_read(Table_ref *table) {
   for (; table != nullptr; table = table->next_local) {
     const thr_lock_type lock_type = table->lock_descriptor().type;
@@ -5873,7 +5629,6 @@ bool preserve_trx_sql_command_may_create_trx_or_lock(
 bool preserve_trx_sql_command_is_preserve_control_or_shutdown(
     enum_sql_command sql_command) {
   switch (sql_command) {
-    case SQLCOM_PREPARE_SHUTDOWN_PRESERVE:
     case SQLCOM_DRAIN_TRANSACTIONS_PRESERVE:
     case SQLCOM_RESET_DRAIN:
     case SQLCOM_RESUME_PRESERVED_TRX:
@@ -8999,8 +8754,7 @@ class Preserve_batch_quiesced_idle_target final {
           early_target_error = true;
         } else {
           m_error = preserve_trx_preserve_attached_transaction(
-              candidate, m_options, m_timeout_seconds,
-              Preserve_trx_delivery_mode::BATCH_MANAGER_DELIVERY, &m_result,
+              candidate, m_options, m_timeout_seconds, &m_result,
               m_binlog_blob_provider, m_lock_warmcopy_artifact,
               m_debug_fail_ha_prepare_low, m_debug_fail_temp_only_prepare,
               m_defer_snapshot_directory_fsync,
@@ -10490,20 +10244,6 @@ void preserved_trx_set_recovery_complete_for_unit_test(bool complete) {
   g_preserved_trx_recovery_cond.notify_all();
 }
 
-size_t preserved_trx_pending_token_delivery_count_for_unit_test() {
-  return g_pending_token_delivery_count.load(std::memory_order_acquire);
-}
-
-void preserved_trx_register_pending_token_delivery_for_unit_test(
-    THD *thd, const char *token) {
-  preserved_trx_register_pending_token_delivery(
-      thd, token == nullptr ? std::string() : std::string(token));
-}
-
-void preserved_trx_erase_pending_token_delivery_for_unit_test(THD *thd) {
-  preserved_trx_erase_pending_token_delivery(thd);
-}
-
 bool preserve_trx_participant_type_is_supported_for_unit_test(
     int legacy_type, Preserve_snapshot_binlog_state binlog_state) {
   return preserve_trx_participant_type_is_supported(
@@ -10668,29 +10408,6 @@ bool preserved_trx_probe_manager_state_guard_for_unit_test(
 bool preserved_trx_shutdown_requested() {
   return preserve_trx_manager_state_owner_snapshot().state ==
          Preserve_trx_manager_state::SHUTDOWN_REQUESTED;
-}
-
-void preserved_trx_note_statement_response(THD *thd) {
-  if (!preserve_trx_is_enabled()) return;
-  note_pending_token_delivery_statement_response(thd);
-}
-
-bool preserved_trx_defer_shutdown_signal() {
-  if (!preserved_trx_shutdown_requested()) return false;
-  if (g_pending_token_delivery_count.load(std::memory_order_acquire) == 0)
-    return false;
-
-  std::lock_guard<std::mutex> lock(g_token_delivery_mutex);
-  if (g_pending_token_delivery.empty()) return false;
-
-  g_deferred_shutdown_signal_requested.store(true);
-  return true;
-}
-
-static void preserved_trx_resume_deferred_shutdown_signal() {
-  if (g_deferred_shutdown_signal_requested.exchange(false)) {
-    kill_mysql();
-  }
 }
 
 static bool preserve_trx_wait_target_timed_out(THD *thd,
@@ -10934,6 +10651,15 @@ Preserve_trx_command_block_result preserved_trx_command_block_result(
       !preserved_trx_has_non_observable_records()) {
     preserved_trx_clear_cleanup_failed_if_no_records();
     return Preserve_trx_command_block_result::ALLOW;
+  }
+
+  if (preserve_trx_closing_command_gate_active(state) &&
+      preserve_trx_batch_state(thd) == Preserve_trx_batch_thd_state::NONE &&
+      preserve_trx_thd_has_batch_inflight_statement(thd) &&
+      thd->preserve_trx_command_packet_before_closing.load(
+          std::memory_order_acquire)) {
+    /* Wait until the initial target scan classifies this accepted command. */
+    std::lock_guard<std::mutex> lock(g_closing_target_classification_mutex);
   }
 
   if (preserve_trx_batch_state(thd) ==
@@ -12416,56 +12142,6 @@ static void delete_detached_mdl_context(const std::string &token) {
       preserve_mdl_key_data(token), token.length());
 }
 
-static void rollback_pending_token_delivery_record(const std::string &token) {
-  Preserved_trx_record record;
-  if (!preserved_trx_take_record(token, &record)) return;
-
-  auto store = create_preserved_trx_default_store(preserve_trx_default_dir());
-  if (store->mark_consume_state(
-          token, Preserve_snapshot_consume_state::CONSUME_PENDING,
-          "token delivery rollback pending") != Preserve_snapshot_status::OK) {
-    const char marker_error[] =
-        "failed to publish token delivery rollback consume state";
-    (void)preserved_trx_add_record_with_error(record, marker_error);
-    log_redacted_token_delivery_cleanup_failure(token, marker_error);
-    return;
-  }
-
-  dberr_t rollback_status = DB_SUCCESS;
-  DBUG_EXECUTE_IF("preserve_trx_fail_token_delivery_rollback",
-                  rollback_status = DB_ERROR;);
-  if (rollback_status == DB_SUCCESS)
-    rollback_status = trx_preserve_rollback_claimed(record.trx);
-  if (rollback_status != DB_SUCCESS) {
-    const char rollback_error[] = "failed to rollback durable transaction";
-    if (preserved_trx_add_record_with_error(record, rollback_error)) {
-      log_redacted_token_delivery_cleanup_failure(
-          token, "failed to restore record after rollback failure");
-    }
-    log_redacted_token_delivery_cleanup_failure(
-        token,
-        rollback_error);
-    audit_preserved_trx_event(current_thd, token, "rollback", "failure",
-                              rollback_error);
-    return;
-  }
-
-  audit_preserved_trx_event(current_thd, token, "rollback", "failure",
-                            "token delivery failed");
-  if (store->mark_consume_state(
-          token, Preserve_snapshot_consume_state::ROLLED_BACK,
-          "token delivery rollback completed") != Preserve_snapshot_status::OK) {
-    log_redacted_token_delivery_cleanup_failure(
-        token, "failed to publish rolled-back consume state");
-  }
-  delete_detached_mdl_context(token);
-  if (delete_preserved_snapshot_files_and_sidecars_or_log(
-          preserve_trx_default_dir(), token, &record.metadata))
-    log_redacted_token_delivery_cleanup_failure(
-        token,
-        "failed to delete snapshot files after rollback");
-}
-
 static bool cleanup_reset_batch_record_artifacts(
     const Preserve_trx_batch_reset_cleanup &cleanup) {
   if (cleanup.token.empty()) return false;
@@ -13372,62 +13048,6 @@ static bool reactivate_current_batch_prepared_failure_to_original_thd(
   reset_preserve_xid_to_active_transaction_xid(thd);
   reset_preserve_statement_transaction_scope(thd);
   return false;
-}
-
-void preserved_trx_finalize_statement_response(THD *thd) {
-  if (!preserve_trx_is_enabled()) return;
-  if (!preserved_trx_has_pending_token_delivery(thd)) return;
-
-  DEBUG_SYNC(thd, "preserve_trx_finalize_token_delivery");
-
-  /*
-    Single-session PRESERVE returns the token to the client before shutdown.
-    The record becomes resumable only after that OK packet is finalized; if
-    delivery fails, the pending token is rolled back so a hidden preserved
-    transaction is not left behind.
-  */
-  std::string token;
-  bool ok_delivered = false;
-  if (!preserved_trx_begin_pending_token_delivery_finalization(
-          thd, &token, &ok_delivered)) {
-    return;
-  }
-
-  if (ok_delivered) {
-    if (preserved_trx_mark_resumable(token)) {
-      log_redacted_token_delivery_cleanup_failure(
-          token,
-          "failed to mark token delivery complete");
-      rollback_pending_token_delivery_record(token);
-      preserved_trx_erase_pending_token_delivery(thd);
-      preserve_trx_store_manager_state_owner(Preserve_trx_manager_state::IDLE,
-                                             0);
-      preserved_trx_resume_deferred_shutdown_signal();
-      return;
-    }
-    audit_preserved_trx_event(thd, token, "preserve", "success");
-    preserved_trx_erase_pending_token_delivery(thd);
-    g_deferred_shutdown_signal_requested.store(false);
-    kill_mysql();
-    return;
-  }
-
-  rollback_pending_token_delivery_record(token);
-  preserved_trx_erase_pending_token_delivery(thd);
-  preserve_trx_store_manager_state_owner(Preserve_trx_manager_state::IDLE, 0);
-  preserved_trx_resume_deferred_shutdown_signal();
-}
-
-void preserved_trx_release_resources(THD *thd) {
-  DEBUG_SYNC(thd, "preserve_trx_release_resources_before_finalize");
-  DBUG_EXECUTE_IF("preserve_trx_trace_release_resources_pending", {
-    if (preserved_trx_has_pending_token_delivery(thd)) {
-      LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
-             "PRESERVE: release_resources is finalizing pending token "
-             "delivery");
-    }
-  });
-  preserved_trx_finalize_statement_response(thd);
 }
 
 void preserved_trx_begin_external_thd_teardown(THD *thd) {
@@ -15708,20 +15328,17 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   DBUG_TRACE;
 
   /*
-    Kernel preserve owns the correctness path shared by single-transaction
-    preserve and batch drain targets:
+    Kernel preserve owns the correctness path for one batch drain target:
       1. validate SQL/session/engine eligibility and preflight participants;
       2. prepare undo/temp/lock/binlog state until the engine prepare boundary;
       3. detach or claim the prepared trx from the original THD;
       4. write the authenticated snapshot and external blobs;
       5. register the token or return ownership to cleanup/fallback paths.
-    The wrapper decides how the token is delivered to a client or batch manager.
   */
 
   THD *target_thd = request.target_thd;
   const Preserve_trx_options &options = request.options;
   const ulonglong timeout_seconds = request.timeout_seconds;
-  const Preserve_trx_delivery_mode delivery_mode = request.delivery_mode;
   Preserve_trx_preserve_result *result = request.result;
   PreserveBinlogBlobProvider *binlog_blob_provider =
       request.binlog_blob_provider;
@@ -15757,7 +15374,6 @@ bool preserve_trx_kernel_preserve_attached_transaction(
           target->record_register_us += elapsed_us;
           break;
         case Preserve_trx_preserve_stage::VALIDATION:
-        case Preserve_trx_preserve_stage::TOKEN_DELIVERY:
         case Preserve_trx_preserve_stage::COMPLETE:
           break;
       }
@@ -15803,20 +15419,15 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   const std::string preserve_resource_lease_key =
       "preserve-thd-" + std::to_string(thd->thread_id());
 
-  const bool batch_delivery =
-      delivery_mode == Preserve_trx_delivery_mode::BATCH_MANAGER_DELIVERY;
   auto reset_requested = [&]() {
-    return batch_delivery && request.drain_ownership != nullptr &&
+    return request.drain_ownership != nullptr &&
            request.drain_ownership->state() ==
                Preserve_trx_drain_terminal::RESET_REQUESTED;
   };
   auto reject_unsupported_for_delivery = [&](const char *reason = "unsupported") {
     set_failure_reason(reason);
-    if (batch_delivery) {
-      if (thd != nullptr && thd->is_error()) thd->clear_error();
-      return true;
-    }
-    return preserve_trx_reject_unsupported();
+    if (thd->is_error()) thd->clear_error();
+    return true;
   };
 
   if (reset_requested())
@@ -15826,13 +15437,11 @@ bool preserve_trx_kernel_preserve_attached_transaction(
     return reject_unsupported_for_delivery("timeout_zero");
 
   const Preserve_trx_transfer_artifact_decision artifact_decision =
-      preserve_trx_transfer_artifact_decision_for_request(delivery_mode);
+      preserve_trx_transfer_artifact_decision();
   if (artifact_decision ==
       Preserve_trx_transfer_artifact_decision::UNSUPPORTED) {
     return reject_unsupported_for_delivery(
-        delivery_mode == Preserve_trx_delivery_mode::BATCH_MANAGER_DELIVERY
-            ? "standby_transfer_publish_unsupported"
-            : "standby_transfer_requires_batch_drain");
+        "standby_transfer_publish_unsupported");
   }
 
   if (!preserved_trx_binlog_format_is_supported(
@@ -15947,14 +15556,14 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   */
   if (lock_warmcopy_route.action ==
       Preserve_trx_lock_warmcopy_route_action::REJECT) {
-    if (batch_delivery && lock_warmcopy_options.enabled) {
+    if (lock_warmcopy_options.enabled) {
       preserve_trx_lock_warmcopy_note_route_reject(
           lock_warmcopy_route.reason);
     }
     return reject_after_binlog_export(
         preserve_trx_lock_warmcopy_reason_name(lock_warmcopy_route.reason));
   }
-  if (batch_delivery && lock_warmcopy_options.enabled &&
+  if (lock_warmcopy_options.enabled &&
       lock_warmcopy_route.action ==
           Preserve_trx_lock_warmcopy_route_action::FALLBACK_TO_LIVE_EXPORT) {
     preserve_trx_lock_warmcopy_note_route_fallback(lock_warmcopy_route.reason);
@@ -15976,58 +15585,13 @@ bool preserve_trx_kernel_preserve_attached_transaction(
                             lock_preflight_read_view_us,
                         substep_started_us);
 
-  Preserve_lock_limits lock_limits;
-  lock_limits.max_lock_count = preserve_trx_max_lock_count;
-  lock_limits.max_modified_tables = preserve_trx_max_modified_tables;
-  lock_limits.max_scan_pages = preserve_trx_max_scan_pages;
-  lock_limits.materialize_timeout_ms = preserve_trx_materialize_timeout_ms;
   /*
     Batch drain preserves the native redo-backed transaction identity. Local
     startup rebuilds the same trx_id in rw_trx_set from Undo, while strict
     promotion must prove the equivalent physical continuity before adopt.
     Record DB_TRX_ID plus that active trx_t already represents implicit lock
     ownership, so batch artifacts serialize only explicit lock_sys state.
-
-    Keep the legacy client-token path unchanged until it is migrated to the
-    same authenticated resurrection contract.
   */
-  const bool use_native_implicit_lock_continuity = batch_delivery;
-  bool materialized_any_implicit_lock = false;
-  auto materialize_implicit_locks_for_live_export = [&]() -> const char * {
-    materialized_any_implicit_lock = false;
-    /*
-      The legacy client-token export has not migrated to the authenticated
-      resurrection contract, so it converts implicit record locks before
-      serializing lock_sys state. Batch drain/transfer must not call this
-      fallback: page/Undo trx_id plus active trx_t membership carries native
-      implicit-lock ownership across startup or a future physical promotion.
-
-      If legacy conversion fails after materializing some locks, the
-      transaction stays attached and remains valid with equivalent or stronger
-      InnoDB lock coverage.
-    */
-    if (trx_preserve_materialize_implicit_locks(
-            thd, lock_limits, &materialized_any_implicit_lock) ==
-        DB_SUCCESS) {
-      return nullptr;
-    }
-    if (materialized_any_implicit_lock) {
-      push_warning(
-          thd, Sql_condition::SL_WARNING, ER_PRESERVE_TRX_UNSUPPORTED,
-          "PRESERVE materialized implicit record locks before rejecting the "
-          "transaction; the transaction remains active with equivalent or "
-          "stronger InnoDB record locks");
-    }
-    return "implicit_lock_materialize_failed";
-  };
-  if (!use_lock_warmcopy_artifact &&
-      !use_native_implicit_lock_continuity) {
-    const char *materialize_failure =
-        materialize_implicit_locks_for_live_export();
-    if (materialize_failure != nullptr) {
-      return reject_after_binlog_export(materialize_failure);
-    }
-  }
 
   DEBUG_SYNC(thd, "preserve_trx_after_lock_materialization");
   DBUG_EXECUTE_IF("preserve_trx_fail_after_lock_materialization",
@@ -16087,13 +15651,6 @@ bool preserve_trx_kernel_preserve_attached_transaction(
                 Preserve_trx_lock_warmcopy_reason::
                     CANONICAL_EQUIVALENCE_FAILED));
       }
-      if (!use_native_implicit_lock_continuity) {
-        const char *materialize_failure =
-            materialize_implicit_locks_for_live_export();
-        if (materialize_failure != nullptr) {
-          return reject_after_binlog_export(materialize_failure);
-        }
-      }
       preserve_trx_lock_warmcopy_note_route_fallback(
           Preserve_trx_lock_warmcopy_reason::CANONICAL_EQUIVALENCE_FAILED);
       use_lock_warmcopy_artifact = false;
@@ -16109,7 +15666,7 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   std::vector<Preserve_modified_table_name> modified_tables;
   substep_started_us = preserve_trx_monotonic_us();
   if (trx_preserve_export_modified_table_names(
-          thd, &modified_tables, lock_limits.max_modified_tables) !=
+          thd, &modified_tables, preserve_trx_max_modified_tables) !=
           DB_SUCCESS ||
       preserve_trx_populate_modified_table_write_masks(thd,
                                                        &modified_tables)) {
@@ -16155,7 +15712,7 @@ bool preserve_trx_kernel_preserve_attached_transaction(
     record_locks_preflight_payload.clear();
     record_locks_preflight_count = 0;
     if (trx_preserve_export_record_locks(thd, &record_locks_preflight_payload,
-                                         lock_limits.max_lock_count) !=
+                                         preserve_trx_max_lock_count) !=
         DB_SUCCESS) {
       const char *reason = preserve_trx_record_lock_export_failure_reason(
           "record_lock_preflight_failed");
@@ -16185,7 +15742,7 @@ bool preserve_trx_kernel_preserve_attached_transaction(
     });
     table_locks_preflight_payload.clear();
     if (trx_preserve_export_table_locks(thd, &table_locks_preflight_payload,
-                                        lock_limits.max_lock_count,
+                                        preserve_trx_max_lock_count,
                                         record_locks_preflight_count) !=
         DB_SUCCESS) {
       return "table_lock_preflight_failed";
@@ -16209,12 +15766,6 @@ bool preserve_trx_kernel_preserve_attached_transaction(
       source instead of mixing warmcopy record state with live table or MDL
       state.
     */
-    if (!use_native_implicit_lock_continuity) {
-      const char *materialize_failure =
-          materialize_implicit_locks_for_live_export();
-      if (materialize_failure != nullptr) return materialize_failure;
-    }
-
     const char *mdl_failure = export_live_mdl_descriptors();
     if (mdl_failure != nullptr) return mdl_failure;
 
@@ -16311,7 +15862,7 @@ bool preserve_trx_kernel_preserve_attached_transaction(
 
   if (use_lock_warmcopy_artifact) {
     if (lock_warmcopy_artifact->record_predicate_table_lock_count >
-        lock_limits.max_lock_count) {
+        preserve_trx_max_lock_count) {
       preserve_trx_lock_warmcopy_note_route_reject(
           Preserve_trx_lock_warmcopy_reason::RESOURCE_LIMIT_EXCEEDED);
       return reject_after_binlog_export(
@@ -16391,133 +15942,47 @@ bool preserve_trx_kernel_preserve_attached_transaction(
     return false;
   };
 
-  /*
-    From this point on, preserve failure handling depends on whether the
-    transaction has crossed prepare/detach durability boundaries. The cleanup
-    lambdas below keep single-session and batch delivery paths explicit so a
-    failure cannot accidentally leave both an active THD and a preserved token.
-  */
-  auto mark_single_detached_cleanup_failure =
-      [&](const char *reason,
-          const Preserve_snapshot_metadata *observable_metadata = nullptr) {
-        const std::string message =
-            redacted_preserved_trx_log_subject(token) +
-            " single preserve cleanup failed after detach: " +
-            (reason == nullptr ? "cleanup failure" : reason) +
-            "; killing session";
-        LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG, message.c_str());
-        if (result != nullptr) result->cleanup_failed_after_reattach = true;
-
-        if (observable_metadata != nullptr) {
-          preserved_trx_add_failed_observable_record(
-              *observable_metadata,
-              reason == nullptr ? "single preserve detached cleanup failure"
-                                : reason);
-        } else {
-          Preserve_snapshot_metadata failure_metadata =
-              make_no_cache_metadata(thd, token, binlog_state);
-          preserved_trx_add_failed_observable_record(
-              failure_metadata,
-              reason == nullptr ? "single preserve detached cleanup failure"
-                                : reason);
-        }
-        thd->killed = THD::KILL_CONNECTION;
-      };
-
-  auto reject_single_after_attached_cleanup =
-      [&](bool reactivate_engine, const char *reason) {
-        set_failure_reason(reason);
-        bool cleanup_failed = false;
-        if (reactivate_engine &&
-            trx_preserve_reactivate_prepare_failure_in_original_thd(thd) !=
-                DB_SUCCESS) {
-          cleanup_failed = true;
-        }
-        if (!cleanup_failed) {
-          reset_preserve_xid_to_active_transaction_xid(thd);
-          thd->get_transaction()->reset_unsafe_rollback_flags(
-              Transaction_ctx::STMT);
-          thd->get_transaction()->reset_scope(Transaction_ctx::STMT);
-        }
-        if (!cleanup_failed && has_logged_binlog_cache &&
-            mysql_binlog_preserve_reactivate_after_prepare_failure(
-                thd, binlog_snapshot)) {
-          cleanup_failed = true;
-        }
-        if (!cleanup_failed && remove_xid_provenance_after_terminal()) {
-          cleanup_failed = true;
-        }
-        if (cleanup_failed) {
-          LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
-                 "PRESERVE: failed to restore single-session transaction "
-                 "after preserve failure; killing session");
-          if (result != nullptr) {
-            result->cleanup_failed_after_reattach = true;
-          }
-          thd->killed = THD::KILL_CONNECTION;
-          return true;
-        }
-        if (thd->killed) return true;
-        return thd->is_error() ? true : preserve_trx_reject_unsupported();
-      };
-
   auto restore_batch_prepare_failure_or_rollback = [&]() {
-    if (batch_delivery) {
-      if (reactivate_current_batch_prepared_failure_to_original_thd(thd)) {
-        if (result != nullptr) {
-          result->cleanup_failed_after_reattach = true;
-        }
-        return reject_unsupported_for_delivery();
-      }
-      if (has_logged_binlog_cache) {
-        if (mysql_binlog_preserve_reactivate_after_prepare_failure(
-                thd, binlog_snapshot)) {
-          if (result != nullptr) {
-            result->reattached_to_original_thd = true;
-            result->cleanup_failed_after_reattach = true;
-          }
-          return reject_unsupported_for_delivery();
-        }
-      }
-      if (remove_xid_provenance_after_terminal()) {
-        if (result != nullptr) result->cleanup_failed_after_reattach = true;
-        return reject_unsupported_for_delivery();
-      }
+    if (reactivate_current_batch_prepared_failure_to_original_thd(thd)) {
+      if (result != nullptr) result->cleanup_failed_after_reattach = true;
+      return reject_unsupported_for_delivery();
+    }
+    if (has_logged_binlog_cache &&
+        mysql_binlog_preserve_reactivate_after_prepare_failure(
+            thd, binlog_snapshot)) {
       if (result != nullptr) {
         result->reattached_to_original_thd = true;
+        result->cleanup_failed_after_reattach = true;
       }
       return reject_unsupported_for_delivery();
     }
-    return reject_single_after_attached_cleanup(
-        true, "single_prepare_failure_cleanup");
+    if (remove_xid_provenance_after_terminal()) {
+      if (result != nullptr) result->cleanup_failed_after_reattach = true;
+      return reject_unsupported_for_delivery();
+    }
+    if (result != nullptr) result->reattached_to_original_thd = true;
+    return reject_unsupported_for_delivery();
   };
   auto restore_unprepared_batch_prepare_failure_or_rollback = [&]() {
-    if (batch_delivery) {
-      reset_preserve_xid_to_active_transaction_xid(thd);
-      thd->get_transaction()->reset_unsafe_rollback_flags(
-          Transaction_ctx::STMT);
-      thd->get_transaction()->reset_scope(Transaction_ctx::STMT);
-      if (has_logged_binlog_cache) {
-        if (mysql_binlog_preserve_reactivate_after_prepare_failure(
-                thd, binlog_snapshot)) {
-          if (result != nullptr) {
-            result->reattached_to_original_thd = true;
-            result->cleanup_failed_after_reattach = true;
-          }
-          return reject_unsupported_for_delivery();
-        }
-      }
-      if (remove_xid_provenance_after_terminal()) {
-        if (result != nullptr) result->cleanup_failed_after_reattach = true;
-        return reject_unsupported_for_delivery();
-      }
+    reset_preserve_xid_to_active_transaction_xid(thd);
+    thd->get_transaction()->reset_unsafe_rollback_flags(
+        Transaction_ctx::STMT);
+    thd->get_transaction()->reset_scope(Transaction_ctx::STMT);
+    if (has_logged_binlog_cache &&
+        mysql_binlog_preserve_reactivate_after_prepare_failure(
+            thd, binlog_snapshot)) {
       if (result != nullptr) {
         result->reattached_to_original_thd = true;
+        result->cleanup_failed_after_reattach = true;
       }
       return reject_unsupported_for_delivery();
     }
-    return reject_single_after_attached_cleanup(
-        false, "single_unprepared_failure_cleanup");
+    if (remove_xid_provenance_after_terminal()) {
+      if (result != nullptr) result->cleanup_failed_after_reattach = true;
+      return reject_unsupported_for_delivery();
+    }
+    if (result != nullptr) result->reattached_to_original_thd = true;
+    return reject_unsupported_for_delivery();
   };
 
   set_stage(Preserve_trx_preserve_stage::UNDO_PREPARE);
@@ -16554,15 +16019,9 @@ bool preserve_trx_kernel_preserve_attached_transaction(
       [&]() -> const char * {
     /*
       Final-fence fallback still happens before engine prepare. It must
-      release the conversion freeze, materialize implicit locks for live export
-      and rebuild all lock payloads before prepare observes the final state.
+      release the conversion freeze and rebuild all lock payloads before
+      prepare observes the final state.
     */
-    if (!use_native_implicit_lock_continuity) {
-      const char *materialize_failure =
-          materialize_implicit_locks_for_live_export();
-      if (materialize_failure != nullptr) return materialize_failure;
-    }
-
     const char *mdl_failure = export_live_mdl_descriptors();
     if (mdl_failure != nullptr) return mdl_failure;
 
@@ -16754,39 +16213,32 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   }
   if (result != nullptr) result->durable_point_crossed = true;
   auto restore_prepared_batch_or_rollback = [&]() {
-    if (batch_delivery) {
-      trx_preserve_thd_transition_failure reactivate_failure =
-          trx_preserve_thd_transition_failure::NONE;
-      if (reactivate_current_batch_prepared_failure_to_original_thd(
-              thd, &reactivate_failure)) {
-        if (result != nullptr) {
-          result->cleanup_failed_after_reattach = true;
-          result->reactivate_failure_reason =
-              trx_preserve_thd_transition_failure_name(reactivate_failure);
-        }
-        return reject_unsupported_for_delivery();
-      }
-      if (has_logged_binlog_cache) {
-        if (mysql_binlog_preserve_reactivate_after_prepare_failure(
-                thd, binlog_snapshot)) {
-          if (result != nullptr) {
-            result->reattached_to_original_thd = true;
-            result->cleanup_failed_after_reattach = true;
-          }
-          return reject_unsupported_for_delivery();
-        }
-      }
-      if (remove_xid_provenance_after_terminal()) {
-        if (result != nullptr) result->cleanup_failed_after_reattach = true;
-        return reject_unsupported_for_delivery();
-      }
+    trx_preserve_thd_transition_failure reactivate_failure =
+        trx_preserve_thd_transition_failure::NONE;
+    if (reactivate_current_batch_prepared_failure_to_original_thd(
+            thd, &reactivate_failure)) {
       if (result != nullptr) {
-        result->reattached_to_original_thd = true;
+        result->cleanup_failed_after_reattach = true;
+        result->reactivate_failure_reason =
+            trx_preserve_thd_transition_failure_name(reactivate_failure);
       }
       return reject_unsupported_for_delivery();
     }
-    return reject_single_after_attached_cleanup(
-        true, "single_prepared_failure_cleanup");
+    if (has_logged_binlog_cache &&
+        mysql_binlog_preserve_reactivate_after_prepare_failure(
+            thd, binlog_snapshot)) {
+      if (result != nullptr) {
+        result->reattached_to_original_thd = true;
+        result->cleanup_failed_after_reattach = true;
+      }
+      return reject_unsupported_for_delivery();
+    }
+    if (remove_xid_provenance_after_terminal()) {
+      if (result != nullptr) result->cleanup_failed_after_reattach = true;
+      return reject_unsupported_for_delivery();
+    }
+    if (result != nullptr) result->reattached_to_original_thd = true;
+    return reject_unsupported_for_delivery();
   };
   DEBUG_SYNC(thd, "preserve_trx_after_undo_prepared_before_kill_check");
   if (thd->killed == THD::KILL_QUERY) {
@@ -16801,9 +16253,7 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   });
   if (thd->killed == THD::KILL_CONNECTION) {
     thaw_lock_warmcopy_conversion();
-    if (batch_delivery) return restore_prepared_batch_or_rollback();
-    return reject_single_after_attached_cleanup(
-        true, "single_kill_connection_after_prepare_cleanup");
+    return restore_prepared_batch_or_rollback();
   }
   if (thd->killed == THD::KILL_QUERY) thd->killed = THD::NOT_KILLED;
   if (reset_requested()) {
@@ -16843,39 +16293,24 @@ bool preserve_trx_kernel_preserve_attached_transaction(
       });
 
   auto rollback_claimed_after_detach_failure = [&]() {
-    bool inject_rollback_failure = false;
-    DBUG_EXECUTE_IF("preserve_trx_fail_single_detached_rollback",
-                    inject_rollback_failure = true;);
-    const dberr_t rollback_status =
-        inject_rollback_failure ? DB_ERROR : trx_preserve_rollback_claimed(trx);
+    const dberr_t rollback_status = trx_preserve_rollback_claimed(trx);
     const bool provenance_cleanup_failed =
         rollback_status == DB_SUCCESS &&
         remove_xid_provenance_after_terminal();
     reset_thd_after_preserve_detach(thd);
     cleanup_original_binlog_cache_after_detach(thd, has_logged_binlog_cache);
-    if (result != nullptr && batch_delivery) {
+    if (result != nullptr) {
       result->cleanup_completed_after_detach_failure =
           rollback_status == DB_SUCCESS && !provenance_cleanup_failed;
       result->cleanup_failed_after_reattach =
           rollback_status != DB_SUCCESS || provenance_cleanup_failed;
-    }
-    if (!batch_delivery && rollback_status != DB_SUCCESS) {
-      mark_single_detached_cleanup_failure(
-          "single preserve detached rollback failure");
-      return true;
-    }
-    if (provenance_cleanup_failed && !batch_delivery) {
-      mark_single_detached_cleanup_failure(
-          "single preserve XID provenance cleanup failure");
-      return true;
     }
     return reject_unsupported_for_delivery();
   };
 
   auto batch_reattached_after_detach_failure = [&]() {
     bool cleanup_failed = false;
-    if (!batch_delivery ||
-        reattach_current_batch_preserve_failure_to_original_thd(
+    if (reattach_current_batch_preserve_failure_to_original_thd(
             thd, trx, token, false, false, &cleanup_failed, nullptr, nullptr,
             has_logged_binlog_cache, &binlog_snapshot))
       return false;
@@ -16912,13 +16347,7 @@ bool preserve_trx_kernel_preserve_attached_transaction(
         remove_xid_provenance_after_terminal();
     reset_thd_after_preserve_detach(thd);
     cleanup_original_binlog_cache_after_detach(thd, has_logged_binlog_cache);
-    if (!batch_delivery &&
-        (rollback_status != DB_SUCCESS || provenance_cleanup_failed)) {
-      mark_single_detached_cleanup_failure(
-          "single preserve detached claim rollback failure");
-      return true;
-    }
-    if (result != nullptr && batch_delivery) {
+    if (result != nullptr) {
       result->cleanup_completed_after_detach_failure =
           rollback_status == DB_SUCCESS && !provenance_cleanup_failed;
       result->cleanup_failed_after_reattach =
@@ -16992,7 +16421,7 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   if (use_lock_warmcopy_artifact) {
     std::string prepared_table_locks_payload;
     if (trx_preserve_export_table_locks(
-            trx, &prepared_table_locks_payload, lock_limits.max_lock_count,
+            trx, &prepared_table_locks_payload, preserve_trx_max_lock_count,
             record_locks_count) != DB_SUCCESS) {
       thaw_lock_warmcopy_conversion();
       return reject_after_detach_failure_or_rollback();
@@ -17028,7 +16457,7 @@ bool preserve_trx_kernel_preserve_attached_transaction(
     }
   } else {
     if (trx_preserve_export_table_locks(
-            trx, &metadata.table_locks_payload, lock_limits.max_lock_count,
+            trx, &metadata.table_locks_payload, preserve_trx_max_lock_count,
             record_locks_count) != DB_SUCCESS) {
       thaw_lock_warmcopy_conversion();
       return reject_after_detach_failure_or_rollback();
@@ -17126,8 +16555,7 @@ bool preserve_trx_kernel_preserve_attached_transaction(
             std::move(rollback_record.metadata.binlog_cache_payload);
       }
     }
-    if (batch_delivery &&
-        !reattach_current_batch_preserve_failure_to_original_thd(
+    if (!reattach_current_batch_preserve_failure_to_original_thd(
             thd, trx, token, true, effective_snapshot_files_may_exist,
             &cleanup_failed, &left_preserved, &metadata, has_logged_binlog_cache,
             &rollback_binlog_snapshot, &blob_descriptors)) {
@@ -17143,43 +16571,30 @@ bool preserve_trx_kernel_preserve_attached_transaction(
       }
       return reject_unsupported_for_delivery();
     }
-    if (batch_delivery && cleanup_failed) {
+    if (cleanup_failed) {
       preserved_trx_add_failed_observable_record(
           metadata, "batch cleanup reattach failure");
       if (result != nullptr) result->cleanup_failed_after_reattach = true;
     }
     delete_detached_mdl_context(token);
-    bool inject_rollback_failure = false;
-    DBUG_EXECUTE_IF("preserve_trx_fail_single_detached_rollback",
-                    inject_rollback_failure = true;);
-    const dberr_t rollback_status =
-        inject_rollback_failure ? DB_ERROR : trx_preserve_rollback_claimed(trx);
+    const dberr_t rollback_status = trx_preserve_rollback_claimed(trx);
     if (rollback_status != DB_SUCCESS &&
         trx_preserve_is_active_attached_to_thd(trx, thd)) {
-      if (result != nullptr && batch_delivery) {
+      if (result != nullptr) {
         result->reattached_to_original_thd = true;
         result->cleanup_failed_after_reattach = true;
       }
       preserve_trx_set_batch_state(thd, 0, Preserve_trx_batch_thd_state::NONE);
       return reject_unsupported_for_delivery();
     }
-    if (!batch_delivery && rollback_status != DB_SUCCESS) {
-      reset_thd_after_preserve_detach(thd);
-      cleanup_original_binlog_cache_after_detach(thd, has_logged_binlog_cache);
-      mark_single_detached_cleanup_failure(
-          "single preserve snapshot cleanup rollback failure", &metadata);
-      return true;
-    }
-    if (result != nullptr && batch_delivery) {
+    if (result != nullptr) {
       result->cleanup_completed_after_detach_failure = true;
       result->cleanup_failed_after_reattach =
           result->cleanup_failed_after_reattach ||
           rollback_status != DB_SUCCESS;
     }
-    if (batch_delivery) {
-      preserved_trx_add_failed_observable_record(
-          metadata, "batch cleanup detached transaction fallback");
-    }
+    preserved_trx_add_failed_observable_record(
+        metadata, "batch cleanup detached transaction fallback");
     const bool cleanup_artifacts_may_exist =
         effective_snapshot_files_may_exist ||
         !metadata.temp_table_manifest_payload.empty();
@@ -17196,13 +16611,11 @@ bool preserve_trx_kernel_preserve_attached_transaction(
               token,
               "failed to taint snapshot after snapshot write cleanup failure");
         }
-        if (result != nullptr && batch_delivery)
-          result->cleanup_failed_after_reattach = true;
+        if (result != nullptr) result->cleanup_failed_after_reattach = true;
       }
     } else if (rollback_status == DB_SUCCESS &&
                remove_xid_provenance_after_terminal()) {
-      if (result != nullptr && batch_delivery)
-        result->cleanup_failed_after_reattach = true;
+      if (result != nullptr) result->cleanup_failed_after_reattach = true;
     }
     reset_thd_after_preserve_detach(thd);
     cleanup_original_binlog_cache_after_detach(thd, has_logged_binlog_cache);
@@ -17248,7 +16661,7 @@ bool preserve_trx_kernel_preserve_attached_transaction(
     prebuilt_binlog_blob_finalized = true;
   }
 
-  if (batch_delivery && has_logged_binlog_cache &&
+  if (has_logged_binlog_cache &&
       artifact_decision ==
           Preserve_trx_transfer_artifact_decision::STANDBY_TRANSFER_SAVE &&
       use_prebuilt_binlog_cache && prebuilt_binlog_blob_finalized) {
@@ -17552,23 +16965,19 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   }
 
   set_stage(Preserve_trx_preserve_stage::RECORD_REGISTER);
-  const Preserved_trx_lifecycle_state registered_state =
-      batch_delivery ? Preserved_trx_lifecycle_state::DRAINING
-                     : Preserved_trx_lifecycle_state::SNAPSHOTTING;
   /*
     Registration is the in-memory handoff from a durable snapshot to runtime
     ownership. Batch preserve keeps the record in DRAINING until every target
-    succeeds; single preserve waits for token delivery before marking resumable.
+    succeeds.
   */
-  if (preserved_trx_add_record(metadata, trx, batch_delivery,
-                               registered_state,
+  if (preserved_trx_add_record(metadata, trx, true,
+                               Preserved_trx_lifecycle_state::DRAINING,
                                blob_descriptors)) {
     thaw_lock_warmcopy_conversion();
     discard_prebuilt_binlog_blob_if_needed();
     bool cleanup_failed = false;
     bool left_preserved = false;
-    if (batch_delivery &&
-        !reattach_current_batch_preserve_failure_to_original_thd(
+    if (!reattach_current_batch_preserve_failure_to_original_thd(
             thd, trx, token, true, true, &cleanup_failed, &left_preserved,
             &metadata, has_logged_binlog_cache, &binlog_snapshot,
             &blob_descriptors)) {
@@ -17584,18 +16993,9 @@ bool preserve_trx_kernel_preserve_attached_transaction(
       return reject_unsupported_for_delivery();
     }
     delete_detached_mdl_context(token);
-    bool inject_rollback_failure = false;
-    DBUG_EXECUTE_IF("preserve_trx_fail_single_detached_rollback",
-                    inject_rollback_failure = true;);
-    const dberr_t rollback_status =
-        inject_rollback_failure ? DB_ERROR : trx_preserve_rollback_claimed(trx);
-    if (!batch_delivery && rollback_status != DB_SUCCESS) {
-      reset_thd_after_preserve_detach(thd);
-      cleanup_original_binlog_cache_after_detach(thd, has_logged_binlog_cache);
-      mark_single_detached_cleanup_failure(
-          "single preserve record register cleanup rollback failure", &metadata);
-      return true;
-    }
+    const dberr_t rollback_status = trx_preserve_rollback_claimed(trx);
+    if (result != nullptr && rollback_status != DB_SUCCESS)
+      result->cleanup_failed_after_reattach = true;
     (void)delete_preserved_snapshot_files_and_sidecars_or_log(
         preserve_trx_default_dir(), token, &metadata);
     reset_thd_after_preserve_detach(thd);
@@ -17605,36 +17005,27 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   thaw_lock_warmcopy_conversion();
   snapshotting_state.remove();
 
-  if (batch_delivery) {
-    const bool retain_native_binlog_cache =
-        artifact_decision ==
-            Preserve_trx_transfer_artifact_decision::STANDBY_TRANSFER_SAVE &&
-        has_logged_binlog_cache && source_rollback_image != nullptr;
-    if (retain_native_binlog_cache)
-      source_rollback_image->native_binlog_cache_retained = true;
-    if (result != nullptr) {
-      result->preserved_trx = trx;
-      result->source_rollback_image = std::move(source_rollback_image);
-    }
-    reset_thd_after_preserve_detach(thd);
-    if (!retain_native_binlog_cache)
-      cleanup_original_binlog_cache_after_detach(thd,
-                                                 has_logged_binlog_cache);
-    audit_preserved_trx_event(thd, token, "preserve", "success");
-    set_stage(Preserve_trx_preserve_stage::COMPLETE);
-    return false;
+  const bool retain_native_binlog_cache =
+      artifact_decision ==
+          Preserve_trx_transfer_artifact_decision::STANDBY_TRANSFER_SAVE &&
+      has_logged_binlog_cache && source_rollback_image != nullptr;
+  if (retain_native_binlog_cache)
+    source_rollback_image->native_binlog_cache_retained = true;
+  if (result != nullptr) {
+    result->preserved_trx = trx;
+    result->source_rollback_image = std::move(source_rollback_image);
   }
-
   reset_thd_after_preserve_detach(thd);
-  cleanup_original_binlog_cache_after_detach(thd, has_logged_binlog_cache);
+  if (!retain_native_binlog_cache)
+    cleanup_original_binlog_cache_after_detach(thd, has_logged_binlog_cache);
+  audit_preserved_trx_event(thd, token, "preserve", "success");
   set_stage(Preserve_trx_preserve_stage::COMPLETE);
   return false;
 }
 
 bool preserve_trx_preserve_attached_transaction(
     THD *target_thd, const Preserve_trx_options &options,
-    ulonglong timeout_seconds, Preserve_trx_delivery_mode delivery_mode,
-    Preserve_trx_preserve_result *result,
+    ulonglong timeout_seconds, Preserve_trx_preserve_result *result,
     PreserveBinlogBlobProvider *binlog_blob_provider,
     const Preserve_trx_lock_warmcopy_artifact *lock_warmcopy_artifact,
     bool debug_fail_ha_prepare_low_override,
@@ -17647,32 +17038,12 @@ bool preserve_trx_preserve_attached_transaction(
     bool defer_xid_provenance_bind,
     Preserve_trx_deferred_transfer_candidate *deferred_transfer_candidate,
     const Preserve_trx_drain_ownership_state *drain_ownership) {
-  const bool batch_delivery =
-      delivery_mode == Preserve_trx_delivery_mode::BATCH_MANAGER_DELIVERY;
   if (target_thd == nullptr) {
     return preserve_trx_reject_unsupported();
   }
   if (!preserved_trx_binlog_format_is_supported(
           target_thd->variables.binlog_format)) {
     return preserve_trx_reject_unsupported();
-  }
-  std::unique_ptr<Preserve_trx_manager_state_guard> draining;
-  if (!batch_delivery) {
-    draining = std::make_unique<Preserve_trx_manager_state_guard>(
-        Preserve_trx_manager_state::IDLE,
-        Preserve_trx_manager_state::SOFT_DRAINING, target_thd->thread_id());
-    if (!draining->active()) {
-      return preserve_trx_reject_unsupported();
-    }
-
-    if (preserve_trx_drain_other_active_transactions(target_thd)) {
-      if (target_thd->killed) {
-        target_thd->send_kill_message();
-        return true;
-      }
-      if (target_thd->is_error()) return true;
-      return preserve_trx_reject_unsupported();
-    }
   }
 
   Preserve_trx_preserve_result local_result;
@@ -17684,8 +17055,7 @@ bool preserve_trx_preserve_attached_transaction(
   DBUG_EXECUTE_IF("pfx_temp_prepare",
                   { debug_fail_temp_only_prepare = true; });
   Preserve_trx_kernel_request request{target_thd, options, timeout_seconds,
-                                      delivery_mode, effective_result,
-                                      binlog_blob_provider,
+                                      effective_result, binlog_blob_provider,
                                       debug_fail_ha_prepare_low,
                                       debug_fail_temp_only_prepare,
                                       lock_warmcopy_artifact,
@@ -17696,26 +17066,7 @@ bool preserve_trx_preserve_attached_transaction(
                                       defer_xid_provenance_bind,
                                       deferred_transfer_candidate,
                                       drain_ownership};
-  const bool error = preserve_trx_kernel_preserve_attached_transaction(request);
-  if (error || batch_delivery) return error;
-
-  effective_result->stage = Preserve_trx_preserve_stage::TOKEN_DELIVERY;
-  DEBUG_SYNC(target_thd, "preserve_trx_before_token_delivery");
-  if (target_thd->killed == THD::KILL_CONNECTION) {
-    rollback_pending_token_delivery_record(effective_result->token);
-    return true;
-  }
-  if (target_thd->killed == THD::KILL_QUERY)
-    target_thd->killed = THD::NOT_KILLED;
-
-  preserved_trx_register_pending_token_delivery(target_thd,
-                                                effective_result->token);
-  draining->transition_to(Preserve_trx_manager_state::SHUTDOWN_REQUESTED);
-  draining->dismiss();
-  DEBUG_SYNC(target_thd, "preserve_trx_after_token_delivery_pending");
-  effective_result->stage = Preserve_trx_preserve_stage::COMPLETE;
-  my_ok(target_thd);
-  return false;
+  return preserve_trx_kernel_preserve_attached_transaction(request);
 }
 
 static const char *preserve_trx_preserve_stage_name(
@@ -17735,8 +17086,6 @@ static const char *preserve_trx_preserve_stage_name(
       return "SNAPSHOT_WRITE";
     case Preserve_trx_preserve_stage::RECORD_REGISTER:
       return "RECORD_REGISTER";
-    case Preserve_trx_preserve_stage::TOKEN_DELIVERY:
-      return "TOKEN_DELIVERY";
     case Preserve_trx_preserve_stage::COMPLETE:
       return "COMPLETE";
   }
@@ -17819,39 +17168,6 @@ static void log_preserve_trx_drain_participant_observations(
   }
 }
 
-static bool preserve_trx_execute_prepare_shutdown_preserve(
-    THD *thd, const Preserve_trx_options &options, bool is_regular_command) {
-  DBUG_TRACE;
-
-  if (!preserve_trx_is_enabled()) {
-    my_error(ER_PRESERVE_TRX_DISABLED, MYF(0));
-    return true;
-  }
-
-  if (check_global_access(thd, SHUTDOWN_ACL)) return true;
-
-  if (preserve_trx_is_unsupported_common_context(thd) || !is_regular_command) {
-    return preserve_trx_reject_unsupported();
-  }
-
-  if (!preserve_trx_has_explicit_active_transaction(thd)) {
-    my_error(ER_PRESERVE_TRX_INVALID_STATE, MYF(0));
-    return true;
-  }
-
-  ulonglong timeout_seconds = 0;
-  if (!preserved_trx_resolve_timeout_seconds(
-          options, thd->variables.preserve_trx_default_timeout,
-          thd->variables.preserve_trx_min_timeout,
-          thd->variables.preserve_trx_max_timeout, &timeout_seconds)) {
-    return preserve_trx_reject_unsupported();
-  }
-
-  return preserve_trx_preserve_attached_transaction(
-      thd, options, timeout_seconds,
-      Preserve_trx_delivery_mode::CLIENT_TOKEN_DELIVERY, nullptr);
-}
-
 static bool send_preserve_trx_transfer_drain_result(
     THD *thd, ulonglong generation,
     const std::vector<my_thread_id> &survivor_thread_ids,
@@ -17928,11 +17244,6 @@ static bool send_preserve_trx_transfer_drain_result(
   return thd->is_error();
 }
 
-bool Sql_cmd_prepare_shutdown_preserve_transaction::execute(THD *thd) {
-  return preserve_trx_execute_prepare_shutdown_preserve(thd, m_options,
-                                                       is_regular());
-}
-
 bool Preserve_trx_drain_service::execute(
     THD *thd, const Preserve_trx_drain_request &request) {
   DBUG_TRACE;
@@ -17975,8 +17286,7 @@ bool Preserve_trx_drain_service::execute(
       preserve_trx_warmcopy_enable && opt_bin_log && mysql_bin_log.is_open();
   const bool lock_warmcopy_enabled = preserve_trx_lock_warmcopy_effective();
   const Preserve_trx_transfer_artifact_decision batch_artifact_decision =
-      preserve_trx_transfer_artifact_decision_for_request(
-          Preserve_trx_delivery_mode::BATCH_MANAGER_DELIVERY);
+      preserve_trx_transfer_artifact_decision();
   const bool standby_transfer_streaming_enabled =
       batch_artifact_decision ==
       Preserve_trx_transfer_artifact_decision::STANDBY_TRANSFER_SAVE;
@@ -21872,12 +21182,6 @@ bool preserve_trx_execute_command(THD *thd) {
 
   Preserve_trx_options options = preserve_trx_options_from_lex(thd->lex);
   switch (thd->lex->sql_command) {
-    case SQLCOM_PREPARE_SHUTDOWN_PRESERVE: {
-      const bool is_regular_command =
-          thd->stmt_arena == nullptr || thd->stmt_arena->is_regular();
-      return preserve_trx_execute_prepare_shutdown_preserve(
-          thd, options, is_regular_command);
-    }
     case SQLCOM_DRAIN_TRANSACTIONS_PRESERVE: {
       Preserve_trx_drain_request request{options};
       Preserve_trx_drain_service service;

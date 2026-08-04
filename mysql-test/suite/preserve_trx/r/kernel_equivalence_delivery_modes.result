@@ -26,31 +26,6 @@ INSERT INTO t_kernel_equiv VALUES
 (2,20,REPEAT('b',64)),
 (3,30,REPEAT('c',64));
 RESET MASTER;
-SET @kernel_equiv_var='single';
-START TRANSACTION;
-UPDATE t_kernel_equiv SET v=101, payload=REPEAT('x',64) WHERE id=1;
-SAVEPOINT s_kernel;
-INSERT INTO t_kernel_equiv VALUES(101,1001,REPEAT('s',64));
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300 WITH USER VARS;
-INSERT INTO t_kernel_equiv_observed
-SELECT 'single', BINLOG_STATE, WROTE_TO_CACHE, BINLOG_CACHE_SIZE > 0,
-SESSION_SQL_LOG_BIN, GLOBAL_LOG_BIN, ISOLATION, MOD_TABLES_COUNT,
-SAVEPOINT_COUNT, BINLOG_WARMCOPY_STATE
-FROM performance_schema.preserved_transactions;
-SELECT COUNT(*) AS single_preserved_count
-FROM performance_schema.preserved_transactions;
-single_preserved_count
-1
-RESUME PRESERVED TRANSACTION 'TOKEN';
-SELECT @kernel_equiv_var AS resumed_var;
-resumed_var
-single
-ROLLBACK TO SAVEPOINT s_kernel;
-UPDATE t_kernel_equiv SET v=v+1 WHERE id=1;
-COMMIT;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_enable=OFF;
-SET GLOBAL preserve_trx_single_phase_max_binlog_cache_bytes=1048576;
 SET @kernel_equiv_var='batch_single_phase';
 START TRANSACTION;
 UPDATE t_kernel_equiv SET v=201, payload=REPEAT('y',64) WHERE id=2;
@@ -112,7 +87,6 @@ ORDER BY entry;
 entry	binlog_state	wrote_to_cache	cache_positive	session_sql_log_bin	global_log_bin	isolation_name	mod_tables_count	savepoint_count	warmcopy_state
 batch_single_phase	LOGGED_WITH_CACHE	YES	1	ON	ON	REPEATABLE-READ	1	1	NOT_USED
 batch_two_phase	LOGGED_WITH_CACHE	YES	1	ON	ON	REPEATABLE-READ	1	1	READY
-single	LOGGED_WITH_CACHE	YES	1	ON	ON	REPEATABLE-READ	1	1	NOT_USED
 SELECT COUNT(DISTINCT CONCAT_WS('|', session_sql_log_bin, global_log_bin,
 isolation_name, mod_tables_count,
 savepoint_count))
@@ -124,7 +98,7 @@ SELECT id, v, OCTET_LENGTH(payload) AS payload_len
 FROM t_kernel_equiv
 ORDER BY id;
 id	v	payload_len
-1	102	64
+1	10	64
 2	202	64
 3	302	64
 SELECT COUNT(*) AS preserved_count_after_all_resumes

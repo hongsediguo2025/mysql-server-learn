@@ -594,7 +594,6 @@ class ResumableTrxNfr2BenchmarkTest(unittest.TestCase):
                 min_statements_before_drain_pause=1,
                 preserve_max_binlog_cache_bytes=8 * 1024 * 1024 * 1024,
                 preserve_max_lock_count=200_000_000,
-                preserve_max_scan_pages=200_000_000,
                 preserve_max_modified_tables=2000,
                 preserve_lock_warmcopy_max_journal_bytes=8 * 1024 * 1024 * 1024,
                 preserve_lock_warmcopy_seal_threads=16,
@@ -1346,7 +1345,6 @@ class ResumableTrxNfr2BenchmarkTest(unittest.TestCase):
                 scenario.config.max_transactions_per_worker,
             )
             self.assertGreaterEqual(scenario.config.preserve_max_lock_count, 960)
-            self.assertGreaterEqual(scenario.config.preserve_max_scan_pages, 960)
             self.assertGreaterEqual(scenario.config.preserve_max_modified_tables, 12)
             self.assertEqual(32, scenario.config.preserve_parallel_preserve_threads)
             self.assertEqual("/tmp/nfr2.pid", scenario.config.server_pid_file)

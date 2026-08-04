@@ -21,7 +21,7 @@ die "ownership claim append result must be checked, not discarded\n"
        /\(void\)\s*preserve_trx_temp_table_append_ownership_claims_from_descriptor\s*\(/s;
 
 my $preserve = read_source('sql/preserve_trx.cc');
-die "single preserve detached claim failure must check rollback-by-token result\n"
+die "detached preserve cleanup must check rollback-by-token result\n"
   if $preserve =~
        /\(void\)\s*trx_preserve_rollback_by_token\s*\(\s*token\.c_str\s*\(\s*\)\s*\)/s;
 while ($preserve =~ /store->mark_tainted\s*\(([^;]+?)\)/sg) {

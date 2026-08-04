@@ -7,7 +7,7 @@ v INT
 INSERT INTO tmp_preserve_post_resume_write_rollback VALUES(1, 10);
 START TRANSACTION;
 UPDATE tmp_preserve_post_resume_write_rollback SET v = 11 WHERE id = 1;
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 RESUME PRESERVED TRANSACTION 'TOKEN';
 SELECT * FROM tmp_preserve_post_resume_write_rollback ORDER BY id;
 id	v

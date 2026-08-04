@@ -47,7 +47,6 @@ class lock_preserve_metadata_plan_t;
 struct MYSQL;
 struct lock_preserve_record_lock_metadata_facts_t;
 struct Preserve_trx_prepared_token_key;
-enum class Preserve_trx_delivery_mode;
 
 static constexpr uint16_t kPreserveTrxTransferProtocolVersion = 1;
 static constexpr uint16_t kPreserveTrxTransferLockPlanContractVersion =
@@ -251,10 +250,6 @@ uint64_t preserve_trx_transfer_receiver_record_lock_reserved_residency_bytes_sta
 
 Preserve_trx_transfer_artifact_decision
 preserve_trx_transfer_artifact_decision();
-
-Preserve_trx_transfer_artifact_decision
-preserve_trx_transfer_artifact_decision_for_request(
-    Preserve_trx_delivery_mode delivery_mode);
 
 enum class Preserve_trx_transfer_status {
   OK = 0,

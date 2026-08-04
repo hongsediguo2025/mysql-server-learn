@@ -27,8 +27,9 @@ INSERT INTO t_autoinc_table_lock(v) VALUES(10);
 # AUTO_INCREMENT lock should be held at this point (legacy lock mode).
 
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
---source include/wait_until_disconnected.inc
+--let $preserve_trx_drain_clause= WITH TIMEOUT 300
+--source suite/preserve_trx/include/drain_transaction_from_control.inc
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 
 --exec echo "restart: --preserve-trx-enable=ON --innodb-autoinc-lock-mode=0" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect

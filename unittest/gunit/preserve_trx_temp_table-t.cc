@@ -1530,7 +1530,7 @@ TEST(TempResumeMaterializerContractTest,
   EXPECT_NE(std::string::npos,
             mtr.find("--error ER_PRESERVE_TRX_UNSUPPORTED"));
   EXPECT_NE(std::string::npos,
-            mtr.find("PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300"));
+            mtr.find("drain_transaction_from_control.inc"));
   EXPECT_NE(std::string::npos, mtr.find("get_preserved_token.inc"));
   EXPECT_NE(std::string::npos,
             mtr.find("preserve_temp_fail_after_open_before_link"));

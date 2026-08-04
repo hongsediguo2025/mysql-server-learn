@@ -18,7 +18,7 @@ SAVEPOINT after_before_mdl;
 SELECT * FROM t_savepoint_mdl_o_after ORDER BY id;
 id	v
 1	30
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 SET lock_wait_timeout=1;
 ALTER TABLE t_savepoint_mdl_o_before ADD COLUMN ddl_marker INT;
 ERROR HY000: Lock wait timeout exceeded; try restarting transaction

@@ -6,7 +6,9 @@ use Exporter 'import';
 use File::Spec;
 
 our @EXPORT_OK = qw(
+  preserve_all_files
   preserve_snapshot_bin_files
+  preserve_snapshot_path_for_token
   preserve_snapshot_tokens
   preserve_durable_artifact_files
 );
@@ -36,6 +38,28 @@ sub preserve_snapshot_bin_files {
     push @files, $path if $name =~ /\.bin$/;
   });
   return sort @files;
+}
+
+sub preserve_all_files {
+  my ($preserve_dir) = @_;
+  my @files;
+  _walk_files($preserve_dir, sub {
+    my ($path, $name) = @_;
+    push @files, $path;
+  });
+  return sort @files;
+}
+
+sub preserve_snapshot_path_for_token {
+  my ($preserve_dir, $token) = @_;
+  return undef unless defined $token && length($token) > 0;
+  my @matches = grep {
+    my (undef, undef, $name) = File::Spec->splitpath($_);
+    $name eq "$token.bin";
+  } preserve_snapshot_bin_files($preserve_dir);
+  die "multiple preserved snapshots found for token $token\n"
+    if @matches > 1;
+  return $matches[0];
 }
 
 sub preserve_snapshot_tokens {

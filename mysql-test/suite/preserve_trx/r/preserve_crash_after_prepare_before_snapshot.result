@@ -2,13 +2,13 @@ DROP TABLE IF EXISTS t_preserve_prepare_crash;
 SET GLOBAL preserve_trx_enable=ON;
 CREATE TABLE t_preserve_prepare_crash(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_preserve_prepare_crash VALUES(1,10);
-SET SESSION debug="+d,preserve_trx_crash_after_undo_prepared_before_snapshot";
 START TRANSACTION;
 SELECT * FROM t_preserve_prepare_crash WHERE a=1 FOR UPDATE;
 a	b
 1	10
 UPDATE t_preserve_prepare_crash SET b=11 WHERE a=1;
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+SET SESSION debug="+d,preserve_trx_crash_after_undo_prepared_before_snapshot";
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 ERROR HY000: Lost connection to MySQL server during query
 SELECT COUNT(*) AS remaining_preserved
 FROM performance_schema.preserved_transactions;

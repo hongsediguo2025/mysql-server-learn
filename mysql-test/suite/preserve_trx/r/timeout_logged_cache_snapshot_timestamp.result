@@ -1,5 +1,6 @@
 DROP TABLE IF EXISTS t_timeout_logged_cache_timestamp;
 SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=OFF;
 SET SESSION preserve_trx_min_timeout=1;
 SET SESSION preserve_trx_default_timeout=1;
 SET SESSION preserve_trx_max_timeout=86400;
@@ -8,15 +9,15 @@ a INT PRIMARY KEY,
 b VARCHAR(1024)
 ) ENGINE=InnoDB;
 INSERT INTO t_timeout_logged_cache_timestamp VALUES(1, REPEAT('a', 1024));
-SET SESSION preserve_trx_min_timeout=1;
-SET SESSION preserve_trx_default_timeout=1;
-SET SESSION preserve_trx_max_timeout=86400;
 SET DEBUG_SYNC =
 'preserve_trx_before_binlog_cache_rename SIGNAL before_binlog_cache_rename WAIT_FOR continue_binlog_cache_rename';
 START TRANSACTION;
 UPDATE t_timeout_logged_cache_timestamp
 SET b = REPEAT('b', 1024) WHERE a = 1;
-PREPARE SHUTDOWN PRESERVE TRANSACTION;
+SET SESSION preserve_trx_min_timeout=1;
+SET SESSION preserve_trx_default_timeout=1;
+SET SESSION preserve_trx_max_timeout=86400;
+DRAIN TRANSACTIONS PRESERVE;
 SET DEBUG_SYNC = 'now WAIT_FOR before_binlog_cache_rename TIMEOUT 5';
 SET DEBUG_SYNC = 'now SIGNAL continue_binlog_cache_rename';
 SELECT p.BINLOG_STATE,

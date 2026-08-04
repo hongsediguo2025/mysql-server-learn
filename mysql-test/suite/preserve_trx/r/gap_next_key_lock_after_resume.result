@@ -12,7 +12,7 @@ SELECT * FROM t_gap_next_key_after_resume
 WHERE id > 10 AND id <= 20 FOR UPDATE;
 id	v
 20	20
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 SET SESSION innodb_lock_wait_timeout=1;
 UPDATE t_gap_next_key_after_resume SET v=21 WHERE id=20;
 ERROR HY000: Lock wait timeout exceeded; try restarting transaction

@@ -7,7 +7,7 @@ SELECT * FROM t_resume_delete_after_unlink WHERE a=1 FOR UPDATE;
 a	b
 1	10
 UPDATE t_resume_delete_after_unlink SET b=11 WHERE a=1;
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 SET SESSION debug="+d,preserve_trx_fail_delete_snapshot_after_unlink";
 RESUME PRESERVED TRANSACTION 'TOKEN';
 SET SESSION debug="-d,preserve_trx_fail_delete_snapshot_after_unlink";

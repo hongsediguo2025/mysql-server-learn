@@ -12,7 +12,7 @@ SELECT id, v, CHAR_LENGTH(pad) AS pad_len
 FROM t_recover_record_lock_page_reorg WHERE id=30;
 id	v	pad_len
 30	30001	180
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 SET SESSION debug='+d,do_page_reorganize';
 INSERT INTO t_recover_record_lock_page_reorg VALUES(1000,1000,'trigger');
 SET SESSION debug='-d,do_page_reorganize';
