@@ -1,0 +1,9 @@
+[mysqld.1]
+server-id=1
+log-bin=preserve-trx-transfer-gtid-mismatch-bin
+binlog-format=ROW
+gtid-mode=ON
+enforce-gtid-consistency=ON
+
+[ENV]
+SERVER_MYPORT_1=@mysqld.1.port

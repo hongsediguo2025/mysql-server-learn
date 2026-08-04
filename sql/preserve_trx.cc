@@ -2777,10 +2777,7 @@ static bool preserve_trx_resurrection_metadata_is_strict(
          metadata.temp_table_manifest_payload.empty() &&
          !metadata.has_read_view && metadata.read_view_payload.empty() &&
          metadata.predicate_locks_payload.empty() &&
-         (metadata.binlog_gtid_next.empty() ||
-          metadata.binlog_gtid_next == "AUTOMATIC") &&
-         metadata.binlog_owned_gtid.empty() &&
-         (!metadata.has_binlog_gtid_mode || metadata.binlog_gtid_mode == 0);
+         preserve_snapshot_gtid_state_is_strict_transfer_safe(metadata);
 }
 
 static bool preserve_trx_resurrection_metadata_supports_local_startup_index(
@@ -17363,6 +17360,9 @@ bool preserve_trx_kernel_preserve_attached_transaction(
        request.deferred_transfer_candidate != nullptr) &&
       bundle_input.prebuilt_record_locks_blob == nullptr &&
       !metadata.record_locks_payload.empty();
+  bundle_input.emit_no_cache_binlog_mode_metadata =
+      artifact_decision ==
+      Preserve_trx_transfer_artifact_decision::STANDBY_TRANSFER_SAVE;
   /*
     Lock warmcopy snapshots should not carry large record payloads inline when
     a prebuilt descriptor is unavailable. The bundle builder moves that payload

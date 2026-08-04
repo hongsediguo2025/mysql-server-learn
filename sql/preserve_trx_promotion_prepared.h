@@ -490,6 +490,9 @@ struct Preserve_trx_prepared_token_snapshot {
       Preserve_trx_prepared_token_state::NOT_FOUND};
   bool record_lock_plan_owned{false};
   bool semantic_bundle_owned{false};
+  bool semantic_global_log_bin{false};
+  bool semantic_has_binlog_gtid_mode{false};
+  uint8_t semantic_binlog_gtid_mode{0};
   bool native_binlog_handle_owned{false};
   bool resurrection_entry_owned{false};
   bool targeted_publication_journal_owned{false};

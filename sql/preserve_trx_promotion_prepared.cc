@@ -156,6 +156,17 @@ void Preserve_trx_physical_promotion_pin_lease::release_for_abandon() noexcept {
 
 namespace {
 
+void copy_semantic_binlog_configuration(
+    const Preserved_trx_bundle *bundle,
+    Preserve_trx_prepared_token_snapshot *snapshot) {
+  snapshot->semantic_global_log_bin =
+      bundle != nullptr && bundle->metadata.global_log_bin;
+  snapshot->semantic_has_binlog_gtid_mode =
+      bundle != nullptr && bundle->metadata.has_binlog_gtid_mode;
+  snapshot->semantic_binlog_gtid_mode =
+      bundle == nullptr ? 0 : bundle->metadata.binlog_gtid_mode;
+}
+
 uint64_t prepared_monotonic_us() {
   using clock = std::chrono::steady_clock;
   return static_cast<uint64_t>(
@@ -2477,6 +2488,7 @@ Preserve_trx_prepared_status Preserve_trx_prepared_token_registry::snapshot(
     snapshot->state = entry->state.load(std::memory_order_acquire);
     snapshot->record_lock_plan_owned = false;
     snapshot->semantic_bundle_owned = false;
+    copy_semantic_binlog_configuration(nullptr, snapshot);
     snapshot->native_binlog_handle_owned = false;
     snapshot->resurrection_entry_owned = false;
     snapshot->targeted_publication_journal_owned = false;
@@ -2490,6 +2502,10 @@ Preserve_trx_prepared_status Preserve_trx_prepared_token_registry::snapshot(
   snapshot->state = entry->state.load(std::memory_order_acquire);
   snapshot->record_lock_plan_owned = entry->resources.has_record_lock_plan();
   snapshot->semantic_bundle_owned = entry->resources.has_semantic_bundle();
+  const auto *semantic_bundle = entry->resources.m_impl == nullptr
+                                    ? nullptr
+                                    : entry->resources.m_impl->semantic_bundle.get();
+  copy_semantic_binlog_configuration(semantic_bundle, snapshot);
   snapshot->native_binlog_handle_owned =
       entry->resources.has_native_binlog_handle();
   snapshot->resurrection_entry_owned =
@@ -2533,6 +2549,11 @@ Preserve_trx_prepared_token_registry::find_unique_adopted(
     snapshot->state = Preserve_trx_prepared_token_state::ADOPTED_LOCKED;
     snapshot->record_lock_plan_owned = entry->resources.has_record_lock_plan();
     snapshot->semantic_bundle_owned = entry->resources.has_semantic_bundle();
+    const auto *semantic_bundle =
+        entry->resources.m_impl == nullptr
+            ? nullptr
+            : entry->resources.m_impl->semantic_bundle.get();
+    copy_semantic_binlog_configuration(semantic_bundle, snapshot);
     snapshot->native_binlog_handle_owned =
         entry->resources.has_native_binlog_handle();
     snapshot->resurrection_entry_owned =

@@ -47,6 +47,25 @@
 #include "sql/preserve_trx_temp_table_carrier.h"
 #include "sql/system_variables.h"
 
+bool preserve_snapshot_gtid_state_is_strict_transfer_safe(
+    const Preserve_snapshot_metadata &metadata) {
+  if (!metadata.has_binlog_gtid_mode ||
+      (metadata.binlog_gtid_mode != static_cast<uint8_t>(Gtid_mode::OFF) &&
+       metadata.binlog_gtid_mode != static_cast<uint8_t>(Gtid_mode::ON)) ||
+      !metadata.binlog_owned_gtid.empty()) {
+    return false;
+  }
+  switch (metadata.binlog_state) {
+    case Preserve_snapshot_binlog_state::LOGGED_WITH_CACHE:
+      return metadata.binlog_gtid_next == "AUTOMATIC";
+    case Preserve_snapshot_binlog_state::GLOBAL_OFF_NO_CACHE:
+    case Preserve_snapshot_binlog_state::SESSION_OFF_NO_CACHE:
+    case Preserve_snapshot_binlog_state::LOGGED_EMPTY:
+      return metadata.binlog_gtid_next.empty();
+  }
+  return false;
+}
+
 bool preserve_trx_snapshot_checked_tlv_size(uint64_t current_size,
                                             uint64_t value_size,
                                             uint64_t *encoded_size) {
@@ -742,6 +761,16 @@ std::string binlog_cache_metadata_tlv_value(
     append_le32(&value, snapshot.binlog_trx_compression_type);
     append_le32(&value, snapshot.binlog_trx_compression_level_zstd);
   }
+  return value;
+}
+
+std::string binlog_no_cache_metadata_tlv_value(
+    const Preserve_snapshot_metadata &metadata) {
+  std::string value;
+  append_le16(&value, kBinlogNoCacheMetadataVersion);
+  append_length_prefixed_string(&value, metadata.binlog_gtid_next);
+  append_length_prefixed_string(&value, metadata.binlog_owned_gtid);
+  value.push_back(static_cast<char>(metadata.binlog_gtid_mode));
   return value;
 }
 
@@ -2544,6 +2573,14 @@ Preserve_snapshot_status build_preserved_trx_bundle(
       return Preserve_snapshot_status::INVALID_ARGUMENT;
     }
     built.tlvs = no_cache_tlvs(built.metadata);
+    if (input.emit_no_cache_binlog_mode_metadata) {
+      if (!built.metadata.has_binlog_gtid_mode) {
+        return Preserve_snapshot_status::INVALID_ARGUMENT;
+      }
+      built.tlvs.push_back(
+          {kTlvBinlogNoCacheMetadata,
+           binlog_no_cache_metadata_tlv_value(built.metadata)});
+    }
   }
 
   const Preserve_snapshot_status prebuilt_record_locks_status =

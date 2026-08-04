@@ -1553,6 +1553,24 @@ $bundle =~ /std::vector<Preserve_snapshot_tlv> no_cache_tlvs[\s\S]*?^}/m
 my $no_cache_tlvs = $&;
 die "new no-cache snapshots must not emit GTID restore metadata TLV\n"
   if $no_cache_tlvs =~ /kTlvBinlogNoCacheMetadata/s;
+die "no-cache GTID mode metadata must default off in the bundle builder\n"
+  unless $bundle_header =~
+         /bool\s+emit_no_cache_binlog_mode_metadata\s*\{\s*false\s*\}/s;
+my $bundle_no_cache_mode_flag_uses =
+  () = $bundle =~ /input\.emit_no_cache_binlog_mode_metadata/g;
+die "only the final no-cache builder branch may test the transfer-only GTID mode flag\n"
+  unless $bundle_no_cache_mode_flag_uses == 1 &&
+         $bundle =~
+         /else\s*\{[\s\S]{0,900}built\.tlvs\s*=\s*no_cache_tlvs\s*\([^;]+;[\s\S]{0,240}if\s*\(\s*input\.emit_no_cache_binlog_mode_metadata\s*\)[\s\S]{0,360}kTlvBinlogNoCacheMetadata/s;
+my $source_no_cache_mode_flag_uses =
+  () = $preserve =~ /emit_no_cache_binlog_mode_metadata/g;
+die "source must enable no-cache GTID mode metadata only for standby transfer\n"
+  unless $source_no_cache_mode_flag_uses == 1 &&
+         $preserve =~
+         /emit_no_cache_binlog_mode_metadata\s*=\s*artifact_decision\s*==\s*Preserve_trx_transfer_artifact_decision::STANDBY_TRANSFER_SAVE/s;
+die "GTID strict-transfer gates must not invade the native binlog hot path\n"
+  if $binlog =~ /preserve_snapshot_gtid_state_is_strict_transfer_safe|emit_no_cache_binlog_mode_metadata/s ||
+     $binlog_ostream =~ /preserve_snapshot_gtid_state_is_strict_transfer_safe|emit_no_cache_binlog_mode_metadata/s;
 
 $preserve =~ /if\s*\(trx_preserve_export_read_view[\s\S]*?preserve_trx_reject_unsupported\s*\(\s*\)/m
   or die "preserve flow must reject ReadView export failure before durable point\n";
@@ -3089,6 +3107,55 @@ my $strict_physical_promotion_gate = $&;
 die "strict physical promotion must be bound to current-process prepared facts and boot incarnation\n"
   unless $strict_physical_promotion_gate =~
              /target_boot_incarnation[\s\S]*preserved_trx_strict_prepared_token_registry[\s\S]*registry\.snapshot/s;
+$promotion =~
+  /bool\s+strict_prepared_snapshot_matches_accepted_epoch\s*\([^\{]*\)\s*\{([\s\S]*?)^}/m
+  or die "could not isolate accepted-epoch prepared-token predicate\n";
+die "production accepted-epoch predicate must include the shared GTID configuration gate\n"
+  unless $& =~ /strict_physical_promotion_gtid_config_matches/s;
+my $promotion_preinit_start = index(
+  $promotion,
+  'preserved_trx_prepare_before_trx_sys_init_for_physical_promotion(');
+my $promotion_preinit_classification = $promotion_preinit_start < 0 ? -1 :
+  index($promotion, 'ready_tokens.insert(', $promotion_preinit_start);
+my $promotion_preinit_gtid_gate = $promotion_preinit_classification < 0 ? -1 :
+  index($promotion, 'strict_physical_promotion_gtid_config_matches(',
+        $promotion_preinit_classification);
+my $promotion_preinit_pin = $promotion_preinit_gtid_gate < 0 ? -1 :
+  index($promotion, 'pin_epoch_for_physical_promotion(',
+        $promotion_preinit_gtid_gate);
+my $promotion_preinit_candidate_registration =
+  $promotion_preinit_pin < 0 ? -1 :
+  index($promotion, 'preserved_trx_register_physical_resurrection_candidates(',
+        $promotion_preinit_pin);
+die "physical promotion pre-init GTID gate must follow READY classification and precede pin/candidate registration\n"
+  unless $promotion_preinit_start >= 0 &&
+         $promotion_preinit_classification > $promotion_preinit_start &&
+         $promotion_preinit_gtid_gate > $promotion_preinit_classification &&
+         $promotion_preinit_pin > $promotion_preinit_gtid_gate &&
+         $promotion_preinit_candidate_registration > $promotion_preinit_pin;
+my $promotion_adopt_start =
+  index($promotion, 'adopt_prepared_epoch_for_physical_promotion_impl(');
+my $promotion_adopt_snapshot = $promotion_adopt_start < 0 ? -1 :
+  index($promotion, 'registry.snapshot(', $promotion_adopt_start);
+my $promotion_adopt_accepted_predicate = $promotion_adopt_snapshot < 0 ? -1 :
+  index($promotion, 'strict_prepared_snapshot_matches_accepted_epoch(',
+        $promotion_adopt_snapshot);
+my $promotion_adopt_mark_ready =
+  $promotion_adopt_accepted_predicate < 0 ? -1 :
+  index($promotion, 'registry.mark_ready_for_gate(',
+        $promotion_adopt_accepted_predicate);
+my $promotion_adopt_intent = $promotion_adopt_mark_ready < 0 ? -1 :
+  index($promotion, 'write_strict_promotion_intent(',
+        $promotion_adopt_mark_ready);
+my $promotion_adopt_begin = $promotion_adopt_intent < 0 ? -1 :
+  index($promotion, 'registry.begin_gate_adopt(', $promotion_adopt_intent);
+die "physical promotion post-trx_sys GTID gate must stay in the snapshot loop before ready, intent, and adopt\n"
+  unless $promotion_adopt_start >= 0 &&
+         $promotion_adopt_snapshot > $promotion_adopt_start &&
+         $promotion_adopt_accepted_predicate > $promotion_adopt_snapshot &&
+         $promotion_adopt_mark_ready > $promotion_adopt_accepted_predicate &&
+         $promotion_adopt_intent > $promotion_adopt_mark_ready &&
+         $promotion_adopt_begin > $promotion_adopt_intent;
 $transfer =~
   /Preserve_trx_transfer_strict_eligibility_status\s+preserve_trx_transfer_validate_strict_eligibility\s*\([\s\S]*?^}/m
   or die "could not isolate strict transfer eligibility validation\n";

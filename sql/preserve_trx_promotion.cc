@@ -54,6 +54,7 @@
 #include "sql/preserve_trx_carrier.h"
 #include "sql/preserve_trx_transfer.h"
 #include "sql/preserve_trx_xid.h"
+#include "sql/rpl_gtid.h"
 #include "scope_guard.h"
 #include "storage/innobase/include/trx0preserve.h"
 
@@ -2960,11 +2961,26 @@ bool strict_prepared_snapshot_matches_fence(
          facts.target_boot_incarnation == proof.target_boot_incarnation;
 }
 
+bool strict_physical_promotion_gtid_config_matches(
+    const Preserve_trx_prepared_token_snapshot &snapshot,
+    bool target_log_bin_configured, uint8_t target_gtid_mode) {
+  return snapshot.semantic_bundle_owned &&
+         snapshot.semantic_global_log_bin &&
+         snapshot.semantic_has_binlog_gtid_mode &&
+         snapshot.semantic_binlog_gtid_mode ==
+             static_cast<uint8_t>(Gtid_mode::ON) &&
+         target_log_bin_configured &&
+         target_gtid_mode == static_cast<uint8_t>(Gtid_mode::ON);
+}
+
 bool strict_prepared_snapshot_matches_accepted_epoch(
     const Preserve_trx_prepared_token_snapshot &snapshot,
-    const Preserve_trx_transfer_accepted_epoch &accepted) {
+    const Preserve_trx_transfer_accepted_epoch &accepted,
+    bool target_log_bin_configured, uint8_t target_gtid_mode) {
   const Preserve_trx_final_token_facts &facts = snapshot.facts;
   return strict_prepared_snapshot_is_ready(snapshot) &&
+         strict_physical_promotion_gtid_config_matches(
+             snapshot, target_log_bin_configured, target_gtid_mode) &&
          facts.required_apply_lsn <= accepted.source_fence_lsn &&
          facts.physical_fence_lsn == accepted.source_fence_lsn &&
          facts.epoch_fact_digest == digest_hex(accepted.fact_digest) &&
@@ -3087,6 +3103,9 @@ adopt_prepared_epoch_for_physical_promotion_impl(
 
   const uint64_t digest_compare_started_us = my_micro_time();
   auto &registry = preserved_trx_strict_prepared_token_registry();
+  const bool target_log_bin_configured = opt_bin_log;
+  const uint8_t target_gtid_mode =
+      static_cast<uint8_t>(Gtid_mode::sysvar_mode);
   std::vector<Preserve_trx_prepared_token_snapshot> snapshots;
   snapshots.reserve(request.tokens.size());
   for (const Preserve_trx_prepared_token_key &key : request.tokens) {
@@ -3096,7 +3115,8 @@ adopt_prepared_epoch_for_physical_promotion_impl(
               ? strict_prepared_snapshot_matches_fence(
                     snapshot, request.expected_fence)
               : strict_prepared_snapshot_matches_accepted_epoch(
-                    snapshot, *accepted_epoch))) {
+                    snapshot, *accepted_epoch, target_log_bin_configured,
+                    target_gtid_mode))) {
       return finish(
           Preserve_trx_physical_promotion_gate_status::REGISTRY_NOT_READY,
           "strict prepared-token facts are not promotion ready");
@@ -3686,6 +3706,26 @@ preserved_trx_prepare_before_trx_sys_init_for_physical_promotion(
   }
 
   auto &prepared_registry = preserved_trx_strict_prepared_token_registry();
+  const bool target_log_bin_configured = opt_bin_log;
+  const uint8_t target_gtid_mode =
+      static_cast<uint8_t>(Gtid_mode::sysvar_mode);
+  for (const auto &key : impl->gate_request.tokens) {
+    Preserve_trx_prepared_token_snapshot snapshot;
+    if (prepared_registry.snapshot(key, &snapshot) !=
+            Preserve_trx_prepared_status::OK ||
+        !strict_prepared_snapshot_is_ready(snapshot)) {
+      return fail_closed(
+          Preserve_trx_physical_promotion_gate_status::REGISTRY_NOT_READY);
+    }
+    if (!strict_physical_promotion_gtid_config_matches(
+            snapshot, target_log_bin_configured, target_gtid_mode)) {
+      LogErr(WARNING_LEVEL, ER_LOG_PRINTF_MSG,
+             "PRESERVE: physical promotion fast resume requires source and "
+             "target log_bin=ON and gtid_mode=ON");
+      return fail_closed(
+          Preserve_trx_physical_promotion_gate_status::REGISTRY_NOT_READY);
+    }
+  }
   if (!impl->gate_request.tokens.empty() &&
       prepared_registry.pin_epoch_for_physical_promotion(
           impl->gate_request.tokens, promotion_monotonic_us(),

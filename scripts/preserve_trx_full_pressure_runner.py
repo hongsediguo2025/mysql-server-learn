@@ -514,6 +514,12 @@ def build_mysqld_commands(
     if transfer_enabled:
         source.extend(
             [
+                "--gtid-mode=ON",
+                "--enforce-gtid-consistency=ON",
+            ]
+        )
+        source.extend(
+            [
                 f"--preserve-trx-transfer-runtime-profile={profile.transfer_runtime_profile}",
                 "--preserve-trx-transfer-io-bytes-per-sec="
                 f"{profile.transfer_io_bytes_per_sec_base}",
@@ -530,6 +536,8 @@ def build_mysqld_commands(
         )
         return source, []
     receiver = common + [
+        "--gtid-mode=ON",
+        "--enforce-gtid-consistency=ON",
         f"--preserve-trx-transfer-runtime-profile={profile.transfer_runtime_profile}",
         "--preserve-trx-transfer-io-bytes-per-sec="
         f"{profile.transfer_io_bytes_per_sec_base}",

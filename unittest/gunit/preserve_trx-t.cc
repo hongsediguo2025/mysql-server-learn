@@ -538,6 +538,23 @@ Preserve_trx_prepared_token_resources acquire_prepared_resources(
   return resources;
 }
 
+class Configured_gtid_mode_guard {
+ public:
+  Configured_gtid_mode_guard(bool log_bin, ulong gtid_mode)
+      : m_log_bin(opt_bin_log), m_gtid_mode(Gtid_mode::sysvar_mode) {
+    opt_bin_log = log_bin;
+    Gtid_mode::sysvar_mode = gtid_mode;
+  }
+  ~Configured_gtid_mode_guard() {
+    Gtid_mode::sysvar_mode = m_gtid_mode;
+    opt_bin_log = m_log_bin;
+  }
+
+ private:
+  bool m_log_bin;
+  ulong m_gtid_mode;
+};
+
 Preserve_trx_prepared_token_resources acquire_strict_prepared_resources(
     const Preserve_trx_prepared_token_key &key, uint64_t prepare_lsn) {
   auto resources = acquire_prepared_resources(key);
@@ -555,6 +572,14 @@ Preserve_trx_prepared_token_resources acquire_strict_prepared_resources(
   EXPECT_EQ(Preserve_trx_prepared_status::OK,
             resources.install_resurrection_entry(std::move(entry)));
   return resources;
+}
+
+Preserve_trx_prepared_token_resources
+acquire_strict_prepared_resources_with_binlog_config(
+    const Preserve_trx_prepared_token_key &key, uint64_t prepare_lsn,
+    bool log_bin, ulong gtid_mode) {
+  Configured_gtid_mode_guard configured_gtid_mode(log_bin, gtid_mode);
+  return acquire_strict_prepared_resources(key, prepare_lsn);
 }
 
 bool activation_intent_writer_for_test(
@@ -1394,6 +1419,10 @@ TEST(PreservedTrxPhysicalPromotion,
   ASSERT_EQ(Preserve_trx_prepared_status::OK,
             registry.snapshot(key, &snapshot));
   EXPECT_TRUE(snapshot.semantic_bundle_owned);
+  EXPECT_EQ(opt_bin_log, snapshot.semantic_global_log_bin);
+  EXPECT_TRUE(snapshot.semantic_has_binlog_gtid_mode);
+  EXPECT_EQ(static_cast<uint8_t>(Gtid_mode::sysvar_mode),
+            snapshot.semantic_binlog_gtid_mode);
 
   EXPECT_EQ(Preserve_trx_prepared_status::OK,
             registry.abort_gate_adopt(
@@ -5701,6 +5730,8 @@ TEST(PreservedTrxTransfer, StrictEligibilityRejectsUnsupportedSemantics) {
       PRESERVE_TRX_TRANSFER_STRICT_PARTICIPANTS_AUTHENTICATED;
   Preserve_snapshot_metadata metadata;
   metadata.token = "91";
+  metadata.has_binlog_gtid_mode = true;
+  metadata.binlog_gtid_mode = static_cast<uint8_t>(Gtid_mode::ON);
   Preserve_trx_transfer_object_descriptor resurrection_index;
   resurrection_index.object_id = kPreserveTrxResurrectionIndexObjectId;
   resurrection_index.kind =
@@ -5731,14 +5762,15 @@ TEST(PreservedTrxTransfer, StrictEligibilityRejectsUnsupportedSemantics) {
             preserve_trx_transfer_validate_strict_eligibility(
                 manifest, metadata, false, false, 3));
 
+  metadata.binlog_state =
+      Preserve_snapshot_binlog_state::LOGGED_WITH_CACHE;
   metadata.binlog_gtid_next = "AUTOMATIC";
-  metadata.has_binlog_gtid_mode = true;
-  metadata.binlog_gtid_mode = 0;
   EXPECT_EQ(Preserve_trx_transfer_strict_eligibility_status::OK,
             preserve_trx_transfer_validate_strict_eligibility(
                 manifest, metadata, false, false, 3));
+  metadata.binlog_state =
+      Preserve_snapshot_binlog_state::GLOBAL_OFF_NO_CACHE;
   metadata.binlog_gtid_next.clear();
-  metadata.has_binlog_gtid_mode = false;
 
   manifest.protocol_version = 3;
   EXPECT_EQ(Preserve_trx_transfer_strict_eligibility_status::LEGACY_PROTOCOL,
@@ -5791,6 +5823,55 @@ TEST(PreservedTrxTransfer, StrictEligibilityRejectsUnsupportedSemantics) {
       Preserve_trx_transfer_strict_eligibility_status::PARTICIPANT_NOT_AUTHENTICATED,
       preserve_trx_transfer_validate_strict_eligibility(
           manifest, metadata, false, false, 1));
+}
+
+TEST(PreservedTrxTransfer, StrictGtidStateRequiresExplicitSafeMode) {
+  struct Case {
+    Preserve_snapshot_binlog_state state;
+    bool has_mode;
+    uint8_t mode;
+    const char *gtid_next;
+    const char *owned_gtid;
+    bool expected;
+  };
+  const Case cases[] = {
+      {Preserve_snapshot_binlog_state::LOGGED_WITH_CACHE, true,
+       static_cast<uint8_t>(Gtid_mode::ON), "AUTOMATIC", "", true},
+      {Preserve_snapshot_binlog_state::LOGGED_WITH_CACHE, true,
+       static_cast<uint8_t>(Gtid_mode::OFF), "AUTOMATIC", "", true},
+      {Preserve_snapshot_binlog_state::LOGGED_EMPTY, true,
+       static_cast<uint8_t>(Gtid_mode::ON), "", "", true},
+      {Preserve_snapshot_binlog_state::SESSION_OFF_NO_CACHE, true,
+       static_cast<uint8_t>(Gtid_mode::ON), "", "", true},
+      {Preserve_snapshot_binlog_state::GLOBAL_OFF_NO_CACHE, true,
+       static_cast<uint8_t>(Gtid_mode::OFF), "", "", true},
+      {Preserve_snapshot_binlog_state::SESSION_OFF_NO_CACHE, false, 0, "", "",
+       false},
+      {Preserve_snapshot_binlog_state::SESSION_OFF_NO_CACHE, true,
+       static_cast<uint8_t>(Gtid_mode::OFF_PERMISSIVE), "", "", false},
+      {Preserve_snapshot_binlog_state::SESSION_OFF_NO_CACHE, true,
+       static_cast<uint8_t>(Gtid_mode::ON_PERMISSIVE), "", "", false},
+      {Preserve_snapshot_binlog_state::LOGGED_WITH_CACHE, true,
+       static_cast<uint8_t>(Gtid_mode::ON), "", "", false},
+      {Preserve_snapshot_binlog_state::LOGGED_EMPTY, true,
+       static_cast<uint8_t>(Gtid_mode::ON), "AUTOMATIC", "", false},
+      {Preserve_snapshot_binlog_state::LOGGED_WITH_CACHE, true,
+       static_cast<uint8_t>(Gtid_mode::ON), "AUTOMATIC",
+       "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:41", false},
+      {static_cast<Preserve_snapshot_binlog_state>(255), true,
+       static_cast<uint8_t>(Gtid_mode::ON), "", "", false},
+  };
+
+  for (const auto &item : cases) {
+    Preserve_snapshot_metadata metadata;
+    metadata.binlog_state = item.state;
+    metadata.has_binlog_gtid_mode = item.has_mode;
+    metadata.binlog_gtid_mode = item.mode;
+    metadata.binlog_gtid_next = item.gtid_next;
+    metadata.binlog_owned_gtid = item.owned_gtid;
+    EXPECT_EQ(item.expected,
+              preserve_snapshot_gtid_state_is_strict_transfer_safe(metadata));
+  }
 }
 
 TEST(PreservedTrxResurrectionIndex, RoundTripsProductV1StartupFacts) {
@@ -8124,6 +8205,8 @@ class PreserveSnapshotTest : public ::testing::Test {
     metadata.session_sql_log_bin = false;
     metadata.option_bin_log = false;
     metadata.global_log_bin = false;
+    metadata.has_binlog_gtid_mode = true;
+    metadata.binlog_gtid_mode = static_cast<uint8_t>(Gtid_mode::OFF);
     metadata.mdl_descriptors_payload = empty_mdl_descriptors_payload();
     return metadata;
   }
@@ -8211,6 +8294,22 @@ class PreserveSnapshotTest : public ::testing::Test {
     metadata.option_bin_log = true;
     metadata.global_log_bin = true;
     return metadata;
+  }
+
+  void expect_closed_binlog_receiver_rejection(uint64_t prewarm_before) {
+    ASSERT_FALSE(mysql_bin_log.is_open());
+    for (uint attempt = 0; attempt < 200; ++attempt) {
+      if (preserve_trx_transfer_receiver_seal_prewarm_tokens_status() >
+          prewarm_before) {
+        break;
+      }
+      my_sleep(10000);
+    }
+    EXPECT_GT(preserve_trx_transfer_receiver_seal_prewarm_tokens_status(),
+              prewarm_before);
+    EXPECT_EQ(static_cast<ulonglong>(
+                  Preserve_trx_promotion_adopt_status::UNSUPPORTED_ARTIFACT),
+              preserve_trx_transfer_receiver_seal_prewarm_last_status());
   }
 
   void write_file(const std::string &path, const std::string &contents) {
@@ -10274,6 +10373,7 @@ TEST_F(PreserveSnapshotTest,
 
 TEST_F(PreserveSnapshotTest,
        ProductionEquivalentGateConsumesExactVerifiedTransactions) {
+  Configured_gtid_mode_guard configured_gtid_mode(true, Gtid_mode::ON);
   preserve_trx_set_enable_value(true);
   preserve_trx_resource_manager_reset_for_unit_test();
   preserved_trx_set_strict_physical_adopt_executor_for_unit_test(
@@ -10327,6 +10427,36 @@ TEST_F(PreserveSnapshotTest,
       m_dir, request, 100);
 
   Preserve_trx_physical_promotion_gate_result result;
+  opt_bin_log = false;
+  EXPECT_EQ(Preserve_trx_physical_promotion_gate_status::REGISTRY_NOT_READY,
+            preserved_trx_adopt_prepared_epoch_for_physical_promotion_for_unit_test(
+                m_dir, request, &result, &verified_transactions, &accepted))
+      << result.message;
+  EXPECT_EQ(0U, result.adopted_count);
+  EXPECT_EQ(0U, result.rolled_back_count);
+  EXPECT_EQ(0U, result.tainted_count);
+  EXPECT_EQ(0, g_strict_production_exact_adopt_calls.load());
+
+  opt_bin_log = true;
+  Gtid_mode::sysvar_mode = Gtid_mode::OFF;
+  EXPECT_EQ(Preserve_trx_physical_promotion_gate_status::REGISTRY_NOT_READY,
+            preserved_trx_adopt_prepared_epoch_for_physical_promotion_for_unit_test(
+                m_dir, request, &result, &verified_transactions, &accepted))
+      << result.message;
+  EXPECT_EQ(0U, result.adopted_count);
+  EXPECT_EQ(0U, result.rolled_back_count);
+  EXPECT_EQ(0U, result.tainted_count);
+  EXPECT_EQ(0, g_strict_production_exact_adopt_calls.load());
+  for (const auto &key : request.tokens) {
+    Preserve_trx_prepared_token_snapshot snapshot;
+    ASSERT_EQ(Preserve_trx_prepared_status::OK,
+              registry.snapshot(key, &snapshot));
+    EXPECT_EQ(Preserve_trx_prepared_token_state::READY_FACTS_PENDING_LEASE,
+              snapshot.state);
+    EXPECT_TRUE(snapshot.semantic_bundle_owned);
+  }
+
+  Gtid_mode::sysvar_mode = Gtid_mode::ON;
   EXPECT_EQ(Preserve_trx_physical_promotion_gate_status::OK,
             preserved_trx_adopt_prepared_epoch_for_physical_promotion_for_unit_test(
                 m_dir, request, &result, &verified_transactions, &accepted))
@@ -10352,7 +10482,71 @@ TEST_F(PreserveSnapshotTest,
 }
 
 TEST_F(PreserveSnapshotTest,
+       ProductionEquivalentGateRejectsUnsupportedSourceConfiguration) {
+  Configured_gtid_mode_guard target_config(true, Gtid_mode::ON);
+  preserve_trx_set_enable_value(true);
+  preserve_trx_resource_manager_reset_for_unit_test();
+  auto &registry = preserved_trx_strict_prepared_token_registry();
+
+  struct Case {
+    bool source_log_bin;
+    ulong source_gtid_mode;
+  };
+  const Case cases[] = {{true, Gtid_mode::OFF}, {false, Gtid_mode::ON}};
+  for (size_t index = 0; index < sizeof(cases) / sizeof(cases[0]); ++index) {
+    Preserve_trx_physical_promotion_gate_request request;
+    request.epoch_id = "production-source-config-" + std::to_string(index);
+    request.operation_deadline_us = my_micro_time() + 1000000;
+    request.worker_count = 1;
+    auto key = make_prepared_token_key(71 + index);
+    key.preserve_dir = m_dir;
+    key.epoch_scope = key.target_boot_incarnation;
+    key.epoch_id = request.epoch_id;
+    key.token = std::to_string(701 + index);
+    request.tokens.push_back(key);
+
+    Preserve_trx_prepare_lease prepare;
+    ASSERT_EQ(Preserve_trx_prepared_status::OK,
+              registry.begin_prepare(key, key.generation, &prepare));
+    auto facts = make_final_token_facts(100);
+    facts.target_boot_incarnation = key.target_boot_incarnation;
+    facts.canonical_digest.clear();
+    ASSERT_TRUE(preserved_trx_finalize_token_facts(&facts));
+    ASSERT_EQ(
+        Preserve_trx_prepared_status::OK,
+        registry.publish_ready(
+            &prepare, std::move(facts),
+            acquire_strict_prepared_resources_with_binlog_config(
+                key, 100, cases[index].source_log_bin,
+                cases[index].source_gtid_mode)));
+
+    const auto accepted = make_production_equivalent_accepted_epoch_for_test(
+        m_dir, request, 100);
+    int trx_identity{};
+    std::vector<trx_t *> verified_transactions{
+        reinterpret_cast<trx_t *>(&trx_identity)};
+    Preserve_trx_physical_promotion_gate_result result;
+    EXPECT_EQ(Preserve_trx_physical_promotion_gate_status::REGISTRY_NOT_READY,
+              preserved_trx_adopt_prepared_epoch_for_physical_promotion_for_unit_test(
+                  m_dir, request, &result, &verified_transactions, &accepted))
+        << result.message;
+    EXPECT_EQ(0U, result.adopted_count);
+    EXPECT_EQ(0U, result.rolled_back_count);
+    EXPECT_EQ(0U, result.tainted_count);
+
+    Preserve_trx_prepared_token_snapshot snapshot;
+    ASSERT_EQ(Preserve_trx_prepared_status::OK,
+              registry.snapshot(key, &snapshot));
+    EXPECT_EQ(Preserve_trx_prepared_token_state::READY_FACTS_PENDING_LEASE,
+              snapshot.state);
+    EXPECT_TRUE(snapshot.semantic_bundle_owned);
+    registry.purge_epoch(key.epoch_scope, request.epoch_id);
+  }
+}
+
+TEST_F(PreserveSnapshotTest,
        ProductionEquivalentGateReversesWholeEpochWhenOneTokenFails) {
+  Configured_gtid_mode_guard configured_gtid_mode(true, Gtid_mode::ON);
   preserve_trx_set_enable_value(true);
   preserve_trx_resource_manager_reset_for_unit_test();
   preserved_trx_set_strict_physical_adopt_executor_for_unit_test(
@@ -15251,6 +15445,7 @@ TEST_F(PreserveSnapshotTest,
   Preserved_trx_bundle bundle;
   Preserved_trx_bundle_build_input input;
   input.metadata = meta;
+  input.emit_no_cache_binlog_mode_metadata = true;
   ASSERT_EQ(Preserve_snapshot_status::OK,
             build_preserved_trx_bundle(input, &bundle));
 
@@ -16487,6 +16682,7 @@ TEST_F(PreserveSnapshotTest,
   Preserved_trx_bundle bundle;
   Preserved_trx_bundle_build_input input;
   input.metadata = meta;
+  input.emit_no_cache_binlog_mode_metadata = true;
   ASSERT_EQ(Preserve_snapshot_status::OK,
             build_preserved_trx_bundle(input, &bundle));
 
@@ -16590,6 +16786,7 @@ TEST_F(PreserveSnapshotTest,
   Preserved_trx_bundle bundle;
   Preserved_trx_bundle_build_input input;
   input.metadata = meta;
+  input.emit_no_cache_binlog_mode_metadata = true;
   ASSERT_EQ(Preserve_snapshot_status::OK,
             build_preserved_trx_bundle(input, &bundle));
 
@@ -16701,6 +16898,7 @@ TEST_F(PreserveSnapshotTest,
   Preserved_trx_bundle bundle;
   Preserved_trx_bundle_build_input input;
   input.metadata = meta;
+  input.emit_no_cache_binlog_mode_metadata = true;
   ASSERT_EQ(Preserve_snapshot_status::OK,
             build_preserved_trx_bundle(input, &bundle));
 
@@ -16916,6 +17114,7 @@ TEST_F(PreserveSnapshotTest,
   Preserved_trx_bundle bundle;
   Preserved_trx_bundle_build_input input;
   input.metadata = meta;
+  input.emit_no_cache_binlog_mode_metadata = true;
   ASSERT_EQ(Preserve_snapshot_status::OK,
             build_preserved_trx_bundle(input, &bundle));
 
@@ -17003,6 +17202,7 @@ TEST_F(PreserveSnapshotTest,
   Preserved_trx_bundle bundle;
   Preserved_trx_bundle_build_input input;
   input.metadata = meta;
+  input.emit_no_cache_binlog_mode_metadata = true;
   input.externalize_record_locks_payload = true;
   ASSERT_EQ(Preserve_snapshot_status::OK,
             build_preserved_trx_bundle(input, &bundle));
@@ -17193,6 +17393,7 @@ TEST_F(PreserveSnapshotTest,
   Preserved_trx_bundle bundle;
   Preserved_trx_bundle_build_input input;
   input.metadata = meta;
+  input.emit_no_cache_binlog_mode_metadata = true;
   input.externalize_record_locks_payload = true;
   ASSERT_EQ(Preserve_snapshot_status::OK,
             build_preserved_trx_bundle(input, &bundle));
@@ -17454,6 +17655,7 @@ TEST_F(PreserveSnapshotTest,
   Preserved_trx_bundle bundle;
   Preserved_trx_bundle_build_input input;
   input.metadata = meta;
+  input.emit_no_cache_binlog_mode_metadata = true;
   input.externalize_record_locks_payload = true;
   ASSERT_EQ(Preserve_snapshot_status::OK,
             build_preserved_trx_bundle(input, &bundle));
@@ -17603,6 +17805,7 @@ TEST_F(PreserveSnapshotTest,
   Preserved_trx_bundle bundle;
   Preserved_trx_bundle_build_input input;
   input.metadata = meta;
+  input.emit_no_cache_binlog_mode_metadata = true;
   ASSERT_EQ(Preserve_snapshot_status::OK,
             build_preserved_trx_bundle(input, &bundle));
 
@@ -17738,6 +17941,7 @@ TEST_F(PreserveSnapshotTest,
   Preserved_trx_bundle bundle;
   Preserved_trx_bundle_build_input input;
   input.metadata = meta;
+  input.emit_no_cache_binlog_mode_metadata = true;
   ASSERT_EQ(Preserve_snapshot_status::OK,
             build_preserved_trx_bundle(input, &bundle));
 
@@ -17944,6 +18148,7 @@ TEST_F(PreserveSnapshotTest,
   Preserved_trx_bundle bundle;
   Preserved_trx_bundle_build_input input;
   input.metadata = meta;
+  input.emit_no_cache_binlog_mode_metadata = true;
   ASSERT_EQ(Preserve_snapshot_status::OK,
             build_preserved_trx_bundle(input, &bundle));
 
@@ -18027,6 +18232,7 @@ TEST_F(PreserveSnapshotTest,
     Preserved_trx_bundle bundle;
     Preserved_trx_bundle_build_input input;
     input.metadata = meta;
+    input.emit_no_cache_binlog_mode_metadata = true;
     EXPECT_EQ(Preserve_snapshot_status::OK,
               build_preserved_trx_bundle(input, &bundle));
     return bundle;
@@ -19165,6 +19371,7 @@ TEST_F(PreserveSnapshotTest,
   Preserved_trx_bundle bundle;
   Preserved_trx_bundle_build_input input;
   input.metadata = meta;
+  input.emit_no_cache_binlog_mode_metadata = true;
   ASSERT_EQ(Preserve_snapshot_status::OK,
             build_preserved_trx_bundle(input, &bundle));
 
@@ -19261,6 +19468,7 @@ TEST_F(PreserveSnapshotTest,
   Preserved_trx_bundle bundle;
   Preserved_trx_bundle_build_input input;
   input.metadata = meta;
+  input.emit_no_cache_binlog_mode_metadata = true;
   ASSERT_EQ(Preserve_snapshot_status::OK,
             build_preserved_trx_bundle(input, &bundle));
 
@@ -20419,6 +20627,7 @@ TEST_F(PreserveSnapshotTest,
   Preserved_trx_bundle bundle;
   Preserved_trx_bundle_build_input input;
   input.metadata = meta;
+  input.emit_no_cache_binlog_mode_metadata = true;
   input.logged_binlog_snapshot = &snapshot;
   ASSERT_EQ(Preserve_snapshot_status::OK,
             build_preserved_trx_bundle(input, &bundle));
@@ -20836,6 +21045,8 @@ TEST_F(PreserveSnapshotTest,
   Preserved_trx_store store(&carrier);
   Preserve_trx_transfer_receiver_registry registry;
   Preserve_snapshot_metadata written_metadata;
+  const uint64_t seal_prewarm_before =
+      preserve_trx_transfer_receiver_seal_prewarm_tokens_status();
   for (const std::string &encoded_frame : encoded_frames) {
     ASSERT_EQ(Preserve_trx_transfer_status::OK,
               preserve_trx_transfer_handle_receiver_payload(
@@ -20843,6 +21054,10 @@ TEST_F(PreserveSnapshotTest,
                   &written_metadata));
   }
 
+  if (!mysql_bin_log.is_open()) {
+    expect_closed_binlog_receiver_rejection(seal_prewarm_before);
+    return;
+  }
   ASSERT_TRUE(wait_for_epoch_ready_token(manifest.epoch_id, manifest.token));
   EXPECT_FALSE(preserve_trx_transfer_epoch_committed(m_dir, manifest));
   EXPECT_EQ(Preserve_trx_transfer_status::COMMITTED_NOT_READY,
@@ -21235,6 +21450,7 @@ TEST_F(PreserveSnapshotTest,
   meta.token = test_transfer_token_string(transfer_token);
   Preserved_trx_bundle_build_input input;
   input.metadata = meta;
+  input.emit_no_cache_binlog_mode_metadata = true;
   ASSERT_EQ(Preserve_snapshot_status::OK,
             build_preserved_trx_bundle(input, &bundle));
 
@@ -23582,6 +23798,7 @@ TEST_F(PreserveSnapshotTest, TransferSourceSendsBundleThroughFrameSink) {
   Preserved_trx_bundle bundle;
   Preserved_trx_bundle_build_input input;
   input.metadata = meta;
+  input.emit_no_cache_binlog_mode_metadata = true;
   ASSERT_EQ(Preserve_snapshot_status::OK,
             build_preserved_trx_bundle(input, &bundle));
 
@@ -23658,6 +23875,7 @@ TEST_F(PreserveSnapshotTest,
     Preserved_trx_bundle bundle;
     Preserved_trx_bundle_build_input input;
     input.metadata = meta;
+    input.emit_no_cache_binlog_mode_metadata = true;
     EXPECT_EQ(Preserve_snapshot_status::OK,
               build_preserved_trx_bundle(input, &bundle));
     return bundle;
@@ -23743,6 +23961,7 @@ TEST_F(PreserveSnapshotTest,
     Preserved_trx_bundle bundle;
     Preserved_trx_bundle_build_input input;
     input.metadata = meta;
+    input.emit_no_cache_binlog_mode_metadata = true;
     EXPECT_EQ(Preserve_snapshot_status::OK,
               build_preserved_trx_bundle(input, &bundle));
     return bundle;
@@ -23952,6 +24171,7 @@ TEST_F(PreserveSnapshotTest,
     meta.token = test_transfer_token_string(transfer_token);
     Preserved_trx_bundle_build_input input;
     input.metadata = meta;
+    input.emit_no_cache_binlog_mode_metadata = true;
     ASSERT_EQ(Preserve_snapshot_status::OK,
               build_preserved_trx_bundle(input, bundle));
     ASSERT_EQ(Preserve_trx_transfer_status::OK,
@@ -24041,6 +24261,7 @@ TEST_F(PreserveSnapshotTest,
   Preserved_trx_bundle bundle;
   Preserved_trx_bundle_build_input input;
   input.metadata = meta;
+  input.emit_no_cache_binlog_mode_metadata = true;
   ASSERT_EQ(Preserve_snapshot_status::OK,
             build_preserved_trx_bundle(input, &bundle));
 
@@ -24591,6 +24812,7 @@ TEST_F(PreserveSnapshotTest,
     Preserved_trx_bundle bundle;
     Preserved_trx_bundle_build_input input;
     input.metadata = meta;
+    input.emit_no_cache_binlog_mode_metadata = true;
     ASSERT_EQ(Preserve_snapshot_status::OK,
               build_preserved_trx_bundle(input, &bundle));
     Preserve_trx_transfer_manifest manifest;
@@ -24644,6 +24866,7 @@ TEST_F(PreserveSnapshotTest,
   Preserved_trx_bundle bundle;
   Preserved_trx_bundle_build_input input;
   input.metadata = meta;
+  input.emit_no_cache_binlog_mode_metadata = true;
   ASSERT_EQ(Preserve_snapshot_status::OK,
             build_preserved_trx_bundle(input, &bundle));
 
@@ -24843,10 +25066,16 @@ TEST_F(PreserveSnapshotTest,
   Local_file_preserved_trx_carrier carrier(m_dir);
   Preserved_trx_store store(&carrier);
   Preserve_trx_transfer_receiver_registry registry;
+  const uint64_t seal_prewarm_before =
+      preserve_trx_transfer_receiver_seal_prewarm_tokens_status();
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
             preserve_trx_transfer_handle_receiver_payload_batch(
                 m_dir, source_sink.frames(), &store, &registry, 300, 3));
 
+  if (!mysql_bin_log.is_open()) {
+    expect_closed_binlog_receiver_rejection(seal_prewarm_before);
+    return;
+  }
   ASSERT_TRUE(wait_for_epoch_ready_token(manifest.epoch_id, manifest.token));
   EXPECT_EQ(Preserve_trx_transfer_status::COMMITTED_NOT_READY,
             registry.query_accepted_epoch(m_dir, manifest.epoch_id));
@@ -25576,6 +25805,7 @@ TEST_F(PreserveSnapshotTest, TransferSourceCanDeclareTokenBeforeManifest) {
   Preserved_trx_bundle bundle;
   Preserved_trx_bundle_build_input input;
   input.metadata = meta;
+  input.emit_no_cache_binlog_mode_metadata = true;
   ASSERT_EQ(Preserve_snapshot_status::OK,
             build_preserved_trx_bundle(input, &bundle));
 
@@ -25609,6 +25839,7 @@ TEST_F(PreserveSnapshotTest,
     Preserved_trx_bundle bundle;
     Preserved_trx_bundle_build_input input;
     input.metadata = meta;
+    input.emit_no_cache_binlog_mode_metadata = true;
     EXPECT_EQ(Preserve_snapshot_status::OK,
               build_preserved_trx_bundle(input, &bundle));
     return bundle;
@@ -25668,6 +25899,7 @@ TEST_F(PreserveSnapshotTest,
     Preserved_trx_bundle bundle;
     Preserved_trx_bundle_build_input input;
     input.metadata = meta;
+    input.emit_no_cache_binlog_mode_metadata = true;
     EXPECT_EQ(Preserve_snapshot_status::OK,
               build_preserved_trx_bundle(input, &bundle));
     return bundle;
@@ -25758,6 +25990,7 @@ TEST_F(PreserveSnapshotTest,
     Preserved_trx_bundle bundle;
     Preserved_trx_bundle_build_input input;
     input.metadata = meta;
+    input.emit_no_cache_binlog_mode_metadata = true;
     EXPECT_EQ(Preserve_snapshot_status::OK,
               build_preserved_trx_bundle(input, &bundle));
     return bundle;
@@ -25847,6 +26080,7 @@ TEST_F(PreserveSnapshotTest,
   Preserved_trx_bundle bundle;
   Preserved_trx_bundle_build_input input;
   input.metadata = meta;
+  input.emit_no_cache_binlog_mode_metadata = true;
   ASSERT_EQ(Preserve_snapshot_status::OK,
             build_preserved_trx_bundle(input, &bundle));
 
@@ -26308,6 +26542,7 @@ TEST_F(PreserveSnapshotTest,
   Preserved_trx_bundle bundle;
   Preserved_trx_bundle_build_input input;
   input.metadata = meta;
+  input.emit_no_cache_binlog_mode_metadata = true;
   ASSERT_EQ(Preserve_snapshot_status::OK,
             build_preserved_trx_bundle(input, &bundle));
 
@@ -26768,6 +27003,7 @@ TEST_F(PreserveSnapshotTest, TransferReceiverCommitEpochReadiesEverySealedToken)
     meta.token = test_transfer_token_string(transfer_token);
     Preserved_trx_bundle_build_input input;
     input.metadata = meta;
+    input.emit_no_cache_binlog_mode_metadata = true;
     ASSERT_EQ(Preserve_snapshot_status::OK,
               build_preserved_trx_bundle(input, bundle));
     ASSERT_EQ(Preserve_trx_transfer_status::OK,
@@ -27138,6 +27374,7 @@ TEST_F(PreserveSnapshotTest, TransferArtifactSinkPublishesThroughFrameSink) {
   Preserved_trx_bundle bundle;
   Preserved_trx_bundle_build_input input;
   input.metadata = meta;
+  input.emit_no_cache_binlog_mode_metadata = true;
   ASSERT_EQ(Preserve_snapshot_status::OK,
             build_preserved_trx_bundle(input, &bundle));
 
@@ -27175,6 +27412,7 @@ TEST_F(PreserveSnapshotTest,
   Preserved_trx_bundle bundle;
   Preserved_trx_bundle_build_input input;
   input.metadata = meta;
+  input.emit_no_cache_binlog_mode_metadata = true;
   ASSERT_EQ(Preserve_snapshot_status::OK,
             build_preserved_trx_bundle(input, &bundle));
 
@@ -27885,10 +28123,16 @@ TEST_F(PreserveSnapshotTest,
   });
   const uint64_t bind_attempts_before =
       preserve_trx_transfer_receiver_epoch_ready_bind_attempts_status();
+  const uint64_t seal_prewarm_before =
+      preserve_trx_transfer_receiver_seal_prewarm_tokens_status();
   for (const std::string &encoded_frame : frame_sink.frames()) {
     ASSERT_EQ(Preserve_trx_transfer_status::OK,
               preserve_trx_transfer_handle_receiver_payload(
                   m_dir, encoded_frame, &store, &registry, 300, nullptr));
+  }
+  if (!mysql_bin_log.is_open()) {
+    expect_closed_binlog_receiver_rejection(seal_prewarm_before);
+    return;
   }
   Preserve_trx_promotion_ready_summary ready_summary;
   const bool ready = wait_for_epoch_ready_token(
@@ -27954,7 +28198,7 @@ TEST_F(PreserveSnapshotTest,
 }
 
 TEST_F(PreserveSnapshotTest,
-       TransferReceiverPreparesNativeBinlogHandleBeforeStrictReady) {
+       TransferReceiverRequiresOpenBinlogBeforeNativeHandleReady) {
   Transfer_codec_context_guard codec_guard;
   preserved_trx_promotion_prepared_metrics_reset_for_unit_test();
   const bool saved_enable = preserve_trx_enable;
@@ -28007,6 +28251,7 @@ TEST_F(PreserveSnapshotTest,
   Preserved_trx_bundle bundle;
   Preserved_trx_bundle_build_input input;
   input.metadata = meta;
+  input.emit_no_cache_binlog_mode_metadata = true;
   input.logged_binlog_snapshot = &snapshot;
   input.externalize_record_locks_payload = true;
   ASSERT_EQ(Preserve_snapshot_status::OK,
@@ -28074,6 +28319,8 @@ TEST_F(PreserveSnapshotTest,
       m_dir, manifest, bundle.metadata.token, &strict_key));
   auto &strict_registry = preserved_trx_strict_prepared_token_registry();
   strict_registry.purge_epoch(strict_key.epoch_scope, strict_key.epoch_id);
+  const uint64_t seal_prewarm_before =
+      preserve_trx_transfer_receiver_seal_prewarm_tokens_status();
 
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
             session.declare_token(transfer_token));
@@ -28085,6 +28332,31 @@ TEST_F(PreserveSnapshotTest,
             sink.publish_bundle(std::move(bundle), 300, &written_metadata,
                                 &durable_snapshot_may_exist));
   ASSERT_EQ(Preserve_trx_transfer_status::OK, session.commit_epoch());
+
+  if (!mysql_bin_log.is_open()) {
+    for (uint attempt = 0; attempt < 200; ++attempt) {
+      if (preserve_trx_transfer_receiver_seal_prewarm_tokens_status() >
+          seal_prewarm_before) {
+        break;
+      }
+      my_sleep(10000);
+    }
+    EXPECT_GT(preserve_trx_transfer_receiver_seal_prewarm_tokens_status(),
+              seal_prewarm_before);
+    EXPECT_EQ(static_cast<ulonglong>(
+                  Preserve_trx_promotion_adopt_status::UNSUPPORTED_ARTIFACT),
+              preserve_trx_transfer_receiver_seal_prewarm_last_status());
+    Preserve_trx_prepared_token_snapshot rejected_snapshot;
+    EXPECT_NE(Preserve_trx_prepared_status::OK,
+              strict_registry.snapshot(strict_key, &rejected_snapshot));
+    Preserve_trx_transfer_accepted_epoch accepted;
+    ASSERT_EQ(Preserve_trx_transfer_status::COMMITTED_NOT_READY,
+              registry.query_accepted_epoch(
+                  m_dir, "epoch-native-binlog-ready", &accepted));
+    EXPECT_NE(Preserve_trx_transfer_epoch_lifecycle::READY,
+              accepted.lifecycle);
+    return;
+  }
 
   Preserve_trx_prepared_token_snapshot strict_snapshot;
   for (uint attempt = 0; attempt < 200; ++attempt) {
@@ -28259,6 +28531,8 @@ TEST_F(PreserveSnapshotTest,
       "epoch-artifact-deadline", transfer_token, 11, &frame_sink);
 
   Preserve_snapshot_metadata written_metadata;
+  const uint64_t seal_prewarm_before =
+      preserve_trx_transfer_receiver_seal_prewarm_tokens_status();
   ASSERT_EQ(Preserve_snapshot_status::OK,
             sink.publish_bundle(std::move(bundle), 300, &written_metadata));
   EXPECT_GT(written_metadata.created_at_us, 0U);
@@ -28266,6 +28540,10 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_TRUE(receiver_metadata.token.empty());
   EXPECT_GT(frame_sink.frame_count(), 0U);
 
+  if (!mysql_bin_log.is_open()) {
+    expect_closed_binlog_receiver_rejection(seal_prewarm_before);
+    return;
+  }
   ASSERT_TRUE(wait_for_epoch_ready_token("epoch-artifact-deadline",
                                          transfer_token));
 }
@@ -28415,6 +28693,7 @@ TEST_F(PreserveSnapshotTest, ArtifactSinkFactoryUsesSourceEpochSession) {
   Preserved_trx_bundle bundle;
   Preserved_trx_bundle_build_input input;
   input.metadata = meta;
+  input.emit_no_cache_binlog_mode_metadata = true;
   ASSERT_EQ(Preserve_snapshot_status::OK,
             build_preserved_trx_bundle(input, &bundle));
 
@@ -28846,6 +29125,8 @@ TEST_F(PreserveSnapshotTest,
 
   const uint64_t object_miss_before =
       preserve_trx_transfer_receiver_object_prewarm_miss_count_status();
+  const uint64_t seal_prewarm_before =
+      preserve_trx_transfer_receiver_seal_prewarm_tokens_status();
   DBUG_SET("+d,preserve_trx_fail_native_binlog_prepare_open");
   auto clear_prepare_failure = create_scope_guard(
       [] { DBUG_SET("-d,preserve_trx_fail_native_binlog_prepare_open"); });
@@ -28853,6 +29134,10 @@ TEST_F(PreserveSnapshotTest,
             preserve_trx_transfer_finalize_deferred_candidate(&session,
                                                                &candidate));
   ASSERT_EQ(Preserve_trx_transfer_status::OK, session.commit_epoch());
+  if (!mysql_bin_log.is_open()) {
+    expect_closed_binlog_receiver_rejection(seal_prewarm_before);
+    return;
+  }
   Preserve_trx_promotion_ready_summary ready_summary;
   const bool ready = wait_for_epoch_ready_token(
       session.epoch_id(), transfer_token, &ready_summary);
@@ -29006,6 +29291,7 @@ TEST_F(PreserveSnapshotTest,
   Preserved_trx_bundle bundle;
   Preserved_trx_bundle_build_input input;
   input.metadata = meta;
+  input.emit_no_cache_binlog_mode_metadata = true;
   ASSERT_EQ(Preserve_snapshot_status::OK,
             build_preserved_trx_bundle(input, &bundle));
 
@@ -30663,7 +30949,9 @@ TEST_F(PreserveSnapshotTest,
 TEST_F(PreserveSnapshotTest, BundleBuilderNoCacheDoesNotEmitMetadataTlv) {
   Preserved_trx_bundle bundle;
   Preserved_trx_bundle_build_input input;
-  input.metadata = metadata();
+  input.metadata = session_off_metadata();
+  input.metadata.has_binlog_gtid_mode = true;
+  input.metadata.binlog_gtid_mode = static_cast<uint8_t>(Gtid_mode::ON);
   ASSERT_EQ(Preserve_snapshot_status::OK,
             build_preserved_trx_bundle(input, &bundle));
 
@@ -30672,6 +30960,90 @@ TEST_F(PreserveSnapshotTest, BundleBuilderNoCacheDoesNotEmitMetadataTlv) {
                              return tlv.tag ==
                                     kTestBinlogNoCacheMetadataTlv;
                            }));
+
+  Preserved_trx_encoded_bundle encoded;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            encode_preserved_trx_bundle(codec_context(), bundle, &encoded,
+                                        nullptr));
+  Preserved_trx_decoded_snapshot decoded;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            decode_preserved_trx_snapshot_bytes(
+                codec_context(), encoded.snapshot_bytes, true, &decoded));
+  EXPECT_FALSE(decoded.header_metadata.has_binlog_gtid_mode);
+}
+
+TEST_F(PreserveSnapshotTest,
+       BundleBuilderTransferNoCacheEmitsModeMetadataTlv) {
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = session_off_metadata();
+  input.metadata.has_binlog_gtid_mode = true;
+  input.metadata.binlog_gtid_mode = static_cast<uint8_t>(Gtid_mode::ON);
+  input.emit_no_cache_binlog_mode_metadata = true;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  EXPECT_EQ(1U, std::count_if(bundle.tlvs.begin(), bundle.tlvs.end(),
+                              [](const Preserve_snapshot_tlv &tlv) {
+                                return tlv.tag ==
+                                       kTestBinlogNoCacheMetadataTlv;
+                              }));
+
+  Preserved_trx_encoded_bundle encoded;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            encode_preserved_trx_bundle(codec_context(), bundle, &encoded,
+                                        nullptr));
+  Preserved_trx_decoded_snapshot decoded;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            decode_preserved_trx_snapshot_bytes(
+                codec_context(), encoded.snapshot_bytes, true, &decoded));
+  EXPECT_TRUE(decoded.header_metadata.has_binlog_gtid_mode);
+  EXPECT_EQ(static_cast<uint8_t>(Gtid_mode::ON),
+            decoded.header_metadata.binlog_gtid_mode);
+  EXPECT_TRUE(decoded.header_metadata.binlog_gtid_next.empty());
+  EXPECT_TRUE(decoded.header_metadata.binlog_owned_gtid.empty());
+}
+
+TEST_F(PreserveSnapshotTest, BundleBuilderTransferNoCacheRequiresMode) {
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = session_off_metadata();
+  input.metadata.has_binlog_gtid_mode = false;
+  input.metadata.binlog_gtid_mode = 0;
+  input.emit_no_cache_binlog_mode_metadata = true;
+  EXPECT_EQ(Preserve_snapshot_status::INVALID_ARGUMENT,
+            build_preserved_trx_bundle(input, &bundle));
+}
+
+TEST_F(PreserveSnapshotTest,
+       BundleBuilderTransferFlagDoesNotChangeLoggedCacheTlvShape) {
+  Mysql_binlog_preserve_snapshot snapshot;
+  snapshot.cache_payload = "logged-cache";
+  snapshot.gtid_next = "AUTOMATIC";
+  snapshot.event_counter = 1;
+  snapshot.with_rbr = true;
+  snapshot.with_start = true;
+  snapshot.with_content = true;
+
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = logged_with_cache_metadata();
+  input.metadata.has_binlog_gtid_mode = true;
+  input.metadata.binlog_gtid_mode = static_cast<uint8_t>(Gtid_mode::ON);
+  input.logged_binlog_snapshot = &snapshot;
+  input.emit_no_cache_binlog_mode_metadata = true;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  EXPECT_EQ(0U, std::count_if(bundle.tlvs.begin(), bundle.tlvs.end(),
+                              [](const Preserve_snapshot_tlv &tlv) {
+                                return tlv.tag ==
+                                       kTestBinlogNoCacheMetadataTlv;
+                              }));
+  EXPECT_EQ(1U, std::count_if(bundle.tlvs.begin(), bundle.tlvs.end(),
+                              [](const Preserve_snapshot_tlv &tlv) {
+                                return tlv.tag == 0x60;
+                              }));
 }
 
 TEST_F(PreserveSnapshotTest,

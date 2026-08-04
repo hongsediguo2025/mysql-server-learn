@@ -1,0 +1,11 @@
+generation	outcome	source_connection_id	token_role	reason	closing_started_us	closing_deadline_us
+GENERATION	SUCCESS	LOGGED_ID	SURVIVOR	NONE	CLOSING_STARTED_US	CLOSING_DEADLINE_US
+GENERATION	SUCCESS	NOCACHE_ID	SURVIVOR	NONE	CLOSING_STARTED_US	CLOSING_DEADLINE_US
+two_classified_tokens
+1
+two_ready_tokens
+1
+no_not_ready_tokens
+1
+one_accepted_epoch
+1

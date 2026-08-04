@@ -501,8 +501,13 @@ struct Preserved_trx_bundle_build_input {
     the external payload; they do not automatically choose externalization.
   */
   bool externalize_record_locks_payload{false};
+  /* Standby transfer preserves GTID mode even when no binlog cache exists. */
+  bool emit_no_cache_binlog_mode_metadata{false};
   Preserved_trx_bundle_build_options options;
 };
+
+bool preserve_snapshot_gtid_state_is_strict_transfer_safe(
+    const Preserve_snapshot_metadata &metadata);
 
 Preserve_snapshot_status build_preserved_trx_bundle(
     const Preserved_trx_bundle_build_input &input,

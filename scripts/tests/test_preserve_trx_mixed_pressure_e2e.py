@@ -748,6 +748,8 @@ class MixedPressureCommandTest(unittest.TestCase):
         self.assertNotIn("preserve-trx-transfer-target-user", " ".join(source))
         self.assertTrue(any(value.startswith("--log-bin=") for value in source))
         self.assertIn("--binlog-format=ROW", source)
+        self.assertNotIn("--gtid-mode=ON", source)
+        self.assertNotIn("--enforce-gtid-consistency=ON", source)
         self.assertIn("hundred_session_semantic_matrix", joined)
 
     def test_acceptance_contract_is_specific_to_each_mode(self):
@@ -798,6 +800,10 @@ class MixedPressureCommandTest(unittest.TestCase):
         self.assertTrue(any(value.startswith("--log-bin=") for value in receiver))
         self.assertIn("--binlog-format=ROW", source)
         self.assertIn("--binlog-format=ROW", receiver)
+        self.assertIn("--gtid-mode=ON", source)
+        self.assertIn("--gtid-mode=ON", receiver)
+        self.assertIn("--enforce-gtid-consistency=ON", source)
+        self.assertIn("--enforce-gtid-consistency=ON", receiver)
         self.assertNotIn("--receiver-unix-socket", command)
         self.assertIn("--warmcopy-required", command)
         self.assertIn(

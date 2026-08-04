@@ -67,6 +67,7 @@
 #include "sql/log.h"
 #include "sql/current_thd.h"
 #include "sql/debug_sync.h"
+#include "sql/binlog.h"
 #include "sql/binlog_preserve_prepared.h"
 #include "sql/preserve_trx.h"
 #include "sql/preserve_trx_carrier_file.h"
@@ -76,6 +77,7 @@
 #include "sql/preserve_trx_xid.h"
 #include "sql/protocol_classic.h"
 #include "sql/rpl_channel_credentials.h"
+#include "sql/rpl_gtid.h"
 #include "sql/sql_class.h"
 #include "sql/sql_thd_internal_api.h"
 #include "sql/ssl_acceptor_context_status.h"
@@ -6532,10 +6534,7 @@ preserve_trx_transfer_validate_strict_eligibility(
     return Preserve_trx_transfer_strict_eligibility_status::
         UNSUPPORTED_ENGINE_SHAPE;
   }
-  if (!metadata.binlog_owned_gtid.empty() ||
-      (metadata.has_binlog_gtid_mode && metadata.binlog_gtid_mode != 0) ||
-      (!metadata.binlog_gtid_next.empty() &&
-       metadata.binlog_gtid_next != "AUTOMATIC")) {
+  if (!preserve_snapshot_gtid_state_is_strict_transfer_safe(metadata)) {
     return Preserve_trx_transfer_strict_eligibility_status::GTID_PRESENT;
   }
   if (metadata.has_read_view || !metadata.read_view_payload.empty()) {
@@ -15096,6 +15095,18 @@ Receiver_staged_token_prewarm_result run_receiver_staged_token_prewarm_job(
     return receiver_staged_token_result(
         Receiver_staged_token_prewarm_outcome::GLOBAL_FAILURE,
         Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT);
+  }
+  if (staged_bundle.metadata.global_log_bin != mysql_bin_log.is_open() ||
+      !staged_bundle.metadata.has_binlog_gtid_mode ||
+      staged_bundle.metadata.binlog_gtid_mode !=
+          static_cast<uint8_t>(global_gtid_mode.get())) {
+    const auto result = receiver_staged_token_result(
+        Receiver_staged_token_prewarm_outcome::TERMINAL_TOKEN_FAILURE,
+        Preserve_trx_promotion_adopt_status::UNSUPPORTED_ARTIFACT,
+        Preserve_trx_receiver_failure_reason::UNSUPPORTED_TOKEN_SEMANTICS);
+    note_receiver_seal_prewarm_status(result.status);
+    record_token_failure(result.failure_reason);
+    return result;
   }
 
   const uint64_t ready_started_us = transfer_monotonic_us();

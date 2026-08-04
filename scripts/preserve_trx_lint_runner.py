@@ -39,6 +39,7 @@ LEGACY_LINT_RULE_IDS: Sequence[str] = (
     "preserve_crash_abandon_contract_lint",
     "preserve_prepare_freeze_semantics_lint",
     "preserve_review_fix_contract_lint",
+    "physical_promotion_partial_ready_contract_lint",
     "readview_low_limit_system_floor_lint",
     "reset_drain_scope_lint",
     "standby_promotion_fast_resume_contract_lint",
