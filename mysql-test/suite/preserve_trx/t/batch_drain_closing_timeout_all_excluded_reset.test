@@ -1,0 +1,109 @@
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_query_log
+--let $credential_file= $MYSQL_TMP_DIR/closing-timeout-all-excluded-reset.secret
+--write_file $credential_file
+closing-timeout-all-excluded-reset-secret
+EOF
+--exec chmod 600 $credential_file
+
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+DROP USER IF EXISTS closing_all_reset_app@localhost;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'closing-timeout-all-excluded-reset-secret';
+GRANT SHUTDOWN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.*
+  TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+CREATE USER closing_all_reset_app@localhost;
+GRANT SELECT, UPDATE ON test.* TO closing_all_reset_app@localhost;
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO closing_all_reset_app@localhost;
+
+--let $restart_parameters= restart: --preserve-trx-enable=ON --preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --preserve-trx-transfer-target-socket=$MASTER_MYSOCK --preserve-trx-transfer-target-user=preserve_trx_ha_admin --preserve-trx-transfer-credential-name=closing_timeout_all_excluded_reset --preserve-trx-transfer-credential-secret-file=$credential_file
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--let $restart_parameters=
+--disable_query_log
+
+CALL mtr.add_suppression(
+  "PRESERVE: rolled back prepared transaction without snapshot during recovery");
+
+SET GLOBAL preserve_trx_batch_max_transactions=1;
+SET GLOBAL preserve_trx_transfer_pipeline_enable=ON;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_transfer_prewarm_paused=ON;
+SET GLOBAL preserve_trx_drain_phase1_timeout_ms=200;
+SET GLOBAL preserve_trx_drain_phase2_timeout_ms=100;
+
+CREATE TABLE t_closing_timeout_all_excluded_reset(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_closing_timeout_all_excluded_reset VALUES(1,10);
+
+--connect(closing_all_reset_ha,localhost,preserve_trx_ha_admin,closing-timeout-all-excluded-reset-secret,test)
+--connect(closing_all_reset_app,localhost,closing_all_reset_app,,test)
+--let $app_id= query_get_value(SELECT CONNECTION_ID() AS id, id, 1)
+START TRANSACTION;
+UPDATE t_closing_timeout_all_excluded_reset SET v=11 WHERE id=1;
+SET DEBUG_SYNC=
+  'before_execute_sql_command SIGNAL closing_all_reset_running WAIT_FOR closing_all_reset_command_continue';
+--send SELECT 1 AS excluded_old_command
+
+--connection default
+SET DEBUG_SYNC='now WAIT_FOR closing_all_reset_running TIMEOUT 10';
+--send DRAIN TRANSACTIONS PRESERVE
+
+--connection default
+--replace_result $app_id EXCLUDED_ID
+--replace_column 1 GENERATION 6 CLOSING_STARTED_US 7 CLOSING_DEADLINE_US
+--reap
+
+--connection closing_all_reset_ha
+SELECT VARIABLE_VALUE=0 AS no_receiver_epoch
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs';
+SELECT VARIABLE_VALUE=0 AS no_receiver_token
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens';
+RESET DRAIN;
+SET DEBUG_SYNC='now SIGNAL closing_all_reset_command_continue';
+
+--connection closing_all_reset_app
+--reap
+
+--connection closing_all_reset_app
+UPDATE t_closing_timeout_all_excluded_reset SET v=v+100 WHERE id=1;
+COMMIT;
+--eval SELECT CONNECTION_ID()=$app_id AS same_connection
+
+--connection closing_all_reset_ha
+SELECT v FROM t_closing_timeout_all_excluded_reset;
+SET GLOBAL preserve_trx_transfer_prewarm_paused=OFF;
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+SHUTDOWN;
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+
+--exec echo "restart: --preserve-trx-enable=ON --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+--disable_query_log
+
+--connect(closing_all_reset_cleanup,localhost,root,,test)
+DROP TABLE t_closing_timeout_all_excluded_reset;
+DROP USER closing_all_reset_app@localhost;
+DROP USER preserve_trx_ha_admin@localhost;
+SET DEBUG_SYNC='RESET';
+--remove_file $credential_file
+
+--enable_query_log

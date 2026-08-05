@@ -1,8 +1,6 @@
 DROP TABLE IF EXISTS t_timeout_snapshot_timestamp;
 SET GLOBAL preserve_trx_enable=ON;
-SET SESSION preserve_trx_min_timeout=1;
-SET SESSION preserve_trx_default_timeout=1;
-SET SESSION preserve_trx_max_timeout=86400;
+SET GLOBAL preserve_trx_token_retention_timeout_ms=1000;
 CREATE TABLE t_timeout_snapshot_timestamp(a INT PRIMARY KEY, b INT)
 ENGINE=InnoDB;
 INSERT INTO t_timeout_snapshot_timestamp VALUES(1,10);
@@ -10,9 +8,6 @@ SET DEBUG_SYNC =
 'preserve_trx_before_snapshot_timestamp SIGNAL before_snapshot_timestamp WAIT_FOR continue_snapshot_timestamp';
 START TRANSACTION;
 UPDATE t_timeout_snapshot_timestamp SET b=11 WHERE a=1;
-SET SESSION preserve_trx_min_timeout=1;
-SET SESSION preserve_trx_default_timeout=1;
-SET SESSION preserve_trx_max_timeout=86400;
 DRAIN TRANSACTIONS PRESERVE;
 SET DEBUG_SYNC = 'now WAIT_FOR before_snapshot_timestamp TIMEOUT 3';
 SET DEBUG_SYNC = 'now SIGNAL continue_snapshot_timestamp';

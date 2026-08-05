@@ -17,7 +17,7 @@ START TRANSACTION;
 INSERT INTO t_same_page_multi_preserved VALUES(10,10,NULL);
 
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
---let $preserve_trx_drain_clause= WITH TIMEOUT 86400
+--let $preserve_trx_drain_clause=
 --source suite/preserve_trx/include/drain_transaction_from_control.inc
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 --exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
@@ -33,7 +33,7 @@ START TRANSACTION;
 INSERT INTO t_same_page_multi_preserved VALUES(20,20,NULL);
 
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
---let $preserve_trx_drain_clause= WITH TIMEOUT 86400
+--let $preserve_trx_drain_clause=
 --source suite/preserve_trx/include/drain_transaction_from_control.inc
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 --exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect

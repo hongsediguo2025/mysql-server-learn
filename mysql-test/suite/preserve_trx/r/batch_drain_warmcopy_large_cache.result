@@ -20,7 +20,7 @@ INSERT INTO t_warmcopy_large VALUES(101,1,REPEAT('p',512));
 START TRANSACTION;
 UPDATE t_warmcopy_large SET payload=REPEAT('y',512) WHERE id=2;
 INSERT INTO t_warmcopy_large VALUES(102,2,REPEAT('q',512));
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 include/assert_grep.inc [warm-copy large cache used prebuilt fast path metrics]
 SELECT COUNT(*) AS preserved_count
 FROM performance_schema.preserved_transactions;

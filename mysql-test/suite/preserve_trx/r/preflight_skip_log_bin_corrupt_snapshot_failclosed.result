@@ -8,7 +8,7 @@ SELECT * FROM t_preflight_corrupt_snapshot WHERE a=1 FOR UPDATE;
 a	b
 1	10
 UPDATE t_preflight_corrupt_snapshot SET b=11 WHERE a=1;
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 # restart: --preserve-trx-enable=ON --skip-log-bin
 include/wait_for_pattern_in_file.inc [Preserved transaction .* recovery forced rollback: preserved transaction snapshot tainted: startup snapshot is unreadable or mismatched]
 SELECT COUNT(*) AS preserved_count_after_corrupt_preflight

@@ -40,7 +40,7 @@ INSERT INTO t_batch_temp_top_enable_after_temp_dml VALUES(1, 10);
 --let $wait_condition= SELECT COUNT(*) = 2 FROM performance_schema.threads WHERE PROCESSLIST_USER = 'root' AND PROCESSLIST_DB = 'test' AND PROCESSLIST_COMMAND = 'Sleep'
 --source include/wait_condition.inc
 --error ER_PRESERVE_TRX_DISABLED
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 
 SELECT COUNT(*) AS preserved_count
   FROM performance_schema.preserved_transactions;

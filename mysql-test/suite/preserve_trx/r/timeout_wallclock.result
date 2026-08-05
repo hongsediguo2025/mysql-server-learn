@@ -1,8 +1,5 @@
 DROP TABLE IF EXISTS t_timeout_wallclock;
 SET GLOBAL preserve_trx_enable=ON;
-SET SESSION preserve_trx_min_timeout=1;
-SET SESSION preserve_trx_default_timeout=1;
-SET SESSION preserve_trx_max_timeout=86400;
 CREATE TABLE t_timeout_wallclock(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_timeout_wallclock VALUES(1,10);
 START TRANSACTION;

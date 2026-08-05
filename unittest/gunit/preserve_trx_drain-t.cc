@@ -298,17 +298,11 @@ TEST(PreserveTrxDrainOrchestrator,
 
 TEST(PreserveTrxDrainRequest, OwnsOptionsCopy) {
   Preserve_trx_options options;
-  options.has_timeout = false;
-  options.timeout_seconds = 30;
   options.user_vars_mode = Preserve_trx_user_vars_mode::INCLUDE;
 
   Preserve_trx_drain_request request{options};
-  options.has_timeout = true;
-  options.timeout_seconds = 60;
   options.user_vars_mode = Preserve_trx_user_vars_mode::EXCLUDE;
 
-  EXPECT_FALSE(request.options.has_timeout);
-  EXPECT_EQ(30U, request.options.timeout_seconds);
   EXPECT_EQ(Preserve_trx_user_vars_mode::INCLUDE, request.options.user_vars_mode);
 }
 

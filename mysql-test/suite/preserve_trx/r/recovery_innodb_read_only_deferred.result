@@ -7,7 +7,7 @@ CREATE TABLE t_read_only_deferred(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
 INSERT INTO t_read_only_deferred VALUES(1, 10);
 START TRANSACTION;
 UPDATE t_read_only_deferred SET v=20 WHERE id=1;
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SHOW STATUS LIKE 'Preserve_trx_startup_recovery_error';
 Variable_name	Value
 Preserve_trx_startup_recovery_error	1

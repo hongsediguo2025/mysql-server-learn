@@ -11,7 +11,7 @@ v INT
 START TRANSACTION;
 INSERT INTO t_batch_post_detach_failure VALUES(1,10);
 SET SESSION debug="+d,preserve_trx_fail_after_snapshot_rename";
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 SET SESSION debug="-d,preserve_trx_fail_after_snapshot_rename";
 SELECT COUNT(*) AS preserved_count
@@ -25,7 +25,7 @@ id	v
 START TRANSACTION;
 INSERT INTO t_batch_post_detach_failure VALUES(2,20);
 SET SESSION debug="+d,preserve_trx_fail_after_snapshot_rename,preserve_trx_fail_delete_snapshot_after_unlink";
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 ERROR HY000: DRAIN TRANSACTIONS PRESERVE batch cleanup failed; inspect preserved_transactions and target sessions before retry
 SET SESSION debug="-d,preserve_trx_fail_after_snapshot_rename,preserve_trx_fail_delete_snapshot_after_unlink";
 SELECT COUNT(*) AS preserved_count_after_cleanup_failure
@@ -40,7 +40,7 @@ id	v
 START TRANSACTION;
 INSERT INTO t_batch_post_detach_failure VALUES(3,30);
 SET SESSION debug="+d,preserve_trx_fail_after_snapshot_rename,preserve_trx_fail_delete_snapshot_files";
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 ERROR HY000: DRAIN TRANSACTIONS PRESERVE batch cleanup failed; inspect preserved_transactions and target sessions before retry
 SET SESSION debug="-d,preserve_trx_fail_after_snapshot_rename,preserve_trx_fail_delete_snapshot_files";
 SELECT COUNT(*) AS preserved_count_after_delete_before_unlink_failure

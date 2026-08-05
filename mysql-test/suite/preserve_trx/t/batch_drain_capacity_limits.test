@@ -24,17 +24,17 @@ INSERT INTO t_batch_capacity VALUES(2,20);
 --connection default
 SET GLOBAL preserve_trx_batch_max_transactions=1;
 --error ER_PRESERVE_TRX_UNSUPPORTED
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 
 SET GLOBAL preserve_trx_batch_max_transactions=256;
 SET GLOBAL preserve_trx_max_total=1;
 --error ER_PRESERVE_TRX_UNSUPPORTED
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 
 SET GLOBAL preserve_trx_max_total=256;
 SET GLOBAL preserve_trx_max_pending_per_user=1;
 --error ER_PRESERVE_TRX_UNSUPPORTED
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 
 SET GLOBAL preserve_trx_max_pending_per_user=256;
 

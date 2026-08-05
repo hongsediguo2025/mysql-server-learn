@@ -28,7 +28,7 @@ UPDATE t_implicit_sec SET k=250, v=21 WHERE id=2;
 
 --connection default
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 --source include/wait_until_disconnected.inc
 
 --exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect

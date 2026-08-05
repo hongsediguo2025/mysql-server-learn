@@ -35,7 +35,7 @@ UPDATE t_lock_warmcopy_spill_budget SET v=21, pad=REPEAT('c',64)
 
 --connection default
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 
 --exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=10" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect

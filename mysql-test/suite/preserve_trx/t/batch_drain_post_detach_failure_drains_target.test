@@ -26,7 +26,7 @@ INSERT INTO t_batch_post_detach_failure VALUES(1,10);
 --connection default
 SET SESSION debug="+d,preserve_trx_fail_after_snapshot_rename";
 --error ER_PRESERVE_TRX_UNSUPPORTED
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SET SESSION debug="-d,preserve_trx_fail_after_snapshot_rename";
 
 SELECT COUNT(*) AS preserved_count
@@ -48,7 +48,7 @@ INSERT INTO t_batch_post_detach_failure VALUES(2,20);
 --connection default
 SET SESSION debug="+d,preserve_trx_fail_after_snapshot_rename,preserve_trx_fail_delete_snapshot_after_unlink";
 --error ER_PRESERVE_TRX_BATCH_CLEANUP_FAILED
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SET SESSION debug="-d,preserve_trx_fail_after_snapshot_rename,preserve_trx_fail_delete_snapshot_after_unlink";
 
 SELECT COUNT(*) AS preserved_count_after_cleanup_failure
@@ -70,7 +70,7 @@ INSERT INTO t_batch_post_detach_failure VALUES(3,30);
 --connection default
 SET SESSION debug="+d,preserve_trx_fail_after_snapshot_rename,preserve_trx_fail_delete_snapshot_files";
 --error ER_PRESERVE_TRX_BATCH_CLEANUP_FAILED
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SET SESSION debug="-d,preserve_trx_fail_after_snapshot_rename,preserve_trx_fail_delete_snapshot_files";
 
 SELECT COUNT(*) AS preserved_count_after_delete_before_unlink_failure

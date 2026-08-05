@@ -1,0 +1,110 @@
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_query_log
+--let $credential_file= $MYSQL_TMP_DIR/source-all-token-local-failure.secret
+--write_file $credential_file
+source-all-token-local-failure-secret
+EOF
+--exec chmod 600 $credential_file
+
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+DROP USER IF EXISTS source_all_token_local_app@localhost;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'source-all-token-local-failure-secret';
+GRANT SHUTDOWN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.*
+  TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+CREATE USER source_all_token_local_app@localhost;
+GRANT SELECT, UPDATE ON test.* TO source_all_token_local_app@localhost;
+
+--let $restart_parameters= restart: --preserve-trx-enable=ON --preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --preserve-trx-transfer-target-socket=$MASTER_MYSOCK --preserve-trx-transfer-target-user=preserve_trx_ha_admin --preserve-trx-transfer-credential-name=source_all_token_local_failure --preserve-trx-transfer-credential-secret-file=$credential_file
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--let $restart_parameters=
+--disable_query_log
+
+CALL mtr.add_suppression(
+  "PRESERVE: rolled back prepared transaction without snapshot during recovery");
+
+SET GLOBAL preserve_trx_batch_max_transactions=1;
+SET GLOBAL preserve_trx_transfer_pipeline_enable=ON;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_transfer_prewarm_paused=ON;
+
+CREATE TABLE t_source_all_token_local_failure(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_source_all_token_local_failure VALUES(1,10);
+
+--connect(source_all_local_ha,localhost,preserve_trx_ha_admin,source-all-token-local-failure-secret,test)
+--connect(source_all_local_signal,localhost,preserve_trx_ha_admin,source-all-token-local-failure-secret,test)
+--connect(source_all_local_app,localhost,source_all_token_local_app,,test)
+--let $app_id= query_get_value(SELECT CONNECTION_ID() AS id, id, 1)
+START TRANSACTION;
+UPDATE t_source_all_token_local_failure SET v=11 WHERE id=1;
+
+--connection source_all_local_ha
+--let $reset_wins_before= query_get_value(SELECT VARIABLE_VALUE+0 AS value FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_reset_drain_wins', value, 1)
+SET GLOBAL debug='+d,preserve_trx_early_fail_candidate_finalize';
+
+--connection default
+SET DEBUG_SYNC=
+  'preserve_trx_drain_after_shutdown_handoff SIGNAL source_all_local_handoff WAIT_FOR source_all_local_release';
+--send DRAIN TRANSACTIONS PRESERVE
+
+--connection source_all_local_ha
+SET DEBUG_SYNC='now WAIT_FOR source_all_local_handoff TIMEOUT 30';
+SET GLOBAL debug='-d,preserve_trx_early_fail_candidate_finalize';
+SELECT VARIABLE_VALUE=0 AS no_receiver_epoch
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs';
+--send RESET DRAIN
+
+--connection source_all_local_signal
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_reset_drain_wins')>$reset_wins_before
+--source include/wait_condition.inc
+SET DEBUG_SYNC='now SIGNAL source_all_local_release';
+
+--connection source_all_local_ha
+--reap
+--connection default
+--error 4021
+--reap
+
+--connection source_all_local_app
+UPDATE t_source_all_token_local_failure SET v=v+100 WHERE id=1;
+COMMIT;
+--eval SELECT CONNECTION_ID()=$app_id AS same_connection
+
+--connection source_all_local_ha
+SELECT v FROM t_source_all_token_local_failure;
+SET GLOBAL preserve_trx_transfer_prewarm_paused=OFF;
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+SHUTDOWN;
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+
+--exec echo "restart: --preserve-trx-enable=ON --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+--disable_query_log
+
+--connect(source_all_local_cleanup,localhost,root,,test)
+DROP TABLE t_source_all_token_local_failure;
+DROP USER source_all_token_local_app@localhost;
+DROP USER preserve_trx_ha_admin@localhost;
+SET DEBUG_SYNC='RESET';
+--remove_file $credential_file
+
+--enable_query_log

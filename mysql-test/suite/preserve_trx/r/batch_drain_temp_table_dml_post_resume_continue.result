@@ -3,7 +3,7 @@ SET GLOBAL preserve_trx_temp_table_enable=ON;
 SET GLOBAL preserve_trx_lock_warmcopy_enable=OFF;
 SET GLOBAL preserve_trx_recovery_max_count=20;
 SET GLOBAL preserve_trx_max_temp_sidecar_bytes=1073741824;
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300 WITH USER VARS;
+DRAIN TRANSACTIONS PRESERVE WITH USER VARS;
 SELECT COUNT(*) AS preserved_count
 FROM performance_schema.preserved_transactions;
 preserved_count

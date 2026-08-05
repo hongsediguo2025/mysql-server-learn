@@ -20,7 +20,7 @@ SET @@null_audit_event_order_check_exact=0;
 SET @@null_audit_event_order_check=@expected_drain_audit;
 SET @@null_audit_event_record_def='MYSQL_AUDIT_MESSAGE_INTERNAL;MYSQL_AUDIT_QUERY_STATUS_END';
 SET SESSION debug='+d,preserve_trx_drain_skip_shutdown_after_audit_no_targets';
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SET SESSION debug='-d,preserve_trx_drain_skip_shutdown_after_audit_no_targets';
 
 SELECT @@null_audit_event_order_check;

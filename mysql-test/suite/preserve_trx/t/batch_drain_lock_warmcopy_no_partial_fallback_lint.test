@@ -202,25 +202,17 @@ die "lock warmcopy must prepare hook-built record stores before WARMCOPY_CLOSING
          index($preserve, 'prepare_phase1_record_store_targets') <
          $closing_transition;
 
-die "early transfer pipeline must be controlled by the transfer pipeline policy, not A\n"
+die "early transfer pipeline must be controlled by the transfer pipeline policy\n"
   unless $preserve =~
          /const\s+bool\s+early_pipeline_policy_enabled\s*=[\s\S]{0,300}standby_transfer_streaming_enabled[\s\S]{0,120}two_phase_enabled[\s\S]{0,160}transfer_pipeline_enabled[\s\S]{0,180}lock_warmcopy_participant\s*!=\s*nullptr[\s\S]{0,180}fallback_to_live_export/s &&
-         $preserve !~
-         /const\s+bool\s+early_pipeline_policy_enabled\s*=[\s\S]{0,300}preserve_trx_drain_command_timeout_fail_batch/s &&
          $preserve =~
          /const\s+bool\s+early_pipeline_enabled\s*=[\s\S]{0,180}early_pipeline_policy_enabled[\s\S]{0,160}batch_transfer_source_session\s*!=\s*nullptr/s;
-die "transfer pipeline O must default ON and command-timeout policy A must default OFF\n"
+die "transfer pipeline policy must default ON\n"
   unless $sys_vars =~
-         /Sys_preserve_trx_drain_command_timeout_fail_batch[\s\S]{0,700}DEFAULT\(false\)/s &&
-         $sys_vars =~
          /Sys_preserve_trx_transfer_pipeline_enable[\s\S]{0,700}DEFAULT\(true\)/s;
-die "A and O must be frozen once per DRAIN attempt\n"
+die "transfer pipeline policy must be frozen once per DRAIN attempt\n"
   unless $preserve =~
-         /const\s+bool\s+transfer_pipeline_enabled\s*=\s*preserve_trx_transfer_pipeline_enable/s &&
-         $preserve =~
-         /const\s+bool\s+command_timeout_fail_batch\s*=\s*preserve_trx_drain_command_timeout_fail_batch/s &&
-         $preserve =~
-         /const\s+bool\s+timeout_exclusion_enabled\s*=[\s\S]{0,160}!command_timeout_fail_batch/s;
+         /const\s+bool\s+transfer_pipeline_enabled\s*=\s*preserve_trx_transfer_pipeline_enable/s;
 my $second_scan = index($preserve, 'early_final_lock_fence_changed');
 my $commit_epoch = index($preserve, 'batch_transfer_source_session->commit_epoch()',
                          $second_scan);

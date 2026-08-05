@@ -7,7 +7,7 @@ SELECT * FROM t_recover_before_purge WHERE a=1 FOR UPDATE;
 a	b
 1	10
 UPDATE t_recover_before_purge SET b=11 WHERE a=1;
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 Pattern "PRESERVE: preserved transaction recovery begin" found
 Pattern "PRESERVE: preserved transaction recovery end .*elapsed_us=[0-9]+" found
 Pattern "PRESERVE: preserved transaction recovery end .*phase_list_us=[0-9]+ .*phase_snapshot_recover_us=[0-9]+ .*phase_snapshot_load_us=[0-9]+ .*phase_snapshot_validate_us=[0-9]+ .*phase_snapshot_kernel_us=[0-9]+ .*phase_snapshot_claim_us=[0-9]+ .*phase_snapshot_read_view_us=[0-9]+ .*phase_snapshot_table_locks_us=[0-9]+ .*phase_snapshot_record_locks_us=[0-9]+ .*phase_snapshot_record_lock_entries=[1-9][0-9]* .*phase_snapshot_record_lock_stable_page_hits=[0-9]+ .*phase_snapshot_record_lock_image_resolves=[0-9]+ .*phase_snapshot_record_lock_bitmap_pages=[1-9][0-9]* .*phase_snapshot_record_lock_bitmap_bits=[1-9][0-9]* .*phase_snapshot_record_lock_page_get_us=[0-9]+ .*phase_snapshot_record_lock_page_get_count=[1-9][0-9]* .*phase_snapshot_record_lock_table_open_us=[0-9]+ .*phase_snapshot_record_lock_prefetch_pages=[0-9]+ .*phase_snapshot_record_lock_prefetch_bytes=[0-9]+ .*phase_snapshot_predicate_locks_us=[0-9]+ .*phase_snapshot_mdl_us=[0-9]+ .*phase_snapshot_register_us=[0-9]+" found

@@ -37,14 +37,12 @@ GRANT SELECT, UPDATE ON test.* TO closing_late_app@localhost;
 --disable_query_log
 
 --let $old_batch_max= `SELECT @@GLOBAL.preserve_trx_batch_max_transactions`
---let $old_fail_batch= `SELECT @@GLOBAL.preserve_trx_drain_command_timeout_fail_batch`
---let $old_closing_timeout= `SELECT @@GLOBAL.preserve_trx_drain_closing_command_timeout_ms`
+--let $old_closing_timeout= `SELECT @@GLOBAL.preserve_trx_drain_phase2_timeout_ms`
 --let $old_prewarm_paused= `SELECT @@GLOBAL.preserve_trx_transfer_prewarm_paused`
 
 SET GLOBAL preserve_trx_enable=ON;
 SET GLOBAL preserve_trx_batch_max_transactions=1;
-SET GLOBAL preserve_trx_drain_command_timeout_fail_batch=ON;
-SET GLOBAL preserve_trx_drain_closing_command_timeout_ms=60000;
+SET GLOBAL preserve_trx_drain_phase2_timeout_ms=60000;
 SET GLOBAL preserve_trx_transfer_prewarm_paused=ON;
 
 CREATE TABLE t_closing_late_transfer_target(
@@ -61,7 +59,7 @@ SET DEBUG_SYNC=
   'preserve_trx_transfer_after_phase1_binlog_stream SIGNAL closing_late_phase1_scanned WAIT_FOR closing_late_transaction_started';
 SET DEBUG_SYNC=
   'preserve_trx_batch_after_one_target_preserved SIGNAL closing_late_target_staged WAIT_FOR closing_late_reset_won';
---send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+--send DRAIN TRANSACTIONS PRESERVE
 
 # This transaction did not exist during either phase-1 declaration scan.
 --connection closing_late_ha
@@ -109,7 +107,6 @@ SET GLOBAL preserve_trx_enable=ON;
 --remove_file $credential_file
 --disable_result_log
 --eval SET GLOBAL preserve_trx_batch_max_transactions=$old_batch_max
---eval SET GLOBAL preserve_trx_drain_command_timeout_fail_batch=$old_fail_batch
---eval SET GLOBAL preserve_trx_drain_closing_command_timeout_ms=$old_closing_timeout
+--eval SET GLOBAL preserve_trx_drain_phase2_timeout_ms=$old_closing_timeout
 --eval SET GLOBAL preserve_trx_transfer_prewarm_paused=$old_prewarm_paused
 --enable_result_log

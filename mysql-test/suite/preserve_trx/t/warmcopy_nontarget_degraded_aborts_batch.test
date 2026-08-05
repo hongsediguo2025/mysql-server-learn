@@ -35,7 +35,7 @@ UPDATE t_warmcopy_nontarget_degraded
 --connection warmcopy_nontarget_owner
 SET DEBUG_SYNC =
   'preserve_trx_warmcopy_after_descriptor_hwm SIGNAL warmcopy_nontarget_hwm WAIT_FOR warmcopy_nontarget_continue';
---send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+--send DRAIN TRANSACTIONS PRESERVE
 
 --connection default
 SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_nontarget_hwm TIMEOUT 10';

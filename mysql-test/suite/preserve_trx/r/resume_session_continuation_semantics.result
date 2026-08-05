@@ -35,7 +35,7 @@ SET SESSION auto_increment_increment=7;
 SET SESSION auto_increment_offset=3;
 START TRANSACTION;
 UPDATE t_resume_session_seed SET v=11 WHERE id=1;
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 RESUME PRESERVED TRANSACTION 'TOKEN';
 ERROR 42000: Access denied; you need (at least one of) the SUPER, SYSTEM_VARIABLES_ADMIN or SESSION_VARIABLES_ADMIN privilege(s) for this operation
 SET SESSION binlog_format=STATEMENT;

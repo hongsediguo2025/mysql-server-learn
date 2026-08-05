@@ -205,7 +205,7 @@ EOF
 --source include/wait_for_pattern_in_file.inc
 
 --error ER_PRESERVE_TRX_UNSUPPORTED
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 
 --exec echo continue > $raw_cursor_continue
 --let $grep_pattern= preserve_rejects_open_server_cursor_done

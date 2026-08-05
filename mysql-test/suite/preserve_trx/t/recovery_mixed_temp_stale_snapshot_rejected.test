@@ -36,7 +36,7 @@ UPDATE t_mixed_stale_snapshot SET v=21 WHERE id=2;
 --connection default
 SET SESSION debug="+d,preserve_trx_batch_fail_after_one_target,preserve_trx_fail_delete_snapshot_files";
 --error ER_PRESERVE_TRX_BATCH_CLEANUP_FAILED
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SET SESSION debug="-d,preserve_trx_batch_fail_after_one_target,preserve_trx_fail_delete_snapshot_files";
 
 SELECT COUNT(*) AS preserved_count_before_restart

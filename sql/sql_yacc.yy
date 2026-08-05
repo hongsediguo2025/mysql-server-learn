@@ -1467,7 +1467,6 @@ void warn_about_deprecated_binary(THD *thd)
 
 %type <ulonglong_number>
         ulonglong_num real_ulonglong_num size_number
-        preserve_trx_timeout_num
 
 %type <preserve_trx_options>
         preserve_trx_with_clause
@@ -2302,8 +2301,6 @@ drain_transactions_preserve_stmt:
           opt_drain_preserve_trx_clauses
           {
             Lex->sql_command= SQLCOM_DRAIN_TRANSACTIONS_PRESERVE;
-            Lex->preserve_trx_has_timeout= $4.has_timeout;
-            Lex->preserve_trx_timeout_seconds= $4.timeout_seconds;
             Lex->preserve_trx_user_vars_mode=
               static_cast<uint>($4.user_vars_mode);
           }
@@ -2330,18 +2327,7 @@ opt_drain_preserve_trx_clauses:
         ;
 
 preserve_trx_with_clause:
-          WITH ident preserve_trx_timeout_num
-          {
-            if (!is_identifier($2, "TIMEOUT"))
-            {
-              YYTHD->syntax_error_at(@2);
-              MYSQL_YYABORT;
-            }
-            $$.init();
-            $$.has_timeout= true;
-            $$.timeout_seconds= $3;
-          }
-        | WITH USER ident
+          WITH USER ident
           {
             if (!is_identifier($3, "VARS"))
             {
@@ -12236,12 +12222,6 @@ real_ulonglong_num:
         | ULONGLONG_NUM { int error; $$= (ulonglong) my_strtoll10($1.str, nullptr, &error); }
         | LONG_NUM      { int error; $$= (ulonglong) my_strtoll10($1.str, nullptr, &error); }
         | dec_num_error { MYSQL_YYABORT; }
-        ;
-
-preserve_trx_timeout_num:
-          NUM           { int error; $$= (ulonglong) my_strtoll10($1.str, nullptr, &error); }
-        | LONG_NUM      { int error; $$= (ulonglong) my_strtoll10($1.str, nullptr, &error); }
-        | ULONGLONG_NUM { int error; $$= (ulonglong) my_strtoll10($1.str, nullptr, &error); }
         ;
 
 dec_num_error:

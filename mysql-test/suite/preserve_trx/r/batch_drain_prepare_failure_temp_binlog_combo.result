@@ -15,7 +15,7 @@ INSERT INTO tmp_batch_prepare_combo VALUES(1,100);
 START TRANSACTION;
 INSERT INTO t_batch_prepare_temp_binlog VALUES(1,10);
 SET SESSION debug="+d,pfx_prepare_low";
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300 WITH USER VARS;
+DRAIN TRANSACTIONS PRESERVE WITH USER VARS;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 SET SESSION debug="-d,pfx_prepare_low";
 SELECT COUNT(*) AS preserved_count_after_ha_prepare_failure
@@ -33,7 +33,7 @@ INSERT INTO tmp_batch_prepare_combo VALUES(2,200);
 START TRANSACTION;
 INSERT INTO t_batch_prepare_temp_binlog VALUES(3,30);
 SET SESSION debug="+d,pfx_temp_prepare";
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300 WITH USER VARS;
+DRAIN TRANSACTIONS PRESERVE WITH USER VARS;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 SET SESSION debug="-d,pfx_temp_prepare";
 SELECT COUNT(*) AS preserved_count_after_temp_prepare_failure

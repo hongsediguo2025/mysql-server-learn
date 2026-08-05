@@ -7,7 +7,7 @@ CREATE TABLE t_preserve_error_codes(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_preserve_error_codes VALUES(1,10);
 START TRANSACTION;
 UPDATE t_preserve_error_codes SET b=11 WHERE a=1;
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 CREATE USER preserve_error_reader@localhost;
 RESUME PRESERVED TRANSACTION 'TOKEN';
 ERROR HY000: Access denied for preserved transaction

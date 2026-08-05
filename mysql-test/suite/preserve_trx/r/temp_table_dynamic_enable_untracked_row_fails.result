@@ -7,7 +7,7 @@ START TRANSACTION;
 INSERT INTO t_dynamic_enable_base VALUES(1, 1);
 INSERT INTO tmp_dynamic_enable VALUES(1, 10);
 SET GLOBAL preserve_trx_temp_table_enable=ON;
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 ROLLBACK;
 DROP TEMPORARY TABLE tmp_dynamic_enable;

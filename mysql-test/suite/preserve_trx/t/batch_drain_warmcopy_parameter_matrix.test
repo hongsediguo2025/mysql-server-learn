@@ -18,7 +18,7 @@ GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
 --let $old_preserve_trx_enable= `SELECT @@GLOBAL.preserve_trx_enable`
 --let $old_preserve_trx_warmcopy_enable= `SELECT @@GLOBAL.preserve_trx_warmcopy_enable`
 --let $old_preserve_trx_warmcopy_min_open_ms= `SELECT @@GLOBAL.preserve_trx_warmcopy_min_open_ms`
---let $old_preserve_trx_warmcopy_close_timeout_ms= `SELECT @@GLOBAL.preserve_trx_warmcopy_close_timeout_ms`
+--let $old_preserve_trx_drain_phase2_timeout_ms= `SELECT @@GLOBAL.preserve_trx_drain_phase2_timeout_ms`
 --let $old_preserve_trx_lock_warmcopy_enable= `SELECT @@GLOBAL.preserve_trx_lock_warmcopy_enable`
 --let $old_preserve_trx_lock_warmcopy_fallback= `SELECT @@GLOBAL.preserve_trx_lock_warmcopy_fallback_to_live_export`
 --let $old_preserve_trx_recovery_max_count= `SELECT @@GLOBAL.preserve_trx_recovery_max_count`
@@ -26,7 +26,7 @@ GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
 
 SET GLOBAL preserve_trx_enable=ON;
 SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
-SET GLOBAL preserve_trx_warmcopy_close_timeout_ms=5000;
+SET GLOBAL preserve_trx_drain_phase2_timeout_ms=5000;
 SET GLOBAL preserve_trx_recovery_max_count=10;
 SET GLOBAL preserve_trx_single_phase_max_binlog_cache_bytes=1048576;
 
@@ -57,7 +57,7 @@ UPDATE t_warmcopy_parameter_matrix
 SET DEBUG_SYNC =
   'preserve_trx_warmcopy_after_closing_state_before_targets SIGNAL warmcopy_matrix_binlog_closing WAIT_FOR warmcopy_matrix_binlog_continue';
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
---send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+--send DRAIN TRANSACTIONS PRESERVE
 
 --connection warmcopy_matrix_binlog_control
 SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_matrix_binlog_closing TIMEOUT 10';
@@ -107,7 +107,7 @@ UPDATE t_warmcopy_parameter_matrix
 SET DEBUG_SYNC =
   'preserve_trx_warmcopy_after_closing_state_before_targets SIGNAL warmcopy_matrix_lock_closing WAIT_FOR warmcopy_matrix_lock_continue';
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
---send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+--send DRAIN TRANSACTIONS PRESERVE
 
 --connection warmcopy_matrix_lock_control
 SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_matrix_lock_closing TIMEOUT 10';
@@ -157,7 +157,7 @@ UPDATE t_warmcopy_parameter_matrix
 SET DEBUG_SYNC =
   'preserve_trx_warmcopy_after_closing_state_before_targets SIGNAL warmcopy_matrix_both_closing WAIT_FOR warmcopy_matrix_both_continue';
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
---send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+--send DRAIN TRANSACTIONS PRESERVE
 
 --connection warmcopy_matrix_both_control
 SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_matrix_both_closing TIMEOUT 10';
@@ -200,7 +200,7 @@ DROP USER preserve_trx_ha_admin@localhost;
 --eval SET GLOBAL preserve_trx_recovery_max_count=$old_preserve_trx_recovery_max_count
 --eval SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=$old_preserve_trx_lock_warmcopy_fallback
 --eval SET GLOBAL preserve_trx_lock_warmcopy_enable=$old_preserve_trx_lock_warmcopy_enable
---eval SET GLOBAL preserve_trx_warmcopy_close_timeout_ms=$old_preserve_trx_warmcopy_close_timeout_ms
+--eval SET GLOBAL preserve_trx_drain_phase2_timeout_ms=$old_preserve_trx_drain_phase2_timeout_ms
 --eval SET GLOBAL preserve_trx_warmcopy_min_open_ms=$old_preserve_trx_warmcopy_min_open_ms
 --eval SET GLOBAL preserve_trx_warmcopy_enable=$old_preserve_trx_warmcopy_enable
 --eval SET GLOBAL preserve_trx_enable=$old_preserve_trx_enable

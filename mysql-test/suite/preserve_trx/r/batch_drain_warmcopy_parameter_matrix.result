@@ -1,7 +1,7 @@
 DROP TABLE IF EXISTS t_warmcopy_parameter_matrix;
 SET GLOBAL preserve_trx_enable=ON;
 SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
-SET GLOBAL preserve_trx_warmcopy_close_timeout_ms=5000;
+SET GLOBAL preserve_trx_drain_phase2_timeout_ms=5000;
 SET GLOBAL preserve_trx_recovery_max_count=10;
 SET GLOBAL preserve_trx_single_phase_max_binlog_cache_bytes=1048576;
 CREATE TABLE t_warmcopy_parameter_matrix(
@@ -22,7 +22,7 @@ SET v=11, pad=REPEAT('x',32)
 WHERE id=1;
 SET DEBUG_SYNC =
 'preserve_trx_warmcopy_after_closing_state_before_targets SIGNAL warmcopy_matrix_binlog_closing WAIT_FOR warmcopy_matrix_binlog_continue';
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_matrix_binlog_closing TIMEOUT 10';
 SELECT 'binlog_only_two_phase_observed' AS matrix_case;
 matrix_case
@@ -47,7 +47,7 @@ SET v=22, pad=REPEAT('y',32)
 WHERE id=2;
 SET DEBUG_SYNC =
 'preserve_trx_warmcopy_after_closing_state_before_targets SIGNAL warmcopy_matrix_lock_closing WAIT_FOR warmcopy_matrix_lock_continue';
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_matrix_lock_closing TIMEOUT 10';
 SELECT 'lock_only_two_phase_observed' AS matrix_case;
 matrix_case
@@ -72,7 +72,7 @@ SET v=33, pad=REPEAT('z',32)
 WHERE id=3;
 SET DEBUG_SYNC =
 'preserve_trx_warmcopy_after_closing_state_before_targets SIGNAL warmcopy_matrix_both_closing WAIT_FOR warmcopy_matrix_both_continue';
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_matrix_both_closing TIMEOUT 10';
 SELECT 'both_warmcopy_two_phase_observed' AS matrix_case;
 matrix_case

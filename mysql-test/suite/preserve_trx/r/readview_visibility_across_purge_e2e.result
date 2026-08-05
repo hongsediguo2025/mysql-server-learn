@@ -14,7 +14,7 @@ WHERE id <= 5;
 original_count	original_sum
 5	150
 UPDATE t_readview_visibility_purge SET v=1001 WHERE id=100;
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SELECT HAS_READ_VIEW, RV_LOW_LIMIT_NO > 0 AS has_low_limit
 FROM performance_schema.preserved_transactions;
 HAS_READ_VIEW	has_low_limit

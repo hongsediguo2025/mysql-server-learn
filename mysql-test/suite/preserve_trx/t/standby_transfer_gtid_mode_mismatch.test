@@ -39,7 +39,7 @@ SET GLOBAL preserve_trx_warmcopy_enable=OFF;
 SET GLOBAL preserve_trx_lock_warmcopy_enable=OFF;
 SET GLOBAL preserve_trx_transfer_prewarm_paused=ON;
 SET GLOBAL preserve_trx_transfer_receiver_prewarm_timeout_ms=30000;
-SET GLOBAL preserve_trx_transfer_receiver_ready_timeout_ms=120000;
+SET GLOBAL preserve_trx_token_retention_timeout_ms=120000;
 
 --connect(standby_transfer_gtid_mismatch_ha,127.0.0.1,preserve_trx_ha_admin,standby-transfer-gtid-mismatch-secret,test,$SERVER_MYPORT_1,)
 
@@ -61,7 +61,7 @@ UPDATE t_standby_transfer_gtid_mismatch SET v=11 WHERE id=1;
 --connection default
 --replace_result $app_id APP_ID
 --replace_column 1 GENERATION 6 CLOSING_STARTED_US 7 CLOSING_DEADLINE_US
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 
 # The artifact was captured under ON. Resume the paused receiver only after its
 # runtime mode changes, so the token must fail at the semantic gate rather than

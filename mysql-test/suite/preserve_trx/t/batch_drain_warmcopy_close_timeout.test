@@ -9,7 +9,8 @@ DROP TABLE IF EXISTS t_warmcopy_timeout;
 SET GLOBAL preserve_trx_enable=ON;
 SET GLOBAL preserve_trx_warmcopy_enable=ON;
 SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
-SET GLOBAL preserve_trx_warmcopy_close_timeout_ms=1;
+SET GLOBAL preserve_trx_drain_phase1_timeout_ms=1;
+SET GLOBAL preserve_trx_drain_phase2_timeout_ms=100;
 
 CREATE TABLE t_warmcopy_timeout(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
 INSERT INTO t_warmcopy_timeout VALUES(1,10);
@@ -26,14 +27,17 @@ SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_timeout_blocked TIMEOUT 10';
 
 --connect(warmcopy_timeout_owner, localhost, root,,test)
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
---send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+SET DEBUG_SYNC =
+  'preserve_trx_warmcopy_after_closing_state_before_targets SIGNAL warmcopy_timeout_closing';
+--send DRAIN TRANSACTIONS PRESERVE
 
 --connection default
---sleep 1
+SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_timeout_closing TIMEOUT 10';
+--sleep 0.2
 SET DEBUG_SYNC = 'now SIGNAL warmcopy_timeout_continue';
 
 --connection warmcopy_timeout_owner
---error ER_PRESERVE_TRX_UNSUPPORTED
+--error ER_PRESERVE_TRX_DRAIN_TIMEOUT
 --reap
 --disconnect warmcopy_timeout_owner
 --remove_file $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
@@ -52,7 +56,8 @@ SELECT * FROM t_warmcopy_timeout;
 
 DROP TABLE t_warmcopy_timeout;
 SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_close_timeout_ms=30000;
+SET GLOBAL preserve_trx_drain_phase1_timeout_ms=600000;
+SET GLOBAL preserve_trx_drain_phase2_timeout_ms=30000;
 SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
 SET GLOBAL preserve_trx_warmcopy_enable=ON;
 SET DEBUG_SYNC = 'RESET';

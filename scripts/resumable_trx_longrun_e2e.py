@@ -74,6 +74,7 @@ def longrun_native_warmcopy_required_total_bytes(config: "LongRunConfig") -> int
 
 def longrun_native_preserve_runtime_settings(
     config: "LongRunConfig",
+    drain_timeout_s: float = 300.0,
 ) -> Dict[str, object]:
     preserve_capacity = max(
         LONGRUN_NATIVE_MIN_PRESERVE_CAPACITY, config.sessions + 64
@@ -82,6 +83,7 @@ def longrun_native_preserve_runtime_settings(
         LONGRUN_NATIVE_WARMCOPY_MAX_TOTAL_BYTES,
         longrun_native_warmcopy_required_total_bytes(config),
     )
+    timeout_ms = max(1, int(math.ceil(drain_timeout_s * 1000.0)))
     return {
         "preserve_trx_enable": "ON" if config.preserve_enabled else "OFF",
         "preserve_trx_temp_table_enable": (
@@ -97,6 +99,8 @@ def longrun_native_preserve_runtime_settings(
             LONGRUN_NATIVE_WARMCOPY_TAIL_BUDGET_BYTES
         ),
         "preserve_trx_warmcopy_max_total_bytes": warmcopy_total,
+        "preserve_trx_drain_phase2_timeout_ms": timeout_ms,
+        "preserve_trx_token_retention_timeout_ms": min(3_600_000, timeout_ms),
     }
 
 
@@ -997,10 +1001,6 @@ class MysqlCycleRuntimeOptions:
     phase_kill_delay_s: float = 0.05
 
 
-def mysql_integer_timeout_literal(timeout_s: float) -> str:
-    return str(max(0, int(math.ceil(timeout_s))))
-
-
 class MysqlCycleRuntime:
     def __init__(
         self,
@@ -1041,7 +1041,12 @@ class MysqlCycleRuntime:
         self._failure_contract_results = []
 
     def configure_preserve_runtime(self, conn, config: LongRunConfig) -> Dict[str, object]:
-        statements = longrun_native_preserve_runtime_sql(config)
+        settings = longrun_native_preserve_runtime_settings(
+            config, self.options.drain_timeout_s
+        )
+        statements = [
+            f"SET GLOBAL {name}={value}" for name, value in settings.items()
+        ]
         cur = None
         try:
             cur = conn.cursor()
@@ -1052,7 +1057,7 @@ class MysqlCycleRuntime:
                 cur.close()
         return {
             "status": "pass",
-            "settings": longrun_native_preserve_runtime_settings(config),
+            "settings": settings,
         }
 
     def _default_restart_runner(self, command: str) -> object:
@@ -1471,9 +1476,7 @@ CREATE TEMPORARY TABLE {table} (
             try:
                 self.execute(
                     conn,
-                    "DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT "
-                    f"{mysql_integer_timeout_literal(self.options.drain_timeout_s)} "
-                    "WITH USER VARS",
+                    "DRAIN TRANSACTIONS PRESERVE WITH USER VARS",
                 )
             except Exception as exc:
                 if not self.is_connection_error(exc):

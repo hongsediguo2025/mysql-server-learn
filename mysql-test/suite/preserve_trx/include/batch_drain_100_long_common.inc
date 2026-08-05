@@ -37,6 +37,7 @@ if (!$batch_long_restart_options)
 --disable_result_log
 --source $batch_long_cleanup_file
 --source $batch_long_setup_file
+SET GLOBAL preserve_trx_token_retention_timeout_ms=3600000;
 DROP PROCEDURE IF EXISTS p_batch_long_apply_end_action;
 DELIMITER |;
 CREATE PROCEDURE p_batch_long_apply_end_action()
@@ -93,10 +94,10 @@ SELECT MIN(TIMESTAMPDIFF(MICROSECOND, started_at, NOW(6))) >= 5000000
   FROM t_batch_long_control;
 
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 86400 WITH USER VARS;
+DRAIN TRANSACTIONS PRESERVE WITH USER VARS;
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 
---exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=200 --max-connections=400 $batch_long_restart_options" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=200 --preserve-trx-token-retention-timeout-ms=3600000 --max-connections=400 $batch_long_restart_options" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 # Debug big-test matrices can spend longer than the default 100s reconnect
 # window inside preserved transaction recovery.

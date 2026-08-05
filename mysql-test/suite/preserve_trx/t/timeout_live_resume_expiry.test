@@ -10,9 +10,6 @@ DROP TABLE IF EXISTS t_timeout_live_resume_expiry;
 --enable_warnings
 
 SET GLOBAL preserve_trx_enable=ON;
-SET SESSION preserve_trx_min_timeout=1;
-SET SESSION preserve_trx_default_timeout=1;
-SET SESSION preserve_trx_max_timeout=86400;
 
 CREATE TABLE t_timeout_live_resume_expiry(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_timeout_live_resume_expiry VALUES(1,10);
@@ -21,7 +18,7 @@ START TRANSACTION;
 UPDATE t_timeout_live_resume_expiry SET b=11 WHERE a=1;
 
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
---let $preserve_trx_drain_one_second_timeout= 1
+--let $preserve_trx_one_second_retention= 1
 --let $preserve_trx_drain_clause=
 --source suite/preserve_trx/include/drain_transaction_from_control.inc
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc

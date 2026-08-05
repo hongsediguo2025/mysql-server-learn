@@ -8,7 +8,7 @@ UPDATE t_recover_record_lock_offset_change SET b=21 WHERE a=2;
 SELECT * FROM t_recover_record_lock_offset_change WHERE a=1 FOR SHARE;
 a	b
 1	10
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 # restart: --preserve-trx-enable=ON --debug=d,preserve_trx_corrupt_import_record_lock_offsets
 SELECT COUNT(*) AS preserved_count_after_offset_change
 FROM performance_schema.preserved_transactions;

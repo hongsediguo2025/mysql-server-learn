@@ -7,7 +7,7 @@ SELECT * FROM t_resume_failure WHERE a=1 FOR UPDATE;
 a	b
 1	10
 UPDATE t_resume_failure SET b=11 WHERE a=1;
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SET SESSION sql_log_bin=0;
 SET @@session.last_insert_id=987;
 SELECT @@session.sql_log_bin AS sql_log_bin_before_failed_resume;

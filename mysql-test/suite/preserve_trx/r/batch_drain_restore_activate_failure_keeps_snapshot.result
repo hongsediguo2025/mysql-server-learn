@@ -10,7 +10,7 @@ INSERT INTO t_batch_restore_activate_failure VALUES(1,10);
 START TRANSACTION;
 INSERT INTO t_batch_restore_activate_failure VALUES(2,20);
 SET SESSION debug="+d,preserve_trx_batch_fail_after_one_target,preserve_trx_fail_activate_reattached_original";
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 SET SESSION debug="-d,preserve_trx_batch_fail_after_one_target,preserve_trx_fail_activate_reattached_original";
 SELECT COUNT(*) AS preserved_count

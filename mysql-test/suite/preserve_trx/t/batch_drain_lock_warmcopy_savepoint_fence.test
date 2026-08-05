@@ -30,7 +30,7 @@ SET SESSION debug="+d,preserve_trx_lock_warmcopy_force_savepoint_final_fence_cha
 --connection default
 SET SESSION debug="+d,preserve_trx_lock_warmcopy_force_savepoint_final_fence_changed";
 --error ER_PRESERVE_TRX_UNSUPPORTED
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SET SESSION debug="-d,preserve_trx_lock_warmcopy_force_savepoint_final_fence_changed";
 SELECT COUNT(*) AS preserved_count_after_savepoint_fence_reject
   FROM performance_schema.preserved_transactions;

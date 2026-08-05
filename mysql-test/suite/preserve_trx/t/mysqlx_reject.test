@@ -20,7 +20,7 @@ SET GLOBAL preserve_trx_enable=ON;
 -->recvresult
 -->stmtsql UPDATE xtest.t_mysqlx_reject SET b=11 WHERE a=1;
 -->recvresult
--->stmtsql DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+-->stmtsql DRAIN TRANSACTIONS PRESERVE;
 -->expecterror ER_PLUGGABLE_PROTOCOL_COMMAND_NOT_SUPPORTED
 -->recvresult
 -->stmtsql SELECT COUNT(*) AS preserved_count FROM performance_schema.preserved_transactions;

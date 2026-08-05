@@ -8,7 +8,7 @@ INSERT INTO t_snapshot_header_corrupt_matrix VALUES(1,10);
 # corrupt snapshot magic
 START TRANSACTION;
 UPDATE t_snapshot_header_corrupt_matrix SET v=11 WHERE id=1;
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 # restart: --preserve-trx-enable=ON --skip-log-bin
 include/wait_for_pattern_in_file.inc [Preserved transaction .* recovery forced rollback: preserved transaction snapshot tainted: startup snapshot is unreadable or mismatched]
 SELECT COUNT(*) AS preserved_count_after_corrupt_header
@@ -21,7 +21,7 @@ id	v
 # corrupt snapshot format version
 START TRANSACTION;
 UPDATE t_snapshot_header_corrupt_matrix SET v=11 WHERE id=1;
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 # restart: --preserve-trx-enable=ON --skip-log-bin
 include/wait_for_pattern_in_file.inc [Preserved transaction .* recovery forced rollback: preserved transaction snapshot tainted: startup snapshot is unreadable or mismatched]
 SELECT COUNT(*) AS preserved_count_after_corrupt_header
@@ -34,7 +34,7 @@ id	v
 # corrupt snapshot header size
 START TRANSACTION;
 UPDATE t_snapshot_header_corrupt_matrix SET v=11 WHERE id=1;
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 # restart: --preserve-trx-enable=ON --skip-log-bin
 include/wait_for_pattern_in_file.inc [Preserved transaction .* recovery forced rollback: preserved transaction snapshot tainted: startup snapshot is unreadable or mismatched]
 SELECT COUNT(*) AS preserved_count_after_corrupt_header
@@ -47,7 +47,7 @@ id	v
 # corrupt snapshot mysql version id
 START TRANSACTION;
 UPDATE t_snapshot_header_corrupt_matrix SET v=11 WHERE id=1;
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 # restart: --preserve-trx-enable=ON --skip-log-bin
 include/wait_for_pattern_in_file.inc [Preserved transaction .* recovery forced rollback: preserved transaction snapshot tainted: startup snapshot is unreadable or mismatched]
 SELECT COUNT(*) AS preserved_count_after_corrupt_header
@@ -60,7 +60,7 @@ id	v
 # corrupt snapshot payload size
 START TRANSACTION;
 UPDATE t_snapshot_header_corrupt_matrix SET v=11 WHERE id=1;
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 # restart: --preserve-trx-enable=ON --skip-log-bin
 include/wait_for_pattern_in_file.inc [Preserved transaction .* recovery forced rollback: preserved transaction snapshot tainted: startup snapshot is unreadable or mismatched]
 SELECT COUNT(*) AS preserved_count_after_corrupt_header
@@ -73,7 +73,7 @@ id	v
 # corrupt snapshot server uuid
 START TRANSACTION;
 UPDATE t_snapshot_header_corrupt_matrix SET v=11 WHERE id=1;
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 # restart: --preserve-trx-enable=ON --skip-log-bin
 include/wait_for_pattern_in_file.inc [Preserved transaction .* recovery forced rollback: preserved transaction snapshot tainted: startup snapshot is unreadable or mismatched]
 SELECT COUNT(*) AS preserved_count_after_corrupt_header
@@ -86,7 +86,7 @@ id	v
 # corrupt snapshot datadir fingerprint
 START TRANSACTION;
 UPDATE t_snapshot_header_corrupt_matrix SET v=11 WHERE id=1;
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 # restart: --preserve-trx-enable=ON --skip-log-bin
 include/wait_for_pattern_in_file.inc [Preserved transaction .* recovery forced rollback: preserved transaction snapshot tainted: startup snapshot is unreadable or mismatched]
 SELECT COUNT(*) AS preserved_count_after_corrupt_header
@@ -99,7 +99,7 @@ id	v
 # corrupt snapshot crc
 START TRANSACTION;
 UPDATE t_snapshot_header_corrupt_matrix SET v=11 WHERE id=1;
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 # restart: --preserve-trx-enable=ON --skip-log-bin
 include/wait_for_pattern_in_file.inc [Preserved transaction .* recovery forced rollback: preserved transaction snapshot tainted: startup snapshot is unreadable or mismatched]
 SELECT COUNT(*) AS preserved_count_after_corrupt_header
@@ -112,7 +112,7 @@ id	v
 # corrupt snapshot first tlv byte
 START TRANSACTION;
 UPDATE t_snapshot_header_corrupt_matrix SET v=11 WHERE id=1;
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 # restart: --preserve-trx-enable=ON --skip-log-bin
 include/wait_for_pattern_in_file.inc [Preserved transaction .* recovery forced rollback: preserved transaction snapshot tainted: startup snapshot is unreadable or mismatched]
 SELECT COUNT(*) AS preserved_count_after_corrupt_header

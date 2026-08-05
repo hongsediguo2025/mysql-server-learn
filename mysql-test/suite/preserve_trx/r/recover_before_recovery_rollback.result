@@ -7,7 +7,7 @@ SELECT * FROM t_recover_before_rollback WHERE a=1 FOR UPDATE;
 a	b
 1	10
 UPDATE t_recover_before_rollback SET b=11 WHERE a=1;
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 Pattern "PRESERVE: preserved transactions recovered before recovery rollback can observe them" found
 RESUME PRESERVED TRANSACTION 'TOKEN';
 SELECT COUNT(*) AS remaining_preserved

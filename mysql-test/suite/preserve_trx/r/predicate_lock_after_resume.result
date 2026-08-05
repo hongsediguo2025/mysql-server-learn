@@ -26,7 +26,7 @@ SET innodb_lock_wait_timeout=1;
 INSERT INTO t_predicate_lock_after_resume VALUES
 (4, ST_GeomFromText('POINT(2 2)'));
 ERROR HY000: Lock wait timeout exceeded; try restarting transaction
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SELECT COUNT(*) AS recovered_predicate_locks
 FROM performance_schema.data_locks
 WHERE OBJECT_SCHEMA='test'

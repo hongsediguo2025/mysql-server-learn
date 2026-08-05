@@ -2,7 +2,7 @@ DROP TABLE IF EXISTS t_warmcopy_finalize_deadline;
 SET GLOBAL preserve_trx_enable=ON;
 SET GLOBAL preserve_trx_warmcopy_enable=ON;
 SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
-SET GLOBAL preserve_trx_warmcopy_close_timeout_ms=15000;
+SET GLOBAL preserve_trx_drain_phase2_timeout_ms=15000;
 CALL mtr.add_suppression("PRESERVE: session remains QUIESCED while waiting for batch drain to release it");
 CREATE TABLE t_warmcopy_finalize_deadline(
 id INT PRIMARY KEY,
@@ -19,7 +19,7 @@ SET DEBUG_SYNC =
 'preserve_trx_batch_after_targets_quiesced_before_attach SIGNAL warmcopy_finalize_ready WAIT_FOR warmcopy_finalize_continue';
 SET DEBUG_SYNC =
 'preserve_trx_batch_after_one_target_preserved SIGNAL warmcopy_finalize_preserved WAIT_FOR warmcopy_finalize_preserved_continue';
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_finalize_closing TIMEOUT 10';
 SELECT 1;
 SET DEBUG_SYNC = 'now SIGNAL warmcopy_finalize_targets';
@@ -46,7 +46,7 @@ id	payload_len	payload_ok
 2	512	1
 DROP TABLE t_warmcopy_finalize_deadline;
 SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_close_timeout_ms=30000;
+SET GLOBAL preserve_trx_drain_phase2_timeout_ms=30000;
 SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
 SET GLOBAL preserve_trx_warmcopy_enable=ON;
 SET DEBUG_SYNC = 'RESET';

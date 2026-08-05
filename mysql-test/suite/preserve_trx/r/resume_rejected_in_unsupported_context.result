@@ -15,7 +15,7 @@ ENGINE=InnoDB;
 INSERT INTO t_resume_unsupported_context VALUES(1,10);
 START TRANSACTION;
 UPDATE t_resume_unsupported_context SET v=20 WHERE id=1;
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 HANDLER t_resume_unsupported_context OPEN;
 RESUME PRESERVED TRANSACTION 'TOKEN';
 ERROR HY000: Resumable transactions across shutdown do not support this operation

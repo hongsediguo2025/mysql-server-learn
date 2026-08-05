@@ -7,7 +7,7 @@ v INT
 INSERT INTO t_table_lock_tlv_import_isolated VALUES(1,10),(2,20);
 START TRANSACTION;
 UPDATE t_table_lock_tlv_import_isolated SET v=21 WHERE id=2;
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SELECT COUNT(*) > 0 AS recovered_ix_from_table_lock_tlv
 FROM performance_schema.data_locks
 WHERE OBJECT_SCHEMA='test'

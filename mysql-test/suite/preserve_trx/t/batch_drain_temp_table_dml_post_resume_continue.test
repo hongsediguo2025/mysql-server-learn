@@ -119,7 +119,7 @@ SET GLOBAL preserve_trx_max_temp_sidecar_bytes=1073741824;
 --source include/wait_condition.inc
 
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300 WITH USER VARS;
+DRAIN TRANSACTIONS PRESERVE WITH USER VARS;
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 
 --exec echo "restart: --preserve-trx-enable=ON --preserve-trx-temp-table-enable=ON --preserve-trx-lock-warmcopy-enable=OFF --preserve-trx-recovery-max-count=20 --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect

@@ -1,20 +1,17 @@
 # Execute DRAIN from a control connection while preserving the caller's
 # business connection as the drain target.
 #
-# Required input:
-#   $preserve_trx_drain_clause
-#     The optional DRAIN suffix, for example "WITH TIMEOUT 300".
 # Optional input:
-#   $preserve_trx_drain_one_second_timeout
-#     Configure the control THD's timeout bounds for one-second expiry tests.
+#   $preserve_trx_drain_clause
+#     The optional DRAIN suffix, for example "WITH USER VARS".
+#   $preserve_trx_one_second_retention
+#     Configure one-second preserved-token retention for expiry tests.
 
 --let $_preserve_trx_drain_target_connection= $CURRENT_CONNECTION
 --connect(preserve_trx_drain_control,localhost,root,,test)
-if ($preserve_trx_drain_one_second_timeout) {
+if ($preserve_trx_one_second_retention) {
   --disable_query_log
-  SET SESSION preserve_trx_min_timeout=1;
-  SET SESSION preserve_trx_default_timeout=1;
-  SET SESSION preserve_trx_max_timeout=86400;
+  SET GLOBAL preserve_trx_token_retention_timeout_ms=1000;
   --enable_query_log
 }
 if (!$preserve_trx_drain_clause) {
@@ -28,4 +25,4 @@ if ($preserve_trx_drain_clause) {
 
 --let $_preserve_trx_drain_target_connection=
 --let $preserve_trx_drain_clause=
---let $preserve_trx_drain_one_second_timeout=
+--let $preserve_trx_one_second_retention=

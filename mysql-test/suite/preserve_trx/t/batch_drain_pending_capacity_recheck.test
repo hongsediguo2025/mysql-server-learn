@@ -29,7 +29,7 @@ SET GLOBAL preserve_trx_batch_max_transactions=1;
 --connect(batch_pending_capacity_owner,localhost,root,,test)
 --connection batch_pending_capacity_owner
 --error ER_PRESERVE_TRX_UNSUPPORTED
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 --disconnect batch_pending_capacity_owner
 
 --connection batch_pending_capacity_a

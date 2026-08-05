@@ -11,7 +11,7 @@ v INT
 START TRANSACTION;
 SET SESSION debug="+d,preserve_trx_keep_autoinc_lock_at_statement_end";
 INSERT INTO t_lock_warmcopy_autoinc(v) VALUES(10);
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 include/assert_grep.inc [lock warmcopy succeeds for autoinc table lock]
 SELECT COUNT(*) AS preserved_count_after_autoinc_warmcopy
 FROM performance_schema.preserved_transactions;

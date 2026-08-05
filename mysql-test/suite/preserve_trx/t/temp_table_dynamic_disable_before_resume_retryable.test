@@ -12,9 +12,6 @@ DROP TABLE IF EXISTS t_temp_dynamic_disable_base;
 
 SET GLOBAL preserve_trx_enable=ON;
 SET GLOBAL preserve_trx_temp_table_enable=ON;
-SET SESSION preserve_trx_min_timeout=1;
-SET SESSION preserve_trx_default_timeout=1;
-SET SESSION preserve_trx_max_timeout=86400;
 
 CREATE TABLE t_temp_dynamic_disable_base(id INT PRIMARY KEY, v INT)
   ENGINE=InnoDB;
@@ -31,7 +28,7 @@ START TRANSACTION;
 UPDATE t_temp_dynamic_disable_base SET v=11 WHERE id=1;
 
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
---let $preserve_trx_drain_one_second_timeout= 1
+--let $preserve_trx_one_second_retention= 1
 --let $preserve_trx_drain_clause=
 --source suite/preserve_trx/include/drain_transaction_from_control.inc
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc

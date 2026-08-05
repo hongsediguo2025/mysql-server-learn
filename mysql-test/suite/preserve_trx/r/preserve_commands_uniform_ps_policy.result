@@ -5,7 +5,7 @@ SET GLOBAL preserve_trx_enable=ON;
 binary_ps_prepare_drain_unsupported
 binary_ps_prepare_resume_unsupported
 binary_ps_prepare_show_unsupported
-PREPARE drain_stmt FROM 'DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300';
+PREPARE drain_stmt FROM 'DRAIN TRANSACTIONS PRESERVE';
 ERROR HY000: This command is not supported in the prepared statement protocol yet
 DEALLOCATE PREPARE drain_stmt;
 ERROR HY000: Unknown prepared statement handler (drain_stmt) given to DEALLOCATE PREPARE

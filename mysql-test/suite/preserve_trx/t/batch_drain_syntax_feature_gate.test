@@ -12,7 +12,7 @@ DROP TABLE drain;
 --error ER_PRESERVE_TRX_DISABLED
 DRAIN TRANSACTIONS PRESERVE;
 --error ER_PRESERVE_TRX_DISABLED
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300 NO USER VARS;
+DRAIN TRANSACTIONS PRESERVE NO USER VARS;
 
 --let $restart_parameters= restart: --preserve-trx-enable=ON
 --source include/restart_mysqld.inc

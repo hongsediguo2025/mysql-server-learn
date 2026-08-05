@@ -35,7 +35,7 @@ explicit_insert_lock_materialized
 1
 SET DEBUG_SYNC =
 'preserve_trx_warmcopy_after_phase1_open SIGNAL lock_wc_explicit_to_implicit_open WAIT_FOR lock_wc_explicit_to_implicit_continue';
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SET DEBUG_SYNC = 'now WAIT_FOR lock_wc_explicit_to_implicit_open TIMEOUT 10';
 ROLLBACK TO SAVEPOINT keep_one;
 SET DEBUG_SYNC = 'now SIGNAL lock_wc_explicit_to_implicit_continue';

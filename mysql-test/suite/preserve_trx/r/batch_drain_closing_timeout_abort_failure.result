@@ -18,23 +18,3 @@ old_command_completed
 id	v
 1	10
 2	20
-ERROR HY000: Resumable transactions across shutdown do not support this operation
-fail_batch_timeout_detected
-1
-fail_batch_has_no_exclusions
-1
-fail_batch_old_command_completed
-2
-id	v
-1	10
-2	20
-ERROR HY000: Resumable transactions across shutdown do not support this operation
-legacy_fail_batch_timeout_detected
-1
-legacy_fail_batch_has_no_exclusions
-1
-legacy_fail_batch_old_command_completed
-3
-id	v
-1	10
-2	20

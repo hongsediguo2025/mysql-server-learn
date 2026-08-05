@@ -1,4 +1,5 @@
 SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_token_retention_timeout_ms=3600000;
 SET GLOBAL preserve_trx_recovery_max_count=200;
 SELECT COUNT(*) AS mapped_token_count
 FROM t_multi_session_100_tokens;

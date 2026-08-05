@@ -7,7 +7,7 @@ v INT
 INSERT INTO t_p_s_locks_count_table_lock VALUES(1,10),(2,20);
 START TRANSACTION;
 UPDATE t_p_s_locks_count_table_lock SET v=21 WHERE id=2;
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SELECT LOCKS_COUNT >= 2 AS locks_count_includes_table_payload
 FROM performance_schema.preserved_transactions;
 locks_count_includes_table_payload

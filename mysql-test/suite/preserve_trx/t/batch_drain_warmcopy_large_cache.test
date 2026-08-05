@@ -36,7 +36,7 @@ INSERT INTO t_warmcopy_large VALUES(102,2,REPEAT('q',512));
 --connect(warmcopy_large_owner, localhost, root,,test)
 --connection warmcopy_large_owner
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
---send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+--send DRAIN TRANSACTIONS PRESERVE
 
 --connection warmcopy_large_owner
 --reap

@@ -213,7 +213,7 @@ $net_clear_body =~ s/bool preserved_trx_end_idle_for_command_packet.*$//s
 
 die "before-header idle helper must wait via the shared quiesce timeout helper if target is owned by batch drain\n"
   unless $net_clear_body =~ /preserve_trx_batch_state_blocks_target_owner/s &&
-         $net_clear_body =~ /preserve_trx_wait_target_timed_out/s;
+         $net_clear_body =~ /preserve_trx_wait_for_drain_owner/s;
 
 my $blocks_target_owner =
   extract_function_body($preserve_src,
@@ -297,11 +297,13 @@ die "pending-quiesce publisher must resolve to QUIESCED or DRAINED_NO_TRANSACTIO
 
 $preserve_src =~ /class Preserve_batch_quiesced_idle_target.*?^};/ms
   or die "could not isolate Preserve_batch_quiesced_idle_target\n";
-my $quiesced_target = $&;
+my $quiesced_target_recheck = $&;
 die "quiesced in-flight targets must recheck common unsupported context before preserve helper\n"
-  unless $quiesced_target =~ /preserve_trx_is_unsupported_common_context/s &&
-         index($quiesced_target, 'preserve_trx_is_unsupported_common_context') <
-         index($quiesced_target, 'preserve_trx_preserve_attached_transaction');
+  unless $quiesced_target_recheck =~ /preserve_trx_is_unsupported_common_context/s &&
+         index($quiesced_target_recheck,
+               'preserve_trx_is_unsupported_common_context') <
+         index($quiesced_target_recheck,
+               'preserve_trx_preserve_attached_transaction');
 
 die "SQL snapshot deletion helper must delegate through the preserve store\n"
   unless $preserve_src =~

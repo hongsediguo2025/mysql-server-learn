@@ -13,7 +13,7 @@ START TRANSACTION;
 INSERT INTO t_lock_warmcopy_predicate_fallback VALUES(1,10);
 UPDATE t_lock_warmcopy_predicate_fallback SET v=11 WHERE id=1;
 SET SESSION debug="+d,preserve_trx_lock_warmcopy_simulate_predicate_locks";
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 include/assert_grep.inc [lock warmcopy predicate fallback is logged]
 SELECT COUNT(*) AS preserved_count_after_predicate_fallback
 FROM performance_schema.preserved_transactions;
@@ -34,7 +34,7 @@ START TRANSACTION;
 INSERT INTO t_lock_warmcopy_predicate_fallback VALUES(2,20);
 UPDATE t_lock_warmcopy_predicate_fallback SET v=21 WHERE id=2;
 SET SESSION debug="+d,preserve_trx_lock_warmcopy_simulate_predicate_locks";
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 SET SESSION debug="-d,preserve_trx_lock_warmcopy_simulate_predicate_locks";
 SELECT COUNT(*) AS preserved_count_after_predicate_strict_reject

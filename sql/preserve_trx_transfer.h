@@ -49,6 +49,7 @@ struct lock_preserve_record_lock_metadata_facts_t;
 struct Preserve_trx_prepared_token_key;
 
 static constexpr uint16_t kPreserveTrxTransferProtocolVersion = 2;
+static constexpr uint32_t kPreserveTrxTransferOperationTimeoutMs = 30000;
 static constexpr uint16_t kPreserveTrxTransferLockPlanContractVersion =
     kPreservedTrxLockPlanContractVersion;
 static constexpr uint32_t PRESERVE_TRX_TRANSFER_STRICT_ACTIVE_UNDO = 1U << 0;
@@ -94,9 +95,8 @@ extern ulonglong preserve_trx_transfer_max_inflight_bytes;
 extern ulonglong preserve_trx_transfer_io_bytes_per_sec;
 extern uint preserve_trx_transfer_commit_batch_tokens;
 extern uint preserve_trx_transfer_worker_yield_us;
-extern uint preserve_trx_transfer_commit_timeout_ms;
 extern uint preserve_trx_transfer_receiver_prewarm_timeout_ms;
-extern uint preserve_trx_transfer_receiver_ready_timeout_ms;
+extern uint preserve_trx_token_retention_timeout_ms;
 extern ulonglong preserve_trx_transfer_phase1_batch_bytes;
 extern uint preserve_trx_transfer_phase1_batch_linger_ms;
 

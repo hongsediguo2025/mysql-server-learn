@@ -18,7 +18,7 @@ START TRANSACTION;
 UPDATE t_lock_warmcopy_record_bitmap
 SET v=v+100, pad=REPEAT('x',32)
 WHERE id IN (2,3);
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 include/assert_grep.inc [lock warmcopy succeeds for multi-record bitmap]
 SELECT COUNT(*) AS preserved_count_after_record_bitmap_warmcopy
 FROM performance_schema.preserved_transactions;

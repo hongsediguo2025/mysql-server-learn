@@ -18,7 +18,7 @@ token VARCHAR(255) NOT NULL UNIQUE
 INSERT INTO t_plain_lock_modified VALUES
 (1,10,'base'),(2,20,'base'),(3,30,'base'),(4,40,'base');
 INSERT INTO t_plain_lock_source VALUES(1,100),(2,200),(3,300),(4,400);
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SELECT COUNT(*) AS preserved_count
 FROM performance_schema.preserved_transactions;
 preserved_count

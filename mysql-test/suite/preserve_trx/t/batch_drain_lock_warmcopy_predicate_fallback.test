@@ -31,7 +31,7 @@ UPDATE t_lock_warmcopy_predicate_fallback SET v=11 WHERE id=1;
 --connection default
 SET SESSION debug="+d,preserve_trx_lock_warmcopy_simulate_predicate_locks";
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 --exec echo "restart: --preserve-trx-enable=ON --preserve-trx-lock-warmcopy-enable=ON --preserve-trx-recovery-max-count=10" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
@@ -69,7 +69,7 @@ UPDATE t_lock_warmcopy_predicate_fallback SET v=21 WHERE id=2;
 --connection default
 SET SESSION debug="+d,preserve_trx_lock_warmcopy_simulate_predicate_locks";
 --error ER_PRESERVE_TRX_UNSUPPORTED
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SET SESSION debug="-d,preserve_trx_lock_warmcopy_simulate_predicate_locks";
 SELECT COUNT(*) AS preserved_count_after_predicate_strict_reject
   FROM performance_schema.preserved_transactions;

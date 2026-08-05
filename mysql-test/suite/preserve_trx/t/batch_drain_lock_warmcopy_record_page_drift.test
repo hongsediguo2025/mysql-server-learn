@@ -39,7 +39,7 @@ UPDATE t_lock_warmcopy_record_page_drift
 --connection lock_wc_page_drift_strict_owner
 SET DEBUG_SYNC =
   'preserve_trx_warmcopy_after_phase1_open SIGNAL lock_wc_page_drift_strict_open WAIT_FOR lock_wc_page_drift_strict_continue';
---send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+--send DRAIN TRANSACTIONS PRESERVE
 
 --connection default
 SET DEBUG_SYNC = 'now WAIT_FOR lock_wc_page_drift_strict_open TIMEOUT 10';
@@ -85,7 +85,7 @@ UPDATE t_lock_warmcopy_record_page_drift
 SET DEBUG_SYNC =
   'preserve_trx_warmcopy_after_phase1_open SIGNAL lock_wc_page_drift_fallback_open WAIT_FOR lock_wc_page_drift_fallback_continue';
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
---send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+--send DRAIN TRANSACTIONS PRESERVE
 
 --connection default
 SET DEBUG_SYNC = 'now WAIT_FOR lock_wc_page_drift_fallback_open TIMEOUT 10';

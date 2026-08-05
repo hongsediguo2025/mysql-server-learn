@@ -148,13 +148,13 @@ SET GLOBAL preserve_trx_enable=ON;
 SET GLOBAL preserve_trx_batch_max_transactions=99;
 SELECT @@global.preserve_trx_batch_max_transactions AS batch_target_limit_probe;
 --error ER_PRESERVE_TRX_UNSUPPORTED
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SELECT COUNT(*) AS preserved_count_after_target_limit_probe
   FROM performance_schema.preserved_transactions;
 SET GLOBAL preserve_trx_batch_max_transactions=256;
 SET SESSION debug="+d,preserve_trx_batch_fail_after_one_target";
 --error ER_PRESERVE_TRX_UNSUPPORTED
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SET SESSION debug="-d,preserve_trx_batch_fail_after_one_target";
 
 SELECT 1 AS shutdown_not_triggered_on_failure;

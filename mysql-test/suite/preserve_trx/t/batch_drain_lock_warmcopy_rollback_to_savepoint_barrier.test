@@ -43,7 +43,7 @@ UPDATE t_lock_warmcopy_savepoint_barrier
 SET DEBUG_SYNC =
   'preserve_trx_warmcopy_after_phase1_open SIGNAL lock_wc_savepoint_barrier_open WAIT_FOR lock_wc_savepoint_barrier_continue';
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
---send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+--send DRAIN TRANSACTIONS PRESERVE
 
 --connection default
 SET DEBUG_SYNC = 'now WAIT_FOR lock_wc_savepoint_barrier_open TIMEOUT 10';

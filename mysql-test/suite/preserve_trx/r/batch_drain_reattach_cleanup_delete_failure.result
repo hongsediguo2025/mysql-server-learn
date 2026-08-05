@@ -13,7 +13,7 @@ INSERT INTO t_batch_reattach_cleanup_delete VALUES(1,10);
 START TRANSACTION;
 INSERT INTO t_batch_reattach_cleanup_delete VALUES(2,20);
 SET SESSION debug="+d,preserve_trx_batch_fail_after_one_target,preserve_trx_fail_delete_snapshot_after_unlink";
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 ERROR HY000: DRAIN TRANSACTIONS PRESERVE batch cleanup failed; inspect preserved_transactions and target sessions before retry
 SET SESSION debug="-d,preserve_trx_batch_fail_after_one_target,preserve_trx_fail_delete_snapshot_after_unlink";
 SELECT 1 AS server_alive_after_unlink_cleanup_failure;
@@ -33,7 +33,7 @@ INSERT INTO t_batch_reattach_cleanup_delete VALUES(3,30);
 START TRANSACTION;
 INSERT INTO t_batch_reattach_cleanup_delete VALUES(4,40);
 SET SESSION debug="+d,preserve_trx_batch_fail_after_one_target,preserve_trx_fail_delete_snapshot_files";
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 ERROR HY000: DRAIN TRANSACTIONS PRESERVE batch cleanup failed; inspect preserved_transactions and target sessions before retry
 SET SESSION debug="-d,preserve_trx_batch_fail_after_one_target,preserve_trx_fail_delete_snapshot_files";
 SELECT COUNT(*) AS preserved_count_before_unlink

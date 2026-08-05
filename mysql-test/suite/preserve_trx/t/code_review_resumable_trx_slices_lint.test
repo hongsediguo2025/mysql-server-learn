@@ -798,11 +798,11 @@ die "ordinary XA MDL restore must use the standard no-op-on-missing backup polic
   unless $xa =~ /restore_backup\s*\([^;]*MDL_context_backup_policy::STANDARD_XA/s;
 die "preserve MDL restore must use the preserve-strict backup policy\n"
   unless $preserve =~ /restore_backup\s*\([^;]*MDL_context_backup_policy::PRESERVE_STRICT/s;
-die "OFF artifact policy sysvar must exist and default to FAIL_IF_PRESENT\n"
-  unless $preserve_header =~ /preserve_trx_off_artifact_policy/s &&
-         $sys_vars =~ /preserve_trx_off_artifact_policy/s &&
-         $sys_vars =~ /FAIL_IF_PRESENT/s;
-die "magic XID checks must route through the policy-aware protection helper\n"
+die "removed OFF artifact policy must not remain public or in preserve core\n"
+  if $preserve_header =~ /preserve_trx_off_artifact_policy/s ||
+     $sys_vars =~ /preserve_trx_off_artifact_policy/s ||
+     $preserve =~ /preserve_trx_off_artifact_policy/s;
+die "magic XID checks must route through the shared protection helper\n"
   unless $trx_preserve =~ /trx_preserve_xid_should_be_protected/s &&
          $ha_innodb =~ /trx_preserve_xid_should_be_protected/s;
 
@@ -3303,6 +3303,37 @@ die "partial READY must not add a production unit-test interface\n"
      $partial_ready_production_headers =~
      /\b[A-Za-z0-9_]*_for_unit_test[A-Za-z0-9_]*
       (?:partial_ready|receiver_excluded|source_excluded|selection)\b/six;
+$preserve =~
+  /(const\s+size_t\s+token_local_failure_count[\s\S]*?
+    preserved_batch_items\.reserve)/sx
+  or die "could not isolate source token-local failure classification\n";
+my $source_token_local_classification = $1;
+die "source token-local failure must remain fenced for RESET DRAIN\n"
+  unless $source_token_local_classification =~
+         /source_failed_batch_items\.push_back/s;
+die "all source token-local failures must remain independently classifiable\n"
+  if $source_token_local_classification =~
+     /token_local_failure_count\s*<\s*target_results\.size\(\)/s;
+die "DRAIN must not restore a source token-local failure\n"
+  if $source_token_local_classification =~
+     /restore_preserved_batch_items_to_original_thds|restore_current_items_to_original_thds/s;
+die "all source token-local failures must keep source ownership fenced for RESET\n"
+  unless $source_token_local_classification =~
+         /source_all_token_local_failed[\s\S]*finish_with_shutdown\(\)/s;
+die "terminal source context must retain source token-local failures\n"
+  unless $preserve =~
+         /retain_source_failed_items_in_source_context\(\)\s*;\s*
+          if\s*\(batch_transfer_source_session\s*!=\s*nullptr\)/sx;
+$preserve =~
+  /(if\s*\(quiesced_target_thread_ids\.empty\(\)\)[\s\S]*?
+    if\s*\(!early_pipeline_enabled\))/sx
+  or die "could not isolate empty survivor handling\n";
+my $empty_survivor_handling = $1;
+die "empty survivor DRAIN must keep the source fenced through shutdown handoff\n"
+  unless $empty_survivor_handling =~ /finish_with_shutdown\(\)/s;
+die "empty survivor DRAIN must not clear generation or restore business\n"
+  if $empty_survivor_handling =~
+     /Preserve_batch_clear_generation|preserve_trx_reject_drain_timeout/s;
 EOF
 
 SELECT 'ok' AS code_review_resumable_trx_slices_lint;

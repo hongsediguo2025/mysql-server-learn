@@ -45,7 +45,7 @@ CALL mtr.add_suppression(
 SET GLOBAL preserve_trx_enable=ON;
 SET GLOBAL preserve_trx_transfer_prewarm_paused=ON;
 SET GLOBAL preserve_trx_transfer_receiver_prewarm_timeout_ms=1000;
-SET GLOBAL preserve_trx_transfer_receiver_ready_timeout_ms=1000;
+SET GLOBAL preserve_trx_token_retention_timeout_ms=1000;
 
 --connect(reset_runtime_ha,localhost,preserve_trx_ha_admin,reset-drain-mtr-secret,test)
 
@@ -102,7 +102,7 @@ SET DEBUG_SYNC=
   'preserve_trx_batch_final_attach_observed_rejection_inflight SIGNAL reset_runtime_attach_observed_busy';
 SET DEBUG_SYNC=
   'preserve_trx_after_final_metadata_accepted_local SIGNAL reset_runtime_final_metadata_local WAIT_FOR reset_runtime_final_metadata_release';
---send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300 WITH USER VARS
+--send DRAIN TRANSACTIONS PRESERVE WITH USER VARS
 
 --connection reset_runtime_ha
 SET DEBUG_SYNC='now WAIT_FOR reset_runtime_phase1_streamed TIMEOUT 30';
@@ -117,7 +117,7 @@ SET @phase1_batch_before=(
   WHERE VARIABLE_NAME='Preserve_trx_transfer_phase1_batch_count');
 --disable_result_log
 --error ER_PRESERVE_TRX_UNSUPPORTED
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 --enable_result_log
 SET @phase1_metrics_nonzero=
   @phase1_frame_before>0 AND @phase1_send_before>0 AND
@@ -278,7 +278,7 @@ SET DEBUG_SYNC=
   'preserve_trx_warmcopy_after_closing_state_before_targets SIGNAL reset_runtime_handoff_phase2 WAIT_FOR reset_runtime_handoff_phase2_release';
 SET DEBUG_SYNC=
   'preserve_trx_drain_after_shutdown_handoff SIGNAL reset_runtime_handoff_won WAIT_FOR reset_runtime_handoff_release';
---send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+--send DRAIN TRANSACTIONS PRESERVE
 
 --connection reset_runtime_ha
 SET DEBUG_SYNC='now WAIT_FOR reset_runtime_handoff_phase2 TIMEOUT 30';
@@ -356,7 +356,7 @@ SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 SET SESSION debug='+d,preserve_trx_drain_skip_shutdown_after_audit_no_targets';
 SET DEBUG_SYNC=
   'preserve_trx_warmcopy_after_closing_state_before_targets SIGNAL reset_runtime_local_active WAIT_FOR reset_runtime_local_release';
---send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+--send DRAIN TRANSACTIONS PRESERVE
 
 --connection reset_runtime_local_ha
 SET DEBUG_SYNC='now WAIT_FOR reset_runtime_local_active TIMEOUT 30';

@@ -157,7 +157,7 @@ class PreserveTrxLintRunnerTest(unittest.TestCase):
         drain_test = (Path(tmp.name) /
                       "mysql-test/suite/preserve_trx/t/drain_surface.test")
         drain_test.write_text(
-            "DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;\n"
+            "DRAIN TRANSACTIONS PRESERVE WITH USER VARS;\n"
         )
 
         summary = run_lint_checks(Path(tmp.name))

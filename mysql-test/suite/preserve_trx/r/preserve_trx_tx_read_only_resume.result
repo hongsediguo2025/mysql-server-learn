@@ -5,7 +5,7 @@ INSERT INTO t_preserve_tx_read_only VALUES(1,10);
 SET SESSION transaction_read_only=ON;
 START TRANSACTION READ WRITE;
 UPDATE t_preserve_tx_read_only SET b=11 WHERE a=1;
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SET SESSION transaction_read_only=OFF;
 SELECT @@session.transaction_read_only AS session_read_only_before_resume;
 session_read_only_before_resume

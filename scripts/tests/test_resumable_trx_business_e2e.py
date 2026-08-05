@@ -4112,45 +4112,6 @@ class WorkloadPlanTest(unittest.TestCase):
         )
         self.assertEqual(runner.runtime.calls[-1][1], True)
 
-    def test_transfer_drain_validates_exact_timeout_exclusion(self):
-        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
-        runner.config = HarnessConfig(
-            scenario="standby_transfer_receiver_drain_metrics",
-            sessions=1,
-            standby_transfer_timeout_exclusion=True,
-            receiver_preserve_dir="/tmp/receiver-preserve",
-            receiver_unix_socket="/tmp/receiver.sock",
-        )
-        runner.timeout_exclusion_probe_connection_id = 299
-        runner.runtime = _TransferDrainRuntime(
-            [
-                (
-                    9,
-                    "SUCCESS_WITH_EXCLUSIONS",
-                    201,
-                    "SURVIVOR",
-                    "NONE",
-                    3000,
-                    4000,
-                ),
-                (
-                    9,
-                    "SUCCESS_WITH_EXCLUSIONS",
-                    299,
-                    "EXCLUDED",
-                    "CLOSING_COMMAND_TIMEOUT",
-                    3000,
-                    4000,
-                ),
-            ]
-        )
-
-        self.assertTrue(runner._execute_drain_preserve())
-        runner.validate_standby_transfer_drain_result(
-            expected_survivor_count=1,
-            expected_excluded_connection_id=299,
-        )
-
     def test_transfer_drain_records_source_disconnect_for_receiver_validation(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
         runner.config = HarnessConfig(
@@ -4315,7 +4276,7 @@ class WorkloadPlanTest(unittest.TestCase):
         self.assertLess(
             runner.runtime.sql.index("SET GLOBAL preserve_trx_warmcopy_enable=OFF"),
             runner.runtime.sql.index(
-                "DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 86400 WITH USER VARS"
+                "DRAIN TRANSACTIONS PRESERVE WITH USER VARS"
             ),
         )
 
@@ -4340,7 +4301,7 @@ class WorkloadPlanTest(unittest.TestCase):
         self.assertLess(
             runner.runtime.sql.index("SET GLOBAL preserve_trx_warmcopy_enable=OFF"),
             runner.runtime.sql.index(
-                "DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 86400 WITH USER VARS"
+                "DRAIN TRANSACTIONS PRESERVE WITH USER VARS"
             ),
         )
 
@@ -4361,7 +4322,7 @@ class WorkloadPlanTest(unittest.TestCase):
         self.assertLess(
             runner.runtime.sql.index("SET GLOBAL preserve_trx_warmcopy_enable=OFF"),
             runner.runtime.sql.index(
-                "DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 86400 WITH USER VARS"
+                "DRAIN TRANSACTIONS PRESERVE WITH USER VARS"
             ),
         )
 
@@ -6257,7 +6218,6 @@ class WorkloadPlanTest(unittest.TestCase):
             )
             self.assertFalse(report["source_workload_has_shutdown_acl"])
             self.assertTrue(report["source_remained_online_after_transfer"])
-            self.assertFalse(report["timeout_exclusion_enabled"])
             self.assertEqual(len(report["drain_result_rows"]), 2)
             self.assertEqual(report["drain_result_outcome"], "SUCCESS")
             self.assertEqual(report["workload_statements_per_tx"], 100000)
@@ -8735,7 +8695,7 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
         )
         self.assertLess(configured_total, 2 * 1024 * 1024 * 1024)
 
-    def test_warmcopy_required_scales_close_timeout_for_full_profile(self):
+    def test_warmcopy_required_scales_phase2_timeout_for_full_profile(self):
         cfg = HarnessConfig(
             sessions=320,
             cycles=3,
@@ -8756,22 +8716,14 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
         ):
             runner.configure_preserve_globals()
 
-        close_timeout_settings = [
+        phase2_timeout_settings = [
             sql
             for sql in runner.runtime.sql
-            if sql.startswith("SET GLOBAL preserve_trx_warmcopy_close_timeout_ms=")
+            if sql.startswith("SET GLOBAL preserve_trx_drain_phase2_timeout_ms=")
         ]
-        hard_timeout_settings = [
-            sql
-            for sql in runner.runtime.sql
-            if sql.startswith("SET GLOBAL preserve_trx_drain_hard_timeout_ms=")
-        ]
-        self.assertEqual(len(close_timeout_settings), 1)
-        self.assertEqual(len(hard_timeout_settings), 1)
-        configured_timeout_ms = int(close_timeout_settings[0].split("=")[1])
-        configured_hard_timeout_ms = int(hard_timeout_settings[0].split("=")[1])
-        self.assertEqual(configured_timeout_ms, 300000)
-        self.assertGreater(configured_hard_timeout_ms, configured_timeout_ms)
+        self.assertEqual(len(phase2_timeout_settings), 1)
+        configured_timeout_ms = int(phase2_timeout_settings[0].split("=")[1])
+        self.assertEqual(configured_timeout_ms, 420000)
 
     def test_warmcopy_required_180_session_profile_uses_large_close_budget(self):
         cfg = HarnessConfig(
@@ -8788,15 +8740,15 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
             return_value=fake_usage,
         ):
             plan = WorkloadPlan(cfg)
-            self.assertGreaterEqual(plan.warmcopy_close_timeout_ms(), 290000)
-        self.assertGreater(plan.drain_hard_timeout_ms(),
-                           plan.warmcopy_close_timeout_ms())
+            self.assertGreaterEqual(plan.warmcopy_close_estimate_ms(), 290000)
+        self.assertGreater(
+            plan.drain_phase2_timeout_ms(), plan.warmcopy_close_estimate_ms()
+        )
 
-    def test_warmcopy_required_honors_explicit_close_timeout(self):
+    def test_configure_preserve_globals_sets_token_retention(self):
         cfg = HarnessConfig(
-            sessions=1000,
-            warmcopy_required=True,
-            preserve_warmcopy_close_timeout_ms=600000,
+            sessions=100,
+            preserve_timeout_s=600,
             artifact_dir=".",
         )
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
@@ -8806,14 +8758,16 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
 
         runner.configure_preserve_globals()
 
-        close_timeout_settings = [
+        retention_settings = [
             sql
             for sql in runner.runtime.sql
-            if sql.startswith("SET GLOBAL preserve_trx_warmcopy_close_timeout_ms=")
+            if sql.startswith(
+                "SET GLOBAL preserve_trx_token_retention_timeout_ms="
+            )
         ]
         self.assertEqual(
-            ["SET GLOBAL preserve_trx_warmcopy_close_timeout_ms=600000"],
-            close_timeout_settings,
+            ["SET GLOBAL preserve_trx_token_retention_timeout_ms=600000"],
+            retention_settings,
         )
 
     def test_warmcopy_required_without_large_cache_keeps_prefix_headroom(self):
@@ -10932,7 +10886,7 @@ class ResetDrainHarnessTest(unittest.TestCase):
                 mock.call(
                     connection,
                     "SET GLOBAL "
-                    "preserve_trx_transfer_receiver_ready_timeout_ms=1000",
+                    "preserve_trx_token_retention_timeout_ms=1000",
                 ),
                 mock.call(
                     connection,

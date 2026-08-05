@@ -18,7 +18,7 @@ UPDATE t_read_view_export_fail SET b=11 WHERE a=1;
 --connect(read_view_export_control,localhost,root,,test)
 SET SESSION debug="+d,preserve_trx_fail_export_read_view";
 --error ER_PRESERVE_TRX_UNSUPPORTED
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SET SESSION debug="-d,preserve_trx_fail_export_read_view";
 --disconnect read_view_export_control
 --connection default

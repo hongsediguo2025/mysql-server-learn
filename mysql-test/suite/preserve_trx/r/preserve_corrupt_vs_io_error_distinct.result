@@ -7,7 +7,7 @@ b INT
 INSERT INTO t_preserve_read_error_distinct VALUES(1,10),(2,20);
 START TRANSACTION;
 UPDATE t_preserve_read_error_distinct SET b=11 WHERE a=1;
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 # restart: --preserve-trx-enable=ON --skip-log-bin
 include/wait_for_pattern_in_file.inc [Preserved transaction .* recovery forced rollback: preserved transaction snapshot tainted: startup snapshot is unreadable or mismatched]
 SELECT COUNT(*) AS preserved_count_after_corrupt_read
@@ -19,7 +19,7 @@ a	b
 1	10
 START TRANSACTION;
 UPDATE t_preserve_read_error_distinct SET b=21 WHERE a=2;
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 # restart_abort: --preserve-trx-enable=ON --skip-log-bin --debug=d,preserve_trx_fail_snapshot_read_io
 include/wait_for_pattern_in_file.inc [Preserved transaction .* recovery failed: I/O error reading durable transaction snapshot]
 include/wait_for_expected_crash.inc [safe_process]

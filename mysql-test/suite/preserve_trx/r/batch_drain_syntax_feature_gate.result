@@ -6,6 +6,6 @@ CREATE TABLE drain(id INT PRIMARY KEY, drain_col INT) ENGINE=InnoDB;
 DROP TABLE drain;
 DRAIN TRANSACTIONS PRESERVE;
 ERROR HY000: Resumable transactions across shutdown are disabled
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300 NO USER VARS;
+DRAIN TRANSACTIONS PRESERVE NO USER VARS;
 ERROR HY000: Resumable transactions across shutdown are disabled
 # restart: --preserve-trx-enable=ON

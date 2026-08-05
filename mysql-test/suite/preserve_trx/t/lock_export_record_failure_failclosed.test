@@ -20,7 +20,7 @@ UPDATE t_lock_export_record_failclosed SET v=11 WHERE id=1;
 --connect(record_lock_export_control,localhost,root,,test)
 SET SESSION debug="+d,preserve_trx_fail_export_record_locks";
 --error ER_PRESERVE_TRX_UNSUPPORTED
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SET SESSION debug="-d,preserve_trx_fail_export_record_locks";
 --disconnect record_lock_export_control
 --connection default

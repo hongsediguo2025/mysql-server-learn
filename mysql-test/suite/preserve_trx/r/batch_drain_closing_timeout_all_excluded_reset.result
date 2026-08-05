@@ -1,0 +1,12 @@
+generation	outcome	source_connection_id	token_role	reason	closing_started_us	closing_deadline_us
+GENERATION	NO_PRESERVABLE_TOKENS	EXCLUDED_ID	EXCLUDED	CLOSING_COMMAND_TIMEOUT	CLOSING_STARTED_US	CLOSING_DEADLINE_US
+no_receiver_epoch
+1
+no_receiver_token
+1
+excluded_old_command
+1
+same_connection
+1
+v
+111

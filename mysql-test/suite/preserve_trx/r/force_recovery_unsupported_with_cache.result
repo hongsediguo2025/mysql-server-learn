@@ -4,7 +4,7 @@ CREATE TABLE t_force_recovery_cache(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_force_recovery_cache VALUES(1,10);
 START TRANSACTION;
 UPDATE t_force_recovery_cache SET b=11 WHERE a=1;
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SELECT @@global.innodb_force_recovery AS force_recovery_after_restart;
 force_recovery_after_restart
 1
@@ -15,10 +15,10 @@ preserved_count_during_force_recovery
 RESUME PRESERVED TRANSACTION 'TOKEN';
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 START TRANSACTION;
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 ROLLBACK;
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 # restart: --preserve-trx-enable=ON --innodb-force-recovery=0
 SELECT @@global.innodb_force_recovery AS force_recovery_after_normal_restart;

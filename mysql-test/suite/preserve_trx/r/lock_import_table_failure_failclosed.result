@@ -7,7 +7,7 @@ v INT
 INSERT INTO t_lock_import_table_failclosed VALUES(1,10),(2,20);
 START TRANSACTION;
 UPDATE t_lock_import_table_failclosed SET v=22 WHERE id=2;
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 # restart: --preserve-trx-enable=ON --debug=d,preserve_trx_fail_import_table_locks
 include/wait_for_pattern_in_file.inc [Preserved transaction .* recovery forced rollback: failed to restore durable transaction semantics]
 SELECT * FROM t_lock_import_table_failclosed ORDER BY id;

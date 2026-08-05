@@ -34,8 +34,7 @@ GRANT SELECT, UPDATE ON test.* TO closing_early_dirty_app@localhost;
 --disable_query_log
 
 SET GLOBAL preserve_trx_batch_max_transactions=1;
-SET GLOBAL preserve_trx_drain_command_timeout_fail_batch=ON;
-SET GLOBAL preserve_trx_drain_closing_command_timeout_ms=60000;
+SET GLOBAL preserve_trx_drain_phase2_timeout_ms=60000;
 SET GLOBAL preserve_trx_transfer_prewarm_paused=ON;
 
 CREATE TABLE t_closing_early_dirty(
@@ -60,7 +59,7 @@ SET GLOBAL debug='+d,preserve_trx_early_force_one_coordinate_drift';
 --connection closing_early_dirty_owner
 SET DEBUG_SYNC=
   'preserve_trx_early_after_dirty_replacement SIGNAL early_dirty_replaced WAIT_FOR early_dirty_continue';
---send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+--send DRAIN TRANSACTIONS PRESERVE
 
 --connection closing_early_dirty_ha
 SET DEBUG_SYNC='now WAIT_FOR early_dirty_replaced TIMEOUT 30';
@@ -120,7 +119,7 @@ SET GLOBAL debug='+d,preserve_trx_early_force_final_fence_change';
 --connection closing_early_dirty_owner
 SET DEBUG_SYNC='RESET';
 --error ER_PRESERVE_TRX_UNSUPPORTED
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 
 --connection closing_early_dirty_ha
 SET GLOBAL debug='-d,preserve_trx_early_force_final_fence_change';

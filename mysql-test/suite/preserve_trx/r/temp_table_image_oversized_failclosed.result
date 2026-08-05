@@ -13,7 +13,7 @@ KEY(v)
 INSERT INTO tmp_temp_image_oversized VALUES(1,100),(2,200);
 START TRANSACTION;
 UPDATE t_temp_image_oversized_base SET v=11 WHERE id=1;
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 SELECT COUNT(*) AS preserved_count_after_oversized_image
 FROM performance_schema.preserved_transactions;

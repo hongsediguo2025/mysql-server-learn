@@ -138,16 +138,10 @@ ulonglong preserve_trx_max_temp_sidecar_bytes = 1073741824;
 ulonglong preserve_trx_single_phase_max_binlog_cache_bytes = ULLONG_MAX;
 uint preserve_trx_max_lock_count = 2000;
 uint preserve_trx_max_modified_tables = 64;
-ulong preserve_trx_off_artifact_policy =
-    PRESERVE_TRX_OFF_ARTIFACT_POLICY_FAIL_IF_PRESENT;
-uint preserve_trx_drain_hard_timeout_ms = 30000;
-uint preserve_trx_drain_closing_command_timeout_ms = 1000;
-bool preserve_trx_drain_command_timeout_fail_batch = false;
+uint preserve_trx_drain_phase1_timeout_ms = 600000;
+uint preserve_trx_drain_phase2_timeout_ms = 30000;
 bool preserve_trx_transfer_pipeline_enable = true;
-uint preserve_trx_transfer_phase1_timeout_ms = 600000;
-uint preserve_trx_transfer_phase2_timeout_ms = 3000;
 bool preserve_trx_warmcopy_enable = true;
-uint preserve_trx_warmcopy_close_timeout_ms = 30000;
 uint preserve_trx_warmcopy_min_open_ms = 1000;
 uint preserve_trx_warmcopy_chunk_bytes = 1048576;
 uint preserve_trx_warmcopy_tail_budget_bytes = 1048576;
@@ -219,26 +213,6 @@ void preserved_trx_leave_server_startup() {
     LogErr(WARNING_LEVEL, ER_LOG_PRINTF_MSG,
            "PRESERVE: failed to prestart promotion gate worker pool");
   }
-}
-
-bool preserve_trx_off_artifact_policy_ignore() {
-  return preserve_trx_off_artifact_policy ==
-         PRESERVE_TRX_OFF_ARTIFACT_POLICY_IGNORE;
-}
-
-bool preserve_trx_off_artifact_policy_recover() {
-  return preserve_trx_off_artifact_policy ==
-         PRESERVE_TRX_OFF_ARTIFACT_POLICY_RECOVER;
-}
-
-bool preserve_trx_off_artifact_policy_abandon() {
-  return preserve_trx_off_artifact_policy ==
-         PRESERVE_TRX_OFF_ARTIFACT_POLICY_ABANDON;
-}
-
-bool preserve_trx_off_artifact_policy_fail_if_present() {
-  return preserve_trx_off_artifact_policy ==
-         PRESERVE_TRX_OFF_ARTIFACT_POLICY_FAIL_IF_PRESENT;
 }
 
 uint preserve_trx_auto_parallel_preserve_threads(uint hardware_threads) {
@@ -460,73 +434,6 @@ bool preserved_trx_listing_has_crash_abandon_artifacts(
          !listing.tainted_tokens.empty() ||
          !listing.consume_state_tokens.empty() ||
          !listing.warm_external_blob_artifacts.empty();
-}
-
-bool preserved_trx_listing_has_any_artifact(
-    const Preserved_trx_carrier_listing &listing) {
-  return preserved_trx_listing_has_crash_abandon_artifacts(listing) ||
-         !listing.standby_pending_tokens.empty() ||
-         !listing.promotion_adopted_tokens.empty() ||
-         !listing.promotion_intent_tokens.empty();
-}
-
-static std::string preserved_trx_listing_artifact_summary(
-    const Preserved_trx_carrier_listing &listing) {
-  return "snapshots=" + std::to_string(listing.snapshot_tokens.size()) +
-         ", external_blobs=" +
-         std::to_string(listing.external_blob_tokens.size()) +
-         ", temp_sidecars=" +
-         std::to_string(listing.temp_sidecar_tokens.size()) +
-         ", tainted=" + std::to_string(listing.tainted_tokens.size()) +
-         ", consume_state=" +
-         std::to_string(listing.consume_state_tokens.size()) +
-         ", standby_pending=" +
-         std::to_string(listing.standby_pending_tokens.size()) +
-         ", promotion_adopted=" +
-         std::to_string(listing.promotion_adopted_tokens.size()) +
-         ", promotion_intent=" +
-         std::to_string(listing.promotion_intent_tokens.size()) +
-         ", warm_external=" +
-         std::to_string(listing.warm_external_blob_artifacts.size());
-}
-
-static bool preserve_trx_off_artifact_preflight(const char *phase) {
-  if (preserve_trx_is_enabled()) return false;
-  if (preserve_trx_off_artifact_policy_ignore() ||
-      preserve_trx_off_artifact_policy_recover() ||
-      preserve_trx_off_artifact_policy_abandon()) {
-    return false;
-  }
-
-  const std::string dir = normalize_dir(preserve_trx_default_dir());
-  auto store = create_preserved_trx_default_store(dir);
-  Preserved_trx_carrier_listing listing;
-  if (store->list_tokens(&listing) != Preserve_snapshot_status::OK) {
-    const std::string message =
-        "PRESERVE: preserve_trx_enable=OFF and "
-        "preserve_trx_off_artifact_policy=FAIL_IF_PRESENT, but failed to "
-        "scan preserved transaction directory '" +
-        dir + "'";
-    LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG, message.c_str());
-    return true;
-  }
-
-  if (!preserved_trx_listing_has_any_artifact(listing)) return false;
-
-  std::string message =
-      "PRESERVE: preserve_trx_enable=OFF found historical Preserve/Resume "
-      "artifacts under '" +
-      dir + "' (" + preserved_trx_listing_artifact_summary(listing) +
-      "). Start with preserve_trx_enable=ON to recover them, use "
-      "preserve_trx_off_artifact_policy=ABANDON for explicit rollback/"
-      "cleanup, or use IGNORE only after external HA tooling has removed or "
-      "intentionally isolated the artifacts";
-  if (phase != nullptr && phase[0] != '\0') {
-    message.append(" during ");
-    message.append(phase);
-  }
-  LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG, message.c_str());
-  return true;
 }
 
 bool preserved_trx_crash_recovery_artifacts_forbidden(
@@ -4860,6 +4767,11 @@ static bool preserve_trx_reject_drain_reset() {
   return true;
 }
 
+static bool preserve_trx_reject_drain_timeout() {
+  my_error(ER_PRESERVE_TRX_DRAIN_TIMEOUT, MYF(0));
+  return true;
+}
+
 void log_redacted_resume_failure(const std::string &token, const char *reason) {
   std::string message = "RESUME PRESERVED TRANSACTION '" +
                         preserved_trx_redacted_token(token) + "' failed";
@@ -5339,7 +5251,7 @@ static bool preserve_trx_phase1_command_still_active(
 
 static Preserve_trx_phase1_readiness_result
 preserve_trx_wait_for_phase1_readiness(
-    THD *owner, ulonglong phase1_deadline_us,
+    THD *owner, ulonglong phase1_deadline_us, ulonglong long_command_age_us,
     const std::shared_ptr<Preserve_trx_drain_attempt> &active_drain_attempt,
     Preserve_trx_phase1_readiness_metrics *metrics,
     const std::function<bool()> &progress = {}) {
@@ -5356,9 +5268,6 @@ preserve_trx_wait_for_phase1_readiness(
                                                  sampled_us)) {
     return Preserve_trx_phase1_readiness_result::DEADLINE;
   }
-  const ulonglong long_command_age_us =
-      static_cast<ulonglong>(preserve_trx_drain_closing_command_timeout_ms) *
-      1000ULL;
   Preserve_trx_phase1_readiness_collector collector(
       owner, sampled_us, long_command_age_us);
   Global_THD_manager::get_instance()->do_for_all_thd_copy(&collector);
@@ -6288,11 +6197,6 @@ Preserve_trx_batch_wait_result preserve_trx_batch_observe_targets_ready_joint(
     pending->erase(ready.thread_id);
   }
   return Preserve_trx_batch_wait_result::READY;
-}
-
-ulonglong preserve_trx_batch_hard_deadline_us() {
-  return preserve_trx_monotonic_deadline_after_ms(
-      preserve_trx_monotonic_us(), preserve_trx_drain_hard_timeout_ms);
 }
 
 class Preserve_batch_clear_generation final : public Do_THD_Impl {
@@ -9227,8 +9131,7 @@ bool preserved_trx_build_native_binlog_cache_facts(
 
 bool preserve_trx_magic_xid_should_be_protected(const XID &xid) {
   if (!xid_is_preserve_magic(xid)) return false;
-  if (!preserve_trx_is_enabled() && preserve_trx_off_artifact_policy_ignore())
-    return false;
+  if (!preserve_trx_is_enabled()) return false;
 
   const char *token =
       xid.get_data() + static_cast<size_t>(PRESERVE_TRX_XID_GTRID_LENGTH);
@@ -9630,27 +9533,6 @@ const Preserved_trx_column_metadata *preserved_trx_columns(size_t *count) {
   return kPreservedTrxColumns;
 }
 
-bool preserved_trx_resolve_timeout_seconds(const Preserve_trx_options &options,
-                                           ulonglong default_timeout,
-                                           ulonglong min_timeout,
-                                           ulonglong max_timeout,
-                                           ulonglong *timeout_seconds) {
-  if (timeout_seconds == nullptr) return false;
-
-  if (min_timeout == 0 || max_timeout == 0 || min_timeout > max_timeout)
-    return false;
-  if (default_timeout < min_timeout || default_timeout > max_timeout)
-    return false;
-
-  const ulonglong effective_timeout =
-      options.has_timeout ? options.timeout_seconds : default_timeout;
-  if (effective_timeout < min_timeout || effective_timeout > max_timeout)
-    return false;
-
-  *timeout_seconds = effective_timeout;
-  return true;
-}
-
 const char *preserved_trx_dir_value() {
   static const std::string dir = preserve_trx_default_dir();
   return dir.c_str();
@@ -9962,23 +9844,9 @@ bool preserved_trx_shutdown_requested() {
          Preserve_trx_manager_state::SHUTDOWN_REQUESTED;
 }
 
-static bool preserve_trx_wait_target_timed_out(THD *thd,
-                                              uint64_t *hard_deadline_us,
-                                              uint *quiesced_wait_loops) {
-  if (thd == nullptr || preserve_trx_drain_hard_timeout_ms == 0) return false;
-  if (*hard_deadline_us == 0) {
-    *hard_deadline_us = preserve_trx_monotonic_deadline_after_ms(
-        preserve_trx_monotonic_us(), preserve_trx_drain_hard_timeout_ms);
-  }
-  if (preserve_trx_monotonic_deadline_expired_at(
-          *hard_deadline_us, preserve_trx_monotonic_us())) {
-    my_error(ER_PRESERVE_TRX_DRAIN_TIMEOUT, MYF(0));
-    return true;
-  }
-
+static void preserve_trx_wait_for_drain_owner(uint *quiesced_wait_loops) {
   preserve_trx_note_quiesced_wait(quiesced_wait_loops);
   my_sleep(10000);
-  return false;
 }
 
 static bool preserve_trx_closing_gate_allows_quiesced_command_read() {
@@ -9993,7 +9861,6 @@ bool preserved_trx_begin_command_read(THD *thd) {
     return true;
   }
 
-  uint64_t hard_deadline_us = 0;
   uint quiesced_wait_loops = 0;
   for (;;) {
     const bool allow_quiesced_read =
@@ -10029,10 +9896,7 @@ bool preserved_trx_begin_command_read(THD *thd) {
       return true;
     }
     mysql_mutex_unlock(&thd->LOCK_thd_data);
-    if (preserve_trx_wait_target_timed_out(thd, &hard_deadline_us,
-                                          &quiesced_wait_loops)) {
-      return false;
-    }
+    preserve_trx_wait_for_drain_owner(&quiesced_wait_loops);
   }
 }
 
@@ -10040,7 +9904,6 @@ bool preserved_trx_command_read_is_idle(THD *thd) {
   if (thd == nullptr) return false;
   if (!preserve_trx_is_enabled()) return thd->m_server_idle;
 
-  uint64_t hard_deadline_us = 0;
   uint quiesced_wait_loops = 0;
   for (;;) {
     const bool allow_quiesced_read =
@@ -10060,10 +9923,7 @@ bool preserved_trx_command_read_is_idle(THD *thd) {
       return was_idle;
     }
     mysql_mutex_unlock(&thd->LOCK_thd_data);
-    if (preserve_trx_wait_target_timed_out(thd, &hard_deadline_us,
-                                          &quiesced_wait_loops)) {
-      return false;
-    }
+    preserve_trx_wait_for_drain_owner(&quiesced_wait_loops);
   }
 }
 
@@ -10079,7 +9939,6 @@ bool preserved_trx_end_idle_for_command_packet(THD *thd) {
       !preserve_trx_closing_gate_allows_quiesced_command_read(),
       std::memory_order_release);
 
-  uint64_t hard_deadline_us = 0;
   uint quiesced_wait_loops = 0;
   for (;;) {
     const bool allow_quiesced_read =
@@ -10101,10 +9960,7 @@ bool preserved_trx_end_idle_for_command_packet(THD *thd) {
       return was_idle;
     }
     mysql_mutex_unlock(&thd->LOCK_thd_data);
-    if (preserve_trx_wait_target_timed_out(thd, &hard_deadline_us,
-                                          &quiesced_wait_loops)) {
-      return false;
-    }
+    preserve_trx_wait_for_drain_owner(&quiesced_wait_loops);
   }
 }
 
@@ -10115,7 +9971,6 @@ bool preserved_trx_end_command_read(THD *thd) {
     return true;
   }
 
-  uint64_t hard_deadline_us = 0;
   uint quiesced_wait_loops = 0;
   for (;;) {
     const bool allow_quiesced_read =
@@ -10135,10 +9990,7 @@ bool preserved_trx_end_command_read(THD *thd) {
       return true;
     }
     mysql_mutex_unlock(&thd->LOCK_thd_data);
-    if (preserve_trx_wait_target_timed_out(thd, &hard_deadline_us,
-                                          &quiesced_wait_loops)) {
-      return false;
-    }
+    preserve_trx_wait_for_drain_owner(&quiesced_wait_loops);
   }
 }
 
@@ -10146,7 +9998,6 @@ bool preserved_trx_wait_if_batch_session_quiesced(THD *thd) {
   if (thd == nullptr) return false;
   if (!preserve_trx_is_enabled()) return false;
 
-  uint64_t hard_deadline_us = 0;
   uint quiesced_wait_loops = 0;
   for (;;) {
     const Preserve_trx_batch_thd_state state = preserve_trx_batch_state(thd);
@@ -10155,10 +10006,7 @@ bool preserved_trx_wait_if_batch_session_quiesced(THD *thd) {
         preserve_trx_closing_gate_allows_quiesced_command_read()) {
       return false;
     }
-    if (preserve_trx_wait_target_timed_out(thd, &hard_deadline_us,
-                                          &quiesced_wait_loops)) {
-      return true;
-    }
+    preserve_trx_wait_for_drain_owner(&quiesced_wait_loops);
   }
 }
 
@@ -12138,6 +11986,11 @@ static void restore_preserved_batch_items_for_reset(
         "reset_local_authority_terminalize_failed", attempt);
   }
 
+  if (items.empty()) {
+    Preserve_batch_clear_generation clear(generation);
+    Global_THD_manager::get_instance()->do_for_all_thd_copy(&clear);
+  }
+
   std::vector<my_thread_id> thread_ids;
   thread_ids.reserve(items.size());
   std::unordered_set<std::string> unique_tokens;
@@ -13763,13 +13616,7 @@ bool preserved_trx_rollback_physical_promotion_adopt(
 
 bool preserved_trx_preflight_recoverability() {
   if (preserved_trx_skip_local_startup_recovery()) return false;
-  if (!preserve_trx_is_enabled()) {
-    if (!preserve_trx_off_artifact_policy_recover() &&
-        !preserve_trx_off_artifact_policy_abandon()) {
-      return preserve_trx_off_artifact_preflight(
-          "preserved transaction preflight");
-    }
-  }
+  if (!preserve_trx_is_enabled()) return false;
   if (srv_force_recovery > 0) return false;
 
   /*
@@ -13827,10 +13674,7 @@ void preserved_trx_resurrection_index_bootstrap_preamble() {
   trx_preserve_startup_resurrection_reset();
   g_startup_resurrection_preamble_failed = false;
   if (preserved_trx_skip_local_startup_recovery()) return;
-  if ((!preserve_trx_is_enabled() &&
-       !preserve_trx_off_artifact_policy_recover())) {
-    return;
-  }
+  if (!preserve_trx_is_enabled()) return;
 
   const std::string dir = normalize_dir(preserve_trx_default_dir());
   auto store = create_preserved_trx_default_store(dir);
@@ -14019,10 +13863,7 @@ bool preserved_trx_resurrection_locks_postamble() {
 
 bool preserved_temp_images_bootstrap_preamble() {
   if (preserved_trx_skip_local_startup_recovery()) return false;
-  if (!preserve_trx_is_enabled() &&
-      !preserve_trx_off_artifact_policy_recover()) {
-    return false;
-  }
+  if (!preserve_trx_is_enabled()) return false;
   if (srv_force_recovery > 0) return false;
 
   /*
@@ -14288,10 +14129,6 @@ bool preserved_trx_recover_all() {
       trx_preserve_startup_resurrection_clear_verified();
     }
   } startup_verified_resurrection_guard;
-  const bool off_recover_mode =
-      !preserve_trx_is_enabled() && preserve_trx_off_artifact_policy_recover();
-  const bool off_abandon_mode =
-      !preserve_trx_is_enabled() && preserve_trx_off_artifact_policy_abandon();
   const uint64_t recovery_started_us = preserve_trx_monotonic_us();
   struct Startup_recovery_phase_metrics {
     uint64_t list_us{0};
@@ -14323,9 +14160,7 @@ bool preserved_trx_recover_all() {
   {
     const std::string message =
         "PRESERVE: preserved transaction recovery begin preserve_enabled=" +
-        std::to_string(preserve_trx_is_enabled() ? 1 : 0) +
-        " off_recover_mode=" + std::to_string(off_recover_mode ? 1 : 0) +
-        " off_abandon_mode=" + std::to_string(off_abandon_mode ? 1 : 0);
+        std::to_string(preserve_trx_is_enabled() ? 1 : 0);
     LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG, message.c_str());
   }
 
@@ -14518,19 +14353,7 @@ bool preserved_trx_recover_all() {
   }
 
   if (!preserve_trx_is_enabled()) {
-    if (preserve_trx_off_artifact_preflight(
-            "preserved transaction recovery")) {
-      return finish_recovery(true, "off_artifact_preflight_failed");
-    }
-    if (off_recover_mode || off_abandon_mode) {
-      /*
-        Explicit OFF artifact-handling modes reuse the startup recovery
-        scan below while the SQL surface still rejects new preserve, drain,
-        resume, transfer, and promotion commands.
-      */
-    } else {
-      return finish_recovery(false, "disabled_no_artifact_work");
-    }
+    return finish_recovery(false, "disabled_no_artifact_work");
   }
 
   /*
@@ -14588,59 +14411,6 @@ bool preserved_trx_recover_all() {
   local_snapshot_token_count = snapshot_tokens.size();
   binlog_cache_token_count = binlog_cache_tokens.size();
   tainted_token_count = tainted_tokens.size();
-
-  if (off_abandon_mode) {
-    bool error = false;
-    for (const std::string &token : listing.snapshot_tokens) {
-      Preserved_trx_bundle cleanup_bundle;
-      Preserve_snapshot_metadata *cleanup_metadata = nullptr;
-      if (store->read(token, true,
-                      Preserved_trx_carrier::Payload_read_mode::METADATA_ONLY,
-                      &cleanup_bundle) == Preserve_snapshot_status::OK) {
-        cleanup_metadata = &cleanup_bundle.metadata;
-      }
-      if (rollback_preserved_snapshot_or_log(
-              dir, token, "preserve_trx_enable=OFF abandon policy",
-              cleanup_metadata,
-              cleanup_metadata == nullptr
-                  ? Temp_sidecar_cleanup_mode::RAW_UNLINK
-                  : Temp_sidecar_cleanup_mode::METADATA_AWARE)) {
-        error = true;
-      }
-    }
-
-    for (const std::string &artifact_filename : warm_external_blob_artifacts) {
-      if (delete_orphan_warm_external_blob_artifact_or_log(store.store(),
-                                                           artifact_filename)) {
-        error = true;
-      }
-    }
-    if (delete_orphan_temp_table_sidecars_or_log(store.store(), listing)) {
-      error = true;
-    }
-    for (const std::string &token : listing.external_blob_tokens) {
-      if (listing.snapshot_tokens.find(token) != listing.snapshot_tokens.end())
-        continue;
-      if (delete_orphan_binlog_cache_or_log(dir, token)) error = true;
-    }
-    for (const std::string &token : listing.tainted_tokens) {
-      if (listing.snapshot_tokens.find(token) != listing.snapshot_tokens.end())
-        continue;
-      if (store->remove_taint(token) != Preserve_snapshot_status::OK) {
-        error = true;
-      }
-    }
-    for (const std::string &token : listing.consume_state_tokens) {
-      if (listing.snapshot_tokens.find(token) != listing.snapshot_tokens.end())
-        continue;
-      if (store->remove_consume_state(token) !=
-          Preserve_snapshot_status::OK) {
-        error = true;
-      }
-    }
-
-    return finish_recovery(error, "off_abandon_completed");
-  }
 
   const Preserved_trx_carrier_listing local_crash_listing =
       preserved_trx_local_crash_abandon_listing(listing);
@@ -16796,9 +16566,10 @@ bool Preserve_trx_drain_service::execute(
     WARMCOPY_CLOSING to block every new ordinary client command. After target
     enumeration and quiesce, participant preflight/seal and per-target preserve
     run inside the blocked window. The command succeeds only after every
-    survivor is preserved and audited; command-timeout exclusions require an
-    explicit receiver ABORT. Other partial failures route through participant
-    cleanup and fail closed instead of publishing a mixed batch.
+    survivor is preserved and audited. The Phase 2 deadline closes token
+    convergence: transfer targets still executing an old command are excluded,
+    while already quiesced targets continue through the existing token-local
+    and epoch-global failure rules.
   */
   const Preserve_trx_options &options = request.options;
 
@@ -16817,12 +16588,15 @@ bool Preserve_trx_drain_service::execute(
     return true;
   }
 
-  ulonglong timeout_seconds = 0;
-  if (!preserved_trx_resolve_timeout_seconds(
-          options, thd->variables.preserve_trx_default_timeout,
-          thd->variables.preserve_trx_min_timeout,
-          thd->variables.preserve_trx_max_timeout, &timeout_seconds))
-    return preserve_trx_reject_unsupported();
+  /* One drain snapshots all timeout policy before publishing any state. */
+  const uint phase1_timeout_ms = preserve_trx_drain_phase1_timeout_ms;
+  const uint phase2_timeout_ms = preserve_trx_drain_phase2_timeout_ms;
+  const uint token_retention_timeout_ms =
+      preserve_trx_token_retention_timeout_ms;
+  const ulonglong phase2_long_command_age_us =
+      static_cast<ulonglong>(phase2_timeout_ms) * 1000ULL;
+  const ulonglong timeout_seconds =
+      (static_cast<ulonglong>(token_retention_timeout_ms) + 999ULL) / 1000ULL;
 
   const ulonglong generation = g_batch_generation.fetch_add(1) + 1;
   const bool binlog_warmcopy_enabled =
@@ -16840,8 +16614,6 @@ bool Preserve_trx_drain_service::execute(
       preserve_trx_lock_warmcopy_requires_two_phase(binlog_warmcopy_enabled);
   const bool transfer_pipeline_enabled =
       preserve_trx_transfer_pipeline_enable;
-  const bool command_timeout_fail_batch =
-      preserve_trx_drain_command_timeout_fail_batch;
   Preserve_trx_drain_orchestrator drain_orchestrator(
       two_phase_enabled ? Preserve_trx_drain_phase_mode::TWO_PHASE
                         : Preserve_trx_drain_phase_mode::SINGLE_PHASE);
@@ -16855,7 +16627,7 @@ bool Preserve_trx_drain_service::execute(
   std::unique_ptr<Warmcopy_batch_drain_participant> warmcopy_participant;
   if (local_binlog_warmcopy_enabled) {
     warmcopy_participant = std::make_unique<Warmcopy_batch_drain_participant>(
-        thd, generation, preserve_trx_warmcopy_close_timeout_ms,
+        thd, generation, phase2_timeout_ms,
         standby_transfer_streaming_enabled);
     drain_orchestrator.add_participant(warmcopy_participant.get());
   }
@@ -16910,7 +16682,7 @@ bool Preserve_trx_drain_service::execute(
   const ulonglong phase1_readiness_deadline_us =
       preserve_trx_monotonic_deadline_after_ms(
           phase1_readiness_started_us,
-          preserve_trx_transfer_phase1_timeout_ms);
+          phase1_timeout_ms);
   auto active_drain_attempt_cleanup = create_scope_guard([&] {
     if (preserve_trx_active_drain_reset_requested(active_drain_attempt) &&
         !active_drain_attempt->reset_release_barrier_complete.load(
@@ -17151,12 +16923,13 @@ bool Preserve_trx_drain_service::execute(
             batch_transfer_frame_sink.get()));
     uint64_t epoch_transport_deadline_us = phase1_readiness_deadline_us;
     epoch_transport_deadline_us = preserve_trx_monotonic_deadline_after_ms(
-        epoch_transport_deadline_us, preserve_trx_transfer_phase2_timeout_ms);
+        epoch_transport_deadline_us, phase2_timeout_ms);
     epoch_transport_deadline_us = preserve_trx_monotonic_deadline_after_ms(
-        epoch_transport_deadline_us, preserve_trx_transfer_commit_timeout_ms);
-    const uint64_t requested_terminal_retention_us = std::max<uint64_t>(
-        1, static_cast<uint64_t>(preserve_trx_transfer_commit_timeout_ms) *
-               2000);
+        epoch_transport_deadline_us,
+        kPreserveTrxTransferOperationTimeoutMs);
+    const uint64_t requested_terminal_retention_us =
+        static_cast<uint64_t>(kPreserveTrxTransferOperationTimeoutMs) *
+        2000ULL;
     const Preserve_trx_transfer_status open_status =
         batch_transfer_source_session->open_epoch(
             requested_terminal_retention_us, epoch_transport_deadline_us);
@@ -17563,8 +17336,8 @@ bool Preserve_trx_drain_service::execute(
     Preserve_trx_phase1_readiness_metrics readiness_metrics;
     const Preserve_trx_phase1_readiness_result readiness_result =
         preserve_trx_wait_for_phase1_readiness(
-            thd, phase1_readiness_deadline_us, active_drain_attempt,
-            &readiness_metrics, active_binlog_progress);
+            thd, phase1_readiness_deadline_us, phase2_long_command_age_us,
+            active_drain_attempt, &readiness_metrics, active_binlog_progress);
     preserve_trx_phase1_readiness_note_latest_metrics(
         readiness_metrics.samples, readiness_metrics.inflight_commands,
         readiness_metrics.oldest_command_age_us,
@@ -17600,8 +17373,6 @@ bool Preserve_trx_drain_service::execute(
     phase2_total_started_us = preserve_trx_monotonic_us();
     if (batch_transfer_source_session != nullptr) {
       batch_transfer_source_session->set_phase1_metrics_enabled(false);
-      batch_transfer_source_session->set_operation_timeout_ms(
-          preserve_trx_transfer_phase2_timeout_ms);
     }
     closing_target_classification_guard =
         std::unique_lock<std::mutex>(g_closing_target_classification_mutex);
@@ -17617,33 +17388,32 @@ bool Preserve_trx_drain_service::execute(
     }
     const ulonglong closing_started_us = preserve_trx_monotonic_us();
     phase2_metrics.closing_started_us = closing_started_us;
-    const uint overall_close_timeout_ms =
-        warmcopy_participant != nullptr
-            ? preserve_trx_warmcopy_close_timeout_ms
-            : preserve_trx_drain_hard_timeout_ms;
-    overall_close_deadline_us = preserve_trx_monotonic_deadline_after_ms(
-        closing_started_us, overall_close_timeout_ms);
-    const ulonglong requested_command_deadline_us =
-        preserve_trx_monotonic_deadline_after_ms(
-            closing_started_us,
-            preserve_trx_drain_closing_command_timeout_ms);
-    closing_command_deadline_us =
-        std::min(requested_command_deadline_us, overall_close_deadline_us);
+    closing_command_deadline_us = preserve_trx_monotonic_deadline_after_ms(
+        closing_started_us, phase2_timeout_ms);
+    overall_close_deadline_us =
+        standby_transfer_streaming_enabled
+            ? preserve_trx_monotonic_deadline_after_ms(
+                  closing_command_deadline_us,
+                  kPreserveTrxTransferOperationTimeoutMs)
+            : closing_command_deadline_us;
     phase2_metrics.closing_command_effective_budget_us =
         closing_command_deadline_us >= closing_started_us
             ? closing_command_deadline_us - closing_started_us
             : 0;
-    phase2_metrics.closing_command_deadline_clamped =
-        requested_command_deadline_us > overall_close_deadline_us ? 1 : 0;
+    phase2_metrics.closing_command_deadline_clamped = 0;
     if (warmcopy_participant != nullptr) {
       warmcopy_participant->set_closing_deadline_us(
           overall_close_deadline_us);
     }
     DEBUG_SYNC(thd, "preserve_trx_warmcopy_after_closing_state_before_targets");
   }
-  const ulonglong target_wait_deadline_us =
-      two_phase_enabled ? closing_command_deadline_us
-                        : preserve_trx_batch_hard_deadline_us();
+  if (!two_phase_enabled) {
+    phase2_total_started_us = preserve_trx_monotonic_us();
+    overall_close_deadline_us = preserve_trx_monotonic_deadline_after_ms(
+        phase2_total_started_us, phase2_timeout_ms);
+    closing_command_deadline_us = overall_close_deadline_us;
+  }
+  const ulonglong target_wait_deadline_us = closing_command_deadline_us;
 
   Preserve_batch_target_counter counter(thd, generation,
                                         phase2_metrics.closing_started_us);
@@ -17678,6 +17448,7 @@ bool Preserve_trx_drain_service::execute(
   bool batch_tokens_selected = false;
   std::vector<Preserve_batch_target_execution> target_results;
   std::vector<Preserve_trx_batch_item> preserved_batch_items;
+  std::vector<Preserve_trx_batch_item> source_failed_batch_items;
   bool transfer_final_ack_accepted = false;
   bool debug_fail_ha_prepare_low = false;
   bool debug_fail_temp_only_prepare = false;
@@ -17704,9 +17475,22 @@ bool Preserve_trx_drain_service::execute(
     debug_fail_early_candidate_finalize = true;
   });
 
+  auto retain_source_failed_items_in_source_context = [&]() {
+    if (source_failed_batch_items.empty()) return;
+    preserved_batch_items.reserve(preserved_batch_items.size() +
+                                   source_failed_batch_items.size());
+    for (Preserve_trx_batch_item &item : source_failed_batch_items) {
+      preserved_batch_items.push_back(std::move(item));
+    }
+    source_failed_batch_items.clear();
+  };
+
   auto finish_phase2_reset =
       [&](std::vector<Preserve_trx_batch_item> *items,
           const char *stage) {
+        if (items == &preserved_batch_items) {
+          retain_source_failed_items_in_source_context();
+        }
         if (batch_transfer_phase1_sender != nullptr)
           batch_transfer_phase1_sender->abort();
         stop_reset_participant_admission();
@@ -17722,10 +17506,6 @@ bool Preserve_trx_drain_service::execute(
               preserve_trx_reset_invariant_failure(
                   "phase2_reset_source_restore_transition_failed",
                   active_drain_attempt);
-            }
-            if (items->empty()) {
-              Preserve_batch_clear_generation clear(generation);
-              Global_THD_manager::get_instance()->do_for_all_thd_copy(&clear);
             }
             restore_preserved_batch_items_for_reset(
                 generation, std::move(*items), active_drain_attempt);
@@ -17749,7 +17529,42 @@ bool Preserve_trx_drain_service::execute(
     return finish_phase2_reset(&preserved_batch_items, stage);
   };
 
+  auto restore_current_items_to_original_thds = [&]() {
+    retain_source_failed_items_in_source_context();
+    return restore_preserved_batch_items_to_original_thds(
+        generation, preserved_batch_items, active_drain_attempt);
+  };
+
+  auto finalize_closing_outcome_metrics = [&]() {
+    if (standby_transfer_streaming_enabled) {
+      std::sort(quiesced_target_thread_ids.begin(),
+                quiesced_target_thread_ids.end());
+      std::sort(excluded_timeout_thread_ids.begin(),
+                excluded_timeout_thread_ids.end());
+    }
+    phase2_metrics.closing_inflight_commands = counter.pending_target_count();
+    phase2_metrics.closing_excluded_tokens =
+        excluded_timeout_thread_ids.size();
+    phase2_metrics.closing_completed_before_deadline =
+        phase2_metrics.closing_inflight_commands >=
+                phase2_metrics.closing_excluded_tokens
+            ? phase2_metrics.closing_inflight_commands -
+                  phase2_metrics.closing_excluded_tokens
+            : 0;
+    phase2_metrics.closing_last_excluded_token =
+        excluded_timeout_thread_ids.empty()
+            ? 0
+            : static_cast<uint64_t>(excluded_timeout_thread_ids.back());
+  };
+
   auto finish_with_shutdown = [&]() {
+    bool source_restore_context_published = false;
+    auto release_retained_drain_scope = create_scope_guard([&] {
+      if (!source_restore_context_published) return;
+      active_drain_attempt->drain_scope_released.store(
+          true, std::memory_order_release);
+      preserved_trx_request_expired_reaper_scan();
+    });
     if (active_drain_attempt != nullptr) {
       if (reset_requested())
         return finish_reset_from_current_items("reset_before_shutdown");
@@ -17763,26 +17578,7 @@ bool Preserve_trx_drain_service::execute(
         return preserve_trx_reject_unsupported();
       }
     }
-    if (standby_transfer_streaming_enabled) {
-      std::sort(quiesced_target_thread_ids.begin(),
-                quiesced_target_thread_ids.end());
-      std::sort(excluded_timeout_thread_ids.begin(),
-                excluded_timeout_thread_ids.end());
-    }
-    phase2_metrics.closing_inflight_commands =
-        counter.pending_target_count();
-    phase2_metrics.closing_excluded_tokens =
-        excluded_timeout_thread_ids.size();
-    phase2_metrics.closing_completed_before_deadline =
-        phase2_metrics.closing_inflight_commands >=
-                phase2_metrics.closing_excluded_tokens
-            ? phase2_metrics.closing_inflight_commands -
-                  phase2_metrics.closing_excluded_tokens
-            : 0;
-    phase2_metrics.closing_last_excluded_token =
-        excluded_timeout_thread_ids.empty()
-            ? 0
-            : static_cast<uint64_t>(excluded_timeout_thread_ids.back());
+    finalize_closing_outcome_metrics();
     publish_phase2_metrics();
 #if defined(ENABLED_DEBUG_SYNC)
     if (active_drain_attempt != nullptr &&
@@ -17791,13 +17587,12 @@ bool Preserve_trx_drain_service::execute(
       DEBUG_SYNC(thd, "preserve_trx_drain_after_shutdown_handoff");
     }
 #endif
-    if (transfer_final_ack_accepted) {
-      if (reset_requested())
-        return finish_reset_from_current_items(
-            "reset_after_shutdown_handoff");
+    if (reset_requested())
+      return finish_reset_from_current_items("reset_after_shutdown_handoff");
+    if (standby_transfer_streaming_enabled) {
       if (active_drain_attempt == nullptr) {
         preserve_trx_reset_invariant_failure(
-            "final_ack_without_transfer_attempt");
+            "transfer_handoff_without_active_attempt");
       }
       {
         std::lock_guard<std::mutex> lock(
@@ -17814,11 +17609,14 @@ bool Preserve_trx_drain_service::execute(
       active_drain_attempt_cleanup.commit();
       active_drain_attempt->source_restore_context_ready.store(
           true, std::memory_order_release);
+      source_restore_context_published = true;
       if (reset_requested()) {
         (void)preserve_trx_try_restore_quarantined_reset(active_drain_attempt);
         return finish_phase2_reset(nullptr,
                                    "reset_after_source_context_publication");
       }
+    }
+    if (transfer_final_ack_accepted) {
       finalize_drain_participants_for_terminal_handoff("finish");
       if (!draining->transition_to(
               Preserve_trx_manager_state::TRANSFER_HANDOFF_COMPLETE, 0)) {
@@ -17852,28 +17650,32 @@ bool Preserve_trx_drain_service::execute(
     DBUG_EXECUTE_IF("preserve_trx_drain_skip_shutdown_after_audit_no_targets", {
       if (counter.target_count() == 0) {
         finalize_drain_participants_for_terminal_handoff("finish_no_targets");
-        if (transfer_final_ack_accepted && active_drain_attempt != nullptr) {
-          active_drain_attempt->drain_scope_released.store(
-              true, std::memory_order_release);
-          preserved_trx_request_expired_reaper_scan();
-        }
         if (!drain_result_attempted) my_ok(thd);
         return false;
       }
     });
     if (transfer_final_ack_accepted) {
-      active_drain_attempt->drain_scope_released.store(
-          true, std::memory_order_release);
-      preserved_trx_request_expired_reaper_scan();
       return false;
     }
     finalize_drain_participants_for_terminal_handoff("finish");
     if (!draining->transition_to(
             Preserve_trx_manager_state::SHUTDOWN_REQUESTED)) {
-      if (reset_requested())
+      if (reset_requested()) {
+        if (source_restore_context_published) {
+          (void)preserve_trx_try_restore_quarantined_reset(
+              active_drain_attempt);
+          return finish_phase2_reset(nullptr,
+                                     "reset_during_shutdown_transition");
+        }
         return finish_reset_from_current_items(
             "reset_during_shutdown_transition");
+      }
       return preserve_trx_reject_unsupported();
+    }
+
+    if (standby_transfer_streaming_enabled) {
+      draining->dismiss();
+      return false;
     }
 
     const bool shutdown_success =
@@ -18011,9 +17813,7 @@ bool Preserve_trx_drain_service::execute(
       counter.transaction_count() <= preserve_trx_batch_max_transactions &&
       preserved_trx_batch_has_capacity(counter.account_counts());
   const bool timeout_exclusion_enabled =
-      standby_transfer_streaming_enabled &&
-      !command_timeout_fail_batch;
-
+      standby_transfer_streaming_enabled;
   if (early_pipeline_enabled) {
     const ulonglong token_selection_started_us = preserve_trx_monotonic_us();
     if (select_batch_tokens(counter.transaction_target_thread_ids())) {
@@ -18427,9 +18227,6 @@ bool Preserve_trx_drain_service::execute(
         }
         early_wait_result = Preserve_trx_batch_wait_result::READY;
       }
-      if (early_wait_result == Preserve_trx_batch_wait_result::DEADLINE) {
-        phase2_metrics.closing_command_timed_out_count += pending.size();
-      }
       if (early_wait_result != Preserve_trx_batch_wait_result::READY) break;
 
       std::set<my_thread_id> ready_binlog_targets;
@@ -18717,9 +18514,7 @@ bool Preserve_trx_drain_service::execute(
         return finish_phase2_reset(
             &preserved_batch_items, "reset_during_early_target_pipeline");
       }
-      const bool cleanup_error =
-          restore_preserved_batch_items_to_original_thds(
-              generation, preserved_batch_items, active_drain_attempt);
+      const bool cleanup_error = restore_current_items_to_original_thds();
       abort_batch_transfer_epoch("early_target_pipeline_failed");
       abort_drain_participants("early_target_pipeline_failed");
       if (cleanup_error) {
@@ -18799,15 +18594,18 @@ bool Preserve_trx_drain_service::execute(
       if (target_wait_result != Preserve_trx_batch_wait_result::READY ||
           target_state == Preserve_trx_batch_thd_state::PENDING_QUIESCE ||
           target_state == Preserve_trx_batch_thd_state::NONE) {
+        const bool deadline_expired =
+            target_wait_result == Preserve_trx_batch_wait_result::DEADLINE;
         if (two_phase_enabled &&
-            target_wait_result == Preserve_trx_batch_wait_result::DEADLINE) {
+            deadline_expired) {
           ++phase2_metrics.closing_command_timed_out_count;
         }
         Preserve_batch_clear_generation clear(generation);
         Global_THD_manager::get_instance()->do_for_all_thd_copy(&clear);
         abort_batch_transfer_epoch("target_wait_failed");
         abort_drain_participants("target_wait_failed");
-        return preserve_trx_reject_unsupported();
+        return deadline_expired ? preserve_trx_reject_drain_timeout()
+                                : preserve_trx_reject_unsupported();
       }
 
       if (temp_unsupported_boundary_seen) {
@@ -19527,9 +19325,8 @@ bool Preserve_trx_drain_service::execute(
           return execution.failure_reason !=
                  Preserve_batch_target_execution::Failure_reason::NONE;
         }));
-    std::set<my_thread_id> restored_failed_targets;
-    if (token_local_failure_count != 0 &&
-        token_local_failure_count < target_results.size()) {
+    std::set<my_thread_id> retained_failed_targets;
+    if (token_local_failure_count != 0) {
       for (Preserve_batch_target_execution &execution : target_results) {
         if (execution.failure_reason ==
             Preserve_batch_target_execution::Failure_reason::NONE) {
@@ -19561,14 +19358,7 @@ bool Preserve_trx_drain_service::execute(
             execution.result.local_authority_staged;
         failed_item.source_rollback_image =
             std::move(execution.result.source_rollback_image);
-        std::vector<Preserve_trx_batch_item> failed_items;
-        failed_items.push_back(std::move(failed_item));
-        if (restore_preserved_batch_items_to_original_thds(
-                generation, failed_items, active_drain_attempt)) {
-          abort_batch_transfer_epoch("source_token_restore_failed");
-          return finish_cleanup_failure_without_shutdown(
-              "source_token_restore_failed");
-        }
+        source_failed_batch_items.push_back(std::move(failed_item));
 
         const auto token_it = batch_tokens_by_thread_id.find(
             execution.target_thread_id);
@@ -19583,7 +19373,7 @@ bool Preserve_trx_drain_service::execute(
             std::remove(batch_tokens.begin(),
                         batch_tokens.end(), failed_token),
             batch_tokens.end());
-        restored_failed_targets.insert(execution.target_thread_id);
+        retained_failed_targets.insert(execution.target_thread_id);
         source_failed_tokens.push_back(
             {execution.target_thread_id, execution.failure_reason});
         LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
@@ -19596,19 +19386,19 @@ bool Preserve_trx_drain_service::execute(
                    .c_str());
       }
     }
-    if (!restored_failed_targets.empty()) {
+    if (!retained_failed_targets.empty()) {
       quiesced_target_thread_ids.erase(
           std::remove_if(quiesced_target_thread_ids.begin(),
                          quiesced_target_thread_ids.end(),
                          [&](my_thread_id target_thread_id) {
-                           return restored_failed_targets.count(
+                           return retained_failed_targets.count(
                                       target_thread_id) != 0;
                          }),
           quiesced_target_thread_ids.end());
       target_results.erase(
           std::remove_if(target_results.begin(), target_results.end(),
                          [&](const Preserve_batch_target_execution &execution) {
-                           return restored_failed_targets.count(
+                           return retained_failed_targets.count(
                                       execution.target_thread_id) != 0;
                          }),
           target_results.end());
@@ -19616,6 +19406,19 @@ bool Preserve_trx_drain_service::execute(
                 [](const auto &left, const auto &right) {
                   return left.first < right.first;
                 });
+    }
+    if (quiesced_target_thread_ids.empty() &&
+        !source_failed_batch_items.empty()) {
+      if (close_warmcopy_participants_for_shutdown(
+              "source_all_token_local_failed_close_failed")) {
+        if (reset_requested())
+          return finish_reset_from_current_items(
+              "reset_during_source_all_token_local_failed_close");
+        return preserve_trx_reject_unsupported();
+      }
+      abort_batch_transfer_epoch("source_all_token_local_failed");
+      retain_source_failed_items_in_source_context();
+      return finish_with_shutdown();
     }
   }
 
@@ -19827,8 +19630,7 @@ bool Preserve_trx_drain_service::execute(
     if (debug_fail_after_one_target) {
       if (preserved_batch_items.size() == 1 &&
           quiesced_target_thread_ids.size() > 1) {
-        if (restore_preserved_batch_items_to_original_thds(
-                generation, preserved_batch_items, active_drain_attempt)) {
+        if (restore_current_items_to_original_thds()) {
           abort_batch_transfer_epoch("debug_after_one_target_cleanup_failed");
           LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
                  "Preserved transaction batch cleanup failed after debug "
@@ -19893,9 +19695,7 @@ bool Preserve_trx_drain_service::execute(
         " logged_binlog_cache=" +
         std::to_string(batch_result.logged_binlog_cache ? 1 : 0);
     LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG, message.c_str());
-    const bool prior_cleanup_error =
-        restore_preserved_batch_items_to_original_thds(
-            generation, preserved_batch_items, active_drain_attempt);
+    const bool prior_cleanup_error = restore_current_items_to_original_thds();
     const bool cleanup_error =
         batch_result.cleanup_failed_after_reattach || prior_cleanup_error;
     if (cleanup_error) {
@@ -19955,8 +19755,7 @@ bool Preserve_trx_drain_service::execute(
       }
     }
     if (commit_failed) {
-      const bool cleanup_error = restore_preserved_batch_items_to_original_thds(
-          generation, preserved_batch_items, active_drain_attempt);
+      const bool cleanup_error = restore_current_items_to_original_thds();
       abort_batch_transfer_epoch("local_authority_commit_failed");
       abort_drain_participants("local_authority_commit_failed");
       if (cleanup_error) {
@@ -19981,9 +19780,7 @@ bool Preserve_trx_drain_service::execute(
       LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
              "Preserved transaction batch directory fsync failed after "
              "deferred snapshot writes");
-      const bool cleanup_error =
-          restore_preserved_batch_items_to_original_thds(
-              generation, preserved_batch_items, active_drain_attempt);
+      const bool cleanup_error = restore_current_items_to_original_thds();
       if (cleanup_error) {
         abort_batch_transfer_epoch(
             "deferred_snapshot_directory_fsync_cleanup_failed");
@@ -20016,9 +19813,7 @@ bool Preserve_trx_drain_service::execute(
     if (debug_force_early_final_fence_change) final_fence_changed = true;
     if (final_fence_changed) {
       ++phase2_metrics.final_validation_rejects;
-      const bool cleanup_error =
-          restore_preserved_batch_items_to_original_thds(
-              generation, preserved_batch_items, active_drain_attempt);
+      const bool cleanup_error = restore_current_items_to_original_thds();
       abort_batch_transfer_epoch("early_final_lock_fence_changed");
       abort_drain_participants("early_final_lock_fence_changed");
       if (cleanup_error) {
@@ -20031,6 +19826,7 @@ bool Preserve_trx_drain_service::execute(
   if (reset_requested())
     return finish_phase2_reset(&preserved_batch_items,
                                         "reset_before_transfer_commit");
+  retain_source_failed_items_in_source_context();
   if (batch_transfer_source_session != nullptr) {
     auto quarantine_retained_bytes = [&]() {
       uint64_t retained_bytes = 0;
@@ -20151,9 +19947,7 @@ bool Preserve_trx_drain_service::execute(
           return enter_commit_unknown(commit_status);
         }
         preserve_trx_transfer_note_source_handoff_committed();
-        const bool cleanup_error =
-            restore_preserved_batch_items_to_original_thds(
-                generation, preserved_batch_items, active_drain_attempt);
+        const bool cleanup_error = restore_current_items_to_original_thds();
         if (cleanup_error) {
           return finish_cleanup_failure_without_shutdown(
               "standby_transfer_not_committed_clean_restore_failed");
@@ -20180,9 +19974,7 @@ bool Preserve_trx_drain_service::execute(
       if (!receiver_committed) {
         abort_batch_transfer_epoch("standby_transfer_commit_failed");
       }
-      const bool cleanup_error =
-          restore_preserved_batch_items_to_original_thds(
-              generation, preserved_batch_items, active_drain_attempt);
+      const bool cleanup_error = restore_current_items_to_original_thds();
       if (cleanup_error) {
         LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
                "Preserved transaction batch cleanup failed after standby "
@@ -20603,8 +20395,6 @@ bool Sql_cmd_drain_transactions_preserve::execute(THD *thd) {
 static Preserve_trx_options preserve_trx_options_from_lex(const LEX *lex) {
   Preserve_trx_options options;
   if (lex == nullptr) return options;
-  options.has_timeout = lex->preserve_trx_has_timeout;
-  options.timeout_seconds = lex->preserve_trx_timeout_seconds;
   /*
     The parser stores Preserve_trx_user_vars_mode as a small integer because LEX
     cannot include this runtime enum. Keep this mapping aligned with the grammar

@@ -41,6 +41,7 @@ EOF
 --enable_query_log
 
 SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_token_retention_timeout_ms=3600000;
 --let $old_preserve_trx_recovery_max_count= `SELECT @@GLOBAL.preserve_trx_recovery_max_count`
 SET GLOBAL preserve_trx_recovery_max_count=200;
 
@@ -60,11 +61,12 @@ for my $i (1 .. 100) {
             ($i * 10) . ", NULL);\n";
   print $fh "--exec echo \"wait\" > " .
             "$vardir/tmp/mysqld.1.expect\n";
-  print $fh "--let \$preserve_trx_drain_clause= WITH TIMEOUT 86400\n";
+  print $fh "--let \$preserve_trx_drain_clause=\n";
   print $fh "--source suite/preserve_trx/include/drain_transaction_from_control.inc\n";
   print $fh "--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc\n";
   print $fh "--exec echo \"restart: --preserve-trx-enable=ON " .
-            "--preserve-trx-recovery-max-count=200\" > " .
+            "--preserve-trx-recovery-max-count=200 " .
+            "--preserve-trx-token-retention-timeout-ms=3600000\" > " .
             "$vardir/tmp/mysqld.1.expect\n";
   print $fh "--enable_reconnect\n";
   print $fh "--source include/wait_until_connected_again.inc\n";

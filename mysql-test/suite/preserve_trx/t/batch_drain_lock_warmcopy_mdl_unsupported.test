@@ -23,7 +23,7 @@ INSERT INTO t_lock_warmcopy_mdl_unsupported VALUES(1,10);
 LOCK TABLES t_lock_warmcopy_mdl_unsupported WRITE;
 UPDATE t_lock_warmcopy_mdl_unsupported SET v=11 WHERE id=1;
 --error ER_PRESERVE_TRX_UNSUPPORTED
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SELECT COUNT(*) AS preserved_count_after_explicit_mdl_reject
   FROM performance_schema.preserved_transactions;
 UNLOCK TABLES;

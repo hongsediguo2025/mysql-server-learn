@@ -9,7 +9,7 @@ KEY k_idx(k)
 INSERT INTO t_implicit_sec VALUES(1,100,10),(2,200,20),(3,300,30);
 START TRANSACTION;
 UPDATE t_implicit_sec SET k=250, v=21 WHERE id=2;
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SELECT COUNT(*) AS recovered_explicit_secondary_record_locks
 FROM performance_schema.data_locks
 WHERE OBJECT_SCHEMA='test'

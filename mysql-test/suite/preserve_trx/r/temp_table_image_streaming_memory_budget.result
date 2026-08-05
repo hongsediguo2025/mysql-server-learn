@@ -17,7 +17,7 @@ KEY idx_v(v)
 SET GLOBAL preserve_trx_temp_table_enable=ON;
 START TRANSACTION;
 UPDATE t_temp_streaming_budget_base SET v = 11 WHERE id = 1;
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 sealed temp image exceeds memory budget
 RESUME PRESERVED TRANSACTION 'TOKEN';
 SELECT COUNT(*) AS temp_rows_after_resume FROM tmp_temp_streaming_budget;

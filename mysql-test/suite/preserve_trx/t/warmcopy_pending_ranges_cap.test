@@ -31,7 +31,7 @@ UPDATE t_warmcopy_pending_cap
 --connection warmcopy_pending_cap_owner
 SET DEBUG_SYNC =
   'preserve_trx_warmcopy_after_descriptor_hwm SIGNAL warmcopy_pending_cap_ready WAIT_FOR warmcopy_pending_cap_continue';
---send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+--send DRAIN TRANSACTIONS PRESERVE
 
 --connection default
 SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_pending_cap_ready TIMEOUT 10';

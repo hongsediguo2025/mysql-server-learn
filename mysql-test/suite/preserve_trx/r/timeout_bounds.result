@@ -1,43 +1,25 @@
-DROP TABLE IF EXISTS t_timeout_bounds;
-SET GLOBAL preserve_trx_enable=ON;
-SET @saved_preserve_trx_min_timeout=@@SESSION.preserve_trx_min_timeout;
-SET @saved_preserve_trx_default_timeout=@@SESSION.preserve_trx_default_timeout;
-SET @saved_preserve_trx_max_timeout=@@SESSION.preserve_trx_max_timeout;
-SET @saved_global_preserve_trx_min_timeout=@@GLOBAL.preserve_trx_min_timeout;
-SET @saved_global_preserve_trx_default_timeout=@@GLOBAL.preserve_trx_default_timeout;
-SET @saved_global_preserve_trx_max_timeout=@@GLOBAL.preserve_trx_max_timeout;
-SET SESSION preserve_trx_min_timeout=10;
-SET SESSION preserve_trx_default_timeout=15;
-SET SESSION preserve_trx_max_timeout=20;
-SELECT @@session.preserve_trx_min_timeout AS min_timeout,
-@@session.preserve_trx_default_timeout AS default_timeout,
-@@session.preserve_trx_max_timeout AS max_timeout;
-min_timeout	default_timeout	max_timeout
-10	15	20
-SET GLOBAL preserve_trx_min_timeout=11;
-SET GLOBAL preserve_trx_default_timeout=12;
-SET GLOBAL preserve_trx_max_timeout=13;
-SELECT @@session.preserve_trx_min_timeout AS inherited_min_timeout,
-@@session.preserve_trx_default_timeout AS inherited_default_timeout,
-@@session.preserve_trx_max_timeout AS inherited_max_timeout;
-inherited_min_timeout	inherited_default_timeout	inherited_max_timeout
-11	12	13
+SET @saved_phase1_timeout_ms=@@GLOBAL.preserve_trx_drain_phase1_timeout_ms;
+SET @saved_phase2_timeout_ms=@@GLOBAL.preserve_trx_drain_phase2_timeout_ms;
+SET @saved_token_retention_timeout_ms=
+@@GLOBAL.preserve_trx_token_retention_timeout_ms;
+SET GLOBAL preserve_trx_drain_phase1_timeout_ms=1234;
+SET GLOBAL preserve_trx_drain_phase2_timeout_ms=2345;
+SET GLOBAL preserve_trx_token_retention_timeout_ms=3456;
+SELECT @@GLOBAL.preserve_trx_drain_phase1_timeout_ms AS phase1_timeout_ms,
+@@GLOBAL.preserve_trx_drain_phase2_timeout_ms AS phase2_timeout_ms,
+@@GLOBAL.preserve_trx_token_retention_timeout_ms
+AS token_retention_timeout_ms;
+phase1_timeout_ms	phase2_timeout_ms	token_retention_timeout_ms
+1234	2345	3456
+SET SESSION preserve_trx_drain_phase1_timeout_ms=1234;
+ERROR HY000: Variable 'preserve_trx_drain_phase1_timeout_ms' is a GLOBAL variable and should be set with SET GLOBAL
+SET SESSION preserve_trx_drain_phase2_timeout_ms=2345;
+ERROR HY000: Variable 'preserve_trx_drain_phase2_timeout_ms' is a GLOBAL variable and should be set with SET GLOBAL
+SET SESSION preserve_trx_token_retention_timeout_ms=3456;
+ERROR HY000: Variable 'preserve_trx_token_retention_timeout_ms' is a GLOBAL variable and should be set with SET GLOBAL
 DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 9;
-ERROR HY000: Resumable transactions across shutdown do not support this operation
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 21;
-ERROR HY000: Resumable transactions across shutdown do not support this operation
-SET SESSION preserve_trx_default_timeout=25;
-DRAIN TRANSACTIONS PRESERVE;
-ERROR HY000: Resumable transactions across shutdown do not support this operation
-SET SESSION preserve_trx_default_timeout=15;
-SET SESSION preserve_trx_min_timeout=30;
-SET SESSION preserve_trx_max_timeout=20;
-DRAIN TRANSACTIONS PRESERVE;
-ERROR HY000: Resumable transactions across shutdown do not support this operation
-SET SESSION preserve_trx_min_timeout=@saved_preserve_trx_min_timeout;
-SET SESSION preserve_trx_default_timeout=@saved_preserve_trx_default_timeout;
-SET SESSION preserve_trx_max_timeout=@saved_preserve_trx_max_timeout;
-SET GLOBAL preserve_trx_min_timeout=@saved_global_preserve_trx_min_timeout;
-SET GLOBAL preserve_trx_default_timeout=@saved_global_preserve_trx_default_timeout;
-SET GLOBAL preserve_trx_max_timeout=@saved_global_preserve_trx_max_timeout;
-SET GLOBAL preserve_trx_enable=ON;
+ERROR 42000: You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'TIMEOUT 9' at line 1
+SET GLOBAL preserve_trx_drain_phase1_timeout_ms=@saved_phase1_timeout_ms;
+SET GLOBAL preserve_trx_drain_phase2_timeout_ms=@saved_phase2_timeout_ms;
+SET GLOBAL preserve_trx_token_retention_timeout_ms=
+@saved_token_retention_timeout_ms;

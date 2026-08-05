@@ -1,0 +1,4 @@
+# Source-shape guard for the consolidated Preserve timeout policy.
+SELECT 'ok' AS preserve_trx_timeout_policy_consolidation_lint;
+preserve_trx_timeout_policy_consolidation_lint
+ok

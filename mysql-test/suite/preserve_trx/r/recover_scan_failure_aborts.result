@@ -7,7 +7,7 @@ SELECT * FROM t_recover_scan_failure WHERE a=1 FOR UPDATE;
 a	b
 1	10
 UPDATE t_recover_scan_failure SET b=11 WHERE a=1;
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 # restart_abort: --preserve-trx-enable=ON --debug=d,preserve_trx_fail_recover_scan
 include/wait_for_pattern_in_file.inc [Failed to scan preserved transaction directory .* during recovery]
 include/wait_for_expected_crash.inc [safe_process]

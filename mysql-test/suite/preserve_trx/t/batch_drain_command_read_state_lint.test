@@ -73,16 +73,16 @@ my $quiesced_wait =
   extract_function_body($preserve_src,
   'bool preserved_trx_wait_if_batch_session_quiesced(THD *thd)');
 die "QUIESCED wait path must expose repeated warning observability\n"
-  unless $quiesced_wait =~ /preserve_trx_wait_target_timed_out/s &&
+  unless $quiesced_wait =~ /preserve_trx_wait_for_drain_owner/s &&
          $preserve_src =~ /kPreserveTrxBatchQuiescedWaitWarningLoops/s &&
          $preserve_src =~ /remains QUIESCED/s &&
          $preserve_src =~ /WARNING_LEVEL/s;
 
-my $timed_wait = extract_function_body(
+my $shared_wait = extract_function_body(
   $preserve_src,
-  'static bool preserve_trx_wait_target_timed_out(THD *thd,');
+  'static void preserve_trx_wait_for_drain_owner(uint *quiesced_wait_loops)');
 die "shared target wait must account repeated QUIESCED waits\n"
-  unless $timed_wait =~
+  unless $shared_wait =~
          /preserve_trx_note_quiesced_wait\s*\(\s*quiesced_wait_loops\s*\)/s;
 
 for my $function_name (
@@ -98,7 +98,7 @@ for my $function_name (
     die "$function_name must use the shared repeated QUIESCED wait\n"
       unless $body =~ /uint\s+quiesced_wait_loops\s*=\s*0/s &&
              $body =~
-             /preserve_trx_wait_target_timed_out\s*\([\s\S]*?&quiesced_wait_loops\s*\)/s;
+             /preserve_trx_wait_for_drain_owner\s*\(\s*&quiesced_wait_loops\s*\)/s;
   }
 }
 

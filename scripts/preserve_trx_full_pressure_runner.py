@@ -480,6 +480,8 @@ def build_mysqld_commands(
         f"--ssl-cert={ssl_data_dir / 'server-cert-verify-san.pem'}",
         f"--ssl-key={ssl_data_dir / 'server-key-verify-san.pem'}",
         "--preserve-trx-enable=ON",
+        "--preserve-trx-token-retention-timeout-ms="
+        f"{profile.preserve_timeout_s * 1000}",
         f"--preserve-trx-memory-budget-bytes={profile.preserve_memory_budget_bytes}",
         f"--preserve-trx-transfer-max-inflight-bytes={profile.transfer_max_inflight_bytes}",
         "--loose-mysqlx=0",
@@ -500,11 +502,7 @@ def build_mysqld_commands(
         )
         source.extend(
             [
-                "--preserve-trx-drain-closing-command-timeout-ms="
-                f"{mixed_close_timeout_ms}",
-                "--preserve-trx-warmcopy-close-timeout-ms="
-                f"{mixed_close_timeout_ms}",
-                "--preserve-trx-drain-hard-timeout-ms="
+                "--preserve-trx-drain-phase2-timeout-ms="
                 f"{mixed_close_timeout_ms}",
                 "--preserve-trx-memory-per-token-bytes=1073741824",
                 "--preserve-trx-warmcopy-max-total-bytes="
@@ -596,18 +594,6 @@ def build_e2e_command(
         "--max-sql-resume-ms",
         str(profile.max_sql_resume_ms),
     ]
-    if profile.mixed_seed_rows_per_table > 0:
-        mixed_arguments.extend(
-            [
-                "--preserve-warmcopy-close-timeout-ms",
-                str(
-                    max(
-                        120_000,
-                        (profile.source_phase2_limit_us + 999) // 1000,
-                    )
-                ),
-            ]
-        )
     if profile.warmcopy_artifact_budget_bytes > 0:
         mixed_arguments.extend(
             [

@@ -15,9 +15,8 @@ SET GLOBAL preserve_trx_enable=ON;
 SET GLOBAL preserve_trx_warmcopy_enable=ON;
 SET GLOBAL preserve_trx_lock_warmcopy_enable=OFF;
 SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
-SET GLOBAL preserve_trx_warmcopy_close_timeout_ms=5000;
-SET GLOBAL preserve_trx_drain_closing_command_timeout_ms=200;
-SET GLOBAL preserve_trx_transfer_phase1_timeout_ms=5000;
+SET GLOBAL preserve_trx_drain_phase1_timeout_ms=5000;
+SET GLOBAL preserve_trx_drain_phase2_timeout_ms=200;
 
 CREATE USER phase1_readiness_app@localhost;
 GRANT SELECT ON test.* TO phase1_readiness_app@localhost;
@@ -46,7 +45,7 @@ SET DEBUG_SYNC=
   'preserve_trx_phase1_readiness_before_poll_sleep SIGNAL phase1_readiness_waiting WAIT_FOR phase1_readiness_poll_continue';
 SET DEBUG_SYNC=
   'preserve_trx_warmcopy_after_closing_state_before_targets SIGNAL phase1_closing_entered';
---send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+--send DRAIN TRANSACTIONS PRESERVE
 
 --connection phase1_readiness_ha
 SET DEBUG_SYNC='now WAIT_FOR phase1_readiness_tail TIMEOUT 10';
@@ -103,8 +102,8 @@ SELECT VARIABLE_VALUE > 0 AS readiness_waited
 
 # Once the absolute Phase1 deadline has expired, readiness must not perform
 # another THD scan or wait for a command that was admitted before CLOSING.
-SET GLOBAL preserve_trx_transfer_phase1_timeout_ms=50;
-SET GLOBAL preserve_trx_drain_closing_command_timeout_ms=5000;
+SET GLOBAL preserve_trx_drain_phase1_timeout_ms=50;
+SET GLOBAL preserve_trx_drain_phase2_timeout_ms=5000;
 
 --connect(phase1_deadline_old,localhost,phase1_readiness_app,,test)
 SET DEBUG_SYNC=
@@ -118,7 +117,7 @@ SET DEBUG_SYNC=
   'preserve_trx_phase1_readiness_before_wait SIGNAL phase1_deadline_tail WAIT_FOR phase1_deadline_continue';
 SET DEBUG_SYNC=
   'preserve_trx_warmcopy_after_closing_state_before_targets SIGNAL phase1_deadline_closing WAIT_FOR phase1_deadline_closing_continue';
---send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+--send DRAIN TRANSACTIONS PRESERVE
 
 --connection phase1_readiness_ha
 SET DEBUG_SYNC='now WAIT_FOR phase1_deadline_tail TIMEOUT 10';
@@ -147,9 +146,8 @@ DROP USER phase1_readiness_app@localhost;
 --disable_query_log
 DROP USER preserve_trx_ha_admin@localhost;
 --enable_query_log
-SET GLOBAL preserve_trx_transfer_phase1_timeout_ms=600000;
-SET GLOBAL preserve_trx_drain_closing_command_timeout_ms=1000;
-SET GLOBAL preserve_trx_warmcopy_close_timeout_ms=30000;
+SET GLOBAL preserve_trx_drain_phase1_timeout_ms=600000;
+SET GLOBAL preserve_trx_drain_phase2_timeout_ms=30000;
 SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
 SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
 SET DEBUG_SYNC='RESET';

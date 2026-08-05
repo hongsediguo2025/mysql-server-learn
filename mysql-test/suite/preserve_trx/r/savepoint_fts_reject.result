@@ -10,7 +10,7 @@ START TRANSACTION;
 INSERT INTO t_savepoint_fts_reject(body) VALUES('before savepoint');
 SAVEPOINT fts_s1;
 INSERT INTO t_savepoint_fts_reject(body) VALUES('after savepoint');
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 ROLLBACK;
 SELECT COUNT(*) AS row_count FROM t_savepoint_fts_reject;
@@ -24,7 +24,7 @@ FULLTEXT KEY body_ft(body)
 START TRANSACTION;
 SAVEPOINT fts_before_engine;
 INSERT INTO t_savepoint_fts_before_engine(body) VALUES('after savepoint');
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 ROLLBACK;
 SELECT COUNT(*) AS row_count FROM t_savepoint_fts_before_engine;

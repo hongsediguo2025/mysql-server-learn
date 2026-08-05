@@ -11,7 +11,7 @@ CREATE TEMPORARY TABLE tmp_preserve_temp_autoinc(
 START TRANSACTION;
 INSERT INTO tmp_preserve_temp_autoinc(v) VALUES(10),(20);
 
---let $preserve_trx_drain_clause= WITH TIMEOUT 300
+--let $preserve_trx_drain_clause=
 --let $preserve_trx_drain_error= ER_PRESERVE_TRX_UNSUPPORTED
 --source suite/preserve_trx/include/drain_transaction_from_control_expect_error.inc
 

@@ -200,26 +200,16 @@ struct Query_options {
 enum class Preserve_trx_parser_user_vars_mode { DEFAULT, INCLUDE, EXCLUDE };
 
 struct Preserve_trx_parser_options {
-  bool has_timeout;
-  ulonglong timeout_seconds;
   Preserve_trx_parser_user_vars_mode user_vars_mode;
 
   void init() {
-    has_timeout = false;
-    timeout_seconds = 0;
     user_vars_mode = Preserve_trx_parser_user_vars_mode::DEFAULT;
   }
 
   bool merge(const Preserve_trx_parser_options &x) {
-    if ((has_timeout && x.has_timeout) ||
-        (user_vars_mode != Preserve_trx_parser_user_vars_mode::DEFAULT &&
-         x.user_vars_mode != Preserve_trx_parser_user_vars_mode::DEFAULT)) {
+    if (user_vars_mode != Preserve_trx_parser_user_vars_mode::DEFAULT &&
+        x.user_vars_mode != Preserve_trx_parser_user_vars_mode::DEFAULT) {
       return true;
-    }
-
-    if (x.has_timeout) {
-      has_timeout = true;
-      timeout_seconds = x.timeout_seconds;
     }
     if (x.user_vars_mode != Preserve_trx_parser_user_vars_mode::DEFAULT)
       user_vars_mode = x.user_vars_mode;

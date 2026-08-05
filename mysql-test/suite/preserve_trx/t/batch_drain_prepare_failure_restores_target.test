@@ -21,7 +21,7 @@ INSERT INTO t_batch_prepare_failure VALUES(1,10);
 --connection default
 SET SESSION debug="+d,pfx_prepare_low";
 --error ER_PRESERVE_TRX_UNSUPPORTED
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SET SESSION debug="-d,pfx_prepare_low";
 
 SELECT COUNT(*) AS preserved_count_after_ha_prepare_failure
@@ -41,7 +41,7 @@ INSERT INTO t_batch_prepare_failure VALUES(2,20);
 --connection default
 SET SESSION debug="+d,pfx_temp_prepare";
 --error ER_PRESERVE_TRX_UNSUPPORTED
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SET SESSION debug="-d,pfx_temp_prepare";
 
 SELECT COUNT(*) AS preserved_count_after_temp_prepare_failure

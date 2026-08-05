@@ -1,6 +1,5 @@
 DROP TABLE IF EXISTS t_recovery_grace;
 SET GLOBAL preserve_trx_enable=ON;
-SET SESSION preserve_trx_min_timeout=1;
 CREATE TABLE t_recovery_grace(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_recovery_grace VALUES(1,10);
 START TRANSACTION;
@@ -8,7 +7,7 @@ SELECT * FROM t_recovery_grace WHERE a=1 FOR UPDATE;
 a	b
 1	10
 UPDATE t_recovery_grace SET b=11 WHERE a=1;
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 1;
+DRAIN TRANSACTIONS PRESERVE;
 SELECT @@global.preserve_trx_recovery_grace_seconds AS recovery_grace_seconds;
 recovery_grace_seconds
 30

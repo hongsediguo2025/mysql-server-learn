@@ -9,7 +9,7 @@ a	b
 1	10
 UPDATE t_read_view_pin SET b=21 WHERE a=2;
 SET SESSION debug="+d,preserve_trx_assert_read_view_pinned_after_detach";
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 Pattern "PRESERVE: read view pinned after detach" found
 RESUME PRESERVED TRANSACTION 'TOKEN';
 COMMIT;

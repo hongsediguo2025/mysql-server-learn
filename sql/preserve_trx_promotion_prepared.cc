@@ -1801,13 +1801,15 @@ Preserve_trx_prepared_token_registry::update_epoch_prepare_deadline(
           current->key.epoch_id != epoch_id) {
         return Preserve_trx_prepared_status::STALE_GENERATION;
       }
-      if (current->facts.epoch_prepare_deadline_us ==
-          deadline_monotonic_us) {
+      if (current->facts.epoch_prepare_deadline_us == deadline_monotonic_us &&
+          current->facts.client_resume_deadline_us ==
+              deadline_monotonic_us) {
         publications.push_back(current);
         continue;
       }
       Preserve_trx_final_token_facts facts = current->facts;
       facts.epoch_prepare_deadline_us = deadline_monotonic_us;
+      facts.client_resume_deadline_us = deadline_monotonic_us;
       facts.canonical_digest.clear();
       if (!preserved_trx_finalize_token_facts(&facts)) {
         return Preserve_trx_prepared_status::INVALID_STATE;

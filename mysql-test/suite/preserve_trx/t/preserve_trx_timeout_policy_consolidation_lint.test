@@ -1,0 +1,110 @@
+--echo # Source-shape guard for the consolidated Preserve timeout policy.
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $root = File::Spec->rel2abs(File::Spec->catdir($mysql_test_dir, '..'));
+
+sub read_file {
+  my ($path) = @_;
+  my $full = File::Spec->catfile($root, split('/', $path));
+  open(my $fh, '<', $full) or die "open $path: $!\n";
+  my $contents = do { local $/; <$fh> };
+  close($fh);
+  return $contents;
+}
+
+my $preserve = read_file('sql/preserve_trx.cc');
+my $header = read_file('sql/preserve_trx.h');
+my $transfer = read_file('sql/preserve_trx_transfer.cc');
+my $transfer_header = read_file('sql/preserve_trx_transfer.h');
+my $sysvars = read_file('sql/sys_vars.cc');
+my $system_variables = read_file('sql/system_variables.h');
+my $grammar = read_file('sql/sql_yacc.yy');
+
+for my $name (
+  qw(
+    preserve_trx_drain_phase1_timeout_ms
+    preserve_trx_drain_phase2_timeout_ms
+    preserve_trx_token_retention_timeout_ms
+  )
+) {
+  die "$name must be declared and exposed as a sysvar\n"
+    unless ($header =~ /extern\s+uint\s+\Q$name\E/s ||
+            $transfer_header =~ /extern\s+uint\s+\Q$name\E/s) &&
+           $sysvars =~ /"\Q$name\E"/s;
+}
+
+for my $obsolete (
+  qw(
+    preserve_trx_drain_hard_timeout_ms
+    preserve_trx_drain_closing_command_timeout_ms
+    preserve_trx_drain_command_timeout_fail_batch
+    preserve_trx_warmcopy_close_timeout_ms
+    preserve_trx_transfer_phase1_timeout_ms
+    preserve_trx_transfer_phase2_timeout_ms
+    preserve_trx_transfer_commit_timeout_ms
+    preserve_trx_transfer_receiver_ready_timeout_ms
+    preserve_trx_default_timeout
+    preserve_trx_min_timeout
+    preserve_trx_max_timeout
+  )
+) {
+  die "obsolete timeout policy remains: $obsolete\n"
+    if $preserve =~ /\b\Q$obsolete\E\b/s ||
+       $header =~ /\b\Q$obsolete\E\b/s ||
+       $transfer =~ /\b\Q$obsolete\E\b/s ||
+       $transfer_header =~ /\b\Q$obsolete\E\b/s ||
+       $sysvars =~ /\b\Q$obsolete\E\b/s ||
+       $system_variables =~ /\b\Q$obsolete\E\b/s;
+}
+
+die "DRAIN SQL must not carry a WITH TIMEOUT clause\n"
+  if $grammar =~ /WITH_SYM\s+TIMEOUT_SYM/s ||
+     $preserve =~ /preserve_trx_timeout_seconds/s ||
+     $header =~ /timeout_seconds\s*\{/s;
+
+die "Phase1 readiness must use the single Phase1 deadline\n"
+  unless $preserve =~ /const\s+uint\s+phase1_timeout_ms\s*=\s*
+                       preserve_trx_drain_phase1_timeout_ms/sx &&
+         $preserve =~ /phase1_readiness_deadline_us[\s\S]{0,250}
+                       phase1_timeout_ms/sx;
+my ($phase1_readiness_impl) =
+  $preserve =~ /(preserve_trx_wait_for_phase1_readiness\([\s\S]*?)
+                 bool\s+preserve_trx_thd_has_batch_inflight_statement/sx;
+die "cannot locate Phase1 readiness implementation\n"
+  unless defined $phase1_readiness_impl;
+die "Phase1 readiness must consume the snapshotted Phase2 threshold\n"
+  if $phase1_readiness_impl =~ /preserve_trx_drain_phase2_timeout_ms/s;
+die "CLOSING must publish one absolute Phase2 deadline\n"
+  unless $preserve =~ /const\s+uint\s+phase2_timeout_ms\s*=\s*
+                       preserve_trx_drain_phase2_timeout_ms/sx &&
+         $preserve =~ /closing_command_deadline_us\s*=\s*
+                       preserve_trx_monotonic_deadline_after_ms\(
+                       [\s\S]{0,180}phase2_timeout_ms/sx;
+die "standby transfer Phase2 timeout must retain token-local exclusion\n"
+  unless $preserve =~ /timeout_exclusion_enabled\s*=\s*
+                       standby_transfer_streaming_enabled/sx &&
+         $preserve =~ /abort_token\([\s\S]{0,180}
+                       closing_command_timeout/sx;
+die "Phase2 timeout must not unconditionally abort the whole epoch\n"
+  if $preserve =~ /finish_phase2_timeout/s;
+die "terminal ACK replay retention must not depend on Phase2 policy\n"
+  unless $preserve =~ /requested_terminal_retention_us\s*=\s*
+                       static_cast<uint64_t>\(
+                         kPreserveTrxTransferOperationTimeoutMs\)
+                       \s*\*\s*2000ULL/sx;
+die "receiver READY and FAILED partitions must remain explicit\n"
+  unless $transfer_header =~ /ready_tokens/s &&
+         $transfer_header =~ /failed_tokens/s &&
+         $transfer_header =~ /selection_published/s;
+die "READY and partial classification must share token retention policy\n"
+  unless (() = $transfer =~ /preserve_trx_token_retention_timeout_ms/g) >= 2;
+die "SQL RESUME must not use an independent fixed receiver window\n"
+  if $transfer =~ /kClientResumeWindowUs/s;
+EOF
+
+SELECT 'ok' AS preserve_trx_timeout_policy_consolidation_lint;

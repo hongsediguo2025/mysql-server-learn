@@ -5,7 +5,7 @@ ENGINE=InnoDB;
 SET @batch_user_var = 'restored-value';
 START TRANSACTION;
 INSERT INTO t_resume_user_vars_failure VALUES(1,10);
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300 WITH USER VARS;
+DRAIN TRANSACTIONS PRESERVE WITH USER VARS;
 SET @batch_user_var = 'preexisting-value';
 SET @unrelated_user_var = 'keep-me';
 SET SESSION debug="+d,preserve_trx_fail_resume_before_attach";

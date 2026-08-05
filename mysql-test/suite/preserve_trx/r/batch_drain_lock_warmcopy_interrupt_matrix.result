@@ -13,7 +13,7 @@ START TRANSACTION;
 UPDATE t_lock_warmcopy_interrupt SET v=11 WHERE id=1;
 SET DEBUG_SYNC =
 'preserve_trx_warmcopy_after_closing_state_before_targets SIGNAL lock_wc_interrupt_closing WAIT_FOR lock_wc_interrupt_continue';
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SET DEBUG_SYNC = 'now WAIT_FOR lock_wc_interrupt_closing TIMEOUT 10';
 KILL QUERY DRAIN_CONN_ID;
 SET DEBUG_SYNC = 'now SIGNAL lock_wc_interrupt_continue';
@@ -36,7 +36,7 @@ START TRANSACTION;
 UPDATE t_lock_warmcopy_interrupt SET v=12 WHERE id=1;
 SET DEBUG_SYNC =
 'preserve_trx_warmcopy_after_closing_state_before_targets SIGNAL lock_wc_interrupt_conn_closing WAIT_FOR lock_wc_interrupt_conn_continue';
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SET DEBUG_SYNC = 'now WAIT_FOR lock_wc_interrupt_conn_closing TIMEOUT 10';
 KILL CONNECTION DRAIN_CONN_ID;
 SET DEBUG_SYNC = 'now SIGNAL lock_wc_interrupt_conn_continue';
@@ -54,7 +54,7 @@ START TRANSACTION;
 UPDATE t_lock_warmcopy_interrupt SET v=13 WHERE id=1;
 SET DEBUG_SYNC =
 'preserve_trx_warmcopy_after_closing_state_before_targets SIGNAL lock_wc_interrupt_target_closing WAIT_FOR lock_wc_interrupt_target_continue';
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SET DEBUG_SYNC = 'now WAIT_FOR lock_wc_interrupt_target_closing TIMEOUT 10';
 KILL CONNECTION TARGET_CONN_ID;
 SET DEBUG_SYNC = 'now SIGNAL lock_wc_interrupt_target_continue';
@@ -77,7 +77,7 @@ START TRANSACTION;
 UPDATE t_lock_warmcopy_interrupt SET v=14 WHERE id=1;
 SET DEBUG_SYNC =
 'preserve_trx_warmcopy_after_closing_state_before_targets SIGNAL lock_wc_interrupt_sigterm_closing WAIT_FOR lock_wc_interrupt_sigterm_continue';
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SET DEBUG_SYNC = 'now WAIT_FOR lock_wc_interrupt_sigterm_closing TIMEOUT 10';
 SELECT 1 AS server_alive_after_lock_warmcopy_sigterm;
 Got one of the listed errors
@@ -101,7 +101,7 @@ UPDATE t_lock_warmcopy_interrupt SET v=16 WHERE id=1;
 SET DEBUG_SYNC = 'now WAIT_FOR lock_wc_interrupt_waiting TIMEOUT 10';
 SET DEBUG_SYNC =
 'preserve_trx_warmcopy_after_closing_state_before_targets SIGNAL lock_wc_interrupt_wait_closing WAIT_FOR lock_wc_interrupt_wait_continue';
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SET DEBUG_SYNC = 'now WAIT_FOR lock_wc_interrupt_wait_closing TIMEOUT 10';
 KILL QUERY WAIT_CONN_ID;
 ERROR 70100: Query execution was interrupted

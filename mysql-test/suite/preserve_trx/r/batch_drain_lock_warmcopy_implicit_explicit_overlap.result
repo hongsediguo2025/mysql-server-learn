@@ -30,7 +30,7 @@ WHERE OBJECT_SCHEMA='test'
     AND LOCK_STATUS='GRANTED';
 explicit_primary_lock_materialized
 1
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 include/assert_grep.inc [lock warmcopy succeeds after implicit explicit overlap]
 SELECT COUNT(*) AS preserved_count_after_implicit_explicit_overlap
 FROM performance_schema.preserved_transactions;

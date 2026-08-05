@@ -1,13 +1,13 @@
 DROP TABLE IF EXISTS t_unknown_magic_xa;
 CALL mtr.add_suppression("Found 1 prepared XA transactions");
-# restart: --preserve-trx-enable=OFF --preserve-trx-off-artifact-policy=IGNORE
+# restart: --preserve-trx-enable=OFF
 CREATE TABLE t_unknown_magic_xa(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
 INSERT INTO t_unknown_magic_xa VALUES(1, 10);
 XA START X'4d53505f50524553', X'65787465726e616c5f6d61676963', 1836281843;
 UPDATE t_unknown_magic_xa SET v=20 WHERE id=1;
 XA END X'4d53505f50524553', X'65787465726e616c5f6d61676963', 1836281843;
 XA PREPARE X'4d53505f50524553', X'65787465726e616c5f6d61676963', 1836281843;
-# restart: --preserve-trx-enable=ON --preserve-trx-off-artifact-policy=FAIL_IF_PRESENT
+# restart: --preserve-trx-enable=ON
 XA RECOVER CONVERT XID;
 formatID	gtrid_length	bqual_length	data
 1836281843	8	14	0x4D53505F5052455365787465726E616C5F6D61676963

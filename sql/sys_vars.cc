@@ -1077,29 +1077,6 @@ static Sys_var_uint Sys_preserve_trx_batch_max_transactions(
     VALID_RANGE(1, UINT_MAX32), DEFAULT(256), BLOCK_SIZE(1), NO_MUTEX_GUARD,
     NOT_IN_BINLOG);
 
-static Sys_var_uint Sys_preserve_trx_default_timeout(
-    "preserve_trx_default_timeout",
-    "Default DRAIN TRANSACTIONS PRESERVE timeout in seconds.",
-    SESSION_VAR(preserve_trx_default_timeout), CMD_LINE(REQUIRED_ARG),
-    VALID_RANGE(1, UINT_MAX32), DEFAULT(300), BLOCK_SIZE(1), NO_MUTEX_GUARD,
-    NOT_IN_BINLOG);
-
-static Sys_var_uint Sys_preserve_trx_min_timeout(
-    "preserve_trx_min_timeout",
-    "Minimum client-specified wall-clock timeout in seconds for preserved "
-    "transactions.",
-    SESSION_VAR(preserve_trx_min_timeout), CMD_LINE(REQUIRED_ARG),
-    VALID_RANGE(1, UINT_MAX32), DEFAULT(60), BLOCK_SIZE(1), NO_MUTEX_GUARD,
-    NOT_IN_BINLOG);
-
-static Sys_var_uint Sys_preserve_trx_max_timeout(
-    "preserve_trx_max_timeout",
-    "Maximum client-specified wall-clock timeout in seconds for preserved "
-    "transactions.",
-    SESSION_VAR(preserve_trx_max_timeout), CMD_LINE(REQUIRED_ARG),
-    VALID_RANGE(1, UINT_MAX32), DEFAULT(86400), BLOCK_SIZE(1), NO_MUTEX_GUARD,
-    NOT_IN_BINLOG);
-
 static Sys_var_uint Sys_preserve_trx_recovery_max_count(
     "preserve_trx_recovery_max_count",
     "Maximum number of startup recovery passes for the same preserved "
@@ -1187,29 +1164,24 @@ static Sys_var_uint Sys_preserve_trx_max_modified_tables(
     VALID_RANGE(0, UINT_MAX32), DEFAULT(64), BLOCK_SIZE(1), NO_MUTEX_GUARD,
     NOT_IN_BINLOG);
 
-static Sys_var_uint Sys_preserve_trx_drain_hard_timeout_ms(
-    "preserve_trx_drain_hard_timeout_ms",
-    "Maximum DRAIN quiesce and shutdown coordination time in milliseconds.",
-    GLOBAL_VAR(preserve_trx_drain_hard_timeout_ms), CMD_LINE(REQUIRED_ARG),
-    VALID_RANGE(1, UINT_MAX32), DEFAULT(30000), BLOCK_SIZE(1), NO_MUTEX_GUARD,
-    NOT_IN_BINLOG);
+static Sys_var_uint Sys_preserve_trx_drain_phase1_timeout_ms(
+    "preserve_trx_drain_phase1_timeout_ms",
+    "Maximum Phase 1 readiness observation time in milliseconds. Expiry "
+    "stops readiness waiting and immediately advances the drain to Phase 2.",
+    GLOBAL_VAR(preserve_trx_drain_phase1_timeout_ms), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(1, UINT_MAX32), DEFAULT(600000), BLOCK_SIZE(1),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG);
 
-static Sys_var_uint Sys_preserve_trx_drain_closing_command_timeout_ms(
-    "preserve_trx_drain_closing_command_timeout_ms",
-    "Maximum shared milliseconds after WARMCOPY_CLOSING is published for "
-    "commands admitted before the boundary to finish. This deadline is "
-    "clamped to the existing overall close deadline.",
-    GLOBAL_VAR(preserve_trx_drain_closing_command_timeout_ms),
-    CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, UINT_MAX32), DEFAULT(1000),
-    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
-
-static Sys_var_bool Sys_preserve_trx_drain_command_timeout_fail_batch(
-    "preserve_trx_drain_command_timeout_fail_batch",
-    "Fail the whole drain when a command admitted before WARMCOPY_CLOSING "
-    "does not finish by the shared command deadline. OFF permits timeout "
-    "exclusion only for standby-transfer drains.",
-    GLOBAL_VAR(preserve_trx_drain_command_timeout_fail_batch),
-    CMD_LINE(OPT_ARG), DEFAULT(false), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+static Sys_var_uint Sys_preserve_trx_drain_phase2_timeout_ms(
+    "preserve_trx_drain_phase2_timeout_ms",
+    "Maximum token-convergence time in milliseconds after publishing "
+    "WARMCOPY_CLOSING. Expiry fails a local-carrier drain. Standby transfer "
+    "instead excludes commands that have not reached the boundary and "
+    "continues with proven survivors; shared integrity failures remain "
+    "fail-closed.",
+    GLOBAL_VAR(preserve_trx_drain_phase2_timeout_ms), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(1, UINT_MAX32), DEFAULT(30000), BLOCK_SIZE(1),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG);
 
 static Sys_var_bool Sys_preserve_trx_transfer_pipeline_enable(
     "preserve_trx_transfer_pipeline_enable",
@@ -1219,38 +1191,11 @@ static Sys_var_bool Sys_preserve_trx_transfer_pipeline_enable(
     GLOBAL_VAR(preserve_trx_transfer_pipeline_enable), CMD_LINE(OPT_ARG),
     DEFAULT(true), NO_MUTEX_GUARD, NOT_IN_BINLOG);
 
-static Sys_var_uint Sys_preserve_trx_transfer_phase1_timeout_ms(
-    "preserve_trx_transfer_phase1_timeout_ms",
-    "Classic-protocol operation timeout in milliseconds for source "
-    "standby-transfer phase 1. The same value is the absolute phase-1 "
-    "readiness deadline; after it expires readiness stops observing commands "
-    "and proceeds to WARMCOPY_CLOSING.",
-    GLOBAL_VAR(preserve_trx_transfer_phase1_timeout_ms),
-    CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, UINT_MAX32), DEFAULT(600000),
-    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
-
-static Sys_var_uint Sys_preserve_trx_transfer_phase2_timeout_ms(
-    "preserve_trx_transfer_phase2_timeout_ms",
-    "Classic-protocol connect/read/write operation timeout in milliseconds "
-    "for source standby-transfer work after command quiesce. This is not an "
-    "end-to-end phase-2 wall-clock deadline.",
-    GLOBAL_VAR(preserve_trx_transfer_phase2_timeout_ms),
-    CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, UINT_MAX32), DEFAULT(3000),
-    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
-
 static Sys_var_bool Sys_preserve_trx_warmcopy_enable(
     "preserve_trx_warmcopy_enable",
     "Enable the warm-copy phase for DRAIN TRANSACTIONS PRESERVE binlog caches.",
     GLOBAL_VAR(preserve_trx_warmcopy_enable), CMD_LINE(OPT_ARG),
     DEFAULT(true), NO_MUTEX_GUARD, NOT_IN_BINLOG);
-
-static Sys_var_uint Sys_preserve_trx_warmcopy_close_timeout_ms(
-    "preserve_trx_warmcopy_close_timeout_ms",
-    "Maximum wall-clock time in milliseconds to wait for warm-copy closing "
-    "convergence.",
-    GLOBAL_VAR(preserve_trx_warmcopy_close_timeout_ms), CMD_LINE(REQUIRED_ARG),
-    VALID_RANGE(0, UINT_MAX32), DEFAULT(30000), BLOCK_SIZE(1), NO_MUTEX_GUARD,
-    NOT_IN_BINLOG);
 
 static Sys_var_uint Sys_preserve_trx_warmcopy_min_open_ms(
     "preserve_trx_warmcopy_min_open_ms",
@@ -1555,14 +1500,6 @@ static Sys_var_uint Sys_preserve_trx_transfer_worker_yield_us(
     VALID_RANGE(0, 1000000), DEFAULT(1000), BLOCK_SIZE(1), NO_MUTEX_GUARD,
     NOT_IN_BINLOG);
 
-static Sys_var_uint Sys_preserve_trx_transfer_commit_timeout_ms(
-    "preserve_trx_transfer_commit_timeout_ms",
-    "Maximum milliseconds the source waits for a Preserve/Resume standby "
-    "direct-transfer epoch commit acknowledgment.",
-    GLOBAL_VAR(preserve_trx_transfer_commit_timeout_ms),
-    CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, UINT_MAX32), DEFAULT(30000),
-    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
-
 static Sys_var_uint Sys_preserve_trx_transfer_receiver_prewarm_timeout_ms(
     "preserve_trx_transfer_receiver_prewarm_timeout_ms",
     "Maximum milliseconds an accepted Preserve/Resume standby epoch may "
@@ -1571,11 +1508,12 @@ static Sys_var_uint Sys_preserve_trx_transfer_receiver_prewarm_timeout_ms(
     CMD_LINE(REQUIRED_ARG), VALID_RANGE(1000, 3600000), DEFAULT(10000),
     BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
 
-static Sys_var_uint Sys_preserve_trx_transfer_receiver_ready_timeout_ms(
-    "preserve_trx_transfer_receiver_ready_timeout_ms",
-    "Maximum milliseconds a READY Preserve/Resume standby epoch may wait for "
-    "a promotion lease in the current receiver process.",
-    GLOBAL_VAR(preserve_trx_transfer_receiver_ready_timeout_ms),
+static Sys_var_uint Sys_preserve_trx_token_retention_timeout_ms(
+    "preserve_trx_token_retention_timeout_ms",
+    "Maximum milliseconds that a classified receiver epoch and its READY "
+    "tokens retain fast-resume eligibility. The immutable READY/FAILED "
+    "selection, promotion gate, and SQL RESUME share one absolute deadline.",
+    GLOBAL_VAR(preserve_trx_token_retention_timeout_ms),
     CMD_LINE(REQUIRED_ARG), VALID_RANGE(1000, 3600000), DEFAULT(30000),
     BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
 
@@ -1937,22 +1875,6 @@ static Sys_var_bool Sys_preserve_trx_enable(
     NO_MUTEX_GUARD, NOT_IN_BINLOG,
     ON_CHECK(preserve_trx_sysvar_check_enable),
     ON_UPDATE(preserve_trx_sysvar_update_enable));
-
-static const char *preserve_trx_off_artifact_policy_names[] = {
-    "FAIL_IF_PRESENT", "IGNORE", "RECOVER", "ABANDON", nullptr};
-
-static Sys_var_enum Sys_preserve_trx_off_artifact_policy(
-    "preserve_trx_off_artifact_policy",
-    "Startup-only policy used when preserve_trx_enable is OFF and historical "
-    "Preserve/Resume artifacts exist in the datadir. FAIL_IF_PRESENT rejects "
-    "startup if artifacts are present; IGNORE keeps the strict native OFF "
-    "path and leaves cleanup to external tooling; RECOVER handles local "
-    "preserve artifacts without allowing new preserve work; ABANDON attempts "
-    "auditable rollback/cleanup of historical artifacts.",
-    READ_ONLY GLOBAL_VAR(preserve_trx_off_artifact_policy),
-    CMD_LINE(REQUIRED_ARG), preserve_trx_off_artifact_policy_names,
-    DEFAULT(PRESERVE_TRX_OFF_ARTIFACT_POLICY_FAIL_IF_PRESENT), NO_MUTEX_GUARD,
-    NOT_IN_BINLOG);
 
 static Sys_var_enum Sys_binlog_format(
     "binlog_format",

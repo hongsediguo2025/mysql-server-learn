@@ -19,7 +19,7 @@ UPDATE t_non_row_preserve_preflight SET v=21 WHERE id=2;
 
 --connection default
 --error ER_PRESERVE_TRX_UNSUPPORTED
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 
 --connection non_row_batch_target
 UPDATE t_non_row_preserve_preflight SET v=22 WHERE id=2;

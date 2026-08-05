@@ -8,7 +8,7 @@ a	b
 1	10
 UPDATE t_preserve_prepare_crash SET b=11 WHERE a=1;
 SET SESSION debug="+d,preserve_trx_crash_after_undo_prepared_before_snapshot";
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 ERROR HY000: Lost connection to MySQL server during query
 SELECT COUNT(*) AS remaining_preserved
 FROM performance_schema.preserved_transactions;

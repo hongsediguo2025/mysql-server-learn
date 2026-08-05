@@ -47,7 +47,6 @@ from scripts.resumable_trx_longrun_e2e import (
     longrun_native_warmcopy_required_total_bytes,
     build_business_live_command,
     build_business_live_plan,
-    mysql_integer_timeout_literal,
     main as longrun_main,
     parse_args as longrun_parse_args,
     run_live_smoke_command,
@@ -57,10 +56,7 @@ from scripts.resumable_trx_business_e2e import parse_args as parse_business_e2e_
 
 
 class ResumableTrxLongRunE2ETest(unittest.TestCase):
-    def test_mysql_integer_timeout_literal_matches_drain_sql_grammar(self):
-        self.assertEqual("30", mysql_integer_timeout_literal(30.0))
-        self.assertEqual("31", mysql_integer_timeout_literal(30.25))
-        self.assertEqual("0", mysql_integer_timeout_literal(-1.0))
+    def test_mysql_cycle_runtime_uses_parameterized_drain_timeout(self):
         options = MysqlCycleRuntimeOptions(
             MysqlConnectionOptions(unix_socket="/tmp/mysql.sock")
         )
@@ -3730,12 +3726,18 @@ class ResumableTrxLongRunE2ETest(unittest.TestCase):
             self.assertIn("SET GLOBAL preserve_trx_enable=ON", sql_text)
             self.assertIn("SET GLOBAL preserve_trx_temp_table_enable=ON", sql_text)
             self.assertIn("SET GLOBAL preserve_trx_warmcopy_enable=OFF", sql_text)
-            self.assertIn("DRAIN TRANSACTIONS PRESERVE", sql_text)
             self.assertIn(
-                "DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300 WITH USER VARS",
+                "SET GLOBAL preserve_trx_drain_phase2_timeout_ms=300000",
                 sql_text,
             )
-            self.assertNotIn("WITH TIMEOUT 30.0", sql_text)
+            self.assertIn(
+                "SET GLOBAL preserve_trx_token_retention_timeout_ms=300000",
+                sql_text,
+            )
+            self.assertIn(
+                "DRAIN TRANSACTIONS PRESERVE WITH USER VARS", sql_text
+            )
+            self.assertNotIn("WITH TIMEOUT", sql_text)
             self.assertIn("RESUME PRESERVED TRANSACTION 'tok-1'", sql_text)
             self.assertIn("RESUME PRESERVED TRANSACTION 'tok-2'", sql_text)
 
@@ -4395,7 +4397,7 @@ class ResumableTrxLongRunE2ETest(unittest.TestCase):
         self.assertIn("DRAIN_OBSERVED_KILL", executed)
         self.assertLess(
             executed.index(
-                "DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300 WITH USER VARS"
+                "DRAIN TRANSACTIONS PRESERVE WITH USER VARS"
             ),
             executed.index(("KILL", result["kill_scenario_results"][0])),
         )

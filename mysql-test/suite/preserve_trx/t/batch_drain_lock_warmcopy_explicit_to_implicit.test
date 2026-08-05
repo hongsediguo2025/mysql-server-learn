@@ -59,7 +59,7 @@ SELECT COUNT(*) > 0 AS explicit_insert_lock_materialized
 SET DEBUG_SYNC =
   'preserve_trx_warmcopy_after_phase1_open SIGNAL lock_wc_explicit_to_implicit_open WAIT_FOR lock_wc_explicit_to_implicit_continue';
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
---send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+--send DRAIN TRANSACTIONS PRESERVE
 
 --connection default
 SET DEBUG_SYNC = 'now WAIT_FOR lock_wc_explicit_to_implicit_open TIMEOUT 10';

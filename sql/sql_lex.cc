@@ -480,8 +480,6 @@ void LEX::reset() {
   mark_broken(false);
   reset_exec_started();
   max_execution_time = 0;
-  preserve_trx_has_timeout = false;
-  preserve_trx_timeout_seconds = 0;
   preserve_trx_user_vars_mode = 0;
   reparse_common_table_expr_at = 0;
   opt_hints_global = nullptr;

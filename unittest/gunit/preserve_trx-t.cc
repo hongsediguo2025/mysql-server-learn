@@ -87,10 +87,6 @@
 #include "unittest/gunit/test_utils.h"
 
 static_assert(
-    std::is_same<decltype(Preserve_trx_options::timeout_seconds), ulonglong>::
-        value,
-    "Preserve_trx_options::timeout_seconds must stay ulonglong");
-static_assert(
     !std::is_move_assignable<Mysql_binlog_preserve_attach_journal>::value,
     "an active native binlog attach journal must not be move-assigned");
 
@@ -968,7 +964,6 @@ TEST(PreservedTrxPreparedRegistry,
             registry.begin_attach(first_key, first_key.generation, &attach));
   ASSERT_EQ(Preserve_trx_prepared_status::OK,
             registry.abort_attach_after_full_unwind(&attach));
-  EXPECT_EQ(1U, registry.expire_once(deadline_us + 1).ready_expired);
   Preserve_trx_cleanup_lease cleanup;
   ASSERT_EQ(Preserve_trx_prepared_status::OK,
             registry.begin_cleanup(
@@ -976,6 +971,7 @@ TEST(PreservedTrxPreparedRegistry,
                 Preserve_trx_prepared_token_state::ADOPTED_LOCKED, &cleanup));
   ASSERT_EQ(Preserve_trx_prepared_status::OK,
             registry.commit_cleanup(&cleanup, true));
+  EXPECT_EQ(1U, registry.expire_once(deadline_us + 1).ready_expired);
   registry.purge_epoch(first_key.epoch_scope, first_key.epoch_id);
   preserve_trx_resource_manager_reset_for_unit_test();
 }
@@ -4011,40 +4007,28 @@ TEST_F(PreservedTrxCommandRead,
   EXPECT_TRUE(preserved_trx_begin_command_read(target));
 }
 
-TEST_F(PreservedTrxCommandRead, TimeoutsWhenTargetStateCannotDrainWithinHardLimit) {
+TEST_F(PreservedTrxCommandRead, WaitsUntilDrainOwnerReleasesTargetState) {
   THD *target = thd();
-  const uint saved_timeout = preserve_trx_drain_hard_timeout_ms;
-  preserve_trx_drain_hard_timeout_ms = 1;
   target->preserve_trx_batch_state = Preserve_trx_batch_thd_state::QUIESCED;
 
   preserve_trx_set_enable_value(true);
-  set_expected_error(ER_PRESERVE_TRX_DRAIN_TIMEOUT);
   target->m_server_idle = false;
-  const auto started = std::chrono::steady_clock::now();
-  EXPECT_FALSE(preserved_trx_begin_command_read(target));
-  set_expected_error(0);
-  const auto elapsed_ms =
-      std::chrono::duration_cast<std::chrono::milliseconds>(
-          std::chrono::steady_clock::now() - started)
-          .count();
-  EXPECT_FALSE(target->m_server_idle);
-  EXPECT_LE(elapsed_ms, 500);
-
-  preserve_trx_drain_hard_timeout_ms = saved_timeout;
-  mysql_mutex_lock(&target->LOCK_thd_data);
-  target->preserve_trx_batch_state = Preserve_trx_batch_thd_state::NONE;
-  mysql_mutex_unlock(&target->LOCK_thd_data);
-  target->m_server_idle = false;
+  std::thread release_target([target] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    mysql_mutex_lock(&target->LOCK_thd_data);
+    target->preserve_trx_batch_state = Preserve_trx_batch_thd_state::NONE;
+    mysql_mutex_unlock(&target->LOCK_thd_data);
+  });
   EXPECT_TRUE(preserved_trx_begin_command_read(target));
+  release_target.join();
+  EXPECT_TRUE(target->m_server_idle);
 }
 
 TEST_F(PreservedTrxCommandRead,
-       ClosingQuiescedTargetReadsOnlyForProtocolRejection) {
+  ClosingQuiescedTargetReadsOnlyForProtocolRejection) {
   THD *target = thd();
-  const uint saved_timeout = preserve_trx_drain_hard_timeout_ms;
-  auto restore_state = create_scope_guard([this, target, saved_timeout] {
+  auto restore_state = create_scope_guard([this, target] {
     set_expected_error(0);
-    preserve_trx_drain_hard_timeout_ms = saved_timeout;
     mysql_mutex_lock(&target->LOCK_thd_data);
     target->preserve_trx_batch_state = Preserve_trx_batch_thd_state::NONE;
     mysql_mutex_unlock(&target->LOCK_thd_data);
@@ -4053,7 +4037,6 @@ TEST_F(PreservedTrxCommandRead,
   });
 
   preserve_trx_set_enable_value(true);
-  preserve_trx_drain_hard_timeout_ms = 1;
   preserved_trx_set_manager_state_for_unit_test(
       Preserve_trx_manager_state::WARMCOPY_CLOSING, 0);
   mysql_mutex_lock(&target->LOCK_thd_data);
@@ -4061,7 +4044,6 @@ TEST_F(PreservedTrxCommandRead,
   target->m_server_idle = true;
   mysql_mutex_unlock(&target->LOCK_thd_data);
 
-  set_expected_error(ER_PRESERVE_TRX_DRAIN_TIMEOUT);
   const bool can_read_for_rejection = preserved_trx_begin_command_read(target);
   EXPECT_TRUE(can_read_for_rejection);
   if (!can_read_for_rejection) return;
@@ -4073,7 +4055,6 @@ TEST_F(PreservedTrxCommandRead,
   EXPECT_TRUE(preserved_trx_mark_inflight_command_packet(target, COM_QUERY));
   EXPECT_TRUE(preserved_trx_end_command_read(target));
   EXPECT_FALSE(target->m_server_idle);
-  set_expected_error(ER_PRESERVE_TRX_DRAIN_TIMEOUT);
   EXPECT_FALSE(preserved_trx_wait_if_batch_session_quiesced(target));
   set_expected_error(0);
   EXPECT_FALSE(preserved_trx_reject_if_batch_session_drained(target));
@@ -4155,52 +4136,32 @@ static XID preserve_magic_xid_for_test(const char *token) {
   return xid;
 }
 
-class PreserveMagicXidPolicy : public ::testing::Test {
+class PreserveMagicXidOffMode : public ::testing::Test {
  protected:
-  void SetUp() override {
-    m_saved_enable = preserve_trx_enable;
-    m_saved_policy = preserve_trx_off_artifact_policy;
-  }
+  void SetUp() override { m_saved_enable = preserve_trx_enable; }
 
-  void TearDown() override {
-    preserve_trx_off_artifact_policy = m_saved_policy;
-    preserve_trx_set_enable_value(m_saved_enable);
-  }
+  void TearDown() override { preserve_trx_set_enable_value(m_saved_enable); }
 
  private:
   bool m_saved_enable{false};
-  ulong m_saved_policy{PRESERVE_TRX_OFF_ARTIFACT_POLICY_FAIL_IF_PRESENT};
 };
 
-TEST_F(PreserveMagicXidPolicy, EnabledFeatureDoesNotProtectUnauthenticatedMagicXid) {
+TEST_F(PreserveMagicXidOffMode,
+       EnabledFeatureDoesNotProtectUnauthenticatedMagicXid) {
   preserve_trx_set_enable_value(true);
-  preserve_trx_off_artifact_policy = PRESERVE_TRX_OFF_ARTIFACT_POLICY_IGNORE;
 
-  const XID xid = preserve_magic_xid_for_test("policy_enabled");
+  const XID xid = preserve_magic_xid_for_test("feature_enabled");
   EXPECT_FALSE(preserve_trx_magic_xid_should_be_protected(xid));
   EXPECT_FALSE(trx_preserve_xid_should_be_protected(xid));
 }
 
-TEST_F(PreserveMagicXidPolicy, IgnoreDoesNotProtectMagicXid) {
+TEST_F(PreserveMagicXidOffMode,
+       DisabledFeatureDoesNotProtectUnauthenticatedMagicXid) {
   preserve_trx_set_enable_value(false);
-  preserve_trx_off_artifact_policy = PRESERVE_TRX_OFF_ARTIFACT_POLICY_IGNORE;
 
-  const XID xid = preserve_magic_xid_for_test("policy_ignore");
+  const XID xid = preserve_magic_xid_for_test("feature_disabled");
   EXPECT_FALSE(preserve_trx_magic_xid_should_be_protected(xid));
   EXPECT_FALSE(trx_preserve_xid_should_be_protected(xid));
-}
-
-TEST_F(PreserveMagicXidPolicy, OffPoliciesDoNotProtectUnauthenticatedMagicXid) {
-  preserve_trx_set_enable_value(false);
-  const XID xid = preserve_magic_xid_for_test("policy_missing_token");
-
-  preserve_trx_off_artifact_policy =
-      PRESERVE_TRX_OFF_ARTIFACT_POLICY_FAIL_IF_PRESENT;
-  EXPECT_FALSE(preserve_trx_magic_xid_should_be_protected(xid));
-  preserve_trx_off_artifact_policy = PRESERVE_TRX_OFF_ARTIFACT_POLICY_RECOVER;
-  EXPECT_FALSE(preserve_trx_magic_xid_should_be_protected(xid));
-  preserve_trx_off_artifact_policy = PRESERVE_TRX_OFF_ARTIFACT_POLICY_ABANDON;
-  EXPECT_FALSE(preserve_trx_magic_xid_should_be_protected(xid));
 }
 
 TEST(PreserveTransactionParticipants, ReadOnlyUnsupportedEngineIsRejected) {
@@ -7186,8 +7147,8 @@ TEST(PreservedTrxTransfer,
 
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
             sink_a->send_encoded_frame("epoch-a-first"));
-  sink_a->set_operation_timeout_ms(
-      preserve_trx_transfer_phase2_timeout_ms);
+  constexpr uint kReconnectOperationTimeoutMs = 1234;
+  sink_a->set_operation_timeout_ms(kReconnectOperationTimeoutMs);
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
             sink_a->send_encoded_frame("epoch-a-reconnect"));
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
@@ -7383,7 +7344,7 @@ TEST(PreservedTrxTransfer, SecureMysqlCloseCleansesKnownPasswordCopies) {
 }
 
 TEST(PreservedTrxTransfer,
-     ConfiguredFrameSinkReconnectsWhenTransferPhaseTimeoutChanges) {
+     ConfiguredFrameSinkReconnectsWhenOperationTimeoutChanges) {
   Transfer_source_config_guard config;
   config.tcp("127.0.0.1", 3307, "transfer_user",
              "transfer_credential");
@@ -7396,14 +7357,15 @@ TEST(PreservedTrxTransfer,
   ASSERT_NE(nullptr, sink.get());
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
             sink->send_encoded_frame("phase1-frame"));
-  EXPECT_EQ(preserve_trx_transfer_phase1_timeout_ms,
+  EXPECT_EQ(kPreserveTrxTransferOperationTimeoutMs,
             client_state.endpoint.operation_timeout_ms);
 
-  sink->set_operation_timeout_ms(preserve_trx_transfer_phase2_timeout_ms);
+  constexpr uint kShortOperationTimeoutMs = 1234;
+  sink->set_operation_timeout_ms(kShortOperationTimeoutMs);
   EXPECT_EQ(1, client_state.disconnect_count);
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
             sink->send_encoded_frame("phase2-frame"));
-  EXPECT_EQ(preserve_trx_transfer_phase2_timeout_ms,
+  EXPECT_EQ(kShortOperationTimeoutMs,
             client_state.endpoint.operation_timeout_ms);
   EXPECT_EQ(2, client_state.connect_count);
 }
@@ -15392,6 +15354,13 @@ TEST(PreservedTrxTransfer, FrameCodecRejectsFieldsForWrongFrameType) {
 TEST_F(PreserveSnapshotTest,
        TransferReceiverApplyFramesPublishesStandbyPendingToken) {
   Transfer_codec_context_guard codec_guard;
+  const uint saved_token_retention_timeout_ms =
+      preserve_trx_token_retention_timeout_ms;
+  auto restore_token_retention_timeout = create_scope_guard([&] {
+    preserve_trx_token_retention_timeout_ms =
+        saved_token_retention_timeout_ms;
+  });
+  preserve_trx_token_retention_timeout_ms = 120000;
   const uint64_t transfer_token = 101;
   Preserve_snapshot_metadata meta = metadata();
   meta.token = test_transfer_token_string(transfer_token);
@@ -15539,6 +15508,20 @@ TEST_F(PreserveSnapshotTest,
   ASSERT_TRUE(registry.lookup(manifest.epoch_id, manifest.token, &record));
   EXPECT_TRUE(record.state == Preserve_trx_transfer_receiver_state::RECEIVING ||
               record.state == Preserve_trx_transfer_receiver_state::SAVED_ONLINE);
+
+#ifndef NDEBUG
+  Preserve_trx_prepared_token_key strict_key;
+  ASSERT_TRUE(preserve_trx_transfer_strict_prepared_key_for_unit_test(
+      m_dir, manifest, bundle.metadata.token, &strict_key));
+  Preserve_trx_prepared_token_snapshot strict_snapshot;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            preserved_trx_strict_prepared_token_registry().snapshot(
+                strict_key, &strict_snapshot));
+  EXPECT_EQ(accepted.deadline_monotonic_us,
+            strict_snapshot.facts.epoch_prepare_deadline_us);
+  EXPECT_EQ(accepted.deadline_monotonic_us,
+            strict_snapshot.facts.client_resume_deadline_us);
+#endif
 
   Preserve_trx_promotion_ready_summary ready_summary;
   ASSERT_TRUE(wait_for_epoch_ready(manifest.epoch_id, 1, &ready_summary));
@@ -24315,7 +24298,7 @@ TEST_F(PreserveSnapshotTest,
 }
 
 TEST_F(PreserveSnapshotTest,
-       TransferSourceEpochSessionUsesTerminalTimeoutOnlyForCommit) {
+       TransferSourceEpochSessionDoesNotRestartTimeoutForCommit) {
   Transfer_codec_context_guard codec_guard;
   const uint64_t transfer_token = 7103;
   Preserve_snapshot_metadata meta = metadata();
@@ -24335,12 +24318,8 @@ TEST_F(PreserveSnapshotTest,
             session.send_token_bundle(bundle, transfer_token));
 
   EXPECT_EQ(Preserve_trx_transfer_status::OK, session.commit_epoch());
-  ASSERT_EQ(1U, sink.operation_timeouts_ms().size());
-  EXPECT_EQ(preserve_trx_transfer_commit_timeout_ms,
-            sink.operation_timeouts_ms().front());
-  ASSERT_EQ(1U, sink.frame_counts_at_timeout().size());
-  EXPECT_EQ(sink.frames().size(),
-            sink.frame_counts_at_timeout().front() + 1);
+  EXPECT_TRUE(sink.operation_timeouts_ms().empty());
+  EXPECT_TRUE(sink.frame_counts_at_timeout().empty());
 
   Preserve_trx_transfer_frame commit;
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
@@ -29576,34 +29555,6 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_NE(nullptr,
             my_stat((m_dir + token + ".tempts.45.undo.warm").c_str(),
                     &stat_area, MYF(0)));
-}
-
-TEST_F(PreserveSnapshotTest, TimeoutDefaultsAndBoundsAreResolved) {
-  Preserve_trx_options options;
-  ulonglong timeout_seconds = 0;
-  EXPECT_TRUE(preserved_trx_resolve_timeout_seconds(options, 15, 10, 20,
-                                                    &timeout_seconds));
-  EXPECT_EQ(15U, timeout_seconds);
-
-  options.has_timeout = true;
-  options.timeout_seconds = 9;
-  EXPECT_FALSE(preserved_trx_resolve_timeout_seconds(options, 15, 10, 20,
-                                                     &timeout_seconds));
-
-  options.timeout_seconds = 21;
-  EXPECT_FALSE(preserved_trx_resolve_timeout_seconds(options, 15, 10, 20,
-                                                     &timeout_seconds));
-
-  options.timeout_seconds = 10;
-  EXPECT_TRUE(preserved_trx_resolve_timeout_seconds(options, 15, 10, 20,
-                                                    &timeout_seconds));
-  EXPECT_EQ(10U, timeout_seconds);
-
-  options.has_timeout = false;
-  EXPECT_FALSE(preserved_trx_resolve_timeout_seconds(options, 25, 10, 20,
-                                                     &timeout_seconds));
-  EXPECT_FALSE(preserved_trx_resolve_timeout_seconds(options, 15, 21, 20,
-                                                     &timeout_seconds));
 }
 
 TEST_F(PreserveSnapshotTest, ZeroSnapshotDeadlineIsInvalid) {

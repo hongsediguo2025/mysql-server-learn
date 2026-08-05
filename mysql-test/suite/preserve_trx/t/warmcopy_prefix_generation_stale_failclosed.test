@@ -32,7 +32,7 @@ UPDATE t_warmcopy_prefix_stale
 --connection warmcopy_prefix_stale_owner
 SET DEBUG_SYNC =
   'preserve_trx_warmcopy_before_prefix_digest_replay SIGNAL warmcopy_prefix_copied WAIT_FOR warmcopy_prefix_continue';
---send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+--send DRAIN TRANSACTIONS PRESERVE
 
 --connection default
 SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_prefix_copied TIMEOUT 10';

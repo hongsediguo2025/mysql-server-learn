@@ -18,7 +18,7 @@ SET DEBUG_SYNC = 'now SIGNAL lock_wc_active_scan_target_waiting WAIT_FOR lock_wc
 SET DEBUG_SYNC = 'now WAIT_FOR lock_wc_active_scan_target_waiting TIMEOUT 10';
 SET DEBUG_SYNC =
 'preserve_trx_lock_warmcopy_after_active_record_scan SIGNAL lock_wc_active_scan_done WAIT_FOR lock_wc_active_scan_continue';
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SET DEBUG_SYNC = 'now WAIT_FOR lock_wc_active_scan_done TIMEOUT 10';
 SET DEBUG_SYNC = 'now SIGNAL lock_wc_active_scan_target_continue';
 SET DEBUG_SYNC = 'now SIGNAL lock_wc_active_scan_continue';

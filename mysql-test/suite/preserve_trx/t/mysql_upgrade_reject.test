@@ -16,7 +16,7 @@ UPDATE t_preserve_upgrade_context SET b=11 WHERE a=1;
 --connect(mysql_upgrade_drain_control,localhost,root,,test)
 SET SESSION debug='+d,preserve_trx_simulate_server_upgrade_context';
 --error ER_PRESERVE_TRX_UNSUPPORTED
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SET SESSION debug='-d,preserve_trx_simulate_server_upgrade_context';
 --disconnect mysql_upgrade_drain_control
 --connection default
@@ -25,7 +25,7 @@ COMMIT;
 
 SET SESSION debug='+d,preserve_trx_simulate_server_upgrade_context';
 --error ER_PRESERVE_TRX_UNSUPPORTED
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SET SESSION debug='-d,preserve_trx_simulate_server_upgrade_context';
 
 SELECT * FROM t_preserve_upgrade_context ORDER BY a;

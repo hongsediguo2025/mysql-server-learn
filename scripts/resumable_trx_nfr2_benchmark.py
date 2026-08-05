@@ -1291,7 +1291,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--drain-interval", type=float, default=20.0)
     parser.add_argument("--business-run-before-drain", type=float, default=0.0)
     parser.add_argument("--duration", type=float, default=0.0)
-    parser.add_argument("--preserve-timeout", type=int, default=86400)
+    parser.add_argument(
+        "--preserve-timeout",
+        type=int,
+        default=3600,
+        help="READY/FAILED token retention in seconds",
+    )
     parser.add_argument("--preserve-max-binlog-cache-bytes", type=int, default=1_073_741_824)
     parser.add_argument("--preserve-max-lock-count", type=int, default=1_000_000)
     parser.add_argument("--preserve-max-modified-tables", type=int, default=512)

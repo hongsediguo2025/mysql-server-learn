@@ -33,7 +33,7 @@ UPDATE t_lock_warmcopy_reason_codes SET v=11, pad=REPEAT('b',32)
 
 --connection default
 --error ER_PRESERVE_TRX_UNSUPPORTED
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 --let $assert_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
 --let $assert_text= lock warmcopy strict reject reason is logged
 --let $assert_select= PRESERVE_LOCK_WARMCOPY.*action=strict_reject.*reason=resource_limit_exceeded

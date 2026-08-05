@@ -40,7 +40,7 @@ PREPARE drained_existing_stmt FROM 'UPDATE t_batch_drained SET b=40 WHERE a=1';
 --connection batch_drained_owner
 SET DEBUG_SYNC =
   'preserve_trx_batch_after_one_target_preserved SIGNAL batch_drained_preserved WAIT_FOR continue_batch_drained';
---send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+--send DRAIN TRANSACTIONS PRESERVE
 
 --connection batch_drained_control
 --disable_warnings

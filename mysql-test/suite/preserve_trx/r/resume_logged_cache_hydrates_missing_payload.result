@@ -5,7 +5,7 @@ ENGINE=InnoDB;
 INSERT INTO t_resume_logged_cache_hydrate VALUES(1,10);
 START TRANSACTION;
 UPDATE t_resume_logged_cache_hydrate SET b=11 WHERE a=1;
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SET SESSION debug="+d,preserve_trx_resume_clear_binlog_cache_payload";
 RESUME PRESERVED TRANSACTION 'TOKEN';
 SET SESSION debug="-d,preserve_trx_resume_clear_binlog_cache_payload";

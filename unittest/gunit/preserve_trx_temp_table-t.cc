@@ -3335,7 +3335,7 @@ TEST(TempDirtyPageHookSourceLintTest,
       << "stage-admission close wait must report timeout/shutdown instead of "
          "spinning forever";
   EXPECT_NE(std::string::npos,
-            wait_body.find("preserve_trx_warmcopy_close_timeout_ms"));
+            wait_body.find("preserve_trx_drain_phase2_timeout_ms"));
   EXPECT_NE(std::string::npos, wait_body.find("ut_time_monotonic_us()"));
   EXPECT_NE(std::string::npos, wait_body.find("srv_shutdown_state.load()"));
   EXPECT_NE(std::string::npos, wait_body.find("DB_LOCK_WAIT_TIMEOUT"));

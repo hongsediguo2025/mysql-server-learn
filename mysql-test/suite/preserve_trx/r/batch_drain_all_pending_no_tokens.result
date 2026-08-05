@@ -13,7 +13,7 @@ SET DEBUG_SYNC =
 UPDATE t_batch_all_pending_no_tokens SET v=21 WHERE id=2;
 SET DEBUG_SYNC = 'now WAIT_FOR batch_no_token_a_ready TIMEOUT 10';
 SET DEBUG_SYNC = 'now WAIT_FOR batch_no_token_b_ready TIMEOUT 10';
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SET DEBUG_SYNC = 'now SIGNAL continue_batch_no_token_a';
 SET DEBUG_SYNC = 'now SIGNAL continue_batch_no_token_b';
 SELECT COUNT(*) AS preserved_count

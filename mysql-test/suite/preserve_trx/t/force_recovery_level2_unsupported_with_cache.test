@@ -25,7 +25,7 @@ START TRANSACTION;
 UPDATE t_force_recovery_level2_cache SET b=11 WHERE a=1;
 
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
---let $preserve_trx_drain_clause= WITH TIMEOUT 300
+--let $preserve_trx_drain_clause=
 --source suite/preserve_trx/include/drain_transaction_from_control.inc
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 
@@ -81,7 +81,7 @@ EOF
 --eval RESUME PRESERVED TRANSACTION '$force_recovery_preserved_token'
 
 START TRANSACTION;
---let $preserve_trx_drain_clause= WITH TIMEOUT 300
+--let $preserve_trx_drain_clause=
 --let $preserve_trx_drain_error= ER_PRESERVE_TRX_UNSUPPORTED
 --source suite/preserve_trx/include/drain_transaction_from_control_expect_error.inc
 ROLLBACK;

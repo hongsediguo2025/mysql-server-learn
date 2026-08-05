@@ -8,7 +8,7 @@ SELECT * FROM t_recovered_count_stale_tmp WHERE a=1 FOR UPDATE;
 a	b
 1	10
 UPDATE t_recovered_count_stale_tmp SET b=11 WHERE a=1;
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SELECT TOKEN, RECOVERED_COUNT AS recovered_count_after_first_restart
 FROM performance_schema.preserved_transactions;
 TOKEN	recovered_count_after_first_restart

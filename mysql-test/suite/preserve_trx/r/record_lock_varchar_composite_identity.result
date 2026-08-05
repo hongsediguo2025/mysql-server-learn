@@ -17,7 +17,7 @@ SET v=101
 WHERE tenant='tenant-a'
    AND id=10.50
 AND ts='2026-06-06 10:11:12.123456';
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SELECT LOCKS_COUNT >= 1 AS has_preserved_locks
 FROM performance_schema.preserved_transactions;
 has_preserved_locks

@@ -39,7 +39,7 @@ SET GLOBAL preserve_trx_warmcopy_enable=OFF;
 SET GLOBAL preserve_trx_lock_warmcopy_enable=OFF;
 SET GLOBAL preserve_trx_transfer_prewarm_paused=ON;
 SET GLOBAL preserve_trx_transfer_receiver_prewarm_timeout_ms=1000;
-SET GLOBAL preserve_trx_transfer_receiver_ready_timeout_ms=120000;
+SET GLOBAL preserve_trx_token_retention_timeout_ms=120000;
 
 CREATE TABLE t_receiver_selection_deadline(
   id INT PRIMARY KEY,
@@ -67,7 +67,7 @@ UPDATE t_receiver_selection_deadline SET v=31 WHERE id=3;
 --connection default
 --replace_result $app1_id APP1_ID $app2_id APP2_ID $app3_id APP3_ID
 --replace_column 1 GENERATION 6 CLOSING_STARTED_US 7 CLOSING_DEADLINE_US
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 
 --connection receiver_deadline_ha
 --let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_tokens')=3

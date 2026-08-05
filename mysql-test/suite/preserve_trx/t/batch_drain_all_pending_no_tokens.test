@@ -44,7 +44,7 @@ SET DEBUG_SYNC = 'now WAIT_FOR batch_no_token_b_ready TIMEOUT 10';
 --connect(batch_no_token_owner,localhost,root,,test)
 --connection batch_no_token_owner
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
---send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+--send DRAIN TRANSACTIONS PRESERVE
 
 --connection batch_no_token_control
 SET DEBUG_SYNC = 'now SIGNAL continue_batch_no_token_a';

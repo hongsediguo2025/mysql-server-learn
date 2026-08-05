@@ -10,7 +10,7 @@ START TRANSACTION;
 UPDATE t_record_lock_supremum_gap SET v=11 WHERE id=10;
 SELECT * FROM t_record_lock_supremum_gap WHERE id > 30 FOR UPDATE;
 id	v
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SET SESSION innodb_lock_wait_timeout=1;
 INSERT INTO t_record_lock_supremum_gap VALUES(40,40);
 ERROR HY000: Lock wait timeout exceeded; try restarting transaction

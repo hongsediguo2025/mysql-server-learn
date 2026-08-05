@@ -1,56 +1,30 @@
 --source include/not_log_bin.inc
 
---disable_warnings
-DROP TABLE IF EXISTS t_timeout_bounds;
---enable_warnings
+SET @saved_phase1_timeout_ms=@@GLOBAL.preserve_trx_drain_phase1_timeout_ms;
+SET @saved_phase2_timeout_ms=@@GLOBAL.preserve_trx_drain_phase2_timeout_ms;
+SET @saved_token_retention_timeout_ms=
+  @@GLOBAL.preserve_trx_token_retention_timeout_ms;
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_drain_phase1_timeout_ms=1234;
+SET GLOBAL preserve_trx_drain_phase2_timeout_ms=2345;
+SET GLOBAL preserve_trx_token_retention_timeout_ms=3456;
 
-SET @saved_preserve_trx_min_timeout=@@SESSION.preserve_trx_min_timeout;
-SET @saved_preserve_trx_default_timeout=@@SESSION.preserve_trx_default_timeout;
-SET @saved_preserve_trx_max_timeout=@@SESSION.preserve_trx_max_timeout;
-SET @saved_global_preserve_trx_min_timeout=@@GLOBAL.preserve_trx_min_timeout;
-SET @saved_global_preserve_trx_default_timeout=@@GLOBAL.preserve_trx_default_timeout;
-SET @saved_global_preserve_trx_max_timeout=@@GLOBAL.preserve_trx_max_timeout;
+SELECT @@GLOBAL.preserve_trx_drain_phase1_timeout_ms AS phase1_timeout_ms,
+       @@GLOBAL.preserve_trx_drain_phase2_timeout_ms AS phase2_timeout_ms,
+       @@GLOBAL.preserve_trx_token_retention_timeout_ms
+         AS token_retention_timeout_ms;
 
-SET SESSION preserve_trx_min_timeout=10;
-SET SESSION preserve_trx_default_timeout=15;
-SET SESSION preserve_trx_max_timeout=20;
+--error ER_GLOBAL_VARIABLE
+SET SESSION preserve_trx_drain_phase1_timeout_ms=1234;
+--error ER_GLOBAL_VARIABLE
+SET SESSION preserve_trx_drain_phase2_timeout_ms=2345;
+--error ER_GLOBAL_VARIABLE
+SET SESSION preserve_trx_token_retention_timeout_ms=3456;
 
-SELECT @@session.preserve_trx_min_timeout AS min_timeout,
-       @@session.preserve_trx_default_timeout AS default_timeout,
-       @@session.preserve_trx_max_timeout AS max_timeout;
-
-SET GLOBAL preserve_trx_min_timeout=11;
-SET GLOBAL preserve_trx_default_timeout=12;
-SET GLOBAL preserve_trx_max_timeout=13;
---connect(timeout_bounds_inherited,localhost,root,,test)
-SELECT @@session.preserve_trx_min_timeout AS inherited_min_timeout,
-       @@session.preserve_trx_default_timeout AS inherited_default_timeout,
-       @@session.preserve_trx_max_timeout AS inherited_max_timeout;
---disconnect timeout_bounds_inherited
---connection default
-
---error ER_PRESERVE_TRX_UNSUPPORTED
+--error ER_PARSE_ERROR
 DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 9;
 
---error ER_PRESERVE_TRX_UNSUPPORTED
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 21;
-
-SET SESSION preserve_trx_default_timeout=25;
---error ER_PRESERVE_TRX_UNSUPPORTED
-DRAIN TRANSACTIONS PRESERVE;
-
-SET SESSION preserve_trx_default_timeout=15;
-SET SESSION preserve_trx_min_timeout=30;
-SET SESSION preserve_trx_max_timeout=20;
---error ER_PRESERVE_TRX_UNSUPPORTED
-DRAIN TRANSACTIONS PRESERVE;
-
-SET SESSION preserve_trx_min_timeout=@saved_preserve_trx_min_timeout;
-SET SESSION preserve_trx_default_timeout=@saved_preserve_trx_default_timeout;
-SET SESSION preserve_trx_max_timeout=@saved_preserve_trx_max_timeout;
-SET GLOBAL preserve_trx_min_timeout=@saved_global_preserve_trx_min_timeout;
-SET GLOBAL preserve_trx_default_timeout=@saved_global_preserve_trx_default_timeout;
-SET GLOBAL preserve_trx_max_timeout=@saved_global_preserve_trx_max_timeout;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_drain_phase1_timeout_ms=@saved_phase1_timeout_ms;
+SET GLOBAL preserve_trx_drain_phase2_timeout_ms=@saved_phase2_timeout_ms;
+SET GLOBAL preserve_trx_token_retention_timeout_ms=
+  @saved_token_retention_timeout_ms;

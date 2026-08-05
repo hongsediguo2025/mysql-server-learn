@@ -125,7 +125,7 @@ if (length($auth) > 0 && ord(substr($auth, 0, 1)) == 0x01) {
 expect_ok($auth, 'auth');
 
 my @commands = (
-  ['drain', 'DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300'],
+  ['drain', 'DRAIN TRANSACTIONS PRESERVE'],
   ['resume', "RESUME PRESERVED TRANSACTION 'msp_missing_token'"],
   ['show', 'SHOW PRESERVED TRANSACTIONS'],
 );
@@ -151,7 +151,7 @@ EOF
 --remove_file $raw_ps_policy_client
 
 --error ER_UNSUPPORTED_PS
-PREPARE drain_stmt FROM 'DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300';
+PREPARE drain_stmt FROM 'DRAIN TRANSACTIONS PRESERVE';
 --error ER_UNKNOWN_STMT_HANDLER
 DEALLOCATE PREPARE drain_stmt;
 

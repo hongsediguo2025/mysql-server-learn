@@ -6,7 +6,7 @@ if (!$fault_error) {
   --let $fault_error= ER_PRESERVE_TRX_UNSUPPORTED
 }
 --error $fault_error
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 --eval SET SESSION debug="-d,$fault_name"
 --disconnect preserve_fault_cleanup_control
 --connection default

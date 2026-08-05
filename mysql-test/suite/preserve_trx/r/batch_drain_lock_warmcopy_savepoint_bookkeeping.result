@@ -19,7 +19,7 @@ UPDATE t_lock_warmcopy_savepoint_bookkeeping SET v=33 WHERE id=3;
 ROLLBACK TO SAVEPOINT later;
 RELEASE SAVEPOINT later;
 UPDATE t_lock_warmcopy_savepoint_bookkeeping SET v=44 WHERE id=4;
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 include/assert_grep.inc [lock warmcopy succeeds for savepoint bookkeeping]
 SELECT COUNT(*) AS preserved_count_after_savepoint_bookkeeping_warmcopy
 FROM performance_schema.preserved_transactions;

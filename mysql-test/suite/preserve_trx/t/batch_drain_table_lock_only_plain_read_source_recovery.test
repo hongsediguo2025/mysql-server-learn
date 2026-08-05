@@ -69,7 +69,7 @@ INSERT INTO t_plain_lock_modified
 --enable_query_log
 
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 
 --exec echo "restart: --preserve-trx-enable=ON --preserve-trx-startup-recovery-threads=4" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect

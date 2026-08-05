@@ -7,7 +7,7 @@ v INT
 START TRANSACTION;
 INSERT INTO t_batch_prepare_failure VALUES(1,10);
 SET SESSION debug="+d,pfx_prepare_low";
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 SET SESSION debug="-d,pfx_prepare_low";
 SELECT COUNT(*) AS preserved_count_after_ha_prepare_failure
@@ -21,7 +21,7 @@ id	v
 START TRANSACTION;
 INSERT INTO t_batch_prepare_failure VALUES(2,20);
 SET SESSION debug="+d,pfx_temp_prepare";
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 SET SESSION debug="-d,pfx_temp_prepare";
 SELECT COUNT(*) AS preserved_count_after_temp_prepare_failure

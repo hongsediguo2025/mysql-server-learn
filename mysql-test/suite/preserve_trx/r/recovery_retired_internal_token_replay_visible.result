@@ -5,15 +5,15 @@ CREATE TABLE t_retired_token_replay(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
 INSERT INTO t_retired_token_replay VALUES(1, 10);
 START TRANSACTION;
 UPDATE t_retired_token_replay SET v=20 WHERE id=1;
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 ROLLBACK;
 SELECT COUNT(*) AS preserved_after_retire
 FROM performance_schema.preserved_transactions;
 preserved_after_retire
 0
-# restart: --preserve-trx-enable=OFF --preserve-trx-off-artifact-policy=IGNORE --skip-log-bin
+# restart: --preserve-trx-enable=OFF --skip-log-bin
 UPDATE t_retired_token_replay SET v=30 WHERE id=1;
-# restart: --preserve-trx-enable=ON --preserve-trx-off-artifact-policy=FAIL_IF_PRESENT --skip-log-bin
+# restart: --preserve-trx-enable=ON --skip-log-bin
 XA RECOVER CONVERT XID;
 formatID	gtrid_length	bqual_length	data
 1836281843	8	32	DATA

@@ -40,7 +40,7 @@ CALL mtr.add_suppression(
 SET GLOBAL preserve_trx_enable=ON;
 SET GLOBAL preserve_trx_transfer_prewarm_paused=ON;
 SET GLOBAL preserve_trx_transfer_receiver_prewarm_timeout_ms=1000;
-SET GLOBAL preserve_trx_transfer_receiver_ready_timeout_ms=1000;
+SET GLOBAL preserve_trx_token_retention_timeout_ms=1000;
 
 --disable_warnings
 DROP TABLE IF EXISTS t_reset_drain_token_local;
@@ -68,7 +68,7 @@ UPDATE t_reset_drain_token_local SET v=v+1 WHERE id=2;
 
 --connect(reset_token_owner,localhost,root,,test)
 --disable_result_log
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300 WITH USER VARS;
+DRAIN TRANSACTIONS PRESERVE WITH USER VARS;
 --enable_result_log
 
 --connection reset_token_keep

@@ -75,7 +75,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "ut0rnd.h"
 #include "ut0ut.h"
 
-extern uint preserve_trx_warmcopy_close_timeout_ms;
+extern uint preserve_trx_drain_phase2_timeout_ms;
 
 namespace {
 
@@ -443,9 +443,7 @@ void trx_preserve_temp_space_image_mark_no_redo_undo_degraded_locked(
 
 dberr_t trx_preserve_temp_space_image_wait_for_staged_dirty_pages_to_drain(
     uint32_t source_space_id) {
-  const uint timeout_ms = preserve_trx_warmcopy_close_timeout_ms == 0
-                              ? 30000
-                              : preserve_trx_warmcopy_close_timeout_ms;
+  const uint timeout_ms = preserve_trx_drain_phase2_timeout_ms;
   const ib_time_monotonic_us_t started_us = ut_time_monotonic_us();
   const ib_time_monotonic_us_t timeout_us =
       static_cast<ib_time_monotonic_us_t>(timeout_ms) * 1000ULL;

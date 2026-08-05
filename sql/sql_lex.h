@@ -4016,8 +4016,6 @@ struct LEX : public Query_tables_list {
   // Maximum execution time for a statement.
   ulong max_execution_time;
 
-  bool preserve_trx_has_timeout;
-  ulonglong preserve_trx_timeout_seconds;
   uint preserve_trx_user_vars_mode;
 
   /*

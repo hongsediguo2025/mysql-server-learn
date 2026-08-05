@@ -29,7 +29,7 @@ UPDATE t_warmcopy_pending_tail
 SET DEBUG_SYNC =
   'preserve_trx_warmcopy_after_descriptor_hwm SIGNAL warmcopy_pending_tail_ready WAIT_FOR warmcopy_pending_tail_continue';
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
---send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+--send DRAIN TRANSACTIONS PRESERVE
 
 --connection default
 SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_pending_tail_ready TIMEOUT 10';

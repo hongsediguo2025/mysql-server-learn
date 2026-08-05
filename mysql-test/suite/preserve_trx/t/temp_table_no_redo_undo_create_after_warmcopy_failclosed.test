@@ -22,7 +22,7 @@ INSERT INTO tmp_preserve_existing VALUES(1, 10);
 SET DEBUG_SYNC =
   'preserve_trx_warmcopy_open SIGNAL temp_create_warmcopy_open WAIT_FOR temp_create_continue_warmcopy';
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
---send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+--send DRAIN TRANSACTIONS PRESERVE
 
 --connection default
 SET DEBUG_SYNC = 'now WAIT_FOR temp_create_warmcopy_open TIMEOUT 10';

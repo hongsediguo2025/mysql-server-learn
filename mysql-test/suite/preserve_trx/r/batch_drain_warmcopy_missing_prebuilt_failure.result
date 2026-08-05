@@ -7,7 +7,7 @@ ENGINE=InnoDB;
 INSERT INTO t_warmcopy_missing_prebuilt VALUES(1,10);
 SET DEBUG_SYNC =
 'preserve_trx_warmcopy_after_descriptor_hwm SIGNAL warmcopy_missing_hwm WAIT_FOR warmcopy_missing_continue';
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_missing_hwm TIMEOUT 10';
 START TRANSACTION;
 UPDATE t_warmcopy_missing_prebuilt SET v=11 WHERE id=1;

@@ -23,7 +23,7 @@ SET v=22, pad=REPEAT('y',32)
 WHERE id=2;
 SET DEBUG_SYNC =
 'preserve_trx_warmcopy_after_phase1_open SIGNAL lock_wc_savepoint_barrier_open WAIT_FOR lock_wc_savepoint_barrier_continue';
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SET DEBUG_SYNC = 'now WAIT_FOR lock_wc_savepoint_barrier_open TIMEOUT 10';
 ROLLBACK TO SAVEPOINT keep_one;
 UPDATE t_lock_warmcopy_savepoint_barrier

@@ -1,0 +1,19 @@
+--source include/force_restart.inc
+
+--let MYSQLD_DATADIR= `SELECT @@datadir`
+--exec mkdir -p "$MYSQLD_DATADIR/preserve"
+--exec printf stale > "$MYSQLD_DATADIR/preserve/off_policy_token.bin"
+
+--let $restart_parameters= restart: --preserve-trx-enable=OFF
+--source include/restart_mysqld.inc
+--let $restart_parameters=
+
+SELECT @@global.preserve_trx_enable;
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+--exec test -e "$MYSQLD_DATADIR/preserve/off_policy_token.bin"
+--exec rm -f "$MYSQLD_DATADIR/preserve/off_policy_token.bin"
+
+--let $restart_parameters= restart: --preserve-trx-enable=ON
+--source include/restart_mysqld.inc
+--let $restart_parameters=

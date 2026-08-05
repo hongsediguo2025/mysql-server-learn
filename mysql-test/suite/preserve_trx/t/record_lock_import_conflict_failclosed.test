@@ -32,7 +32,7 @@ SELECT * FROM t_record_lock_import_conflict WHERE id=1 FOR SHARE;
 
 --connection default
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 
 --perl

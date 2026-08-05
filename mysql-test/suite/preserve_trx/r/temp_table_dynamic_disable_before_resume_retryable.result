@@ -1,9 +1,6 @@
 DROP TABLE IF EXISTS t_temp_dynamic_disable_base;
 SET GLOBAL preserve_trx_enable=ON;
 SET GLOBAL preserve_trx_temp_table_enable=ON;
-SET SESSION preserve_trx_min_timeout=1;
-SET SESSION preserve_trx_default_timeout=1;
-SET SESSION preserve_trx_max_timeout=86400;
 CREATE TABLE t_temp_dynamic_disable_base(id INT PRIMARY KEY, v INT)
 ENGINE=InnoDB;
 INSERT INTO t_temp_dynamic_disable_base VALUES(1,10);

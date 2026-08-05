@@ -13,7 +13,7 @@ START TRANSACTION;
 INSERT INTO t_lock_warmcopy_conversion_nowait VALUES(2,20);
 SET DEBUG_SYNC =
 'preserve_trx_warmcopy_after_closing_state_before_targets SIGNAL lock_wc_conversion_nowait_closing WAIT_FOR lock_wc_conversion_nowait_continue';
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SET DEBUG_SYNC = 'now WAIT_FOR lock_wc_conversion_nowait_closing TIMEOUT 10';
 SELECT 'conversion_command_barrier_observed' AS barrier_case;
 barrier_case

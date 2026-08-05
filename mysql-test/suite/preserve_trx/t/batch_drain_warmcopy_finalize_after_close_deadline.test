@@ -18,7 +18,7 @@ GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
 SET GLOBAL preserve_trx_enable=ON;
 SET GLOBAL preserve_trx_warmcopy_enable=ON;
 SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
-SET GLOBAL preserve_trx_warmcopy_close_timeout_ms=15000;
+SET GLOBAL preserve_trx_drain_phase2_timeout_ms=15000;
 CALL mtr.add_suppression("PRESERVE: session remains QUIESCED while waiting for batch drain to release it");
 
 CREATE TABLE t_warmcopy_finalize_deadline(
@@ -44,7 +44,7 @@ SET DEBUG_SYNC =
 SET DEBUG_SYNC =
   'preserve_trx_batch_after_one_target_preserved SIGNAL warmcopy_finalize_preserved WAIT_FOR warmcopy_finalize_preserved_continue';
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
---send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+--send DRAIN TRANSACTIONS PRESERVE
 
 --connection warmcopy_finalize_control
 SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_finalize_closing TIMEOUT 10';
@@ -99,7 +99,7 @@ DROP TABLE t_warmcopy_finalize_deadline;
 DROP USER preserve_trx_ha_admin@localhost;
 --enable_query_log
 SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_close_timeout_ms=30000;
+SET GLOBAL preserve_trx_drain_phase2_timeout_ms=30000;
 SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
 SET GLOBAL preserve_trx_warmcopy_enable=ON;
 SET DEBUG_SYNC = 'RESET';

@@ -13,7 +13,7 @@ START TRANSACTION;
 UPDATE t_warmcopy_disconnect SET v=21 WHERE id=2;
 SET DEBUG_SYNC =
 'preserve_trx_external_thd_pin_acquired SIGNAL warmcopy_disconnect_pin WAIT_FOR warmcopy_disconnect_pin_continue';
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_disconnect_pin TIMEOUT 10';
 SET DEBUG_SYNC = 'now SIGNAL warmcopy_disconnect_pin_continue';
 SELECT COUNT(*) AS preserved_count

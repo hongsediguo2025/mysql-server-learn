@@ -618,7 +618,7 @@ class HarnessConfig:
     mixed_min_completed_statements: int = 0
     max_sql_resume_ms: int = 0
     compact_expected_state_row_threshold: int = 1_000_000
-    preserve_timeout_s: int = 86400
+    preserve_timeout_s: int = 3600
     preserve_max_binlog_cache_bytes: int = 1_073_741_824
     preserve_warmcopy_max_total_bytes: int = 0
     preserve_max_lock_count: int = 1_000_000
@@ -644,7 +644,6 @@ class HarnessConfig:
     server_error_log: Optional[str] = None
     server_pid_file: Optional[str] = None
     warmcopy_required: bool = False
-    preserve_warmcopy_close_timeout_ms: int = 0
     lock_warmcopy_mode: str = "default"
     two_phase: bool = False
     max_phase2_pause_ms: int = 5000
@@ -674,7 +673,6 @@ class HarnessConfig:
     receiver_restart_command: Optional[str] = None
     receiver_physical_copy_before_drain: bool = False
     standalone_transfer_accept_committed_not_ready: bool = False
-    standby_transfer_timeout_exclusion: bool = False
     reset_drain_phase: str = "both"
     receiver_read_load_threads: int = 0
     receiver_read_load_baseline_s: float = 0.0
@@ -743,18 +741,6 @@ class HarnessConfig:
         if self.max_receiver_ready_after_phase2_ms < 0:
             raise ValueError(
                 "max receiver ready after phase2 ms must be non-negative"
-            )
-        if self.preserve_warmcopy_close_timeout_ms < 0:
-            raise ValueError(
-                "preserve warmcopy close timeout ms must be non-negative"
-            )
-        if (
-            self.standby_transfer_timeout_exclusion
-            and self.scenario != "standby_transfer_receiver_drain_metrics"
-        ):
-            raise ValueError(
-                "standby transfer timeout exclusion is only valid for "
-                "standby_transfer_receiver_drain_metrics"
             )
         if self.receiver_read_load_threads < 0:
             raise ValueError("receiver read-load threads must be non-negative")
@@ -1046,8 +1032,8 @@ class HarnessConfig:
                 )
         if self.shutdown_quiet_period_s < 0:
             raise ValueError("shutdown_quiet_period_s must be non-negative")
-        if self.preserve_timeout_s <= 0:
-            raise ValueError("preserve_timeout_s must be positive")
+        if self.preserve_timeout_s <= 0 or self.preserve_timeout_s > 3600:
+            raise ValueError("preserve_timeout_s must be in [1, 3600]")
         if self.preserve_max_binlog_cache_bytes <= 0:
             raise ValueError("preserve_max_binlog_cache_bytes must be positive")
         if self.preserve_warmcopy_max_total_bytes < 0:
@@ -2076,9 +2062,7 @@ WHERE n < {row_count}
             for index in range(len(self.effective_large_binlog_cache_buckets_mb()))
         )
 
-    def warmcopy_close_timeout_ms(self) -> int:
-        if self.config.preserve_warmcopy_close_timeout_ms > 0:
-            return self.config.preserve_warmcopy_close_timeout_ms
+    def warmcopy_close_estimate_ms(self) -> int:
         default_timeout_ms = 30_000
         max_timeout_ms = 300_000
         if not self.config.warmcopy_required:
@@ -2093,14 +2077,14 @@ WHERE n < {row_count}
         )
         return min(max_timeout_ms, max(default_timeout_ms, scaled_timeout_ms))
 
-    def drain_hard_timeout_ms(self) -> int:
+    def drain_phase2_timeout_ms(self) -> int:
         base_timeout_ms = 120_000
         if not self.config.warmcopy_required:
             return base_timeout_ms
-        return max(base_timeout_ms, self.warmcopy_close_timeout_ms() + 120_000)
+        return max(base_timeout_ms, self.warmcopy_close_estimate_ms() + 120_000)
 
     def resume_connection_wait_timeout_s(self) -> float:
-        drain_budget_s = self.drain_hard_timeout_ms() / 1000.0
+        drain_budget_s = self.drain_phase2_timeout_ms() / 1000.0
         return max(
             self.config.resume_timeout_s,
             drain_budget_s
@@ -5741,7 +5725,6 @@ class BusinessE2ERunner:
             SourceContinuousTieredLoadProbe
         ] = None
         source_tiered_drain_started = False
-        timeout_exclusion_probe_started = False
         try:
             if self.config.receiver_read_load_threads > 0:
                 table = self.plan.table_names()[0]
@@ -5786,9 +5769,6 @@ class BusinessE2ERunner:
                     self.config.source_tiered_load_min_samples_per_tier,
                     timeout_s=min(60.0, self.config.resume_timeout_s),
                 )
-            if self.config.standby_transfer_timeout_exclusion:
-                self.start_standby_transfer_timeout_exclusion_probe()
-                timeout_exclusion_probe_started = True
             error_log_offset = self.warmcopy_error_log_offset()
             LOG.info(
                 "issuing standby-transfer DRAIN TRANSACTIONS PRESERVE for receiver metrics"
@@ -5883,9 +5863,6 @@ class BusinessE2ERunner:
                         ),
                     )
                 )
-            if timeout_exclusion_probe_started:
-                self.stop_standby_transfer_timeout_exclusion_probe()
-                timeout_exclusion_probe_started = False
             if read_load_probe is not None:
                 self.receiver_read_load_report = read_load_probe.stop()
                 validate_receiver_read_load_report(
@@ -5932,13 +5909,6 @@ class BusinessE2ERunner:
                         ),
                     )
                 )
-            if timeout_exclusion_probe_started:
-                try:
-                    self.stop_standby_transfer_timeout_exclusion_probe()
-                except Exception as exc:
-                    LOG.warning(
-                        "timeout exclusion probe cleanup failed: %s", exc
-                    )
             self.stop_event.set()
             self.coordinator.release_transaction_start_hold()
             if generation:
@@ -6022,7 +5992,7 @@ class BusinessE2ERunner:
             self.runtime.execute(
                 conn,
                 "SET GLOBAL "
-                "preserve_trx_transfer_receiver_ready_timeout_ms=1000",
+                "preserve_trx_token_retention_timeout_ms=1000",
             )
             if self.reset_debug_sync_used:
                 self.runtime.execute(
@@ -6127,8 +6097,7 @@ class BusinessE2ERunner:
                     )
                 self.runtime.execute(
                     conn,
-                    "DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT "
-                    f"{self.config.preserve_timeout_s} WITH USER VARS",
+                    "DRAIN TRANSACTIONS PRESERVE WITH USER VARS",
                 )
                 state["error"] = AssertionError(
                     "DRAIN returned OK instead of RESET cancellation"
@@ -7785,12 +7754,6 @@ class BusinessE2ERunner:
                     self, "source_remained_online_after_transfer", False
                 )
             ),
-            "timeout_exclusion_enabled": (
-                self.config.standby_transfer_timeout_exclusion
-            ),
-            "timeout_exclusion_probe_connection_id": getattr(
-                self, "timeout_exclusion_probe_connection_id", None
-            ),
             "drain_result_rows": list(
                 getattr(self, "drain_result_rows", [])
             ),
@@ -9190,14 +9153,19 @@ END
                 self.config.warmcopy_required or self.config.temp_table_workload
             ):
                 plan = WorkloadPlan(self.config)
-            drain_hard_timeout_ms = (
-                plan.drain_hard_timeout_ms() if plan is not None else 120_000
+            drain_phase2_timeout_ms = (
+                plan.drain_phase2_timeout_ms() if plan is not None else 120_000
             )
+            token_retention_timeout_ms = self.config.preserve_timeout_s * 1000
             batch_capacity = max(256, self.config.sessions * 2)
             commands = [
                 "SET GLOBAL preserve_trx_enable=ON",
                 f"SET GLOBAL preserve_trx_recovery_max_count={max(200, self.config.sessions * 2)}",
-                f"SET GLOBAL preserve_trx_drain_hard_timeout_ms={drain_hard_timeout_ms}",
+                "SET GLOBAL preserve_trx_drain_phase1_timeout_ms=600000",
+                "SET GLOBAL preserve_trx_drain_phase2_timeout_ms="
+                f"{drain_phase2_timeout_ms}",
+                "SET GLOBAL preserve_trx_token_retention_timeout_ms="
+                f"{token_retention_timeout_ms}",
                 f"SET GLOBAL preserve_trx_max_total={batch_capacity}",
                 f"SET GLOBAL preserve_trx_max_pending_per_user={batch_capacity}",
                 f"SET GLOBAL preserve_trx_batch_max_transactions={batch_capacity}",
@@ -9277,7 +9245,6 @@ END
                         "SET GLOBAL log_error_verbosity=3",
                         "SET GLOBAL binlog_format=ROW",
                         "SET GLOBAL preserve_trx_warmcopy_enable=ON",
-                        f"SET GLOBAL preserve_trx_warmcopy_close_timeout_ms={plan.warmcopy_close_timeout_ms()}",
                         "SET GLOBAL preserve_trx_warmcopy_min_open_ms=1",
                         "SET GLOBAL preserve_trx_warmcopy_chunk_bytes=16777216",
                         f"SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes={tail_budget_bytes}",
@@ -9491,143 +9458,6 @@ END
         return SourceWorkloadRuntime(
             self.runtime, workload_user, workload_password
         )
-
-    def start_standby_transfer_timeout_exclusion_probe(self) -> None:
-        worker_runtime = getattr(self, "worker_runtime", None)
-        if worker_runtime is None:
-            raise AssertionError(
-                "standby transfer workload runtime was not initialized"
-            )
-
-        admin_conn = self.runtime.connect(database=False)
-        try:
-            self.runtime.execute(
-                admin_conn,
-                "SET GLOBAL preserve_trx_drain_command_timeout_fail_batch=OFF",
-            )
-            self.runtime.execute(
-                admin_conn,
-                "SET GLOBAL preserve_trx_drain_closing_command_timeout_ms=100",
-            )
-            self.runtime.execute(
-                admin_conn,
-                "SET GLOBAL preserve_trx_transfer_phase1_timeout_ms=1000",
-            )
-            self.runtime.execute(
-                admin_conn,
-                "CREATE TABLE IF NOT EXISTS "
-                f"{quote_identifier(self.config.database)}."
-                "`rtx_closing_timeout_probe` ("
-                "id INT PRIMARY KEY, v INT NOT NULL) ENGINE=InnoDB",
-            )
-            self.runtime.execute(
-                admin_conn,
-                "INSERT INTO "
-                f"{quote_identifier(self.config.database)}."
-                "`rtx_closing_timeout_probe` VALUES(1,0) "
-                "ON DUPLICATE KEY UPDATE v=VALUES(v)",
-            )
-
-            probe_conn = worker_runtime.connect(
-                database=True, autocommit=False
-            )
-            worker_runtime.execute(probe_conn, "START TRANSACTION")
-            worker_runtime.execute(
-                probe_conn,
-                "UPDATE `rtx_closing_timeout_probe` SET v=v+1 WHERE id=1",
-            )
-            rows = worker_runtime.execute(
-                probe_conn, "SELECT CONNECTION_ID()", fetch=True
-            )
-            if len(rows) != 1:
-                probe_conn.close()
-                raise AssertionError(
-                    "timeout exclusion probe did not obtain a connection ID"
-                )
-            connection_id = int(rows[0][0])
-            errors: List[BaseException] = []
-
-            def run_old_command() -> None:
-                try:
-                    worker_runtime.execute(
-                        probe_conn, "SELECT SLEEP(300)", fetch=True
-                    )
-                except BaseException as exc:
-                    errors.append(exc)
-
-            thread = threading.Thread(
-                target=run_old_command,
-                name="standby-transfer-timeout-exclusion",
-                daemon=True,
-            )
-            thread.start()
-            deadline = time.monotonic() + min(
-                10.0, self.config.startup_timeout_s
-            )
-            while True:
-                running = self.runtime.execute(
-                    admin_conn,
-                    "SELECT COUNT(*) FROM performance_schema.threads "
-                    f"WHERE PROCESSLIST_ID={connection_id} "
-                    "AND PROCESSLIST_INFO LIKE 'SELECT SLEEP(300)%'",
-                    fetch=True,
-                )
-                if running and int(running[0][0]) == 1:
-                    break
-                if errors:
-                    probe_conn.close()
-                    raise AssertionError(
-                        "timeout exclusion probe command failed before DRAIN"
-                    ) from errors[0]
-                if time.monotonic() >= deadline:
-                    probe_conn.close()
-                    raise TimeoutError(
-                        "timeout exclusion probe command did not become visible"
-                    )
-                time.sleep(0.01)
-        finally:
-            admin_conn.close()
-
-        self.timeout_exclusion_probe_connection_id = connection_id
-        self.timeout_exclusion_probe_connection = probe_conn
-        self.timeout_exclusion_probe_thread = thread
-        self.timeout_exclusion_probe_errors = errors
-
-    def stop_standby_transfer_timeout_exclusion_probe(self) -> None:
-        thread = getattr(self, "timeout_exclusion_probe_thread", None)
-        connection_id = getattr(
-            self, "timeout_exclusion_probe_connection_id", None
-        )
-        if thread is not None and thread.is_alive() and connection_id is not None:
-            admin_conn = None
-            try:
-                admin_conn = self.runtime.connect(database=False)
-                self.runtime.execute(admin_conn, f"KILL {int(connection_id)}")
-            except BaseException:
-                pass
-            finally:
-                if admin_conn is not None:
-                    try:
-                        admin_conn.close()
-                    except Exception:
-                        pass
-        if thread is not None:
-            thread.join(min(10.0, self.config.worker_join_timeout_s))
-            if thread.is_alive():
-                raise TimeoutError(
-                    "timeout exclusion probe did not stop after source shutdown"
-                )
-        probe_conn = getattr(self, "timeout_exclusion_probe_connection", None)
-        if probe_conn is not None:
-            try:
-                probe_conn.close()
-            except Exception:
-                pass
-        errors = list(getattr(self, "timeout_exclusion_probe_errors", []))
-        if errors and not all(self.runtime.is_connection_error(exc) for exc in errors):
-            raise AssertionError(
-                "timeout exclusion probe failed for a non-connection reason"
-            ) from errors[0]
 
     def validate_standby_transfer_endpoint_config(self) -> None:
         source_conn = self.runtime.connect(database=False)
@@ -11876,41 +11706,21 @@ END
             conn = self.runtime.connect(database=False)
             rows = self.runtime.execute(
                 conn,
-                f"DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT {self.config.preserve_timeout_s} WITH USER VARS",
+                "DRAIN TRANSACTIONS PRESERVE WITH USER VARS",
                 fetch=expects_transfer_result,
             )
             if expects_transfer_result:
                 self.drain_result_rows = self._decode_transfer_drain_result(rows)
-                excluded_connection_id = getattr(
-                    self, "timeout_exclusion_probe_connection_id", None
-                )
-                if (
-                    self.config.standby_transfer_timeout_exclusion
-                    and excluded_connection_id is None
-                ):
-                    raise AssertionError(
-                        "standby transfer timeout exclusion probe was not started"
-                    )
                 self.validate_standby_transfer_drain_result(
                     expected_survivor_count=(
                         self.config.sessions
                         if self.config.strict_token_count
                         else None
                     ),
-                    expected_excluded_connection_id=(
-                        int(excluded_connection_id)
-                        if self.config.standby_transfer_timeout_exclusion
-                        else None
-                    ),
                 )
         except BaseException as exc:
             if self.runtime.is_connection_error(exc):
                 if expects_transfer_result:
-                    if self.config.standby_transfer_timeout_exclusion:
-                        raise AssertionError(
-                            "standby transfer DRAIN disconnected before its "
-                            "timeout-exclusion result was read"
-                        ) from exc
                     self.drain_result_transport_disconnected = True
                     self.drain_result_rows = []
                     LOG.warning(
@@ -13631,7 +13441,7 @@ command is used after each DRAIN command shuts that server down.
     parser.add_argument("--mixed-min-started-sessions", type=int, default=0, help="minimum mixed-pressure connections that must execute SQL before DRAIN")
     parser.add_argument("--mixed-min-completed-statements", type=int, default=0, help="minimum aggregate business SQL count required after warmup before DRAIN")
     parser.add_argument("--max-sql-resume-ms", type=int, default=0, help="maximum individual SQL RESUME latency for local startup evidence; 0 disables the gate")
-    parser.add_argument("--preserve-timeout", dest="preserve_timeout_s", type=int, default=86400, help="WITH TIMEOUT value for DRAIN TRANSACTIONS PRESERVE")
+    parser.add_argument("--preserve-timeout", dest="preserve_timeout_s", type=int, default=3600, help="READY/FAILED token retention in seconds; configures preserve_trx_token_retention_timeout_ms")
     parser.add_argument("--preserve-max-binlog-cache-bytes", dest="preserve_max_binlog_cache_bytes", type=int, default=1_073_741_824, help="preserve_trx_max_binlog_cache_bytes for high-cardinality preserve artifacts")
     parser.add_argument("--preserve-warmcopy-max-total-bytes", dest="preserve_warmcopy_max_total_bytes", type=int, default=0, help="explicit source warm external-artifact byte budget; 0 keeps workload-derived sizing")
     parser.add_argument("--preserve-max-lock-count", dest="preserve_max_lock_count", type=int, default=1_000_000, help="preserve_trx_max_lock_count for this high-cardinality E2E")
@@ -13665,15 +13475,6 @@ command is used after each DRAIN command shuts that server down.
     binlog_order_group.add_argument("--canonical-binlog-transaction-order", dest="strict_binlog_transaction_order", action="store_false", help="compare normalized binlog table events after sorting complete transactions; use only for intentional order-insensitive baselines")
     parser.add_argument("--server-error-log", help="mysqld error log used for server-side warm-copy binlog-cache phase2 timing; defaults to mysqld.err next to the Unix socket")
     parser.add_argument("--warmcopy-required", action="store_true", help="enable warm-copy globals and enforce warm-copy phase2 pause gate")
-    parser.add_argument(
-        "--preserve-warmcopy-close-timeout-ms",
-        type=int,
-        default=0,
-        help=(
-            "explicit warm-copy CLOSING budget for this E2E; "
-            "0 keeps workload-derived sizing"
-        ),
-    )
     parser.add_argument("--warmcopy-mode", choices=("required", "optional", "off"), help="compatibility alias for warm-copy E2E mode; 'required' is equivalent to --warmcopy-required")
     parser.add_argument("--lock-warmcopy-mode", choices=("default", "on", "off"), default="default", help="explicitly set preserve_trx_lock_warmcopy_enable for this run")
     parser.add_argument("--two-phase", action="store_true", help="compatibility flag documenting that the warmcopy_two_phase_large_cache_equivalence scenario must use the two-phase warm-copy path")
@@ -13717,15 +13518,6 @@ command is used after each DRAIN command shuts that server down.
             "accept current-process COMMITTED_NOT_READY receiver evidence "
             "when no production physical fence provider exists; this does "
             "not survive receiver restart and never proves promotion readiness"
-        ),
-    )
-    parser.add_argument(
-        "--standby-transfer-timeout-exclusion",
-        action="store_true",
-        help=(
-            "add one ordinary source transaction whose old command exceeds "
-            "the CLOSING deadline; validate survivor-only transfer and the "
-            "exact excluded source connection ID"
         ),
     )
     parser.add_argument(
@@ -13849,9 +13641,6 @@ command is used after each DRAIN command shuts that server down.
         server_error_log=args.server_error_log,
         server_pid_file=args.server_pid_file,
         warmcopy_required=warmcopy_required,
-        preserve_warmcopy_close_timeout_ms=(
-            args.preserve_warmcopy_close_timeout_ms
-        ),
         lock_warmcopy_mode=args.lock_warmcopy_mode,
         two_phase=args.two_phase,
         max_phase2_pause_ms=args.max_phase2_pause_ms,
@@ -13886,9 +13675,6 @@ command is used after each DRAIN command shuts that server down.
         receiver_physical_copy_before_drain=args.receiver_physical_copy_before_drain,
         standalone_transfer_accept_committed_not_ready=(
             args.standalone_transfer_accept_committed_not_ready
-        ),
-        standby_transfer_timeout_exclusion=(
-            args.standby_transfer_timeout_exclusion
         ),
         reset_drain_phase=args.reset_drain_phase,
         receiver_read_load_threads=args.receiver_read_load_threads,

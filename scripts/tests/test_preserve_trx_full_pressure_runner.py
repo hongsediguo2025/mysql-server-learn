@@ -119,18 +119,18 @@ class FullPressureProfileTest(unittest.TestCase):
         self.assertIn(
             "--preserve-trx-warmcopy-max-total-bytes=8589934592", source
         )
-        for option in (
-            "--preserve-trx-drain-closing-command-timeout-ms=600000",
-            "--preserve-trx-warmcopy-close-timeout-ms=600000",
-            "--preserve-trx-drain-hard-timeout-ms=600000",
-        ):
-            self.assertIn(option, source)
+        self.assertIn(
+            "--preserve-trx-drain-phase2-timeout-ms=600000", source
+        )
+        for command_line in (source, receiver):
+            self.assertIn(
+                "--preserve-trx-token-retention-timeout-ms=1800000",
+                command_line,
+            )
         option = "--preserve-warmcopy-max-total-bytes"
         self.assertIn(option, command)
         self.assertEqual("8589934592", command[command.index(option) + 1])
-        option = "--preserve-warmcopy-close-timeout-ms"
-        self.assertIn(option, command)
-        self.assertEqual("600000", command[command.index(option) + 1])
+        self.assertNotIn("--preserve-warmcopy-close-timeout-ms", command)
 
     def test_paths_derive_receiver_preserve_dir_from_datadir(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -103,9 +103,8 @@ ulonglong preserve_trx_transfer_max_inflight_bytes = 1073741824ULL;
 ulonglong preserve_trx_transfer_io_bytes_per_sec = 33554432ULL;
 uint preserve_trx_transfer_commit_batch_tokens = 8;
 uint preserve_trx_transfer_worker_yield_us = 1000;
-uint preserve_trx_transfer_commit_timeout_ms = 30000;
 uint preserve_trx_transfer_receiver_prewarm_timeout_ms = 10000;
-uint preserve_trx_transfer_receiver_ready_timeout_ms = 30000;
+uint preserve_trx_token_retention_timeout_ms = 30000;
 ulonglong preserve_trx_transfer_phase1_batch_bytes = 4194304ULL;
 uint preserve_trx_transfer_phase1_batch_linger_ms = 20;
 
@@ -1790,7 +1789,7 @@ Preserve_trx_transfer_status default_transfer_client_connect(
       create_scope_guard([&] { secure_transfer_mysql_close(mysql); });
 
   const uint operation_timeout_ms = endpoint.operation_timeout_ms == 0
-                                        ? preserve_trx_transfer_commit_timeout_ms
+                                        ? kPreserveTrxTransferOperationTimeoutMs
                                         : endpoint.operation_timeout_ms;
   uint timeout_seconds = static_cast<uint>(std::max<uint64_t>(
       1, std::min<uint64_t>(
@@ -2084,7 +2083,7 @@ std::mutex &transfer_object_stage_mutex(
 
 Preserve_trx_transfer_client_endpoint configured_transfer_client_endpoint() {
   Preserve_trx_transfer_client_endpoint endpoint;
-  endpoint.operation_timeout_ms = preserve_trx_transfer_phase1_timeout_ms;
+  endpoint.operation_timeout_ms = kPreserveTrxTransferOperationTimeoutMs;
   if (preserve_trx_transfer_target_host != nullptr) {
     endpoint.host = preserve_trx_transfer_target_host;
   }
@@ -5117,7 +5116,6 @@ void bind_strict_prepared_tokens_from_epoch_fact(
     }
   }
   if (fact_loaded_us == 0) return;
-  constexpr uint64_t kClientResumeWindowUs = 300ULL * 1000000ULL;
   const std::string epoch_fact_digest = digest_hex(fact.fact_digest);
 
   const auto bind_token =
@@ -5193,7 +5191,7 @@ void bind_strict_prepared_tokens_from_epoch_fact(
     facts.prewarm_object_set_digest = digest_hex(token.manifest_digest);
     facts.target_boot_incarnation = key.target_boot_incarnation;
     facts.epoch_prepare_deadline_us = accepted.deadline_monotonic_us;
-    facts.client_resume_deadline_us = fact_loaded_us + kClientResumeWindowUs;
+    facts.client_resume_deadline_us = accepted.deadline_monotonic_us;
     if (has_record_locks) {
       facts.record_lock_unique_pages =
           record_lock_facts.facts.unique_pages;
@@ -5385,8 +5383,9 @@ std::atomic<uint> &receiver_object_prewarm_delay_ms_for_unit_test() {
   return delay_ms;
 }
 
-uint64_t transfer_commit_timeout_seconds() {
-  return (static_cast<uint64_t>(preserve_trx_transfer_commit_timeout_ms) + 999) /
+uint64_t transfer_token_retention_timeout_seconds() {
+  return (static_cast<uint64_t>(preserve_trx_token_retention_timeout_ms) +
+          999) /
          1000;
 }
 
@@ -5682,7 +5681,7 @@ bool synchronize_receiver_epoch_ready_deadline(
   if (accepted.lifecycle ==
       Preserve_trx_transfer_epoch_lifecycle::PREWARMING) {
     ready_deadline_us = receiver_epoch_deadline_after_ms(
-        now_us, preserve_trx_transfer_receiver_ready_timeout_ms);
+        now_us, preserve_trx_token_retention_timeout_ms);
   } else if (accepted.lifecycle !=
              Preserve_trx_transfer_epoch_lifecycle::READY) {
     return false;
@@ -5979,7 +5978,7 @@ bool publish_receiver_epoch_selection_if_possible(
   }
 
   const uint64_t ready_deadline_us = receiver_epoch_deadline_after_ms(
-      now_us, preserve_trx_transfer_receiver_ready_timeout_ms);
+      now_us, preserve_trx_token_retention_timeout_ms);
   if (!deadline_reached && !ready_tokens.empty() &&
       preserved_trx_strict_prepared_token_registry()
               .update_epoch_prepare_deadline(receiver_boot_incarnation(),
@@ -9009,10 +9008,8 @@ Preserve_trx_transfer_receiver_registry::
     return Preserve_trx_receiver_promotion_lease_status::NOT_READY;
   }
   accepted.lifecycle = Preserve_trx_transfer_epoch_lifecycle::ADOPT_LEASED;
-  accepted.deadline_monotonic_us = 0;
   accepted_snapshot->lifecycle =
       Preserve_trx_transfer_epoch_lifecycle::ADOPT_LEASED;
-  accepted_snapshot->deadline_monotonic_us = 0;
   return Preserve_trx_receiver_promotion_lease_status::ACQUIRED;
 }
 
@@ -13200,12 +13197,6 @@ Preserve_trx_transfer_source_epoch_session::commit_epoch() {
     if (!send_allowed) {
       status = Preserve_trx_transfer_status::UNSUPPORTED;
     } else {
-      try {
-        sink->set_operation_timeout_ms(
-            preserve_trx_transfer_commit_timeout_ms);
-      } catch (...) {
-        status = Preserve_trx_transfer_status::UNSUPPORTED;
-      }
       if (status == Preserve_trx_transfer_status::OK) {
         ack_start_us = transfer_monotonic_us();
         try {
@@ -18100,7 +18091,7 @@ void preserve_trx_transfer_dispatch_command(THD *thd) {
   if (transfer_frame_batch_magic_matches(encoded_frame)) {
     status = preserve_trx_transfer_handle_receiver_payload_batch(
         preserve_dir, std::vector<std::string>{encoded_frame}, &store.store(),
-        &default_receiver_registry(), transfer_commit_timeout_seconds(),
+        &default_receiver_registry(), transfer_token_retention_timeout_seconds(),
         preserve_trx_transfer_receiver_workers, nullptr,
         send_receiver_admission_ack, &ack_context,
         send_receiver_commit_accepted_ack, &ack_context);
@@ -18112,7 +18103,7 @@ void preserve_trx_transfer_dispatch_command(THD *thd) {
         receiver_frame_is_sequence_tracked(decoded_frame.type)) {
       status = preserve_trx_transfer_handle_receiver_payload_batch(
           preserve_dir, std::vector<std::string>{encoded_frame}, &store.store(),
-          &default_receiver_registry(), transfer_commit_timeout_seconds(),
+          &default_receiver_registry(), transfer_token_retention_timeout_seconds(),
           preserve_trx_transfer_receiver_workers, nullptr,
           send_receiver_admission_ack, &ack_context,
           send_receiver_commit_accepted_ack, &ack_context);
@@ -18121,7 +18112,7 @@ void preserve_trx_transfer_dispatch_command(THD *thd) {
       if (status == Preserve_trx_transfer_status::OK) {
         status = preserve_trx_transfer_apply_receiver_frame(
             preserve_dir, decoded_frame, &store.store(),
-            &default_receiver_registry(), transfer_commit_timeout_seconds(),
+            &default_receiver_registry(), transfer_token_retention_timeout_seconds(),
             nullptr);
       }
     }

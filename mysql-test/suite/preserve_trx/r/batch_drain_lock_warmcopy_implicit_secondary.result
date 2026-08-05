@@ -16,7 +16,7 @@ INSERT INTO t_lock_warmcopy_implicit_secondary VALUES
 START TRANSACTION;
 INSERT INTO t_lock_warmcopy_implicit_secondary
 VALUES(2,20,20,REPEAT('b',32));
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 include/assert_grep.inc [lock warmcopy succeeds for implicit secondary strict mode]
 SELECT COUNT(*) AS preserved_count_after_implicit_secondary
 FROM performance_schema.preserved_transactions;

@@ -7,9 +7,7 @@ DROP TABLE IF EXISTS t_timeout_snapshot_timestamp;
 --enable_warnings
 
 SET GLOBAL preserve_trx_enable=ON;
-SET SESSION preserve_trx_min_timeout=1;
-SET SESSION preserve_trx_default_timeout=1;
-SET SESSION preserve_trx_max_timeout=86400;
+SET GLOBAL preserve_trx_token_retention_timeout_ms=1000;
 
 CREATE TABLE t_timeout_snapshot_timestamp(a INT PRIMARY KEY, b INT)
   ENGINE=InnoDB;
@@ -23,9 +21,6 @@ START TRANSACTION;
 UPDATE t_timeout_snapshot_timestamp SET b=11 WHERE a=1;
 
 --connect(preserve_timestamp_drain,localhost,root,,test)
-SET SESSION preserve_trx_min_timeout=1;
-SET SESSION preserve_trx_default_timeout=1;
-SET SESSION preserve_trx_max_timeout=86400;
 --send DRAIN TRANSACTIONS PRESERVE
 
 --connection default

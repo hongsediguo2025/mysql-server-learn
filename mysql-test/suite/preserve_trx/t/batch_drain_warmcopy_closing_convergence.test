@@ -15,7 +15,7 @@ DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
 SET GLOBAL preserve_trx_enable=ON;
 SET GLOBAL preserve_trx_warmcopy_enable=ON;
 SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
-SET GLOBAL preserve_trx_warmcopy_close_timeout_ms=5000;
+SET GLOBAL preserve_trx_drain_phase2_timeout_ms=5000;
 
 CREATE TABLE t_warmcopy_close(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
 INSERT INTO t_warmcopy_close VALUES(1,10),(2,20);
@@ -51,7 +51,7 @@ SET @closing_control_commands_before=(
 SET DEBUG_SYNC =
   'preserve_trx_warmcopy_after_closing_state_before_targets SIGNAL warmcopy_close_closing WAIT_FOR warmcopy_close_continue';
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
---send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+--send DRAIN TRANSACTIONS PRESERVE
 
 --connection warmcopy_close_control
 SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_close_closing TIMEOUT 10';
@@ -124,7 +124,7 @@ DROP USER preserve_trx_ha_admin@localhost;
 --enable_query_log
 --remove_file $MYSQLTEST_VARDIR/tmp/warmcopy_close_ping.out
 SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_close_timeout_ms=30000;
+SET GLOBAL preserve_trx_drain_phase2_timeout_ms=30000;
 SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
 SET GLOBAL preserve_trx_warmcopy_enable=ON;
 SET DEBUG_SYNC = 'RESET';

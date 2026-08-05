@@ -1,7 +1,0 @@
-SHUTDOWN;
-# restart_abort: --preserve-trx-enable=OFF
-include/wait_for_pattern_in_file.inc [preserve_trx_enable=OFF found historical Preserve/Resume artifacts]
-include/wait_for_expected_crash.inc [safe_process]
-SELECT @@global.preserve_trx_enable;
-@@global.preserve_trx_enable
-1

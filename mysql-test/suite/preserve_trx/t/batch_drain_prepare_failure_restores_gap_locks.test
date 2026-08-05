@@ -23,7 +23,7 @@ SELECT * FROM t_prepare_failure_gap WHERE id BETWEEN 10 AND 30 FOR UPDATE;
 SET DEBUG='+d,ib_force_release_gap_lock_prepare';
 SET DEBUG='+d,preserve_trx_fail_after_undo_prepared';
 --error ER_PRESERVE_TRX_UNSUPPORTED
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SET DEBUG='-d,preserve_trx_fail_after_undo_prepared';
 SET DEBUG='-d,ib_force_release_gap_lock_prepare';
 

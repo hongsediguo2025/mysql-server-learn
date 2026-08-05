@@ -21,7 +21,7 @@ UPDATE t_warmcopy_nontarget_degraded
 SET v=21, filler=REPEAT('e',256) WHERE id=2;
 SET DEBUG_SYNC =
 'preserve_trx_warmcopy_after_descriptor_hwm SIGNAL warmcopy_nontarget_hwm WAIT_FOR warmcopy_nontarget_continue';
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_nontarget_hwm TIMEOUT 10';
 ROLLBACK TO SAVEPOINT s_warmcopy_degraded;
 SELECT v AS app1_value_after_savepoint

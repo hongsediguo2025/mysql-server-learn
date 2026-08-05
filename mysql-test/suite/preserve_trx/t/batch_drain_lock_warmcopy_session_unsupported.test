@@ -29,7 +29,7 @@ SELECT GET_LOCK('lock_warmcopy_session_unsupported', 0) AS got_user_lock;
 
 --connection default
 --error ER_PRESERVE_TRX_UNSUPPORTED
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 SELECT COUNT(*) AS preserved_count_after_session_unsupported
   FROM performance_schema.preserved_transactions;
 

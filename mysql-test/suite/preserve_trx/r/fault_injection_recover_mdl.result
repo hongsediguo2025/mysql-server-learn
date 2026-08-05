@@ -4,7 +4,7 @@ CREATE TABLE t_fault_recover_mdl(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_fault_recover_mdl VALUES(1,10);
 START TRANSACTION;
 UPDATE t_fault_recover_mdl SET b=11 WHERE a=1;
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 # restart: --preserve-trx-enable=ON --debug=d,preserve_trx_fail_recover_mdl
 include/wait_for_pattern_in_file.inc [Preserved transaction .* recovery forced rollback: failed to restore durable transaction MDL context]
 SELECT COUNT(*) AS preserved_count

@@ -79,25 +79,14 @@ bool preserved_trx_build_native_binlog_cache_facts(
     const Preserved_trx_external_blob_descriptor &descriptor,
     uint64_t binlog_incarnation, uint64_t key_generation,
     Mysql_binlog_preserve_cache_facts *facts);
-enum Preserve_trx_off_artifact_policy {
-  PRESERVE_TRX_OFF_ARTIFACT_POLICY_FAIL_IF_PRESENT = 0,
-  PRESERVE_TRX_OFF_ARTIFACT_POLICY_IGNORE = 1,
-  PRESERVE_TRX_OFF_ARTIFACT_POLICY_RECOVER = 2,
-  PRESERVE_TRX_OFF_ARTIFACT_POLICY_ABANDON = 3
-};
 enum class Preserved_trx_recover_load_profile {
   SNAPSHOT_ONLY,
   WITH_SEMANTIC_EXTERNAL_BLOBS
 };
-extern ulong preserve_trx_off_artifact_policy;
-extern uint preserve_trx_drain_hard_timeout_ms;
-extern uint preserve_trx_drain_closing_command_timeout_ms;
-extern bool preserve_trx_drain_command_timeout_fail_batch;
+extern uint preserve_trx_drain_phase1_timeout_ms;
+extern uint preserve_trx_drain_phase2_timeout_ms;
 extern bool preserve_trx_transfer_pipeline_enable;
-extern uint preserve_trx_transfer_phase1_timeout_ms;
-extern uint preserve_trx_transfer_phase2_timeout_ms;
 extern bool preserve_trx_warmcopy_enable;
-extern uint preserve_trx_warmcopy_close_timeout_ms;
 extern uint preserve_trx_warmcopy_min_open_ms;
 extern uint preserve_trx_warmcopy_chunk_bytes;
 extern uint preserve_trx_warmcopy_tail_budget_bytes;
@@ -120,10 +109,6 @@ uint preserve_trx_auto_parallel_preserve_threads(uint hardware_threads);
 bool preserve_trx_is_enabled();
 void preserve_trx_set_enable_value(bool enabled);
 bool preserve_trx_magic_xid_should_be_protected(const XID &xid);
-bool preserve_trx_off_artifact_policy_ignore();
-bool preserve_trx_off_artifact_policy_recover();
-bool preserve_trx_off_artifact_policy_abandon();
-bool preserve_trx_off_artifact_policy_fail_if_present();
 bool preserve_trx_execute_command(THD *thd);
 
 ulonglong preserve_trx_warmcopy_prefix_bytes_status();
@@ -347,8 +332,6 @@ enum class Preserve_trx_command_block_result {
 using Preserved_trx_manager_state_publication_probe = void (*)(void *);
 
 struct Preserve_trx_options {
-  bool has_timeout{false};
-  ulonglong timeout_seconds{0};
   Preserve_trx_user_vars_mode user_vars_mode{
       Preserve_trx_user_vars_mode::DEFAULT};
 };
@@ -628,11 +611,6 @@ bool preserved_trx_populate_row_locks_count(
 std::string preserved_trx_redacted_token(const std::string &token);
 bool preserved_trx_resume_deadline_expired(
     const Preserve_snapshot_metadata &metadata);
-bool preserved_trx_resolve_timeout_seconds(const Preserve_trx_options &options,
-                                           ulonglong default_timeout,
-                                           ulonglong min_timeout,
-                                           ulonglong max_timeout,
-                                           ulonglong *timeout_seconds);
 bool preserved_trx_preflight_recoverability();
 void preserved_trx_resurrection_index_bootstrap_preamble();
 bool preserved_trx_resurrection_index_bootstrap_postamble();

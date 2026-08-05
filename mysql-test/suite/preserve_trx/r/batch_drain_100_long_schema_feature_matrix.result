@@ -10,7 +10,7 @@ AS all_sessions_older_than_five_seconds
 FROM t_batch_long_control;
 all_sessions_older_than_five_seconds
 1
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 86400 WITH USER VARS;
+DRAIN TRANSACTIONS PRESERVE WITH USER VARS;
 SELECT COUNT(*) AS preserved_count
 FROM performance_schema.preserved_transactions;
 preserved_count

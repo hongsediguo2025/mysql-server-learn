@@ -1,8 +1,5 @@
 DROP TABLE IF EXISTS t_timeout_resume_rollback_failure;
 SET GLOBAL preserve_trx_enable=ON;
-SET SESSION preserve_trx_min_timeout=1;
-SET SESSION preserve_trx_default_timeout=1;
-SET SESSION preserve_trx_max_timeout=86400;
 CREATE TABLE t_timeout_resume_rollback_failure(a INT PRIMARY KEY, b INT)
 ENGINE=InnoDB;
 INSERT INTO t_timeout_resume_rollback_failure VALUES(1,10);

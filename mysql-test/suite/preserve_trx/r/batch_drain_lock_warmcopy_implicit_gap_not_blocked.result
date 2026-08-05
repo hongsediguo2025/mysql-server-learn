@@ -12,7 +12,7 @@ v INT
 INSERT INTO t_lock_warmcopy_implicit_gap VALUES(10,10,10),(30,30,30);
 START TRANSACTION;
 INSERT INTO t_lock_warmcopy_implicit_gap VALUES(20,20,20);
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 include/assert_grep.inc [lock warmcopy succeeds for implicit gap strict mode]
 SELECT COUNT(*) AS preserved_count_after_implicit_gap
 FROM performance_schema.preserved_transactions;

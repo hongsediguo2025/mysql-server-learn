@@ -53,7 +53,7 @@ SET DEBUG_SYNC =
   'preserve_trx_lock_warmcopy_after_active_record_scan SIGNAL lock_wc_fallback_active_scan_done WAIT_FOR lock_wc_fallback_active_scan_continue';
 --enable_query_log
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
---send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+--send DRAIN TRANSACTIONS PRESERVE
 
 --connection default
 --disable_query_log

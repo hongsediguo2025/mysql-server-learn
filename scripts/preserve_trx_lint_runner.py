@@ -39,6 +39,7 @@ LEGACY_LINT_RULE_IDS: Sequence[str] = (
     "preserve_crash_abandon_contract_lint",
     "preserve_prepare_freeze_semantics_lint",
     "preserve_review_fix_contract_lint",
+    "preserve_trx_timeout_policy_consolidation_lint",
     "physical_promotion_partial_ready_contract_lint",
     "readview_low_limit_system_floor_lint",
     "reset_drain_scope_lint",
@@ -52,6 +53,8 @@ LEGACY_LINT_RULE_IDS: Sequence[str] = (
     "temp_table_phase2_slo_manifest_lint",
     "temp_table_row_hook_no_payload_lint",
     "test_layering_doc_contract_lint",
+    "transfer_startup_isolation_lint",
+    "unified_active_undo_v1_contract_lint",
     "wide_error_masks_lint",
 )
 

@@ -21,7 +21,7 @@ START TRANSACTION;
 UPDATE t_preserve_kill_after_undo_binlog SET b=11 WHERE a=1;
 
 --connect(preserve_kill_after_undo_binlog_drain,localhost,root,,test)
---send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+--send DRAIN TRANSACTIONS PRESERVE
 
 --connection default
 # Let preserve progress through the active-session drain before the control

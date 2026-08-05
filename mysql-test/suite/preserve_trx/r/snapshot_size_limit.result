@@ -6,7 +6,7 @@ CREATE TABLE t_snapshot_size_limit(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_snapshot_size_limit VALUES(1,10);
 START TRANSACTION;
 UPDATE t_snapshot_size_limit SET b=11 WHERE a=1;
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 SELECT COUNT(*) AS preserved_count
 FROM performance_schema.preserved_transactions;
