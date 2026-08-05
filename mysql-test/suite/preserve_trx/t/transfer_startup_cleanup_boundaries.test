@@ -1,0 +1,135 @@
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+--let MYSQLD_DATADIR= `SELECT @@datadir`
+--let $PRESERVE_TRX_DIR= `SELECT @@global.preserve_trx_dir`
+CALL mtr.add_suppression("PRESERVE: transfer startup cleanup incomplete");
+
+# Stop before replacing the canonical root with a symlink. Transfer startup
+# must unlink the root symlink itself and leave the external target untouched.
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+SHUTDOWN;
+--source include/wait_until_disconnected.inc
+
+--perl
+use strict;
+use warnings;
+use File::Path qw(make_path remove_tree);
+use File::Spec;
+
+my $datadir = $ENV{'MYSQLD_DATADIR'};
+my $root = File::Spec->catdir($datadir, 'preserve');
+my $target = File::Spec->catdir($datadir, 'transfer-startup-external');
+remove_tree($root) if -d $root && !-l $root;
+unlink($root) if -l $root;
+remove_tree($target) if -e $target;
+make_path($target, {mode => 0700});
+open(my $fh, '>', File::Spec->catfile($target, 'sentinel'))
+  or die "cannot create external sentinel: $!";
+print {$fh} 'keep';
+close($fh);
+symlink($target, $root) or die "cannot create Preserve root symlink: $!";
+EOF
+
+--exec echo "restart: --preserve-trx-enable=ON --preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+--perl
+use strict;
+use warnings;
+use File::Path qw(remove_tree);
+use File::Spec;
+
+my $datadir = $ENV{'MYSQLD_DATADIR'};
+my $root = File::Spec->catdir($datadir, 'preserve');
+my $target = File::Spec->catdir($datadir, 'transfer-startup-external');
+die "Preserve root symlink survived startup" if -l $root;
+die "Preserve root was not recreated as a directory" unless -d $root;
+die "external sentinel was removed" unless -f File::Spec->catfile($target, 'sentinel');
+remove_tree($target);
+EOF
+
+# An inaccessible root is a hygiene failure, not a startup correctness failure.
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+SHUTDOWN;
+--source include/wait_until_disconnected.inc
+
+--perl
+use strict;
+use warnings;
+use File::Path qw(make_path);
+use File::Spec;
+
+my $root = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve');
+make_path($root, {mode => 0700}) unless -d $root;
+open(my $fh, '>', File::Spec->catfile($root, 'inaccessible-sentinel'))
+  or die "cannot create inaccessible sentinel: $!";
+print {$fh} 'keep';
+close($fh);
+chmod(0000, $root) or die "cannot make Preserve root inaccessible: $!";
+EOF
+
+--exec echo "restart: --preserve-trx-enable=ON --preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+--perl
+use strict;
+use warnings;
+use File::Path qw(remove_tree);
+use File::Spec;
+
+my $root = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve');
+chmod(0700, $root) or die "cannot restore Preserve root access: $!";
+die "failed cleanup must retain its inaccessible sentinel"
+  unless -f File::Spec->catfile($root, 'inaccessible-sentinel');
+remove_tree($root);
+EOF
+
+# More than four child-directory levels is rejected, but safe siblings are
+# still removed and mysqld remains available.
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+SHUTDOWN;
+--source include/wait_until_disconnected.inc
+
+--perl
+use strict;
+use warnings;
+use File::Path qw(make_path);
+use File::Spec;
+
+my $root = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve');
+my $deep = File::Spec->catdir($root, qw(a b c d e));
+make_path($deep, {mode => 0700});
+open(my $deep_fh, '>', File::Spec->catfile($deep, 'sentinel'))
+  or die "cannot create deep sentinel: $!";
+print {$deep_fh} 'keep';
+close($deep_fh);
+open(my $sibling_fh, '>', File::Spec->catfile($root, 'safe-sibling'))
+  or die "cannot create safe sibling: $!";
+print {$sibling_fh} 'remove';
+close($sibling_fh);
+EOF
+
+--exec echo "restart: --preserve-trx-enable=ON --preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+--perl
+use strict;
+use warnings;
+use File::Path qw(remove_tree);
+use File::Spec;
+
+my $root = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve');
+my $deep_sentinel = File::Spec->catfile($root, qw(a b c d e sentinel));
+die "depth-overflow subtree was traversed" unless -f $deep_sentinel;
+die "safe sibling was not cleaned" if -e File::Spec->catfile($root, 'safe-sibling');
+remove_tree($root);
+EOF
+
+SELECT 'ok' AS transfer_startup_cleanup_boundaries;

@@ -1,0 +1,4 @@
+# Source-shape guard for Transfer startup isolation.
+SELECT 'ok' AS transfer_startup_isolation_lint;
+transfer_startup_isolation_lint
+ok

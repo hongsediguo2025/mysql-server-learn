@@ -171,6 +171,7 @@ extern bool recv_needed_recovery;
 extern bool srv_read_only_mode;
 static std::atomic<bool> g_preserve_trx_enable_cached{true};
 static std::atomic<bool> g_preserve_trx_enable_cache_initialized{false};
+static std::atomic<bool> g_preserved_trx_server_startup_active{false};
 
 bool preserve_trx_is_enabled() {
   if (!g_preserve_trx_enable_cache_initialized.load(std::memory_order_acquire)) {
@@ -183,6 +184,41 @@ void preserve_trx_set_enable_value(bool enabled) {
   preserve_trx_enable = enabled;
   g_preserve_trx_enable_cached.store(enabled, std::memory_order_release);
   g_preserve_trx_enable_cache_initialized.store(true, std::memory_order_release);
+}
+
+bool preserved_trx_server_startup_active() {
+  return g_preserved_trx_server_startup_active.load(std::memory_order_acquire);
+}
+
+bool preserved_trx_skip_local_startup_recovery() {
+  return preserved_trx_server_startup_active() && preserve_trx_is_enabled() &&
+         preserve_trx_transfer_artifact_mode ==
+             PRESERVE_TRX_TRANSFER_ARTIFACT_STANDBY_TRANSFER_SAVE;
+}
+
+void preserved_trx_enter_server_startup() {
+  if (!preserve_trx_is_enabled()) return;
+  bool expected = false;
+  const bool entered =
+      g_preserved_trx_server_startup_active.compare_exchange_strong(
+          expected, true, std::memory_order_acq_rel);
+  DBUG_ASSERT(entered);
+}
+
+void preserved_trx_leave_server_startup() {
+  const bool deferred_transfer_startup =
+      preserved_trx_skip_local_startup_recovery();
+  const bool was_active =
+      g_preserved_trx_server_startup_active.exchange(false,
+                                                     std::memory_order_acq_rel);
+  if (!was_active || !deferred_transfer_startup) return;
+
+  preserved_trx_start_expired_reaper_if_ready();
+  if (!srv_read_only_mode &&
+      !preserved_trx_promotion_start_gate_workers()) {
+    LogErr(WARNING_LEVEL, ER_LOG_PRINTF_MSG,
+           "PRESERVE: failed to prestart promotion gate worker pool");
+  }
 }
 
 bool preserve_trx_off_artifact_policy_ignore() {
@@ -1948,7 +1984,8 @@ void mark_preserved_trx_recovery_complete() {
     g_preserved_trx_recovery_done = true;
   }
   g_preserved_trx_recovery_cond.notify_all();
-  preserved_trx_start_expired_reaper_if_ready();
+  if (!preserved_trx_skip_local_startup_recovery())
+    preserved_trx_start_expired_reaper_if_ready();
 }
 
 void mark_preserved_trx_recovery_deferred() {
@@ -9621,6 +9658,7 @@ const char *preserved_trx_dir_value() {
 
 void preserved_trx_mark_recovery_complete() {
   mark_preserved_trx_recovery_complete();
+  if (preserved_trx_skip_local_startup_recovery()) return;
   if (preserve_trx_is_enabled() &&
       !preserved_trx_promotion_start_gate_workers()) {
     LogErr(WARNING_LEVEL, ER_LOG_PRINTF_MSG,
@@ -9634,6 +9672,11 @@ bool preserved_trx_recovery_complete() {
 }
 
 bool preserved_trx_mark_innodb_read_only_recovery_state() {
+  if (preserved_trx_skip_local_startup_recovery()) {
+    trx_preserve_startup_resurrection_reset();
+    mark_preserved_trx_recovery_complete();
+    return false;
+  }
   if (!preserve_trx_is_enabled()) {
     mark_preserved_trx_recovery_complete();
     return false;
@@ -9677,6 +9720,7 @@ bool preserved_trx_local_record_exists(const std::string &token) {
 }
 
 bool preserved_trx_validate_snapshot_support(bool allow_create_missing) {
+  if (preserved_trx_skip_local_startup_recovery()) return false;
   const std::string dir = preserve_trx_default_dir();
   return preserved_trx_default_carrier_support_has_error(dir,
                                                          allow_create_missing);
@@ -13718,6 +13762,7 @@ bool preserved_trx_rollback_physical_promotion_adopt(
 }
 
 bool preserved_trx_preflight_recoverability() {
+  if (preserved_trx_skip_local_startup_recovery()) return false;
   if (!preserve_trx_is_enabled()) {
     if (!preserve_trx_off_artifact_policy_recover() &&
         !preserve_trx_off_artifact_policy_abandon()) {
@@ -13781,6 +13826,7 @@ bool preserved_trx_preflight_recoverability() {
 void preserved_trx_resurrection_index_bootstrap_preamble() {
   trx_preserve_startup_resurrection_reset();
   g_startup_resurrection_preamble_failed = false;
+  if (preserved_trx_skip_local_startup_recovery()) return;
   if ((!preserve_trx_is_enabled() &&
        !preserve_trx_off_artifact_policy_recover())) {
     return;
@@ -13910,6 +13956,11 @@ void preserved_trx_resurrection_index_bootstrap_preamble() {
 }
 
 bool preserved_trx_resurrection_index_bootstrap_postamble() {
+  if (preserved_trx_skip_local_startup_recovery()) {
+    trx_preserve_startup_resurrection_reset();
+    g_startup_resurrection_preamble_failed = false;
+    return false;
+  }
   if (g_startup_resurrection_preamble_failed) return true;
   if (srv_force_recovery > 0 || srv_read_only_mode) {
     trx_preserve_startup_resurrection_reset();
@@ -13937,6 +13988,10 @@ bool preserved_trx_resurrection_index_bootstrap_postamble() {
 }
 
 bool preserved_trx_resurrection_locks_postamble() {
+  if (preserved_trx_skip_local_startup_recovery()) {
+    trx_preserve_startup_resurrection_reset();
+    return false;
+  }
   std::vector<std::string> authorities;
   std::vector<trx_t *> transactions;
   if (trx_preserve_startup_collect_lock_resurrection_failures(
@@ -13963,6 +14018,7 @@ bool preserved_trx_resurrection_locks_postamble() {
 }
 
 bool preserved_temp_images_bootstrap_preamble() {
+  if (preserved_trx_skip_local_startup_recovery()) return false;
   if (!preserve_trx_is_enabled() &&
       !preserve_trx_off_artifact_policy_recover()) {
     return false;
@@ -14455,6 +14511,11 @@ bool preserved_trx_recover_all() {
     preserved_trx_mark_recovery_complete();
     return error;
   };
+
+  if (preserved_trx_skip_local_startup_recovery()) {
+    trx_preserve_startup_resurrection_reset();
+    return finish_recovery(false, "transfer_startup_local_recovery_skipped");
+  }
 
   if (!preserve_trx_is_enabled()) {
     if (preserve_trx_off_artifact_preflight(

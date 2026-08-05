@@ -509,6 +509,10 @@ using Preserved_trx_view_rows = std::vector<Preserved_trx_view_row>;
 
 const Preserved_trx_column_metadata *preserved_trx_columns(size_t *count);
 const char *preserved_trx_dir_value();
+void preserved_trx_enter_server_startup();
+void preserved_trx_leave_server_startup();
+bool preserved_trx_server_startup_active();
+bool preserved_trx_skip_local_startup_recovery();
 bool preserved_trx_ensure_snapshot_support();
 bool preserved_trx_validate_snapshot_support(bool allow_create_missing);
 bool preserved_trx_preflight_recoverability();

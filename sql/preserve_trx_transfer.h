@@ -1441,6 +1441,7 @@ void preserve_trx_transfer_set_receiver_worker_init_pause_for_unit_test(
 void preserve_trx_transfer_set_prewarm_paused_for_unit_test(bool paused);
 bool preserve_trx_transfer_receiver_workers_starting_for_unit_test();
 /* Receiver transfer state is valid only for the current mysqld process. */
+Preserve_trx_transfer_status preserve_trx_transfer_cleanup_startup_root();
 Preserve_trx_transfer_status
 preserve_trx_transfer_cleanup_receiver_restart_state(
     const std::string &root_dir);

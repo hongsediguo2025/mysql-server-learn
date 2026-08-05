@@ -1,0 +1,7 @@
+CALL mtr.add_suppression("PRESERVE: transfer startup cleanup incomplete");
+SHUTDOWN;
+SHUTDOWN;
+SHUTDOWN;
+SELECT 'ok' AS transfer_startup_cleanup_boundaries;
+transfer_startup_cleanup_boundaries
+ok

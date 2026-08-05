@@ -96,11 +96,10 @@ static_assert(
 
 using Physical_prepare_entrypoint =
     Preserve_trx_physical_promotion_gate_status (*)(
-        const std::string &, const Preserve_trx_physical_bootstrap_request &,
+        const Preserve_trx_physical_bootstrap_request &,
         Preserve_trx_physical_promotion_bootstrap_attempt *);
 using Physical_adopt_entrypoint =
     Preserve_trx_physical_promotion_gate_status (*)(
-        const std::string &,
         Preserve_trx_physical_promotion_bootstrap_attempt *,
         Preserve_trx_physical_promotion_gate_result *);
 
@@ -9920,7 +9919,7 @@ TEST_F(PreserveSnapshotTest,
   Preserve_trx_physical_promotion_bootstrap_attempt attempt;
   EXPECT_EQ(Preserve_trx_physical_promotion_gate_status::REGISTRY_NOT_READY,
             preserved_trx_adopt_ready_epoch_for_physical_promotion(
-                m_dir, &attempt, &result));
+                &attempt, &result));
   EXPECT_EQ(0U, result.adopted_count);
   EXPECT_EQ(0U, result.tainted_count);
   MY_STAT stat_area;
@@ -9942,7 +9941,7 @@ TEST_F(PreserveSnapshotTest,
   Preserve_trx_physical_promotion_bootstrap_attempt attempt;
   EXPECT_EQ(Preserve_trx_physical_promotion_gate_status::REGISTRY_NOT_READY,
             preserved_trx_prepare_before_trx_sys_init_for_physical_promotion(
-                m_dir, request, &attempt));
+                request, &attempt));
   EXPECT_EQ(Preserve_trx_physical_promotion_gate_status::OK, attempt.abort());
 }
 
@@ -9960,7 +9959,7 @@ TEST_F(PreserveSnapshotTest,
   Preserve_trx_physical_promotion_bootstrap_attempt attempt;
   EXPECT_EQ(Preserve_trx_physical_promotion_gate_status::INVALID_ARGUMENT,
             preserved_trx_prepare_before_trx_sys_init_for_physical_promotion(
-                m_dir, request, &attempt));
+                request, &attempt));
   EXPECT_EQ(Preserve_trx_physical_promotion_gate_status::OK, attempt.abort());
 }
 

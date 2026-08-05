@@ -366,7 +366,6 @@ void preserved_trx_set_strict_physical_adopt_reversal_executor_for_unit_test(
 
 Preserve_trx_physical_promotion_gate_status
 preserved_trx_adopt_ready_epoch_for_physical_promotion(
-    const std::string &preserve_dir,
     Preserve_trx_physical_promotion_bootstrap_attempt *attempt,
     Preserve_trx_physical_promotion_gate_result *result);
 Preserve_trx_physical_promotion_gate_status
@@ -417,11 +416,10 @@ class Preserve_trx_physical_promotion_bootstrap_attempt {
 
   friend Preserve_trx_physical_promotion_gate_status
   preserved_trx_prepare_before_trx_sys_init_for_physical_promotion(
-      const std::string &, const Preserve_trx_physical_bootstrap_request &,
+      const Preserve_trx_physical_bootstrap_request &,
       Preserve_trx_physical_promotion_bootstrap_attempt *);
   friend Preserve_trx_physical_promotion_gate_status
   preserved_trx_adopt_ready_epoch_for_physical_promotion(
-      const std::string &,
       Preserve_trx_physical_promotion_bootstrap_attempt *,
       Preserve_trx_physical_promotion_gate_result *);
 };
@@ -433,7 +431,6 @@ class Preserve_trx_physical_promotion_bootstrap_attempt {
 */
 Preserve_trx_physical_promotion_gate_status
 preserved_trx_prepare_before_trx_sys_init_for_physical_promotion(
-    const std::string &preserve_dir,
     const Preserve_trx_physical_bootstrap_request &request,
     Preserve_trx_physical_promotion_bootstrap_attempt *attempt);
 

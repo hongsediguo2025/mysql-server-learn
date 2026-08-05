@@ -5915,22 +5915,29 @@ static int init_server_components() {
     unireg_abort(1);
   }
 
-  /*
-    Transfer receiver artifacts belong only to the mysqld process that accepted
-    them. Discard them before InnoDB initialization, because InnoDB startup
-    Preserve hooks must never interpret process-local receiver files as local
-    shutdown/startup recovery input. This is unconditional for a normal start:
-    the receiver endpoint may intentionally be disabled in the new process.
-  */
   if (!opt_initialize && !is_help_or_validate_option()) {
-    const Preserve_trx_transfer_status cleanup_status =
-        preserve_trx_transfer_cleanup_receiver_restart_state(
-            preserved_trx_dir_value());
-    if (cleanup_status != Preserve_trx_transfer_status::OK) {
-      LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
-             "PRESERVE: failed to discard process-local transfer receiver "
-             "state during startup");
-      unireg_abort(MYSQLD_ABORT_EXIT);
+    preserved_trx_enter_server_startup();
+    if (preserved_trx_skip_local_startup_recovery()) {
+      const Preserve_trx_transfer_status cleanup_status =
+          preserve_trx_transfer_cleanup_startup_root();
+      if (cleanup_status != Preserve_trx_transfer_status::OK) {
+        const std::string message =
+            "PRESERVE: transfer startup cleanup incomplete: root=" +
+            std::string(preserved_trx_dir_value()) + " status=" +
+            std::to_string(static_cast<uint>(cleanup_status)) +
+            "; residual artifacts are ignored by local startup recovery";
+        LogErr(WARNING_LEVEL, ER_LOG_PRINTF_MSG, message.c_str());
+      }
+    } else {
+      const Preserve_trx_transfer_status cleanup_status =
+          preserve_trx_transfer_cleanup_receiver_restart_state(
+              preserved_trx_dir_value());
+      if (cleanup_status != Preserve_trx_transfer_status::OK) {
+        LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+               "PRESERVE: failed to discard process-local transfer receiver "
+               "state during startup");
+        unireg_abort(MYSQLD_ABORT_EXIT);
+      }
     }
   }
 
@@ -7121,6 +7128,7 @@ int mysqld_main(int argc, char **argv)
   set_ports();
 
   if (init_server_components()) unireg_abort(MYSQLD_ABORT_EXIT);
+  preserved_trx_leave_server_startup();
 
   if (!server_id_supplied)
     LogErr(INFORMATION_LEVEL, ER_WARN_NO_SERVERID_SPECIFIED);

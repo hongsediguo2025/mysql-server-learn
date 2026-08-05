@@ -1,0 +1,59 @@
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+--let MYSQLD_DATADIR= `SELECT @@datadir`
+--let $PRESERVE_TRX_DIR= `SELECT @@global.preserve_trx_dir`
+--let $UNKNOWN_SENTINEL= $PRESERVE_TRX_DIR/startup-isolation.unknown
+--let $KNOWN_TOKEN= 91001
+--let $KNOWN_MARKER= $PRESERVE_TRX_DIR/$KNOWN_TOKEN.standby_pending
+--let $KNOWN_SNAPSHOT= $PRESERVE_TRX_DIR/$KNOWN_TOKEN.bin
+--let $TRANSFER_OBJECT= $PRESERVE_TRX_DIR/.transfer/startup-isolation/$KNOWN_TOKEN/frame.part
+
+CALL mtr.add_suppression("PRESERVE: transfer startup cleanup incomplete");
+
+# LOCAL_CARRIER keeps its selective receiver cleanup contract. Known receiver
+# artifacts are removed, while an unrelated file remains outside that policy.
+--exec mkdir -p "$PRESERVE_TRX_DIR/.transfer/startup-isolation/$KNOWN_TOKEN"
+--exec printf unknown > "$UNKNOWN_SENTINEL"
+--exec printf pending > "$KNOWN_MARKER"
+--exec printf snapshot > "$KNOWN_SNAPSHOT"
+--exec printf staged > "$TRANSFER_OBJECT"
+
+--let $restart_parameters= restart: --preserve-trx-enable=ON --preserve-trx-transfer-artifact-mode=LOCAL_CARRIER --skip-log-bin
+--source include/restart_mysqld.inc
+--let $restart_parameters=
+
+--exec test -e "$UNKNOWN_SENTINEL"
+--exec test ! -e "$KNOWN_MARKER"
+--exec test ! -e "$KNOWN_SNAPSHOT"
+--exec test ! -e "$TRANSFER_OBJECT"
+
+# Transfer+ON owns the complete canonical root. Unknown files and corrupt
+# local-carrier-looking files are deleted without being parsed as startup input.
+--exec mkdir -p "$PRESERVE_TRX_DIR/.transfer/startup-isolation/$KNOWN_TOKEN"
+--exec printf corrupt > "$KNOWN_SNAPSHOT"
+--exec printf staged > "$TRANSFER_OBJECT"
+
+--let $restart_parameters= restart: --preserve-trx-enable=ON --preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --skip-log-bin
+--source include/restart_mysqld.inc
+--let $restart_parameters=
+
+--exec test -d "$PRESERVE_TRX_DIR"
+--exec test ! -e "$UNKNOWN_SENTINEL"
+--exec test ! -e "$KNOWN_SNAPSHOT"
+--exec test ! -e "$TRANSFER_OBJECT"
+
+SELECT COUNT(*) = 0 AS startup_metrics_zero
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME IN (
+   'Preserve_trx_startup_recovery_error',
+   'Preserve_trx_startup_recovery_snapshot_tokens',
+   'Preserve_trx_startup_recovery_local_snapshot_tokens',
+   'Preserve_trx_startup_recovery_binlog_cache_tokens',
+   'Preserve_trx_startup_recovery_tainted_tokens',
+   'Preserve_trx_startup_recovery_standby_pending_tokens',
+   'Preserve_trx_startup_recovery_promotion_intent_tokens',
+   'Preserve_trx_startup_recovery_orphan_rollback_count')
+   AND VARIABLE_VALUE <> '0';
+SELECT COUNT(*) AS preserved_transactions_after_transfer_startup
+  FROM performance_schema.preserved_transactions;

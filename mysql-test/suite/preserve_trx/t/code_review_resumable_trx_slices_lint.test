@@ -3029,18 +3029,18 @@ die "process-local snapshot removal must propagate deferred directory fsync with
            /Local_file_preserved_trx_carrier::remove_with_status[\s\S]{0,500}options\.defer_directory_fsync\s*=\s*options\.defer_directory_fsync\s*\|\|\s*m_write_options\.defer_directory_fsync[\s\S]{0,240}delete_snapshot_files_with_status/s &&
          $carrier_file =~
            /delete_snapshot_files_with_status[\s\S]{0,5200}!options\.defer_directory_fsync[\s\S]{0,500}fsync_directory/s;
-die "receiver restart must discard transfer state before ordinary recovery hooks\n"
+die "startup must isolate transfer artifacts before ordinary recovery hooks\n"
   unless $mysqld =~
-         /if\s*\(!opt_initialize\s*&&\s*!is_help_or_validate_option\(\)\)[\s\S]{0,500}preserve_trx_transfer_cleanup_receiver_restart_state[\s\S]*preserved_trx_preflight_recoverability/s;
+         /if\s*\(!opt_initialize\s*&&\s*!is_help_or_validate_option\(\)\)[\s\S]{0,1200}preserve_trx_transfer_cleanup_startup_root[\s\S]{0,1200}preserve_trx_transfer_cleanup_receiver_restart_state[\s\S]*preserved_trx_preflight_recoverability/s;
 die "receiver admission must not depend on a Preserve-owned HA role sysvar\n"
   if $sys_vars =~ /preserve_trx_transfer_receiver_enable/s ||
      $transfer =~ /preserve_trx_transfer_receiver_enable/s ||
      $transfer_header =~ /preserve_trx_transfer_receiver_enable/s ||
      $preserve =~ /preserve_trx_transfer_receiver_enable/s ||
      $promotion =~ /preserve_trx_transfer_receiver_enable/s;
-die "receiver restart cleanup must run before InnoDB/core storage-engine initialization\n"
+die "both startup cleanup policies must run before InnoDB/core storage-engine initialization\n"
   unless $mysqld =~
-         /preserve_trx_transfer_cleanup_receiver_restart_state[\s\S]{0,1500}plugin_register_builtin_and_init_core_se/s;
+         /preserve_trx_transfer_cleanup_startup_root[\s\S]{0,1500}preserve_trx_transfer_cleanup_receiver_restart_state[\s\S]{0,1500}plugin_register_builtin_and_init_core_se/s;
 my $receiver_restart_cleanup_decl =
   index($transfer_header,
         'preserve_trx_transfer_cleanup_receiver_restart_state');

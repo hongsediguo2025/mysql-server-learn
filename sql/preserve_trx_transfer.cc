@@ -2692,15 +2692,20 @@ std::string normalize_dir(const std::string &dir) {
   return dir + FN_LIBCHAR;
 }
 
-std::string transfer_default_preserve_dir() {
-  const char *datadir =
-      mysql_real_data_home_ptr != nullptr ? mysql_real_data_home_ptr
-                                          : mysql_real_data_home;
-  return normalize_dir(normalize_dir(std::string(datadir)) + "preserve");
-}
-
 std::string join_path(const std::string &dir, const std::string &name) {
   return normalize_dir(dir) + name;
+}
+
+std::string strip_trailing_directory_separators(std::string path) {
+  while (path.size() > 1 &&
+         (path.back() == FN_LIBCHAR
+#ifdef _WIN32
+          || path.back() == FN_LIBCHAR2
+#endif
+          )) {
+    path.pop_back();
+  }
+  return path;
 }
 
 bool transfer_component_safe(const std::string &component) {
@@ -2936,15 +2941,19 @@ Preserve_trx_transfer_status remove_receiver_restart_tree(
   for (uint index = 0; index < dir_info->number_off_files; ++index) {
     FILEINFO *entry = dir_info->dir_entry + index;
     if (entry == nullptr || is_dot_or_dotdot(entry->name)) continue;
-    status = remove_receiver_restart_tree(join_path(path, entry->name),
-                                          depth + 1);
-    if (status != Preserve_trx_transfer_status::OK) break;
+    const Preserve_trx_transfer_status child_status =
+        remove_receiver_restart_tree(join_path(path, entry->name), depth + 1);
+    if (status == Preserve_trx_transfer_status::OK &&
+        child_status != Preserve_trx_transfer_status::OK) {
+      status = child_status;
+    }
   }
   my_dirend(dir_info);
-  if (status != Preserve_trx_transfer_status::OK) return status;
-  return rmdir(path.c_str()) == 0 || errno == ENOENT
-             ? Preserve_trx_transfer_status::OK
-             : Preserve_trx_transfer_status::IO_ERROR;
+  if (rmdir(path.c_str()) != 0 && errno != ENOENT &&
+      status == Preserve_trx_transfer_status::OK) {
+    status = Preserve_trx_transfer_status::IO_ERROR;
+  }
+  return status;
 }
 
 Preserve_trx_transfer_status remove_receiver_restart_promotion_markers(
@@ -6210,6 +6219,19 @@ preserve_trx_transfer_copy_accepted_resurrection_entry(
     return Preserve_trx_transfer_status::CORRUPT;
   }
   return Preserve_trx_transfer_status::OK;
+}
+
+Preserve_trx_transfer_status
+preserve_trx_transfer_cleanup_startup_root() {
+  const std::string root_dir =
+      strip_trailing_directory_separators(preserved_trx_dir_value());
+  if (root_dir.empty()) return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+  const Preserve_trx_transfer_status cleanup_status =
+      remove_receiver_restart_tree(root_dir, 0);
+  const bool create_failed = ensure_dir_exists(root_dir);
+  if (cleanup_status != Preserve_trx_transfer_status::OK) return cleanup_status;
+  return create_failed ? Preserve_trx_transfer_status::IO_ERROR
+                       : Preserve_trx_transfer_status::OK;
 }
 
 Preserve_trx_transfer_status
@@ -17933,7 +17955,7 @@ void preserve_trx_transfer_dispatch_command(THD *thd) {
         thd, Preserve_trx_transfer_status::UNSUPPORTED);
     return;
   }
-  const std::string preserve_dir = transfer_default_preserve_dir();
+  const std::string preserve_dir = preserved_trx_dir_value();
   Receiver_admission_ack_context ack_context;
   ack_context.thd = thd;
   ack_context.encoded_payload = &encoded_frame;

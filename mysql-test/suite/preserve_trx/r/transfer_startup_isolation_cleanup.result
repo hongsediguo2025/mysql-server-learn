@@ -1,0 +1,21 @@
+CALL mtr.add_suppression("PRESERVE: transfer startup cleanup incomplete");
+# restart: --preserve-trx-enable=ON --preserve-trx-transfer-artifact-mode=LOCAL_CARRIER --skip-log-bin
+# restart: --preserve-trx-enable=ON --preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --skip-log-bin
+SELECT COUNT(*) = 0 AS startup_metrics_zero
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME IN (
+'Preserve_trx_startup_recovery_error',
+'Preserve_trx_startup_recovery_snapshot_tokens',
+'Preserve_trx_startup_recovery_local_snapshot_tokens',
+'Preserve_trx_startup_recovery_binlog_cache_tokens',
+'Preserve_trx_startup_recovery_tainted_tokens',
+'Preserve_trx_startup_recovery_standby_pending_tokens',
+'Preserve_trx_startup_recovery_promotion_intent_tokens',
+'Preserve_trx_startup_recovery_orphan_rollback_count')
+AND VARIABLE_VALUE <> '0';
+startup_metrics_zero
+1
+SELECT COUNT(*) AS preserved_transactions_after_transfer_startup
+FROM performance_schema.preserved_transactions;
+preserved_transactions_after_transfer_startup
+0

@@ -1,0 +1,91 @@
+--echo # Source-shape guard for Transfer startup isolation.
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $root = File::Spec->rel2abs(File::Spec->catdir($mysql_test_dir, '..'));
+
+sub read_file {
+  my ($path) = @_;
+  my $full = File::Spec->catfile($root, split('/', $path));
+  open(my $fh, '<', $full) or die "open $path: $!\n";
+  my $contents = do { local $/; <$fh> };
+  close($fh);
+  return $contents;
+}
+
+my $mysqld = read_file('sql/mysqld.cc');
+my $preserve = read_file('sql/preserve_trx.cc');
+my $header = read_file('sql/preserve_trx.h');
+my $transfer = read_file('sql/preserve_trx_transfer.cc');
+my $transfer_header = read_file('sql/preserve_trx_transfer.h');
+my $promotion = read_file('sql/preserve_trx_promotion.cc');
+my $promotion_header = read_file('sql/preserve_trx_promotion.h');
+
+die "Preserve module must own the server-startup marker and unified skip predicate\n"
+  unless $header =~ /preserved_trx_enter_server_startup/s &&
+         $header =~ /preserved_trx_leave_server_startup/s &&
+         $header =~ /preserved_trx_skip_local_startup_recovery/s &&
+         $preserve =~ /g_preserved_trx_server_startup_active/s &&
+         $preserve =~ /PRESERVE_TRX_TRANSFER_ARTIFACT_STANDBY_TRANSFER_SAVE/s;
+
+my $enter = index($mysqld, 'preserved_trx_enter_server_startup()');
+my $cleanup = $enter < 0 ? -1 :
+  index($mysqld, 'preserve_trx_transfer_cleanup_startup_root()', $enter);
+my $engine_init = $cleanup < 0 ? -1 :
+  index($mysqld, 'plugin_register_builtin_and_init_core_se', $cleanup);
+my $leave = $engine_init < 0 ? -1 :
+  index($mysqld, 'preserved_trx_leave_server_startup()', $engine_init);
+my $network = $leave < 0 ? -1 : index($mysqld, 'network_init()', $leave);
+die "startup lifecycle must enclose Preserve cleanup and engine recovery\n"
+  unless $enter >= 0 && $cleanup > $enter && $engine_init > $cleanup &&
+         $leave > $engine_init && $network > $leave;
+
+die "Transfer+ON cleanup failure must warn and continue startup\n"
+  unless $mysqld =~ /preserve_trx_transfer_cleanup_startup_root[\s\S]{0,700}WARNING_LEVEL/s;
+die "OFF and LOCAL_CARRIER must retain selective cleanup and fatal handling\n"
+  unless $mysqld =~ /preserve_trx_transfer_cleanup_receiver_restart_state[\s\S]{0,700}unireg_abort/s;
+
+die "startup full-root cleanup must use the canonical Preserve directory\n"
+  unless $transfer =~ /preserve_trx_transfer_cleanup_startup_root[\s\S]{0,500}preserved_trx_dir_value/s;
+die "receiver dispatch must not calculate a second production Preserve root\n"
+  if $transfer =~ /transfer_default_preserve_dir/s;
+die "startup cleanup must be a production API\n"
+  unless $transfer_header =~ /preserve_trx_transfer_cleanup_startup_root/s;
+
+for my $entry (
+  qw(
+    preserved_trx_preflight_recoverability
+    preserved_trx_resurrection_index_bootstrap_preamble
+    preserved_trx_resurrection_index_bootstrap_postamble
+    preserved_trx_resurrection_locks_postamble
+    preserved_temp_images_bootstrap_preamble
+    preserved_trx_mark_innodb_read_only_recovery_state
+    preserved_trx_recover_all
+  )
+) {
+  $preserve =~ /(?:bool|void)\s+\Q$entry\E\s*\([^)]*\)\s*\{[\s\S]*?^\}/m
+    or die "$entry missing\n";
+  my $body = $&;
+  die "$entry must gate local startup recovery\n"
+    unless $body =~ /preserved_trx_skip_local_startup_recovery/s;
+}
+
+die "Transfer startup must defer workers until the startup marker is cleared\n"
+  unless $preserve =~ /preserved_trx_leave_server_startup[\s\S]{0,1000}preserved_trx_start_expired_reaper_if_ready/s &&
+         $preserve =~ /preserved_trx_leave_server_startup[\s\S]{0,1300}!srv_read_only_mode[\s\S]{0,300}preserved_trx_promotion_start_gate_workers/s;
+
+die "production promotion wrappers must use the canonical Preserve root\n"
+  unless $promotion =~ /preserved_trx_prepare_before_trx_sys_init_for_physical_promotion[\s\S]{0,2500}preserved_trx_dir_value/s &&
+         $promotion =~ /preserved_trx_adopt_ready_epoch_for_physical_promotion[\s\S]{0,7000}preserved_trx_dir_value/s;
+die "production promotion wrappers must reject server-startup calls\n"
+  unless $promotion =~ /preserved_trx_prepare_before_trx_sys_init_for_physical_promotion[\s\S]{0,700}preserved_trx_server_startup_active/s &&
+         $promotion =~ /preserved_trx_adopt_ready_epoch_for_physical_promotion[\s\S]{0,700}preserved_trx_server_startup_active/s;
+die "HA-facing promotion wrappers must not accept a Preserve directory\n"
+  if $promotion_header =~ /preserved_trx_(?:prepare_before_trx_sys_init|adopt_ready_epoch)_for_physical_promotion\s*\(\s*const\s+std::string/s;
+EOF
+
+SELECT 'ok' AS transfer_startup_isolation_lint;

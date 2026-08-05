@@ -3602,14 +3602,16 @@ bool Preserve_trx_physical_promotion_bootstrap_attempt::
 
 Preserve_trx_physical_promotion_gate_status
 preserved_trx_prepare_before_trx_sys_init_for_physical_promotion(
-    const std::string &preserve_dir,
     const Preserve_trx_physical_bootstrap_request &request,
     Preserve_trx_physical_promotion_bootstrap_attempt *attempt) {
   if (!preserve_trx_is_enabled()) {
     return Preserve_trx_physical_promotion_gate_status::NOT_ENABLED;
   }
-  if (preserve_dir.empty() || request.epoch_id.empty() ||
-      attempt == nullptr || attempt->m_impl == nullptr ||
+  if (preserved_trx_server_startup_active()) {
+    return Preserve_trx_physical_promotion_gate_status::REGISTRY_NOT_READY;
+  }
+  if (request.epoch_id.empty() || attempt == nullptr ||
+      attempt->m_impl == nullptr ||
       attempt->m_impl->active ||
       request.operation_deadline_us <= my_micro_time() ||
       request.worker_count == 0 ||
@@ -3632,7 +3634,8 @@ preserved_trx_prepare_before_trx_sys_init_for_physical_promotion(
                : cleanup_status;
   };
 
-  const std::string root_dir = promotion_normalize_dir(preserve_dir);
+  const std::string root_dir =
+      promotion_normalize_dir(preserved_trx_dir_value());
   const uint64_t operation_deadline_monotonic_us =
       promotion_wall_deadline_to_monotonic(request.operation_deadline_us);
   if (operation_deadline_monotonic_us == 0) {
@@ -3805,11 +3808,17 @@ void preserved_trx_set_strict_physical_adopt_reversal_executor_for_unit_test(
 
 Preserve_trx_physical_promotion_gate_status
 preserved_trx_adopt_ready_epoch_for_physical_promotion(
-    const std::string &preserve_dir,
     Preserve_trx_physical_promotion_bootstrap_attempt *attempt,
     Preserve_trx_physical_promotion_gate_result *result) {
   if (result == nullptr) {
     return Preserve_trx_physical_promotion_gate_status::INVALID_ARGUMENT;
+  }
+  if (preserved_trx_server_startup_active()) {
+    *result = {};
+    result->status =
+        Preserve_trx_physical_promotion_gate_status::REGISTRY_NOT_READY;
+    result->message = "physical promotion is unavailable during server startup";
+    return result->status;
   }
   const Preserve_trx_physical_promotion_gate_request *request = nullptr;
   std::vector<trx_t *> verified_transactions;
@@ -3862,7 +3871,7 @@ preserved_trx_adopt_ready_epoch_for_physical_promotion(
     status = result->status;
   } else {
     status = adopt_ready_epoch_for_physical_promotion_impl(
-        promotion_normalize_dir(preserve_dir), *request, false,
+        promotion_normalize_dir(preserved_trx_dir_value()), *request, false,
         &verified_transactions, accepted_epoch, prepared_token_pin, result);
   }
 
