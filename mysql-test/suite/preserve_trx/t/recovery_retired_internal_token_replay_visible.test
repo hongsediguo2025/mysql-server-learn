@@ -38,8 +38,6 @@ ROLLBACK;
 --connection default
 SELECT COUNT(*) AS preserved_after_retire
   FROM performance_schema.preserved_transactions;
---exec sh -c 'test ! -e "$MYSQLD_DATADIR/preserve/.xid_provenance"'
-
 --let $restart_parameters= restart: --preserve-trx-enable=OFF --preserve-trx-off-artifact-policy=IGNORE --skip-log-bin
 --let $do_not_echo_parameters= 1
 --source include/restart_mysqld.inc

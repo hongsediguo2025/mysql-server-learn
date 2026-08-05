@@ -42,7 +42,7 @@ DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 SELECT COUNT(*) AS remaining_preserved
   FROM performance_schema.preserved_transactions;
 
---exec sh -c 'test ! -d "$MYSQLD_DATADIR/preserve" || ! find "$MYSQLD_DATADIR/preserve" \( -name "*.bin" -o -name "*.bin.tmp" -o -name "*.binlog_cache" -o -name "*.binlog_cache.tmp" -o -name ".xid_provenance" \) -print -quit | grep -q .'
+--exec sh -c 'test ! -d "$MYSQLD_DATADIR/preserve" || ! find "$MYSQLD_DATADIR/preserve" \( -name "*.bin" -o -name "*.bin.tmp" -o -name "*.binlog_cache" -o -name "*.binlog_cache.tmp" \) -print -quit | grep -q .'
 
 SELECT * FROM t_preserve_prepare_crash ORDER BY a;
 

@@ -196,24 +196,6 @@ open(my $sh, '>:raw', File::Spec->catfile($preserve_dir, "$token.bin"))
 print {$sh} $snapshot;
 close($sh);
 
-my $identity =
-  "PTRX_SNAPSHOT_IDENTITY_PRODUCT_V1\n" .
-  length($token) . ":$token\n" .
-  length('root') . ":root\n" .
-  length('localhost') . ":localhost\n" .
-  "$created_at\n" .
-  ($created_at + 300 * 1000000) . "\n" .
-  "2\n0\n1\n0\n";
-my $identity_digest = unpack('H*', sha256($identity));
-my $generation = substr(unpack('H*', sha256("test-generation:$token")), 0, 32);
-my $ledger_body =
-  "PTRX_XID_PROVENANCE_PRODUCT_V1\n" .
-  "$token B $generation $identity_digest\n";
-my $ledger_digest = unpack('H*', sha256($ledger_body));
-my $ledger_path = File::Spec->catfile($preserve_dir, '.xid_provenance');
-open(my $lh, '>:raw', $ledger_path) or die "cannot write $ledger_path: $!";
-print {$lh} $ledger_body, "sha256 $ledger_digest\n";
-close($lh);
 EOF
 
 --exec echo "restart: --preserve-trx-enable=ON --preserve-trx-temp-table-enable=OFF" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect

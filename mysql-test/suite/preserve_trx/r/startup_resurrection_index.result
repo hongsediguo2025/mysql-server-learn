@@ -1,3 +1,4 @@
+CALL mtr.add_suppression("Preserved transaction '.*' recovery forced rollback: preserved transaction snapshot tainted: ACTIVE Undo exact reservation failed");
 DROP TABLE IF EXISTS t_startup_resurrection_index;
 SET GLOBAL preserve_trx_enable=ON;
 CREATE TABLE t_startup_resurrection_index(
@@ -52,10 +53,16 @@ WHERE VARIABLE_NAME='Preserve_trx_startup_resurrection_undo_body_records')>0
 AS fallback_read_undo_records;
 index_candidates	no_index_hit	one_fallback	fallback_read_undo_pages	fallback_read_undo_records
 1	1	1	1	1
-RESUME PRESERVED TRANSACTION 'TOKEN';
-COMMIT;
+SELECT COUNT(*) AS preserved_after_anchor_fallback
+FROM performance_schema.preserved_transactions;
+preserved_after_anchor_fallback
+0
+SELECT v AS rolled_back_value
+FROM t_startup_resurrection_index WHERE id=2;
+rolled_back_value
+20
 SELECT * FROM t_startup_resurrection_index ORDER BY id;
 id	v
 1	11
-2	21
+2	20
 DROP TABLE t_startup_resurrection_index;

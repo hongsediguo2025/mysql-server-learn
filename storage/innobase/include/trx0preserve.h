@@ -46,7 +46,6 @@ struct trx_rseg_t;
 struct trx_t;
 
 bool trx_preserve_feature_enabled();
-bool trx_preserve_xid_is_magic_active(const XID &xid);
 bool trx_preserve_xid_should_be_protected(const XID &xid);
 
 struct Preserve_modified_table_name {
@@ -74,9 +73,9 @@ struct trx_preserve_resurrection_undo_anchor {
 };
 
 struct trx_preserve_resurrection_facts {
+  std::string authority_token;
   uint64_t trx_id{0};
-  uint64_t prepare_lsn{0};
-  XID xid;
+  uint64_t freeze_lsn{0};
   std::vector<trx_preserve_resurrection_undo_anchor> undo_anchors;
   std::vector<uint64_t> modified_table_ids;
 };
@@ -121,7 +120,7 @@ enum class trx_preserve_targeted_publication_status : uint8_t {
 struct trx_preserve_targeted_publication_candidate {
   XID xid;
   uint64_t trx_id{0};
-  uint64_t prepare_lsn{0};
+  uint64_t freeze_lsn{0};
   uint64_t safe_next_trx_id_floor{0};
 };
 
@@ -183,26 +182,29 @@ struct trx_preserve_record_lock_residency_t {
   uint64_t missing_pages{0};
 };
 
-trx_t *trx_preserve_claim_prepared(const XID &xid);
-bool trx_preserve_probe_detached_prepared(const XID &xid);
 trx_t *trx_preserve_current_thd_trx(THD *thd);
 uint64_t trx_preserve_current_redo_lsn();
-dberr_t trx_preserve_claim_detached_prepared(trx_t *trx);
-dberr_t trx_preserve_claim_detached_prepared_exact(trx_t *trx,
+dberr_t trx_preserve_flush_redo_up_to(uint64_t lsn);
+dberr_t trx_preserve_claim_detached_active_undo(trx_t *trx);
+dberr_t trx_preserve_claim_detached_active_undo_exact(trx_t *trx,
                                                    const XID &expected_xid);
+bool trx_preserve_validate_reserved_exact(trx_t *trx,
+                                          const XID &expected_xid);
+bool trx_preserve_validate_reserved_authority(
+    trx_t *trx, const std::string &authority_token);
 trx_preserve_targeted_publication_status
-trx_preserve_publish_simulated_prepared(
+trx_preserve_publish_simulated_active_undo(
     const Preserve_trx_targeted_publication_capability &capability,
     const Preserve_trx_prepared_token_key &key,
     const trx_preserve_targeted_publication_candidate &candidate,
     trx_preserve_targeted_publication_journal *journal);
 trx_preserve_targeted_publication_status
-trx_preserve_unclaim_simulated_prepared(
+trx_preserve_unclaim_simulated_active_undo(
     const Preserve_trx_targeted_publication_capability &capability,
     const Preserve_trx_prepared_token_key &key,
     trx_preserve_targeted_publication_journal *journal);
 trx_preserve_targeted_publication_status
-trx_preserve_unpublish_simulated_prepared(
+trx_preserve_unpublish_simulated_active_undo(
     const Preserve_trx_targeted_publication_capability &capability,
     const Preserve_trx_prepared_token_key &key,
     trx_preserve_targeted_publication_journal *journal);
@@ -210,17 +212,11 @@ dberr_t trx_preserve_rollback_by_token(const char *token);
 dberr_t trx_preserve_rollback_by_token_for_thd(const char *token, THD *thd);
 dberr_t trx_preserve_rollback_claimed(trx_t *trx);
 bool trx_preserve_token_has_any_owner(const char *token);
-dberr_t trx_preserve_rollback_prepared_without_snapshot(
-    const std::vector<std::string> &snapshot_tokens, uint32_t *rolled_back,
-    std::vector<std::string> *rolled_back_tokens = nullptr);
-dberr_t trx_preserve_resolve_recovered_prepared_batch(
-    const std::vector<trx_preserve_resurrection_facts> &expected,
-    std::vector<trx_t *> *transactions);
-dberr_t trx_preserve_handoff_recovered_prepared_to_native_rollback(
-    const std::vector<trx_t *> &transactions);
 dberr_t trx_preserve_prepare_resumed_rollback_gtid(trx_t *trx);
 dberr_t trx_preserve_activate_resumed(trx_t *trx);
-dberr_t trx_preserve_reactivate_prepared_in_original_thd(THD *thd);
+dberr_t trx_preserve_finish_resumed_activation(trx_t *trx, THD *thd);
+bool trx_preserve_active_undo_v1_blocks_undo_upgrade();
+void trx_preserve_startup_note_active_undo_v1_authority();
 enum class trx_preserve_thd_transition_failure {
   NONE,
   NULL_THD,
@@ -244,7 +240,7 @@ dberr_t trx_preserve_reactivate_prepare_failure_in_original_thd(
     THD *thd, trx_preserve_thd_transition_failure *reason = nullptr);
 dberr_t trx_preserve_activate_reattached_in_original_thd(trx_t *trx, THD *thd);
 bool trx_preserve_is_active_attached_to_thd(trx_t *trx, THD *thd);
-dberr_t trx_preserve_prepare_current(THD *thd, const XID &xid);
+dberr_t trx_preserve_freeze_current(THD *thd, const XID &xid);
 trx_t *trx_preserve_create_temp_only_claimed(const XID &xid, uint64_t trx_id);
 bool trx_preserve_engine_state_facts(const trx_t *trx,
                                      bool *has_persistent_state,
@@ -267,7 +263,8 @@ dberr_t trx_preserve_export_modified_table_names(
     THD *thd, std::vector<Preserve_modified_table_name> *tables,
     uint32_t max_modified_tables);
 dberr_t trx_preserve_export_resurrection_facts(
-    trx_t *trx, uint32_t max_modified_tables,
+    trx_t *trx, const std::string &authority_token,
+    uint32_t max_modified_tables,
     trx_preserve_resurrection_facts *facts);
 void trx_preserve_startup_resurrection_reset();
 dberr_t trx_preserve_startup_register_resurrection_candidate(
@@ -281,7 +278,24 @@ trx_preserve_startup_validate_resurrection_candidate(
 trx_preserve_startup_resurrection_result
 trx_preserve_startup_apply_resurrection_candidate(
     trx_t *trx, std::vector<uint64_t> *modified_table_ids);
-trx_t *trx_preserve_startup_resurrection_find_verified(const XID &xid);
+trx_t *trx_preserve_startup_resurrection_find_verified(
+    const std::string &authority_token);
+
+struct trx_preserve_startup_reservation_result {
+  std::vector<std::string> reserved_authorities;
+  std::vector<std::string> rejected_authorities;
+};
+
+dberr_t trx_preserve_startup_reserve_verified(
+    trx_preserve_startup_reservation_result *result);
+dberr_t trx_preserve_abandon_active_undo_reservations(
+    const std::vector<trx_t *> &transactions);
+void trx_preserve_startup_forget_authorities(
+    const std::vector<std::string> &authorities);
+void trx_preserve_startup_note_lock_resurrection_failure(trx_t *trx);
+dberr_t trx_preserve_startup_collect_lock_resurrection_failures(
+    std::vector<std::string> *authorities,
+    std::vector<trx_t *> *transactions);
 void trx_preserve_startup_resurrection_clear_verified();
 void trx_preserve_startup_note_undo_body_scan(uint64_t pages,
                                              uint64_t records);
@@ -399,8 +413,6 @@ void trx_preserve_collect_preserved_rsegs(
     std::vector<const trx_rseg_t *> *rsegs);
 void trx_preserve_note_rseg_owner_state_change(
     trx_t *trx, int old_state, int new_state);
-void trx_preserve_note_rseg_owner_xid_reset(trx_t *trx);
-void trx_preserve_note_rseg_owner_xid_restore(trx_t *trx);
 
 struct Preserve_rseg_collection_debug_result {
   bool contains_redo{false};

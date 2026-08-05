@@ -128,9 +128,6 @@ std::set<std::string> preserved_trx_local_import_snapshot_tokens(
 std::set<std::string> preserved_trx_local_recoverable_snapshot_tokens(
     const Preserved_trx_carrier_listing &listing);
 
-std::set<std::string> preserved_trx_orphan_rollback_retained_tokens(
-    const Preserved_trx_carrier_listing &listing);
-
 Preserved_trx_carrier_listing preserved_trx_local_crash_abandon_listing(
     const Preserved_trx_carrier_listing &listing);
 
@@ -230,6 +227,18 @@ class Preserved_trx_carrier {
       const std::string &token,
       const std::vector<unsigned char> &snapshot_bytes) = 0;
 
+  /*
+    ACTIVE_UNDO_V1 local publication keeps the snapshot hidden until its
+    Resurrection Index and redo freeze boundary are durable. Carriers that do
+    not provide this local two-step publication fail closed by default.
+  */
+  virtual Preserved_trx_carrier_status stage_snapshot_new(
+      const std::string &token,
+      const std::vector<unsigned char> &snapshot_bytes);
+
+  virtual Preserved_trx_carrier_status commit_staged_snapshot(
+      const std::string &token);
+
   virtual Preserved_trx_carrier_status write_resurrection_index_new(
       const std::string &token,
       const std::vector<unsigned char> &index_bytes);
@@ -271,6 +280,17 @@ class Preserved_trx_carrier {
       const std::string &token, Preserved_trx_encoded_bundle *encoded,
       const Preserved_trx_carrier_read_limits &read_limits,
       Payload_read_mode payload_read_mode = Payload_read_mode::WITH_EXTERNAL_BLOBS) = 0;
+
+  /*
+    Read one descriptor-authenticated external body without requiring the token
+    snapshot to be published. Local batch rollback uses this only while it owns
+    an unpublished ACTIVE_UNDO_V1 authority staged by the same drain attempt.
+  */
+  virtual Preserved_trx_carrier_status read_external_blob(
+      const std::string &token,
+      const Preserved_trx_external_blob_descriptor &descriptor,
+      const Preserved_trx_carrier_read_limits &read_limits,
+      Preserved_trx_external_blob *blob);
 
   virtual Preserved_trx_carrier_status rewrite_existing(
       const std::string &token,
@@ -493,6 +513,15 @@ class Preserved_trx_store {
       Preserve_snapshot_delete_status *write_failure_delete_status = nullptr,
       Preserved_trx_store_write_stats *write_stats = nullptr);
 
+  Preserve_snapshot_status stage_local_authority(
+      Preserved_trx_bundle bundle, uint64_t timeout_seconds,
+      Preserve_snapshot_metadata *written_metadata,
+      std::array<unsigned char, kPreservedTrxSha256Length> *snapshot_digest,
+      Preserve_snapshot_delete_status *write_failure_delete_status = nullptr,
+      Preserved_trx_store_write_stats *write_stats = nullptr);
+
+  Preserve_snapshot_status commit_local_authority(const std::string &token);
+
   Preserve_snapshot_status codec_context(
       Preserved_trx_codec_context *context,
       Preserved_trx_codec_context_purpose purpose);
@@ -505,12 +534,21 @@ class Preserved_trx_store {
       const std::string &token, uint64_t max_bytes,
       std::vector<unsigned char> *index_bytes);
 
+  Preserve_snapshot_status read_snapshot_payload_digest(
+      const std::string &token,
+      std::array<unsigned char, kPreservedTrxSha256Length> *digest);
+
   Preserve_snapshot_status read(const std::string &token, bool validate_identity,
                                 Preserved_trx_bundle *bundle);
   Preserve_snapshot_status read(const std::string &token, bool validate_identity,
                                 Preserved_trx_carrier::Payload_read_mode
                                     payload_read_mode,
                                 Preserved_trx_bundle *bundle);
+
+  Preserve_snapshot_status read_external_blob(
+      const std::string &token,
+      const Preserved_trx_external_blob_descriptor &descriptor,
+      Preserved_trx_external_blob *blob);
 
   Preserve_snapshot_status rewrite_recovered_count(const std::string &token,
                                                    uint32_t recovered_count);
@@ -562,7 +600,8 @@ class Preserved_trx_store {
       bool *durable_snapshot_may_exist,
       Preserve_snapshot_delete_status *write_failure_delete_status,
       Preserved_trx_store_write_stats *write_stats,
-      bool publish_standby_pending);
+      bool publish_standby_pending, bool stage_snapshot,
+      std::array<unsigned char, kPreservedTrxSha256Length> *snapshot_digest);
 
   Preserved_trx_carrier *m_carrier{nullptr};
   Preserved_trx_carrier_read_limits m_read_limits;

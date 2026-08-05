@@ -563,10 +563,10 @@ void trx_sys_close(void) {
 
   trx_purge_sys_close();
 
-  /* Only prepared or active-recovered transactions may be left in the system.
-  The active-recovered transactions are allowed only if we did not force to
-  rollback them during shutdown (which might happen if e.g. it is fast
-  shutdown). Free all of them. */
+  /* Only prepared, preserved, or active-recovered transactions may be left in
+  the system. The active-recovered transactions are allowed only if we did not
+  force their rollback during shutdown (which might happen in fast shutdown).
+  Free their process-local objects; preserved ACTIVE Undo remains durable. */
   trx_sys_after_background_threads_shutdown_validate();
 
   for (trx_t *trx = UT_LIST_GET_FIRST(trx_sys->rw_trx_list); trx != nullptr;

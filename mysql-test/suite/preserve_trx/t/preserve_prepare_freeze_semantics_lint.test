@@ -26,22 +26,32 @@ my $lock_h = read_file("storage/innobase/include/lock0lock.h");
 my $lock = read_file("storage/innobase/lock/lock0preserve.cc");
 my $sql = read_file("sql/preserve_trx.cc");
 
-die "missing explicit preserve prepare entry\n"
-  unless $trx_h =~ /trx_prepare_for_preserve\s*\(/ &&
-         $trx =~ /trx_prepare_for_preserve\s*\(/;
-die "native XA lock release must remain isolated behind the native semantics branch\n"
-  unless $trx =~
-    /semantics\s*==\s*trx_prepare_semantics::NATIVE_XA[\s\S]{0,900}lock_trx_release_read_locks\s*\(\s*trx\s*,\s*true\s*\)/s;
-die "preserve prepare must select freeze semantics\n"
-  unless $trx =~
-    /trx_prepare_for_preserve\s*\([^)]*\)\s*\{\s*return\s+trx_prepare_for_mysql_low\s*\(\s*trx\s*,\s*trx_prepare_semantics::PRESERVE_FREEZE\s*\)/s;
-die "missing unified preserve current-transaction prepare bridge\n"
-  unless $preserve_h =~ /trx_preserve_prepare_current\s*\(/ &&
+die "missing explicit in-memory Preserve freeze entry\n"
+  unless $trx_h =~ /trx_freeze_for_preserve\s*\(/ &&
+         $trx =~ /trx_freeze_for_preserve\s*\(/;
+die "native XA prepare must retain its native Undo and lock-release path\n"
+  unless $trx =~ /trx_prepare_low\s*\(/ &&
+         $trx =~ /TRX_UNDO_PREPARED/ &&
+         $trx =~ /lock_trx_release_read_locks\s*\(\s*trx\s*,\s*true\s*\)/s;
+my ($freeze) =
+  $trx =~ /(dberr_t\s+trx_freeze_for_preserve\s*\([^)]*\)\s*\{[\s\S]*?^\})/m
+  or die "could not isolate Preserve freeze entry\n";
+die "Preserve freeze must keep Undo ACTIVE and avoid native prepared accounting\n"
+  unless $freeze =~ /ACTIVE_UNDO_V1/ &&
+         $freeze !~ /trx_prepare_low|TRX_UNDO_PREPARED|n_prepared_trx|lock_trx_release_read_locks/;
+die "missing unified Preserve current-transaction freeze bridge\n"
+  unless $preserve_h =~ /trx_preserve_freeze_current\s*\(/ &&
          $preserve =~
-           /trx_preserve_prepare_current\s*\([^)]*\)[\s\S]{0,900}innobase_preserve_prepare\s*\(\s*thd\s*\)/s;
-die "InnoDB preserve handler must use the dedicated freeze prepare\n"
+           /trx_preserve_freeze_current\s*\([^)]*\)[\s\S]{0,1200}innobase_preserve_freeze\s*\(\s*thd\s*\)/s;
+die "InnoDB Preserve handler must use the dedicated in-memory freeze\n"
   unless $handler =~
-    /innobase_preserve_prepare\s*\([^)]*\)[\s\S]{0,1200}trx_prepare_for_preserve\s*\(\s*trx\s*\)/s;
+    /innobase_preserve_freeze\s*\([^)]*\)[\s\S]{0,1200}trx_freeze_for_preserve\s*\(\s*trx\s*\)/s;
+die "removed Preserve prepare entry must not return\n"
+  if $trx_h =~ /trx_prepare_for_preserve\s*\(/ ||
+     $trx =~ /trx_prepare_for_preserve\s*\(/ ||
+     $preserve_h =~ /trx_preserve_prepare_current\s*\(/ ||
+     $preserve =~ /trx_preserve_prepare_current\s*\(/ ||
+     $handler =~ /innobase_preserve_prepare\s*\(/;
 die "preserve SQL path must not call generic ha_prepare_low\n"
   if $sql =~ /ha_prepare_low\s*\(\s*thd\s*,\s*true\s*\)/;
 die "prepare failure must not rebuild record locks\n"

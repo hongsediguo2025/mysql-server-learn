@@ -48,14 +48,14 @@ struct MYSQL;
 struct lock_preserve_record_lock_metadata_facts_t;
 struct Preserve_trx_prepared_token_key;
 
-static constexpr uint16_t kPreserveTrxTransferProtocolVersion = 1;
+static constexpr uint16_t kPreserveTrxTransferProtocolVersion = 2;
 static constexpr uint16_t kPreserveTrxTransferLockPlanContractVersion =
     kPreservedTrxLockPlanContractVersion;
-static constexpr uint32_t PRESERVE_TRX_TRANSFER_STRICT_PREPARED_REDO = 1U << 0;
+static constexpr uint32_t PRESERVE_TRX_TRANSFER_STRICT_ACTIVE_UNDO = 1U << 0;
 static constexpr uint32_t
     PRESERVE_TRX_TRANSFER_STRICT_PARTICIPANTS_AUTHENTICATED = 1U << 1;
 static constexpr uint32_t kPreserveTrxTransferStrictEligibilityKnownFlags =
-    PRESERVE_TRX_TRANSFER_STRICT_PREPARED_REDO |
+    PRESERVE_TRX_TRANSFER_STRICT_ACTIVE_UNDO |
     PRESERVE_TRX_TRANSFER_STRICT_PARTICIPANTS_AUTHENTICATED;
 static constexpr const char kPreserveTrxResurrectionIndexObjectId[] =
     "resurrection_index";
@@ -376,7 +376,7 @@ struct Preserve_trx_transfer_phase1_blob_request {
     never encoded into the transfer protocol or retained by the receiver.
   */
   std::string inline_payload;
-  uint64_t required_source_prepare_lsn{0};
+  uint64_t required_source_freeze_lsn{0};
   uint16_t lock_plan_contract_version{0};
   uint64_t source_live_lock_generation{0};
   std::array<unsigned char, kPreservedTrxSha256Length>
@@ -510,7 +510,7 @@ struct Preserve_trx_transfer_manifest {
   std::string epoch_id;
   uint64_t token{0};
   uint64_t frame_sequence{0};
-  uint64_t source_prepare_lsn{0};
+  uint64_t source_freeze_lsn{0};
   uint64_t source_epoch_commit_lsn{0};
   uint32_t strict_eligibility_flags{0};
   std::vector<Preserve_trx_transfer_object_descriptor> objects;
@@ -518,7 +518,7 @@ struct Preserve_trx_transfer_manifest {
 
 struct Preserve_trx_transfer_epoch_fact_token {
   uint64_t token{0};
-  uint64_t source_prepare_lsn{0};
+  uint64_t source_freeze_lsn{0};
   uint64_t source_epoch_commit_lsn{0};
   std::array<unsigned char, kPreservedTrxSha256Length> manifest_digest{};
   std::vector<Preserve_trx_transfer_object_descriptor> objects;
@@ -593,7 +593,7 @@ struct Preserve_trx_transfer_receiver_record {
   uint64_t token{0};
   uint16_t protocol_version{kPreserveTrxTransferProtocolVersion};
   uint32_t strict_eligibility_flags{0};
-  uint64_t source_prepare_lsn{0};
+  uint64_t source_freeze_lsn{0};
   uint64_t source_epoch_commit_lsn{0};
   Preserve_trx_transfer_receiver_state state{
       Preserve_trx_transfer_receiver_state::RECEIVING};
@@ -1151,11 +1151,11 @@ class Preserve_trx_transfer_source_epoch_session {
       const Preserve_trx_transfer_manifest &manifest,
       bool queue_final_metadata = false);
   Preserve_trx_transfer_status begin_token_prewarm_manifest(
-      uint64_t transfer_token, uint64_t required_source_prepare_lsn = 0);
+      uint64_t transfer_token, uint64_t required_source_freeze_lsn = 0);
   Preserve_trx_transfer_status begin_token_prewarm_manifests_batch(
       const std::vector<uint64_t> &transfer_tokens);
   bool token_prewarm_lsn_fact(uint64_t transfer_token,
-                              uint64_t *source_prepare_lsn,
+                              uint64_t *source_freeze_lsn,
                               uint64_t *source_epoch_commit_lsn) const;
   Preserve_trx_transfer_status stream_prebuilt_blobs_batch(
       const std::string &preserve_dir,
@@ -1385,7 +1385,7 @@ void preserve_trx_transfer_set_codec_context_provider_for_unit_test(
     Preserve_trx_transfer_codec_context_provider provider);
 
 using Preserve_trx_transfer_source_lsn_provider =
-    bool (*)(uint64_t *source_prepare_lsn, uint64_t *source_epoch_commit_lsn);
+    bool (*)(uint64_t *source_freeze_lsn, uint64_t *source_epoch_commit_lsn);
 
 void preserve_trx_transfer_set_source_lsn_provider_for_unit_test(
     Preserve_trx_transfer_source_lsn_provider provider);
@@ -1674,7 +1674,7 @@ struct Preserve_trx_deferred_transfer_candidate {
   Preserved_trx_bundle bundle;
   Preserve_trx_resurrection_index_entry resurrection_entry;
   bool has_resurrection_entry{false};
-  uint64_t source_prepare_lsn{0};
+  uint64_t source_freeze_lsn{0};
   uint64_t source_epoch_commit_lsn{0};
   bool captured{false};
   bool external_objects_staged{false};

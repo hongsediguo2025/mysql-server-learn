@@ -221,18 +221,6 @@ std::set<std::string> preserved_trx_local_import_snapshot_tokens(
   return tokens;
 }
 
-std::set<std::string> preserved_trx_orphan_rollback_retained_tokens(
-    const Preserved_trx_carrier_listing &listing) {
-  std::set<std::string> tokens = listing.snapshot_tokens;
-  tokens.insert(listing.standby_pending_tokens.begin(),
-                listing.standby_pending_tokens.end());
-  tokens.insert(listing.promotion_adopted_tokens.begin(),
-                listing.promotion_adopted_tokens.end());
-  tokens.insert(listing.promotion_intent_tokens.begin(),
-                listing.promotion_intent_tokens.end());
-  return tokens;
-}
-
 Preserved_trx_carrier_listing preserved_trx_local_crash_abandon_listing(
     const Preserved_trx_carrier_listing &listing) {
   auto local_token = [&](const std::string &token) {
@@ -298,10 +286,29 @@ Preserved_trx_carrier::write_resurrection_index_new(
   return Preserved_trx_carrier_status::CORRUPT;
 }
 
+Preserved_trx_carrier_status Preserved_trx_carrier::stage_snapshot_new(
+    const std::string &, const std::vector<unsigned char> &) {
+  return Preserved_trx_carrier_status::CORRUPT;
+}
+
+Preserved_trx_carrier_status Preserved_trx_carrier::commit_staged_snapshot(
+    const std::string &) {
+  return Preserved_trx_carrier_status::CORRUPT;
+}
+
 Preserved_trx_carrier_status Preserved_trx_carrier::read_resurrection_index(
     const std::string &, uint64_t, std::vector<unsigned char> *index_bytes) {
   if (index_bytes != nullptr) index_bytes->clear();
   return Preserved_trx_carrier_status::NOT_FOUND;
+}
+
+Preserved_trx_carrier_status Preserved_trx_carrier::read_external_blob(
+    const std::string &,
+    const Preserved_trx_external_blob_descriptor &,
+    const Preserved_trx_carrier_read_limits &,
+    Preserved_trx_external_blob *blob) {
+  if (blob != nullptr) *blob = {};
+  return Preserved_trx_carrier_status::CORRUPT;
 }
 
 Preserved_trx_carrier_status Preserved_trx_carrier::standby_projection_exists(
@@ -357,7 +364,7 @@ Preserve_snapshot_status Preserved_trx_store::write(
     Preserved_trx_store_write_stats *write_stats) {
   return write_impl(std::move(bundle), timeout_seconds, written_metadata,
                     durable_snapshot_may_exist, write_failure_delete_status,
-                    write_stats, false);
+                    write_stats, false, false, nullptr);
 }
 
 Preserve_snapshot_status Preserved_trx_store::write_standby_pending(
@@ -369,7 +376,29 @@ Preserve_snapshot_status Preserved_trx_store::write_standby_pending(
   if (!preserve_trx_is_enabled()) return Preserve_snapshot_status::UNSUPPORTED;
   return write_impl(std::move(bundle), timeout_seconds, written_metadata,
                     durable_snapshot_may_exist, write_failure_delete_status,
-                    write_stats, true);
+                    write_stats, true, false, nullptr);
+}
+
+Preserve_snapshot_status Preserved_trx_store::stage_local_authority(
+    Preserved_trx_bundle bundle, uint64_t timeout_seconds,
+    Preserve_snapshot_metadata *written_metadata,
+    std::array<unsigned char, kPreservedTrxSha256Length> *snapshot_digest,
+    Preserve_snapshot_delete_status *write_failure_delete_status,
+    Preserved_trx_store_write_stats *write_stats) {
+  if (!preserve_trx_is_enabled() || snapshot_digest == nullptr) {
+    return Preserve_snapshot_status::UNSUPPORTED;
+  }
+  return write_impl(std::move(bundle), timeout_seconds, written_metadata,
+                    nullptr, write_failure_delete_status, write_stats, false,
+                    true, snapshot_digest);
+}
+
+Preserve_snapshot_status Preserved_trx_store::commit_local_authority(
+    const std::string &token) {
+  if (m_carrier == nullptr || !carrier_token_filename_safe(token)) {
+    return Preserve_snapshot_status::INVALID_ARGUMENT;
+  }
+  return map_carrier_status(m_carrier->commit_staged_snapshot(token));
 }
 
 Preserve_snapshot_status Preserved_trx_store::write_impl(
@@ -377,8 +406,12 @@ Preserve_snapshot_status Preserved_trx_store::write_impl(
     Preserve_snapshot_metadata *written_metadata,
     bool *durable_snapshot_may_exist,
     Preserve_snapshot_delete_status *write_failure_delete_status,
-    Preserved_trx_store_write_stats *write_stats, bool publish_standby_pending) {
-  if (m_carrier == nullptr || bundle.metadata.token.empty())
+    Preserved_trx_store_write_stats *write_stats, bool publish_standby_pending,
+    bool stage_snapshot,
+    std::array<unsigned char, kPreservedTrxSha256Length> *snapshot_digest) {
+  if (m_carrier == nullptr || bundle.metadata.token.empty() ||
+      (stage_snapshot &&
+       (publish_standby_pending || snapshot_digest == nullptr)))
     return Preserve_snapshot_status::INVALID_ARGUMENT;
   if (!carrier_token_filename_safe(bundle.metadata.token))
     return Preserve_snapshot_status::INVALID_ARGUMENT;
@@ -530,6 +563,10 @@ Preserve_snapshot_status Preserved_trx_store::write_impl(
         durable_snapshot_may_exist, write_failure_delete_status);
   }
   if (written_metadata != nullptr) *written_metadata = encoded_metadata;
+  if (stage_snapshot) {
+    SHA_EVP256(encoded.snapshot_bytes.data(), encoded.snapshot_bytes.size(),
+               snapshot_digest->data());
+  }
 
   if (publish_standby_pending) {
     /*
@@ -551,8 +588,12 @@ Preserve_snapshot_status Preserved_trx_store::write_impl(
   }
 
   store_step_started_us = my_micro_time();
-  carrier_status = m_carrier->write_snapshot_new(encoded_metadata.token,
-                                                 encoded.snapshot_bytes);
+  carrier_status =
+      stage_snapshot
+          ? m_carrier->stage_snapshot_new(encoded_metadata.token,
+                                          encoded.snapshot_bytes)
+          : m_carrier->write_snapshot_new(encoded_metadata.token,
+                                          encoded.snapshot_bytes);
   add_store_write_elapsed(&Preserved_trx_store_write_stats::write_snapshot_us,
                           store_step_started_us, write_stats);
   if (carrier_status == Preserved_trx_carrier_status::
@@ -615,6 +656,37 @@ Preserve_snapshot_status Preserved_trx_store::read_resurrection_index(
     return Preserve_snapshot_status::INVALID_ARGUMENT;
   return map_carrier_status(
       m_carrier->read_resurrection_index(token, max_bytes, index_bytes));
+}
+
+Preserve_snapshot_status Preserved_trx_store::read_external_blob(
+    const std::string &token,
+    const Preserved_trx_external_blob_descriptor &descriptor,
+    Preserved_trx_external_blob *blob) {
+  if (m_carrier == nullptr || blob == nullptr ||
+      !carrier_token_filename_safe(token)) {
+    return Preserve_snapshot_status::INVALID_ARGUMENT;
+  }
+  return map_carrier_status(
+      m_carrier->read_external_blob(token, descriptor, m_read_limits, blob));
+}
+
+Preserve_snapshot_status Preserved_trx_store::read_snapshot_payload_digest(
+    const std::string &token,
+    std::array<unsigned char, kPreservedTrxSha256Length> *digest) {
+  if (m_carrier == nullptr || digest == nullptr ||
+      !carrier_token_filename_safe(token)) {
+    return Preserve_snapshot_status::INVALID_ARGUMENT;
+  }
+  Preserved_trx_encoded_bundle encoded;
+  const Preserved_trx_carrier_status status = m_carrier->read_existing(
+      token, &encoded, m_read_limits,
+      Preserved_trx_carrier::Payload_read_mode::SNAPSHOT_ONLY);
+  if (status != Preserved_trx_carrier_status::OK) {
+    return map_carrier_status(status);
+  }
+  SHA_EVP256(encoded.snapshot_bytes.data(), encoded.snapshot_bytes.size(),
+             digest->data());
+  return Preserve_snapshot_status::OK;
 }
 
 Preserve_snapshot_status Preserved_trx_store::read(

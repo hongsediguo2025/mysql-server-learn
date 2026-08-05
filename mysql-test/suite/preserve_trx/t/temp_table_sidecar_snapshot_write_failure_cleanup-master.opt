@@ -1,0 +1,1 @@
+--debug=d,preserve_trx_fail_before_snapshot_fsync

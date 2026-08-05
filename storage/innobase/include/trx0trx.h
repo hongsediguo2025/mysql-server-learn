@@ -213,7 +213,7 @@ dberr_t trx_prepare_for_mysql(trx_t *trx);
 Prepare a transaction for Preserve without releasing transaction locks.
 @param[in,out] trx Transaction instance to prepare.
 @return DB_SUCCESS or error number. */
-dberr_t trx_prepare_for_preserve(trx_t *trx);
+dberr_t trx_freeze_for_preserve(trx_t *trx);
 
 /** This function is used to find number of prepared transactions and
  their transaction objects for a recovery.
@@ -871,6 +871,12 @@ enum trx_rseg_type_t {
   TRX_RSEG_TYPE_NOREDO    /*!< non-redo rollback segment. */
 };
 
+/** Process-local contract for a transaction owned by Preserve/Resume. */
+enum class trx_preserve_undo_contract : uint8_t {
+  NONE = 0,
+  ACTIVE_UNDO_V1
+};
+
 struct trx_t {
   enum isolation_level_t {
 
@@ -1128,9 +1134,11 @@ struct trx_t {
   transaction is in trx_sys->rw_trx_list. */
   bool preserve_trx_claimed;
 
-  /** Redo LSN that made this transaction PREPARED. This is populated only at
-  the native prepare boundary and exported only for strict transfer evidence. */
-  lsn_t preserve_prepare_lsn;
+  /** Persistent Undo state expected while Preserve owns this transaction. */
+  trx_preserve_undo_contract preserve_undo_contract;
+
+  /** Redo LSN sampled after the last accepted mutation. */
+  lsn_t preserve_freeze_lsn;
 
   const char *mysql_log_file_name;
   /*!< if MySQL binlog is used, this field

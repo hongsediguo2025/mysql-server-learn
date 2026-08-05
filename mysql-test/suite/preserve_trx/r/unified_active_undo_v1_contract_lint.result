@@ -1,0 +1,5 @@
+# Lint-only guard for the unified ACTIVE Undo V1 contract. Runtime
+# behavior is covered by Preserve GUnit, startup MTR and transfer E2E.
+SELECT 'ok' AS unified_active_undo_v1_contract_lint;
+unified_active_undo_v1_contract_lint
+ok

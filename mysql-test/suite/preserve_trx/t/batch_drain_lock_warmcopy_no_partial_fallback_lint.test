@@ -78,13 +78,13 @@ my $metadata_seal = extract_function(
 my $freeze_pos = index($kernel, 'trx_preserve_lock_warmcopy_conversion_freeze');
 my $verify_pos = index($kernel,
   'preserve_trx_lock_warmcopy_verify_record_final_fence');
-my $prepare_pos = index($kernel, 'trx_preserve_prepare_current(thd, xid)');
-die "lock warmcopy freeze/final-fence/prepare path is incomplete\n"
-  if $freeze_pos < 0 || $verify_pos < 0 || $prepare_pos < 0;
+my $engine_freeze_pos = index($kernel, 'trx_preserve_freeze_current(thd, xid)');
+die "lock warmcopy conversion/final-fence/engine-freeze path is incomplete\n"
+  if $freeze_pos < 0 || $verify_pos < 0 || $engine_freeze_pos < 0;
 die "lock warmcopy artifact final fence compare must happen after conversion freeze\n"
   if $verify_pos < $freeze_pos;
-die "lock warmcopy artifact final fence compare must happen before preserve prepare\n"
-  if $verify_pos > $prepare_pos;
+die "lock warmcopy artifact final fence compare must happen before ACTIVE Undo freeze\n"
+  if $verify_pos > $engine_freeze_pos;
 
 die "lock warmcopy table post-prepare drift must not preserve by swapping only the table payload\n"
   if $kernel =~

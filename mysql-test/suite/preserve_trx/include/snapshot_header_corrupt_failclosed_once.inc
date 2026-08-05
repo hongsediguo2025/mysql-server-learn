@@ -48,7 +48,7 @@ EOF
 --disable_reconnect
 
 --let $grep_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
---let $grep_pattern= Preserved transaction .* recovery forced rollback: corrupt durable transaction snapshot
+--let $grep_pattern= Preserved transaction .* recovery forced rollback: preserved transaction snapshot tainted: startup snapshot is unreadable or mismatched
 --let $wait_timeout= 30
 --source include/wait_for_pattern_in_file.inc
 

@@ -119,7 +119,6 @@ extern bool preserve_trx_recover_lock_page_prefetch;
 uint preserve_trx_auto_parallel_preserve_threads(uint hardware_threads);
 bool preserve_trx_is_enabled();
 void preserve_trx_set_enable_value(bool enabled);
-bool preserve_trx_magic_xid_has_snapshot(const XID &xid);
 bool preserve_trx_magic_xid_should_be_protected(const XID &xid);
 bool preserve_trx_off_artifact_policy_ignore();
 bool preserve_trx_off_artifact_policy_recover();
@@ -448,7 +447,8 @@ struct Preserve_trx_preserve_result {
   const char *reactivate_failure_reason{nullptr};
   /* True when binlog cache semantics were logged into the snapshot. */
   bool logged_binlog_cache{false};
-  std::string snapshot_identity_digest;
+  uint64_t freeze_lsn{0};
+  bool local_authority_staged{false};
   /*
     Non-owning handle for batch-drain final validation. It is set only after
     the preserved record owns the detached transaction and remains valid until
@@ -631,6 +631,8 @@ bool preserved_trx_resolve_timeout_seconds(const Preserve_trx_options &options,
                                            ulonglong *timeout_seconds);
 bool preserved_trx_preflight_recoverability();
 void preserved_trx_resurrection_index_bootstrap_preamble();
+bool preserved_trx_resurrection_index_bootstrap_postamble();
+bool preserved_trx_resurrection_locks_postamble();
 bool preserved_temp_images_bootstrap_preamble();
 bool preserved_trx_recover_all();
 bool preserved_trx_recovery_complete();
@@ -649,7 +651,7 @@ enum class Preserved_trx_physical_adopt_status : uint8_t {
   INVALID_ARGUMENT,
   PHYSICAL_FENCE_REVALIDATE_FAILED,
   PHYSICAL_FENCE_PROVIDER_VIOLATION,
-  PREPARED_TRX_NOT_FOUND,
+  EXACT_TRX_NOT_FOUND,
   LOCK_CONFLICT,
   SEMANTIC_IMPORT_FAILED,
   ROLLED_BACK,
@@ -669,9 +671,9 @@ struct Preserved_trx_physical_adopt_result {
 };
 
 Preserved_trx_physical_adopt_status
-preserved_trx_adopt_prepared_for_physical_promotion(
+preserved_trx_import_reserved_for_physical_promotion(
     const std::string &dir, Preserve_trx_gate_adopt_lease *adopt_lease,
-    trx_t *prepared_trx,
+    trx_t *exact_trx,
     Preserve_trx_physical_fence_lease *physical_lease,
     uint64_t operation_deadline_us,
     Preserved_trx_physical_adopt_result *result);
@@ -684,14 +686,14 @@ bool preserved_trx_resurrection_entry_to_engine_facts(
 
 bool preserved_trx_reverse_simulated_promotion_adopt(
     const Preserve_trx_prepared_token_key &key,
-    trx_t *prepared_trx, Preserve_trx_cleanup_lease *cleanup_lease,
+    trx_t *exact_trx, Preserve_trx_cleanup_lease *cleanup_lease,
     Preserve_trx_physical_fence_lease *physical_lease, std::string *reason);
 bool preserved_trx_rollback_physical_promotion_adopt(
-    const Preserve_trx_prepared_token_key &key, trx_t *prepared_trx,
+    const Preserve_trx_prepared_token_key &key, trx_t *exact_trx,
     Preserve_trx_cleanup_lease *cleanup_lease,
     Preserve_trx_physical_fence_lease *physical_lease, std::string *reason);
 
-bool preserved_trx_adopt_ready_bundle_for_promotion(
+bool preserved_trx_import_reserved_bundle_for_promotion(
     const std::string &dir, Preserved_trx_bundle bundle,
     Preserved_trx_promotion_ready_adopt_result *result,
     uint64_t deadline_us = 0);
@@ -720,8 +722,7 @@ bool preserve_trx_preserve_attached_transaction(
         nullptr,
     const std::string &transfer_preserve_dir = std::string(),
     const std::string &preselected_token = std::string(),
-    bool xid_provenance_intent_prepared = false,
-    bool defer_xid_provenance_bind = false,
+    bool defer_local_authority_commit = false,
     Preserve_trx_deferred_transfer_candidate *deferred_transfer_candidate =
         nullptr,
     const Preserve_trx_drain_ownership_state *drain_ownership = nullptr);

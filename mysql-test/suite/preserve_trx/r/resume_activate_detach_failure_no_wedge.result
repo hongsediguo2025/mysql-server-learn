@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_resume_activate_detach_failure;
-CALL mtr.add_suppression("Preserved transaction resume failed to activate prepared undo state");
+CALL mtr.add_suppression("Preserved transaction resume failed to validate ACTIVE Undo state");
 CALL mtr.add_suppression("Preserved transaction resume failed to detach transaction after undo activation failure; retrying cleanup detach");
 SET GLOBAL preserve_trx_enable=ON;
 CREATE TABLE t_resume_activate_detach_failure(id INT PRIMARY KEY, v INT)

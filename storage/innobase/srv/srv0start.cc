@@ -1330,11 +1330,9 @@ dberr_t srv_undo_tablespaces_upgrade() {
     goto cleanup;
   }
 
-  /* Recovered transactions in the prepared state prevent the old
-  rsegs and undo tablespaces they are in from being deleted.
-  These transactions must be either committed or rolled back by
-  the mysql server.*/
-  if (trx_sys->n_prepared_trx > 0) {
+  /* Recovered XA PREPARED or Preserve ACTIVE-Undo owners keep old rsegs live. */
+  if (trx_sys->n_prepared_trx > 0 ||
+      trx_preserve_active_undo_v1_blocks_undo_upgrade()) {
     ib::warn(ER_IB_MSG_1094);
     return (DB_SUCCESS);
   }
@@ -2680,6 +2678,9 @@ files_checked:
 
     preserved_trx_resurrection_index_bootstrap_preamble();
     purge_queue = trx_sys_init_at_db_start();
+    if (preserved_trx_resurrection_index_bootstrap_postamble()) {
+      return (srv_init_abort(DB_ERROR));
+    }
 
     if (srv_is_upgrade_mode) {
       if (!purge_queue->empty()) {
@@ -2895,7 +2896,10 @@ void srv_dict_recover_on_restart() {
   that the data dictionary tables will be free of any locks.
   The data dictionary latch should guarantee that there is at
   most one data dictionary transaction active at a time. */
-  if (srv_force_recovery < SRV_FORCE_NO_TRX_UNDO && trx_sys_need_rollback()) {
+  const bool defer_active_undo_v1_read_only_rollback =
+      srv_read_only_mode && trx_preserve_active_undo_v1_blocks_undo_upgrade();
+  if (srv_force_recovery < SRV_FORCE_NO_TRX_UNDO &&
+      !defer_active_undo_v1_read_only_rollback && trx_sys_need_rollback()) {
     trx_rollback_or_clean_recovered(FALSE);
   }
 
@@ -3142,7 +3146,8 @@ void srv_pre_dd_shutdown() {
     /* Check that goal of SRV_SHUTDOWN_RECOVERY_ROLLBACK is reached:
     1. In read-only mode, no rollbacks should be executed.
     2. The trx_recovery_rollback thread should not be started. */
-    ut_ad(trx_sys_recovered_active_trxs_count() == 0);
+    ut_ad(trx_sys_recovered_active_trxs_count() == 0 ||
+          trx_preserve_active_undo_v1_blocks_undo_upgrade());
     ut_a(!srv_thread_is_active(srv_threads.m_trx_recovery_rollback));
 
     /* Check the goal of SRV_SHUTDOWN_PRE_DD_AND_SYSTEM_TRANSACTIONS,

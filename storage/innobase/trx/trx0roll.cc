@@ -183,6 +183,14 @@ static dberr_t trx_rollback_low(trx_t *trx) {
   active MySQL transaction (or recovered prepared transaction)
   that is associated with the current thread. */
 
+  if (trx->state == TRX_STATE_PRESERVED &&
+      trx->preserve_undo_contract ==
+          trx_preserve_undo_contract::ACTIVE_UNDO_V1) {
+    trx_undo_gtid_add_update_undo(trx, false, true);
+    ut_ad(!trx_is_autocommit_non_locking(trx));
+    return trx_rollback_for_mysql_low(trx);
+  }
+
   switch (trx->state) {
     case TRX_STATE_FORCED_ROLLBACK:
     case TRX_STATE_NOT_STARTED:

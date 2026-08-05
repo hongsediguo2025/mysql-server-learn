@@ -150,6 +150,7 @@ substr($snapshot, 516, 4) = le32(crc32($snapshot));
 open(my $out, '>:raw', $bin_path) or die "cannot rewrite $bin_path: $!";
 print {$out} $snapshot;
 close($out);
+PreserveSnapshotFiles::refresh_resurrection_index_snapshot_digest($bin_path);
 EOF
 
 --exec echo "restart: --preserve-trx-enable=ON --preserve-trx-temp-table-enable=ON --preserve-trx-recovery-grace-seconds=30" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
@@ -196,6 +197,7 @@ die "expected one original snapshot, found " . scalar(@orig) unless @orig == 1;
 my $orig_path = $orig[0];
 (my $bin_path = $orig_path) =~ s/\.orig$//;
 move($orig_path, $bin_path) or die "cannot restore original snapshot: $!";
+PreserveSnapshotFiles::refresh_resurrection_index_snapshot_digest($bin_path);
 for my $path (PreserveSnapshotFiles::preserve_all_files($preserve_dir)) {
   next unless $path =~ /\.tempts\.\d+\.undo$/;
   unlink $path or die "cannot remove legacy undo sidecar $path: $!";

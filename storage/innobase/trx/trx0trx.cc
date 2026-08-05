@@ -155,7 +155,8 @@ static void trx_init(trx_t *trx) {
 
   trx->is_recovered = false;
   trx->preserve_trx_claimed = false;
-  trx->preserve_prepare_lsn = 0;
+  trx->preserve_undo_contract = trx_preserve_undo_contract::NONE;
+  trx->preserve_freeze_lsn = 0;
 
   trx->op_info = "";
 
@@ -604,8 +605,11 @@ void trx_free_prepared_or_active_recovered(trx_t *trx) {
   ut_a(trx->magic_n == TRX_MAGIC_N);
   ulint expected_undo_state;
   if (trx->state == TRX_STATE_ACTIVE) {
-    ut_a(trx_state_eq(trx, TRX_STATE_ACTIVE));
     ut_a(trx->is_recovered);
+    expected_undo_state = TRX_UNDO_ACTIVE;
+  } else if (trx->state == TRX_STATE_PRESERVED &&
+             trx->preserve_undo_contract ==
+                 trx_preserve_undo_contract::ACTIVE_UNDO_V1) {
     expected_undo_state = TRX_UNDO_ACTIVE;
   } else {
     ut_a(trx_state_eq(trx, TRX_STATE_PREPARED) ||
@@ -629,7 +633,10 @@ void trx_free_prepared_or_active_recovered(trx_t *trx) {
   ut_ad(!trx->in_rw_trx_list);
   ut_a(!trx->read_only);
 
+  const trx_state_t old_state = trx->state;
   trx->state = TRX_STATE_NOT_STARTED;
+  trx_preserve_note_rseg_owner_state_change(trx, old_state,
+                                            TRX_STATE_NOT_STARTED);
   trx->will_lock = 0;
   trx_preserve_release_claim_before_free(trx);
 
@@ -773,10 +780,15 @@ void trx_resurrect_locks() {
           dd_table_close(table, nullptr, nullptr, true);
           dict_table_remove_from_cache(table);
           mutex_exit(&dict_sys->mutex);
+          trx_preserve_startup_note_lock_resurrection_failure(trx);
           continue;
         }
 
-        if (trx->state == TRX_STATE_PREPARED && !dict_table_is_sdi(table->id)) {
+        if ((trx->state == TRX_STATE_PREPARED ||
+             (trx->state == TRX_STATE_PRESERVED &&
+              trx->preserve_undo_contract ==
+                  trx_preserve_undo_contract::ACTIVE_UNDO_V1)) &&
+            !dict_table_is_sdi(table->id)) {
           trx->mod_tables.insert(table);
         }
         DICT_TF2_FLAG_SET(table, DICT_TF2_RESURRECT_PREPARED);
@@ -787,6 +799,8 @@ void trx_resurrect_locks() {
                               trx_get_id_for_print(trx), table->name.m_name));
 
         dd_table_close(table, nullptr, nullptr, false);
+      } else {
+        trx_preserve_startup_note_lock_resurrection_failure(trx);
       }
     }
   }
@@ -826,16 +840,7 @@ static trx_t *trx_resurrect_insert(
       ib::info(ER_IB_MSG_1204) << "Transaction " << trx_get_id_for_print(trx)
                                << " was in the XA prepared state.";
 
-      const bool preserve_magic_xid =
-          trx_preserve_xid_should_be_protected(*trx->xid);
-
-      if (srv_force_recovery == 0 || preserve_magic_xid) {
-        if (srv_force_recovery > 0) {
-          ib::info(ER_IB_MSG_1205)
-              << "Since innodb_force_recovery > 0, preserved XA transaction "
-                 "will remain prepared for SQL-layer taint handling.";
-        }
-
+      if (srv_force_recovery == 0) {
         trx->state = TRX_STATE_PREPARED;
         ++trx_sys->n_prepared_trx;
       } else {
@@ -988,8 +993,9 @@ static void trx_resurrect(trx_rseg_t *rseg) {
   trx_undo_t *undo;
   /*
     An authenticated Index hit only defers this transaction's Undo body scan.
-    Native resurrection still builds and publishes a PREPARED trx_t; SQL-layer
-    recovery changes it to PRESERVED only after the full bundle is validated.
+    Native resurrection still builds and publishes the ACTIVE trx_t described
+    by the Undo header. The post-init reservation changes it to PRESERVED only
+    after the complete authority contract has been validated.
   */
   std::set<trx_t *> indexed_candidates;
 
@@ -2878,12 +2884,8 @@ bool trx_is_mysql_xa(const trx_t *trx) {
   return (my_xid != 0);
 }
 
-enum class trx_prepare_semantics { NATIVE_XA, PRESERVE_FREEZE };
-
 /** Prepares a transaction. */
-static void trx_prepare(
-    trx_t *trx,                    /*!< in/out: transaction */
-    trx_prepare_semantics semantics) /*!< in: prepare behavior */
+static void trx_prepare(trx_t *trx) /*!< in/out: transaction */
 {
   /* This transaction has crossed the point of no return and cannot
   be rolled back asynchronously now. It must commit or rollback
@@ -2900,8 +2902,6 @@ static void trx_prepare(
   if (trx->rsegs.m_redo.rseg != nullptr && trx_is_redo_rseg_updated(trx)) {
     lsn = trx_prepare_low(trx, &trx->rsegs.m_redo, false);
   }
-
-  trx->preserve_prepare_lsn = lsn;
 
   if (trx->rsegs.m_noredo.rseg != nullptr && trx_is_temp_rseg_updated(trx)) {
     trx_prepare_low(trx, &trx->rsegs.m_noredo, true);
@@ -2930,21 +2930,17 @@ static void trx_prepare(
   /* Reset after successfully adding GTID to in memory table. */
   trx->persists_gtid = false;
 
-  if (semantics == trx_prepare_semantics::NATIVE_XA) {
-    /* Force isolation level to RC and release GAP locks
-    for test purpose. */
-    DBUG_EXECUTE_IF("ib_force_release_gap_lock_prepare",
-                    trx->isolation_level = TRX_ISO_READ_COMMITTED;);
+  /* Force isolation level to RC and release GAP locks for test purpose. */
+  DBUG_EXECUTE_IF("ib_force_release_gap_lock_prepare",
+                  trx->isolation_level = TRX_ISO_READ_COMMITTED;);
 
-    /* Release read locks after PREPARE for READ COMMITTED
-    and lower isolation. Preserve keeps the complete transaction lock set. */
-    if (trx->isolation_level <= TRX_ISO_READ_COMMITTED) {
-      /* Stop inheriting GAP locks. */
-      trx->skip_lock_inheritance = true;
+  /* Release read locks after PREPARE for READ COMMITTED and lower isolation. */
+  if (trx->isolation_level <= TRX_ISO_READ_COMMITTED) {
+    /* Stop inheriting GAP locks. */
+    trx->skip_lock_inheritance = true;
 
-      /* Release only GAP locks for now. */
-      lock_trx_release_read_locks(trx, true);
-    }
+    /* Release only GAP locks for now. */
+    lock_trx_release_read_locks(trx, true);
   }
 
   switch (thd_requested_durability(trx->mysql_thd)) {
@@ -2985,8 +2981,7 @@ static void trx_prepare(
 /**
 Does the transaction prepare for MySQL.
 @param[in, out] trx		Transaction instance to prepare */
-static dberr_t trx_prepare_for_mysql_low(
-    trx_t *trx, trx_prepare_semantics semantics) {
+static dberr_t trx_prepare_for_mysql_low(trx_t *trx) {
   trx_start_if_not_started_xa(trx, false);
 
   TrxInInnoDB trx_in_innodb(trx, true);
@@ -3003,7 +2998,7 @@ static dberr_t trx_prepare_for_mysql_low(
 
   trx->op_info = "preparing";
 
-  trx_prepare(trx, semantics);
+  trx_prepare(trx);
 
   trx->op_info = "";
 
@@ -3011,11 +3006,30 @@ static dberr_t trx_prepare_for_mysql_low(
 }
 
 dberr_t trx_prepare_for_mysql(trx_t *trx) {
-  return trx_prepare_for_mysql_low(trx, trx_prepare_semantics::NATIVE_XA);
+  return trx_prepare_for_mysql_low(trx);
 }
 
-dberr_t trx_prepare_for_preserve(trx_t *trx) {
-  return trx_prepare_for_mysql_low(trx, trx_prepare_semantics::PRESERVE_FREEZE);
+dberr_t trx_freeze_for_preserve(trx_t *trx) {
+  trx_start_if_not_started_xa(trx, false);
+
+  TrxInInnoDB trx_in_innodb(trx, true);
+  if (trx_in_innodb.is_aborted() && trx->killed_by != os_thread_get_curr_id()) {
+    return DB_FORCED_ABORT;
+  }
+  if (!trx_state_eq(trx, TRX_STATE_ACTIVE) || !trx_is_rseg_updated(trx)) {
+    return DB_ERROR;
+  }
+  if (trx->preserve_undo_contract != trx_preserve_undo_contract::NONE &&
+      trx->preserve_undo_contract !=
+          trx_preserve_undo_contract::ACTIVE_UNDO_V1) {
+    return DB_ERROR;
+  }
+
+  trx->op_info = "freezing for preserve";
+  trx->preserve_undo_contract = trx_preserve_undo_contract::ACTIVE_UNDO_V1;
+  trx->preserve_freeze_lsn = 0;
+  trx->op_info = "";
+  return DB_SUCCESS;
 }
 
 /**
@@ -3101,8 +3115,7 @@ int trx_recover_for_mysql(
     from or to NOT_STARTED while we are holding the
     trx_sys->mutex. It may change to PREPARED, but not if
     trx->is_recovered. */
-    if (trx_state_eq(trx, TRX_STATE_PREPARED) &&
-        !trx_preserve_xid_should_be_protected(*trx->xid)) {
+    if (trx_state_eq(trx, TRX_STATE_PREPARED)) {
       if (get_info_about_prepared_transaction(&txn_list[count], trx, mem_root))
         break;
 
@@ -3172,7 +3185,7 @@ static MY_ATTRIBUTE((warn_unused_result)) trx_t *trx_get_trx_by_xid_low(
 trx_t *trx_get_trx_by_xid(const XID *xid) {
   trx_t *trx;
 
-  if (xid == nullptr || trx_preserve_xid_should_be_protected(*xid)) {
+  if (xid == nullptr) {
     return (nullptr);
   }
 

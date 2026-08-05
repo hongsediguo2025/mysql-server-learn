@@ -303,8 +303,8 @@ no-redo undo image is materialized into the same physical temp space.
 @param[in,out]  rseg  rollback segment whose cached lists are discarded */
 void trx_undo_discard_cached_for_rseg(trx_rseg_t *rseg);
 
-/** At shutdown, frees the undo logs of a transaction which was either
-PREPARED or (ACTIVE and recovered).
+/** At shutdown, frees the in-memory undo logs of a transaction which was
+PREPARED, Preserve-owned with ACTIVE Undo, or ACTIVE and recovered.
 @param[in]  trx                   transation which undo logs are freed
 @param[in]  expected_undo_state   expected state of undo logs */
 void trx_undo_free_trx_with_prepared_or_active_logs(

@@ -184,14 +184,10 @@ die "transfer TRX_SYS store fact must persist the native store, retain its redo 
 die "ordinary transaction-id allocation must not perform transfer TRX_SYS fact capture\n"
   if $trx_sys_ic =~ /trx_preserve_capture_durable_trx_id_store_fact/s;
 my ($simulated_publication_body) =
-  $trx_preserve =~ /(trx_preserve_targeted_publication_status\s+trx_preserve_publish_simulated_prepared\([\s\S]*?^})/m
+  $trx_preserve =~ /(trx_preserve_targeted_publication_status\s+trx_preserve_publish_simulated_active_undo\([\s\S]*?^})/m
   or die "could not isolate simulated targeted publication\n";
 die "online targeted publication must not mutate startup-only found_prepared_trx\n"
   if $simulated_publication_body =~ /found_prepared_trx/s;
-die "standby transfer wire contract must expose one product v1 and no pre-product compatibility constant\n"
-  unless $transfer_header =~
-           /kPreserveTrxTransferProtocolVersion\s*=\s*1/s &&
-         $transfer_header !~ /kPreserveTrxTransferLegacyProtocolVersion/s;
 die "standby transfer v1 COMMIT frame and epoch fact must carry the complete TRX_SYS store proof\n"
   unless $transfer =~
            /append_u64\s*\(&out,\s*frame\.trx_id_store\.source_trx_id_store\)[\s\S]*source_trx_id_store_lsn[\s\S]*source_safe_next_trx_id_floor/s &&
@@ -230,14 +226,13 @@ die "snapshot/carrier product v1 must not retain a Preserve HMAC or key context\
        /MSPKEY1|bound_key|ensure_key|read_key|create_key|\.key\.tmp/s;
 die "resurrection index product v1 must use a local identity and canonical digest\n"
   unless $resurrection_index =~
-           /kResurrectionIndexMagic\[\]\s*=\s*\{'P',\s*'T',\s*'R',\s*'X',\s*'R',\s*'I',\s*'X',\s*'1'\}/s &&
+           /kResurrectionIndexMagic\[\]\s*=\s*\{'P',\s*'T',\s*'R',\s*'X',\s*'A',\s*'I',\s*'X',\s*'1'\}/s &&
          $resurrection_index_header =~ /local_instance_identity/s &&
          $resurrection_index !~ /\bHMAC\s*\(|source_server_uuid|target_server_uuid/s;
-die "provenance and snapshot identity product v1 must use canonical SHA-256 without a key\n"
-  unless $preserve =~ /PTRX_XID_PROVENANCE_PRODUCT_V1/s &&
-         $preserve =~ /PTRX_SNAPSHOT_IDENTITY_PRODUCT_V1/s &&
-         $preserve =~ /"sha256 "\s*\+\s*digest/s &&
-         $preserve !~ /preserve_trx_hmac_hex|preserve_trx_xid_codec_context/s;
+die "resurrection index v1 must bind the complete snapshot digest without an XID ledger\n"
+  unless $resurrection_index_header =~ /snapshot_digest/s &&
+         $preserve =~ /read_snapshot_payload_digest/s &&
+         $preserve !~ /preserve_trx_hmac_hex|preserve_trx_xid_codec_context|xid_provenance/is;
 die "lock-plan and promotion intent contracts must use independent product-v1 domains\n"
   unless $bundle_header =~
            /kPreservedTrxLockPlanContractVersion\s*=\s*1/s &&
@@ -909,10 +904,10 @@ die "undo truncate check must use the pre-collected preserved rseg set under rse
 $trx =~ /static trx_t \*trx_resurrect_insert[\s\S]*?^}/m
   or die "could not isolate trx_resurrect_insert\n";
 my $trx_resurrect_insert = $&;
-die "force recovery must keep preserve magic XA transactions prepared\n"
+die "native force recovery must not retain a Preserve-specific PREPARED exception\n"
   unless $trx_resurrect_insert =~
-         /preserve_magic_xid\s*=\s*trx_preserve_xid_should_be_protected[\s\S]*srv_force_recovery\s*==\s*0\s*\|\|\s*preserve_magic_xid/s &&
-         $trx_resurrect_insert =~ /\+\+trx_sys->n_prepared_trx/s;
+           /srv_force_recovery\s*==\s*0[\s\S]*TRX_STATE_PREPARED[\s\S]*\+\+trx_sys->n_prepared_trx[\s\S]*TRX_STATE_ACTIVE/s &&
+         $trx_resurrect_insert !~ /preserve_magic|trx_preserve/s;
 
 die "startup Resurrection Index preamble must run after Undo lists exist and before trx_sys resurrection\n"
   unless $srv_start =~
@@ -1053,8 +1048,8 @@ die "batch prepare failure helper must restore InnoDB and binlog state before re
          $batch_prepare_restore =~ /reattached_to_original_thd/s;
 $preserve =~ /DBUG_EXECUTE_IF\s*\(\s*"pfx_prepare_low"[\s\S]*?prepare_failed\s*=\s*true[\s\S]*?if\s*\(\s*prepare_failed\s*\)\s*\{[\s\S]*?return\s+restore_unprepared_batch_prepare_failure_or_rollback\s*\(\s*\)\s*;/m
   or die "pre-engine-prepare failure hook must route through unprepared batch restore helper\n";
-$preserve =~ /trx_preserve_prepare_current\s*\(\s*thd\s*,\s*xid\s*\)[\s\S]*?return\s+restore_batch_prepare_failure_or_rollback\s*\(\s*\)\s*;/m
-  or die "preserve engine prepare failure must route through prepared batch restore helper\n";
+$preserve =~ /trx_preserve_freeze_current\s*\(\s*thd\s*,\s*xid\s*\)[\s\S]*?return\s+restore_batch_prepare_failure_or_rollback\s*\(\s*\)\s*;/m
+  or die "preserve engine freeze failure must route through the reversible batch restore helper\n";
 $preserve =~ /DBUG_EXECUTE_IF\s*\(\s*"pfx_temp_prepare"[\s\S]*?temp_prepare_failed\s*=\s*true[\s\S]*?if\s*\(\s*temp_prepare_failed\s*\)\s*\{[\s\S]*?return\s+restore_batch_prepare_failure_or_rollback\s*\(\s*\)\s*;/m
   or die "temp-only prepare failure hook must route through batch restore helper\n";
 
@@ -1064,14 +1059,14 @@ my $binlog_preflight_pos =
   index($preserve,
         'set_stage(Preserve_trx_preserve_stage::BINLOG_PREFLIGHT);',
         $kernel_row_format_guard_pos);
-my $prepare_low_pos =
-  index($preserve, 'trx_preserve_prepare_current(thd, xid)',
+my $freeze_pos =
+  index($preserve, 'trx_preserve_freeze_current(thd, xid)',
         $kernel_row_format_guard_pos);
-die "non-ROW binlog format must fail before binlog export and preserve prepare\n"
+die "non-ROW binlog format must fail before binlog export and Preserve freeze\n"
   if $kernel_row_format_guard_pos < 0 || $binlog_preflight_pos < 0 ||
-     $prepare_low_pos < 0 ||
+     $freeze_pos < 0 ||
      $kernel_row_format_guard_pos > $binlog_preflight_pos ||
-     $kernel_row_format_guard_pos > $prepare_low_pos;
+     $kernel_row_format_guard_pos > $freeze_pos;
 my $target_wrapper_pos =
   index($preserve, 'bool preserve_trx_preserve_attached_transaction(');
 my $target_row_format_guard_pos =
@@ -1607,6 +1602,14 @@ die "startup preserve-trx preflight must run even when --skip-log-bin is used\n"
 $preserve =~ /Preserve_trx_command_block_result preserved_trx_command_block_result\([\s\S]*?^}/m
   or die "could not isolate preserved_trx_command_block_result\n";
 my $sql_command_gate = $&;
+my $sql_gate_ha_bypass_pos =
+  index($sql_command_gate, 'preserve_trx_is_ha_control_connection(thd)');
+my $sql_gate_classification_wait_pos =
+  index($sql_command_gate, 'g_closing_target_classification_mutex');
+die "CLOSING SQL gate must identify the HA control connection before waiting for target classification\n"
+  unless $sql_gate_ha_bypass_pos >= 0 &&
+         $sql_gate_classification_wait_pos >= 0 &&
+         $sql_gate_ha_bypass_pos < $sql_gate_classification_wait_pos;
 die "CLOSING SQL gate must wait for initial target classification before deciding an unclassified old command\n"
   unless $sql_command_gate =~
          /preserve_trx_closing_command_gate_active[\s\S]*Preserve_trx_batch_thd_state::NONE[\s\S]*preserve_trx_command_packet_before_closing[\s\S]*g_closing_target_classification_mutex/s;
@@ -1676,19 +1679,22 @@ my $shared_recover_adopt_kernel =
 my $recover_add_record_pos =
   index($shared_recover_adopt_kernel, 'preserved_trx_add_record');
 my $recover_claim_pos =
-  index($shared_recover_adopt_kernel, 'trx_preserve_claim_prepared');
-die "recovery must claim the prepared transaction before publishing the recovered record\n"
+  index($shared_recover_adopt_kernel,
+        'trx_preserve_claim_detached_active_undo_exact');
+die "recovery must exact-claim the ACTIVE-Undo transaction before publishing the recovered record\n"
   unless $recover_add_record_pos >= 0 && $recover_claim_pos >= 0 &&
          $recover_claim_pos < $recover_add_record_pos;
-die "shared recover/adopt kernel must exact-claim an authenticated startup trx pointer and retain XID lookup only as the null-pointer fallback\n"
+die "shared recover/adopt kernel must exact-claim an authenticated startup trx pointer\n"
   unless $shared_recover_adopt_kernel =~
-         /if\s*\(\s*options\.prepared_trx\s*!=\s*nullptr\s*\)[\s\S]*trx_preserve_claim_detached_prepared_exact\s*\(\s*options\.prepared_trx\s*,\s*xid\s*\)[\s\S]*else\s*\{\s*trx\s*=\s*trx_preserve_claim_prepared\s*\(\s*xid\s*\)/s;
-die "an exact startup pointer claim failure must not silently fall back to an rw_trx_list XID scan or a synthetic temp-only claim\n"
+         /if\s*\(\s*options\.exact_trx\s*!=\s*nullptr\s*\)[\s\S]*trx_preserve_claim_detached_active_undo_exact\s*\(\s*options\.exact_trx\s*,\s*xid\s*\)/s;
+die "shared recovery must not retain the old PREPARED XID-scan fallback\n"
+  if $shared_recover_adopt_kernel =~ /trx_preserve_claim_prepared/s;
+die "synthetic temp-only claim must be limited to snapshots without an exact trx\n"
   unless $shared_recover_adopt_kernel =~
-         /trx\s*==\s*nullptr\s*&&\s*options\.prepared_trx\s*==\s*nullptr\s*&&[\s\S]*preserved_trx_snapshot_allows_synthetic_temp_claim/s;
+         /trx\s*==\s*nullptr\s*&&\s*options\.exact_trx\s*==\s*nullptr\s*&&[\s\S]*preserved_trx_snapshot_allows_synthetic_temp_claim/s;
 die "startup recovery must resolve an authenticated exact trx pointer before entering the shared kernel\n"
   unless $recover_snapshot =~
-         /recover_options\.prepared_trx\s*=\s*trx_preserve_startup_resurrection_find_verified\s*\(\s*startup_xid\s*\)[\s\S]*preserved_trx_recover_or_adopt_bundle_shared/s;
+         /recover_options\.exact_trx\s*=\s*trx_preserve_startup_resurrection_find_verified\s*\(\s*token\s*\)[\s\S]*preserved_trx_recover_or_adopt_bundle_shared/s;
 die "recovery must not call legacy raw snapshot read/rewrite helpers\n"
   if $recover_snapshot =~ /preserved_trx_read_snapshot|read_snapshot_with_identity_check|rewrite_snapshot_recovered_count/s;
 die "recovery max-count cleanup must leave a FAILED observable P_S record\n"
@@ -2164,12 +2170,12 @@ $preserve =~ /DEBUG_SYNC\s*\(\s*thd\s*,\s*"preserve_trx_batch_after_targets_quie
   or die "batch drain must expose a pre-attach sync point after targets are quiesced\n";
 die "pre-attach sync point must be before target context-switch attach loop\n"
   if $1 =~ /preserve_one_target\s*\(|preserve_trx_preserve_attached_transaction/s;
-die "lock warmcopy must not hold a global prepare guard across preserve prepare\n"
+die "lock warmcopy must not hold a global prepare guard across Preserve freeze\n"
   if $preserve =~
-     /lock_warmcopy_prepare_guard\.reset\s*\(\s*lock_warmcopy_prepare_guard_create\s*\(\s*\)\s*\)[\s\S]*trx_preserve_prepare_current\s*\(\s*thd\s*,\s*xid\s*\)[\s\S]*lock_warmcopy_prepare_guard\.reset\s*\(\s*\)/s;
-die "lock warmcopy final fence must use per-trx conversion freeze before preserve prepare\n"
+     /lock_warmcopy_prepare_guard\.reset\s*\(\s*lock_warmcopy_prepare_guard_create\s*\(\s*\)\s*\)[\s\S]*trx_preserve_freeze_current\s*\(\s*thd\s*,\s*xid\s*\)[\s\S]*lock_warmcopy_prepare_guard\.reset\s*\(\s*\)/s;
+die "lock warmcopy final fence must use per-trx conversion freeze before Preserve freeze\n"
   unless $preserve =~
-         /trx_t\s+\*lock_warmcopy_frozen_trx\s*=\s*nullptr[\s\S]*auto\s+thaw_lock_warmcopy_conversion[\s\S]*trx_preserve_lock_warmcopy_conversion_freeze\s*\(\s*thd[\s\S]*trx_preserve_prepare_current\s*\(\s*thd\s*,\s*xid\s*\)[\s\S]*thaw_lock_warmcopy_conversion/s;
+         /trx_t\s+\*lock_warmcopy_frozen_trx\s*=\s*nullptr[\s\S]*auto\s+thaw_lock_warmcopy_conversion[\s\S]*trx_preserve_lock_warmcopy_conversion_freeze\s*\(\s*thd[\s\S]*trx_preserve_freeze_current\s*\(\s*thd\s*,\s*xid\s*\)[\s\S]*thaw_lock_warmcopy_conversion/s;
 die "batch preserve detach/reattach failures must expose InnoDB transition reasons\n"
   unless $trx_preserve_header =~ /enum class trx_preserve_thd_transition_failure/s &&
          $trx_preserve =~ /trx_preserve_thd_transition_failure_name/s &&
@@ -2182,12 +2188,12 @@ die "lock warmcopy must expose a debug-only post-freeze conversion attempt injec
          /preserve_trx_lock_warmcopy_after_conversion_freeze[\s\S]{0,600}DBUG_EXECUTE_IF\s*\(\s*"preserve_trx_lock_warmcopy_simulate_conversion_after_freeze"[\s\S]{0,600}preserve_trx_lock_warmcopy_after_final_fence/s &&
          $trx_preserve =~
          /trx_preserve_lock_warmcopy_note_conversion_attempt_after_freeze[\s\S]*lock_warmcopy_trx_conversion_note_attempt[\s\S]*lock_warmcopy_trx_conversion_note_handled/s;
-$preserve =~ /if\s*\(\s*trx_preserve_prepare_current\s*\(\s*thd\s*,\s*xid\s*\)\s*!=\s*DB_SUCCESS\s*\)([\s\S]*?)metadata\.has_read_view/m
+$preserve =~ /if\s*\(\s*trx_preserve_freeze_current\s*\(\s*thd\s*,\s*xid\s*\)\s*!=\s*DB_SUCCESS\s*\)([\s\S]*?)metadata\.has_read_view/m
   or die "could not isolate lock warmcopy guarded metadata region\n";
 my $lock_warmcopy_guarded_metadata = $1;
 die "lock warmcopy conversion freeze must cover detach, claim, lock metadata, and table/autoinc cross-check\n"
   unless $lock_warmcopy_guarded_metadata =~ /trx_preserve_detach_current_thd/s &&
-         $lock_warmcopy_guarded_metadata =~ /trx_preserve_claim_detached_prepared/s &&
+         $lock_warmcopy_guarded_metadata =~ /trx_preserve_claim_detached_active_undo/s &&
          $lock_warmcopy_guarded_metadata =~ /metadata\.record_locks_payload/s &&
          $lock_warmcopy_guarded_metadata =~ /metadata\.table_locks_payload/s &&
          $lock_warmcopy_guarded_metadata =~ /trx_preserve_table_locks_payload_has_autoinc[\s\S]*preserve_trx_lock_warmcopy_after_lock_metadata_guarded[\s\S]*verify_lock_warmcopy_frozen_fence\s*\(\s*\)/s;
@@ -2707,11 +2713,11 @@ die "standby transfer SEAL_OBJECT must verify object digest with streaming IO, n
   unless $transfer =~ /sha256_digest_file_streaming/s &&
          $transfer_seal_staged_object =~ /sha256_digest_file_streaming/s &&
          $transfer_seal_staged_object !~ /read_whole_file/s;
-die "standby promotion transfer must emit and decode only product v1\n"
+die "standby promotion transfer must emit and decode only the current v2 transport protocol\n"
   unless $transfer_header =~
-         /kPreserveTrxTransferProtocolVersion\s*=\s*1\s*;/s &&
+         /kPreserveTrxTransferProtocolVersion\s*=\s*2\s*;/s &&
          $transfer_header !~ /kPreserveTrxTransferLegacyProtocolVersion/s &&
-         $transfer_header =~ /source_prepare_lsn/s &&
+         $transfer_header =~ /source_freeze_lsn/s &&
          $transfer_header =~ /source_epoch_commit_lsn/s &&
          $transfer =~
          /transfer_protocol_version_is_decodable[\s\S]*return\s+version\s*==\s*kPreserveTrxTransferProtocolVersion/s;
@@ -2783,8 +2789,8 @@ die "standby promotion Phase D execute mode must not report READY tokens as skip
          $promotion =~ /write_adopted_marker_for_tokens/s &&
          $promotion_gate =~ /promotion-ready record not built/s;
 $preserve =~
-  /bool preserved_trx_adopt_ready_bundle_for_promotion\s*\([\s\S]*?^}/m
-  or die "could not isolate preserved_trx_adopt_ready_bundle_for_promotion\n";
+  /bool preserved_trx_import_reserved_bundle_for_promotion\s*\([\s\S]*?^}/m
+  or die "could not isolate preserved_trx_import_reserved_bundle_for_promotion\n";
 my $promotion_ready_adopt_helper = $&;
 die "standby promotion Phase D helper must delegate claim/import/register to the shared startup recover/adopt kernel\n"
   unless $promotion_ready_adopt_helper =~
@@ -2794,7 +2800,7 @@ die "standby promotion Phase D helper must not directly claim, import semantic s
      /trx_preserve_claim_prepared\s*\(|trx_preserve_import_read_view\s*\(|trx_preserve_import_table_locks\s*\(|trx_preserve_import_record_locks\s*\(|create_detached_mdl_context\s*\(|preserved_trx_add_record\s*\(/s;
 die "shared startup recover/adopt kernel must contain claim/import/register and post-claim rollback\n"
   unless $preserve =~
-         /preserved_trx_recover_or_adopt_bundle_shared[\s\S]*trx_preserve_claim_prepared[\s\S]*trx_preserve_import_read_view[\s\S]*trx_preserve_import_table_locks[\s\S]*trx_preserve_import_record_locks[\s\S]*create_detached_mdl_context[\s\S]*preserved_trx_add_record[\s\S]*trx_preserve_rollback_claimed/s;
+         /preserved_trx_recover_or_adopt_bundle_shared[\s\S]*trx_preserve_claim_detached_active_undo_exact[\s\S]*trx_preserve_import_read_view[\s\S]*trx_preserve_import_table_locks[\s\S]*trx_preserve_import_record_locks[\s\S]*create_detached_mdl_context[\s\S]*preserved_trx_add_record[\s\S]*trx_preserve_rollback_claimed/s;
 die "promotion-adopted records must be registered as promotion-owned and non-resumable until the promotion resume core consumes them\n"
   unless $preserve =~ /ADOPTED_FOR_PROMOTION/s &&
          $shared_recover_adopt_kernel =~
@@ -2826,7 +2832,7 @@ die "shared startup recover/adopt kernel must accept operation options with a mo
          $shared_recover_adopt_kernel =~ /recover_or_adopt_deadline_expired/s;
 die "promotion default adopt path must pass gate_timeout_ms as the shared-kernel deadline\n"
   unless $promotion =~
-         /promotion_adopt_ready_bundle_default[\s\S]*gate_deadline_us[\s\S]*preserved_trx_adopt_ready_bundle_for_promotion\s*\([\s\S]*gate_deadline_us/s &&
+         /promotion_adopt_ready_bundle_default[\s\S]*gate_deadline_us[\s\S]*preserved_trx_import_reserved_bundle_for_promotion\s*\([\s\S]*gate_deadline_us/s &&
          $promotion_gate =~ /gate_deadline_us\s*=\s*my_micro_time\s*\(\s*\)\s*\+\s*request\.gate_timeout_ms\s*\*\s*1000/s;
 die "promotion gate must fail closed when the requested token count exceeds the batch budget\n"
   unless $promotion_header =~ /gate_batch_tokens/s &&
@@ -2841,20 +2847,11 @@ die "promotion gate worker_count must drive a bounded adopt worker pool\n"
 die "standby promotion Phase D helper must not delete standby artifacts inside the promotion gate\n"
   if $promotion_ready_adopt_helper =~
      /delete_preserved_snapshot_files_and_sidecars_or_log|remove_with_status|remove_standby_pending/s;
-die "standby promotion Phase C+ must expose a read-only detached prepared-trx probe\n"
-  unless $trx_preserve =~
-         /bool\s+trx_preserve_probe_detached_prepared\s*\(\s*const XID\s*&xid\s*\)/s;
-$trx_preserve =~
-  /bool\s+trx_preserve_probe_detached_prepared\s*\(\s*const XID\s*&xid\s*\)\s*\{[\s\S]*?^}/m
-  or die "could not isolate trx_preserve_probe_detached_prepared\n";
-my $promotion_prepared_probe = $&;
-die "standby promotion prepared-trx probe must not claim, mark, or reset prepared transactions\n"
-  if $promotion_prepared_probe =~
-     /preserve_trx_claimed\s*=|trx_preserve_mark_preserved|xid->reset\s*\(/s;
-die "standby promotion prepared-trx probe must only report detached prepared preserve XIDs\n"
-  unless $promotion_prepared_probe =~ /mysql_thd\s*==\s*nullptr/s &&
-         $promotion_prepared_probe =~ /TRX_STATE_PREPARED/s &&
-         $promotion_prepared_probe =~ /xid\.eq\s*\(\s*trx->xid\s*\)/s;
+die "standby promotion must consume exact verified transactions without a PREPARED probe\n"
+  unless $promotion =~ /trx_preserve_startup_resurrection_find_verified\s*\(\s*key\.token\s*\)/s &&
+         $promotion =~ /trx_preserve_startup_reserve_verified/s;
+die "standby promotion must not reintroduce a PREPARED XID probe\n"
+  if $trx_preserve =~ /trx_preserve_probe_detached_prepared/s;
 die "standby promotion abandoned cleanup must be a separate worker entry, not a gate-side wait\n"
   unless $promotion =~ /preserved_trx_cleanup_abandoned_standby_promotion_epoch/s &&
          $promotion =~ /read_promotion_abandoned_epoch/s &&
@@ -2883,7 +2880,7 @@ die "remote-only batch rollback must retain and consume a source rollback image\
   unless $preserve_header =~ /Preserve_trx_source_rollback_image/s &&
          $preserve =~ /Preserve_trx_batch_item[\s\S]*source_rollback_image/s &&
          $preserve =~
-         /hydrate_logged_binlog_cache_payload_if_needed\s*\(\s*&record\s*,\s*item\.token\s*,\s*item\.source_rollback_image\.get\s*\(\s*\)\s*,\s*&binlog_payload_lease\s*\)/s;
+         /hydrate_logged_binlog_cache_payload_if_needed\s*\(\s*&record\s*,\s*item\.token\s*,\s*item\.source_rollback_image\.get\s*\(\s*\)\s*,\s*&binlog_payload_lease\s*,\s*item\.local_authority_staged\s*\)/s;
 die "snapshot build and publication must hold a checked codec memory lease\n"
   unless $preserve =~ /preserve_trx_snapshot_codec_peak_bytes/s &&
          $preserve =~ /Preserve_trx_memory_kind::SNAPSHOT_CODEC_BUFFER/s &&
@@ -2924,44 +2921,38 @@ die "resume savepoint restore must rebuild the authenticated SESSION order and e
   unless $preserve =~ /restore_session_participant_topology/s &&
          $preserve =~ /savepoint_ha_list_for_suffix/s &&
          $preserve =~ /metadata\.savepoint_suffix_ordinals\[entry_index\]/s;
-die "unknown magic XIDs must require authenticated internal provenance before protection\n"
-  unless $preserve =~
-         /preserve_trx_xid_provenance_preload[\s\S]*preserve_trx_publish_xid_provenance_map/s &&
-         $preserve =~
-         /preserve_trx_magic_xid_should_be_protected[\s\S]{0,900}preserve_trx_xid_provenance_snapshot[\s\S]{0,300}provenance->find/s &&
-         $preserve =~
-         /xid_provenance_intent_prepared[\s\S]{0,1200}preserve_trx_xid_provenance_begin\s*\(\s*token\s*\)[\s\S]{0,700}trx_preserve_prepare_current\s*\(\s*thd\s*,\s*xid\s*\)/s &&
-         $preserve =~
-         /artifact_sink->publish_bundle[\s\S]{0,1800}defer_xid_provenance_bind[\s\S]{0,500}preserve_trx_xid_provenance_bind[\s\S]{0,2500}preserved_trx_add_record/s &&
-         $trx_preserve =~
-         /trx_preserve_rollback_prepared_without_snapshot[\s\S]*trx_preserve_xid_should_be_protected/s;
-my ($magic_xid_classifier) =
-  $preserve =~ /bool preserve_trx_magic_xid_should_be_protected\([^\{]*\)\s*\{([\s\S]*?)^}/m;
-die "magic-XID classifier must be an immutable in-memory lookup without file/key IO\n"
-  unless defined($magic_xid_classifier) &&
-         $magic_xid_classifier !~
-         /create_preserved_trx|codec_context|my_open|my_read|store->read/s;
+die "ACTIVE-Undo v1 must not retain the XID provenance ledger\n"
+  if $preserve =~ /xid_provenance/i || $trx_preserve =~ /xid_provenance/i ||
+     $carrier =~ /xid_provenance/i || $carrier_file =~ /xid_provenance/i;
+die "source Preserve must freeze ACTIVE Undo and publish local authority only after a redo barrier\n"
+  unless $preserve =~ /trx_preserve_freeze_current\s*\(\s*thd\s*,\s*xid\s*\)/s &&
+         $preserve =~ /stage_local_authority/s &&
+         $preserve =~ /trx_preserve_flush_redo_up_to/s &&
+         $preserve =~ /commit_local_authority/s;
 die "innodb_read_only startup must record deferred Preserve recovery instead of publishing completion\n"
   unless $ha_innodb =~
          /srv_read_only_mode[\s\S]{0,180}preserved_trx_mark_innodb_read_only_recovery_state/s &&
          $ha_innodb !~
          /srv_read_only_mode[\s\S]{0,180}preserved_trx_mark_recovery_complete/s;
-die "post-PREPARE failure reactivation must retain locks and only reactivate transaction and Undo state\n"
+$trx_preserve =~
+  /(dberr_t\s+trx_preserve_reactivate_prepare_failure_in_original_thd\([\s\S]*?^})/m
+  or die "could not isolate post-freeze reactivation helper\n";
+my $post_freeze_reactivation = $1;
+die "post-freeze failure reactivation must retain locks and clear only runtime ACTIVE Undo authority\n"
   unless $preserve =~
-         /restore_prepared_batch_or_rollback[\s\S]{0,900}reactivate_current_batch_prepared_failure_to_original_thd/s &&
-         $trx_preserve =~
-         /trx_preserve_reactivate_prepare_failure_in_original_thd[\s\S]*trx_preserve_activate_undo_state/s;
-die "post-PREPARE failure reactivation must not rebuild record locks or repair lock inheritance\n"
-  if $trx_preserve =~
-       /trx_preserve_reactivate_prepare_failure_in_original_thd[\s\S]*skip_lock_inheritance\s*=\s*false/s ||
+           /restore_prepared_batch_or_rollback[\s\S]{0,900}reactivate_current_batch_prepared_failure_to_original_thd/s &&
+         $post_freeze_reactivation =~ /ACTIVE_UNDO_V1/s &&
+         $post_freeze_reactivation =~
+           /preserve_undo_contract\s*=\s*trx_preserve_undo_contract::NONE/s &&
+         $post_freeze_reactivation =~ /preserve_freeze_lsn\s*=\s*0/s &&
+         $post_freeze_reactivation =~ /xid->reset\s*\(\s*\)/s;
+die "post-freeze failure reactivation must not rewrite Undo or rebuild record locks\n"
+  if $post_freeze_reactivation =~ /trx_preserve_activate_undo_state/s ||
+     $post_freeze_reactivation =~ /skip_lock_inheritance\s*=\s*false/s ||
      $trx_preserve =~ /lock_preserve_restore_record_locks_after_prepare_failure/s;
-die "batch preserve must reserve provenance in one write before workers and bind all snapshot identities before epoch commit\n"
+die "batch local authority must flush the maximum freeze LSN before committing staged snapshots\n"
   unless $preserve =~
-         /preserve_trx_xid_provenance_begin_many[\s\S]*preserve_one_target/s &&
-         $preserve =~
-         /preserve_trx_xid_provenance_bind_many[\s\S]*commit_epoch\s*\(/s &&
-         $preserve =~
-         /preselected_token[\s\S]*defer_xid_provenance_bind/s;
+         /local_authority_max_freeze_lsn[\s\S]*trx_preserve_flush_redo_up_to\s*\(\s*local_authority_max_freeze_lsn\s*\)[\s\S]*commit_local_authority/s;
 die "phase1 transfer binlog artifacts must survive until epoch success or rollback\n"
   unless $preserve =~
          /~Phase1_transfer_binlog_blob_provider[\s\S]*cleanup_phase1_blobs/s;
@@ -3023,7 +3014,7 @@ die "process-local promotion markers must defer file and directory fsync\n"
          $carrier_file =~
          /write_promotion_intent_epoch[\s\S]{0,900}m_write_options/s &&
          $promotion =~
-         /adopt_prepared_epoch_for_physical_promotion_impl[\s\S]{0,9000}create_preserved_trx_process_local_store/s &&
+         /adopt_ready_epoch_for_physical_promotion_impl[\s\S]{0,9000}create_preserved_trx_process_local_store/s &&
          $preserve =~
          /write_strict_attach_intent[\s\S]{0,1800}create_preserved_trx_process_local_store/s;
 $carrier_file =~
@@ -3066,7 +3057,7 @@ die "receiver restart cleanup is a production mysqld API and must be declared ou
      ($transfer_unit_test_guard >= 0 &&
       $transfer_unit_test_guard > $transfer_unit_test_guard_end);
 $promotion =~
-  /adopt_prepared_epoch_for_physical_promotion_impl\s*\([\s\S]*?^}/m
+  /adopt_ready_epoch_for_physical_promotion_impl\s*\([\s\S]*?^}/m
   or die "could not isolate strict physical promotion gate\n";
 my $strict_physical_promotion_gate = $&;
 die "strict physical promotion must be bound to current-process prepared facts and boot incarnation\n"
@@ -3099,7 +3090,7 @@ die "physical promotion pre-init GTID gate must follow READY classification and 
          $promotion_preinit_pin > $promotion_preinit_gtid_gate &&
          $promotion_preinit_candidate_registration > $promotion_preinit_pin;
 my $promotion_adopt_start =
-  index($promotion, 'adopt_prepared_epoch_for_physical_promotion_impl(');
+  index($promotion, 'adopt_ready_epoch_for_physical_promotion_impl(');
 my $promotion_adopt_snapshot = $promotion_adopt_start < 0 ? -1 :
   index($promotion, 'registry.snapshot(', $promotion_adopt_start);
 my $promotion_adopt_accepted_predicate = $promotion_adopt_snapshot < 0 ? -1 :
@@ -3238,7 +3229,7 @@ die "physical promotion prepare entrypoint missing\n"
          /preserved_trx_prepare_before_trx_sys_init_for_physical_promotion\s*\(/s;
 die "physical promotion adopt entrypoint missing\n"
   unless $promotion =~
-         /preserved_trx_adopt_prepared_epoch_for_physical_promotion\s*\(/s;
+         /preserved_trx_adopt_ready_epoch_for_physical_promotion\s*\(/s;
 die "physical promotion attempt must keep private handoff and complete steps\n"
   unless $promotion_header =~ /prepare_gate_handoff/s &&
          $promotion_header =~ /complete_gate_handoff/s;
@@ -3291,9 +3282,9 @@ my $resolution_ready_publish =
 die "COMMIT_UNKNOWN must publish HA resolution readiness only after source drain teardown\n"
   unless $unknown_finalize >= 0 &&
          $resolution_ready_publish > $unknown_finalize;
-die "partial READY must not change transfer protocol v1\n"
+die "partial READY must retain the unified ACTIVE Undo v2 transfer protocol\n"
   unless $transfer_header =~
-         /kPreserveTrxTransferProtocolVersion\s*=\s*1\s*;/s;
+         /kPreserveTrxTransferProtocolVersion\s*=\s*2\s*;/s;
 die "partial READY must not add SQL grammar tokens\n"
   if $sql_yacc =~
      /\b(?:PARTIAL_READY|SOURCE_EXCLUDED|RECEIVER_EXCLUDED)\b/s;

@@ -46,8 +46,7 @@ struct Preserve_trx_kernel_request {
       nullptr};
   std::string transfer_preserve_dir;
   std::string preselected_token;
-  bool xid_provenance_intent_prepared{false};
-  bool defer_xid_provenance_bind{false};
+  bool defer_local_authority_commit{false};
   Preserve_trx_deferred_transfer_candidate *deferred_transfer_candidate{
       nullptr};
   const Preserve_trx_drain_ownership_state *drain_ownership{nullptr};

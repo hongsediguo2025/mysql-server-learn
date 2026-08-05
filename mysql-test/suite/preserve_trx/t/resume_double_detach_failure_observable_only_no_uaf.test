@@ -9,6 +9,7 @@ DROP TABLE IF EXISTS t_resume_double_detach_failure;
 --disable_query_log
 CALL mtr.add_suppression("Preserved transaction resume failed to detach transaction after savepoint restore failure; retrying cleanup detach");
 CALL mtr.add_suppression("Preserved transaction resume failed to detach transaction after savepoint restore failure; killing session");
+CALL mtr.add_suppression("Preserved transaction '.*' recovery forced rollback: preserved transaction snapshot tainted: ACTIVE Undo exact reservation failed");
 --enable_query_log
 
 SET GLOBAL preserve_trx_enable=ON;

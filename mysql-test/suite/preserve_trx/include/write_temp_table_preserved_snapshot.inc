@@ -262,38 +262,4 @@ open(my $sh, '>:raw', File::Spec->catfile($preserve_dir, "$token.bin"))
 print {$sh} $snapshot;
 close($sh);
 
-my $identity =
-  "PTRX_SNAPSHOT_IDENTITY_PRODUCT_V1\n" .
-  length($token) . ":$token\n" .
-  length('root') . ":root\n" .
-  length('localhost') . ":localhost\n" .
-  "$created_at\n" .
-  ($created_at + 300 * 1000000) . "\n" .
-  "2\n0\n1\n0\n";
-my $identity_digest = unpack('H*', sha256($identity));
-my $generation = substr(unpack('H*', sha256("test-generation:$token")), 0, 32);
-my $ledger_path = File::Spec->catfile($preserve_dir, '.xid_provenance');
-my %provenance;
-if (-e $ledger_path) {
-  open(my $lh, '<:raw', $ledger_path) or die "cannot read $ledger_path: $!";
-  while (my $line = <$lh>) {
-    chomp($line);
-    next if $line eq 'PTRX_XID_PROVENANCE_PRODUCT_V1' ||
-            $line =~ /^sha256 / || $line eq '';
-    $line =~ /^(\S+) B ([0-9a-f]{32}) ([0-9a-f]{64})$/
-      or die "invalid existing provenance record: $line";
-    $provenance{$1} = [$2, $3];
-  }
-  close($lh);
-}
-$provenance{$token} = [$generation, $identity_digest];
-my $ledger_body = "PTRX_XID_PROVENANCE_PRODUCT_V1\n";
-for my $ledger_token (sort keys %provenance) {
-  $ledger_body .= "$ledger_token B $provenance{$ledger_token}[0] " .
-                  "$provenance{$ledger_token}[1]\n";
-}
-my $ledger_digest = unpack('H*', sha256($ledger_body));
-open(my $lh, '>:raw', $ledger_path) or die "cannot write $ledger_path: $!";
-print {$lh} $ledger_body, "sha256 $ledger_digest\n";
-close($lh);
 EOF

@@ -2,6 +2,8 @@
 --source include/not_log_bin.inc
 --source include/force_restart.inc
 
+CALL mtr.add_suppression("Preserved transaction '.*' recovery forced rollback: preserved transaction snapshot tainted: ACTIVE Undo exact reservation failed");
+
 --disable_warnings
 DROP TABLE IF EXISTS t_startup_resurrection_index;
 --enable_warnings
@@ -85,10 +87,10 @@ SELECT
      WHERE VARIABLE_NAME='Preserve_trx_startup_resurrection_undo_body_records')>0
     AS fallback_read_undo_records;
 
---source suite/preserve_trx/include/get_preserved_token.inc
---replace_result $preserved_token TOKEN
---eval RESUME PRESERVED TRANSACTION '$preserved_token'
-COMMIT;
+SELECT COUNT(*) AS preserved_after_anchor_fallback
+  FROM performance_schema.preserved_transactions;
+SELECT v AS rolled_back_value
+  FROM t_startup_resurrection_index WHERE id=2;
 
 SELECT * FROM t_startup_resurrection_index ORDER BY id;
 DROP TABLE t_startup_resurrection_index;

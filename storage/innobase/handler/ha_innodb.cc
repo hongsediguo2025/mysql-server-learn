@@ -3668,6 +3668,12 @@ static bool innobase_dict_recover(dict_recovery_mode_t dict_recovery_mode,
       }
 
       srv_dict_recover_on_restart();
+      if (preserved_trx_resurrection_locks_postamble()) {
+        LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+               "PRESERVE: failed to terminalize ACTIVE Undo transaction "
+               "after table-lock resurrection failure");
+        return (true);
+      }
   }
 
   srv_start_threads(dict_recovery_mode != DICT_RECOVERY_RESTART_SERVER);
@@ -19190,13 +19196,13 @@ ulint innobase_get_at_most_n_mbchars(
   return (char_length);
 }
 
-/** Prepare the current InnoDB transaction for Preserve. */
-dberr_t innobase_preserve_prepare(THD *thd) {
+/** Freeze the current InnoDB transaction for Preserve without XA prepare. */
+dberr_t innobase_preserve_freeze(THD *thd) {
   trx_t *trx = check_trx_exists(thd);
 
-  thd_get_xid(thd, (MYSQL_XID *)trx->xid);
-  ut_ad(trx->xid != nullptr);
-  ut_ad(trx_preserve_xid_should_be_protected(*trx->xid));
+  if (trx->xid == nullptr || !xid_is_preserve_magic(*trx->xid)) {
+    return DB_ERROR;
+  }
 
   innobase_srv_conc_force_exit_innodb(trx);
 
@@ -19214,7 +19220,7 @@ dberr_t innobase_preserve_prepare(THD *thd) {
 
   ut_ad(trx_is_registered_for_2pc(trx));
 
-  const dberr_t err = trx_prepare_for_preserve(trx);
+  const dberr_t err = trx_freeze_for_preserve(trx);
   if (err == DB_FORCED_ABORT) {
     innobase_rollback(innodb_hton_ptr, thd, true);
   }

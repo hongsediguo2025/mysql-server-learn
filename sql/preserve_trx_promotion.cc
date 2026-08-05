@@ -681,7 +681,7 @@ bool promotion_adopt_ready_bundle_default(
 
   Preserved_trx_promotion_ready_adopt_result adopt_result;
   Preserved_trx_bundle bundle_copy = ready_bundle;
-  if (preserved_trx_adopt_ready_bundle_for_promotion(
+  if (preserved_trx_import_reserved_bundle_for_promotion(
           preserve_dir, std::move(bundle_copy), &adopt_result,
           gate_deadline_us)) {
     token_result->status = Preserve_trx_promotion_adopt_status::OK;
@@ -3006,7 +3006,7 @@ bool write_strict_promotion_intent(
 }
 
 Preserve_trx_physical_promotion_gate_status
-adopt_prepared_epoch_for_physical_promotion_impl(
+adopt_ready_epoch_for_physical_promotion_impl(
     const std::string &preserve_dir,
     const Preserve_trx_physical_promotion_gate_request &request,
     bool use_test_provider, const std::vector<trx_t *> *verified_transactions,
@@ -3210,15 +3210,25 @@ adopt_prepared_epoch_for_physical_promotion_impl(
                     1000;
   const auto executor =
       g_strict_physical_adopt_executor_for_unit_test == nullptr
-          ? preserved_trx_adopt_prepared_for_physical_promotion
+          ? preserved_trx_import_reserved_for_physical_promotion
           : g_strict_physical_adopt_executor_for_unit_test;
   struct Strict_adopt_task {
     Preserve_trx_strict_promotion_intent_state state{
         Preserve_trx_strict_promotion_intent_state::CLEANUP_TAINTED};
+    uint64_t token{0};
   };
   std::vector<Strict_adopt_task> tasks(request.tokens.size());
+  for (size_t i = 0; i < request.tokens.size(); ++i) {
+    if (!parse_uint64_strict(request.tokens[i].token, &tasks[i].token) ||
+        tasks[i].token == 0) {
+      return finish(
+          Preserve_trx_physical_promotion_gate_status::INVALID_ARGUMENT,
+          "strict physical promotion token is not numeric");
+    }
+  }
   std::atomic<size_t> next_task{0};
   std::atomic<bool> worker_abort{false};
+  std::atomic<bool> global_failure{false};
   auto run_worker = [&]() {
     for (;;) {
       if (worker_abort.load(std::memory_order_acquire)) break;
@@ -3229,6 +3239,8 @@ adopt_prepared_epoch_for_physical_promotion_impl(
       if (registry.begin_gate_adopt(key, key.generation, &adopt_lease,
                                     prepared_token_pin) !=
           Preserve_trx_prepared_status::OK) {
+        global_failure.store(true, std::memory_order_release);
+        worker_abort.store(true, std::memory_order_release);
         continue;
       }
       try {
@@ -3251,12 +3263,17 @@ adopt_prepared_epoch_for_physical_promotion_impl(
                        Preserve_trx_prepared_status::OK) {
           tasks[i].state = Preserve_trx_strict_promotion_intent_state::
               ABANDONED_ROLLED_BACK;
-        } else if (adopt_lease.active()) {
-          (void)registry.abort_gate_adopt(
-              &adopt_lease,
-              Preserve_trx_gate_abort_outcome::CLEANUP_TAINTED);
+        } else {
+          if (adopt_lease.active()) {
+            (void)registry.abort_gate_adopt(
+                &adopt_lease,
+                Preserve_trx_gate_abort_outcome::CLEANUP_TAINTED);
+          }
+          global_failure.store(true, std::memory_order_release);
+          worker_abort.store(true, std::memory_order_release);
         }
       } catch (...) {
+        global_failure.store(true, std::memory_order_release);
         worker_abort.store(true, std::memory_order_release);
         if (adopt_lease.active()) {
           (void)registry.abort_gate_adopt(
@@ -3267,6 +3284,7 @@ adopt_prepared_epoch_for_physical_promotion_impl(
     }
   };
   if (!run_promotion_gate_worker_batch(worker_count, run_worker)) {
+    global_failure.store(true, std::memory_order_release);
     worker_abort.store(true, std::memory_order_release);
   }
   const auto reversal_executor =
@@ -3311,12 +3329,7 @@ adopt_prepared_epoch_for_physical_promotion_impl(
     return complete;
   };
 
-  const bool epoch_has_failed_token = std::any_of(
-      tasks.begin(), tasks.end(), [](const Strict_adopt_task &task) {
-        return task.state !=
-               Preserve_trx_strict_promotion_intent_state::ADOPTED_LOCKED;
-      });
-  if (epoch_has_failed_token) {
+  if (global_failure.load(std::memory_order_acquire)) {
     (void)reverse_adopted_tokens();
   }
 
@@ -3388,9 +3401,30 @@ adopt_prepared_epoch_for_physical_promotion_impl(
     return finish(Preserve_trx_physical_promotion_gate_status::CLEANUP_TAINTED,
                   "strict promotion left tainted tokens");
   }
-  if (result->rolled_back_count != 0) {
+  if (global_failure.load(std::memory_order_acquire)) {
     return finish(Preserve_trx_physical_promotion_gate_status::ADOPT_FAILED,
-                  "strict promotion rolled back failed tokens");
+                  "strict promotion encountered an epoch-global failure");
+  }
+  try {
+    result->adopted_tokens.reserve(result->adopted_count);
+    result->ordinary_recovery_tokens.reserve(result->rolled_back_count);
+    for (const Strict_adopt_task &task : tasks) {
+      if (task.state ==
+          Preserve_trx_strict_promotion_intent_state::ADOPTED_LOCKED) {
+        result->adopted_tokens.push_back(task.token);
+      } else if (task.state == Preserve_trx_strict_promotion_intent_state::
+                                   ABANDONED_ROLLED_BACK) {
+        result->ordinary_recovery_tokens.push_back(task.token);
+      }
+    }
+  } catch (const std::bad_alloc &) {
+    const bool reversed = reverse_adopted_tokens();
+    summarize_tasks();
+    return finish(
+        reversed && result->tainted_count == 0
+            ? Preserve_trx_physical_promotion_gate_status::ADOPT_FAILED
+            : Preserve_trx_physical_promotion_gate_status::CLEANUP_TAINTED,
+        "strict promotion result allocation failed");
   }
   return finish(Preserve_trx_physical_promotion_gate_status::OK, "ok");
 }
@@ -3401,8 +3435,9 @@ class Preserve_trx_physical_promotion_bootstrap_attempt::Impl {
  public:
   Preserve_trx_physical_promotion_gate_request gate_request;
   Preserve_trx_transfer_accepted_epoch accepted_epoch;
-  std::vector<trx_preserve_resurrection_facts> accepted_engine_facts;
   Preserve_trx_physical_promotion_pin_lease prepared_token_pin;
+  std::vector<trx_t *> reserved_transactions;
+  bool gate_handoff_started{false};
   bool accepted_epoch_completed{false};
   bool active{false};
 };
@@ -3426,13 +3461,15 @@ Preserve_trx_physical_promotion_bootstrap_attempt::abort() {
     trx_preserve_startup_resurrection_reset();
     m_impl->accepted_epoch = {};
     m_impl->gate_request = {};
-    m_impl->accepted_engine_facts.clear();
+    m_impl->reserved_transactions.clear();
+    m_impl->gate_handoff_started = false;
     m_impl->accepted_epoch_completed = false;
     m_impl->active = false;
     g_physical_promotion_bootstrap_active.store(false,
                                                 std::memory_order_release);
   };
   bool cleanup_tainted = false;
+  const bool abandon_reservations = !m_impl->gate_handoff_started;
 
   if (m_impl->accepted_epoch_completed) {
     m_impl->prepared_token_pin.release_atomically();
@@ -3469,6 +3506,11 @@ Preserve_trx_physical_promotion_bootstrap_attempt::abort() {
             m_impl->accepted_epoch) != Preserve_trx_transfer_status::OK) {
       cleanup_tainted = true;
     }
+    if (!cleanup_tainted && abandon_reservations &&
+        trx_preserve_abandon_active_undo_reservations(
+            m_impl->reserved_transactions) != DB_SUCCESS) {
+      cleanup_tainted = true;
+    }
     /* Once ABANDONING is published, the receiver reaper owns retry. */
     finish_attempt();
     return cleanup_tainted
@@ -3484,70 +3526,46 @@ Preserve_trx_physical_promotion_bootstrap_attempt::abort() {
 bool Preserve_trx_physical_promotion_bootstrap_attempt::prepare_gate_handoff(
     const Preserve_trx_physical_promotion_gate_request **request,
     std::vector<trx_t *> *verified_transactions,
-    std::vector<trx_t *> *ordinary_recovery_transactions,
     const Preserve_trx_transfer_accepted_epoch **accepted_epoch,
     const Preserve_trx_physical_promotion_pin_lease **prepared_token_pin) {
   if (m_impl == nullptr || !m_impl->active || m_impl->accepted_epoch_completed ||
       request == nullptr ||
       verified_transactions == nullptr ||
-      ordinary_recovery_transactions == nullptr || accepted_epoch == nullptr ||
-      prepared_token_pin == nullptr ||
+      accepted_epoch == nullptr || prepared_token_pin == nullptr ||
       (m_impl->gate_request.tokens.empty()
            ? m_impl->prepared_token_pin.active()
            : !m_impl->prepared_token_pin.active()) ||
-      m_impl->accepted_engine_facts.size() !=
-          m_impl->accepted_epoch.tokens.size() ||
       my_micro_time() >= m_impl->gate_request.operation_deadline_us ||
       m_impl->accepted_epoch.lifecycle !=
           Preserve_trx_transfer_epoch_lifecycle::ADOPT_LEASED) {
     return false;
   }
 
-  std::vector<trx_t *> accepted_transactions;
+  trx_preserve_startup_reservation_result reservation;
   try {
-    if (trx_preserve_resolve_recovered_prepared_batch(
-            m_impl->accepted_engine_facts, &accepted_transactions) !=
-            DB_SUCCESS ||
-        accepted_transactions.size() != m_impl->accepted_epoch.tokens.size()) {
+    verified_transactions->reserve(m_impl->gate_request.tokens.size());
+    for (const auto &key : m_impl->gate_request.tokens) {
+      trx_t *verified =
+          trx_preserve_startup_resurrection_find_verified(key.token);
+      if (verified == nullptr) return false;
+      verified_transactions->push_back(verified);
+    }
+    if (trx_preserve_startup_reserve_verified(&reservation) != DB_SUCCESS ||
+        !reservation.rejected_authorities.empty() ||
+        reservation.reserved_authorities.size() !=
+            verified_transactions->size()) {
+      m_impl->reserved_transactions = *verified_transactions;
       return false;
     }
-    verified_transactions->reserve(m_impl->gate_request.tokens.size());
-    ordinary_recovery_transactions->reserve(
-        m_impl->accepted_epoch.failed_tokens.size());
-    size_t ready_index = 0;
-    size_t ordinary_index = 0;
-    for (size_t index = 0; index < m_impl->accepted_epoch.tokens.size();
-         ++index) {
-      const uint64_t token = m_impl->accepted_epoch.tokens[index];
-      if (ready_index < m_impl->gate_request.tokens.size() &&
-          m_impl->gate_request.tokens[ready_index].token ==
-              std::to_string(token)) {
-        const auto &key = m_impl->gate_request.tokens[ready_index];
-        XID xid;
-        xid.set(PRESERVE_TRX_XID_FORMAT_ID, PRESERVE_TRX_XID_GTRID,
-                PRESERVE_TRX_XID_GTRID_LENGTH, key.token.c_str(),
-                static_cast<long>(key.token.length()));
-        trx_t *verified = trx_preserve_startup_resurrection_find_verified(xid);
-        if (verified == nullptr || verified != accepted_transactions[index]) {
-          return false;
-        }
-        verified_transactions->push_back(verified);
-        ++ready_index;
-      } else {
-        if (ordinary_index >= m_impl->accepted_epoch.failed_tokens.size() ||
-            m_impl->accepted_epoch.failed_tokens[ordinary_index].token !=
-                token) {
-          return false;
-        }
-        ordinary_recovery_transactions->push_back(
-            accepted_transactions[index]);
-        ++ordinary_index;
+    for (size_t index = 0; index < verified_transactions->size(); ++index) {
+      if (!trx_preserve_validate_reserved_authority(
+              (*verified_transactions)[index],
+              m_impl->gate_request.tokens[index].token)) {
+        m_impl->reserved_transactions = *verified_transactions;
+        return false;
       }
     }
-    if (ready_index != m_impl->gate_request.tokens.size() ||
-        ordinary_index != m_impl->accepted_epoch.failed_tokens.size()) {
-      return false;
-    }
+    m_impl->reserved_transactions = *verified_transactions;
   } catch (const std::bad_alloc &) {
     return false;
   }
@@ -3555,6 +3573,7 @@ bool Preserve_trx_physical_promotion_bootstrap_attempt::prepare_gate_handoff(
   *request = &m_impl->gate_request;
   *accepted_epoch = &m_impl->accepted_epoch;
   *prepared_token_pin = &m_impl->prepared_token_pin;
+  m_impl->gate_handoff_started = true;
   return true;
 }
 
@@ -3572,7 +3591,8 @@ bool Preserve_trx_physical_promotion_bootstrap_attempt::
   trx_preserve_startup_resurrection_reset();
   m_impl->accepted_epoch = {};
   m_impl->gate_request = {};
-  m_impl->accepted_engine_facts.clear();
+  m_impl->reserved_transactions.clear();
+  m_impl->gate_handoff_started = false;
   m_impl->accepted_epoch_completed = false;
   m_impl->active = false;
   g_physical_promotion_bootstrap_active.store(false,
@@ -3680,10 +3700,10 @@ preserved_trx_prepare_before_trx_sys_init_for_physical_promotion(
     impl->gate_request.epoch_id = accepted.epoch_id;
     impl->gate_request.operation_deadline_us = request.operation_deadline_us;
     impl->gate_request.worker_count = request.worker_count;
-    impl->gate_request.tokens.reserve(fact_tokens.size());
+    impl->gate_request.tokens.reserve(ready_tokens.size());
     for (size_t index = 0; index < fact_tokens.size(); ++index) {
       const auto &token = fact_tokens[index];
-      if (token.token == 0 || token.source_prepare_lsn == 0 ||
+      if (token.token == 0 || token.source_freeze_lsn == 0 ||
           token.source_epoch_commit_lsn == 0 ||
           token.source_epoch_commit_lsn > accepted.source_fence_lsn ||
           token.token != accepted.tokens[index] ||
@@ -3738,43 +3758,21 @@ preserved_trx_prepare_before_trx_sys_init_for_physical_promotion(
   std::vector<Preserve_trx_resurrection_index_entry> ready_entries;
   try {
     ready_entries.reserve(impl->gate_request.tokens.size());
-    impl->accepted_engine_facts.reserve(fact_tokens.size());
     size_t ready_index = 0;
-    for (size_t index = 0; index < fact_tokens.size(); ++index) {
-      const auto &fact_token = fact_tokens[index];
+    for (const auto &fact_token : fact_tokens) {
+      if (ready_tokens.count(fact_token.token) == 0) continue;
       Preserve_trx_resurrection_index_entry entry;
-      const bool ready = ready_tokens.count(fact_token.token) != 0;
-      if ((ready &&
-           (ready_index >= impl->gate_request.tokens.size() ||
-            prepared_registry.copy_ready_resurrection_entry(
-                impl->gate_request.tokens[ready_index], promotion_monotonic_us(),
-                &entry) != Preserve_trx_prepared_status::OK)) ||
-          (!ready &&
-           preserve_trx_transfer_copy_accepted_resurrection_entry(
-               root_dir, accepted, fact_token.token, nullptr, &entry) !=
-               Preserve_trx_transfer_status::OK) ||
-          entry.token != fact_token.token ||
-          entry.prepare_lsn != fact_token.source_prepare_lsn) {
+      if (ready_index >= impl->gate_request.tokens.size() ||
+          prepared_registry.copy_ready_resurrection_entry(
+              impl->gate_request.tokens[ready_index], promotion_monotonic_us(),
+              &entry) != Preserve_trx_prepared_status::OK ||
+          entry.authority_token != std::to_string(fact_token.token) ||
+          entry.freeze_lsn != fact_token.source_freeze_lsn) {
         return fail_closed(
             Preserve_trx_physical_promotion_gate_status::REGISTRY_NOT_READY);
       }
-      trx_preserve_resurrection_facts engine_facts;
-      XID expected_xid;
-      const std::string token = std::to_string(fact_token.token);
-      expected_xid.set(PRESERVE_TRX_XID_FORMAT_ID, PRESERVE_TRX_XID_GTRID,
-                       PRESERVE_TRX_XID_GTRID_LENGTH, token.c_str(),
-                       static_cast<long>(token.length()));
-      if (preserved_trx_resurrection_entry_to_engine_facts(
-              entry, &engine_facts) ||
-          !engine_facts.xid.eq(&expected_xid)) {
-        return fail_closed(
-            Preserve_trx_physical_promotion_gate_status::REGISTRY_NOT_READY);
-      }
-      impl->accepted_engine_facts.push_back(std::move(engine_facts));
-      if (ready) {
-        ready_entries.push_back(std::move(entry));
-        ++ready_index;
-      }
+      ready_entries.push_back(std::move(entry));
+      ++ready_index;
     }
     if (ready_index != impl->gate_request.tokens.size()) {
       return fail_closed(
@@ -3806,7 +3804,7 @@ void preserved_trx_set_strict_physical_adopt_reversal_executor_for_unit_test(
 }
 
 Preserve_trx_physical_promotion_gate_status
-preserved_trx_adopt_prepared_epoch_for_physical_promotion(
+preserved_trx_adopt_ready_epoch_for_physical_promotion(
     const std::string &preserve_dir,
     Preserve_trx_physical_promotion_bootstrap_attempt *attempt,
     Preserve_trx_physical_promotion_gate_result *result) {
@@ -3815,12 +3813,10 @@ preserved_trx_adopt_prepared_epoch_for_physical_promotion(
   }
   const Preserve_trx_physical_promotion_gate_request *request = nullptr;
   std::vector<trx_t *> verified_transactions;
-  std::vector<trx_t *> ordinary_recovery_transactions;
   const Preserve_trx_transfer_accepted_epoch *accepted_epoch = nullptr;
   const Preserve_trx_physical_promotion_pin_lease *prepared_token_pin = nullptr;
   if (attempt == nullptr ||
       !attempt->prepare_gate_handoff(&request, &verified_transactions,
-                                     &ordinary_recovery_transactions,
                                      &accepted_epoch, &prepared_token_pin)) {
     const auto cleanup_status =
         attempt == nullptr
@@ -3835,18 +3831,13 @@ preserved_trx_adopt_prepared_epoch_for_physical_promotion(
     return result->status;
   }
 
-  std::vector<uint64_t> adopted_tokens;
-  std::vector<uint64_t> ordinary_recovery_tokens;
-  std::vector<trx_t *> all_accepted_recovery_transactions;
+  std::vector<uint64_t> initially_failed_tokens;
   try {
-    adopted_tokens = accepted_epoch->ready_tokens;
-    ordinary_recovery_tokens.reserve(accepted_epoch->failed_tokens.size());
+    initially_failed_tokens.reserve(accepted_epoch->failed_tokens.size());
     for (const auto &failed : accepted_epoch->failed_tokens) {
-      ordinary_recovery_tokens.push_back(failed.token);
+      initially_failed_tokens.push_back(failed.token);
     }
-    if (adopted_tokens.size() != verified_transactions.size() ||
-        ordinary_recovery_tokens.size() !=
-        ordinary_recovery_transactions.size()) {
+    if (accepted_epoch->ready_tokens.size() != verified_transactions.size()) {
       (void)attempt->abort();
       *result = {};
       result->status =
@@ -3854,15 +3845,6 @@ preserved_trx_adopt_prepared_epoch_for_physical_promotion(
       result->message = "physical promotion token partition changed";
       return result->status;
     }
-    all_accepted_recovery_transactions.reserve(
-        verified_transactions.size() + ordinary_recovery_transactions.size());
-    all_accepted_recovery_transactions.insert(
-        all_accepted_recovery_transactions.end(), verified_transactions.begin(),
-        verified_transactions.end());
-    all_accepted_recovery_transactions.insert(
-        all_accepted_recovery_transactions.end(),
-        ordinary_recovery_transactions.begin(),
-        ordinary_recovery_transactions.end());
   } catch (const std::bad_alloc &) {
     (void)attempt->abort();
     *result = {};
@@ -3879,21 +3861,23 @@ preserved_trx_adopt_prepared_epoch_for_physical_promotion(
     result->message = "no READY tokens; ordinary recovery only";
     status = result->status;
   } else {
-    status = adopt_prepared_epoch_for_physical_promotion_impl(
+    status = adopt_ready_epoch_for_physical_promotion_impl(
         promotion_normalize_dir(preserve_dir), *request, false,
         &verified_transactions, accepted_epoch, prepared_token_pin, result);
   }
 
   if (status == Preserve_trx_physical_promotion_gate_status::OK) {
-    if (trx_preserve_handoff_recovered_prepared_to_native_rollback(
-            ordinary_recovery_transactions) != DB_SUCCESS) {
-      (void)attempt->abort();
+    try {
+      result->ordinary_recovery_tokens.insert(
+          result->ordinary_recovery_tokens.end(),
+          initially_failed_tokens.begin(), initially_failed_tokens.end());
+      std::sort(result->ordinary_recovery_tokens.begin(),
+                result->ordinary_recovery_tokens.end());
+    } catch (const std::bad_alloc &) {
       result->status =
           Preserve_trx_physical_promotion_gate_status::CLEANUP_TAINTED;
       result->message =
-          "NOT_READY transaction handoff to native rollback failed";
-      result->adopted_tokens.clear();
-      result->ordinary_recovery_tokens.clear();
+          "physical promotion result allocation failed after exact adopt";
       return result->status;
     }
     if (!attempt->complete_gate_handoff()) {
@@ -3902,31 +3886,30 @@ preserved_trx_adopt_prepared_epoch_for_physical_promotion(
       result->message = "accepted receiver epoch cleanup failed after adopt";
       return result->status;
     }
-    result->adopted_tokens = std::move(adopted_tokens);
-    result->ordinary_recovery_tokens =
-        std::move(ordinary_recovery_tokens);
   } else if (status !=
                  Preserve_trx_physical_promotion_gate_status::CLEANUP_TAINTED &&
              result->tainted_count == 0) {
-    const std::vector<trx_t *> *recovery_transactions = nullptr;
-    if (result->rolled_back_count == 0) {
-      recovery_transactions = &all_accepted_recovery_transactions;
-    } else if (result->rolled_back_count == verified_transactions.size()) {
-      recovery_transactions = &ordinary_recovery_transactions;
-    }
-    if (recovery_transactions == nullptr ||
-        trx_preserve_handoff_recovered_prepared_to_native_rollback(
-            *recovery_transactions) != DB_SUCCESS) {
+    const bool all_ready_rolled_back =
+        result->rolled_back_count == verified_transactions.size();
+    if (result->rolled_back_count != 0 && !all_ready_rolled_back) {
       result->status =
           Preserve_trx_physical_promotion_gate_status::CLEANUP_TAINTED;
       result->message =
-          "strict adopt failed and native rollback handoff is tainted";
+          "strict adopt failed with a partial reservation outcome";
     }
     const auto cleanup_status = attempt->abort();
     if (cleanup_status != Preserve_trx_physical_promotion_gate_status::OK) {
       result->status = cleanup_status;
       result->message =
           "physical promotion gate failed and epoch cleanup is tainted";
+    } else if (!all_ready_rolled_back && result->rolled_back_count == 0 &&
+               trx_preserve_abandon_active_undo_reservations(
+                   verified_transactions) != DB_SUCCESS) {
+      result->status =
+          Preserve_trx_physical_promotion_gate_status::CLEANUP_TAINTED;
+      result->message =
+          "physical promotion authority was revoked but READY reservation "
+          "cleanup failed";
     }
     result->adopted_tokens.clear();
     result->ordinary_recovery_tokens.clear();
@@ -3944,7 +3927,7 @@ preserved_trx_adopt_prepared_epoch_for_physical_promotion(
 }
 
 Preserve_trx_physical_promotion_gate_status
-preserved_trx_adopt_prepared_epoch_for_physical_promotion_for_unit_test(
+preserved_trx_adopt_ready_epoch_for_physical_promotion_for_unit_test(
     const std::string &preserve_dir,
     const Preserve_trx_physical_promotion_gate_request &request,
     Preserve_trx_physical_promotion_gate_result *result,
@@ -3961,7 +3944,7 @@ preserved_trx_adopt_prepared_epoch_for_physical_promotion_for_unit_test(
     }
     return Preserve_trx_physical_promotion_gate_status::INVALID_ARGUMENT;
   }
-  return adopt_prepared_epoch_for_physical_promotion_impl(
+  return adopt_ready_epoch_for_physical_promotion_impl(
       preserve_dir, request, !production_equivalent, verified_transactions,
       accepted_epoch, nullptr, result);
 }

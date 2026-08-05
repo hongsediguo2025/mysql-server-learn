@@ -1,5 +1,7 @@
 CALL mtr.add_suppression("Preserved transaction .* recovery cleanup failed: failed to delete snapshot files before reattach");
+CALL mtr.add_suppression("Preserved transaction .* recovery cleanup failed: failed to delete snapshot files");
 CALL mtr.add_suppression("Preserved transaction batch cleanup failed after target preserve error");
+CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: preserved transaction snapshot tainted");
 DROP TABLE IF EXISTS t_batch_logged_cache_failure_record;
 SET GLOBAL preserve_trx_enable=ON;
 CREATE TABLE t_batch_logged_cache_failure_record(
@@ -16,19 +18,14 @@ SET SESSION debug="-d,preserve_trx_fail_after_snapshot_rename,preserve_trx_fail_
 SELECT COUNT(*) AS preserved_count_after_failure
 FROM performance_schema.preserved_transactions;
 preserved_count_after_failure
-1
-SELECT TOKEN, BINLOG_STATE, WROTE_TO_CACHE,
-BINLOG_CACHE_SIZE > 0 AS BINLOG_CACHE_SIZE_POSITIVE,
-SESSION_SQL_LOG_BIN, GLOBAL_LOG_BIN
+0
+# restart: --preserve-trx-enable=ON
+SELECT COUNT(*) AS preserved_count_after_restart
 FROM performance_schema.preserved_transactions;
-TOKEN	BINLOG_STATE	WROTE_TO_CACHE	BINLOG_CACHE_SIZE_POSITIVE	SESSION_SQL_LOG_BIN	GLOBAL_LOG_BIN
-TOKEN	LOGGED_WITH_CACHE	YES	1	ON	ON
-SELECT 1;
-ERROR HY000: Preserve drain is active; this command was not executed
-RESUME PRESERVED TRANSACTION 'TOKEN';
-COMMIT;
+preserved_count_after_restart
+0
 SELECT * FROM t_batch_logged_cache_failure_record ORDER BY id;
 id	v
-1	11
+1	10
 DROP TABLE t_batch_logged_cache_failure_record;
 SET GLOBAL preserve_trx_enable=ON;

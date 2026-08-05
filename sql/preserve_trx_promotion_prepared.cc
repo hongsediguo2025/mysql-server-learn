@@ -1191,9 +1191,10 @@ Preserve_trx_prepared_status
 Preserve_trx_prepared_token_resources::install_resurrection_entry(
     std::unique_ptr<Preserve_trx_resurrection_index_entry> entry) {
   if (m_impl == nullptr || !m_impl->acquired || entry == nullptr ||
-      m_impl->resurrection_entry != nullptr || entry->token == 0 ||
-      entry->trx_id == 0 || entry->prepare_lsn == 0 ||
-      std::to_string(entry->token) != m_impl->key.token) {
+      m_impl->resurrection_entry != nullptr ||
+      entry->authority_token.empty() ||
+      entry->trx_id == 0 || entry->freeze_lsn == 0 ||
+      entry->authority_token != m_impl->key.token) {
     return Preserve_trx_prepared_status::INVALID_ARGUMENT;
   }
   m_impl->resurrection_entry = std::move(entry);

@@ -2,7 +2,7 @@
 --source include/force_restart.inc
 
 --disable_query_log
-CALL mtr.add_suppression("Found 1 prepared XA transactions");
+CALL mtr.add_suppression("Preserved transaction '.*' recovery forced rollback: preserved transaction snapshot tainted: ACTIVE Undo exact reservation failed");
 --enable_query_log
 
 --disable_warnings
@@ -31,6 +31,7 @@ SELECT @@global.preserve_trx_enable AS enable_after_restart;
 
 SELECT COUNT(*) AS recovered_while_disabled
   FROM performance_schema.preserved_transactions;
+SELECT * FROM t_recover_enable_off ORDER BY a;
 
 --let $restart_parameters= restart: --preserve-trx-enable=ON --skip-log-bin
 --source include/restart_mysqld.inc
@@ -39,14 +40,8 @@ SELECT @@global.preserve_trx_enable AS enable_after_enabled_restart;
 
 SELECT COUNT(*) AS recovered_after_enabled_restart
   FROM performance_schema.preserved_transactions;
-
---source suite/preserve_trx/include/get_preserved_token.inc
-
---replace_result $preserved_token TOKEN
---eval RESUME PRESERVED TRANSACTION '$preserved_token'
-
-COMMIT;
 SELECT * FROM t_recover_enable_off ORDER BY a;
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
 
 DROP TABLE t_recover_enable_off;
 SET GLOBAL preserve_trx_enable=ON;

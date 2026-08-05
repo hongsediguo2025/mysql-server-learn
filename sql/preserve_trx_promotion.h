@@ -118,7 +118,7 @@ using Preserve_trx_promotion_adopt_executor =
   The HA promotion coordinator installs this provider when it can prove the
   physical apply state for a standby-pending epoch.  A missing provider is a
   fail-closed condition: promotion may inspect the artifacts, but it must not
-  claim or import prepared transactions as if redo apply had reached the source
+  claim or import ACTIVE-Undo transactions as if redo apply had reached the source
   epoch.  Unit tests use the _for_unit_test wrapper below so test-only setup is
   visible at call sites.
 */
@@ -365,12 +365,12 @@ void preserved_trx_set_strict_physical_adopt_reversal_executor_for_unit_test(
     Preserve_trx_strict_physical_adopt_reversal_executor executor);
 
 Preserve_trx_physical_promotion_gate_status
-preserved_trx_adopt_prepared_epoch_for_physical_promotion(
+preserved_trx_adopt_ready_epoch_for_physical_promotion(
     const std::string &preserve_dir,
     Preserve_trx_physical_promotion_bootstrap_attempt *attempt,
     Preserve_trx_physical_promotion_gate_result *result);
 Preserve_trx_physical_promotion_gate_status
-preserved_trx_adopt_prepared_epoch_for_physical_promotion_for_unit_test(
+preserved_trx_adopt_ready_epoch_for_physical_promotion_for_unit_test(
     const std::string &preserve_dir,
     const Preserve_trx_physical_promotion_gate_request &request,
     Preserve_trx_physical_promotion_gate_result *result,
@@ -408,7 +408,6 @@ class Preserve_trx_physical_promotion_bootstrap_attempt {
   bool prepare_gate_handoff(
       const Preserve_trx_physical_promotion_gate_request **request,
       std::vector<trx_t *> *verified_transactions,
-      std::vector<trx_t *> *ordinary_recovery_transactions,
       const Preserve_trx_transfer_accepted_epoch **accepted_epoch,
       const Preserve_trx_physical_promotion_pin_lease **prepared_token_pin);
   bool complete_gate_handoff();
@@ -421,7 +420,7 @@ class Preserve_trx_physical_promotion_bootstrap_attempt {
       const std::string &, const Preserve_trx_physical_bootstrap_request &,
       Preserve_trx_physical_promotion_bootstrap_attempt *);
   friend Preserve_trx_physical_promotion_gate_status
-  preserved_trx_adopt_prepared_epoch_for_physical_promotion(
+  preserved_trx_adopt_ready_epoch_for_physical_promotion(
       const std::string &,
       Preserve_trx_physical_promotion_bootstrap_attempt *,
       Preserve_trx_physical_promotion_gate_result *);

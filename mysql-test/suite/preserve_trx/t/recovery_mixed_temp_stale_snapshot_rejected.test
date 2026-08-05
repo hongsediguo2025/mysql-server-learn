@@ -52,11 +52,19 @@ require File::Spec->catfile($ENV{'MYSQL_TEST_DIR'}, 'suite', 'preserve_trx',
 
 my $dir = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve');
 my @snapshots = PreserveSnapshotFiles::preserve_snapshot_bin_files($dir);
+my @all_files = PreserveSnapshotFiles::preserve_all_files($dir);
+my @staged_snapshots = grep { /\.bin\.tmp$/ } @all_files;
 my @temp_sidecars = grep { /\.tempts\.\d+\./ }
-  PreserveSnapshotFiles::preserve_all_files($dir);
-die "expected one stale mixed snapshot, found " . scalar(@snapshots) . "\n"
-  unless @snapshots == 1;
+  @all_files;
+my @tainted = grep { /\.tainted$/ } @all_files;
+die "unexpected published mixed snapshot, found " . scalar(@snapshots) . "\n"
+  unless @snapshots == 0;
+die "expected one unpublished mixed snapshot, found " .
+    scalar(@staged_snapshots) . "\n"
+  unless @staged_snapshots == 1;
 die "expected stale temporary-table sidecars\n" unless @temp_sidecars > 0;
+die "expected one tainted marker, found " . scalar(@tainted) . "\n"
+  unless @tainted == 1;
 EOF
 
 --connection mixed_stale_target

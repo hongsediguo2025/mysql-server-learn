@@ -18,7 +18,7 @@
 namespace {
 
 constexpr char kResurrectionIndexMagic[] = {'P', 'T', 'R', 'X',
-                                             'R', 'I', 'X', '1'};
+                                             'A', 'I', 'X', '1'};
 constexpr size_t kResurrectionIndexMagicLength =
     sizeof(kResurrectionIndexMagic);
 constexpr size_t kResurrectionIndexMaxBytes = 64U * 1024U * 1024U;
@@ -72,10 +72,9 @@ bool digest_is_nonzero(
                      [](unsigned char value) { return value != 0; });
 }
 
-bool xid_is_valid(const Preserve_trx_resurrection_xid &xid) {
-  return xid.format_id != -1 && xid.gtrid_length > 0 &&
-         xid.gtrid_length <= 64 && xid.bqual_length <= 64 &&
-         xid.gtrid_length + xid.bqual_length <= xid.data.size();
+bool authority_token_is_valid(const std::string &token) {
+  return !token.empty() && token.size() <= kResurrectionIndexMaxStringBytes &&
+         token.find('\0') == std::string::npos;
 }
 
 bool anchor_is_valid(const Preserve_trx_resurrection_undo_anchor &anchor) {
@@ -85,8 +84,8 @@ bool anchor_is_valid(const Preserve_trx_resurrection_undo_anchor &anchor) {
 }
 
 bool entry_is_valid(const Preserve_trx_resurrection_index_entry &entry) {
-  if (entry.token == 0 || entry.trx_id == 0 || entry.prepare_lsn == 0 ||
-      !xid_is_valid(entry.xid) || !digest_is_nonzero(entry.snapshot_digest) ||
+  if (!authority_token_is_valid(entry.authority_token) || entry.trx_id == 0 ||
+      entry.freeze_lsn == 0 || !digest_is_nonzero(entry.snapshot_digest) ||
       entry.undo_anchors.empty() ||
       entry.undo_anchors.size() > kResurrectionIndexMaxUndoAnchors ||
       entry.modified_table_ids.size() > kResurrectionIndexMaxTableIds) {
@@ -113,14 +112,15 @@ bool index_is_valid(const Preserve_trx_resurrection_index &index) {
       index.entries.size() > kResurrectionIndexMaxEntries) {
     return false;
   }
-  uint64_t previous_token = 0;
+  std::string previous_token;
   std::set<uint64_t> trx_ids;
   for (const auto &entry : index.entries) {
-    if (!entry_is_valid(entry) || entry.token <= previous_token ||
+    if (!entry_is_valid(entry) ||
+        (!previous_token.empty() && entry.authority_token <= previous_token) ||
         !trx_ids.insert(entry.trx_id).second) {
       return false;
     }
-    previous_token = entry.token;
+    previous_token = entry.authority_token;
   }
   return true;
 }
@@ -230,14 +230,11 @@ Preserve_trx_resurrection_index_status preserve_trx_encode_resurrection_index(
     }
     append_u32(&out, static_cast<uint32_t>(index.entries.size()));
     for (const auto &entry : index.entries) {
-      append_u64(&out, entry.token);
+      if (!append_string(&out, entry.authority_token)) {
+        return Preserve_trx_resurrection_index_status::INVALID_ARGUMENT;
+      }
       append_u64(&out, entry.trx_id);
-      append_u64(&out, entry.prepare_lsn);
-      append_u64(&out, static_cast<uint64_t>(entry.xid.format_id));
-      append_u32(&out, entry.xid.gtrid_length);
-      append_u32(&out, entry.xid.bqual_length);
-      out.append(reinterpret_cast<const char *>(entry.xid.data.data()),
-                 entry.xid.data.size());
+      append_u64(&out, entry.freeze_lsn);
       out.append(reinterpret_cast<const char *>(entry.snapshot_digest.data()),
                  entry.snapshot_digest.size());
       append_u32(&out, static_cast<uint32_t>(entry.undo_anchors.size()));
@@ -319,24 +316,18 @@ Preserve_trx_resurrection_index_status preserve_trx_decode_resurrection_index(
     uint32_t entry_count = 0;
     if (!reader.read_u32(&entry_count) || entry_count == 0 ||
         entry_count > kResurrectionIndexMaxEntries ||
-        entry_count > reader.remaining() / 240) {
+        entry_count > reader.remaining() / 80) {
       return Preserve_trx_resurrection_index_status::CORRUPT;
     }
     parsed.entries.reserve(entry_count);
     for (uint32_t i = 0; i < entry_count; ++i) {
       Preserve_trx_resurrection_index_entry entry;
-      uint64_t xid_format = 0;
       const char *bytes = nullptr;
-      if (!reader.read_u64(&entry.token) || !reader.read_u64(&entry.trx_id) ||
-          !reader.read_u64(&entry.prepare_lsn) ||
-          !reader.read_u64(&xid_format) ||
-          !reader.read_u32(&entry.xid.gtrid_length) ||
-          !reader.read_u32(&entry.xid.bqual_length) ||
-          reader.read_fixed(entry.xid.data.size(), &bytes)) {
+      if (!reader.read_string(&entry.authority_token) ||
+          !reader.read_u64(&entry.trx_id) ||
+          !reader.read_u64(&entry.freeze_lsn)) {
         return Preserve_trx_resurrection_index_status::CORRUPT;
       }
-      entry.xid.format_id = static_cast<int64_t>(xid_format);
-      std::memcpy(entry.xid.data.data(), bytes, entry.xid.data.size());
       if (reader.read_fixed(entry.snapshot_digest.size(), &bytes)) {
         return Preserve_trx_resurrection_index_status::CORRUPT;
       }

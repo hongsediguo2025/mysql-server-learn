@@ -87,7 +87,7 @@ die "receiver expiry must reuse housekeeping instead of adding a reaper thread\n
 
 die "standby transfer protocol version changed\n"
   unless $transfer_header =~
-         /kPreserveTrxTransferProtocolVersion\s*=\s*1/ &&
+         /kPreserveTrxTransferProtocolVersion\s*=\s*2/ &&
          $transfer_header !~ /kPreserveTrxTransferLegacyProtocolVersion/;
 
 my ($frame_enum) =
@@ -199,15 +199,14 @@ die "RESET before artifact publication must discard warm blobs and reuse snapsho
   unless $preserve_kernel =~
          /preserve_trx_before_artifact_publish[\s\S]*preserve_trx_batch_cancel_before_publish[\s\S]*discard_prebuilt_binlog_blob_if_needed\(\)[\s\S]*return reject_after_snapshot_failure\(false\)/s;
 
-die "early workers must enter RESET completion after join/result collection\n"
+die "early workers must collect completed items and enter RESET completion immediately after join\n"
   unless $preserve =~
-         /const size_t expected_completed_workers[\s\S]*if \(reset_requested\(\)\)[\s\S]*finish_reset_with_provenance\([\s\S]*reset_during_early_target_pipeline/s;
+         /join_workers\.rollback\(\);[\s\S]*?if \(reset_requested\(\)\) \{[\s\S]*?collect_early_preserved_items\(\);[\s\S]*?return finish_phase2_reset\(\s*&preserved_batch_items,\s*"reset_during_early_target_pipeline"\);[\s\S]*?const size_t expected_completed_workers/s;
 die "phase-2 workers must enter RESET completion before ordinary target failure handling\n"
   unless $preserve =~
-         /const Preserve_batch_target_execution \*failed_execution[\s\S]*if \(reset_requested\(\)\)\s*return finish_reset_with_provenance\(&preserved_batch_items,\s*"reset_after_phase2_workers"\);\s*if \(failed_execution != nullptr\)/s;
-die "RESET provenance wrapper must delegate transaction restoration to finish_phase2_reset\n"
-  unless $preserve =~
-         /auto finish_reset_with_provenance\s*=[\s\S]*return finish_phase2_reset\(items, stage\)[\s\S]*return finish_phase2_reset\(items, stage, &batch_provenance_tokens\)/s;
+         /const Preserve_batch_target_execution \*failed_execution[\s\S]*if \(reset_requested\(\)\)\s*return finish_phase2_reset\(&preserved_batch_items,\s*"reset_after_phase2_workers"\);\s*if \(failed_execution != nullptr\)/s;
+die "RESET must not retain the removed XID-provenance completion wrapper\n"
+  if $preserve =~ /finish_reset_with_provenance|batch_provenance_tokens/;
 
 my ($reset_participant_stop) =
   $preserve =~

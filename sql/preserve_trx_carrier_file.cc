@@ -602,6 +602,34 @@ void set_blob_descriptor_from_payload(Preserved_trx_external_blob *blob) {
              blob->payload.length(), blob->descriptor.digest.data());
 }
 
+Preserved_trx_carrier_status read_external_blob_path_by_descriptor(
+    const std::string &path,
+    const Preserved_trx_external_blob_descriptor &descriptor,
+    uint64_t max_bytes, Preserved_trx_external_blob *blob) {
+  if (blob == nullptr ||
+      !external_blob_name_is_filename_safe(descriptor.name) ||
+      descriptor.size == 0 || descriptor.size > max_bytes) {
+    return Preserved_trx_carrier_status::CORRUPT;
+  }
+
+  std::vector<unsigned char> bytes;
+  const Preserved_trx_carrier_status status =
+      read_file_limited(path, max_bytes, &bytes);
+  if (status != Preserved_trx_carrier_status::OK) return status;
+
+  Preserved_trx_external_blob materialized;
+  materialized.name = descriptor.name;
+  materialized.payload.assign(reinterpret_cast<const char *>(bytes.data()),
+                              bytes.size());
+  set_blob_descriptor_from_payload(&materialized);
+  if (materialized.descriptor.size != descriptor.size ||
+      materialized.descriptor.digest != descriptor.digest) {
+    return Preserved_trx_carrier_status::CORRUPT;
+  }
+  *blob = std::move(materialized);
+  return Preserved_trx_carrier_status::OK;
+}
+
 std::string sha256_hex(const std::string &payload) {
   std::array<unsigned char, kPromotionDigestBytes> digest{};
   SHA_EVP256(reinterpret_cast<const unsigned char *>(payload.data()),
@@ -1340,7 +1368,6 @@ Preserve_snapshot_delete_status delete_snapshot_files_with_status(
                       ERROR_AFTER_SNAPSHOT_DELETE;);
 
   delete_optional_sidecar(binlog_cache_path);
-  delete_optional_sidecar(tainted_path);
   for (const std::string &candidate_dir : snapshot_dirs_for_token(dir, token)) {
     delete_optional_sidecar(join_path(candidate_dir,
                                       token + ".standby_pending"));
@@ -1370,10 +1397,12 @@ Preserve_snapshot_delete_status delete_snapshot_files_with_status(
       if (fsync_directory(removed_dir)) error = true;
     }
   }
-  if (!error) {
-    const bool marker_existed = file_exists(consume_state_path);
+  if (!error && !options.defer_directory_fsync) {
+    const bool taint_existed = file_exists(tainted_path);
+    const bool consume_state_existed = file_exists(consume_state_path);
+    delete_optional_sidecar(tainted_path);
     delete_optional_sidecar(consume_state_path);
-    if (!error && marker_existed && !options.defer_directory_fsync &&
+    if (!error && (taint_existed || consume_state_existed) &&
         fsync_directory(dir)) {
       error = true;
     }
@@ -1978,16 +2007,115 @@ Local_file_preserved_trx_carrier::write_snapshot_new(
 }
 
 Preserved_trx_carrier_status
+Local_file_preserved_trx_carrier::stage_snapshot_new(
+    const std::string &token,
+    const std::vector<unsigned char> &snapshot_bytes) {
+  if (!token_is_filename_safe(token)) {
+    return Preserved_trx_carrier_status::CORRUPT;
+  }
+  if (m_write_options.shard_snapshot_files &&
+      ensure_generic_external_blob_shard_dir(m_dir, token)) {
+    return Preserved_trx_carrier_status::IO_ERROR;
+  }
+  for (const std::string &candidate_dir : snapshot_dirs_for_token(m_dir, token)) {
+    if (file_exists(join_path(candidate_dir, token + ".bin")) ||
+        file_exists(join_path(candidate_dir, token + ".bin.tmp"))) {
+      return Preserved_trx_carrier_status::ALREADY_EXISTS;
+    }
+  }
+
+  const std::string write_dir =
+      snapshot_dir_for_new_write(m_dir, token, m_write_options);
+  if (ensure_directory(write_dir)) {
+    return Preserved_trx_carrier_status::IO_ERROR;
+  }
+  const std::string stage_path = join_path(write_dir, token + ".bin.tmp");
+  File file = my_create(stage_path.c_str(), 0600,
+                        O_WRONLY | O_TRUNC | O_EXCL | O_NOFOLLOW, MYF(0));
+  if (file < 0) return Preserved_trx_carrier_status::IO_ERROR;
+
+  bool error = !write_all(file, snapshot_bytes);
+  notify_step(m_write_options, Preserve_snapshot_io_step::WRITE_TEMP_FILE);
+  DBUG_EXECUTE_IF("preserve_trx_fail_before_snapshot_fsync", error = true;);
+  if (!error && !m_write_options.defer_file_fsync && my_sync(file, MYF(0))) {
+    error = true;
+  }
+  if (!m_write_options.defer_file_fsync) {
+    notify_step(m_write_options, Preserve_snapshot_io_step::FSYNC_TEMP_FILE);
+  }
+  if (my_close(file, MYF(0))) error = true;
+  if (error) {
+    (void)my_delete(stage_path.c_str(), MYF(0));
+    return Preserved_trx_carrier_status::IO_ERROR;
+  }
+  if (!m_write_options.defer_directory_fsync && fsync_directory(write_dir)) {
+    return Preserved_trx_carrier_status::IO_ERROR;
+  }
+  return Preserved_trx_carrier_status::OK;
+}
+
+Preserved_trx_carrier_status
+Local_file_preserved_trx_carrier::commit_staged_snapshot(
+    const std::string &token) {
+  if (!token_is_filename_safe(token)) {
+    return Preserved_trx_carrier_status::CORRUPT;
+  }
+  for (const std::string &candidate_dir : snapshot_dirs_for_token(m_dir, token)) {
+    const std::string stage_path = join_path(candidate_dir, token + ".bin.tmp");
+    if (!file_exists(stage_path)) continue;
+    if (path_is_symlink(stage_path)) {
+      return Preserved_trx_carrier_status::CORRUPT;
+    }
+    const std::string final_path = join_path(candidate_dir, token + ".bin");
+    if (file_exists(final_path)) {
+      return Preserved_trx_carrier_status::ALREADY_EXISTS;
+    }
+    DBUG_EXECUTE_IF("preserve_trx_crash_before_snapshot_rename",
+                    DBUG_SUICIDE(););
+    if (my_rename(stage_path.c_str(), final_path.c_str(), MYF(0))) {
+      return Preserved_trx_carrier_status::IO_ERROR;
+    }
+    notify_step(m_write_options, Preserve_snapshot_io_step::RENAME_TEMP_FILE);
+    DBUG_EXECUTE_IF(
+        "preserve_trx_fail_after_snapshot_rename",
+        return Preserved_trx_carrier_status::
+            IO_ERROR_DURABLE_SNAPSHOT_MAY_EXIST;);
+    DBUG_EXECUTE_IF(
+        "preserve_trx_fail_snapshot_directory_fsync",
+        return Preserved_trx_carrier_status::
+            IO_ERROR_DURABLE_SNAPSHOT_MAY_EXIST;);
+    if (!m_write_options.defer_directory_fsync &&
+        fsync_directory(candidate_dir)) {
+      return Preserved_trx_carrier_status::
+          IO_ERROR_DURABLE_SNAPSHOT_MAY_EXIST;
+    }
+    if (!m_write_options.defer_directory_fsync) {
+      notify_step(m_write_options, Preserve_snapshot_io_step::FSYNC_DIRECTORY);
+    }
+    return Preserved_trx_carrier_status::OK;
+  }
+  return Preserved_trx_carrier_status::NOT_FOUND;
+}
+
+Preserved_trx_carrier_status
 Local_file_preserved_trx_carrier::write_resurrection_index_new(
     const std::string &token,
     const std::vector<unsigned char> &index_bytes) {
   if (!token_is_filename_safe(token) || index_bytes.empty()) {
     return Preserved_trx_carrier_status::CORRUPT;
   }
-  const std::string snapshot_path =
-      snapshot_path_for_existing_token(m_dir, token);
+  std::string snapshot_path = snapshot_path_for_existing_token(m_dir, token);
   if (!file_exists(snapshot_path)) {
-    return Preserved_trx_carrier_status::NOT_FOUND;
+    for (const std::string &candidate_dir : snapshot_dirs_for_token(m_dir, token)) {
+      const std::string staged = join_path(candidate_dir, token + ".bin.tmp");
+      if (file_exists(staged)) {
+        snapshot_path = staged;
+        break;
+      }
+    }
+    if (!file_exists(snapshot_path)) {
+      return Preserved_trx_carrier_status::NOT_FOUND;
+    }
   }
   if (path_is_symlink(snapshot_path)) {
     return Preserved_trx_carrier_status::CORRUPT;
@@ -2129,6 +2257,34 @@ Preserved_trx_carrier_status Local_file_preserved_trx_carrier::read_existing(
     if (read_status != Preserved_trx_carrier_status::OK) return read_status;
   }
   return Preserved_trx_carrier_status::OK;
+}
+
+Preserved_trx_carrier_status
+Local_file_preserved_trx_carrier::read_external_blob(
+    const std::string &token,
+    const Preserved_trx_external_blob_descriptor &descriptor,
+    const Preserved_trx_carrier_read_limits &read_limits,
+    Preserved_trx_external_blob *blob) {
+  if (blob == nullptr || !token_is_filename_safe(token) ||
+      !external_blob_name_is_filename_safe(descriptor.name)) {
+    return Preserved_trx_carrier_status::CORRUPT;
+  }
+
+  const std::vector<std::string> candidate_dirs =
+      generic_external_blob_uses_shard(descriptor.name)
+          ? generic_external_blob_dirs_for_token(m_dir, token)
+          : std::vector<std::string>{normalize_dir(m_dir)};
+  std::string blob_path;
+  for (const std::string &candidate_dir : candidate_dirs) {
+    const std::string candidate = join_path(
+        candidate_dir, external_blob_filename(token, descriptor.name));
+    if (!file_exists(candidate)) continue;
+    if (!blob_path.empty()) return Preserved_trx_carrier_status::CORRUPT;
+    blob_path = candidate;
+  }
+  if (blob_path.empty()) return Preserved_trx_carrier_status::NOT_FOUND;
+  return read_external_blob_path_by_descriptor(
+      blob_path, descriptor, read_limits.max_external_blob_bytes, blob);
 }
 
 Preserved_trx_carrier_status Local_file_preserved_trx_carrier::rewrite_existing(
@@ -2929,22 +3085,8 @@ Local_file_preserved_trx_carrier::read_warm_external_blob(
     return Preserved_trx_carrier_status::CORRUPT;
   }
 
-  std::vector<unsigned char> bytes;
-  const Preserved_trx_carrier_status read_status =
-      read_file_limited(warm_path, max_bytes, &bytes);
-  if (read_status != Preserved_trx_carrier_status::OK) return read_status;
-
-  Preserved_trx_external_blob materialized;
-  materialized.name = blob_name;
-  materialized.payload.assign(reinterpret_cast<const char *>(bytes.data()),
-                              bytes.size());
-  set_blob_descriptor_from_payload(&materialized);
-  if (materialized.descriptor.size != descriptor.size ||
-      materialized.descriptor.digest != descriptor.digest) {
-    return Preserved_trx_carrier_status::CORRUPT;
-  }
-  *blob = std::move(materialized);
-  return Preserved_trx_carrier_status::OK;
+  return read_external_blob_path_by_descriptor(warm_path, descriptor, max_bytes,
+                                               blob);
 }
 
 Preserved_trx_carrier_status

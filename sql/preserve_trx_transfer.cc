@@ -1981,22 +1981,22 @@ bool transfer_bundle_codec_context(Preserved_trx_codec_context *context) {
   return transfer_bundle_codec_context_from_config(context);
 }
 
-bool load_source_transfer_lsn_fact(uint64_t *source_prepare_lsn,
+bool load_source_transfer_lsn_fact(uint64_t *source_freeze_lsn,
                                    uint64_t *source_epoch_commit_lsn) {
-  if (source_prepare_lsn == nullptr || source_epoch_commit_lsn == nullptr) {
+  if (source_freeze_lsn == nullptr || source_epoch_commit_lsn == nullptr) {
     return false;
   }
 
   Preserve_trx_transfer_source_lsn_provider provider =
       unit_source_lsn_provider();
   if (provider != nullptr) {
-    return provider(source_prepare_lsn, source_epoch_commit_lsn) &&
-           *source_prepare_lsn != 0 && *source_epoch_commit_lsn != 0;
+    return provider(source_freeze_lsn, source_epoch_commit_lsn) &&
+           *source_freeze_lsn != 0 && *source_epoch_commit_lsn != 0;
   }
 
   const uint64_t lsn = trx_preserve_current_redo_lsn();
   if (lsn == 0) return false;
-  *source_prepare_lsn = lsn;
+  *source_freeze_lsn = lsn;
   *source_epoch_commit_lsn = lsn;
   return true;
 }
@@ -2048,11 +2048,11 @@ Preserve_trx_transfer_status populate_source_commit_proof(
   if (!load_source_trx_id_store_fact(&store_fact)) {
     return Preserve_trx_transfer_status::UNSUPPORTED;
   }
-  uint64_t sampled_prepare_lsn = 0;
+  uint64_t sampled_freeze_lsn = 0;
   uint64_t source_fence_lsn = 0;
-  if (!load_source_transfer_lsn_fact(&sampled_prepare_lsn,
+  if (!load_source_transfer_lsn_fact(&sampled_freeze_lsn,
                                      &source_fence_lsn) ||
-      sampled_prepare_lsn > source_fence_lsn ||
+      sampled_freeze_lsn > source_fence_lsn ||
       !transfer_trx_id_store_fact_is_valid(store_fact, source_fence_lsn)) {
     return Preserve_trx_transfer_status::CORRUPT;
   }
@@ -4161,7 +4161,7 @@ Preserve_trx_transfer_manifest receiver_record_manifest(
   manifest.protocol_version = record.protocol_version;
   manifest.epoch_id = record.epoch_id;
   manifest.token = record.token;
-  manifest.source_prepare_lsn = record.source_prepare_lsn;
+  manifest.source_freeze_lsn = record.source_freeze_lsn;
   manifest.source_epoch_commit_lsn = record.source_epoch_commit_lsn;
   manifest.strict_eligibility_flags = record.strict_eligibility_flags;
   manifest.objects = record.objects;
@@ -4693,16 +4693,9 @@ bool decode_receiver_resurrection_index(
 
   const Preserve_trx_resurrection_index_entry &entry = index.entries.front();
   const std::string token = std::to_string(manifest.token);
-  if (entry.token != manifest.token ||
-      entry.prepare_lsn != manifest.source_prepare_lsn ||
-      entry.snapshot_digest != snapshot_object->digest ||
-      entry.xid.format_id != PRESERVE_TRX_XID_FORMAT_ID ||
-      entry.xid.gtrid_length != PRESERVE_TRX_XID_GTRID_LENGTH ||
-      entry.xid.bqual_length != token.size() ||
-      std::memcmp(entry.xid.data.data(), PRESERVE_TRX_XID_GTRID,
-                  PRESERVE_TRX_XID_GTRID_LENGTH) != 0 ||
-      std::memcmp(entry.xid.data.data() + PRESERVE_TRX_XID_GTRID_LENGTH,
-                  token.data(), token.size()) != 0) {
+  if (entry.authority_token != token ||
+      entry.freeze_lsn != manifest.source_freeze_lsn ||
+      entry.snapshot_digest != snapshot_object->digest) {
     return false;
   }
   *verified_entry = entry;
@@ -5160,7 +5153,7 @@ void bind_strict_prepared_tokens_from_epoch_fact(
     Preserve_trx_transfer_manifest manifest;
     manifest.epoch_id = fact.epoch_id;
     manifest.token = token.token;
-    manifest.source_prepare_lsn = token.source_prepare_lsn;
+    manifest.source_freeze_lsn = token.source_freeze_lsn;
     manifest.source_epoch_commit_lsn = token.source_epoch_commit_lsn;
     manifest.objects = token.objects;
     Preserve_trx_prepared_token_key key;
@@ -5816,7 +5809,7 @@ bool publish_receiver_epoch_ready_from_fact_if_possible_impl(
     Preserve_trx_transfer_manifest strict_manifest;
     strict_manifest.epoch_id = fact->epoch_id;
     strict_manifest.token = fact_token.token;
-    strict_manifest.source_prepare_lsn = fact_token.source_prepare_lsn;
+    strict_manifest.source_freeze_lsn = fact_token.source_freeze_lsn;
     strict_manifest.source_epoch_commit_lsn =
         fact_token.source_epoch_commit_lsn;
     strict_manifest.objects = fact_token.objects;
@@ -5954,7 +5947,7 @@ bool publish_receiver_epoch_selection_if_possible(
     Preserve_trx_transfer_manifest manifest;
     manifest.epoch_id = accepted.epoch_id;
     manifest.token = fact_token.token;
-    manifest.source_prepare_lsn = fact_token.source_prepare_lsn;
+    manifest.source_freeze_lsn = fact_token.source_freeze_lsn;
     manifest.source_epoch_commit_lsn = fact_token.source_epoch_commit_lsn;
     manifest.objects = fact_token.objects;
     if (ready) {
@@ -6207,7 +6200,7 @@ preserve_trx_transfer_copy_accepted_resurrection_entry(
   const Preserve_trx_transfer_manifest manifest = receiver_record_manifest(record);
   std::string encoded_manifest;
   if (manifest.epoch_id != accepted.epoch_id || manifest.token != token ||
-      manifest.source_prepare_lsn != fact_token->source_prepare_lsn ||
+      manifest.source_freeze_lsn != fact_token->source_freeze_lsn ||
       manifest.source_epoch_commit_lsn !=
           fact_token->source_epoch_commit_lsn ||
       preserve_trx_transfer_encode_manifest(manifest, &encoded_manifest) !=
@@ -6354,7 +6347,7 @@ Preserve_trx_transfer_status preserve_trx_transfer_encode_manifest(
   out.append(kTransferManifestMagic, kTransferManifestMagicLength);
   append_u16(&out, manifest.protocol_version);
   append_u64(&out, manifest.frame_sequence);
-  append_u64(&out, manifest.source_prepare_lsn);
+  append_u64(&out, manifest.source_freeze_lsn);
   append_u64(&out, manifest.source_epoch_commit_lsn);
   append_u32(&out, manifest.strict_eligibility_flags);
   if (append_string(&out, manifest.epoch_id)) {
@@ -6410,7 +6403,7 @@ Preserve_trx_transfer_status preserve_trx_transfer_decode_manifest(
   if (!transfer_protocol_version_is_decodable(parsed.protocol_version)) {
     return Preserve_trx_transfer_status::UNSUPPORTED;
   }
-  if (reader.read_u64(&parsed.source_prepare_lsn) ||
+  if (reader.read_u64(&parsed.source_freeze_lsn) ||
       reader.read_u64(&parsed.source_epoch_commit_lsn)) {
     return Preserve_trx_transfer_status::CORRUPT;
   }
@@ -6504,8 +6497,8 @@ preserve_trx_transfer_validate_strict_eligibility(
     return Preserve_trx_transfer_strict_eligibility_status::LEGACY_PROTOCOL;
   }
   if ((manifest.strict_eligibility_flags &
-       PRESERVE_TRX_TRANSFER_STRICT_PREPARED_REDO) == 0 ||
-      manifest.source_prepare_lsn == 0 ||
+       PRESERVE_TRX_TRANSFER_STRICT_ACTIVE_UNDO) == 0 ||
+      manifest.source_freeze_lsn == 0 ||
       manifest.source_epoch_commit_lsn == 0) {
     return Preserve_trx_transfer_strict_eligibility_status::
         TOKEN_NOT_PREPARED_REDO;
@@ -6609,15 +6602,15 @@ Preserve_trx_transfer_status preserve_trx_transfer_encode_epoch_fact(
   uint64_t previous_token = 0;
   for (const Preserve_trx_transfer_epoch_fact_token &token : tokens) {
     if (token.token == 0 || token.token <= previous_token ||
-        token.source_prepare_lsn == 0 || token.source_epoch_commit_lsn == 0 ||
-        token.source_prepare_lsn > fact.source_fence_lsn ||
+        token.source_freeze_lsn == 0 || token.source_epoch_commit_lsn == 0 ||
+        token.source_freeze_lsn > fact.source_fence_lsn ||
         token.source_epoch_commit_lsn > fact.source_fence_lsn) {
       return Preserve_trx_transfer_status::INVALID_ARGUMENT;
     }
     previous_token = token.token;
     body.append("token=").append(std::to_string(token.token)).append("\n");
-    body.append("source_prepare_lsn=")
-        .append(std::to_string(token.source_prepare_lsn))
+    body.append("source_freeze_lsn=")
+        .append(std::to_string(token.source_freeze_lsn))
         .append("\n");
     body.append("source_epoch_commit_lsn=")
         .append(std::to_string(token.source_epoch_commit_lsn))
@@ -6733,16 +6726,16 @@ Preserve_trx_transfer_status preserve_trx_transfer_decode_epoch_fact(
     }
     previous_token = token.token;
     if (!next_line() ||
-        !line_has_prefix(line, "source_prepare_lsn=", &value) ||
-        !parse_uint64_strict(value, &token.source_prepare_lsn) ||
-        token.source_prepare_lsn == 0) {
+        !line_has_prefix(line, "source_freeze_lsn=", &value) ||
+        !parse_uint64_strict(value, &token.source_freeze_lsn) ||
+        token.source_freeze_lsn == 0) {
       return Preserve_trx_transfer_status::CORRUPT;
     }
     if (!next_line() ||
         !line_has_prefix(line, "source_epoch_commit_lsn=", &value) ||
         !parse_uint64_strict(value, &token.source_epoch_commit_lsn) ||
         token.source_epoch_commit_lsn == 0 ||
-        token.source_prepare_lsn > parsed.source_fence_lsn ||
+        token.source_freeze_lsn > parsed.source_fence_lsn ||
         token.source_epoch_commit_lsn > parsed.source_fence_lsn) {
       return Preserve_trx_transfer_status::CORRUPT;
     }
@@ -6850,7 +6843,7 @@ Preserve_trx_transfer_status build_epoch_fact_from_manifests(
     if (encode_status != Preserve_trx_transfer_status::OK) return encode_status;
     Preserve_trx_transfer_epoch_fact_token token;
     token.token = manifest.token;
-    token.source_prepare_lsn = manifest.source_prepare_lsn;
+    token.source_freeze_lsn = manifest.source_freeze_lsn;
     token.source_epoch_commit_lsn = manifest.source_epoch_commit_lsn;
     token.manifest_digest = sha256_digest(encoded_manifest);
     token.objects = manifest.objects;
@@ -6901,7 +6894,7 @@ bool epoch_fact_tokens_equal(
     const Preserve_trx_transfer_epoch_fact_token &left,
     const Preserve_trx_transfer_epoch_fact_token &right) {
   return left.token == right.token &&
-         left.source_prepare_lsn == right.source_prepare_lsn &&
+         left.source_freeze_lsn == right.source_freeze_lsn &&
          left.source_epoch_commit_lsn == right.source_epoch_commit_lsn &&
          left.manifest_digest == right.manifest_digest &&
          transfer_object_descriptors_equal(left.objects, right.objects);
@@ -7731,7 +7724,7 @@ Preserve_trx_transfer_receiver_registry::begin_receive(
   record.strict_eligibility_flags = manifest.strict_eligibility_flags;
   record.epoch_id = manifest.epoch_id;
   record.token = manifest.token;
-  record.source_prepare_lsn = manifest.source_prepare_lsn;
+  record.source_freeze_lsn = manifest.source_freeze_lsn;
   record.source_epoch_commit_lsn = manifest.source_epoch_commit_lsn;
   record.state = Preserve_trx_transfer_receiver_state::RECEIVING;
   record.objects = manifest.objects;
@@ -10381,7 +10374,7 @@ Preserve_trx_transfer_status preserve_trx_transfer_build_portable_objects_impl(
     std::vector<Preserve_trx_transfer_object_payload> *objects,
     const std::set<std::string> *presealed_prebuilt_objects,
     const Preserve_trx_resurrection_index_entry *resurrection_entry,
-    uint64_t fixed_source_prepare_lsn = 0,
+    uint64_t fixed_source_freeze_lsn = 0,
     uint64_t fixed_source_epoch_commit_lsn = 0) {
   if (manifest == nullptr || objects == nullptr || transfer_token == 0) {
     LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
@@ -10433,17 +10426,17 @@ Preserve_trx_transfer_status preserve_trx_transfer_build_portable_objects_impl(
       test_provider(bundle, transfer_token, &provided_entry)) {
     effective_entry = &provided_entry;
   }
-  uint64_t sampled_prepare_lsn = 0;
-  if ((fixed_source_prepare_lsn == 0) !=
+  uint64_t sampled_freeze_lsn = 0;
+  if ((fixed_source_freeze_lsn == 0) !=
       (fixed_source_epoch_commit_lsn == 0)) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
   if (fixed_source_epoch_commit_lsn != 0) {
-    sampled_prepare_lsn = fixed_source_prepare_lsn;
+    sampled_freeze_lsn = fixed_source_freeze_lsn;
     built_manifest.source_epoch_commit_lsn =
         fixed_source_epoch_commit_lsn;
   } else if (!load_source_transfer_lsn_fact(
-                 &sampled_prepare_lsn,
+                 &sampled_freeze_lsn,
                  &built_manifest.source_epoch_commit_lsn)) {
     const std::string message =
         "PRESERVE: standby transfer source LSN fact unavailable token=" +
@@ -10451,9 +10444,9 @@ Preserve_trx_transfer_status preserve_trx_transfer_build_portable_objects_impl(
     LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG, message.c_str());
     return Preserve_trx_transfer_status::UNSUPPORTED;
   }
-  built_manifest.source_prepare_lsn =
-      effective_entry == nullptr ? sampled_prepare_lsn
-                                 : effective_entry->prepare_lsn;
+  built_manifest.source_freeze_lsn =
+      effective_entry == nullptr ? sampled_freeze_lsn
+                                 : effective_entry->freeze_lsn;
 
   std::vector<Preserve_trx_transfer_object_payload> built_objects;
   std::set<std::string> object_ids;
@@ -10470,9 +10463,9 @@ Preserve_trx_transfer_status preserve_trx_transfer_build_portable_objects_impl(
   built_objects.push_back(std::move(snapshot_object));
 
   if (effective_entry != nullptr) {
-    if (effective_entry->token != transfer_token ||
-        effective_entry->prepare_lsn == 0 ||
-        effective_entry->prepare_lsn >
+    if (effective_entry->authority_token != std::to_string(transfer_token) ||
+        effective_entry->freeze_lsn == 0 ||
+        effective_entry->freeze_lsn >
             built_manifest.source_epoch_commit_lsn) {
       return Preserve_trx_transfer_status::INVALID_ARGUMENT;
     }
@@ -10507,7 +10500,7 @@ Preserve_trx_transfer_status preserve_trx_transfer_build_portable_objects_impl(
     built_manifest.objects.push_back(index_object.descriptor);
     built_objects.push_back(std::move(index_object));
     built_manifest.strict_eligibility_flags =
-        PRESERVE_TRX_TRANSFER_STRICT_PREPARED_REDO |
+        PRESERVE_TRX_TRANSFER_STRICT_ACTIVE_UNDO |
         PRESERVE_TRX_TRANSFER_STRICT_PARTICIPANTS_AUTHENTICATED;
   }
 
@@ -11214,7 +11207,7 @@ Preserve_trx_transfer_source_epoch_session::begin_token_objects(
 
 Preserve_trx_transfer_status
 Preserve_trx_transfer_source_epoch_session::begin_token_prewarm_manifest(
-    uint64_t transfer_token, uint64_t required_source_prepare_lsn) {
+    uint64_t transfer_token, uint64_t required_source_freeze_lsn) {
   std::lock_guard<std::mutex> guard(m_mutex);
   if (m_sink == nullptr || m_chunk_bytes == 0 || transfer_token == 0) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
@@ -11227,7 +11220,7 @@ Preserve_trx_transfer_source_epoch_session::begin_token_prewarm_manifest(
   }
   const bool prewarm_manifest_started =
       m_prewarm_manifest_tokens.count(transfer_token) != 0;
-  if (prewarm_manifest_started && required_source_prepare_lsn == 0) {
+  if (prewarm_manifest_started && required_source_freeze_lsn == 0) {
     return Preserve_trx_transfer_status::OK;
   }
 
@@ -11245,23 +11238,23 @@ Preserve_trx_transfer_source_epoch_session::begin_token_prewarm_manifest(
     if (lsn_fact == m_prewarm_lsn_facts.end()) {
       return Preserve_trx_transfer_status::CORRUPT;
     }
-    manifest.source_prepare_lsn = lsn_fact->second.first;
+    manifest.source_freeze_lsn = lsn_fact->second.first;
     manifest.source_epoch_commit_lsn = lsn_fact->second.second;
   } else {
-    if (!load_source_transfer_lsn_fact(&manifest.source_prepare_lsn,
+    if (!load_source_transfer_lsn_fact(&manifest.source_freeze_lsn,
                                        &manifest.source_epoch_commit_lsn)) {
       return Preserve_trx_transfer_status::UNSUPPORTED;
     }
   }
-  if (required_source_prepare_lsn != 0) {
-    manifest.source_prepare_lsn = required_source_prepare_lsn;
+  if (required_source_freeze_lsn != 0) {
+    manifest.source_freeze_lsn = required_source_freeze_lsn;
     manifest.source_epoch_commit_lsn =
         std::max(manifest.source_epoch_commit_lsn,
-                 required_source_prepare_lsn);
+                 required_source_freeze_lsn);
   }
   if (prewarm_manifest_started &&
       m_prewarm_lsn_facts[transfer_token] ==
-          std::make_pair(manifest.source_prepare_lsn,
+          std::make_pair(manifest.source_freeze_lsn,
                          manifest.source_epoch_commit_lsn)) {
     return Preserve_trx_transfer_status::OK;
   }
@@ -11288,7 +11281,7 @@ Preserve_trx_transfer_source_epoch_session::begin_token_prewarm_manifest(
 
   m_prewarm_manifest_tokens.insert(transfer_token);
   m_prewarm_lsn_facts[transfer_token] = {
-      manifest.source_prepare_lsn, manifest.source_epoch_commit_lsn};
+      manifest.source_freeze_lsn, manifest.source_epoch_commit_lsn};
   return Preserve_trx_transfer_status::OK;
 }
 
@@ -11328,7 +11321,7 @@ Preserve_trx_transfer_source_epoch_session::begin_token_prewarm_manifests_batch(
     Preserve_trx_transfer_manifest manifest;
     manifest.epoch_id = m_epoch_id;
     manifest.token = transfer_token;
-    if (!load_source_transfer_lsn_fact(&manifest.source_prepare_lsn,
+    if (!load_source_transfer_lsn_fact(&manifest.source_freeze_lsn,
                                        &manifest.source_epoch_commit_lsn)) {
       return Preserve_trx_transfer_status::UNSUPPORTED;
     }
@@ -11355,7 +11348,7 @@ Preserve_trx_transfer_source_epoch_session::begin_token_prewarm_manifests_batch(
     encoded_frames.push_back(std::move(encoded_frame));
     newly_started.push_back(transfer_token);
     newly_started_lsn_facts.push_back(
-        {manifest.source_prepare_lsn, manifest.source_epoch_commit_lsn});
+        {manifest.source_freeze_lsn, manifest.source_epoch_commit_lsn});
   }
   if (encoded_frames.empty()) return Preserve_trx_transfer_status::OK;
 
@@ -11375,17 +11368,17 @@ Preserve_trx_transfer_source_epoch_session::begin_token_prewarm_manifests_batch(
 }
 
 bool Preserve_trx_transfer_source_epoch_session::token_prewarm_lsn_fact(
-    uint64_t transfer_token, uint64_t *source_prepare_lsn,
+    uint64_t transfer_token, uint64_t *source_freeze_lsn,
     uint64_t *source_epoch_commit_lsn) const {
-  if (source_prepare_lsn == nullptr || source_epoch_commit_lsn == nullptr) {
+  if (source_freeze_lsn == nullptr || source_epoch_commit_lsn == nullptr) {
     return false;
   }
   std::lock_guard<std::mutex> guard(m_mutex);
   const auto found = m_prewarm_lsn_facts.find(transfer_token);
   if (found == m_prewarm_lsn_facts.end()) return false;
-  *source_prepare_lsn = found->second.first;
+  *source_freeze_lsn = found->second.first;
   *source_epoch_commit_lsn = found->second.second;
-  return *source_prepare_lsn != 0 && *source_epoch_commit_lsn != 0;
+  return *source_freeze_lsn != 0 && *source_epoch_commit_lsn != 0;
 }
 
 Preserve_trx_transfer_status
@@ -12046,7 +12039,7 @@ Preserve_trx_transfer_source_epoch_session::stream_prebuilt_blobs_batch(
         payload_offset >= request.size ||
         (inline_payload &&
          request.inline_payload.size() != expected_payload_bytes) ||
-        (request.required_source_prepare_lsn != 0 &&
+        (request.required_source_freeze_lsn != 0 &&
          !binlog_prewarm_seed) ||
         (payload_offset != 0 &&
          (request.object_id != kPreservedTrxBlobBinlogCache ||
@@ -12357,13 +12350,13 @@ Preserve_trx_transfer_source_epoch_session::stream_prebuilt_blobs_batch(
     if (binlog_seed_object) {
       if (!prewarm_manifest_started) {
         publish_prewarm_manifest = true;
-      } else if (prepared.request.required_source_prepare_lsn != 0) {
+      } else if (prepared.request.required_source_freeze_lsn != 0) {
         std::pair<uint64_t, uint64_t> required_lsn_fact = prewarm_lsn_fact;
         required_lsn_fact.first =
-            prepared.request.required_source_prepare_lsn;
+            prepared.request.required_source_freeze_lsn;
         required_lsn_fact.second =
             std::max(required_lsn_fact.second,
-                     prepared.request.required_source_prepare_lsn);
+                     prepared.request.required_source_freeze_lsn);
         publish_prewarm_manifest =
             required_lsn_fact != prewarm_lsn_fact;
       }
@@ -12373,24 +12366,24 @@ Preserve_trx_transfer_source_epoch_session::stream_prebuilt_blobs_batch(
       prewarm_manifest.epoch_id = m_epoch_id;
       prewarm_manifest.token = transfer_token;
       if (prewarm_manifest_started) {
-        prewarm_manifest.source_prepare_lsn = prewarm_lsn_fact.first;
+        prewarm_manifest.source_freeze_lsn = prewarm_lsn_fact.first;
         prewarm_manifest.source_epoch_commit_lsn = prewarm_lsn_fact.second;
       } else if (!load_source_transfer_lsn_fact(
-                     &prewarm_manifest.source_prepare_lsn,
+                     &prewarm_manifest.source_freeze_lsn,
                      &prewarm_manifest.source_epoch_commit_lsn)) {
         return Preserve_trx_transfer_status::UNSUPPORTED;
       }
-      if (prepared.request.required_source_prepare_lsn != 0) {
-        prewarm_manifest.source_prepare_lsn =
-            prepared.request.required_source_prepare_lsn;
+      if (prepared.request.required_source_freeze_lsn != 0) {
+        prewarm_manifest.source_freeze_lsn =
+            prepared.request.required_source_freeze_lsn;
         prewarm_manifest.source_epoch_commit_lsn =
             std::max(prewarm_manifest.source_epoch_commit_lsn,
-                     prepared.request.required_source_prepare_lsn);
+                     prepared.request.required_source_freeze_lsn);
       }
-      if (prewarm_manifest.source_prepare_lsn != 0 &&
+      if (prewarm_manifest.source_freeze_lsn != 0 &&
           prewarm_manifest.source_epoch_commit_lsn != 0) {
         prewarm_started_lsn_facts[transfer_token] = {
-            prewarm_manifest.source_prepare_lsn,
+            prewarm_manifest.source_freeze_lsn,
             prewarm_manifest.source_epoch_commit_lsn};
         prewarm_manifest.objects.reserve(projected->second.size());
         for (const auto &entry : projected->second) {
@@ -12680,9 +12673,9 @@ preserve_trx_transfer_stage_deferred_candidate_external_objects(
     }
   }
   if (stage_binlog_seed) {
-    const uint64_t required_source_prepare_lsn =
+    const uint64_t required_source_freeze_lsn =
         candidate->has_resurrection_entry
-            ? candidate->resurrection_entry.prepare_lsn
+            ? candidate->resurrection_entry.freeze_lsn
             : 0;
     if (batch_sender != nullptr) {
       Preserve_trx_transfer_phase1_blob_request request;
@@ -12691,7 +12684,7 @@ preserve_trx_transfer_stage_deferred_candidate_external_objects(
       request.size = binlog_seed_descriptor.total_size;
       request.digest = binlog_seed_descriptor.digest;
       request.inline_payload = std::move(binlog_seed_payload);
-      request.required_source_prepare_lsn = required_source_prepare_lsn;
+      request.required_source_freeze_lsn = required_source_freeze_lsn;
       const Preserve_trx_transfer_status status =
           batch_sender->enqueue(request);
       if (status != Preserve_trx_transfer_status::OK) return status;
@@ -12701,10 +12694,10 @@ preserve_trx_transfer_stage_deferred_candidate_external_objects(
           candidate->transfer_token, binlog_seed_descriptor);
       if (status != Preserve_trx_transfer_status::OK) return status;
       status = session->begin_token_prewarm_manifest(
-          candidate->transfer_token, required_source_prepare_lsn);
+          candidate->transfer_token, required_source_freeze_lsn);
       if (status != Preserve_trx_transfer_status::OK) return status;
       if (!session->token_prewarm_lsn_fact(
-              candidate->transfer_token, &candidate->source_prepare_lsn,
+              candidate->transfer_token, &candidate->source_freeze_lsn,
               &candidate->source_epoch_commit_lsn)) {
         return Preserve_trx_transfer_status::CORRUPT;
       }
@@ -12814,24 +12807,24 @@ Preserve_trx_transfer_status preserve_trx_transfer_finalize_deferred_candidate(
           &presealed_external_objects,
           candidate->has_resurrection_entry ? &candidate->resurrection_entry
                                             : nullptr,
-          candidate->source_prepare_lsn,
+          candidate->source_freeze_lsn,
           candidate->source_epoch_commit_lsn);
   if (status != Preserve_trx_transfer_status::OK) {
     const std::string message =
         "PRESERVE: deferred transfer finalize build failed epoch=" +
         candidate->epoch_id +
         " token=" + std::to_string(candidate->transfer_token) +
-        " source_prepare_lsn=" +
-        std::to_string(candidate->source_prepare_lsn) +
+        " source_freeze_lsn=" +
+        std::to_string(candidate->source_freeze_lsn) +
         " source_epoch_commit_lsn=" +
         std::to_string(candidate->source_epoch_commit_lsn) +
         " resurrection_token=" +
+        (candidate->has_resurrection_entry
+             ? candidate->resurrection_entry.authority_token
+             : std::string()) +
+        " resurrection_freeze_lsn=" +
         std::to_string(candidate->has_resurrection_entry
-                           ? candidate->resurrection_entry.token
-                           : 0) +
-        " resurrection_prepare_lsn=" +
-        std::to_string(candidate->has_resurrection_entry
-                           ? candidate->resurrection_entry.prepare_lsn
+                           ? candidate->resurrection_entry.freeze_lsn
                            : 0) +
         " binlog_seed_staged=" +
         (candidate->binlog_prewarm_seed_staged ? "1" : "0") +
@@ -13025,9 +13018,9 @@ Preserve_trx_transfer_source_epoch_session::commit_epoch() {
   if (status != Preserve_trx_transfer_status::OK) return status;
   const uint64_t source_fence_lsn = commit.chunk_offset;
   for (const auto &manifest : m_finalized_manifests) {
-    if (manifest.source_prepare_lsn == 0 ||
+    if (manifest.source_freeze_lsn == 0 ||
         manifest.source_epoch_commit_lsn == 0 ||
-        manifest.source_prepare_lsn > source_fence_lsn ||
+        manifest.source_freeze_lsn > source_fence_lsn ||
         manifest.source_epoch_commit_lsn > source_fence_lsn) {
       return Preserve_trx_transfer_status::CORRUPT;
     }
@@ -14268,11 +14261,11 @@ Preserve_trx_transfer_status commit_epoch_manifests(
   if (!load_source_trx_id_store_fact(&trx_id_store_fact)) {
     return Preserve_trx_transfer_status::UNSUPPORTED;
   }
-  uint64_t sampled_prepare_lsn = 0;
+  uint64_t sampled_freeze_lsn = 0;
   uint64_t source_fence_lsn = 0;
-  if (!load_source_transfer_lsn_fact(&sampled_prepare_lsn,
+  if (!load_source_transfer_lsn_fact(&sampled_freeze_lsn,
                                      &source_fence_lsn) ||
-      sampled_prepare_lsn > source_fence_lsn ||
+      sampled_freeze_lsn > source_fence_lsn ||
       !transfer_trx_id_store_fact_is_valid(trx_id_store_fact,
                                            source_fence_lsn)) {
     return Preserve_trx_transfer_status::CORRUPT;
@@ -14631,6 +14624,9 @@ bool receiver_epoch_expired_or_removed(
     const std::string &root_dir,
     Preserve_trx_transfer_receiver_registry *registry,
     const Preserve_trx_transfer_manifest &manifest);
+void purge_receiver_epoch_derived_state_after_worker_stop(
+    const std::string &root_dir, const std::string &epoch_id,
+    Preserve_trx_transfer_receiver_registry *registry);
 
 Receiver_staged_token_prewarm_key receiver_staged_token_prewarm_key(
     const std::string &root_dir,
@@ -15125,8 +15121,8 @@ Receiver_staged_token_prewarm_result run_receiver_staged_token_prewarm_job(
         manifest.source_epoch_commit_lsn, staged_bundle);
   }
   if (receiver_epoch_expired_or_removed(root_dir, registry, manifest)) {
-    purge_receiver_epoch_derived_state(
-        root_dir, manifest.epoch_id, receiver_boot_incarnation());
+    purge_receiver_epoch_derived_state_after_worker_stop(
+        root_dir, manifest.epoch_id, registry);
     return receiver_staged_token_result(
         Receiver_staged_token_prewarm_outcome::EXPIRED,
         Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY);
@@ -15184,8 +15180,8 @@ Receiver_staged_token_prewarm_result run_receiver_staged_token_prewarm_job(
       prepare_strict_bundle_for_receiver(root_dir, manifest,
                                          std::move(staged_bundle), registry);
   if (receiver_epoch_expired_or_removed(root_dir, registry, manifest)) {
-    purge_receiver_epoch_derived_state(
-        root_dir, manifest.epoch_id, receiver_boot_incarnation());
+    purge_receiver_epoch_derived_state_after_worker_stop(
+        root_dir, manifest.epoch_id, registry);
     return receiver_staged_token_result(
         Receiver_staged_token_prewarm_outcome::EXPIRED,
         Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY);
@@ -15310,6 +15306,17 @@ bool receiver_epoch_expired_or_removed(
   if (!registry->lookup(manifest.epoch_id, manifest.token, &record)) return true;
   return record.state != Preserve_trx_transfer_receiver_state::DECLARED &&
          record.state != Preserve_trx_transfer_receiver_state::RECEIVING;
+}
+
+void purge_receiver_epoch_derived_state_after_worker_stop(
+    const std::string &root_dir, const std::string &epoch_id,
+    Preserve_trx_transfer_receiver_registry *registry) {
+  if (registry != nullptr &&
+      registry->accepted_epoch_is_live(root_dir, epoch_id)) {
+    return;
+  }
+  purge_receiver_epoch_derived_state(root_dir, epoch_id,
+                                     receiver_boot_incarnation());
 }
 
 static bool run_receiver_object_prewarm_job(
@@ -15558,9 +15565,8 @@ static bool run_receiver_object_prewarm_job(
   }
   if (receiver_epoch_expired_or_removed(root_dir, registry,
                                         effective_manifest)) {
-    purge_receiver_epoch_derived_state(
-        root_dir, effective_manifest.epoch_id,
-        receiver_boot_incarnation());
+    purge_receiver_epoch_derived_state_after_worker_stop(
+        root_dir, effective_manifest.epoch_id, registry);
     return false;
   }
   note_elapsed();

@@ -9,7 +9,7 @@ DROP TABLE IF EXISTS t_resume_activation_failure;
 SET GLOBAL preserve_trx_enable=ON;
 
 --disable_query_log
-CALL mtr.add_suppression("Preserved transaction resume failed to activate prepared undo state");
+CALL mtr.add_suppression("Preserved transaction resume failed to validate ACTIVE Undo state");
 --enable_query_log
 
 CREATE TABLE t_resume_activation_failure(a INT PRIMARY KEY, b INT)

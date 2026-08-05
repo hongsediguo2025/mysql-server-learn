@@ -1,0 +1,114 @@
+--echo # Lint-only guard for the unified ACTIVE Undo V1 contract. Runtime
+--echo # behavior is covered by Preserve GUnit, startup MTR and transfer E2E.
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $root = File::Spec->rel2abs(File::Spec->catdir($mysql_test_dir, '..'));
+
+sub read_file {
+  my ($path) = @_;
+  my $full_path = File::Spec->catfile($root, split('/', $path));
+  open(my $fh, '<', $full_path) or die "open $path: $!\n";
+  my $contents = do { local $/; <$fh> };
+  close($fh);
+  return $contents;
+}
+
+my $preserve = read_file('sql/preserve_trx.cc');
+my $carrier = read_file('sql/preserve_trx_carrier.cc');
+my $carrier_file = read_file('sql/preserve_trx_carrier_file.cc');
+my $kernel = read_file('sql/preserve_trx_kernel.h');
+my $resurrection = read_file('sql/preserve_trx_resurrection_index.h');
+my $transfer = read_file('sql/preserve_trx_transfer.h');
+my $ha_innodb = read_file('storage/innobase/handler/ha_innodb.cc');
+my $trx_header = read_file('storage/innobase/include/trx0trx.h');
+my $trx = read_file('storage/innobase/trx/trx0trx.cc');
+my $trx_preserve = read_file('storage/innobase/trx/trx0preserve.cc');
+my $srv_start = read_file('storage/innobase/srv/srv0start.cc');
+
+my $all = join("\n", $preserve, $carrier, $carrier_file, $kernel,
+               $resurrection, $transfer, $ha_innodb, $trx_header, $trx,
+               $trx_preserve);
+
+die "ACTIVE Undo V1 runtime contract is missing\n"
+  unless $all =~ /ACTIVE_UNDO_V1/;
+die "Preserve resurrection facts must use freeze_lsn\n"
+  unless $resurrection =~ /freeze_lsn/;
+die "Preserve transfer facts must use source_freeze_lsn\n"
+  unless $transfer =~ /source_freeze_lsn/;
+die "ACTIVE Undo V1 transfer must use protocol version 2 only\n"
+  unless $transfer =~ /kPreserveTrxTransferProtocolVersion\s*=\s*2\s*;/ &&
+         $transfer !~ /kPreserveTrxTransferLegacyProtocolVersion/;
+die "trx_t must expose Preserve freeze_lsn, not prepare_lsn\n"
+  unless $trx_header =~ /preserve_freeze_lsn/;
+
+die "Preserve-specific prepare_lsn naming remains\n"
+  if $all =~ /preserve_prepare_lsn|source_prepare_lsn|required_source_prepare_lsn/;
+die "XID provenance ledger remains in the unified V1 model\n"
+  if $all =~ /xid_provenance/i;
+die "old recovered PREPARED handoff remains\n"
+  if $trx_preserve =~ /trx_preserve_handoff_recovered_prepared_to_native_rollback/;
+die "Preserve still persists Undo PREPARED through its freeze entry point\n"
+  if $trx =~ /trx_prepare_for_preserve\s*\([^)]*\)\s*\{[\s\S]*?PRESERVE_FREEZE/;
+my ($freeze) =
+  $trx =~ /(dberr_t\s+trx_freeze_for_preserve\s*\([^)]*\)\s*\{[\s\S]*?^\})/m
+  or die "could not isolate ACTIVE Undo freeze\n";
+die "ACTIVE Undo freeze must remain in-memory and must not increment native prepared accounting\n"
+  unless $freeze =~ /ACTIVE_UNDO_V1/ &&
+         $freeze !~ /trx_prepare_low|TRX_UNDO_PREPARED|n_prepared_trx/;
+my ($innodb_freeze) =
+  $ha_innodb =~ /(dberr_t\s+innobase_preserve_freeze\s*\([^)]*\)\s*\{[\s\S]*?^\})/m
+  or die "could not isolate InnoDB Preserve freeze wrapper\n";
+die "InnoDB Preserve freeze must validate the installed runtime authority without rereading THD XID\n"
+  unless $innodb_freeze =~ /xid_is_preserve_magic/ &&
+         $innodb_freeze !~ /thd_get_xid|trx_preserve_xid_should_be_protected/;
+my ($free_recovered) =
+  $trx =~ /(void\s+trx_free_prepared_or_active_recovered\s*\([^)]*\)\s*\{[\s\S]*?^\})/m
+  or die "could not isolate recovered transaction free path\n";
+die "native ACTIVE cleanup must still require a recovered transaction\n"
+  unless $free_recovered =~ /state\s*==\s*TRX_STATE_ACTIVE[\s\S]*?ut_a\s*\(trx->is_recovered\)/;
+die "source PRESERVED ACTIVE Undo cleanup must not require startup recovery identity\n"
+  unless $free_recovered =~ /TRX_STATE_PRESERVED[\s\S]*?ACTIVE_UNDO_V1[\s\S]*?expected_undo_state\s*=\s*TRX_UNDO_ACTIVE/;
+die "Preserve exact claim still has an XID scan fallback\n"
+  if $trx_preserve =~ /trx_preserve_claim_prepared\s*\(/;
+my ($export_facts) =
+  $trx_preserve =~ /(dberr_t\s+trx_preserve_export_resurrection_facts\s*\([^)]*\)\s*\{[\s\S]*?^\})/m
+  or die "could not isolate ACTIVE Undo resurrection fact export\n";
+die "MIXED resurrection fact export must not reject temp no-redo Undo\n"
+  if $export_facts =~ /m_noredo/;
+die "startup must reserve exact READY candidates immediately after trx-sys initialization\n"
+  unless $srv_start =~ /trx_sys_init_at_db_start\s*\(\s*\)[\s\S]{0,300}preserved_trx_resurrection_index_bootstrap_postamble\s*\(\s*\)/s;
+die "local startup Index eligibility must include persistent-only and mixed transactions\n"
+  unless $preserve =~ /preserve_trx_resurrection_metadata_supports_local_startup_index[\s\S]{0,700}PERSISTENT_ONLY[\s\S]{0,700}MIXED/;
+my ($local_resume) =
+  $preserve =~ /(static\s+bool\s+preserved_trx_resume_record_on_current_thd\([\s\S]*?)(?=^bool\s+Sql_cmd_resume_preserved_transaction::execute)/m
+  or die "could not isolate local SQL RESUME\n";
+my $local_terminal = index($local_resume, 'Preserve_snapshot_consume_state::ACTIVE_CONSUMED');
+my $local_identity_clear =
+  index($local_resume, 'trx_preserve_finish_resumed_activation');
+die "local SQL RESUME must clear ACTIVE Undo identity only after terminal publication\n"
+  unless $local_terminal >= 0 && $local_identity_clear > $local_terminal;
+my ($physical_resume) =
+  $preserve =~ /(static\s+Preserved_trx_promotion_resume_status\s+preserved_trx_resume_adopted_for_promotion_on_current_thd\([^;]*?\)\s*\{[\s\S]*?)(?=^bool\s+Sql_cmd_show_preserved_transactions::execute)/m
+  or die "could not isolate physical SQL RESUME\n";
+my $physical_terminal = index($physical_resume, 'registry.commit_attach');
+my $physical_identity_clear =
+  index($physical_resume, 'trx_preserve_finish_resumed_activation');
+die "physical SQL RESUME must clear ACTIVE Undo identity only after registry ACTIVE publication\n"
+  unless $physical_terminal >= 0 &&
+         $physical_identity_clear > $physical_terminal;
+my ($startup_preamble) =
+  $preserve =~ /(void\s+preserved_trx_resurrection_index_bootstrap_preamble\s*\(\s*\)\s*\{[\s\S]*?)(?=^bool\s+preserved_temp_images_bootstrap_preamble)/m
+  or die "could not isolate startup Resurrection Index preamble\n";
+my $temp_skip = index($startup_preamble,
+                      'preserved_trx_snapshot_allows_synthetic_temp_claim');
+my $index_context = index($startup_preamble, 'store->codec_context');
+die "TEMP_ONLY startup must bypass Resurrection Index identity setup\n"
+  unless $temp_skip >= 0 && $index_context >= 0 && $temp_skip < $index_context;
+EOF
+
+SELECT 'ok' AS unified_active_undo_v1_contract_lint;

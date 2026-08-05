@@ -3,13 +3,16 @@
 --source include/force_restart.inc
 
 CALL mtr.add_suppression("Preserved transaction .* recovery cleanup failed: failed to delete snapshot files before reattach");
+CALL mtr.add_suppression("Preserved transaction .* recovery cleanup failed: failed to delete snapshot files");
 CALL mtr.add_suppression("Preserved transaction batch cleanup failed after target preserve error");
+CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: preserved transaction snapshot tainted");
 
 --disable_warnings
 DROP TABLE IF EXISTS t_batch_logged_cache_failure_record;
 --enable_warnings
 
 SET GLOBAL preserve_trx_enable=ON;
+--let MYSQLD_DATADIR= `SELECT @@datadir`
 
 CREATE TABLE t_batch_logged_cache_failure_record(
   id INT PRIMARY KEY,
@@ -30,29 +33,42 @@ SET SESSION debug="-d,preserve_trx_fail_after_snapshot_rename,preserve_trx_fail_
 
 SELECT COUNT(*) AS preserved_count_after_failure
   FROM performance_schema.preserved_transactions;
---source suite/preserve_trx/include/get_preserved_token.inc
 
---replace_column 1 TOKEN
-SELECT TOKEN, BINLOG_STATE, WROTE_TO_CACHE,
-       BINLOG_CACHE_SIZE > 0 AS BINLOG_CACHE_SIZE_POSITIVE,
-       SESSION_SQL_LOG_BIN, GLOBAL_LOG_BIN
-  FROM performance_schema.preserved_transactions;
+--perl
+use strict;
+use warnings;
+use File::Spec;
+require File::Spec->catfile($ENV{'MYSQL_TEST_DIR'}, 'suite', 'preserve_trx',
+                            'include', 'preserve_snapshot_files.pl');
 
---let $expect_bin= 1
---let $expect_binlog_cache= 1
---source suite/preserve_trx/include/assert_preserve_dir_files.inc
+my $dir = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve');
+my @snapshots = PreserveSnapshotFiles::preserve_snapshot_bin_files($dir);
+my @files = PreserveSnapshotFiles::preserve_all_files($dir);
+my @caches = grep { /\.binlog_cache$/ } @files;
+my @tainted = grep { /\.tainted$/ } @files;
+die "expected one retained snapshot, found " . scalar(@snapshots) . "\n"
+  unless @snapshots == 1;
+die "expected one retained binlog cache, found " . scalar(@caches) . "\n"
+  unless @caches == 1;
+die "expected one tainted marker, found " . scalar(@tainted) . "\n"
+  unless @tainted == 1;
+EOF
 
 --connection batch_logged_cache_failure_app
---error ER_PRESERVE_TRX_SESSION_DRAINED
-SELECT 1;
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 --disconnect batch_logged_cache_failure_app
 
 --connection default
---replace_result $preserved_token TOKEN
---eval RESUME PRESERVED TRANSACTION '$preserved_token'
-COMMIT;
+--let $restart_parameters= restart: --preserve-trx-enable=ON
+--let $do_not_echo_parameters= 1
+--source include/restart_mysqld.inc
+--let $do_not_echo_parameters=
+--let $restart_parameters=
 
+SELECT COUNT(*) AS preserved_count_after_restart
+  FROM performance_schema.preserved_transactions;
 SELECT * FROM t_batch_logged_cache_failure_record ORDER BY id;
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
 
 DROP TABLE t_batch_logged_cache_failure_record;
 SET GLOBAL preserve_trx_enable=ON;

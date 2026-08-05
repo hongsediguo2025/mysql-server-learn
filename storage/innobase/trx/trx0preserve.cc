@@ -83,16 +83,25 @@ bool trx_preserve_xid_should_be_protected(const XID &xid) {
   return preserve_trx_magic_xid_should_be_protected(xid);
 }
 
-bool trx_preserve_xid_is_magic_active(const XID &xid) {
-  return trx_preserve_xid_should_be_protected(xid);
+static std::atomic<uint32_t> trx_preserve_active_preserved_rseg_owners{0};
+static std::atomic_bool trx_preserve_startup_active_undo_upgrade_guard{false};
+
+bool trx_preserve_active_undo_v1_blocks_undo_upgrade() {
+  return trx_preserve_startup_active_undo_upgrade_guard.load(
+             std::memory_order_acquire) ||
+         trx_preserve_active_preserved_rseg_owners.load(
+             std::memory_order_acquire) != 0;
 }
 
-static std::atomic<uint32_t> trx_preserve_active_preserved_rseg_owners{0};
+void trx_preserve_startup_note_active_undo_v1_authority() {
+  trx_preserve_startup_active_undo_upgrade_guard.store(true,
+                                                       std::memory_order_release);
+}
 
 static bool trx_preserve_rseg_owner_counts(const trx_t *trx, int state) {
-  return trx != nullptr &&
-         (state == TRX_STATE_PREPARED || state == TRX_STATE_PRESERVED) &&
-         trx->xid != nullptr && trx_preserve_xid_is_magic_active(*trx->xid);
+  return trx != nullptr && state == TRX_STATE_PRESERVED &&
+         trx->preserve_undo_contract ==
+             trx_preserve_undo_contract::ACTIVE_UNDO_V1;
 }
 
 static void trx_preserve_active_preserved_rseg_owners_inc() {
@@ -122,18 +131,12 @@ void trx_preserve_note_rseg_owner_state_change(trx_t *trx,
   }
 }
 
-void trx_preserve_note_rseg_owner_xid_reset(trx_t *trx) {
-  if (trx_preserve_rseg_owner_counts(trx, trx != nullptr ? trx->state
-                                                         : TRX_STATE_NOT_STARTED)) {
-    trx_preserve_active_preserved_rseg_owners_dec();
-  }
-}
-
-void trx_preserve_note_rseg_owner_xid_restore(trx_t *trx) {
-  if (trx_preserve_rseg_owner_counts(trx, trx != nullptr ? trx->state
-                                                         : TRX_STATE_NOT_STARTED)) {
-    trx_preserve_active_preserved_rseg_owners_inc();
-  }
+static bool trx_preserve_redo_undo_is_active(const trx_t *trx) {
+  return trx != nullptr &&
+         (trx->rsegs.m_redo.insert_undo == nullptr ||
+          trx->rsegs.m_redo.insert_undo->state == TRX_UNDO_ACTIVE) &&
+         (trx->rsegs.m_redo.update_undo == nullptr ||
+          trx->rsegs.m_redo.update_undo->state == TRX_UNDO_ACTIVE);
 }
 
 trx_t *trx_preserve_current_thd_trx(THD *thd) {
@@ -143,6 +146,12 @@ trx_t *trx_preserve_current_thd_trx(THD *thd) {
 uint64_t trx_preserve_current_redo_lsn() {
   if (log_sys == nullptr) return 0;
   return static_cast<uint64_t>(log_get_lsn(*log_sys));
+}
+
+dberr_t trx_preserve_flush_redo_up_to(uint64_t lsn) {
+  if (lsn == 0 || log_sys == nullptr) return DB_ERROR;
+  log_write_up_to(*log_sys, static_cast<lsn_t>(lsn), true);
+  return DB_SUCCESS;
 }
 
 bool trx_preserve_validate_trx_id_store_fact(uint64_t store_value,
@@ -263,12 +272,7 @@ static void trx_preserve_store_state_trx_sys_locked(trx_t *trx,
         trx->mysql_thd != nullptr);
 #endif /* UNIV_DEBUG */
 
-  /*
-    Preserve/resume changes only ACTIVE/PREPARED/PRESERVED list-ownership
-    states. Keep these transitions under trx_sys_mutex, matching InnoDB's
-    ACTIVE->PREPARED path and the list/n_prepared_trx bookkeeping updated
-    beside these stores.
-  */
+  /* Preserve runtime ownership transitions stay under trx_sys_mutex. */
   trx->state = state;
   trx_preserve_note_rseg_owner_state_change(trx, old_state, state);
 }
@@ -285,31 +289,8 @@ static void trx_preserve_store_private_state(trx_t *trx, trx_state_t state) {
   trx_preserve_note_rseg_owner_state_change(trx, old_state, state);
 }
 
-static dberr_t trx_preserve_mark_preserved(trx_t *trx) {
-  ut_ad(trx_sys_mutex_own());
-
-  if (trx == nullptr || trx->xid == nullptr ||
-      !xid_is_preserve_magic(*trx->xid)) {
-    return DB_ERROR;
-  }
-
-  if (trx_state_eq(trx, TRX_STATE_PRESERVED)) {
-    return DB_SUCCESS;
-  }
-
-  if (!trx_state_eq(trx, TRX_STATE_PREPARED)) {
-    return DB_ERROR;
-  }
-
-  ut_a(trx_sys->n_prepared_trx > 0);
-  --trx_sys->n_prepared_trx;
-  trx_preserve_store_state_trx_sys_locked(trx, TRX_STATE_PRESERVED);
-
-  return DB_SUCCESS;
-}
-
 static bool trx_preserve_state_allows_token_rollback(trx_state_t state) {
-  return state == TRX_STATE_PREPARED || state == TRX_STATE_PRESERVED;
+  return state == TRX_STATE_PRESERVED;
 }
 
 enum class trx_preserve_rollback_scope {
@@ -356,13 +337,7 @@ static trx_t *trx_preserve_find_for_token_rollback(
       continue;
     }
 
-    if (trx_state_eq(trx, TRX_STATE_PREPARED) &&
-        trx_preserve_mark_preserved(trx) != DB_SUCCESS) {
-      return nullptr;
-    }
-
     *claimed_xid = *trx->xid;
-    trx_preserve_note_rseg_owner_xid_reset(trx);
     trx->xid->reset();
     return trx;
   }
@@ -375,73 +350,21 @@ static void trx_preserve_release_token_rollback_claim(trx_t *trx,
   trx_sys_mutex_enter();
   if (trx->xid->is_null()) {
     *trx->xid = xid;
-    trx_preserve_note_rseg_owner_xid_restore(trx);
   }
   trx_sys_mutex_exit();
 }
 
-trx_t *trx_preserve_claim_prepared(const XID &xid) {
-  if (!xid_is_preserve_magic(xid)) {
-    return nullptr;
-  }
-  DBUG_EXECUTE_IF("preserve_trx_fail_xid_lookup_claim", return nullptr;);
-
-  trx_t *claimed = nullptr;
-
-  trx_sys_mutex_enter();
-
-  for (trx_t *trx = UT_LIST_GET_FIRST(trx_sys->rw_trx_list); trx != nullptr;
-       trx = UT_LIST_GET_NEXT(trx_list, trx)) {
-    assert_trx_in_rw_list(trx);
-
-    if (trx->mysql_thd == nullptr && !trx->preserve_trx_claimed &&
-        trx_state_eq(trx, TRX_STATE_PREPARED) && xid.eq(trx->xid) &&
-        trx_preserve_mark_preserved(trx) == DB_SUCCESS) {
-      trx->preserve_trx_claimed = true;
-      claimed = trx;
-      break;
-    }
-  }
-
-  trx_sys_mutex_exit();
-
-  return claimed;
-}
-
-bool trx_preserve_probe_detached_prepared(const XID &xid) {
-  if (!xid_is_preserve_magic(xid) || trx_sys == nullptr) return false;
-
-  bool found = false;
-
-  trx_sys_mutex_enter();
-
-  for (trx_t *trx = UT_LIST_GET_FIRST(trx_sys->rw_trx_list); trx != nullptr;
-       trx = UT_LIST_GET_NEXT(trx_list, trx)) {
-    assert_trx_in_rw_list(trx);
-
-    if (trx->mysql_thd == nullptr && !trx->preserve_trx_claimed &&
-        trx_state_eq(trx, TRX_STATE_PREPARED) && xid.eq(trx->xid)) {
-      found = true;
-      break;
-    }
-  }
-
-  trx_sys_mutex_exit();
-
-  return found;
-}
-
-static dberr_t trx_preserve_claim_detached_prepared_low(
+static dberr_t trx_preserve_claim_detached_active_undo_low(
     trx_t *trx, const XID *expected_xid) {
   dberr_t err;
 
   trx_sys_mutex_enter();
   if (trx == nullptr || trx->mysql_thd != nullptr ||
-      trx->preserve_trx_claimed || !trx_state_eq(trx, TRX_STATE_PREPARED) ||
+      trx->preserve_trx_claimed || !trx_state_eq(trx, TRX_STATE_PRESERVED) ||
+      trx->preserve_undo_contract !=
+          trx_preserve_undo_contract::ACTIVE_UNDO_V1 ||
       trx->xid == nullptr ||
       (expected_xid != nullptr && !expected_xid->eq(trx->xid))) {
-    err = DB_ERROR;
-  } else if (trx_preserve_mark_preserved(trx) != DB_SUCCESS) {
     err = DB_ERROR;
   } else {
     trx->preserve_trx_claimed = true;
@@ -452,14 +375,36 @@ static dberr_t trx_preserve_claim_detached_prepared_low(
   return err;
 }
 
-dberr_t trx_preserve_claim_detached_prepared(trx_t *trx) {
-  return trx_preserve_claim_detached_prepared_low(trx, nullptr);
+dberr_t trx_preserve_claim_detached_active_undo(trx_t *trx) {
+  return trx_preserve_claim_detached_active_undo_low(trx, nullptr);
 }
 
-dberr_t trx_preserve_claim_detached_prepared_exact(
+dberr_t trx_preserve_claim_detached_active_undo_exact(
     trx_t *trx, const XID &expected_xid) {
   if (!xid_is_preserve_magic(expected_xid)) return DB_ERROR;
-  return trx_preserve_claim_detached_prepared_low(trx, &expected_xid);
+  return trx_preserve_claim_detached_active_undo_low(trx, &expected_xid);
+}
+
+bool trx_preserve_validate_reserved_exact(trx_t *trx,
+                                          const XID &expected_xid) {
+  if (!xid_is_preserve_magic(expected_xid) || trx_sys == nullptr) return false;
+  trx_sys_mutex_enter();
+  const bool valid =
+      trx != nullptr && trx->mysql_thd == nullptr &&
+      trx->preserve_trx_claimed && trx_state_eq(trx, TRX_STATE_PRESERVED) &&
+      trx->preserve_undo_contract ==
+          trx_preserve_undo_contract::ACTIVE_UNDO_V1 &&
+      trx->xid != nullptr && expected_xid.eq(trx->xid) &&
+      trx_preserve_redo_undo_is_active(trx);
+  trx_sys_mutex_exit();
+  return valid;
+}
+
+bool trx_preserve_validate_reserved_authority(
+    trx_t *trx, const std::string &authority_token) {
+  XID expected_xid;
+  return trx_preserve_token_to_xid(authority_token.c_str(), &expected_xid) &&
+         trx_preserve_validate_reserved_exact(trx, expected_xid);
 }
 
 dberr_t trx_preserve_rollback_by_token(const char *token) {
@@ -550,13 +495,7 @@ dberr_t trx_preserve_rollback_claimed(trx_t *trx) {
   if (trx->mysql_thd == nullptr && trx->preserve_trx_claimed &&
       trx->xid != nullptr && xid_is_preserve_magic(*trx->xid) &&
       trx_preserve_state_allows_token_rollback(trx->state)) {
-    if (trx_state_eq(trx, TRX_STATE_PREPARED) &&
-        trx_preserve_mark_preserved(trx) != DB_SUCCESS) {
-      trx_sys_mutex_exit();
-      return DB_ERROR;
-    }
     claimed_xid = *trx->xid;
-    trx_preserve_note_rseg_owner_xid_reset(trx);
     trx->xid->reset();
     trx->preserve_trx_claimed = false;
     claimed = true;
@@ -576,7 +515,6 @@ dberr_t trx_preserve_rollback_claimed(trx_t *trx) {
     trx_sys_mutex_enter();
     if (trx->xid->is_null()) {
       *trx->xid = claimed_xid;
-      trx_preserve_note_rseg_owner_xid_restore(trx);
       trx->preserve_trx_claimed = true;
     }
     trx_sys_mutex_exit();
@@ -610,72 +548,6 @@ bool trx_preserve_token_has_any_owner(const char *token) {
   return found;
 }
 
-static bool trx_preserve_xid_token_in(
-    const XID &xid, const std::vector<std::string> &tokens) {
-  if (!xid_is_preserve_magic(xid)) return false;
-
-  const char *token =
-      xid.get_data() + static_cast<size_t>(PRESERVE_TRX_XID_GTRID_LENGTH);
-  const size_t token_length = static_cast<size_t>(xid.get_bqual_length());
-
-  for (const std::string &snapshot_token : tokens) {
-    if (snapshot_token.length() == token_length &&
-        std::memcmp(snapshot_token.c_str(), token, token_length) == 0) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-dberr_t trx_preserve_rollback_prepared_without_snapshot(
-    const std::vector<std::string> &snapshot_tokens, uint32_t *rolled_back,
-    std::vector<std::string> *rolled_back_tokens) {
-  if (rolled_back != nullptr) *rolled_back = 0;
-  if (rolled_back_tokens != nullptr) rolled_back_tokens->clear();
-  if (trx_sys == nullptr) return DB_SUCCESS;
-
-  for (;;) {
-    trx_t *trx = nullptr;
-
-    trx_sys_mutex_enter();
-    for (trx_t *candidate = UT_LIST_GET_FIRST(trx_sys->rw_trx_list);
-         candidate != nullptr;
-         candidate = UT_LIST_GET_NEXT(trx_list, candidate)) {
-      assert_trx_in_rw_list(candidate);
-
-      if (candidate->mysql_thd == nullptr &&
-          !candidate->preserve_trx_claimed &&
-          trx_state_eq(candidate, TRX_STATE_PREPARED) &&
-          candidate->xid != nullptr &&
-          xid_is_preserve_magic(*candidate->xid) &&
-          trx_preserve_xid_should_be_protected(*candidate->xid) &&
-          !trx_preserve_xid_token_in(*candidate->xid, snapshot_tokens)) {
-        candidate->preserve_trx_claimed = true;
-        trx = candidate;
-        break;
-      }
-    }
-    trx_sys_mutex_exit();
-
-    if (trx == nullptr) return DB_SUCCESS;
-
-    std::string token;
-    if (rolled_back_tokens != nullptr && trx->xid != nullptr) {
-      const char *token_data =
-          trx->xid->get_data() + PRESERVE_TRX_XID_GTRID_LENGTH;
-      token.assign(token_data,
-                   static_cast<size_t>(trx->xid->get_bqual_length()));
-    }
-    const dberr_t err = trx_preserve_rollback_claimed(trx);
-    if (err != DB_SUCCESS) return err;
-
-    if (rolled_back != nullptr) ++*rolled_back;
-    if (rolled_back_tokens != nullptr)
-      rolled_back_tokens->push_back(std::move(token));
-  }
-}
-
 dberr_t trx_preserve_prepare_resumed_rollback_gtid(trx_t *trx) {
   if (trx == nullptr || trx->xid == nullptr ||
       !xid_is_preserve_magic(*trx->xid)) {
@@ -690,129 +562,11 @@ dberr_t trx_preserve_prepare_resumed_rollback_gtid(trx_t *trx) {
   return trx_undo_gtid_add_update_undo(trx, false, true);
 }
 
-static dberr_t trx_preserve_activate_undo_ptr_state_deferred_flush(
-    trx_t *trx, trx_undo_ptr_t *undo_ptr, bool no_redo, lsn_t *max_lsn) {
-  if (undo_ptr->rseg == nullptr ||
-      (undo_ptr->insert_undo == nullptr && undo_ptr->update_undo == nullptr)) {
-    return DB_SUCCESS;
-  }
-
-  mtr_t mtr;
-
-  mtr.start();
-  if (no_redo) {
-    mtr.set_log_mode(MTR_LOG_NO_REDO);
-  }
-  undo_ptr->rseg->latch();
-
-  if (undo_ptr->insert_undo != nullptr) {
-    if (!(no_redo && undo_ptr->insert_undo->state == TRX_UNDO_ACTIVE)) {
-      trx_undo_set_state_at_prepare(trx, undo_ptr->insert_undo, true, &mtr);
-      undo_ptr->insert_undo->state = TRX_UNDO_ACTIVE;
-    }
-  }
-
-  if (undo_ptr->update_undo != nullptr) {
-    if (!no_redo) {
-      trx_undo_gtid_set(trx, undo_ptr->update_undo);
-    }
-    if (!(no_redo && undo_ptr->update_undo->state == TRX_UNDO_ACTIVE)) {
-      trx_undo_set_state_at_prepare(trx, undo_ptr->update_undo, true, &mtr);
-      undo_ptr->update_undo->state = TRX_UNDO_ACTIVE;
-    }
-  }
-
-  undo_ptr->rseg->unlatch();
-  mtr.commit();
-  if (!no_redo) {
-    const lsn_t lsn = mtr.commit_lsn();
-    ut_ad(lsn > 0 || !mtr_t::s_logging.is_enabled());
-    if (max_lsn != nullptr) *max_lsn = std::max(*max_lsn, lsn);
-  }
-
-  return DB_SUCCESS;
-}
-
-static dberr_t trx_preserve_activate_undo_ptr_state(trx_t *trx,
-                                                    trx_undo_ptr_t *undo_ptr,
-                                                    bool no_redo) {
-  lsn_t max_lsn = 0;
-  const dberr_t err = trx_preserve_activate_undo_ptr_state_deferred_flush(
-      trx, undo_ptr, no_redo, &max_lsn);
-  if (err == DB_SUCCESS && max_lsn > 0) {
-    log_write_up_to(*log_sys, max_lsn, true);
-  }
-  return err;
-}
-
-dberr_t trx_preserve_handoff_recovered_prepared_to_native_rollback(
-    const std::vector<trx_t *> &transactions) {
-  if (transactions.empty()) return DB_SUCCESS;
-  if (trx_sys == nullptr) return DB_ERROR;
-
-  std::set<trx_t *> unique;
-  try {
-    unique.insert(transactions.begin(), transactions.end());
-  } catch (const std::bad_alloc &) {
-    return DB_OUT_OF_MEMORY;
-  }
-  if (unique.size() != transactions.size() || unique.count(nullptr) != 0) {
-    return DB_ERROR;
-  }
-
-  const auto valid = [](trx_t *trx) -> bool {
-    return trx != nullptr && trx->xid != nullptr && trx->is_recovered &&
-           trx->mysql_thd == nullptr && !trx->preserve_trx_claimed &&
-           trx_state_eq(trx, TRX_STATE_PREPARED) &&
-           xid_is_preserve_magic(*trx->xid) &&
-           trx_preserve_xid_should_be_protected(*trx->xid);
-  };
-
-  trx_sys_mutex_enter();
-  const bool all_valid =
-      std::all_of(transactions.begin(), transactions.end(), valid) &&
-      trx_sys->n_prepared_trx >= transactions.size();
-  trx_sys_mutex_exit();
-  if (!all_valid) return DB_ERROR;
-
-  lsn_t max_lsn = 0;
-  for (trx_t *trx : transactions) {
-    dberr_t err = trx_preserve_activate_undo_ptr_state_deferred_flush(
-        trx, &trx->rsegs.m_redo, false, &max_lsn);
-    if (err == DB_SUCCESS) {
-      err = trx_preserve_activate_undo_ptr_state_deferred_flush(
-          trx, &trx->rsegs.m_noredo, true, &max_lsn);
-    }
-    if (err != DB_SUCCESS) return err;
-  }
-  if (max_lsn > 0) log_write_up_to(*log_sys, max_lsn, true);
-
-  trx_sys_mutex_enter();
-  if (!std::all_of(transactions.begin(), transactions.end(), valid) ||
-      trx_sys->n_prepared_trx < transactions.size()) {
-    trx_sys_mutex_exit();
-    return DB_ERROR;
-  }
-  for (trx_t *trx : transactions) {
-    --trx_sys->n_prepared_trx;
-    trx_preserve_store_state_trx_sys_locked(trx, TRX_STATE_ACTIVE);
-    trx->no = TRX_ID_MAX;
-  }
-  trx_sys_mutex_exit();
-  return DB_SUCCESS;
-}
-
-static dberr_t trx_preserve_activate_undo_state(trx_t *trx) {
-  dberr_t err = trx_preserve_activate_undo_ptr_state(
-      trx, &trx->rsegs.m_redo, false);
-  if (err != DB_SUCCESS) return err;
-
-  return trx_preserve_activate_undo_ptr_state(trx, &trx->rsegs.m_noredo, true);
-}
-
 dberr_t trx_preserve_activate_resumed(trx_t *trx) {
   if (trx == nullptr || trx->xid == nullptr ||
-      !xid_is_preserve_magic(*trx->xid)) {
+      !xid_is_preserve_magic(*trx->xid) ||
+      trx->preserve_undo_contract !=
+          trx_preserve_undo_contract::ACTIVE_UNDO_V1) {
     return DB_ERROR;
   }
 
@@ -823,33 +577,30 @@ dberr_t trx_preserve_activate_resumed(trx_t *trx) {
 
   DBUG_EXECUTE_IF("preserve_trx_fail_activate_resumed", return DB_ERROR;);
 
-  return trx_preserve_activate_undo_state(trx);
+  return DB_SUCCESS;
 }
 
-dberr_t trx_preserve_reactivate_prepared_in_original_thd(THD *thd) {
-  if (thd == nullptr) return DB_ERROR;
-
-  trx_t *trx = thd_to_trx(thd);
-  if (trx == nullptr || trx->xid == nullptr ||
-      !xid_is_preserve_magic(*trx->xid) || trx->mysql_thd != thd ||
-      trx->preserve_trx_claimed) {
+dberr_t trx_preserve_finish_resumed_activation(trx_t *trx, THD *thd) {
+  if (trx == nullptr || thd == nullptr || trx->xid == nullptr ||
+      !xid_is_preserve_magic(*trx->xid)) {
     return DB_ERROR;
   }
 
   dberr_t err = DB_SUCCESS;
   trx_sys_mutex_enter();
-  if (!trx_state_eq(trx, TRX_STATE_PREPARED) || trx->mysql_thd != thd ||
-      trx->preserve_trx_claimed) {
+  if (!trx_state_eq(trx, TRX_STATE_ACTIVE) || trx->mysql_thd != thd ||
+      trx->preserve_trx_claimed ||
+      trx->preserve_undo_contract !=
+          trx_preserve_undo_contract::ACTIVE_UNDO_V1) {
     err = DB_ERROR;
   } else {
-    ut_a(trx_sys->n_prepared_trx > 0);
-    --trx_sys->n_prepared_trx;
-    trx_preserve_store_state_trx_sys_locked(trx, TRX_STATE_ACTIVE);
+    trx->preserve_undo_contract = trx_preserve_undo_contract::NONE;
+    trx->preserve_freeze_lsn = 0;
+    trx->xid->reset();
   }
   trx_sys_mutex_exit();
 
-  if (err != DB_SUCCESS) return err;
-  return trx_preserve_activate_undo_state(trx);
+  return err;
 }
 
 const char *trx_preserve_thd_transition_failure_name(
@@ -908,28 +659,17 @@ dberr_t trx_preserve_reactivate_prepare_failure_in_original_thd(
   if (trx->preserve_trx_claimed)
     return fail(trx_preserve_thd_transition_failure::CLAIMED);
 
-  bool was_prepared = false;
   dberr_t err = DB_SUCCESS;
   trx_sys_mutex_enter();
-  if (trx_state_eq(trx, TRX_STATE_PREPARED)) {
-    if (trx->mysql_thd != thd || trx->preserve_trx_claimed) {
-      err = DB_ERROR;
-      if (reason != nullptr) {
-        *reason = trx->mysql_thd != thd
-                      ? trx_preserve_thd_transition_failure::THD_MISMATCH
-                      : trx_preserve_thd_transition_failure::CLAIMED;
-      }
-    } else {
-      ut_a(trx_sys->n_prepared_trx > 0);
-      --trx_sys->n_prepared_trx;
-      trx_preserve_store_state_trx_sys_locked(trx, TRX_STATE_ACTIVE);
-      was_prepared = true;
-    }
-  } else if (!trx_state_eq(trx, TRX_STATE_ACTIVE) || trx->mysql_thd != thd ||
-             trx->preserve_trx_claimed) {
+  if (!trx_state_eq(trx, TRX_STATE_ACTIVE) || trx->mysql_thd != thd ||
+      trx->preserve_trx_claimed ||
+      trx->preserve_undo_contract !=
+          trx_preserve_undo_contract::ACTIVE_UNDO_V1) {
     err = DB_ERROR;
     if (reason != nullptr) {
-      if (!trx_state_eq(trx, TRX_STATE_ACTIVE)) {
+      if (!trx_state_eq(trx, TRX_STATE_ACTIVE) ||
+          trx->preserve_undo_contract !=
+              trx_preserve_undo_contract::ACTIVE_UNDO_V1) {
         *reason =
             trx_preserve_thd_transition_failure::NOT_ACTIVE_OR_PREPARED;
       } else if (trx->mysql_thd != thd) {
@@ -938,22 +678,19 @@ dberr_t trx_preserve_reactivate_prepare_failure_in_original_thd(
         *reason = trx_preserve_thd_transition_failure::CLAIMED;
       }
     }
+  } else {
+    trx->preserve_undo_contract = trx_preserve_undo_contract::NONE;
+    trx->preserve_freeze_lsn = 0;
+    trx->xid->reset();
   }
   trx_sys_mutex_exit();
 
-  if (err != DB_SUCCESS) return err;
-  if (!was_prepared) return DB_SUCCESS;
-  err = trx_preserve_activate_undo_state(trx);
-  if (err != DB_SUCCESS && reason != nullptr) {
-    *reason = trx_preserve_thd_transition_failure::UNDO_ACTIVATE_FAILED;
-  }
   return err;
 }
 
 dberr_t trx_preserve_activate_reattached_in_original_thd(trx_t *trx,
                                                         THD *thd) {
-  if (trx == nullptr || thd == nullptr || trx->xid == nullptr ||
-      !xid_is_preserve_magic(*trx->xid)) {
+  if (trx == nullptr || thd == nullptr) {
     return DB_ERROR;
   }
 
@@ -965,7 +702,7 @@ dberr_t trx_preserve_activate_reattached_in_original_thd(trx_t *trx,
   DBUG_EXECUTE_IF("preserve_trx_fail_activate_reattached_original",
                   return DB_ERROR;);
 
-  return trx_preserve_activate_undo_state(trx);
+  return DB_SUCCESS;
 }
 
 bool trx_preserve_is_active_attached_to_thd(trx_t *trx, THD *thd) {
@@ -982,22 +719,17 @@ bool trx_preserve_is_active_attached_to_thd(trx_t *trx, THD *thd) {
 
 static dberr_t trx_preserve_make_temp_only_claimable(trx_t *trx);
 
-/*
-  Prepare the current transaction using Preserve freeze semantics.
-
-  Redo, mixed and temp-only transactions share the same prepare operation.
-  Temp-only transactions first acquire the rw-list/rseg bookkeeping needed by
-  claim and rollback. Unlike native XA prepare, this path retains every lock
-  and other transaction resource owned by the source transaction.
-*/
-dberr_t trx_preserve_prepare_current(THD *thd, const XID &xid) {
+/* Freeze the current transaction without changing persistent Undo state. */
+dberr_t trx_preserve_freeze_current(THD *thd, const XID &xid) {
   if (thd == nullptr || !xid_is_preserve_magic(xid)) return DB_ERROR;
 
   trx_t *trx = thd_to_trx(thd);
   if (trx == nullptr) return DB_ERROR;
 
-  if (trx_state_eq(trx, TRX_STATE_PREPARED)) {
-    return trx->xid != nullptr && xid_is_preserve_magic(*trx->xid)
+  if (trx->preserve_undo_contract ==
+      trx_preserve_undo_contract::ACTIVE_UNDO_V1) {
+    return trx_state_eq(trx, TRX_STATE_ACTIVE) && trx->xid != nullptr &&
+                   xid.eq(trx->xid)
                ? DB_SUCCESS
                : DB_ERROR;
   }
@@ -1014,7 +746,9 @@ dberr_t trx_preserve_prepare_current(THD *thd, const XID &xid) {
   }
 
   *trx->xid = xid;
-  return innobase_preserve_prepare(thd);
+  const dberr_t err = innobase_preserve_freeze(thd);
+  if (err != DB_SUCCESS) trx->xid->reset();
+  return err;
 }
 
 static void trx_preserve_add_to_rw_trx_list_ordered(trx_t *trx) {
@@ -1118,6 +852,8 @@ trx_t *trx_preserve_create_temp_only_claimed(const XID &xid, uint64_t trx_id) {
   trx->will_lock = 1;
   trx->is_recovered = true;
   trx->preserve_trx_claimed = true;
+  trx->preserve_undo_contract =
+      trx_preserve_undo_contract::ACTIVE_UNDO_V1;
   trx_preserve_store_private_state(trx, TRX_STATE_PRESERVED);
 
   trx_assign_rseg_durable(trx);
@@ -1126,6 +862,7 @@ trx_t *trx_preserve_create_temp_only_claimed(const XID &xid, uint64_t trx_id) {
     trx_preserve_store_private_state(trx, TRX_STATE_NOT_STARTED);
     trx->xid->reset();
     trx->preserve_trx_claimed = false;
+    trx->preserve_undo_contract = trx_preserve_undo_contract::NONE;
     trx->will_lock = 0;
     trx->is_recovered = false;
     trx_free_for_background(trx);
@@ -1146,6 +883,7 @@ trx_t *trx_preserve_create_temp_only_claimed(const XID &xid, uint64_t trx_id) {
     trx_preserve_store_private_state(trx, TRX_STATE_NOT_STARTED);
     trx->xid->reset();
     trx->preserve_trx_claimed = false;
+    trx->preserve_undo_contract = trx_preserve_undo_contract::NONE;
     trx->will_lock = 0;
     trx->is_recovered = false;
     trx_free_for_background(trx);
@@ -1178,6 +916,9 @@ uint64_t trx_preserve_trx_id(const trx_t *trx) {
 void trx_preserve_release_claim_before_free(trx_t *trx) {
   if (trx != nullptr) {
     trx->preserve_trx_claimed = false;
+    trx->preserve_undo_contract = trx_preserve_undo_contract::NONE;
+    trx->preserve_freeze_lsn = 0;
+    if (trx->xid != nullptr) trx->xid->reset();
   }
 }
 
@@ -1319,23 +1060,33 @@ dberr_t trx_preserve_export_modified_table_names(
 }
 
 dberr_t trx_preserve_export_resurrection_facts(
-    trx_t *trx, uint32_t max_modified_tables,
+    trx_t *trx, const std::string &authority_token,
+    uint32_t max_modified_tables,
     trx_preserve_resurrection_facts *facts) {
-  if (trx == nullptr || facts == nullptr || trx->xid == nullptr ||
-      trx->state != TRX_STATE_PREPARED || trx->preserve_prepare_lsn == 0 ||
+  /* MIXED transactions authenticate temp no-redo state through the sidecar. */
+  if (trx == nullptr || facts == nullptr || authority_token.empty() ||
+      trx->xid == nullptr ||
+      trx->state != TRX_STATE_PRESERVED ||
+      trx->preserve_undo_contract !=
+          trx_preserve_undo_contract::ACTIVE_UNDO_V1 ||
+      trx->preserve_freeze_lsn == 0 ||
       trx->id == 0 || trx->rsegs.m_redo.rseg == nullptr ||
       (trx->rsegs.m_redo.insert_undo == nullptr &&
        trx->rsegs.m_redo.update_undo == nullptr) ||
-      trx->rsegs.m_noredo.insert_undo != nullptr ||
-      trx->rsegs.m_noredo.update_undo != nullptr ||
       trx->mod_tables.size() > max_modified_tables) {
     return DB_UNSUPPORTED;
   }
+  if ((trx->rsegs.m_redo.insert_undo != nullptr &&
+       trx->rsegs.m_redo.insert_undo->state != TRX_UNDO_ACTIVE) ||
+      (trx->rsegs.m_redo.update_undo != nullptr &&
+       trx->rsegs.m_redo.update_undo->state != TRX_UNDO_ACTIVE)) {
+    return DB_ERROR;
+  }
 
   trx_preserve_resurrection_facts exported;
+  exported.authority_token = authority_token;
   exported.trx_id = trx->id;
-  exported.prepare_lsn = trx->preserve_prepare_lsn;
-  exported.xid = *trx->xid;
+  exported.freeze_lsn = trx->preserve_freeze_lsn;
 
   const auto add_anchor = [&](const trx_undo_t *undo,
                               trx_preserve_resurrection_undo_kind kind) {
@@ -1377,10 +1128,14 @@ namespace {
 std::mutex trx_preserve_startup_resurrection_mutex;
 std::map<uint64_t, trx_preserve_resurrection_facts>
     trx_preserve_startup_resurrection_candidates;
+std::map<std::string, trx_preserve_resurrection_facts>
+    trx_preserve_startup_resurrection_expected;
 /* Valid only between trx_sys startup resurrection and completion of
-preserved_trx_recover_all(), before recovered PREPARED transactions can be
-freed by normal server work. */
+preserved_trx_recover_all(), before recovered transactions can be freed by
+normal server work. */
 std::map<std::string, trx_t *> trx_preserve_startup_resurrection_verified;
+std::map<std::string, trx_t *>
+    trx_preserve_startup_lock_resurrection_failures;
 std::atomic_bool trx_preserve_startup_resurrection_metrics_enabled{false};
 std::atomic<uint64_t> trx_preserve_startup_resurrection_candidates_count{0};
 std::atomic<uint64_t> trx_preserve_startup_resurrection_index_hits{0};
@@ -1392,14 +1147,18 @@ std::atomic<uint64_t> trx_preserve_startup_resurrection_undo_body_records{0};
 bool trx_preserve_resurrection_anchor_equal(
     const trx_preserve_resurrection_undo_anchor &left,
     const trx_preserve_resurrection_undo_anchor &right) {
-  return left.kind == right.kind &&
-         left.rseg_space_id == right.rseg_space_id &&
-         left.undo_slot == right.undo_slot &&
-         left.hdr_page_no == right.hdr_page_no &&
-         left.hdr_offset == right.hdr_offset &&
-         left.top_page_no == right.top_page_no &&
-         left.top_offset == right.top_offset &&
-         left.top_undo_no == right.top_undo_no && left.empty == right.empty;
+  if (left.kind != right.kind ||
+      left.rseg_space_id != right.rseg_space_id ||
+      left.undo_slot != right.undo_slot ||
+      left.hdr_page_no != right.hdr_page_no ||
+      left.hdr_offset != right.hdr_offset ||
+      left.top_page_no != right.top_page_no || left.empty != right.empty) {
+    return false;
+  }
+
+  /* Recovery canonicalizes the cursor of an empty Undo segment to zero. */
+  return left.empty || (left.top_offset == right.top_offset &&
+                        left.top_undo_no == right.top_undo_no);
 }
 
 bool trx_preserve_resurrection_xid_token(const XID &xid,
@@ -1413,10 +1172,9 @@ bool trx_preserve_resurrection_xid_token(const XID &xid,
 
 bool trx_preserve_resurrection_facts_valid(
     const trx_preserve_resurrection_facts &facts) {
-  if (facts.trx_id == 0 || facts.prepare_lsn == 0 ||
-      facts.xid.get_format_id() == -1 || facts.xid.get_gtrid_length() <= 0 ||
-      facts.xid.get_gtrid_length() > 64 || facts.xid.get_bqual_length() < 0 ||
-      facts.xid.get_bqual_length() > 64 || facts.undo_anchors.empty() ||
+  if (facts.authority_token.empty() ||
+      facts.authority_token.size() > PRESERVE_TRX_TOKEN_MAX_LENGTH ||
+      facts.trx_id == 0 || facts.freeze_lsn == 0 || facts.undo_anchors.empty() ||
       facts.undo_anchors.size() > 2) {
     return false;
   }
@@ -1462,7 +1220,9 @@ void trx_preserve_add_startup_anchor(
 void trx_preserve_startup_resurrection_reset() {
   std::lock_guard<std::mutex> guard(trx_preserve_startup_resurrection_mutex);
   trx_preserve_startup_resurrection_candidates.clear();
+  trx_preserve_startup_resurrection_expected.clear();
   trx_preserve_startup_resurrection_verified.clear();
+  trx_preserve_startup_lock_resurrection_failures.clear();
   trx_preserve_startup_resurrection_candidates_count.store(
       0, std::memory_order_release);
   trx_preserve_startup_resurrection_index_hits.store(0,
@@ -1482,10 +1242,17 @@ void trx_preserve_startup_resurrection_reset() {
 dberr_t trx_preserve_startup_register_resurrection_candidate(
     const trx_preserve_resurrection_facts &facts) {
   if (!trx_preserve_resurrection_facts_valid(facts)) return DB_ERROR;
+  trx_preserve_startup_note_active_undo_v1_authority();
   std::lock_guard<std::mutex> guard(trx_preserve_startup_resurrection_mutex);
   if (!trx_preserve_startup_resurrection_candidates.emplace(facts.trx_id,
                                                              facts)
            .second) {
+    return DB_ERROR;
+  }
+  if (!trx_preserve_startup_resurrection_expected
+           .emplace(facts.authority_token, facts)
+           .second) {
+    trx_preserve_startup_resurrection_candidates.erase(facts.trx_id);
     return DB_ERROR;
   }
   trx_preserve_startup_resurrection_candidates_count.fetch_add(
@@ -1540,19 +1307,17 @@ trx_preserve_startup_validate_resurrection_candidate(
   }
   const bool matches =
       trx_preserve_resurrection_facts_valid(actual) &&
-      actual.prepare_lsn == expected.prepare_lsn &&
-      actual.xid.eq(&expected.xid) && anchors_match;
+      actual.freeze_lsn == expected.freeze_lsn &&
+      actual.authority_token == expected.authority_token && anchors_match;
   if (!matches) {
     trx_preserve_startup_resurrection_fallbacks.fetch_add(
         1, std::memory_order_relaxed);
     return trx_preserve_startup_resurrection_result::FALLBACK;
   }
   if (verified_trx != nullptr) {
-    std::string token;
     std::lock_guard<std::mutex> guard(trx_preserve_startup_resurrection_mutex);
-    if (!trx_preserve_resurrection_xid_token(expected.xid, &token) ||
-        !trx_preserve_startup_resurrection_verified
-             .emplace(std::move(token), verified_trx)
+    if (!trx_preserve_startup_resurrection_verified
+             .emplace(expected.authority_token, verified_trx)
              .second) {
       trx_preserve_startup_resurrection_fallbacks.fetch_add(
           1, std::memory_order_relaxed);
@@ -1568,10 +1333,13 @@ trx_preserve_startup_validate_resurrection_candidate(
 trx_preserve_startup_resurrection_result
 trx_preserve_startup_apply_resurrection_candidate(
     trx_t *trx, std::vector<uint64_t> *modified_table_ids) {
-  if (trx == nullptr || trx->xid == nullptr || modified_table_ids == nullptr) {
+  if (trx == nullptr || modified_table_ids == nullptr || !trx->is_recovered ||
+      !trx_state_eq(trx, TRX_STATE_ACTIVE) ||
+      !trx_preserve_redo_undo_is_active(trx)) {
     return trx_preserve_startup_resurrection_result::FALLBACK;
   }
-  uint64_t prepare_lsn = 0;
+  uint64_t freeze_lsn = 0;
+  std::string authority_token;
   {
     std::lock_guard<std::mutex> guard(trx_preserve_startup_resurrection_mutex);
     auto candidate =
@@ -1579,13 +1347,14 @@ trx_preserve_startup_apply_resurrection_candidate(
     if (candidate == trx_preserve_startup_resurrection_candidates.end()) {
       return trx_preserve_startup_resurrection_result::NOT_CANDIDATE;
     }
-    prepare_lsn = candidate->second.prepare_lsn;
+    freeze_lsn = candidate->second.freeze_lsn;
+    authority_token = candidate->second.authority_token;
   }
 
   trx_preserve_resurrection_facts actual;
+  actual.authority_token = std::move(authority_token);
   actual.trx_id = trx->id;
-  actual.prepare_lsn = prepare_lsn;
-  actual.xid = *trx->xid;
+  actual.freeze_lsn = freeze_lsn;
   trx_preserve_add_startup_anchor(
       trx->rsegs.m_redo.insert_undo,
       trx_preserve_resurrection_undo_kind::INSERT, &actual.undo_anchors);
@@ -1596,107 +1365,185 @@ trx_preserve_startup_apply_resurrection_candidate(
       trx_preserve_startup_validate_resurrection_candidate(
           actual, modified_table_ids, trx);
   if (result == trx_preserve_startup_resurrection_result::INDEXED) {
-    trx->preserve_prepare_lsn = prepare_lsn;
+    trx->preserve_freeze_lsn = freeze_lsn;
   }
   return result;
 }
 
-trx_t *trx_preserve_startup_resurrection_find_verified(const XID &xid) {
-  std::string token;
-  if (!trx_preserve_resurrection_xid_token(xid, &token)) return nullptr;
+trx_t *trx_preserve_startup_resurrection_find_verified(
+    const std::string &authority_token) {
+  if (authority_token.empty()) return nullptr;
   std::lock_guard<std::mutex> guard(trx_preserve_startup_resurrection_mutex);
-  const auto found = trx_preserve_startup_resurrection_verified.find(token);
+  const auto found =
+      trx_preserve_startup_resurrection_verified.find(authority_token);
   return found == trx_preserve_startup_resurrection_verified.end()
              ? nullptr
              : found->second;
 }
 
-dberr_t trx_preserve_resolve_recovered_prepared_batch(
-    const std::vector<trx_preserve_resurrection_facts> &expected,
-    std::vector<trx_t *> *transactions) {
-  if (transactions == nullptr || trx_sys == nullptr) return DB_ERROR;
-  transactions->clear();
-  if (expected.empty()) return DB_SUCCESS;
+dberr_t trx_preserve_startup_reserve_verified(
+    trx_preserve_startup_reservation_result *result) {
+  if (result == nullptr || trx_sys == nullptr) return DB_ERROR;
+  result->reserved_authorities.clear();
+  result->rejected_authorities.clear();
 
-  std::map<uint64_t, size_t> expected_by_trx_id;
-  std::set<std::string> expected_tokens;
-  std::vector<trx_t *> resolved;
+  struct Reservation {
+    std::string authority;
+    trx_preserve_resurrection_facts facts;
+    trx_t *trx{nullptr};
+    XID xid;
+    bool valid{false};
+  };
+  std::vector<Reservation> reservations;
   try {
-    resolved.assign(expected.size(), nullptr);
-    for (size_t index = 0; index < expected.size(); ++index) {
-      std::string token;
-      if (!trx_preserve_resurrection_facts_valid(expected[index]) ||
-          !trx_preserve_resurrection_xid_token(expected[index].xid, &token) ||
-          !expected_by_trx_id.emplace(expected[index].trx_id, index).second ||
-          !expected_tokens.insert(std::move(token)).second) {
-        return DB_ERROR;
+    std::lock_guard<std::mutex> guard(
+        trx_preserve_startup_resurrection_mutex);
+    reservations.reserve(trx_preserve_startup_resurrection_expected.size());
+    for (const auto &expected : trx_preserve_startup_resurrection_expected) {
+      Reservation reservation;
+      reservation.authority = expected.first;
+      reservation.facts = expected.second;
+      const auto verified =
+          trx_preserve_startup_resurrection_verified.find(expected.first);
+      if (verified != trx_preserve_startup_resurrection_verified.end()) {
+        reservation.trx = verified->second;
       }
+      reservation.valid =
+          reservation.trx != nullptr &&
+          trx_preserve_token_to_xid(reservation.authority.c_str(),
+                                    &reservation.xid);
+      reservations.push_back(std::move(reservation));
     }
+    result->reserved_authorities.reserve(reservations.size());
+    result->rejected_authorities.reserve(reservations.size());
   } catch (const std::bad_alloc &) {
     return DB_OUT_OF_MEMORY;
   }
 
-  dberr_t status = DB_SUCCESS;
   trx_sys_mutex_enter();
-  for (trx_t *trx = UT_LIST_GET_FIRST(trx_sys->rw_trx_list); trx != nullptr;
-       trx = UT_LIST_GET_NEXT(trx_list, trx)) {
-    const auto found = expected_by_trx_id.find(trx->id);
-    if (found == expected_by_trx_id.end()) continue;
-    const size_t index = found->second;
-    if (resolved[index] != nullptr || trx->xid == nullptr ||
-        !trx->is_recovered || trx->mysql_thd != nullptr ||
-        trx->preserve_trx_claimed ||
-        !trx_state_eq(trx, TRX_STATE_PREPARED) ||
-        !expected[index].xid.eq(trx->xid)) {
-      status = DB_ERROR;
-      break;
-    }
+  for (Reservation &reservation : reservations) {
+    trx_t *trx = reservation.trx;
+    reservation.valid =
+        reservation.valid && trx->is_recovered && trx->mysql_thd == nullptr &&
+        !trx->preserve_trx_claimed &&
+        trx_state_eq(trx, TRX_STATE_ACTIVE) &&
+        trx->preserve_undo_contract == trx_preserve_undo_contract::NONE &&
+        trx->id == reservation.facts.trx_id &&
+        trx->preserve_freeze_lsn == reservation.facts.freeze_lsn &&
+        trx_preserve_redo_undo_is_active(trx);
+    if (!reservation.valid) continue;
 
-    const trx_undo_t *insert_undo = trx->rsegs.m_redo.insert_undo;
-    const trx_undo_t *update_undo = trx->rsegs.m_redo.update_undo;
-    const size_t actual_anchor_count =
-        static_cast<size_t>(insert_undo != nullptr) +
-        static_cast<size_t>(update_undo != nullptr);
-    bool anchors_match =
-        actual_anchor_count == expected[index].undo_anchors.size();
-    for (const auto &expected_anchor : expected[index].undo_anchors) {
-      const trx_undo_t *undo =
-          expected_anchor.kind ==
-                  trx_preserve_resurrection_undo_kind::INSERT
-              ? insert_undo
-              : update_undo;
-      if (undo == nullptr) {
-        anchors_match = false;
-        continue;
-      }
-      const trx_preserve_resurrection_undo_anchor actual_anchor{
-          expected_anchor.kind,
-          static_cast<uint32_t>(undo->space),
-          static_cast<uint32_t>(undo->id),
-          static_cast<uint32_t>(undo->hdr_page_no),
-          static_cast<uint32_t>(undo->hdr_offset),
-          static_cast<uint32_t>(undo->top_page_no),
-          static_cast<uint32_t>(undo->top_offset),
-          static_cast<uint64_t>(undo->top_undo_no),
-          undo->empty != 0};
-      if (!trx_preserve_resurrection_anchor_equal(expected_anchor,
-                                                  actual_anchor)) {
-        anchors_match = false;
-      }
-    }
-    if (!anchors_match) {
-      status = DB_ERROR;
-      break;
-    }
-    resolved[index] = trx;
+    *trx->xid = reservation.xid;
+    trx->preserve_undo_contract =
+        trx_preserve_undo_contract::ACTIVE_UNDO_V1;
+    trx->preserve_freeze_lsn = reservation.facts.freeze_lsn;
+    trx->preserve_trx_claimed = true;
+    trx_preserve_store_state_trx_sys_locked(trx, TRX_STATE_PRESERVED);
   }
   trx_sys_mutex_exit();
 
-  if (status != DB_SUCCESS ||
-      std::find(resolved.begin(), resolved.end(), nullptr) != resolved.end()) {
-    return status == DB_SUCCESS ? DB_ERROR : status;
+  for (const Reservation &reservation : reservations) {
+    (reservation.valid ? result->reserved_authorities
+                       : result->rejected_authorities)
+        .push_back(reservation.authority);
   }
-  *transactions = std::move(resolved);
+  return DB_SUCCESS;
+}
+
+dberr_t trx_preserve_abandon_active_undo_reservations(
+    const std::vector<trx_t *> &transactions) {
+  if (transactions.empty()) return DB_SUCCESS;
+  if (trx_sys == nullptr) return DB_ERROR;
+  std::set<trx_t *> unique;
+  try {
+    unique.insert(transactions.begin(), transactions.end());
+  } catch (const std::bad_alloc &) {
+    return DB_OUT_OF_MEMORY;
+  }
+  if (unique.size() != transactions.size() || unique.count(nullptr) != 0) {
+    return DB_ERROR;
+  }
+
+  trx_sys_mutex_enter();
+  const bool valid = std::all_of(
+      transactions.begin(), transactions.end(), [](const trx_t *trx) {
+        return trx->is_recovered && trx->mysql_thd == nullptr &&
+               trx->preserve_trx_claimed &&
+               trx_state_eq(trx, TRX_STATE_PRESERVED) &&
+               trx->preserve_undo_contract ==
+                   trx_preserve_undo_contract::ACTIVE_UNDO_V1 &&
+               trx_preserve_redo_undo_is_active(trx);
+      });
+  if (valid) {
+    for (trx_t *trx : transactions) {
+      trx->preserve_trx_claimed = false;
+      trx->preserve_undo_contract = trx_preserve_undo_contract::NONE;
+      trx->preserve_freeze_lsn = 0;
+      trx->xid->reset();
+      trx_preserve_store_state_trx_sys_locked(trx, TRX_STATE_ACTIVE);
+    }
+  }
+  trx_sys_mutex_exit();
+  return valid ? DB_SUCCESS : DB_ERROR;
+}
+
+void trx_preserve_startup_forget_authorities(
+    const std::vector<std::string> &authorities) {
+  std::lock_guard<std::mutex> guard(trx_preserve_startup_resurrection_mutex);
+  for (const std::string &authority : authorities) {
+    trx_preserve_startup_resurrection_expected.erase(authority);
+    trx_preserve_startup_resurrection_verified.erase(authority);
+    trx_preserve_startup_lock_resurrection_failures.erase(authority);
+  }
+}
+
+void trx_preserve_startup_note_lock_resurrection_failure(trx_t *trx) {
+  if (trx == nullptr || trx->xid == nullptr) return;
+
+  std::string authority;
+  trx_sys_mutex_enter();
+  const bool active_undo_v1 =
+      trx->is_recovered && trx->mysql_thd == nullptr &&
+      trx->preserve_trx_claimed &&
+      trx_state_eq(trx, TRX_STATE_PRESERVED) &&
+      trx->preserve_undo_contract ==
+          trx_preserve_undo_contract::ACTIVE_UNDO_V1 &&
+      trx_preserve_resurrection_xid_token(*trx->xid, &authority);
+  trx_sys_mutex_exit();
+  if (!active_undo_v1) return;
+
+  std::lock_guard<std::mutex> guard(trx_preserve_startup_resurrection_mutex);
+  const auto verified =
+      trx_preserve_startup_resurrection_verified.find(authority);
+  if (verified != trx_preserve_startup_resurrection_verified.end() &&
+      verified->second == trx) {
+    trx_preserve_startup_lock_resurrection_failures.emplace(authority, trx);
+  }
+}
+
+dberr_t trx_preserve_startup_collect_lock_resurrection_failures(
+    std::vector<std::string> *authorities,
+    std::vector<trx_t *> *transactions) {
+  if (authorities == nullptr || transactions == nullptr) return DB_ERROR;
+  authorities->clear();
+  transactions->clear();
+  try {
+    std::lock_guard<std::mutex> guard(
+        trx_preserve_startup_resurrection_mutex);
+    authorities->reserve(
+        trx_preserve_startup_lock_resurrection_failures.size());
+    transactions->reserve(
+        trx_preserve_startup_lock_resurrection_failures.size());
+    for (const auto &failure :
+         trx_preserve_startup_lock_resurrection_failures) {
+      authorities->push_back(failure.first);
+      transactions->push_back(failure.second);
+    }
+  } catch (const std::bad_alloc &) {
+    authorities->clear();
+    transactions->clear();
+    return DB_OUT_OF_MEMORY;
+  }
   return DB_SUCCESS;
 }
 
@@ -1715,8 +1562,8 @@ bool trx_preserve_targeted_publication_candidate_valid(
   return capability.valid_for(key) &&
          trx_preserve_resurrection_xid_token(candidate.xid, &token) &&
          token == key.token && candidate.trx_id != 0 &&
-         candidate.trx_id < TRX_ID_MAX && candidate.prepare_lsn != 0 &&
-         candidate.prepare_lsn <= capability.source_fence_lsn() &&
+         candidate.trx_id < TRX_ID_MAX && candidate.freeze_lsn != 0 &&
+         candidate.freeze_lsn <= capability.source_fence_lsn() &&
          candidate.safe_next_trx_id_floor > candidate.trx_id &&
          candidate.safe_next_trx_id_floor <= TRX_ID_MAX;
 }
@@ -1726,10 +1573,12 @@ bool trx_preserve_targeted_publication_existing_matches(
     const trx_preserve_targeted_publication_candidate &candidate) {
   return trx != nullptr && trx->xid != nullptr &&
          trx->id == candidate.trx_id && candidate.xid.eq(trx->xid) &&
-         trx_state_eq(trx, TRX_STATE_PREPARED) &&
+         trx_state_eq(trx, TRX_STATE_PRESERVED) &&
          trx->mysql_thd == nullptr && !trx->preserve_trx_claimed &&
+         trx->preserve_undo_contract ==
+             trx_preserve_undo_contract::ACTIVE_UNDO_V1 &&
          trx->is_recovered &&
-         trx->preserve_prepare_lsn == candidate.prepare_lsn &&
+         trx->preserve_freeze_lsn == candidate.freeze_lsn &&
          trx->rsegs.m_redo.rseg != nullptr &&
          trx->rsegs.m_redo.insert_undo == nullptr &&
          trx->rsegs.m_redo.update_undo == nullptr &&
@@ -1766,7 +1615,7 @@ void trx_preserve_targeted_publication_discard_unpublished(trx_t *trx) {
     trx->rsegs.m_redo.rseg = nullptr;
   }
   trx->xid->reset();
-  trx->preserve_prepare_lsn = 0;
+  trx->preserve_freeze_lsn = 0;
   trx->is_recovered = false;
   trx_free_resurrected(trx);
 }
@@ -1785,7 +1634,7 @@ bool trx_preserve_targeted_publication_journal_matches(
 }  // namespace
 
 trx_preserve_targeted_publication_status
-trx_preserve_publish_simulated_prepared(
+trx_preserve_publish_simulated_active_undo(
     const Preserve_trx_targeted_publication_capability &capability,
     const Preserve_trx_prepared_token_key &key,
     const trx_preserve_targeted_publication_candidate &candidate,
@@ -1812,8 +1661,8 @@ trx_preserve_publish_simulated_prepared(
   published->read_only = false;
   published->auto_commit = false;
   published->is_recovered = true;
-  published->preserve_prepare_lsn =
-      static_cast<lsn_t>(candidate.prepare_lsn);
+  published->preserve_freeze_lsn =
+      static_cast<lsn_t>(candidate.freeze_lsn);
   published->start_time = ut_time();
   trx_assign_rseg_durable(published);
   if (published->rsegs.m_redo.rseg == nullptr) {
@@ -1832,7 +1681,9 @@ trx_preserve_publish_simulated_prepared(
   existing = trx_preserve_targeted_publication_find_conflict_locked(
       candidate, &conflict);
   if (existing == nullptr && !conflict) {
-    trx_preserve_store_private_state(published, TRX_STATE_PREPARED);
+    published->preserve_undo_contract =
+        trx_preserve_undo_contract::ACTIVE_UNDO_V1;
+    trx_preserve_store_private_state(published, TRX_STATE_PRESERVED);
     auto id_pos = std::lower_bound(trx_sys->rw_trx_ids.begin(),
                                    trx_sys->rw_trx_ids.end(), published->id);
     ut_a(id_pos == trx_sys->rw_trx_ids.end() || *id_pos != published->id);
@@ -1846,7 +1697,6 @@ trx_preserve_publish_simulated_prepared(
           static_cast<trx_id_t>(candidate.safe_next_trx_id_floor);
     }
     trx_sys->min_active_id.store(trx_sys->rw_trx_ids.front());
-    ++trx_sys->n_prepared_trx;
   }
   trx_sys_mutex_exit();
 
@@ -1873,7 +1723,7 @@ trx_preserve_publish_simulated_prepared(
 }
 
 trx_preserve_targeted_publication_status
-trx_preserve_unclaim_simulated_prepared(
+trx_preserve_unclaim_simulated_active_undo(
     const Preserve_trx_targeted_publication_capability &capability,
     const Preserve_trx_prepared_token_key &key,
     trx_preserve_targeted_publication_journal *journal) {
@@ -1900,7 +1750,9 @@ trx_preserve_unclaim_simulated_prepared(
     trx_sys_mutex_exit();
     return trx_preserve_targeted_publication_status::CONFLICT;
   }
-  if (trx_state_eq(trx, TRX_STATE_PREPARED) &&
+  if (trx_state_eq(trx, TRX_STATE_PRESERVED) &&
+      trx->preserve_undo_contract ==
+          trx_preserve_undo_contract::ACTIVE_UNDO_V1 &&
       !trx->preserve_trx_claimed && !journal->claimed) {
     trx_sys_mutex_exit();
     return trx_preserve_targeted_publication_status::OK;
@@ -1910,8 +1762,6 @@ trx_preserve_unclaim_simulated_prepared(
     trx_sys_mutex_exit();
     return trx_preserve_targeted_publication_status::INVALID_STATE;
   }
-  trx_preserve_store_state_trx_sys_locked(trx, TRX_STATE_PREPARED);
-  ++trx_sys->n_prepared_trx;
   trx->preserve_trx_claimed = false;
   journal->claimed = false;
   trx_sys_mutex_exit();
@@ -1919,7 +1769,7 @@ trx_preserve_unclaim_simulated_prepared(
 }
 
 trx_preserve_targeted_publication_status
-trx_preserve_unpublish_simulated_prepared(
+trx_preserve_unpublish_simulated_active_undo(
     const Preserve_trx_targeted_publication_capability &capability,
     const Preserve_trx_prepared_token_key &key,
     trx_preserve_targeted_publication_journal *journal) {
@@ -1954,7 +1804,9 @@ trx_preserve_unpublish_simulated_prepared(
                      trx_preserve_rw_trx_list_contains(trx) &&
                      trx->xid != nullptr && journal->xid.eq(trx->xid) &&
                      trx->id == journal->trx_id && trx->mysql_thd == nullptr &&
-                     trx_state_eq(trx, TRX_STATE_PREPARED) &&
+                     trx_state_eq(trx, TRX_STATE_PRESERVED) &&
+                     trx->preserve_undo_contract ==
+                         trx_preserve_undo_contract::ACTIVE_UNDO_V1 &&
                      !trx->preserve_trx_claimed && trx->read_view == nullptr &&
                      trx->rsegs.m_redo.rseg != nullptr &&
                      trx->rsegs.m_redo.insert_undo == nullptr &&
@@ -1971,8 +1823,6 @@ trx_preserve_unpublish_simulated_prepared(
   UT_LIST_REMOVE(trx_sys->rw_trx_list, trx);
   ut_d(trx->in_rw_trx_list = false);
   trx_sys->rw_trx_set.erase(tracked);
-  ut_a(trx_sys->n_prepared_trx > 0);
-  --trx_sys->n_prepared_trx;
   const trx_state_t old_state = trx->state;
   trx->state = TRX_STATE_COMMITTED_IN_MEMORY;
   trx_preserve_note_rseg_owner_state_change(
@@ -1991,7 +1841,8 @@ trx_preserve_unpublish_simulated_prepared(
   trx->state = TRX_STATE_NOT_STARTED;
   trx->will_lock = 0;
   trx->preserve_trx_claimed = false;
-  trx->preserve_prepare_lsn = 0;
+  trx->preserve_undo_contract = trx_preserve_undo_contract::NONE;
+  trx->preserve_freeze_lsn = 0;
   trx_free_resurrected(trx);
 
   journal->trx = nullptr;
@@ -2048,8 +1899,7 @@ void trx_preserve_startup_resurrection_finish() {
 
   Once a transaction is preserved, resume must import from the serialized
   snapshot instead of keeping an in-memory ReadView pointer alive across process
-  exit. Claimed prepared-preserve transactions are included because they may be
-  waiting for snapshot cleanup or resume handling.
+  exit.
 */
 void trx_preserve_close_read_views_for_shutdown() {
   if (trx_sys == nullptr || trx_sys->mvcc == nullptr) return;
@@ -2057,11 +1907,9 @@ void trx_preserve_close_read_views_for_shutdown() {
   trx_sys_mutex_enter();
   for (trx_t *trx = UT_LIST_GET_FIRST(trx_sys->rw_trx_list); trx != nullptr;
        trx = UT_LIST_GET_NEXT(trx_list, trx)) {
-    const bool is_preserved = trx_state_eq(trx, TRX_STATE_PRESERVED);
-    const bool is_claimed_prepared_preserve_trx =
-        trx_state_eq(trx, TRX_STATE_PREPARED) && trx->preserve_trx_claimed &&
-        trx->xid != nullptr && xid_is_preserve_magic(*trx->xid);
-    if ((is_preserved || is_claimed_prepared_preserve_trx) &&
+    if (trx_state_eq(trx, TRX_STATE_PRESERVED) &&
+        trx->preserve_undo_contract ==
+            trx_preserve_undo_contract::ACTIVE_UNDO_V1 &&
         trx->read_view != nullptr) {
       trx_sys->mvcc->view_close(trx->read_view, true);
     }
@@ -2686,9 +2534,9 @@ bool trx_preserve_rseg_has_preserved_trx(const trx_rseg_t *rseg) {
                            trx->rsegs.m_noredo.rseg == rseg;
     if (!uses_rseg) continue;
 
-    if (trx_state_eq(trx, TRX_STATE_PRESERVED) ||
-        (trx_state_eq(trx, TRX_STATE_PREPARED) && trx->xid != nullptr &&
-         xid_is_preserve_magic(*trx->xid))) {
+    if (trx_state_eq(trx, TRX_STATE_PRESERVED) &&
+        trx->preserve_undo_contract ==
+            trx_preserve_undo_contract::ACTIVE_UNDO_V1) {
       found = true;
       break;
     }
@@ -2719,9 +2567,9 @@ void trx_preserve_collect_preserved_rsegs(
   for (trx_t *trx = UT_LIST_GET_FIRST(trx_sys->rw_trx_list); trx != nullptr;
        trx = UT_LIST_GET_NEXT(trx_list, trx)) {
     assert_trx_in_rw_list(trx);
-    if (trx_state_eq(trx, TRX_STATE_PRESERVED) ||
-        (trx_state_eq(trx, TRX_STATE_PREPARED) && trx->xid != nullptr &&
-         xid_is_preserve_magic(*trx->xid))) {
+    if (trx_state_eq(trx, TRX_STATE_PRESERVED) &&
+        trx->preserve_undo_contract ==
+            trx_preserve_undo_contract::ACTIVE_UNDO_V1) {
       remember_rseg(trx->rsegs.m_redo.rseg);
       remember_rseg(trx->rsegs.m_noredo.rseg);
     }
@@ -2751,7 +2599,7 @@ void trx_preserve_debug_current_thd_rseg_collection(
 }
 
 /*
-  Detach a freshly prepared preserve trx from its original THD.
+  Detach a frozen ACTIVE transaction from its original THD.
 
   The caller still owns cleanup on failure. On success the trx is removed from
   mysql_trx_list, thd_to_trx() and ha_info are cleared, and the original THD no
@@ -2788,9 +2636,11 @@ trx_t *trx_preserve_detach_current_thd(
     }
     return nullptr;
   }
-  if (!trx_state_eq(trx, TRX_STATE_PREPARED)) {
+  if (!trx_state_eq(trx, TRX_STATE_ACTIVE) ||
+      trx->preserve_undo_contract !=
+          trx_preserve_undo_contract::ACTIVE_UNDO_V1) {
     if (reason != nullptr) {
-      *reason = trx_preserve_thd_transition_failure::NOT_PREPARED;
+      *reason = trx_preserve_thd_transition_failure::NOT_ACTIVE_OR_PREPARED;
     }
     return nullptr;
   }
@@ -2801,12 +2651,17 @@ trx_t *trx_preserve_detach_current_thd(
     return nullptr;
   }
 
+  const uint64_t freeze_lsn = trx_preserve_current_redo_lsn();
+  if (freeze_lsn == 0) return nullptr;
+
   trx_sys_mutex_enter();
   if (
 #ifdef UNIV_DEBUG
       !trx->in_mysql_trx_list ||
 #endif /* UNIV_DEBUG */
-      trx->mysql_thd != thd) {
+      trx->mysql_thd != thd || !trx_state_eq(trx, TRX_STATE_ACTIVE) ||
+      trx->preserve_undo_contract !=
+          trx_preserve_undo_contract::ACTIVE_UNDO_V1) {
     if (reason != nullptr) {
 #ifdef UNIV_DEBUG
       *reason = !trx->in_mysql_trx_list
@@ -2823,6 +2678,8 @@ trx_t *trx_preserve_detach_current_thd(
   UT_LIST_REMOVE(trx_sys->mysql_trx_list, trx);
   ut_d(trx->in_mysql_trx_list = false);
   trx->mysql_thd = nullptr;
+  trx->preserve_freeze_lsn = freeze_lsn;
+  trx_preserve_store_state_trx_sys_locked(trx, TRX_STATE_PRESERVED);
   ut_ad(trx_sys_validate_trx_list());
   trx_sys_mutex_exit();
 
@@ -2869,7 +2726,9 @@ dberr_t trx_preserve_attach_to_thd(trx_t *trx, THD *thd) {
 
   trx_sys_mutex_enter();
   if (!trx_state_eq(trx, TRX_STATE_PRESERVED) || trx->mysql_thd != nullptr ||
-      !trx->preserve_trx_claimed) {
+      !trx->preserve_trx_claimed ||
+      trx->preserve_undo_contract !=
+          trx_preserve_undo_contract::ACTIVE_UNDO_V1) {
     err = DB_ERROR;
   } else {
     trx->mysql_thd = thd;
@@ -2901,10 +2760,9 @@ dberr_t trx_preserve_attach_to_thd(trx_t *trx, THD *thd) {
 /*
   Reattach a preserve candidate to its original THD after preserve fails.
 
-  This is the recovery path before a durable snapshot has taken ownership. It
-  accepts a PREPARED candidate that still needs to leave n_prepared_trx, or a
-  PRESERVED candidate left by a later failure, and restores ACTIVE handler state
-  on the original THD so normal rollback/error handling can continue.
+  This is the recovery path before authority has taken durable ownership. It
+  restores an ACTIVE-Undo PRESERVED candidate to its original THD so normal
+  rollback/error handling can continue.
 */
 dberr_t trx_preserve_reattach_preserved_to_original_thd(trx_t *trx, THD *thd) {
   if (trx == nullptr || thd == nullptr || trx->xid == nullptr ||
@@ -2929,15 +2787,11 @@ dberr_t trx_preserve_reattach_preserved_to_original_thd(trx_t *trx, THD *thd) {
   dberr_t err = DB_SUCCESS;
 
   trx_sys_mutex_enter();
-  if ((!trx_state_eq(trx, TRX_STATE_PREPARED) &&
-       !trx_state_eq(trx, TRX_STATE_PRESERVED)) ||
-      trx->mysql_thd != nullptr) {
+  if (!trx_state_eq(trx, TRX_STATE_PRESERVED) || trx->mysql_thd != nullptr ||
+      trx->preserve_undo_contract !=
+          trx_preserve_undo_contract::ACTIVE_UNDO_V1) {
     err = DB_ERROR;
   } else {
-    if (trx_state_eq(trx, TRX_STATE_PREPARED)) {
-      ut_a(trx_sys->n_prepared_trx > 0);
-      --trx_sys->n_prepared_trx;
-    }
     trx->mysql_thd = thd;
     trx->preserve_trx_claimed = false;
     trx->is_recovered = false;
@@ -2985,7 +2839,9 @@ static dberr_t trx_preserve_detach_resumed_from_thd_low(trx_t *trx, THD *thd) {
       !trx->in_mysql_trx_list ||
 #endif /* UNIV_DEBUG */
       trx->mysql_thd != thd || trx->preserve_trx_claimed ||
-      !trx_state_eq(trx, TRX_STATE_ACTIVE)) {
+      !trx_state_eq(trx, TRX_STATE_ACTIVE) ||
+      trx->preserve_undo_contract !=
+          trx_preserve_undo_contract::ACTIVE_UNDO_V1) {
     trx_sys_mutex_exit();
     return DB_ERROR;
   }

@@ -10,6 +10,7 @@ CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: cor
 CALL mtr.add_suppression("Preserved transaction .* recovery deferred cleanup: corrupt temporary table manifest");
 CALL mtr.add_suppression("Preserved transaction .* recovery deferred cleanup: corrupt durable transaction snapshot");
 CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: corrupt durable transaction snapshot");
+CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: preserved transaction snapshot tainted: startup snapshot is unreadable or mismatched");
 --enable_query_log
 
 SET GLOBAL preserve_trx_enable=ON;

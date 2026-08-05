@@ -54,6 +54,11 @@ class Local_file_preserved_trx_carrier final
   Preserved_trx_carrier_status write_snapshot_new(
       const std::string &token,
       const std::vector<unsigned char> &snapshot_bytes) override;
+  Preserved_trx_carrier_status stage_snapshot_new(
+      const std::string &token,
+      const std::vector<unsigned char> &snapshot_bytes) override;
+  Preserved_trx_carrier_status commit_staged_snapshot(
+      const std::string &token) override;
   Preserved_trx_carrier_status write_resurrection_index_new(
       const std::string &token,
       const std::vector<unsigned char> &index_bytes) override;
@@ -68,6 +73,11 @@ class Local_file_preserved_trx_carrier final
       const Preserved_trx_carrier_read_limits &read_limits,
       Payload_read_mode payload_read_mode =
           Payload_read_mode::WITH_EXTERNAL_BLOBS) override;
+  Preserved_trx_carrier_status read_external_blob(
+      const std::string &token,
+      const Preserved_trx_external_blob_descriptor &descriptor,
+      const Preserved_trx_carrier_read_limits &read_limits,
+      Preserved_trx_external_blob *blob) override;
   Preserved_trx_carrier_status rewrite_existing(
       const std::string &token,
       const std::vector<unsigned char> &snapshot_bytes) override;

@@ -32,11 +32,9 @@ INSERT INTO t_preserve_fault_cleanup VALUES(1,10);
 --source suite/preserve_trx/include/preserve_fault_cleanup_case.inc
 
 --let $fault_name= preserve_trx_fail_after_snapshot_rename
---let $fault_error= ER_PRESERVE_TRX_BATCH_CLEANUP_FAILED
 --source suite/preserve_trx/include/preserve_fault_cleanup_case.inc
 
 --let $fault_name= preserve_trx_fail_snapshot_directory_fsync
---let $fault_error= ER_PRESERVE_TRX_BATCH_CLEANUP_FAILED
 --source suite/preserve_trx/include/preserve_fault_cleanup_case.inc
 
 --let $fault_name= preserve_trx_fail_after_binlog_mode_validation

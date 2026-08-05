@@ -87,7 +87,7 @@ die "physical-fence provider must remain simulator-only\n"
          $prepared =~ /TEST_ONLY_PHYSICAL_FENCE_SIMULATOR/;
 
 die "strict gate must use the shared physical-fence kernel entry\n"
-  unless $promotion =~ /preserved_trx_adopt_prepared_for_physical_promotion/ &&
+  unless $promotion =~ /preserved_trx_import_reserved_for_physical_promotion/ &&
          $preserve =~ /STANDBY_PROMOTION_PHYSICAL_FENCE/;
 die "promotion wrapper must not directly claim or import prepared trx state\n"
   if $promotion =~ /trx_preserve_claim_prepared|trx_preserve_import_read_view|preserved_trx_add_record/;

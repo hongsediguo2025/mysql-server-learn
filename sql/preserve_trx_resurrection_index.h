@@ -15,7 +15,6 @@
 #include "sql/preserve_trx_bundle.h"
 
 static constexpr uint16_t kPreserveTrxResurrectionIndexVersion = 1;
-static constexpr size_t kPreserveTrxResurrectionIndexXidBytes = 128;
 
 enum class Preserve_trx_resurrection_index_status : uint8_t {
   OK = 0,
@@ -29,13 +28,6 @@ enum class Preserve_trx_resurrection_index_status : uint8_t {
 enum class Preserve_trx_resurrection_undo_kind : uint8_t {
   INSERT = 1,
   UPDATE = 2
-};
-
-struct Preserve_trx_resurrection_xid {
-  int64_t format_id{-1};
-  uint32_t gtrid_length{0};
-  uint32_t bqual_length{0};
-  std::array<unsigned char, kPreserveTrxResurrectionIndexXidBytes> data{};
 };
 
 struct Preserve_trx_resurrection_undo_anchor {
@@ -61,10 +53,9 @@ struct Preserve_trx_resurrection_undo_anchor {
 };
 
 struct Preserve_trx_resurrection_index_entry {
-  uint64_t token{0};
+  std::string authority_token;
   uint64_t trx_id{0};
-  uint64_t prepare_lsn{0};
-  Preserve_trx_resurrection_xid xid;
+  uint64_t freeze_lsn{0};
   std::array<unsigned char, kPreservedTrxSha256Length> snapshot_digest{};
   std::vector<Preserve_trx_resurrection_undo_anchor> undo_anchors;
   std::vector<uint64_t> modified_table_ids;

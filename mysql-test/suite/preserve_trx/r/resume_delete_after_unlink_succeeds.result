@@ -1,3 +1,4 @@
+CALL mtr.add_suppression("Preserved transaction '.*' snapshot cleanup failed after resume; transaction remains attached");
 DROP TABLE IF EXISTS t_resume_delete_after_unlink;
 SET GLOBAL preserve_trx_enable=ON;
 CREATE TABLE t_resume_delete_after_unlink(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;

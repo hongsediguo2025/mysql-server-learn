@@ -1402,32 +1402,6 @@ TEST(TempResumeMaterializerContractTest,
 }
 
 TEST(TempResumeMaterializerContractTest,
-     NativeOwnedNoRedoUndoDoesNotRunPreparedRollbackActivation) {
-  const std::string trx_preserve_impl = read_source_file_for_temp_table_test(
-      "storage/innobase/trx/trx0preserve.cc");
-  ASSERT_FALSE(trx_preserve_impl.empty());
-
-  const std::string activate_body =
-      extract_function_body_after_signature_for_temp_table_test(
-          trx_preserve_impl,
-          "static dberr_t "
-          "trx_preserve_activate_undo_ptr_state_deferred_flush(");
-  ASSERT_FALSE(activate_body.empty());
-
-  EXPECT_NE(std::string::npos,
-            activate_body.find(
-                "no_redo && undo_ptr->insert_undo->state == TRX_UNDO_ACTIVE"))
-      << "native-adopted temporary insert undo is already ACTIVE; activating a "
-         "resumed transaction must not pass it to the PREPARED->ACTIVE rollback "
-         "transition";
-  EXPECT_NE(std::string::npos,
-            activate_body.find(
-                "no_redo && undo_ptr->update_undo->state == TRX_UNDO_ACTIVE"))
-      << "native-adopted temporary update undo is already ACTIVE; activating a "
-         "resumed transaction must preserve that state";
-}
-
-TEST(TempResumeMaterializerContractTest,
      NativeSlotAdoptionMaterializesPagesBeforePublishingSlots) {
   const std::string temp_preserve_impl = read_source_file_for_temp_table_test(
       "storage/innobase/trx/trx0temp_preserve.cc");

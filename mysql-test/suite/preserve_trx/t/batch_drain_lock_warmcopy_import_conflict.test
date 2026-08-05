@@ -180,6 +180,8 @@ for my $bin_path (@bin_paths) {
       open(my $out, '>:raw', $bin_path) or die "cannot rewrite $bin_path: $!";
       print {$out} $snapshot;
       close($out);
+      PreserveSnapshotFiles::refresh_resurrection_index_snapshot_digest(
+        $bin_path);
       $mutated = 1;
       last;
     }
@@ -203,6 +205,8 @@ for my $bin_path (@bin_paths) {
         open(my $out, '>:raw', $bin_path) or die "cannot rewrite $bin_path: $!";
         print {$out} $snapshot;
         close($out);
+        PreserveSnapshotFiles::refresh_resurrection_index_snapshot_digest(
+          $bin_path);
         $mutated = 1;
         last;
       }
