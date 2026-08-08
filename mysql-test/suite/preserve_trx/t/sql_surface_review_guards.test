@@ -1,6 +1,6 @@
 --source include/force_restart.inc
 
---let $restart_parameters= restart: --preserve-trx-enable=OFF
+--let $restart_parameters= restart: --rds-preserve-trx-enable=OFF
 --source include/restart_mysqld.inc
 --let $restart_parameters=
 
@@ -44,6 +44,6 @@ DRAIN TRANSACTIONS PRESERVE WITH NO USER VARS WITH USER VARS;
 
 DROP USER preserve_pfs_denied@localhost;
 
---let $restart_parameters= restart: --preserve-trx-enable=ON
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON
 --source include/restart_mysqld.inc
 --let $restart_parameters=

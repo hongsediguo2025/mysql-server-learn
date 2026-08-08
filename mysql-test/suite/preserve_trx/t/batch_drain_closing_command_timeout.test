@@ -12,11 +12,9 @@ GRANT SHUTDOWN ON *.* TO preserve_trx_ha_admin@localhost;
 GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
 --enable_query_log
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_enable=ON;
-SET GLOBAL preserve_trx_lock_warmcopy_enable=OFF;
-SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
-SET GLOBAL preserve_trx_drain_phase2_timeout_ms=200;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=PROMOTION_PREPARE;
+SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms=200;
 
 CREATE TABLE t_closing_command_timeout(
   id INT PRIMARY KEY,
@@ -79,7 +77,7 @@ COMMIT;
 # A different Phase2 budget applies to the complete blocked window; no inner
 # command or warmcopy deadline may extend it.
 --connection default
-SET GLOBAL preserve_trx_drain_phase2_timeout_ms=50;
+SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms=50;
 
 --connect(closing_timeout_c,localhost,closing_timeout_app,,test)
 START TRANSACTION;
@@ -123,8 +121,6 @@ DROP USER closing_timeout_app@localhost;
 --disable_query_log
 DROP USER preserve_trx_ha_admin@localhost;
 --enable_query_log
-SET GLOBAL preserve_trx_drain_phase2_timeout_ms=30000;
-SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
-SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms=30000;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=BUSINESS_FIRST;
 SET DEBUG_SYNC='RESET';

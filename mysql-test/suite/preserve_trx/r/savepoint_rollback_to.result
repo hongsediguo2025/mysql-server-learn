@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_savepoint_rollback_to;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_savepoint_rollback_to(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
 INSERT INTO t_savepoint_rollback_to VALUES(1,10),(2,20),(3,30);
 START TRANSACTION;
@@ -19,4 +19,4 @@ id	v
 2	20
 3	30
 DROP TABLE t_savepoint_rollback_to;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

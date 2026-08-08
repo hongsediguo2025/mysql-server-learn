@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_batch_capacity_exact;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_batch_capacity_exact(
 id INT PRIMARY KEY,
 v INT
@@ -8,9 +8,6 @@ START TRANSACTION;
 INSERT INTO t_batch_capacity_exact VALUES(1,10);
 START TRANSACTION;
 INSERT INTO t_batch_capacity_exact VALUES(2,20);
-SET GLOBAL preserve_trx_batch_max_transactions=2;
-SET GLOBAL preserve_trx_max_total=2;
-SET GLOBAL preserve_trx_max_pending_per_user=2;
 DRAIN TRANSACTIONS PRESERVE;
 SELECT COUNT(*) AS preserved_count_at_exact_limit
 FROM performance_schema.preserved_transactions;
@@ -32,4 +29,4 @@ FROM t_batch_capacity_exact;
 committed_rows
 2
 DROP TABLE t_batch_capacity_exact;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

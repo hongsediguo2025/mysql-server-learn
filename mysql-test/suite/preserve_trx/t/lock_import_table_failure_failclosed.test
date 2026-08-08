@@ -6,7 +6,7 @@
 DROP TABLE IF EXISTS t_lock_import_table_failclosed;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 --let MYSQLD_DATADIR= `SELECT @@datadir`
 
 --disable_query_log
@@ -30,7 +30,7 @@ UPDATE t_lock_import_table_failclosed SET v=22 WHERE id=2;
 
 --let $_server_id= 1
 --let $_expect_file_name= $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
---let $restart_parameters= restart: --preserve-trx-enable=ON --debug=d,preserve_trx_fail_import_table_locks
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --debug=d,preserve_trx_fail_import_table_locks
 --source include/start_mysqld.inc
 
 --let $grep_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
@@ -44,4 +44,4 @@ SELECT COUNT(*) AS preserved_count
   FROM performance_schema.preserved_transactions;
 
 DROP TABLE t_lock_import_table_failclosed;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

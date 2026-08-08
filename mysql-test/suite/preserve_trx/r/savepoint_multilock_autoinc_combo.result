@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_savepoint_multilock_autoinc;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_savepoint_multilock_autoinc(
 id INT AUTO_INCREMENT PRIMARY KEY,
 v INT,
@@ -55,4 +55,4 @@ id	v
 5	50
 100	15
 DROP TABLE t_savepoint_multilock_autoinc;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

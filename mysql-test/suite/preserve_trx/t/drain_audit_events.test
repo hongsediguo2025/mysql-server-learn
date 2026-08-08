@@ -3,7 +3,7 @@
 --source include/have_null_audit_plugin.inc
 --source include/not_log_bin.inc
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 --replace_regex /\.dll/.so/
 eval INSTALL PLUGIN null_audit SONAME '$AUDIT_NULL';
@@ -31,4 +31,4 @@ SELECT @@null_audit_event_record LIKE
 --disable_warnings
 UNINSTALL PLUGIN null_audit;
 --enable_warnings
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

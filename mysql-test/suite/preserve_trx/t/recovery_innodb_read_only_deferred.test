@@ -5,7 +5,7 @@
 DROP TABLE IF EXISTS t_read_only_deferred;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CALL mtr.add_suppression("Skip re-populating collations and character sets tables in InnoDB read-only mode");
 CALL mtr.add_suppression("Skip updating information_schema metadata in InnoDB read-only mode");
 CALL mtr.add_suppression("PRESERVE: startup recovery deferred because innodb_read_only is enabled");
@@ -20,7 +20,7 @@ UPDATE t_read_only_deferred SET v=20 WHERE id=1;
 --source suite/preserve_trx/include/drain_transaction_from_control.inc
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 
---exec echo "restart: --preserve-trx-enable=ON --innodb-read-only=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON --innodb-read-only=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -28,7 +28,7 @@ UPDATE t_read_only_deferred SET v=20 WHERE id=1;
 SHOW STATUS LIKE 'Preserve_trx_startup_recovery_error';
 --source suite/preserve_trx/include/assert_one_snapshot_file.inc
 
---let $restart_parameters= restart: --preserve-trx-enable=ON --innodb-read-only=OFF
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --innodb-read-only=OFF
 --let $do_not_echo_parameters= 1
 --source include/restart_mysqld.inc
 --let $do_not_echo_parameters=

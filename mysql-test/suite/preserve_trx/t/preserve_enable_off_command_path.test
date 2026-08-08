@@ -1,11 +1,11 @@
 --source include/have_debug.inc
 --source include/force_restart.inc
 
---let $restart_parameters= restart: --preserve-trx-enable=OFF
+--let $restart_parameters= restart: --rds-preserve-trx-enable=OFF
 --source include/restart_mysqld.inc
 --let $restart_parameters=
 
-SELECT @@global.preserve_trx_enable;
+SELECT @@global.rds_preserve_trx_enable;
 
 CREATE TABLE t_off_command_path (id INT PRIMARY KEY) ENGINE=InnoDB;
 INSERT INTO t_off_command_path VALUES (1);
@@ -20,6 +20,6 @@ XA PREPARE X'4d53505f50524553', X'746f6b656e', 1836281843;
 XA ROLLBACK X'4d53505f50524553', X'746f6b656e', 1836281843;
 DROP TABLE t_off_command_path_xa;
 
---let $restart_parameters= restart: --preserve-trx-enable=ON
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON
 --source include/restart_mysqld.inc
 --let $restart_parameters=

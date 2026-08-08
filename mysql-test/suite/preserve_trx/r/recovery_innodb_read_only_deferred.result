@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_read_only_deferred;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CALL mtr.add_suppression("Skip re-populating collations and character sets tables in InnoDB read-only mode");
 CALL mtr.add_suppression("Skip updating information_schema metadata in InnoDB read-only mode");
 CALL mtr.add_suppression("PRESERVE: startup recovery deferred because innodb_read_only is enabled");
@@ -11,7 +11,7 @@ DRAIN TRANSACTIONS PRESERVE;
 SHOW STATUS LIKE 'Preserve_trx_startup_recovery_error';
 Variable_name	Value
 Preserve_trx_startup_recovery_error	1
-# restart: --preserve-trx-enable=ON --innodb-read-only=OFF
+# restart: --rds-preserve-trx-enable=ON --innodb-read-only=OFF
 RESUME PRESERVED TRANSACTION 'TOKEN';
 ROLLBACK;
 SELECT * FROM t_read_only_deferred ORDER BY id;

@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_batch_current_durable_rollback_log_bin;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_batch_current_durable_rollback_log_bin(
 id INT PRIMARY KEY,
 v INT
@@ -32,4 +32,4 @@ include/assert_grep.inc [New transaction after current target rollback remains i
 include/assert_grep.inc [Rolled back current target durable failure is not written to binlog]
 include/assert_grep.inc [New transaction after current target rollback commits with a nonzero Xid event]
 DROP TABLE t_batch_current_durable_rollback_log_bin;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

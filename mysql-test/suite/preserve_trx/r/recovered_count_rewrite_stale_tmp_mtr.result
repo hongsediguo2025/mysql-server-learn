@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_recovered_count_stale_tmp;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_recovered_count_stale_tmp(a INT PRIMARY KEY, b INT)
 ENGINE=InnoDB;
 INSERT INTO t_recovered_count_stale_tmp VALUES(1,10);
@@ -13,7 +13,7 @@ SELECT TOKEN, RECOVERED_COUNT AS recovered_count_after_first_restart
 FROM performance_schema.preserved_transactions;
 TOKEN	recovered_count_after_first_restart
 TOKEN	1
-# restart: --preserve-trx-enable=ON
+# restart: --rds-preserve-trx-enable=ON
 SELECT TOKEN, RECOVERED_COUNT AS recovered_count_after_second_restart
 FROM performance_schema.preserved_transactions;
 TOKEN	recovered_count_after_second_restart
@@ -24,4 +24,4 @@ SELECT * FROM t_recovered_count_stale_tmp ORDER BY a;
 a	b
 1	11
 DROP TABLE t_recovered_count_stale_tmp;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

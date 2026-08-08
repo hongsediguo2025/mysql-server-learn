@@ -7,8 +7,8 @@
 DROP TABLE IF EXISTS t_preserve_materialized_attach_base;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 
 CREATE TABLE t_preserve_materialized_attach_base(
   id INT PRIMARY KEY,
@@ -38,7 +38,7 @@ UPDATE t_preserve_materialized_attach_base SET v = 11 WHERE id = 1;
 --source suite/preserve_trx/include/drain_transaction_from_control.inc
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 
---exec echo "restart: --preserve-trx-enable=ON --preserve-trx-temp-table-enable=ON --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-temp-table-enable=ON --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -95,5 +95,5 @@ DROP TEMPORARY TABLE tmp_preserve_materialized_attach_b;
 --source suite/preserve_trx/include/assert_no_preserve_residue.inc
 
 DROP TABLE t_preserve_materialized_attach_base;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;

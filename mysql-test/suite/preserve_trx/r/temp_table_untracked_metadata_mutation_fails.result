@@ -1,5 +1,5 @@
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 CREATE TEMPORARY TABLE tmp_preserve_untracked(
 id INT PRIMARY KEY,
 v INT
@@ -18,18 +18,18 @@ Warnings:
 Warning	1751	The creation of some temporary tables could not be rolled back.
 DROP TEMPORARY TABLE tmp_preserve_untracked_late;
 DROP TEMPORARY TABLE tmp_preserve_untracked;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 START TRANSACTION;
 CREATE TEMPORARY TABLE tmp_preserve_toggle_off_late(
 id INT PRIMARY KEY
 ) ENGINE=InnoDB;
-SET GLOBAL preserve_trx_temp_table_enable=OFF;
+SET GLOBAL rds_preserve_trx_temp_table_enable=OFF;
 DRAIN TRANSACTIONS PRESERVE;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 ROLLBACK;
 Warnings:
 Warning	1751	The creation of some temporary tables could not be rolled back.
 DROP TEMPORARY TABLE tmp_preserve_toggle_off_late;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;

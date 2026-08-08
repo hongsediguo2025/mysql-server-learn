@@ -4,7 +4,7 @@
 
 --let MYSQLD_DATADIR= `SELECT @@datadir`
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 SHUTDOWN;
@@ -39,7 +39,7 @@ for my $name (sort keys %files) {
 }
 EOF
 
---exec echo "restart: --preserve-trx-enable=ON --preserve-trx-temp-table-enable=OFF" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-temp-table-enable=OFF" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -67,5 +67,5 @@ for my $name (
 }
 EOF
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;

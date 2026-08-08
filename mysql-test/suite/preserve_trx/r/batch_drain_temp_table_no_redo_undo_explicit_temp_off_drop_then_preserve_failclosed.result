@@ -1,6 +1,6 @@
 DROP TABLE IF EXISTS t_batch_temp_explicit_off_late_preserve;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=OFF;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=OFF;
 CREATE TABLE t_batch_temp_explicit_off_late_preserve(
 sid INT PRIMARY KEY,
 v INT NOT NULL
@@ -16,7 +16,7 @@ DROP TEMPORARY TABLE tmp_batch_temp_explicit_off_late_preserve;
 INSERT INTO t_batch_temp_explicit_off_late_preserve VALUES(1, 10);
 START TRANSACTION;
 INSERT INTO t_batch_temp_explicit_off_late_preserve VALUES(2, 20);
-SET GLOBAL preserve_trx_temp_table_enable=OFF;
+SET GLOBAL rds_preserve_trx_temp_table_enable=OFF;
 DRAIN TRANSACTIONS PRESERVE;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 SELECT COUNT(*) AS preserved_count
@@ -34,5 +34,5 @@ sid	v
 3	30
 4	40
 DROP TABLE t_batch_temp_explicit_off_late_preserve;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

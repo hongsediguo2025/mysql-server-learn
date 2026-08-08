@@ -6,10 +6,8 @@
 DROP TABLE IF EXISTS t_warmcopy_new;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
-SET GLOBAL preserve_trx_single_phase_max_binlog_cache_bytes=1;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=BUSINESS_FIRST;
 
 CREATE TABLE t_warmcopy_new(
   id INT PRIMARY KEY,
@@ -33,7 +31,6 @@ SET DEBUG_SYNC =
 
 --connection default
 SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_new_open TIMEOUT 10';
-SET GLOBAL preserve_trx_warmcopy_enable=OFF;
 
 --connect(warmcopy_new_control_drain, localhost, root,,test)
 --connection warmcopy_new_control_drain
@@ -62,7 +59,7 @@ SET DEBUG_SYNC = 'now SIGNAL warmcopy_new_continue';
 
 --connection default
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
---exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=10" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -94,8 +91,6 @@ SELECT id, v, OCTET_LENGTH(payload) AS payload_len,
   FROM t_warmcopy_new ORDER BY id;
 
 DROP TABLE t_warmcopy_new;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
-SET GLOBAL preserve_trx_single_phase_max_binlog_cache_bytes=18446744073709551615;
-SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=BUSINESS_FIRST;
 SET DEBUG_SYNC = 'RESET';

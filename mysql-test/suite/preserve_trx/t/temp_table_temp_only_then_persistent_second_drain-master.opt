@@ -1,1 +1,1 @@
---preserve-trx-enable=ON --preserve-trx-temp-table-enable=ON --preserve-trx-recovery-max-count=20
+--rds-preserve-trx-enable=ON --rds-preserve-trx-temp-table-enable=ON

@@ -1,8 +1,8 @@
 DROP TABLE IF EXISTS t_temp_default_on_base;
-SELECT @@global.preserve_trx_temp_table_enable AS temp_table_gate_default;
+SELECT @@global.rds_preserve_trx_temp_table_enable AS temp_table_gate_default;
 temp_table_gate_default
 1
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_temp_default_on_base(
 id INT PRIMARY KEY,
 v INT
@@ -17,7 +17,7 @@ INSERT INTO tmp_temp_default_on VALUES(1, 100), (2, 200);
 START TRANSACTION;
 UPDATE t_temp_default_on_base SET v = 11 WHERE id = 1;
 DRAIN TRANSACTIONS PRESERVE;
-SELECT @@global.preserve_trx_temp_table_enable AS temp_table_gate_after_restart;
+SELECT @@global.rds_preserve_trx_temp_table_enable AS temp_table_gate_after_restart;
 temp_table_gate_after_restart
 1
 RESUME PRESERVED TRANSACTION 'TOKEN';
@@ -33,4 +33,4 @@ id	v
 1	11
 DROP TEMPORARY TABLE tmp_temp_default_on;
 DROP TABLE t_temp_default_on_base;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

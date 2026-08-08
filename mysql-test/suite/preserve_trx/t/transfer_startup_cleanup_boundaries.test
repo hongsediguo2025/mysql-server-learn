@@ -2,7 +2,7 @@
 --source include/force_restart.inc
 
 --let MYSQLD_DATADIR= `SELECT @@datadir`
---let $PRESERVE_TRX_DIR= `SELECT @@global.preserve_trx_dir`
+--let $PRESERVE_TRX_DIR= `SELECT CONCAT(@@global.datadir, 'preserve/')`
 CALL mtr.add_suppression("PRESERVE: transfer startup cleanup incomplete");
 
 # Stop before replacing the canonical root with a symlink. Transfer startup
@@ -31,7 +31,7 @@ close($fh);
 symlink($target, $root) or die "cannot create Preserve root symlink: $!";
 EOF
 
---exec echo "restart: --preserve-trx-enable=ON --preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -71,7 +71,7 @@ close($fh);
 chmod(0000, $root) or die "cannot make Preserve root inaccessible: $!";
 EOF
 
---exec echo "restart: --preserve-trx-enable=ON --preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -114,7 +114,7 @@ print {$sibling_fh} 'remove';
 close($sibling_fh);
 EOF
 
---exec echo "restart: --preserve-trx-enable=ON --preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect

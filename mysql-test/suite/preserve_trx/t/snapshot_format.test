@@ -2,9 +2,7 @@
 
 --let MYSQLD_DATADIR= `SELECT @@datadir`
 
-SELECT @@global.preserve_trx_dir = CONCAT(@@global.datadir, 'preserve/') AS default_dir;
-
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 --perl
 use strict;
@@ -27,4 +25,4 @@ die "leftover temp files: @tmp" if @tmp;
 print "no preserve temp files\n";
 EOF
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

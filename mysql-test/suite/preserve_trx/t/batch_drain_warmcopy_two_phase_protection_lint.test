@@ -157,16 +157,18 @@ die "tail budget guard must not scan the whole warm blob for digest during phase
   if $finalize_body =~ /read_file_sha256_digest|EVP_DigestUpdate|my_read/s;
 die "tail budget guard must finalize via the live warmcopy session path\n"
   unless $finalize_body =~ /mysql_binlog_preserve_warmcopy_finalize_session/s &&
-         $finalize_body =~ /preserve_trx_warmcopy_tail_budget_bytes/s;
+         $finalize_body =~ /m_tail_budget_bytes/s;
 die "tail budget guard must fail closed after post-HWM tail growth\n"
   unless $tail =~ /preserve_trx_warmcopy_after_descriptor_hwm/s &&
-         $tail =~ /preserve_trx_warmcopy_tail_budget_bytes=8/s &&
+         $tail =~ /rds_preserve_trx_transfer_runtime_profile=PROMOTION_PREPARE/s &&
+         $tail =~ /while\s*\(\$tail_update\s*<=\s*20\)/s &&
+         $tail =~ /REPEAT\('c',59994\)/s &&
          $tail =~ /--error ER_PRESERVE_TRX_UNSUPPORTED\s+--reap/s &&
          $tail =~ /assert_no_snapshot_file\.inc/s;
 die "tail budget result must fail closed, preserve nothing, and leave committed tail row intact\n"
   unless $tail_result =~ /ERROR HY000: Resumable transactions across shutdown do not support this operation/s &&
          $tail_result =~ /preserved_count\s+0/s &&
-         $tail_result =~ /payload_len\s+1024/s;
+         $tail_result =~ /payload_len\s+60000/s;
 EOF
 
 SELECT 'ok' AS batch_drain_warmcopy_two_phase_protection_lint;

@@ -82,7 +82,6 @@ class FullPressureProfile:
     mixed_min_completed_statements: int = 0
     mixed_min_survivor_count: int = 0
     max_sql_resume_ms: int = 0
-    warmcopy_artifact_budget_bytes: int = 0
     source_tiered_load_threads_per_tier: int = 0
     source_tiered_load_work_units: Tuple[int, ...] = ()
     source_tiered_load_min_samples_per_tier: int = 0
@@ -211,7 +210,6 @@ MIXED_FULL_PROFILE = dataclasses.replace(
     mixed_min_survivor_count=1,
     source_phase2_limit_us=600_000_000,
     max_sql_resume_ms=100,
-    warmcopy_artifact_budget_bytes=8 * 1024**3,
 )
 
 MIXED_SMOKE_PROFILE = dataclasses.replace(
@@ -233,7 +231,6 @@ MIXED_SMOKE_PROFILE = dataclasses.replace(
     source_phase2_limit_us=180_000_000,
     ready_after_final_spool_ack_limit_us=500_000,
     max_sql_resume_ms=100,
-    warmcopy_artifact_budget_bytes=2 * 1024**3,
 )
 
 
@@ -479,11 +476,11 @@ def build_mysqld_commands(
         f"--ssl-ca={ssl_data_dir / 'ca-cert-verify-san.pem'}",
         f"--ssl-cert={ssl_data_dir / 'server-cert-verify-san.pem'}",
         f"--ssl-key={ssl_data_dir / 'server-key-verify-san.pem'}",
-        "--preserve-trx-enable=ON",
-        "--preserve-trx-token-retention-timeout-ms="
+        "--rds-preserve-trx-enable=ON",
+        "--rds-preserve-trx-token-retention-timeout-ms="
         f"{profile.preserve_timeout_s * 1000}",
-        f"--preserve-trx-memory-budget-bytes={profile.preserve_memory_budget_bytes}",
-        f"--preserve-trx-transfer-max-inflight-bytes={profile.transfer_max_inflight_bytes}",
+        f"--rds-preserve-trx-memory-budget-bytes={profile.preserve_memory_budget_bytes}",
+        f"--rds-preserve-trx-transfer-max-inflight-bytes={profile.transfer_max_inflight_bytes}",
         "--loose-mysqlx=0",
     ]
     source = common + [
@@ -502,11 +499,8 @@ def build_mysqld_commands(
         )
         source.extend(
             [
-                "--preserve-trx-drain-phase2-timeout-ms="
+                "--rds-preserve-trx-drain-phase2-timeout-ms="
                 f"{mixed_close_timeout_ms}",
-                "--preserve-trx-memory-per-token-bytes=1073741824",
-                "--preserve-trx-warmcopy-max-total-bytes="
-                f"{profile.warmcopy_artifact_budget_bytes}",
             ]
         )
     if transfer_enabled:
@@ -518,31 +512,23 @@ def build_mysqld_commands(
         )
         source.extend(
             [
-                f"--preserve-trx-transfer-runtime-profile={profile.transfer_runtime_profile}",
-                "--preserve-trx-transfer-io-bytes-per-sec="
-                f"{profile.transfer_io_bytes_per_sec_base}",
-                "--preserve-trx-transfer-target-user=preserve_transfer",
-                "--preserve-trx-transfer-credential-name=fullpressure",
-                "--preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE",
-                "--preserve-trx-transfer-target-host=127.0.0.1",
-                f"--preserve-trx-transfer-target-port={receiver_port}",
+                f"--rds-preserve-trx-transfer-runtime-profile={profile.transfer_runtime_profile}",
+                "--rds-preserve-trx-transfer-target-user=preserve_transfer",
+                "--rds-preserve-trx-transfer-credential-name=fullpressure",
+                "--rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE",
+                "--rds-preserve-trx-transfer-target-host=127.0.0.1",
+                f"--rds-preserve-trx-transfer-target-port={receiver_port}",
             ]
         )
     else:
         source.append(
-            "--preserve-trx-transfer-artifact-mode=LOCAL_CARRIER"
+            "--rds-preserve-trx-transfer-artifact-mode=LOCAL_CARRIER"
         )
         return source, []
     receiver = common + [
         "--gtid-mode=ON",
         "--enforce-gtid-consistency=ON",
-        f"--preserve-trx-transfer-runtime-profile={profile.transfer_runtime_profile}",
-        "--preserve-trx-transfer-io-bytes-per-sec="
-        f"{profile.transfer_io_bytes_per_sec_base}",
-        "--preserve-trx-promotion-prewarm-io-bytes-per-sec="
-        f"{profile.prewarm_io_bytes_per_sec_base}",
-        "--preserve-trx-promotion-prewarm-workers="
-        f"{min(profile.promotion_prewarm_workers, profile.receiver_workers)}",
+        f"--rds-preserve-trx-transfer-runtime-profile={profile.transfer_runtime_profile}",
         f"--datadir={paths.receiver_datadir}",
         f"--socket={paths.receiver_socket}",
         f"--port={receiver_port}",
@@ -551,7 +537,6 @@ def build_mysqld_commands(
         f"--server-id={receiver_port}",
         f"--log-bin={paths.receiver_root / 'mysql-bin'}",
         f"--innodb-buffer-pool-size={profile.receiver_buffer_pool_bytes}",
-        f"--preserve-trx-transfer-receiver-workers={profile.receiver_workers}",
     ]
     return source, receiver
 
@@ -594,13 +579,6 @@ def build_e2e_command(
         "--max-sql-resume-ms",
         str(profile.max_sql_resume_ms),
     ]
-    if profile.warmcopy_artifact_budget_bytes > 0:
-        mixed_arguments.extend(
-            [
-                "--preserve-warmcopy-max-total-bytes",
-                str(profile.warmcopy_artifact_budget_bytes),
-            ]
-        )
     if evidence == "mixed-shutdown-startup":
         command = [
             sys.executable,
@@ -631,8 +609,6 @@ def build_e2e_command(
             "1",
             "--preserve-timeout",
             str(profile.preserve_timeout_s),
-            "--lock-warmcopy-mode",
-            "on",
             "--max-phase2-total-ms",
             str(profile.source_phase2_limit_us // 1000),
             "--source-datadir",
@@ -697,14 +673,6 @@ def build_e2e_command(
         "--lockset-minimal-table",
         "--preserve-timeout",
         str(profile.preserve_timeout_s),
-        "--preserve-lock-warmcopy-max-journal-bytes",
-        str(1024**3),
-        "--lock-warmcopy-mode",
-        "on",
-        "--transfer-phase1-batch-bytes",
-        str(profile.phase1_batch_bytes),
-        "--transfer-phase1-batch-linger-ms",
-        str(profile.phase1_batch_linger_ms),
         "--max-phase2-total-ms",
         str(profile.source_phase2_limit_us // 1000),
         "--max-receiver-ready-after-phase2-ms",

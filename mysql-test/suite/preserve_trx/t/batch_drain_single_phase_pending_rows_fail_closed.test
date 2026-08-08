@@ -5,13 +5,9 @@
 DROP TABLE IF EXISTS t_single_phase_pending_rows;
 --enable_warnings
 
---let $old_preserve_trx_enable= `SELECT @@GLOBAL.preserve_trx_enable`
---let $old_preserve_trx_warmcopy_enable= `SELECT @@GLOBAL.preserve_trx_warmcopy_enable`
---let $old_preserve_trx_single_phase_max_binlog_cache_bytes= `SELECT @@GLOBAL.preserve_trx_single_phase_max_binlog_cache_bytes`
+--let $old_rds_preserve_trx_enable= `SELECT @@GLOBAL.rds_preserve_trx_enable`
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_enable=OFF;
-SET GLOBAL preserve_trx_single_phase_max_binlog_cache_bytes=1073741824;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_single_phase_pending_rows(
   id INT PRIMARY KEY,
@@ -60,7 +56,5 @@ SELECT COUNT(*) AS changed_rows
 
 DROP TABLE t_single_phase_pending_rows;
 --disable_query_log
---eval SET GLOBAL preserve_trx_single_phase_max_binlog_cache_bytes=$old_preserve_trx_single_phase_max_binlog_cache_bytes
---eval SET GLOBAL preserve_trx_warmcopy_enable=$old_preserve_trx_warmcopy_enable
---eval SET GLOBAL preserve_trx_enable=$old_preserve_trx_enable
+--eval SET GLOBAL rds_preserve_trx_enable=$old_rds_preserve_trx_enable
 --enable_query_log

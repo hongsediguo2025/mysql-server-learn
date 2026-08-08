@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_batch_current_durable_log_bin;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_batch_current_durable_log_bin(
 id INT PRIMARY KEY,
 v INT
@@ -26,4 +26,4 @@ id	v
 include/assert_grep.inc [Current target durable failure keeps logged binlog cache committable]
 include/assert_grep.inc [Current target durable failure commits with a nonzero Xid event]
 DROP TABLE t_batch_current_durable_log_bin;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

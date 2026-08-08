@@ -1,7 +1,7 @@
 DROP USER IF EXISTS preserve_obj_user@localhost;
 DROP ROLE IF EXISTS preserve_obj_role;
 DROP DATABASE IF EXISTS preserve_obj_db;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE DATABASE preserve_obj_db;
 USE preserve_obj_db;
 CREATE TABLE t_preserve_obj_priv(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
@@ -65,4 +65,4 @@ DROP USER preserve_obj_user@localhost;
 DROP ROLE preserve_obj_role;
 USE test;
 DROP DATABASE preserve_obj_db;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

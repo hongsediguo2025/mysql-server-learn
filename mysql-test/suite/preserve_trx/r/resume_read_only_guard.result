@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_resume_read_only_guard;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_resume_read_only_guard(
 id INT PRIMARY KEY,
 v INT
@@ -22,4 +22,4 @@ SELECT * FROM t_resume_read_only_guard ORDER BY id;
 id	v
 1	10
 DROP TABLE t_resume_read_only_guard;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

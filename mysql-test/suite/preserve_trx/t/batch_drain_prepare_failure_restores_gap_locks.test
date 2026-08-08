@@ -6,8 +6,7 @@
 DROP TABLE IF EXISTS t_prepare_failure_gap;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_lock_warmcopy_enable=OFF;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_prepare_failure_gap(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
 INSERT INTO t_prepare_failure_gap VALUES(10, 10), (30, 30);
 
@@ -44,5 +43,4 @@ COMMIT;
 --connection default
 SELECT * FROM t_prepare_failure_gap ORDER BY id;
 DROP TABLE t_prepare_failure_gap;
-SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
 --source include/wait_until_count_sessions.inc

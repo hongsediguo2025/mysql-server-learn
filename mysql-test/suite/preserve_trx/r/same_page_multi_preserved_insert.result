@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_same_page_multi_preserved;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_same_page_multi_preserved(
 id INT PRIMARY KEY,
 v INT,
@@ -40,4 +40,4 @@ FROM t_same_page_multi_preserved;
 row_count	resumed_rows	bumped_rows
 2	2	2
 DROP TABLE t_same_page_multi_preserved;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

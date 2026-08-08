@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_temp_virtual_base;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_temp_virtual_base(
 id INT PRIMARY KEY,
 v INT
@@ -25,4 +25,4 @@ id	v
 1	11
 DROP TEMPORARY TABLE tmp_temp_virtual;
 DROP TABLE t_temp_virtual_base;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

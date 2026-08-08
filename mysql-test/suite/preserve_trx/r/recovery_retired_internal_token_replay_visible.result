@@ -1,6 +1,6 @@
 DROP TABLE IF EXISTS t_retired_token_replay;
 CALL mtr.add_suppression("Found 1 prepared XA transactions");
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_retired_token_replay(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
 INSERT INTO t_retired_token_replay VALUES(1, 10);
 START TRANSACTION;
@@ -11,9 +11,9 @@ SELECT COUNT(*) AS preserved_after_retire
 FROM performance_schema.preserved_transactions;
 preserved_after_retire
 0
-# restart: --preserve-trx-enable=OFF --skip-log-bin
+# restart: --rds-preserve-trx-enable=OFF --skip-log-bin
 UPDATE t_retired_token_replay SET v=30 WHERE id=1;
-# restart: --preserve-trx-enable=ON --skip-log-bin
+# restart: --rds-preserve-trx-enable=ON --skip-log-bin
 XA RECOVER CONVERT XID;
 formatID	gtrid_length	bqual_length	data
 1836281843	8	32	DATA

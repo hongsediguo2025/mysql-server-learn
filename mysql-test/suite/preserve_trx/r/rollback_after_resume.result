@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_rollback_after_resume;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_rollback_after_resume(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_rollback_after_resume VALUES(1,10),(2,20);
 START TRANSACTION;
@@ -18,4 +18,4 @@ a	b
 1	10
 2	20
 DROP TABLE t_rollback_after_resume;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

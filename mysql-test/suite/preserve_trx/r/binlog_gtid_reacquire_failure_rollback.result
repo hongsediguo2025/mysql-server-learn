@@ -1,6 +1,6 @@
 DROP TABLE IF EXISTS t_gtid_reacquire;
 DROP TABLE IF EXISTS t_gtid_reacquire_conflict;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 SET SESSION sql_log_bin=0;
 CREATE TABLE t_gtid_reacquire(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 CREATE TABLE t_gtid_reacquire_conflict(a INT PRIMARY KEY) ENGINE=InnoDB;
@@ -29,4 +29,4 @@ SET SESSION sql_log_bin=0;
 DROP TABLE t_gtid_reacquire, t_gtid_reacquire_conflict;
 SET SESSION sql_log_bin=1;
 RESET MASTER;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

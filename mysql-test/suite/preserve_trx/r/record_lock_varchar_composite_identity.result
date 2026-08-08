@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_record_lock_varchar_composite;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_record_lock_varchar_composite(
 tenant VARCHAR(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL,
 id DECIMAL(10,2) NOT NULL,
@@ -48,4 +48,4 @@ tenant	id	ts	v
 tenant-a	10.50	2026-06-06 10:11:12.123456	102
 tenant-a	11.50	2026-06-06 10:11:12.123456	201
 DROP TABLE t_record_lock_varchar_composite;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_read_uncommitted_after_resume;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_read_uncommitted_after_resume(
 id INT PRIMARY KEY,
 v INT
@@ -33,4 +33,4 @@ id	v
 1	10
 2	20
 DROP TABLE t_read_uncommitted_after_resume;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

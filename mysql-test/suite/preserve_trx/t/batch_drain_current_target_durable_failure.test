@@ -6,7 +6,7 @@
 DROP TABLE IF EXISTS t_batch_current_durable;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_batch_current_durable(
   id INT PRIMARY KEY,
@@ -36,4 +36,4 @@ COMMIT;
 SELECT * FROM t_batch_current_durable ORDER BY id;
 
 DROP TABLE t_batch_current_durable;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

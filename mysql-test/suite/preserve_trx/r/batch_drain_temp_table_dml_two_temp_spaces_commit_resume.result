@@ -1,6 +1,5 @@
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
-SET GLOBAL preserve_trx_lock_warmcopy_enable=OFF;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 CREATE TABLE t_two_temp_spaces_commit_base(
 id INT PRIMARY KEY,
 v INT NOT NULL
@@ -64,6 +63,5 @@ preserved_count_after_resume
 DROP TEMPORARY TABLE tmp_two_temp_commit_a;
 DROP TEMPORARY TABLE tmp_two_temp_commit_b;
 DROP TABLE t_two_temp_spaces_commit_base;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
-SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;

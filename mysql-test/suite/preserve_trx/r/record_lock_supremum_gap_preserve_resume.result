@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_record_lock_supremum_gap;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_record_lock_supremum_gap(
 id INT PRIMARY KEY,
 v INT
@@ -24,4 +24,4 @@ id	v
 30	30
 40	40
 DROP TABLE t_record_lock_supremum_gap;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

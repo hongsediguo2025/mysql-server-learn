@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_force_recovery_magic_retry;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_force_recovery_magic_retry(a INT PRIMARY KEY, b INT)
 ENGINE=InnoDB;
 INSERT INTO t_force_recovery_magic_retry VALUES(1,10);
@@ -15,7 +15,7 @@ preserved_count_during_force_recovery
 0
 RESUME PRESERVED TRANSACTION 'TOKEN';
 ERROR HY000: Resumable transactions across shutdown do not support this operation
-# restart: --preserve-trx-enable=ON --innodb-force-recovery=0
+# restart: --rds-preserve-trx-enable=ON --innodb-force-recovery=0
 SELECT @@global.innodb_force_recovery AS force_recovery_after_normal_restart;
 force_recovery_after_normal_restart
 0
@@ -27,4 +27,4 @@ SELECT * FROM t_force_recovery_magic_retry ORDER BY a;
 a	b
 1	10
 DROP TABLE t_force_recovery_magic_retry;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

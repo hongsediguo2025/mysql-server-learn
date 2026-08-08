@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_recovery_logged_cache_lazy_payload;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_recovery_logged_cache_lazy_payload(
 id INT PRIMARY KEY,
 payload VARCHAR(128)
@@ -31,4 +31,4 @@ id	payload_length	payload_prefix
 2	80	y
 include/assert_grep.inc [Recovered logged-cache transaction writes row events on final COMMIT]
 DROP TABLE t_recovery_logged_cache_lazy_payload;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

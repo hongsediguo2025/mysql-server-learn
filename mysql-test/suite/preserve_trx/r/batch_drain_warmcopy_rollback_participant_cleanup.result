@@ -1,7 +1,6 @@
 DROP TABLE IF EXISTS t_warmcopy_rollback;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=PROMOTION_PREPARE;
 CREATE TABLE t_warmcopy_rollback(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
 INSERT INTO t_warmcopy_rollback VALUES(1,10),(2,20);
 START TRANSACTION;
@@ -29,7 +28,6 @@ FROM performance_schema.preserved_transactions;
 preserved_count_after_resume
 0
 DROP TABLE t_warmcopy_rollback;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
-SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=BUSINESS_FIRST;
 SET DEBUG_SYNC = 'RESET';

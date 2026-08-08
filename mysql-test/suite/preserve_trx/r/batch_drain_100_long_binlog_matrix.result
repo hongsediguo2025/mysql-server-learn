@@ -1,5 +1,4 @@
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_recovery_max_count=200;
+SET GLOBAL rds_preserve_trx_enable=ON;
 SELECT COUNT(*) AS session_count
 FROM t_batch_long_control;
 session_count
@@ -129,4 +128,4 @@ include/assert_grep.inc [100-session LOGGED_EMPTY future DML is written to the b
 include/assert_grep.inc [100-session explicit GTID DML is written to the binlog]
 include/assert_grep.inc [100-session SESSION_OFF_NO_CACHE DML stays out of the binlog]
 include/assert_grep.inc [100-session ignored LOGGED_EMPTY pre-drain DML stays out of the binlog]
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

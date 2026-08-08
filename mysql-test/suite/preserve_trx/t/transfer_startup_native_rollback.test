@@ -5,7 +5,7 @@
 DROP TABLE IF EXISTS t_transfer_startup_native_rollback;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_transfer_startup_native_rollback(
   id INT PRIMARY KEY,
   value INT NOT NULL
@@ -20,7 +20,7 @@ UPDATE t_transfer_startup_native_rollback SET value=20 WHERE id=1;
 --source include/kill_mysqld.inc
 --disconnect active_trx
 
---let $restart_parameters= restart: --preserve-trx-enable=ON --preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --skip-log-bin
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --skip-log-bin
 --source include/start_mysqld.inc
 --let $restart_parameters=
 

@@ -7,7 +7,7 @@ DROP USER IF EXISTS preserve_error_reader@localhost;
 DROP TABLE IF EXISTS t_preserve_error_codes;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 --disable_query_log
 CALL mtr.add_suppression("RESUME PRESERVED TRANSACTION .* failed: token not found");
 CALL mtr.add_suppression("Preserved transaction .* rejected because snapshot binlog_state=LOGGED_EMPTY requires log_bin=ON");
@@ -27,7 +27,7 @@ UPDATE t_preserve_error_codes SET b=11 WHERE a=1;
 --source suite/preserve_trx/include/drain_transaction_from_control.inc
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 
---exec echo "restart: --preserve-trx-enable=ON --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -62,4 +62,4 @@ SELECT * FROM t_preserve_error_codes ORDER BY a;
 
 DROP USER preserve_error_reader@localhost;
 DROP TABLE t_preserve_error_codes;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

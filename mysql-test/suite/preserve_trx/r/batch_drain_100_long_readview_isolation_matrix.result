@@ -1,5 +1,4 @@
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_recovery_max_count=200;
+SET GLOBAL rds_preserve_trx_enable=ON;
 SELECT COUNT(*) AS session_count
 FROM t_batch_long_control;
 session_count
@@ -100,4 +99,4 @@ rr-own-write-external-hidden	1
 rr-own-write-mixed	1
 rr-secondary-old	1
 rr-vs-current-read	1
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

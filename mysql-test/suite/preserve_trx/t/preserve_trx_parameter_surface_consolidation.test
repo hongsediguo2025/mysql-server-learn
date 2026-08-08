@@ -1,0 +1,32 @@
+--echo # Preserve/Resume product parameter surface is exactly 16 rds_ names.
+
+SELECT COUNT(*) AS rds_parameter_count
+  FROM performance_schema.global_variables
+ WHERE VARIABLE_NAME LIKE 'rds_preserve_trx_%';
+
+SELECT COUNT(*) AS legacy_parameter_count
+  FROM performance_schema.global_variables
+ WHERE VARIABLE_NAME LIKE 'preserve_trx_%';
+
+SELECT @@GLOBAL.rds_preserve_trx_enable AS preserve_enabled,
+       @@GLOBAL.rds_preserve_trx_temp_table_enable AS temp_table_enabled,
+       @@GLOBAL.rds_preserve_trx_memory_budget_bytes AS memory_budget,
+       @@GLOBAL.rds_preserve_trx_drain_phase1_timeout_ms AS phase1_timeout,
+       @@GLOBAL.rds_preserve_trx_drain_phase2_timeout_ms AS phase2_timeout,
+       @@GLOBAL.rds_preserve_trx_token_retention_timeout_ms AS retention_timeout,
+       @@GLOBAL.rds_preserve_trx_transfer_artifact_mode AS artifact_mode,
+       @@GLOBAL.rds_preserve_trx_transfer_runtime_profile AS runtime_profile,
+       @@GLOBAL.rds_preserve_trx_transfer_prewarm_paused AS prewarm_paused,
+       @@GLOBAL.rds_preserve_trx_transfer_max_inflight_bytes AS max_inflight;
+
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile='BALANCED';
+SELECT @@GLOBAL.rds_preserve_trx_transfer_runtime_profile AS runtime_profile;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile='PROMOTION_PREPARE';
+SELECT @@GLOBAL.rds_preserve_trx_transfer_runtime_profile AS runtime_profile;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile='BUSINESS_FIRST';
+SELECT @@GLOBAL.rds_preserve_trx_transfer_runtime_profile AS runtime_profile;
+
+--error ER_UNKNOWN_SYSTEM_VARIABLE
+SET GLOBAL preserve_trx_enable=ON;
+--error ER_UNKNOWN_SYSTEM_VARIABLE
+SET GLOBAL preserve_trx_max_total=1;

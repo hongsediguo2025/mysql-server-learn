@@ -1,9 +1,5 @@
 DROP TABLE IF EXISTS t_lock_warmcopy_predicate_fallback;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_enable=OFF;
-SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
-SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=ON;
-SET GLOBAL preserve_trx_recovery_max_count=10;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_lock_warmcopy_predicate_fallback(
 id INT PRIMARY KEY,
 v INT
@@ -28,22 +24,4 @@ preserved_count_after_predicate_resume
 SELECT id, v FROM t_lock_warmcopy_predicate_fallback ORDER BY id;
 id	v
 1	11
-SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=OFF;
-SET SESSION debug="+d,preserve_trx_lock_warmcopy_simulate_predicate_locks";
-START TRANSACTION;
-INSERT INTO t_lock_warmcopy_predicate_fallback VALUES(2,20);
-UPDATE t_lock_warmcopy_predicate_fallback SET v=21 WHERE id=2;
-SET SESSION debug="+d,preserve_trx_lock_warmcopy_simulate_predicate_locks";
-DRAIN TRANSACTIONS PRESERVE;
-ERROR HY000: Resumable transactions across shutdown do not support this operation
-SET SESSION debug="-d,preserve_trx_lock_warmcopy_simulate_predicate_locks";
-SELECT COUNT(*) AS preserved_count_after_predicate_strict_reject
-FROM performance_schema.preserved_transactions;
-preserved_count_after_predicate_strict_reject
-0
-COMMIT;
-SELECT id, v FROM t_lock_warmcopy_predicate_fallback ORDER BY id;
-id	v
-1	11
-2	21
 DROP TABLE t_lock_warmcopy_predicate_fallback;

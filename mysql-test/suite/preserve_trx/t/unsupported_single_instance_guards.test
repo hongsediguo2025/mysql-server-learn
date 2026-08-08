@@ -7,7 +7,7 @@ DROP TABLE IF EXISTS t_myisam;
 DROP TABLE IF EXISTS t_trigger;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_innodb(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 CREATE TABLE t_myisam(a INT PRIMARY KEY, b INT) ENGINE=MyISAM;
@@ -109,4 +109,4 @@ DROP PROCEDURE preserve_proc;
 DROP TABLE t_trigger;
 DROP TABLE t_myisam;
 DROP TABLE t_innodb;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

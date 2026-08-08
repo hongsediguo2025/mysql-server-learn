@@ -24,7 +24,7 @@ GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
 CREATE USER receiver_global_app@localhost;
 GRANT SELECT, UPDATE ON test.* TO receiver_global_app@localhost;
 
---let $restart_parameters= restart: --preserve-trx-enable=ON --preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --preserve-trx-transfer-target-socket=$MASTER_MYSOCK --preserve-trx-transfer-target-user=preserve_trx_ha_admin --preserve-trx-transfer-credential-name=receiver_selection_global --preserve-trx-transfer-credential-secret-file=$credential_file
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$MASTER_MYPORT --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=receiver_selection_global --rds-preserve-trx-transfer-credential-secret-file=$credential_file
 --disable_result_log
 --source include/restart_mysqld.inc
 --enable_result_log
@@ -33,11 +33,6 @@ GRANT SELECT, UPDATE ON test.* TO receiver_global_app@localhost;
 CALL mtr.add_suppression(
   "PRESERVE: rolled back prepared transaction without snapshot during recovery");
 
-SET GLOBAL preserve_trx_batch_max_transactions=2;
-SET GLOBAL preserve_trx_transfer_pipeline_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_enable=OFF;
-SET GLOBAL preserve_trx_lock_warmcopy_enable=OFF;
-SET GLOBAL preserve_trx_transfer_receiver_prewarm_timeout_ms=1000;
 
 CREATE TABLE t_receiver_selection_global(
   id INT PRIMARY KEY,
@@ -75,7 +70,7 @@ SELECT VARIABLE_VALUE=0 AS no_classified_tokens
 SHUTDOWN;
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 
---exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect

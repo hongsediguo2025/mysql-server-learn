@@ -241,18 +241,18 @@ class PreserveTrxLintRunnerTest(unittest.TestCase):
         (root / "storage/innobase/trx").mkdir(parents=True)
         (root / "sql/preserve_trx_temp_table.cc").write_text(
             "bool preserve_trx_temp_table_row_hooks_enabled() {\n"
-            "  return preserve_trx_temp_table_enable;\n"
+            "  return rds_preserve_trx_temp_table_enable;\n"
             "}\n"
             "Temp_table_warmcopy_participant *"
             "preserve_trx_temp_table_ensure_participant(THD *thd) {\n"
-            "  if (!preserve_trx_temp_table_enable || thd == nullptr)\n"
+            "  if (!rds_preserve_trx_temp_table_enable || thd == nullptr)\n"
             "    return nullptr;\n"
             "}\n"
         )
         (root / "storage/innobase/include/trx0temp_preserve.h").write_text(
             "static inline bool "
             "trx_preserve_temp_space_image_dirty_page_hook_enabled() {\n"
-            "  return preserve_trx_temp_table_enable;\n"
+            "  return rds_preserve_trx_temp_table_enable;\n"
             "}\n"
         )
         (root / "storage/innobase/trx/trx0temp_preserve.cc").write_text(

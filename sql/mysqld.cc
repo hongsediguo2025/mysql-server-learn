@@ -6192,7 +6192,7 @@ static int init_server_components() {
   if (opt_validate_config && !opt_initialize && preserve_trx_enable &&
       preserved_trx_validate_snapshot_support(false)) {
     LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
-           "preserve_trx_enable=ON requires valid snapshot support");
+           "rds_preserve_trx_enable=ON requires valid snapshot support");
     unireg_abort(MYSQLD_ABORT_EXIT);
   }
 
@@ -6295,7 +6295,7 @@ static int init_server_components() {
   if (!opt_initialize && preserve_trx_enable &&
       preserved_trx_validate_snapshot_support(!is_help_or_validate_option())) {
     LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
-           "preserve_trx_enable=ON requires valid snapshot support");
+           "rds_preserve_trx_enable=ON requires valid snapshot support");
     unireg_abort(MYSQLD_ABORT_EXIT);
   }
   preserve_trx_set_enable_value(preserve_trx_enable);

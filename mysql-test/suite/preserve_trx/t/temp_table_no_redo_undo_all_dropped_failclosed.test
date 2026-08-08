@@ -4,8 +4,8 @@
 DROP TABLE IF EXISTS t_temp_no_redo_drop_all_base;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 
 CREATE TABLE t_temp_no_redo_drop_all_base(
   id INT PRIMARY KEY,
@@ -61,5 +61,5 @@ SELECT * FROM t_temp_no_redo_drop_all_base ORDER BY id;
 --source suite/preserve_trx/include/assert_no_preserve_residue.inc
 
 DROP TABLE t_temp_no_redo_drop_all_base;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

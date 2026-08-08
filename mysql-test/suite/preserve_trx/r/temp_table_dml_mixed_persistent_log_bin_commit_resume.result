@@ -1,5 +1,5 @@
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 CREATE TEMPORARY TABLE tmp_preserve_mixed_logbin(
 id INT PRIMARY KEY,
 v INT NOT NULL,
@@ -27,5 +27,5 @@ id	v
 2	200
 DROP TABLE t_preserve_mixed_logbin;
 DROP TEMPORARY TABLE tmp_preserve_mixed_logbin;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;

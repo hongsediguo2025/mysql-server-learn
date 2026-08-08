@@ -1,6 +1,6 @@
 CALL mtr.add_suppression("Preserved transaction '.*' recovery forced rollback: preserved transaction snapshot tainted: ACTIVE Undo exact reservation failed");
 DROP TABLE IF EXISTS t_startup_resurrection_index;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_startup_resurrection_index(
 id INT PRIMARY KEY,
 v INT

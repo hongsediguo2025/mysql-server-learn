@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_row_pending_flush;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_row_pending_flush(a INT PRIMARY KEY, b VARCHAR(128)) ENGINE=InnoDB;
 INSERT INTO t_row_pending_flush VALUES
 (1,'before'), (2,'before'), (3,'before'), (4,'before'), (5,'before'),
@@ -19,4 +19,4 @@ rows_after_commit
 10
 include/assert_grep.inc [Pending row update is flushed into exported LOGGED_WITH_CACHE payload]
 DROP TABLE t_row_pending_flush;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

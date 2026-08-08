@@ -77,8 +77,8 @@ EOF
 --enable_result_log
 --enable_query_log
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=OFF;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=OFF;
 
 --disable_query_log
 --disable_result_log
@@ -89,7 +89,7 @@ SET GLOBAL preserve_trx_temp_table_enable=OFF;
 --let $wait_condition= SELECT COUNT(*) = 100 FROM performance_schema.threads WHERE PROCESSLIST_USER = 'root' AND PROCESSLIST_DB = 'test' AND PROCESSLIST_COMMAND = 'Sleep'
 --source include/wait_condition.inc
 
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 --error ER_PRESERVE_TRX_UNSUPPORTED
 DRAIN TRANSACTIONS PRESERVE;
 
@@ -126,5 +126,5 @@ SELECT COUNT(*) AS base_rows,
 --remove_file $MYSQLTEST_VARDIR/tmp/batch_temp_dynamic_disconnect.inc
 --remove_file $MYSQLTEST_VARDIR/tmp/batch_temp_dynamic_cleanup.inc
 
-SET GLOBAL preserve_trx_temp_table_enable=ON;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

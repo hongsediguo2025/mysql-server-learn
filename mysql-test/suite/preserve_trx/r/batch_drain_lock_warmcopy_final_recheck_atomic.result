@@ -1,38 +1,10 @@
 DROP TABLE IF EXISTS t_lock_warmcopy_final_recheck;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_enable=OFF;
-SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
-SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=OFF;
-SET GLOBAL preserve_trx_recovery_max_count=10;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_lock_warmcopy_final_recheck(
 id INT PRIMARY KEY,
 v INT
 ) ENGINE=InnoDB;
 INSERT INTO t_lock_warmcopy_final_recheck VALUES(1,10),(2,20);
-START TRANSACTION;
-UPDATE t_lock_warmcopy_final_recheck SET v=11 WHERE id=1;
-SET SESSION debug="+d,preserve_trx_lock_warmcopy_simulate_conversion_after_freeze";
-SET SESSION debug="+d,preserve_trx_lock_warmcopy_simulate_conversion_after_freeze";
-DRAIN TRANSACTIONS PRESERVE;
-ERROR HY000: Resumable transactions across shutdown do not support this operation
-include/assert_grep.inc [lock warmcopy final fence strict reject is logged]
-SET SESSION debug="-d,preserve_trx_lock_warmcopy_simulate_conversion_after_freeze";
-SELECT COUNT(*) AS preserved_count_after_final_recheck_strict_reject
-FROM performance_schema.preserved_transactions;
-preserved_count_after_final_recheck_strict_reject
-0
-SET SESSION debug="-d,preserve_trx_lock_warmcopy_simulate_conversion_after_freeze";
-UPDATE t_lock_warmcopy_final_recheck SET v=21 WHERE id=2;
-COMMIT;
-SELECT id, v FROM t_lock_warmcopy_final_recheck ORDER BY id;
-id	v
-1	11
-2	21
-SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=ON;
-SELECT @@GLOBAL.preserve_trx_lock_warmcopy_fallback_to_live_export
-AS final_recheck_fallback_enabled;
-final_recheck_fallback_enabled
-1
 START TRANSACTION;
 UPDATE t_lock_warmcopy_final_recheck SET v=31 WHERE id=1;
 SET SESSION debug="+d,preserve_trx_lock_warmcopy_simulate_conversion_after_freeze";
@@ -52,5 +24,5 @@ preserved_count_after_final_recheck_resume
 SELECT id, v FROM t_lock_warmcopy_final_recheck ORDER BY id;
 id	v
 1	31
-2	21
+2	20
 DROP TABLE t_lock_warmcopy_final_recheck;

@@ -1,6 +1,6 @@
 CALL mtr.add_suppression("PRESERVE: transfer startup cleanup incomplete");
-# restart: --preserve-trx-enable=ON --preserve-trx-transfer-artifact-mode=LOCAL_CARRIER --skip-log-bin
-# restart: --preserve-trx-enable=ON --preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --skip-log-bin
+# restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=LOCAL_CARRIER --skip-log-bin
+# restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --skip-log-bin
 SELECT COUNT(*) = 0 AS startup_metrics_zero
 FROM performance_schema.global_status
 WHERE VARIABLE_NAME IN (

@@ -1,6 +1,6 @@
 DROP TABLE IF EXISTS t_temp_encrypted_space_base;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 CREATE TABLE t_temp_encrypted_space_base(id INT PRIMARY KEY, v INT)
 ENGINE=InnoDB;
 INSERT INTO t_temp_encrypted_space_base VALUES(1,10);
@@ -31,5 +31,5 @@ id	v
 2	200
 DROP TEMPORARY TABLE tmp_temp_encrypted_space;
 DROP TABLE t_temp_encrypted_space_base;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

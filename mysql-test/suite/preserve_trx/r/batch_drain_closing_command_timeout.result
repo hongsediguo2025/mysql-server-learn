@@ -1,10 +1,8 @@
 DROP TABLE IF EXISTS t_closing_command_timeout;
 DROP USER IF EXISTS closing_timeout_app@localhost;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_enable=ON;
-SET GLOBAL preserve_trx_lock_warmcopy_enable=OFF;
-SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
-SET GLOBAL preserve_trx_drain_phase2_timeout_ms=200;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=PROMOTION_PREPARE;
+SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms=200;
 CREATE TABLE t_closing_command_timeout(
 id INT PRIMARY KEY,
 v INT NOT NULL
@@ -46,7 +44,7 @@ timed_out_seen
 SET DEBUG_SYNC='now SIGNAL closing_timeout_a_continue';
 SET DEBUG_SYNC='now SIGNAL closing_timeout_b_continue';
 COMMIT;
-SET GLOBAL preserve_trx_drain_phase2_timeout_ms=50;
+SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms=50;
 START TRANSACTION;
 SET DEBUG_SYNC=
 'before_execute_sql_command SIGNAL closing_timeout_c_running WAIT_FOR closing_timeout_c_continue';
@@ -75,8 +73,6 @@ preserved_count
 0
 DROP TABLE t_closing_command_timeout;
 DROP USER closing_timeout_app@localhost;
-SET GLOBAL preserve_trx_drain_phase2_timeout_ms=30000;
-SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
-SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms=30000;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=BUSINESS_FIRST;
 SET DEBUG_SYNC='RESET';

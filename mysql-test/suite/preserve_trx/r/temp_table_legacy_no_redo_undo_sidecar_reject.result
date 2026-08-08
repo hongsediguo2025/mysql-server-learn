@@ -1,6 +1,6 @@
 DROP TABLE IF EXISTS t_temp_legacy_undo_base;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 CREATE TABLE t_temp_legacy_undo_base(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
 INSERT INTO t_temp_legacy_undo_base VALUES(1,10);
 CREATE TEMPORARY TABLE tmp_legacy_undo(
@@ -33,5 +33,5 @@ id	v
 1	11
 DROP TEMPORARY TABLE tmp_legacy_undo;
 DROP TABLE t_temp_legacy_undo_base;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

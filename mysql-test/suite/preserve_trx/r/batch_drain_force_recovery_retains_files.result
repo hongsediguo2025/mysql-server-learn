@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_batch_force_recovery;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_batch_force_recovery(
 id INT PRIMARY KEY,
 v INT
@@ -24,7 +24,7 @@ RESUME PRESERVED TRANSACTION 'TOKEN';
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 DRAIN TRANSACTIONS PRESERVE;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
-# restart: --preserve-trx-enable=ON --innodb-force-recovery=0
+# restart: --rds-preserve-trx-enable=ON --innodb-force-recovery=0
 SELECT @@global.innodb_force_recovery AS force_recovery_after_normal_restart;
 force_recovery_after_normal_restart
 0
@@ -37,4 +37,4 @@ FROM performance_schema.preserved_transactions;
 preserved_count_after_rollback
 0
 DROP TABLE t_batch_force_recovery;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

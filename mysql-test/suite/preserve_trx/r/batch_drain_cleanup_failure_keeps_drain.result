@@ -1,6 +1,6 @@
 CALL mtr.add_suppression("Preserved transaction batch cleanup failed after debug injected target error");
 DROP TABLE IF EXISTS t_batch_cleanup_failure;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_batch_cleanup_failure(
 id INT PRIMARY KEY,
 v INT
@@ -40,4 +40,4 @@ preserved_count_after_restart
 SELECT * FROM t_batch_cleanup_failure ORDER BY id;
 id	v
 DROP TABLE t_batch_cleanup_failure;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

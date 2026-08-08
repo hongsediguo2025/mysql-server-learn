@@ -3,9 +3,9 @@
 --let MYSQLD_DATADIR= `SELECT @@datadir`
 --let $error_log= $MYSQLTEST_VARDIR/log/preserve_trx_startup_option.err
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
---let $restart_parameters= restart: --preserve-trx-enable=ON
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON
 --source include/restart_mysqld.inc
 --let $restart_parameters=
 
@@ -32,10 +32,10 @@ unlink $path if $path ne '' && -e $path;
 EOF
 
 --error 1
---exec $MYSQLD_CMD --validate-config --preserve-trx-enable=ON --log-error=$error_log > $error_log 2>&1
+--exec $MYSQLD_CMD --validate-config --rds-preserve-trx-enable=ON --log-error=$error_log > $error_log 2>&1
 
 --let SEARCH_FILE= $error_log
---let SEARCH_PATTERN= preserve_trx_enable=ON requires valid snapshot support
+--let SEARCH_PATTERN= rds_preserve_trx_enable=ON requires valid snapshot support
 --source include/search_pattern.inc
 
 --perl
@@ -50,7 +50,7 @@ unlink($dir) or die "cannot remove preserve directory symlink: $!";
 remove_tree($target) if -e $target;
 EOF
 
---let $restart_parameters= restart: --preserve-trx-enable=ON
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON
 --source include/restart_mysqld.inc
 --let $restart_parameters=
 
@@ -75,10 +75,10 @@ unlink $path if $path ne '' && -e $path;
 EOF
 
 --error 1
---exec $MYSQLD_CMD --validate-config --preserve-trx-enable=ON --log-error=$error_log > $error_log 2>&1
+--exec $MYSQLD_CMD --validate-config --rds-preserve-trx-enable=ON --log-error=$error_log > $error_log 2>&1
 
 --let SEARCH_FILE= $error_log
---let SEARCH_PATTERN= preserve_trx_enable=ON requires valid snapshot support
+--let SEARCH_PATTERN= rds_preserve_trx_enable=ON requires valid snapshot support
 --source include/search_pattern.inc
 
 --perl
@@ -90,7 +90,7 @@ my $dir = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve');
 unlink($dir) or die "cannot remove preserve file: $!";
 EOF
 
---let $restart_parameters= restart: --preserve-trx-enable=ON
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON
 --source include/restart_mysqld.inc
 --let $restart_parameters=
 
@@ -113,10 +113,10 @@ unlink $path if $path ne '' && -e $path;
 EOF
 
 --error 1
---exec $MYSQLD_CMD --validate-config --preserve-trx-enable=ON --log-error=$error_log > $error_log 2>&1
+--exec $MYSQLD_CMD --validate-config --rds-preserve-trx-enable=ON --log-error=$error_log > $error_log 2>&1
 
 --let SEARCH_FILE= $error_log
---let SEARCH_PATTERN= preserve_trx_enable=ON requires valid snapshot support
+--let SEARCH_PATTERN= rds_preserve_trx_enable=ON requires valid snapshot support
 --source include/search_pattern.inc
 
 --perl
@@ -128,7 +128,7 @@ my $dir = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve');
 chmod(0700, $dir) or die "cannot restore preserve dir access: $!";
 EOF
 
---let $restart_parameters= restart: --preserve-trx-enable=ON
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON
 --source include/restart_mysqld.inc
 --let $restart_parameters=
 
@@ -151,10 +151,10 @@ unlink $path if $path ne '' && -e $path;
 EOF
 
 --error 1
---exec $MYSQLD_CMD --validate-config --preserve-trx-enable=ON --log-error=$error_log > $error_log 2>&1
+--exec $MYSQLD_CMD --validate-config --rds-preserve-trx-enable=ON --log-error=$error_log > $error_log 2>&1
 
 --let SEARCH_FILE= $error_log
---let SEARCH_PATTERN= preserve_trx_enable=ON requires valid snapshot support
+--let SEARCH_PATTERN= rds_preserve_trx_enable=ON requires valid snapshot support
 --source include/search_pattern.inc
 
 --perl
@@ -166,7 +166,7 @@ my $dir = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve');
 unlink($dir) or die "cannot remove preserve symlink: $!";
 EOF
 
---let $restart_parameters= restart: --preserve-trx-enable=ON
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON
 --source include/restart_mysqld.inc
 --let $restart_parameters=
 

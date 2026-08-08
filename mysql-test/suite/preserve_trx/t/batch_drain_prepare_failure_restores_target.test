@@ -6,7 +6,7 @@
 DROP TABLE IF EXISTS t_batch_prepare_failure;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_batch_prepare_failure(
   id INT PRIMARY KEY,
@@ -56,4 +56,4 @@ COMMIT;
 SELECT * FROM t_batch_prepare_failure ORDER BY id;
 
 DROP TABLE t_batch_prepare_failure;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

@@ -6,7 +6,7 @@ DROP TABLE IF EXISTS t_spatial_write_predicate_anchor;
 DROP TABLE IF EXISTS t_spatial_write_predicate;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 --disable_query_log
 CALL mtr.add_suppression("PRESERVE rejected.*unsupported_spatial_write_predicate_lock");
@@ -60,4 +60,4 @@ SELECT id, ST_AsText(pos) AS pos, v
 --source suite/preserve_trx/include/assert_no_preserve_residue.inc
 DROP TABLE t_spatial_write_predicate;
 DROP TABLE t_spatial_write_predicate_anchor;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

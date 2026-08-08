@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_compression_metadata_mismatch;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_compression_metadata_mismatch(
 id INT PRIMARY KEY,
 payload TEXT
@@ -31,4 +31,4 @@ FROM t_compression_metadata_mismatch;
 id	payload_length	payload_prefix
 1	1000	a
 DROP TABLE t_compression_metadata_mismatch;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

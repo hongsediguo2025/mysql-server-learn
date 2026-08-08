@@ -1,6 +1,6 @@
 DROP TABLE IF EXISTS t_temp_resume_dml_base;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 CREATE TABLE t_temp_resume_dml_base(
 id INT PRIMARY KEY,
 v INT
@@ -104,5 +104,5 @@ temp_rows	temp_sum
 13	792
 DROP TEMPORARY TABLE tmp_resume_dml_after_preserve;
 DROP TABLE t_temp_resume_dml_base;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

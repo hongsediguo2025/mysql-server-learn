@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_resume_user_vars_decimal;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_resume_user_vars_decimal(id INT PRIMARY KEY, v INT)
 ENGINE=InnoDB;
 SET @preserve_decimal_var = CAST(123.45 AS DECIMAL(10,2));
@@ -23,4 +23,4 @@ SELECT * FROM t_resume_user_vars_decimal ORDER BY id;
 id	v
 1	10
 DROP TABLE t_resume_user_vars_decimal;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

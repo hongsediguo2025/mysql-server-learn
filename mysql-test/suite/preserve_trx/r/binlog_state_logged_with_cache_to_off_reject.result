@@ -1,15 +1,15 @@
 DROP TABLE IF EXISTS t_logged_cache_to_off;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_logged_cache_to_off(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_logged_cache_to_off VALUES(1,10);
 START TRANSACTION;
 UPDATE t_logged_cache_to_off SET b=11 WHERE a=1;
 DRAIN TRANSACTIONS PRESERVE;
-# restart: --preserve-trx-enable=ON --skip-log-bin
+# restart: --rds-preserve-trx-enable=ON --skip-log-bin
 include/wait_for_pattern_in_file.inc [Preserved transaction .* rejected because snapshot binlog_state=LOGGED_WITH_CACHE requires log_bin=ON]
 SELECT * FROM t_logged_cache_to_off WHERE a=1;
 a	b
 1	10
-# restart: --preserve-trx-enable=ON
+# restart: --rds-preserve-trx-enable=ON
 DROP TABLE t_logged_cache_to_off;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

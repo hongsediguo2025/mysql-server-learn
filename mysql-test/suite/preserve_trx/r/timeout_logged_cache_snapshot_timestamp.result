@@ -1,20 +1,19 @@
 DROP TABLE IF EXISTS t_timeout_logged_cache_timestamp;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_enable=OFF;
-SET GLOBAL preserve_trx_token_retention_timeout_ms=1000;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_token_retention_timeout_ms=1000;
 CREATE TABLE t_timeout_logged_cache_timestamp(
 a INT PRIMARY KEY,
 b VARCHAR(1024)
 ) ENGINE=InnoDB;
 INSERT INTO t_timeout_logged_cache_timestamp VALUES(1, REPEAT('a', 1024));
 SET DEBUG_SYNC =
-'preserve_trx_before_binlog_cache_rename SIGNAL before_binlog_cache_rename WAIT_FOR continue_binlog_cache_rename';
+'preserve_trx_before_snapshot_timestamp SIGNAL before_logged_cache_snapshot_timestamp WAIT_FOR continue_logged_cache_snapshot_timestamp';
 START TRANSACTION;
 UPDATE t_timeout_logged_cache_timestamp
 SET b = REPEAT('b', 1024) WHERE a = 1;
 DRAIN TRANSACTIONS PRESERVE;
-SET DEBUG_SYNC = 'now WAIT_FOR before_binlog_cache_rename TIMEOUT 5';
-SET DEBUG_SYNC = 'now SIGNAL continue_binlog_cache_rename';
+SET DEBUG_SYNC = 'now WAIT_FOR before_logged_cache_snapshot_timestamp TIMEOUT 5';
+SET DEBUG_SYNC = 'now SIGNAL continue_logged_cache_snapshot_timestamp';
 SELECT p.BINLOG_STATE,
 p.WROTE_TO_CACHE,
 p.BINLOG_CACHE_SIZE > 0 AS binlog_cache_size_positive,
@@ -26,4 +25,4 @@ LOGGED_WITH_CACHE	YES	1	1	1
 RESUME PRESERVED TRANSACTION 'TOKEN';
 ROLLBACK;
 DROP TABLE t_timeout_logged_cache_timestamp;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

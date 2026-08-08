@@ -5,7 +5,7 @@
 DROP TABLE IF EXISTS t_batch_global_off;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_batch_global_off(
   id INT PRIMARY KEY,
@@ -29,7 +29,7 @@ INSERT INTO t_batch_global_off VALUES(2,20,NULL);
 DRAIN TRANSACTIONS PRESERVE NO USER VARS;
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 
---exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=10 --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON  --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -48,8 +48,8 @@ SELECT ROW_NUMBER() OVER (ORDER BY TOKEN) AS rn, TOKEN
 
 --let $token1= `SELECT TOKEN FROM t_batch_global_off_tokens WHERE rn = 1`
 --let $token2= `SELECT TOKEN FROM t_batch_global_off_tokens WHERE rn = 2`
---let $cache_file1= `SELECT CONCAT(@@global.preserve_trx_dir, '$token1', '.binlog_cache')`
---let $cache_file2= `SELECT CONCAT(@@global.preserve_trx_dir, '$token2', '.binlog_cache')`
+--let $cache_file1= `SELECT CONCAT(@@global.datadir, 'preserve/', '$token1', '.binlog_cache')`
+--let $cache_file2= `SELECT CONCAT(@@global.datadir, 'preserve/', '$token2', '.binlog_cache')`
 
 --error 1
 --file_exists $cache_file1
@@ -102,4 +102,4 @@ SELECT COUNT(*) AS row_count,
   FROM t_batch_global_off;
 
 DROP TABLE t_batch_global_off;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

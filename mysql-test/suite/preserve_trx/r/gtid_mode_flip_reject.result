@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_gtid_mode_flip;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 SET SESSION sql_log_bin=0;
 CREATE TABLE t_gtid_mode_flip(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_gtid_mode_flip VALUES(1,10);
@@ -11,7 +11,7 @@ ON
 START TRANSACTION;
 UPDATE t_gtid_mode_flip SET b=11 WHERE a=1;
 DRAIN TRANSACTIONS PRESERVE;
-# restart: --preserve-trx-enable=ON --gtid-mode=OFF --enforce-gtid-consistency=OFF
+# restart: --rds-preserve-trx-enable=ON --gtid-mode=OFF --enforce-gtid-consistency=OFF
 SELECT @@GLOBAL.GTID_MODE AS gtid_mode_after_restart;
 gtid_mode_after_restart
 OFF
@@ -27,5 +27,5 @@ SET SESSION sql_log_bin=0;
 DROP TABLE t_gtid_mode_flip;
 SET SESSION sql_log_bin=1;
 RESET MASTER;
-# restart: --preserve-trx-enable=ON --gtid-mode=ON --enforce-gtid-consistency
-SET GLOBAL preserve_trx_enable=ON;
+# restart: --rds-preserve-trx-enable=ON --gtid-mode=ON --enforce-gtid-consistency
+SET GLOBAL rds_preserve_trx_enable=ON;

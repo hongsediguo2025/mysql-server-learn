@@ -7,19 +7,11 @@ DROP TABLE IF EXISTS t_lock_warmcopy_crash_prepare;
 --enable_warnings
 
 --let $MYSQLD_DATADIR= `SELECT @@datadir`
---let PRESERVE_TRX_DIR= `SELECT @@global.preserve_trx_dir`
+--let PRESERVE_TRX_DIR= `SELECT CONCAT(@@global.datadir, 'preserve/')`
 
---let $old_preserve_trx_enable= `SELECT @@GLOBAL.preserve_trx_enable`
---let $old_preserve_trx_warmcopy_enable= `SELECT @@GLOBAL.preserve_trx_warmcopy_enable`
---let $old_preserve_trx_lock_warmcopy_enable= `SELECT @@GLOBAL.preserve_trx_lock_warmcopy_enable`
---let $old_preserve_trx_lock_warmcopy_fallback= `SELECT @@GLOBAL.preserve_trx_lock_warmcopy_fallback_to_live_export`
---let $old_preserve_trx_recovery_max_count= `SELECT @@GLOBAL.preserve_trx_recovery_max_count`
+--let $old_rds_preserve_trx_enable= `SELECT @@GLOBAL.rds_preserve_trx_enable`
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_enable=OFF;
-SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
-SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=OFF;
-SET GLOBAL preserve_trx_recovery_max_count=10;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 --disable_query_log
 CALL mtr.add_suppression("Attempting backtrace");
@@ -45,7 +37,7 @@ DRAIN TRANSACTIONS PRESERVE;
 --source include/wait_until_disconnected.inc
 
 --source suite/preserve_trx/include/ha_crash_abandon_preserve_artifacts.inc
---exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=10 --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON  --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -62,9 +54,5 @@ SELECT id, v FROM t_lock_warmcopy_crash_prepare ORDER BY id;
 DROP TABLE t_lock_warmcopy_crash_prepare;
 
 --disable_query_log
---eval SET GLOBAL preserve_trx_recovery_max_count=$old_preserve_trx_recovery_max_count
---eval SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=$old_preserve_trx_lock_warmcopy_fallback
---eval SET GLOBAL preserve_trx_lock_warmcopy_enable=$old_preserve_trx_lock_warmcopy_enable
---eval SET GLOBAL preserve_trx_warmcopy_enable=$old_preserve_trx_warmcopy_enable
---eval SET GLOBAL preserve_trx_enable=$old_preserve_trx_enable
+--eval SET GLOBAL rds_preserve_trx_enable=$old_rds_preserve_trx_enable
 --enable_query_log

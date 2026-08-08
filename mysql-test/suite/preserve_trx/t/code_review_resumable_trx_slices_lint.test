@@ -664,9 +664,13 @@ die "preserved record-lock import must bulk-adopt a validated page bitmap instea
      /for\s*\([^)]*heap_no[\s\S]*lock_preserve_bitmap_get_nth_bit[\s\S]*lock_preserve_add_record_lock_for_import/s;
 die "preserved record-lock import must expose an import-only page bitmap helper in lock0lock.cc\n"
   unless $lock =~ /lock_preserve_add_record_bitmap_for_import\s*\(/s;
-die "record-lock startup prefetch must have an explicit preserve_trx_recover_lock_page_prefetch sysvar\n"
-  unless $sys_vars =~ /preserve_trx_recover_lock_page_prefetch/s &&
-         $preserve_header =~ /preserve_trx_recover_lock_page_prefetch/s;
+die "record-lock startup prefetch must be a fixed internal Preserve policy\n"
+  unless $preserve =~
+           /const\s+bool\s+preserve_trx_recover_lock_page_prefetch\s*=\s*true/s &&
+         $preserve_header =~
+           /extern\s+const\s+bool\s+preserve_trx_recover_lock_page_prefetch/s;
+die "record-lock startup prefetch must not retain a product sysvar\n"
+  if $sys_vars =~ /preserve_trx_recover_lock_page_prefetch/s;
 die "record-lock startup prefetch must not expose an unused IO-governor sysvar\n"
   if $sys_vars =~ /preserve_trx_recover_lock_page_prefetch_io_bytes_per_sec/s ||
      $preserve_header =~ /preserve_trx_recover_lock_page_prefetch_io_bytes_per_sec/s;
@@ -2510,13 +2514,17 @@ $transfer =~
   /Preserve_trx_transfer_artifact_decision\s+preserve_trx_transfer_artifact_decision\(\)[\s\S]*?^}/m
   or die "could not isolate preserve_trx_transfer_artifact_decision\n";
 my $transfer_artifact_decision = $&;
-die "standby-transfer artifact decision must require a configured source endpoint before entering STANDBY_TRANSFER_SAVE\n"
+die "standby-transfer artifact decision must require a configured TCP source endpoint before entering STANDBY_TRANSFER_SAVE\n"
   unless $transfer_endpoint_ready =~
-         /preserve_trx_transfer_target_host[\s\S]*preserve_trx_transfer_target_port[\s\S]*preserve_trx_transfer_target_socket[\s\S]*preserve_trx_transfer_target_user[\s\S]*preserve_trx_transfer_source_credential_ready/s &&
+         /preserve_trx_transfer_target_host[\s\S]*preserve_trx_transfer_target_port[\s\S]*preserve_trx_transfer_target_user[\s\S]*preserve_trx_transfer_source_credential_ready/s &&
          $transfer_artifact_decision =~
          /preserve_trx_transfer_source_endpoint_ready\s*\(\s*\)[\s\S]*UNSUPPORTED[\s\S]*STANDBY_TRANSFER_SAVE/s &&
          $transfer =~
          /preserve_trx_transfer_make_configured_frame_sink[\s\S]*preserve_trx_transfer_source_endpoint_ready\s*\(\s*\)[\s\S]*UNSUPPORTED/s;
+die "standby-transfer source endpoint must not retain a Unix-socket branch\n"
+  if $transfer_endpoint_ready =~ /target_socket|unix_socket/s ||
+     $transfer_header =~ /target_socket|unix_socket/s ||
+     $sys_vars =~ /transfer_target_socket/s;
 die "online standby transfer must not expose source/target routing UUID sysvars\n"
   if $sys_vars =~
          /preserve_trx_transfer_(?:allowed_source_uuid|target_server_uuid)/s ||
@@ -2584,8 +2592,9 @@ die "standby transfer source must freeze one credential snapshot before creating
          /preserve_trx_transfer_make_configured_frame_sink[\s\S]*snapshot_transfer_epoch_credential[\s\S]*Preserve_trx_transfer_client_frame_sink/s &&
          $gunit =~ /CredentialSnapshotPinsPasswordAcrossReplacementAndReconnect/s &&
          $gunit =~ /ConfiguredFrameSinkDefaultClientUsesCredentialStore/s;
-die "standby transfer client must preserve TCP/socket endpoint exclusivity\n"
-  unless $transfer =~ /has_tcp_target\s*!=\s*has_socket_target/s;
+die "standby transfer client must require and force a TCP endpoint\n"
+  unless $transfer =~
+           /endpoint\.host\.empty\(\)[\s\S]*endpoint\.port\s*==\s*0[\s\S]*MYSQL_PROTOCOL_TCP[\s\S]*mysql_real_connect/s;
 die "standby transfer must not impose a Preserve-specific TLS policy\n"
   if $transfer =~
        /Ssl_mysql_main_status::get_ssl_ca_and_capath|MYSQL_OPT_SSL_CA|MYSQL_OPT_SSL_CAPATH|SSL_MODE_VERIFY_IDENTITY|mysql_get_ssl_cipher/s;
@@ -2632,9 +2641,10 @@ die "standby transfer online receiver must not persist or replay raw frame spool
 die "standby transfer online SEAL must keep external objects epoch-scoped instead of flat-token preinstall\n"
   if $transfer =~
      /case\s+Preserve_trx_transfer_frame_type::SEAL_OBJECT:[\s\S]*?install_receiver_sealed_external_object[\s\S]*?break\s*;/s;
-die "standby transfer chunk sysvar must not exceed the 1MiB frame codec boundary\n"
-  unless $sys_vars =~
-         /Sys_preserve_trx_transfer_chunk_bytes[\s\S]*VALID_RANGE\s*\(\s*1\s*,\s*1048576\s*\)/s;
+die "standby transfer policy chunk must remain at the 1MiB frame codec boundary\n"
+  unless $transfer_header =~
+           /uint32_t\s+transfer_chunk_bytes\s*\{\s*1024U\s*\*\s*1024U\s*\}/s &&
+         $transfer !~ /transfer_chunk_bytes\s*=/s;
 die "standby transfer source publication must be selected only by artifact mode, not by a duplicate source enable sysvar\n"
   if $sys_vars =~ /preserve_trx_transfer_enable/s ||
      $transfer =~ /preserve_trx_transfer_enable/s ||
@@ -2660,19 +2670,17 @@ my ($final_target_coverage) =
 die "standby final-target coverage must not treat missing binlog provider as covered\n"
   if $final_target_coverage =~
      /batch_transfer_binlog_blob_provider\s*==\s*nullptr\s*\|\|/s;
-die "standby transfer sender workers must default to three and drive parallel final-token payload sends before the commit barrier\n"
-  unless $sys_vars =~
-             /Sys_preserve_trx_transfer_sender_workers[\s\S]*VALID_RANGE\s*\(\s*1\s*,\s*64\s*\)[\s\S]*DEFAULT\s*\(\s*3\s*\)/s &&
+die "standby transfer policy sender workers must default to three and drive parallel final-token payload sends before the commit barrier\n"
+  unless $transfer_header =~ /uint32_t\s+sender_workers\s*\{\s*3\s*\}/s &&
          $transfer =~
-             /Preserve_trx_transfer_source_epoch_session::commit_epoch[\s\S]*preserve_trx_transfer_sender_workers[\s\S]*payload_index\s*=\s*worker_index[\s\S]*payload_index\s*\+=\s*worker_count[\s\S]*send_encoded_frame_on_session\s*\(\s*payload\s*,\s*worker_index\s*\)[\s\S]*workers\.emplace_back\s*\(\s*send_worker\s*,\s*worker\s*\)[\s\S]*encoded_commit/s;
-die "standby transfer data sessions must default to three and route token-affine payloads over independent classic connections\n"
-  unless $sys_vars =~
-             /Sys_preserve_trx_transfer_data_sessions[\s\S]*VALID_RANGE\s*\(\s*1\s*,\s*64\s*\)[\s\S]*DEFAULT\s*\(\s*3\s*\)/s &&
+             /Preserve_trx_transfer_source_epoch_session::commit_epoch[\s\S]*m_runtime_policy\.sender_workers[\s\S]*payload_index\s*=\s*worker_index[\s\S]*payload_index\s*\+=\s*worker_count[\s\S]*send_encoded_frame_on_session\s*\(\s*payload\s*,\s*worker_index\s*\)[\s\S]*workers\.emplace_back\s*\(\s*send_worker\s*,\s*worker\s*\)[\s\S]*encoded_commit/s;
+die "standby transfer policy data sessions must default to three and route token-affine payloads over independent classic connections\n"
+  unless $transfer_header =~ /uint32_t\s+data_sessions\s*\{\s*3\s*\}/s &&
          $transfer =~
-             /Preserve_trx_transfer_client_frame_sink[\s\S]*preserve_trx_transfer_data_sessions[\s\S]*m_connections\.resize[\s\S]*send_encoded_frame_on_session[\s\S]*session_index\s*%\s*m_connections\.size\s*\(\s*\)[\s\S]*connection_index_for_frame[\s\S]*token\s*%\s*m_connections\.size\s*\(\s*\)/s;
-die "standby transfer receiver worker sysvar must document the batch receiver worker path\n"
-  unless $sys_vars =~
-             /Sys_preserve_trx_transfer_receiver_workers[\s\S]*batch receiver[\s\S]*classic single-frame dispatch[\s\S]*VALID_RANGE\s*\(\s*1\s*,\s*64\s*\)[\s\S]*DEFAULT\s*\(\s*3\s*\)/s;
+             /Preserve_trx_transfer_client_frame_sink[\s\S]*uint32_t\s+data_sessions[\s\S]*m_connections\.resize[\s\S]*send_encoded_frame_on_session[\s\S]*session_index\s*%\s*m_connections\.size\s*\(\s*\)[\s\S]*connection_index_for_frame[\s\S]*token\s*%\s*m_connections\.size\s*\(\s*\)/s;
+die "standby transfer policy receiver workers must default to three and drive the batch receiver path\n"
+  unless $transfer_header =~ /uint32_t\s+receiver_workers\s*\{\s*3\s*\}/s &&
+         $transfer =~ /receiver_runtime_policy\.receiver_workers/s;
 die "standby transfer receiver batch payload path must use the bounded frame worker helper\n"
   unless $transfer_header =~ /preserve_trx_transfer_handle_receiver_payload_batch/s &&
          $transfer_header =~ /preserve_trx_transfer_apply_receiver_frame_batch_with_workers/s &&
@@ -3334,6 +3342,46 @@ die "empty survivor DRAIN must keep the source fenced through shutdown handoff\n
 die "empty survivor DRAIN must not clear generation or restore business\n"
   if $empty_survivor_handling =~
      /Preserve_batch_clear_generation|preserve_trx_reject_drain_timeout/s;
+
+my @rds_preserve_parameters = qw(
+  rds_preserve_trx_enable
+  rds_preserve_trx_temp_table_enable
+  rds_preserve_trx_memory_budget_bytes
+  rds_preserve_trx_drain_phase1_timeout_ms
+  rds_preserve_trx_drain_phase2_timeout_ms
+  rds_preserve_trx_token_retention_timeout_ms
+  rds_preserve_trx_lock_warmcopy_conversion_wait_timeout_ms
+  rds_preserve_trx_transfer_artifact_mode
+  rds_preserve_trx_transfer_target_host
+  rds_preserve_trx_transfer_target_port
+  rds_preserve_trx_transfer_target_user
+  rds_preserve_trx_transfer_credential_name
+  rds_preserve_trx_transfer_credential_secret_file
+  rds_preserve_trx_transfer_runtime_profile
+  rds_preserve_trx_transfer_prewarm_paused
+  rds_preserve_trx_transfer_max_inflight_bytes
+);
+for my $parameter (@rds_preserve_parameters) {
+  die "missing product parameter $parameter\n"
+    unless $sys_vars =~
+      /static\s+Sys_var_[A-Za-z0-9_]+\s+Sys_[A-Za-z0-9_]+\s*\(\s*"\Q$parameter\E"/s;
+}
+my @registered_rds_parameters =
+  $sys_vars =~
+    /static\s+Sys_var_[A-Za-z0-9_]+\s+Sys_[A-Za-z0-9_]+\s*\(\s*"(rds_preserve_trx_[a-z0-9_]+)"/sg;
+die "Preserve product parameter surface must contain exactly 16 rds_ names\n"
+  unless @registered_rds_parameters == 16;
+die "legacy Preserve sysvar registrations must be removed\n"
+  if $sys_vars =~
+    /static\s+Sys_var_[A-Za-z0-9_]+\s+Sys_[A-Za-z0-9_]+\s*\(\s*"preserve_trx_[a-z0-9_]+"/s;
+die "the read-only preserve_trx_dir sysvar must be removed\n"
+  if $sys_vars =~ /Sys_var_preserve_trx_dir|Sys_preserve_trx_dir/s;
+die "transaction count admission sysvars must be removed\n"
+  if $sys_vars =~
+    /Sys_preserve_trx_(?:max_total|max_pending_per_user|batch_max_transactions)/s;
+die "warmcopy and transfer pipeline product booleans must be removed\n"
+  if $sys_vars =~
+    /Sys_preserve_trx_(?:warmcopy_enable|lock_warmcopy_enable|lock_warmcopy_fallback_to_live_export|transfer_pipeline_enable)/s;
 EOF
 
 SELECT 'ok' AS code_review_resumable_trx_slices_lint;

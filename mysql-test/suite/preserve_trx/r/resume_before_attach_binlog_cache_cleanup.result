@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_resume_before_attach_binlog;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_resume_before_attach_binlog(a INT PRIMARY KEY, b INT)
 ENGINE=InnoDB;
 INSERT INTO t_resume_before_attach_binlog VALUES(1,10),(2,20);
@@ -27,4 +27,4 @@ include/assert_grep.inc [Failed before-attach resume transaction is discarded fr
 RESUME PRESERVED TRANSACTION 'TOKEN';
 ROLLBACK;
 DROP TABLE t_resume_before_attach_binlog;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

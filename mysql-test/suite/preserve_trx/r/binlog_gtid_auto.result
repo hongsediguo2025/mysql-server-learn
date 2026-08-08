@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_gtid_auto;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 SET SESSION sql_log_bin=0;
 CREATE TABLE t_gtid_auto(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_gtid_auto VALUES(1,10);
@@ -30,4 +30,4 @@ SET SESSION sql_log_bin=0;
 DROP TABLE t_gtid_auto;
 SET SESSION sql_log_bin=1;
 RESET MASTER;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

@@ -1,6 +1,6 @@
 DROP TABLE IF EXISTS t_temp_multi_row_format_base;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 CREATE TABLE t_temp_multi_row_format_base(id INT PRIMARY KEY, v INT)
 ENGINE=InnoDB;
 INSERT INTO t_temp_multi_row_format_base VALUES(1,10);
@@ -45,5 +45,5 @@ dynamic_rows
 DROP TEMPORARY TABLE tmp_multi_row_format_compact;
 DROP TEMPORARY TABLE tmp_multi_row_format_dynamic;
 DROP TABLE t_temp_multi_row_format_base;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

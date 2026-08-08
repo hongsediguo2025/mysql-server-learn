@@ -1,7 +1,6 @@
 DROP TABLE IF EXISTS t_warmcopy_post_prepare_failure;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=PROMOTION_PREPARE;
 CREATE TABLE t_warmcopy_post_prepare_failure(
 id INT PRIMARY KEY,
 v INT,
@@ -37,6 +36,5 @@ id	v	payload_len	payload_matches_expected
 include/assert_grep.inc [Warmcopy post-prepare failure keeps original binlog cache committable]
 include/assert_grep.inc [Warmcopy post-prepare failure commits with a nonzero Xid event]
 DROP TABLE t_warmcopy_post_prepare_failure;
-SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
-SET GLOBAL preserve_trx_warmcopy_enable=ON;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=BUSINESS_FIRST;
+SET GLOBAL rds_preserve_trx_enable=ON;

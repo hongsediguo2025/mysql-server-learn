@@ -13,12 +13,3 @@ committed_values
 1:111,2:221
 no_receiver_epoch_after_reset
 1
-legacy_excluded_old_command
-2
-ERROR HY000: DRAIN TRANSACTIONS PRESERVE was reset before shutdown handoff
-SELECT GROUP_CONCAT(CONCAT(id, ':', v) ORDER BY id) AS legacy_committed_values
-FROM t_closing_timeout_legacy_reset;
-legacy_committed_values
-1:111,2:221
-no_receiver_epoch_after_legacy_reset
-1

@@ -1,6 +1,6 @@
 DROP TABLE IF EXISTS t_logged_empty_gtid_next;
 DROP DATABASE IF EXISTS preserve_trx_ignored;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 SET SESSION sql_log_bin=0;
 CREATE DATABASE preserve_trx_ignored;
 CREATE TABLE t_logged_empty_gtid_next(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
@@ -28,4 +28,4 @@ DROP TABLE t_logged_empty_gtid_next;
 DROP DATABASE preserve_trx_ignored;
 SET SESSION sql_log_bin=1;
 RESET MASTER;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

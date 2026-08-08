@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_preserve_token_redaction;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 SET GLOBAL log_output='TABLE';
 SET GLOBAL general_log=OFF;
 SET GLOBAL slow_query_log=OFF;
@@ -232,4 +232,4 @@ TRUNCATE TABLE mysql.slow_log;
 SET GLOBAL long_query_time=10.000000;
 SET GLOBAL log_slow_admin_statements=0;
 SET GLOBAL log_output='FILE';
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

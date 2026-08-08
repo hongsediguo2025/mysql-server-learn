@@ -15,7 +15,7 @@ CALL mtr.add_suppression("Found 1 prepared XA transactions");
 
 --let MYSQLD_DATADIR= `SELECT @@datadir`
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_force_recovery_unsupported(a INT PRIMARY KEY, b INT)
   ENGINE=InnoDB;
@@ -30,7 +30,7 @@ UPDATE t_force_recovery_unsupported SET b=11 WHERE a=1;
 --source suite/preserve_trx/include/drain_transaction_from_control.inc
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 
---exec echo "restart: --preserve-trx-enable=ON --innodb-force-recovery=1" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON --innodb-force-recovery=1" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -52,7 +52,7 @@ DRAIN TRANSACTIONS PRESERVE;
 
 --source suite/preserve_trx/include/assert_one_snapshot_file.inc
 
---let $restart_parameters= restart: --preserve-trx-enable=ON --innodb-force-recovery=0
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --innodb-force-recovery=0
 --let $do_not_echo_parameters= 1
 --source include/restart_mysqld.inc
 --let $do_not_echo_parameters=
@@ -68,4 +68,4 @@ SELECT COUNT(*) AS preserved_count_after_tainted_rollback
 --source suite/preserve_trx/include/assert_no_snapshot_file.inc
 
 DROP TABLE t_force_recovery_unsupported;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

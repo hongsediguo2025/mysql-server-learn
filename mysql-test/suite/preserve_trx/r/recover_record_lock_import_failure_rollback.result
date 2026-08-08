@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_recover_record_lock_import_failure;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_recover_record_lock_import_failure(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_recover_record_lock_import_failure VALUES(1,10),(2,20);
 SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
@@ -9,11 +9,11 @@ SELECT * FROM t_recover_record_lock_import_failure WHERE a=1 FOR SHARE;
 a	b
 1	10
 DRAIN TRANSACTIONS PRESERVE;
-# restart: --preserve-trx-enable=ON --debug=d,preserve_trx_fail_import_record_locks
+# restart: --rds-preserve-trx-enable=ON --debug=d,preserve_trx_fail_import_record_locks
 include/wait_for_pattern_in_file.inc [Preserved transaction .* recovery forced rollback: failed to restore durable transaction semantics]
 SELECT * FROM t_recover_record_lock_import_failure ORDER BY a;
 a	b
 1	10
 2	20
 DROP TABLE t_recover_record_lock_import_failure;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

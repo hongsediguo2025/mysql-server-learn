@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_resume_replaces_user_vars;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_resume_replaces_user_vars(
 id INT PRIMARY KEY,
 v INT
@@ -24,4 +24,4 @@ SELECT * FROM t_resume_replaces_user_vars ORDER BY id;
 id	v
 1	10
 DROP TABLE t_resume_replaces_user_vars;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

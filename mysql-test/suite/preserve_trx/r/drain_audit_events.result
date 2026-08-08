@@ -1,4 +1,4 @@
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 INSTALL PLUGIN null_audit SONAME 'adt_null.so';
 SET @expected_drain_audit=CONCAT(
 'MYSQL_AUDIT_MESSAGE_INTERNAL;component="mysqld" producer="preserve_trx" ',
@@ -22,4 +22,4 @@ SELECT @@null_audit_event_record LIKE
 drain_audit_recorded
 1
 UNINSTALL PLUGIN null_audit;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

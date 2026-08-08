@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_batch_global_off;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_batch_global_off(
 id INT PRIMARY KEY,
 v INT,
@@ -61,4 +61,4 @@ FROM t_batch_global_off;
 row_count	distinct_ids	resumed_rows	bumped_rows
 2	2	2	2
 DROP TABLE t_batch_global_off;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

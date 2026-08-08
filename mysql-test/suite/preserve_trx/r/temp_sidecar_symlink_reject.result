@@ -1,5 +1,5 @@
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 # image sidecar symlink is rejected
 SHUTDOWN;
 temp image sidecar symlink installed
@@ -16,5 +16,5 @@ SELECT COUNT(*) AS preserved_count_after_undo_symlink
 FROM performance_schema.preserved_transactions;
 preserved_count_after_undo_symlink
 0
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;

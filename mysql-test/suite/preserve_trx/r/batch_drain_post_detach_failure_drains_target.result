@@ -3,7 +3,7 @@ CALL mtr.add_suppression("Preserved transaction .* recovery cleanup failed: fail
 CALL mtr.add_suppression("Preserved transaction .* recovery cleanup failed: failed to delete snapshot files");
 CALL mtr.add_suppression("Preserved transaction batch cleanup failed after target preserve error");
 DROP TABLE IF EXISTS t_batch_post_detach_failure;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_batch_post_detach_failure(
 id INT PRIMARY KEY,
 v INT
@@ -57,4 +57,4 @@ id	v
 2	20
 3	30
 DROP TABLE t_batch_post_detach_failure;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

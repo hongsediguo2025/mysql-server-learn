@@ -27,7 +27,7 @@ CREATE USER closing_all_app@localhost;
 GRANT SELECT, UPDATE ON test.* TO closing_all_app@localhost;
 GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO closing_all_app@localhost;
 
---let $restart_parameters= restart: --preserve-trx-enable=ON --preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --preserve-trx-transfer-target-socket=$MASTER_MYSOCK --preserve-trx-transfer-target-user=preserve_trx_ha_admin --preserve-trx-transfer-credential-name=closing_timeout_all_excluded --preserve-trx-transfer-credential-secret-file=$credential_file
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$MASTER_MYPORT --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=closing_timeout_all_excluded --rds-preserve-trx-transfer-credential-secret-file=$credential_file
 --disable_result_log
 --source include/restart_mysqld.inc
 --enable_result_log
@@ -37,14 +37,10 @@ GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO closing_all_app@localhost;
 CALL mtr.add_suppression(
   "PRESERVE: rolled back prepared transaction without snapshot during recovery");
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_transfer_prewarm_paused=ON;
---let $old_pipeline_enable= `SELECT @@GLOBAL.preserve_trx_transfer_pipeline_enable`
---let $old_lock_warmcopy_enable= `SELECT @@GLOBAL.preserve_trx_lock_warmcopy_enable`
-SET GLOBAL preserve_trx_transfer_pipeline_enable=ON;
-SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
-SET GLOBAL preserve_trx_drain_phase1_timeout_ms=200;
-SET GLOBAL preserve_trx_drain_phase2_timeout_ms=100;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=ON;
+SET GLOBAL rds_preserve_trx_drain_phase1_timeout_ms=200;
+SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms=100;
 
 --connect(closing_all_ha,localhost,preserve_trx_ha_admin,closing-timeout-all-excluded-secret,test)
 
@@ -120,7 +116,7 @@ SET DEBUG_SYNC='now SIGNAL closing_all_shutdown';
 SHUTDOWN;
 --connection default
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
---exec echo "restart: --preserve-trx-enable=ON --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -129,10 +125,8 @@ SHUTDOWN;
 DROP TABLE t_closing_timeout_all_excluded;
 DROP USER preserve_trx_ha_admin@localhost;
 DROP USER closing_all_app@localhost;
-SET GLOBAL preserve_trx_drain_phase2_timeout_ms=30000;
-SET GLOBAL preserve_trx_drain_phase1_timeout_ms=600000;
---eval SET GLOBAL preserve_trx_lock_warmcopy_enable=$old_lock_warmcopy_enable
---eval SET GLOBAL preserve_trx_transfer_pipeline_enable=$old_pipeline_enable
+SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms=30000;
+SET GLOBAL rds_preserve_trx_drain_phase1_timeout_ms=600000;
 SET DEBUG_SYNC='RESET';
 --remove_file $credential_file
 

@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_gtid_anonymous_reject;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_gtid_anonymous_reject(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_gtid_anonymous_reject VALUES(1,10);
 SET GTID_NEXT='ANONYMOUS';
@@ -16,4 +16,4 @@ SELECT @@SESSION.GTID_NEXT;
 @@SESSION.GTID_NEXT
 AUTOMATIC
 DROP TABLE t_gtid_anonymous_reject;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

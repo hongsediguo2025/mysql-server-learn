@@ -9,7 +9,7 @@ DROP TABLE IF EXISTS t_resume_session_autoinc;
 DROP TABLE IF EXISTS t_resume_session_seed;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_resume_session_parent(
   id INT PRIMARY KEY
@@ -52,7 +52,7 @@ UPDATE t_resume_session_seed SET v=11 WHERE id=1;
 DRAIN TRANSACTIONS PRESERVE;
 --source include/wait_until_disconnected.inc
 
---exec echo "restart: --preserve-trx-enable=ON --log-bin=preserve-trx-session-continuation-bin --server-id=1 --binlog-format=ROW" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON --log-bin=preserve-trx-session-continuation-bin --server-id=1 --binlog-format=ROW" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect

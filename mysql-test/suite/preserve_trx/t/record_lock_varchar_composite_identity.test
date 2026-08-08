@@ -5,7 +5,7 @@
 DROP TABLE IF EXISTS t_record_lock_varchar_composite;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_record_lock_varchar_composite(
   tenant VARCHAR(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL,
@@ -30,7 +30,7 @@ UPDATE t_record_lock_varchar_composite
 --let $preserve_trx_drain_clause=
 --source suite/preserve_trx/include/drain_transaction_from_control.inc
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
---exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -74,4 +74,4 @@ SELECT tenant, id, ts, v
  ORDER BY tenant, id, ts;
 
 DROP TABLE t_record_lock_varchar_composite;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

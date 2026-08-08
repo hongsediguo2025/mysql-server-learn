@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_recovery_stale_tmp_sidecars;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_recovery_stale_tmp_sidecars(a INT PRIMARY KEY, b INT)
 ENGINE=InnoDB;
 INSERT INTO t_recovery_stale_tmp_sidecars VALUES(1, 10);
@@ -9,11 +9,11 @@ a	b
 1	10
 UPDATE t_recovery_stale_tmp_sidecars SET b=11 WHERE a=1;
 DRAIN TRANSACTIONS PRESERVE;
-# restart: --preserve-trx-enable=ON
+# restart: --rds-preserve-trx-enable=ON
 RESUME PRESERVED TRANSACTION 'TOKEN';
 COMMIT;
 SELECT * FROM t_recovery_stale_tmp_sidecars ORDER BY a;
 a	b
 1	11
 DROP TABLE t_recovery_stale_tmp_sidecars;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

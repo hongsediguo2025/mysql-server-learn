@@ -1,6 +1,6 @@
 DROP TABLE IF EXISTS t_logged_empty;
 DROP DATABASE IF EXISTS preserve_trx_ignored;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE DATABASE preserve_trx_ignored;
 CREATE TABLE t_logged_empty(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 CREATE TABLE preserve_trx_ignored.seed(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
@@ -35,4 +35,4 @@ a	b
 include/assert_grep.inc [Future DML is written to the binlog after LOGGED_EMPTY resume]
 DROP TABLE t_logged_empty;
 DROP DATABASE preserve_trx_ignored;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

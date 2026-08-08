@@ -12,7 +12,7 @@ CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: pre
 
 --let MYSQLD_DATADIR= `SELECT @@datadir`
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_snapshot_bin_symlink_reject(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
 INSERT INTO t_snapshot_bin_symlink_reject VALUES(1,10);
@@ -45,8 +45,8 @@ symlink($real, $snapshot) or die "cannot create snapshot symlink: $!";
 print "snapshot bin symlink installed\n";
 EOF
 
---echo # restart: --preserve-trx-enable=ON --skip-log-bin
---exec echo "restart: --preserve-trx-enable=ON --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--echo # restart: --rds-preserve-trx-enable=ON --skip-log-bin
+--exec echo "restart: --rds-preserve-trx-enable=ON --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect

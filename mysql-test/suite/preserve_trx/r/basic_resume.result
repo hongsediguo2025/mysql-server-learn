@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_basic_resume;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_basic_resume(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_basic_resume VALUES(1,10);
 START TRANSACTION;
@@ -18,4 +18,4 @@ SELECT * FROM t_basic_resume ORDER BY a;
 a	b
 1	12
 DROP TABLE t_basic_resume;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

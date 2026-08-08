@@ -1029,25 +1029,8 @@ static Sys_var_bool Sys_partial_revokes(
     ON_CHECK(check_partial_revokes), ON_UPDATE(partial_revokes_update), nullptr,
     sys_var::PARSE_EARLY);
 
-class Sys_var_preserve_trx_dir final : public Sys_var_charptr_func {
- public:
-  Sys_var_preserve_trx_dir()
-      : Sys_var_charptr_func(
-            "preserve_trx_dir",
-            "Directory used for preserved transaction snapshot files.",
-            GLOBAL) {
-    is_os_charset = true;
-  }
-
-  const uchar *global_value_ptr(THD *, LEX_STRING *) override {
-    return pointer_cast<const uchar *>(preserved_trx_dir_value());
-  }
-};
-
-static Sys_var_preserve_trx_dir Sys_preserve_trx_dir;
-
 static Sys_var_bool Sys_preserve_trx_temp_table_enable(
-    "preserve_trx_temp_table_enable",
+    "rds_preserve_trx_temp_table_enable",
     "Enable constrained user InnoDB temporary table preserve/resume support. "
     "Tracked Temp-DML is preserved through physical image and no-redo undo "
     "sidecars; DDL, unsupported metadata, savepoint and statement-rollback "
@@ -1055,117 +1038,16 @@ static Sys_var_bool Sys_preserve_trx_temp_table_enable(
     GLOBAL_VAR(preserve_trx_temp_table_enable), CMD_LINE(OPT_ARG),
     DEFAULT(true), NO_MUTEX_GUARD, NOT_IN_BINLOG);
 
-static Sys_var_uint Sys_preserve_trx_max_total(
-    "preserve_trx_max_total",
-    "Maximum total number of preserved transactions allowed on the instance.",
-    GLOBAL_VAR(preserve_trx_max_total), CMD_LINE(REQUIRED_ARG),
-    VALID_RANGE(1, UINT_MAX32), DEFAULT(256), BLOCK_SIZE(1), NO_MUTEX_GUARD,
-    NOT_IN_BINLOG);
-
-static Sys_var_uint Sys_preserve_trx_max_pending_per_user(
-    "preserve_trx_max_pending_per_user",
-    "Maximum number of preserved transactions pending for one account.",
-    GLOBAL_VAR(preserve_trx_max_pending_per_user), CMD_LINE(REQUIRED_ARG),
-    VALID_RANGE(1, UINT_MAX32), DEFAULT(256), BLOCK_SIZE(1), NO_MUTEX_GUARD,
-    NOT_IN_BINLOG);
-
-static Sys_var_uint Sys_preserve_trx_batch_max_transactions(
-    "preserve_trx_batch_max_transactions",
-    "Maximum number of transactions that one DRAIN TRANSACTIONS PRESERVE "
-    "command may preserve.",
-    GLOBAL_VAR(preserve_trx_batch_max_transactions), CMD_LINE(REQUIRED_ARG),
-    VALID_RANGE(1, UINT_MAX32), DEFAULT(256), BLOCK_SIZE(1), NO_MUTEX_GUARD,
-    NOT_IN_BINLOG);
-
-static Sys_var_uint Sys_preserve_trx_recovery_max_count(
-    "preserve_trx_recovery_max_count",
-    "Maximum number of startup recovery passes for the same preserved "
-    "transaction before it is rolled back.",
-    GLOBAL_VAR(preserve_trx_recovery_max_count), CMD_LINE(REQUIRED_ARG),
-    VALID_RANGE(1, UINT_MAX32), DEFAULT(3), BLOCK_SIZE(1), NO_MUTEX_GUARD,
-    NOT_IN_BINLOG);
-
-static Sys_var_uint Sys_preserve_trx_recovery_grace_seconds(
-    "preserve_trx_recovery_grace_seconds",
-    "Startup recovery grace window in seconds for the first recovery of a "
-    "preserved transaction whose original timeout already expired.",
-    GLOBAL_VAR(preserve_trx_recovery_grace_seconds), CMD_LINE(REQUIRED_ARG),
-    VALID_RANGE(30, 1800), DEFAULT(120), BLOCK_SIZE(1), NO_MUTEX_GUARD,
-    NOT_IN_BINLOG);
-
-static Sys_var_ulonglong Sys_preserve_trx_max_snapshot_bytes(
-    "preserve_trx_max_snapshot_bytes",
-    "Maximum size in bytes of a preserved transaction snapshot metadata file.",
-    GLOBAL_VAR(preserve_trx_max_snapshot_bytes), CMD_LINE(REQUIRED_ARG),
-    VALID_RANGE(1, ULLONG_MAX), DEFAULT(16777216), BLOCK_SIZE(1),
-    NO_MUTEX_GUARD, NOT_IN_BINLOG);
-
-static Sys_var_ulonglong Sys_preserve_trx_max_binlog_cache_bytes(
-    "preserve_trx_max_binlog_cache_bytes",
-    "Maximum size in bytes of a preserved transaction binlog cache sidecar "
-    "file.",
-    GLOBAL_VAR(preserve_trx_max_binlog_cache_bytes), CMD_LINE(REQUIRED_ARG),
-    VALID_RANGE(1, ULLONG_MAX), DEFAULT(1073741824), BLOCK_SIZE(1),
-    NO_MUTEX_GUARD, NOT_IN_BINLOG);
-
-static Sys_var_ulonglong Sys_preserve_trx_max_temp_sidecar_bytes(
-    "preserve_trx_max_temp_sidecar_bytes",
-    "Maximum size in bytes of a preserved temporary table image or undo "
-    "sidecar file.",
-    GLOBAL_VAR(preserve_trx_max_temp_sidecar_bytes), CMD_LINE(REQUIRED_ARG),
-    VALID_RANGE(1, ULLONG_MAX), DEFAULT(1073741824), BLOCK_SIZE(1),
-    NO_MUTEX_GUARD, NOT_IN_BINLOG);
-
 static Sys_var_ulonglong Sys_preserve_trx_memory_budget_bytes(
-    "preserve_trx_memory_budget_bytes",
+    "rds_preserve_trx_memory_budget_bytes",
     "Maximum Preserve/Resume heap bytes that may be leased across all active "
     "preserve operations before callers must spill or fail closed.",
     GLOBAL_VAR(preserve_trx_memory_budget_bytes), CMD_LINE(REQUIRED_ARG),
     VALID_RANGE(4096, ULLONG_MAX), DEFAULT(268435456), BLOCK_SIZE(1),
     NO_MUTEX_GUARD, NOT_IN_BINLOG);
 
-static Sys_var_ulonglong Sys_preserve_trx_memory_per_token_bytes(
-    "preserve_trx_memory_per_token_bytes",
-    "Maximum Preserve/Resume heap bytes that may be leased by one preserved "
-    "transaction token before callers must spill or fail closed.",
-    GLOBAL_VAR(preserve_trx_memory_per_token_bytes), CMD_LINE(REQUIRED_ARG),
-    VALID_RANGE(4096, ULLONG_MAX), DEFAULT(67108864), BLOCK_SIZE(1),
-    NO_MUTEX_GUARD, NOT_IN_BINLOG);
-
-static Sys_var_uint Sys_preserve_trx_spill_chunk_bytes(
-    "preserve_trx_spill_chunk_bytes",
-    "Scratch chunk size used when Preserve/Resume streams large artifacts to "
-    "the spill backend.",
-    GLOBAL_VAR(preserve_trx_spill_chunk_bytes), CMD_LINE(REQUIRED_ARG),
-    VALID_RANGE(4096, 67108864), DEFAULT(4194304), BLOCK_SIZE(1),
-    NO_MUTEX_GUARD, NOT_IN_BINLOG);
-
-static Sys_var_ulonglong Sys_preserve_trx_single_phase_max_binlog_cache_bytes(
-    "preserve_trx_single_phase_max_binlog_cache_bytes",
-    "Maximum logged binlog cache bytes that preserve may copy without a "
-    "warm-copy phase. Larger single-phase preserves fail before undo prepare "
-    "or detach.",
-    GLOBAL_VAR(preserve_trx_single_phase_max_binlog_cache_bytes),
-    CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, ULLONG_MAX), DEFAULT(ULLONG_MAX),
-    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
-
-static Sys_var_uint Sys_preserve_trx_max_lock_count(
-    "preserve_trx_max_lock_count",
-    "Maximum number of record locks that preserve may export "
-    "before rejecting the transaction.",
-    GLOBAL_VAR(preserve_trx_max_lock_count), CMD_LINE(REQUIRED_ARG),
-    VALID_RANGE(0, UINT_MAX32), DEFAULT(2000), BLOCK_SIZE(1), NO_MUTEX_GUARD,
-    NOT_IN_BINLOG);
-
-static Sys_var_uint Sys_preserve_trx_max_modified_tables(
-    "preserve_trx_max_modified_tables",
-    "Maximum modified InnoDB tables exported per preserved transaction.",
-    GLOBAL_VAR(preserve_trx_max_modified_tables), CMD_LINE(REQUIRED_ARG),
-    VALID_RANGE(0, UINT_MAX32), DEFAULT(64), BLOCK_SIZE(1), NO_MUTEX_GUARD,
-    NOT_IN_BINLOG);
-
 static Sys_var_uint Sys_preserve_trx_drain_phase1_timeout_ms(
-    "preserve_trx_drain_phase1_timeout_ms",
+    "rds_preserve_trx_drain_phase1_timeout_ms",
     "Maximum Phase 1 readiness observation time in milliseconds. Expiry "
     "stops readiness waiting and immediately advances the drain to Phase 2.",
     GLOBAL_VAR(preserve_trx_drain_phase1_timeout_ms), CMD_LINE(REQUIRED_ARG),
@@ -1173,7 +1055,7 @@ static Sys_var_uint Sys_preserve_trx_drain_phase1_timeout_ms(
     NO_MUTEX_GUARD, NOT_IN_BINLOG);
 
 static Sys_var_uint Sys_preserve_trx_drain_phase2_timeout_ms(
-    "preserve_trx_drain_phase2_timeout_ms",
+    "rds_preserve_trx_drain_phase2_timeout_ms",
     "Maximum token-convergence time in milliseconds after publishing "
     "WARMCOPY_CLOSING. Expiry fails a local-carrier drain. Standby transfer "
     "instead excludes commands that have not reached the boundary and "
@@ -1183,149 +1065,8 @@ static Sys_var_uint Sys_preserve_trx_drain_phase2_timeout_ms(
     VALID_RANGE(1, UINT_MAX32), DEFAULT(30000), BLOCK_SIZE(1),
     NO_MUTEX_GUARD, NOT_IN_BINLOG);
 
-static Sys_var_bool Sys_preserve_trx_transfer_pipeline_enable(
-    "preserve_trx_transfer_pipeline_enable",
-    "Enable standby-transfer Phase 1 active binlog progress and per-token "
-    "early Preserve overlap during WARMCOPY_CLOSING. This controls performance "
-    "orchestration only and does not change command-timeout failure policy.",
-    GLOBAL_VAR(preserve_trx_transfer_pipeline_enable), CMD_LINE(OPT_ARG),
-    DEFAULT(true), NO_MUTEX_GUARD, NOT_IN_BINLOG);
-
-static Sys_var_bool Sys_preserve_trx_warmcopy_enable(
-    "preserve_trx_warmcopy_enable",
-    "Enable the warm-copy phase for DRAIN TRANSACTIONS PRESERVE binlog caches.",
-    GLOBAL_VAR(preserve_trx_warmcopy_enable), CMD_LINE(OPT_ARG),
-    DEFAULT(true), NO_MUTEX_GUARD, NOT_IN_BINLOG);
-
-static Sys_var_uint Sys_preserve_trx_warmcopy_min_open_ms(
-    "preserve_trx_warmcopy_min_open_ms",
-    "Minimum wall-clock time in milliseconds that a warm-copy drain remains "
-    "open before closing admission.",
-    GLOBAL_VAR(preserve_trx_warmcopy_min_open_ms), CMD_LINE(REQUIRED_ARG),
-    VALID_RANGE(0, UINT_MAX32), DEFAULT(1000), BLOCK_SIZE(1), NO_MUTEX_GUARD,
-    NOT_IN_BINLOG);
-
-static Sys_var_uint Sys_preserve_trx_warmcopy_chunk_bytes(
-    "preserve_trx_warmcopy_chunk_bytes",
-    "Target byte chunk size for warm-copy binlog cache prefix copy.",
-    GLOBAL_VAR(preserve_trx_warmcopy_chunk_bytes), CMD_LINE(REQUIRED_ARG),
-    VALID_RANGE(1, UINT_MAX32), DEFAULT(1048576), BLOCK_SIZE(1),
-    NO_MUTEX_GUARD, NOT_IN_BINLOG);
-
-static Sys_var_uint Sys_preserve_trx_warmcopy_tail_budget_bytes(
-    "preserve_trx_warmcopy_tail_budget_bytes",
-    "Maximum binlog cache tail bytes allowed after the warm-copy descriptor "
-    "high-water mark before preserve phase rejects the drain.",
-    GLOBAL_VAR(preserve_trx_warmcopy_tail_budget_bytes),
-    CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, UINT_MAX32), DEFAULT(1048576),
-    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
-
-static Sys_var_ulonglong Sys_preserve_trx_warmcopy_max_total_bytes(
-    "preserve_trx_warmcopy_max_total_bytes",
-    "Maximum total bytes of warm-copy binlog cache artifacts per drain epoch.",
-    GLOBAL_VAR(preserve_trx_warmcopy_max_total_bytes), CMD_LINE(REQUIRED_ARG),
-    VALID_RANGE(1, ULLONG_MAX), DEFAULT(10737418240ULL), BLOCK_SIZE(1),
-    NO_MUTEX_GUARD, NOT_IN_BINLOG);
-
-static Sys_var_uint Sys_preserve_trx_warmcopy_pending_range_limit(
-    "preserve_trx_warmcopy_pending_range_limit",
-    "Maximum number of out-of-order warm-copy mirror ranges retained per "
-    "participant before the participant is degraded.",
-    GLOBAL_VAR(preserve_trx_warmcopy_pending_range_limit),
-    CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, UINT_MAX32), DEFAULT(1024),
-    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
-
-static Sys_var_ulonglong Sys_preserve_trx_warmcopy_pending_bytes_limit(
-    "preserve_trx_warmcopy_pending_bytes_limit",
-    "Maximum bytes of out-of-order warm-copy mirror payload retained per "
-    "participant before the participant is degraded.",
-    GLOBAL_VAR(preserve_trx_warmcopy_pending_bytes_limit),
-    CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, ULLONG_MAX), DEFAULT(67108864ULL),
-    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
-
-static Sys_var_bool Sys_preserve_trx_lock_warmcopy_enable(
-    "preserve_trx_lock_warmcopy_enable",
-    "Enable Preserve/Resume lock metadata warm-copy. This option is "
-    "independent from preserve_trx_warmcopy_enable, which controls binlog "
-    "cache warm-copy.",
-    GLOBAL_VAR(preserve_trx_lock_warmcopy_enable), CMD_LINE(OPT_ARG),
-    DEFAULT(true), NO_MUTEX_GUARD, NOT_IN_BINLOG);
-
-static Sys_var_bool Sys_preserve_trx_lock_warmcopy_fallback_to_live_export(
-    "preserve_trx_lock_warmcopy_fallback_to_live_export",
-    "Allow Preserve/Resume to discard an invalid lock warm-copy artifact and "
-    "fall back to the existing live lock export path for the whole target.",
-    GLOBAL_VAR(preserve_trx_lock_warmcopy_fallback_to_live_export),
-    CMD_LINE(OPT_ARG), DEFAULT(true), NO_MUTEX_GUARD, NOT_IN_BINLOG);
-
-static Sys_var_ulonglong Sys_preserve_trx_lock_warmcopy_max_memory_bytes(
-    "preserve_trx_lock_warmcopy_max_memory_bytes",
-    "Maximum Preserve/Resume lock warm-copy artifact payload bytes retained "
-    "in memory in one drain epoch before spill or fail-closed handling is "
-    "required. This is not a total process heap limit.",
-    GLOBAL_VAR(preserve_trx_lock_warmcopy_max_memory_bytes),
-    CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, ULLONG_MAX), DEFAULT(268435456ULL),
-    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
-
-static Sys_var_ulonglong Sys_preserve_trx_lock_warmcopy_max_journal_bytes(
-    "preserve_trx_lock_warmcopy_max_journal_bytes",
-    "Maximum journal bytes for Preserve/Resume lock warm-copy state in one "
-    "drain epoch before spill or fail-closed handling is required.",
-    GLOBAL_VAR(preserve_trx_lock_warmcopy_max_journal_bytes),
-    CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, ULLONG_MAX), DEFAULT(1073741824ULL),
-    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
-
-static Sys_var_uint Sys_preserve_trx_lock_warmcopy_max_dirty_shards(
-    "preserve_trx_lock_warmcopy_max_dirty_shards",
-    "Maximum dirty record shards that Preserve/Resume lock warm-copy may "
-    "revalidate in phase 2 before the target artifact becomes invalid.",
-    GLOBAL_VAR(preserve_trx_lock_warmcopy_max_dirty_shards),
-    CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, UINT_MAX32), DEFAULT(100000),
-    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
-
-static Sys_var_uint Sys_preserve_trx_lock_warmcopy_max_mdl_descriptors(
-    "preserve_trx_lock_warmcopy_max_mdl_descriptors",
-    "Maximum transaction-duration MDL descriptors that Preserve/Resume lock "
-    "warm-copy may retain for one target before the artifact becomes invalid.",
-    GLOBAL_VAR(preserve_trx_lock_warmcopy_max_mdl_descriptors),
-    CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, UINT_MAX32), DEFAULT(100000),
-    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
-
-static Sys_var_uint Sys_preserve_trx_lock_warmcopy_seal_threads(
-    "preserve_trx_lock_warmcopy_seal_threads",
-    "Number of lock warm-copy phase-2 record seal worker threads. 0 selects "
-    "an automatic worker count bounded by the number of targets.",
-    GLOBAL_VAR(preserve_trx_lock_warmcopy_seal_threads),
-    CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, 1024), DEFAULT(0), BLOCK_SIZE(1),
-    NO_MUTEX_GUARD, NOT_IN_BINLOG);
-
-static Sys_var_uint Sys_preserve_trx_parallel_preserve_threads(
-    "preserve_trx_parallel_preserve_threads",
-    "Number of DRAIN TRANSACTIONS PRESERVE phase-2 target preserve worker "
-    "threads. 0 selects an automatic worker count for lock warm-copy batch "
-    "drains; 1 forces the legacy serial target preserve loop.",
-    GLOBAL_VAR(preserve_trx_parallel_preserve_threads),
-    CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, 1024), DEFAULT(0), BLOCK_SIZE(1),
-    NO_MUTEX_GUARD, NOT_IN_BINLOG);
-
-static Sys_var_uint Sys_preserve_trx_startup_recovery_threads(
-    "preserve_trx_startup_recovery_threads",
-    "Number of Preserve/Resume startup snapshot recovery worker threads. 0 "
-    "selects an automatic worker count for local preserved snapshots; 1 "
-    "forces the legacy serial startup recovery loop.",
-    GLOBAL_VAR(preserve_trx_startup_recovery_threads), CMD_LINE(REQUIRED_ARG),
-    VALID_RANGE(0, 1024), DEFAULT(0), BLOCK_SIZE(1), NO_MUTEX_GUARD,
-    NOT_IN_BINLOG);
-
-static Sys_var_bool Sys_preserve_trx_recover_lock_page_prefetch(
-    "preserve_trx_recover_lock_page_prefetch",
-    "Issue best-effort asynchronous InnoDB page reads for preserved record-lock "
-    "payload pages before startup recovery imports the record locks.",
-    GLOBAL_VAR(preserve_trx_recover_lock_page_prefetch), CMD_LINE(OPT_ARG),
-    DEFAULT(true), NO_MUTEX_GUARD, NOT_IN_BINLOG);
-
 static Sys_var_uint Sys_preserve_trx_lock_warmcopy_conversion_wait_timeout_ms(
-    "preserve_trx_lock_warmcopy_conversion_wait_timeout_ms",
+    "rds_preserve_trx_lock_warmcopy_conversion_wait_timeout_ms",
     "Maximum milliseconds another session may wait when lock warm-copy has "
     "temporarily frozen implicit-to-explicit record lock conversion for a "
     "target transaction.",
@@ -1351,43 +1092,37 @@ static bool check_preserve_trx_transfer_artifact_mode(sys_var *, THD *,
       static_cast<ulong>(var->save_result.ulonglong_value);
   if (requested_mode != preserve_trx_transfer_artifact_mode) {
     my_error(ER_WRONG_ARGUMENTS, MYF(0),
-             "preserve_trx_transfer_artifact_mode is a startup-only option");
+             "rds_preserve_trx_transfer_artifact_mode is a startup-only "
+             "option");
     return true;
   }
   return false;
 }
 
 static Sys_var_charptr Sys_preserve_trx_transfer_target_host(
-    "preserve_trx_transfer_target_host",
+    "rds_preserve_trx_transfer_target_host",
     "Host name or address used by Preserve/Resume standby direct-transfer "
     "source background sessions. Empty means no TCP target is configured.",
     READ_ONLY GLOBAL_VAR(preserve_trx_transfer_target_host),
     CMD_LINE(REQUIRED_ARG), IN_FS_CHARSET, DEFAULT(""));
 
 static Sys_var_uint Sys_preserve_trx_transfer_target_port(
-    "preserve_trx_transfer_target_port",
+    "rds_preserve_trx_transfer_target_port",
     "TCP port used by Preserve/Resume standby direct-transfer source "
     "background sessions. 0 means no TCP target port is configured.",
     READ_ONLY GLOBAL_VAR(preserve_trx_transfer_target_port),
     CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, 65535), DEFAULT(0), BLOCK_SIZE(1),
     NO_MUTEX_GUARD, NOT_IN_BINLOG);
 
-static Sys_var_charptr Sys_preserve_trx_transfer_target_socket(
-    "preserve_trx_transfer_target_socket",
-    "Unix socket used by Preserve/Resume standby direct-transfer source "
-    "background sessions. Empty means no socket target is configured.",
-    READ_ONLY GLOBAL_VAR(preserve_trx_transfer_target_socket),
-    CMD_LINE(REQUIRED_ARG), IN_FS_CHARSET, DEFAULT(""));
-
 static Sys_var_charptr Sys_preserve_trx_transfer_target_user(
-    "preserve_trx_transfer_target_user",
+    "rds_preserve_trx_transfer_target_user",
     "Account name used by Preserve/Resume standby direct-transfer source "
     "background sessions. The password material is referenced separately.",
     READ_ONLY GLOBAL_VAR(preserve_trx_transfer_target_user),
     CMD_LINE(REQUIRED_ARG), IN_SYSTEM_CHARSET, DEFAULT(""));
 
 static Sys_var_charptr Sys_preserve_trx_transfer_credential_name(
-    "preserve_trx_transfer_credential_name",
+    "rds_preserve_trx_transfer_credential_name",
     "Credential reference used by Preserve/Resume standby direct-transfer "
     "source background sessions. The variable stores a credential name, not a "
     "plain-text password.",
@@ -1395,7 +1130,7 @@ static Sys_var_charptr Sys_preserve_trx_transfer_credential_name(
     CMD_LINE(REQUIRED_ARG), IN_SYSTEM_CHARSET, DEFAULT(""));
 
 static Sys_var_charptr Sys_preserve_trx_transfer_credential_secret_file(
-    "preserve_trx_transfer_credential_secret_file",
+    "rds_preserve_trx_transfer_credential_secret_file",
     "Path to a local file containing the Preserve/Resume standby "
     "direct-transfer credential secret. The path is read only by source "
     "background sessions when no in-memory credential store entry is "
@@ -1404,17 +1139,18 @@ static Sys_var_charptr Sys_preserve_trx_transfer_credential_secret_file(
     CMD_LINE(REQUIRED_ARG), IN_FS_CHARSET, DEFAULT(""));
 
 static Sys_var_enum Sys_preserve_trx_transfer_artifact_mode(
-    "preserve_trx_transfer_artifact_mode",
+    "rds_preserve_trx_transfer_artifact_mode",
     "Artifact publication mode for Preserve/Resume. LOCAL_CARRIER preserves "
     "the current local carrier path; STANDBY_TRANSFER_SAVE publishes through "
     "the configured standby transfer endpoint.",
     GLOBAL_VAR(preserve_trx_transfer_artifact_mode), CMD_LINE(REQUIRED_ARG),
     preserve_trx_transfer_artifact_mode_names,
-    DEFAULT(PRESERVE_TRX_TRANSFER_ARTIFACT_LOCAL_CARRIER), NO_MUTEX_GUARD,
+    DEFAULT(PRESERVE_TRX_TRANSFER_ARTIFACT_STANDBY_TRANSFER_SAVE),
+    NO_MUTEX_GUARD,
     NOT_IN_BINLOG, ON_CHECK(check_preserve_trx_transfer_artifact_mode));
 
 static Sys_var_enum Sys_preserve_trx_transfer_runtime_profile(
-    "preserve_trx_transfer_runtime_profile",
+    "rds_preserve_trx_transfer_runtime_profile",
     "Runtime resource profile for Preserve/Resume standby transfer and "
     "prewarm. Profiles change only worker and IO budgets; they do not change "
     "artifact format, token identity, or trigger resume.",
@@ -1424,7 +1160,7 @@ static Sys_var_enum Sys_preserve_trx_transfer_runtime_profile(
     NOT_IN_BINLOG);
 
 static Sys_var_bool Sys_preserve_trx_transfer_prewarm_paused(
-    "preserve_trx_transfer_prewarm_paused",
+    "rds_preserve_trx_transfer_prewarm_paused",
     "Pause opportunistic Preserve/Resume standby prewarm workers while "
     "allowing receiver saved-artifact writes and backlog accumulation to "
     "continue.",
@@ -1432,168 +1168,22 @@ static Sys_var_bool Sys_preserve_trx_transfer_prewarm_paused(
     DEFAULT(false), NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(nullptr),
     ON_UPDATE(update_preserve_trx_transfer_prewarm_paused));
 
-static Sys_var_uint Sys_preserve_trx_transfer_data_sessions(
-    "preserve_trx_transfer_data_sessions",
-    "Classic-protocol data session count snapshotted when a Preserve/Resume "
-    "standby transfer sink is created. Token-affine final payloads are spread "
-    "across these sessions; epoch commit and mixed-token control batches use "
-    "the control session.",
-    GLOBAL_VAR(preserve_trx_transfer_data_sessions), CMD_LINE(REQUIRED_ARG),
-    VALID_RANGE(1, 64), DEFAULT(3), BLOCK_SIZE(1), NO_MUTEX_GUARD,
-    NOT_IN_BINLOG);
-
-static Sys_var_uint Sys_preserve_trx_transfer_sender_workers(
-    "preserve_trx_transfer_sender_workers",
-    "Maximum source worker count for sending token-grouped final transfer "
-    "payloads before the single epoch commit barrier.",
-    GLOBAL_VAR(preserve_trx_transfer_sender_workers), CMD_LINE(REQUIRED_ARG),
-    VALID_RANGE(1, 64), DEFAULT(3), BLOCK_SIZE(1), NO_MUTEX_GUARD,
-    NOT_IN_BINLOG);
-
-static Sys_var_uint Sys_preserve_trx_transfer_receiver_workers(
-    "preserve_trx_transfer_receiver_workers",
-    "Maximum worker count for the Preserve/Resume standby direct-transfer "
-    "batch receiver payload path. classic single-frame dispatch still validates "
-    "and stages one command frame on the dispatching session.",
-    GLOBAL_VAR(preserve_trx_transfer_receiver_workers),
-    CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, 64), DEFAULT(3), BLOCK_SIZE(1),
-    NO_MUTEX_GUARD, NOT_IN_BINLOG);
-
-static Sys_var_uint Sys_preserve_trx_transfer_chunk_bytes(
-    "preserve_trx_transfer_chunk_bytes",
-    "Target chunk size in bytes for Preserve/Resume standby direct-transfer "
-    "object payloads.",
-    GLOBAL_VAR(preserve_trx_transfer_chunk_bytes), CMD_LINE(REQUIRED_ARG),
-    VALID_RANGE(1, 1048576), DEFAULT(1048576), BLOCK_SIZE(1),
-    NO_MUTEX_GUARD, NOT_IN_BINLOG);
-
 static Sys_var_ulonglong Sys_preserve_trx_transfer_max_inflight_bytes(
-    "preserve_trx_transfer_max_inflight_bytes",
+    "rds_preserve_trx_transfer_max_inflight_bytes",
     "Maximum unsealed bytes allowed in one Preserve/Resume standby "
     "direct-transfer epoch before backpressure or fail-closed handling.",
     GLOBAL_VAR(preserve_trx_transfer_max_inflight_bytes),
     CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, ULLONG_MAX),
     DEFAULT(1073741824ULL), BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
 
-static Sys_var_ulonglong Sys_preserve_trx_transfer_io_bytes_per_sec(
-    "preserve_trx_transfer_io_bytes_per_sec",
-    "Base aggregate byte-per-second budget for Preserve/Resume standby "
-    "transfer source payloads and receiver saved-artifact writes. The runtime "
-    "profile scales this budget without changing artifact semantics.",
-    GLOBAL_VAR(preserve_trx_transfer_io_bytes_per_sec), CMD_LINE(REQUIRED_ARG),
-    VALID_RANGE(1, ULLONG_MAX), DEFAULT(33554432ULL), BLOCK_SIZE(1),
-    NO_MUTEX_GUARD, NOT_IN_BINLOG);
-
-static Sys_var_uint Sys_preserve_trx_transfer_commit_batch_tokens(
-    "preserve_trx_transfer_commit_batch_tokens",
-    "Base number of token manifests processed between cooperative yields "
-    "while finalizing a Preserve/Resume transfer epoch.",
-    GLOBAL_VAR(preserve_trx_transfer_commit_batch_tokens),
-    CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, 1024), DEFAULT(8), BLOCK_SIZE(1),
-    NO_MUTEX_GUARD, NOT_IN_BINLOG);
-
-static Sys_var_uint Sys_preserve_trx_transfer_worker_yield_us(
-    "preserve_trx_transfer_worker_yield_us",
-    "Microseconds Preserve/Resume transfer and prewarm workers yield between "
-    "bounded work batches. The wait occurs outside registry and object locks.",
-    GLOBAL_VAR(preserve_trx_transfer_worker_yield_us), CMD_LINE(REQUIRED_ARG),
-    VALID_RANGE(0, 1000000), DEFAULT(1000), BLOCK_SIZE(1), NO_MUTEX_GUARD,
-    NOT_IN_BINLOG);
-
-static Sys_var_uint Sys_preserve_trx_transfer_receiver_prewarm_timeout_ms(
-    "preserve_trx_transfer_receiver_prewarm_timeout_ms",
-    "Maximum milliseconds an accepted Preserve/Resume standby epoch may "
-    "remain PREWARMING in the current receiver process.",
-    GLOBAL_VAR(preserve_trx_transfer_receiver_prewarm_timeout_ms),
-    CMD_LINE(REQUIRED_ARG), VALID_RANGE(1000, 3600000), DEFAULT(10000),
-    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
-
 static Sys_var_uint Sys_preserve_trx_token_retention_timeout_ms(
-    "preserve_trx_token_retention_timeout_ms",
+    "rds_preserve_trx_token_retention_timeout_ms",
     "Maximum milliseconds that a classified receiver epoch and its READY "
     "tokens retain fast-resume eligibility. The immutable READY/FAILED "
     "selection, promotion gate, and SQL RESUME share one absolute deadline.",
     GLOBAL_VAR(preserve_trx_token_retention_timeout_ms),
     CMD_LINE(REQUIRED_ARG), VALID_RANGE(1000, 3600000), DEFAULT(30000),
     BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
-
-static Sys_var_ulonglong Sys_preserve_trx_transfer_phase1_batch_bytes(
-    "preserve_trx_transfer_phase1_batch_bytes",
-    "Target encoded-byte threshold for one Preserve/Resume phase-1 standby "
-    "transfer batch. Zero disables batching. Each transfer epoch snapshots "
-    "the value when the epoch is opened.",
-    GLOBAL_VAR(preserve_trx_transfer_phase1_batch_bytes),
-    CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, 67108864ULL), DEFAULT(4194304ULL),
-    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
-
-static Sys_var_uint Sys_preserve_trx_transfer_phase1_batch_linger_ms(
-    "preserve_trx_transfer_phase1_batch_linger_ms",
-    "Maximum milliseconds the oldest queued phase-1 standby transfer object "
-    "may wait before its batch is sent. Zero sends immediately. Each transfer "
-    "epoch snapshots the value when the epoch is opened.",
-    GLOBAL_VAR(preserve_trx_transfer_phase1_batch_linger_ms),
-    CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, 1000), DEFAULT(20), BLOCK_SIZE(1),
-    NO_MUTEX_GUARD, NOT_IN_BINLOG);
-
-static Sys_var_uint Sys_preserve_trx_promotion_gate_batch_tokens(
-    "preserve_trx_promotion_gate_batch_tokens",
-    "Maximum standby-pending tokens a single Preserve/Resume promotion gate "
-    "batch may adopt. Requests above this limit fail closed instead of "
-    "silently spilling into an unbounded gate window.",
-    GLOBAL_VAR(preserve_trx_promotion_gate_batch_tokens),
-    CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, 1024), DEFAULT(3), BLOCK_SIZE(1),
-    NO_MUTEX_GUARD, NOT_IN_BINLOG);
-
-static Sys_var_uint Sys_preserve_trx_promotion_gate_workers(
-    "preserve_trx_promotion_gate_workers",
-    "Maximum worker count for Preserve/Resume standby promotion gate token "
-    "adoption. The current entry uses this as the default request budget; "
-    "future HA hooks may map it to a bounded worker pool.",
-    GLOBAL_VAR(preserve_trx_promotion_gate_workers), CMD_LINE(REQUIRED_ARG),
-    VALID_RANGE(1, 1024), DEFAULT(3), BLOCK_SIZE(1), NO_MUTEX_GUARD,
-    NOT_IN_BINLOG);
-
-static Sys_var_uint Sys_preserve_trx_promotion_gate_timeout_ms(
-    "preserve_trx_promotion_gate_timeout_ms",
-    "Default promotion gate deadline in milliseconds for Preserve/Resume "
-    "standby adopt operations.",
-    GLOBAL_VAR(preserve_trx_promotion_gate_timeout_ms),
-    CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, UINT_MAX32), DEFAULT(1000),
-    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
-
-static Sys_var_uint Sys_preserve_trx_promotion_prewarm_workers(
-    "preserve_trx_promotion_prewarm_workers",
-    "Base active worker budget for opportunistic Preserve/Resume standby "
-    "prewarm. The receiver owns a bounded pool and the runtime profile may "
-    "raise the active subset up to receiver_workers.",
-    GLOBAL_VAR(preserve_trx_promotion_prewarm_workers),
-    CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, 1024), DEFAULT(1), BLOCK_SIZE(1),
-    NO_MUTEX_GUARD, NOT_IN_BINLOG);
-
-static Sys_var_ulonglong Sys_preserve_trx_promotion_prewarm_io_bytes_per_sec(
-    "preserve_trx_promotion_prewarm_io_bytes_per_sec",
-    "Base aggregate byte-per-second budget for Preserve/Resume standby "
-    "prewarm reads.",
-    GLOBAL_VAR(preserve_trx_promotion_prewarm_io_bytes_per_sec),
-    CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, ULLONG_MAX), DEFAULT(33554432ULL),
-    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
-
-static Sys_var_ulonglong Sys_preserve_trx_promotion_prewarm_max_bytes(
-    "preserve_trx_promotion_prewarm_max_bytes",
-    "Base maximum bytes one Preserve/Resume standby prewarm round may read. "
-    "Exceeding the budget leaves the current-process token not ready.",
-    GLOBAL_VAR(preserve_trx_promotion_prewarm_max_bytes),
-    CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, ULLONG_MAX),
-    DEFAULT(268435456ULL), BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
-
-static Sys_var_ulonglong Sys_preserve_trx_promotion_ready_cache_max_bytes(
-    "preserve_trx_promotion_ready_cache_max_bytes",
-    "Maximum estimated bytes retained by the Preserve/Resume promotion ready "
-    "cache. Eviction only removes rebuildable memory state and never deletes "
-    "the current-process standby artifact.",
-    GLOBAL_VAR(preserve_trx_promotion_ready_cache_max_bytes),
-    CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, ULLONG_MAX),
-    DEFAULT(536870912ULL), BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
 
 static bool fix_binlog_cache_size(sys_var *, THD *thd, enum_var_type) {
   check_binlog_cache_size(thd);
@@ -1866,7 +1456,7 @@ static Sys_var_test_flag Sys_core_file("core_file",
                                        TEST_CORE_ON_SIGNAL);
 
 static Sys_var_bool Sys_preserve_trx_enable(
-    "preserve_trx_enable",
+    "rds_preserve_trx_enable",
     "Enable resumable transactions across shutdown. When enabled, supported "
     "transactions can be preserved, drained, recovered, and resumed across a "
     "server restart; unsupported cases fail closed before a durable token is "

@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_binlog_cache_sidecar_digest;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_binlog_cache_sidecar_digest(
 id INT PRIMARY KEY,
 payload VARCHAR(128)
@@ -16,7 +16,7 @@ WHERE id=2;
 DRAIN TRANSACTIONS PRESERVE;
 corrupted_same_size_binlog_cache_sidecar
 1
-# restart: --preserve-trx-enable=ON
+# restart: --rds-preserve-trx-enable=ON
 SELECT COUNT(*) AS preserved_count_after_corrupt_sidecar
 FROM performance_schema.preserved_transactions;
 preserved_count_after_corrupt_sidecar
@@ -28,4 +28,4 @@ id	payload
 1	a
 2	b
 DROP TABLE t_binlog_cache_sidecar_digest;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

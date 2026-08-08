@@ -5,7 +5,7 @@
 DROP TABLE IF EXISTS t_serializable_record_lock_after_resume;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_serializable_record_lock_after_resume(
   id INT PRIMARY KEY,
@@ -24,7 +24,7 @@ SELECT * FROM t_serializable_record_lock_after_resume
 --let $preserve_trx_drain_clause=
 --source suite/preserve_trx/include/drain_transaction_from_control.inc
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
---exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -56,4 +56,4 @@ INSERT INTO t_serializable_record_lock_after_resume VALUES(15,15);
 SELECT * FROM t_serializable_record_lock_after_resume ORDER BY id;
 
 DROP TABLE t_serializable_record_lock_after_resume;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

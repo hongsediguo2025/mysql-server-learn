@@ -5,7 +5,7 @@
 DROP TABLE IF EXISTS t_preserve_kill_after_undo_binlog;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_preserve_kill_after_undo_binlog(a INT PRIMARY KEY, b INT)
   ENGINE=InnoDB;
@@ -67,4 +67,4 @@ SELECT * FROM t_preserve_kill_after_undo_binlog WHERE a=1;
 --remove_file $MYSQLTEST_VARDIR/tmp/kill_after_undo_binlog_cleanup.mysqlbinlog
 
 DROP TABLE t_preserve_kill_after_undo_binlog;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

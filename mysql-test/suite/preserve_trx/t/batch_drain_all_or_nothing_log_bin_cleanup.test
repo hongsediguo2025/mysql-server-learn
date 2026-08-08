@@ -11,7 +11,7 @@ CALL mtr.add_suppression("Preserved transaction .* recovery cleanup failed: fail
 CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: preserved transaction snapshot tainted");
 CALL mtr.add_suppression("Preserved transaction batch cleanup failed after target preserve error");
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_batch_log_bin_cleanup(
   id INT PRIMARY KEY,
@@ -116,7 +116,7 @@ COMMIT;
 --shutdown_server
 --source include/wait_until_disconnected.inc
 
---exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -135,4 +135,4 @@ SELECT * FROM t_batch_log_bin_cleanup ORDER BY id;
 --remove_file $MYSQLTEST_VARDIR/tmp/batch_log_bin_cleanup_delete_before.mysqlbinlog
 
 DROP TABLE t_batch_log_bin_cleanup;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

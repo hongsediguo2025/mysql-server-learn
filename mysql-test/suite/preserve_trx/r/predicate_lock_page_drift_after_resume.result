@@ -1,6 +1,6 @@
 DROP TABLE IF EXISTS t_predicate_page_drift_anchor;
 DROP TABLE IF EXISTS t_predicate_page_drift;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_predicate_page_drift_anchor(
 id INT PRIMARY KEY,
 v INT
@@ -23,7 +23,7 @@ WHERE MBRWithin(pos, @g) FOR UPDATE;
 locked_rows
 1
 DRAIN TRANSACTIONS PRESERVE;
-# restart: --preserve-trx-enable=ON --debug=d,preserve_trx_corrupt_import_predicate_page_identity
+# restart: --rds-preserve-trx-enable=ON --debug=d,preserve_trx_corrupt_import_predicate_page_identity
 include/wait_for_pattern_in_file.inc [Preserved transaction .* recovery forced rollback: failed to restore durable transaction semantics]
 SELECT COUNT(*) AS recovered_tokens
 FROM performance_schema.preserved_transactions;
@@ -39,4 +39,4 @@ id	pos
 2	POINT(10 10)
 DROP TABLE t_predicate_page_drift;
 DROP TABLE t_predicate_page_drift_anchor;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

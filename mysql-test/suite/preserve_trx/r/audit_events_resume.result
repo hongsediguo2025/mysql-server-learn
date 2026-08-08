@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_preserve_audit_resume;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_preserve_audit_resume(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_preserve_audit_resume VALUES(1,10);
 START TRANSACTION;
@@ -36,4 +36,4 @@ UNINSTALL PLUGIN null_audit;
 Warnings:
 Warning	1620	Plugin is busy and will be uninstalled on shutdown
 DROP TABLE t_preserve_audit_resume;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

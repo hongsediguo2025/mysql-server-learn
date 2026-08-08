@@ -1,6 +1,6 @@
 CALL mtr.add_suppression("Preserved transaction batch cleanup failed after debug injected target error");
 DROP TABLE IF EXISTS t_batch_cleanup_no_shutdown;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_batch_cleanup_no_shutdown(
 id INT PRIMARY KEY,
 v INT
@@ -27,8 +27,8 @@ SELECT TOKEN, STATE, LAST_ERROR IS NOT NULL AS has_last_error
 FROM performance_schema.preserved_transactions
 ORDER BY TOKEN;
 TOKEN	STATE	has_last_error
-SET GLOBAL preserve_trx_enable=OFF;
-ERROR HY000: Incorrect arguments to preserve_trx_enable is a startup-only option
+SET GLOBAL rds_preserve_trx_enable=OFF;
+ERROR HY000: Incorrect arguments to rds_preserve_trx_enable is a startup-only option
 INSERT INTO t_batch_cleanup_no_shutdown VALUES(99,99);
 ROLLBACK;
 SELECT COUNT(*) AS preserved_count_after_restart
@@ -39,4 +39,4 @@ SELECT * FROM t_batch_cleanup_no_shutdown ORDER BY id;
 id	v
 99	99
 DROP TABLE t_batch_cleanup_no_shutdown;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

@@ -1,5 +1,5 @@
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=OFF;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=OFF;
 
 CREATE TABLE t_dynamic_enable_base(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
 CREATE TEMPORARY TABLE tmp_dynamic_enable(id INT PRIMARY KEY, v INT)
@@ -8,7 +8,7 @@ CREATE TEMPORARY TABLE tmp_dynamic_enable(id INT PRIMARY KEY, v INT)
 START TRANSACTION;
 INSERT INTO t_dynamic_enable_base VALUES(1, 1);
 INSERT INTO tmp_dynamic_enable VALUES(1, 10);
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 
 --let $preserve_trx_drain_clause=
 --let $preserve_trx_drain_error= ER_PRESERVE_TRX_UNSUPPORTED
@@ -17,5 +17,5 @@ SET GLOBAL preserve_trx_temp_table_enable=ON;
 ROLLBACK;
 DROP TEMPORARY TABLE tmp_dynamic_enable;
 DROP TABLE t_dynamic_enable_base;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;

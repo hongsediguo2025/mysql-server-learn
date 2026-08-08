@@ -1,6 +1,6 @@
 DROP TABLE IF EXISTS t_keyring_logged_cache_temp;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 CREATE TABLE t_keyring_logged_cache_temp(a INT PRIMARY KEY, b INT)
 ENGINE=InnoDB;
 INSERT INTO t_keyring_logged_cache_temp VALUES(1,10);
@@ -12,7 +12,7 @@ INSERT INTO tmp_keyring_logged_cache_temp VALUES(1,'before-preserve');
 START TRANSACTION;
 UPDATE t_keyring_logged_cache_temp SET b=11 WHERE a=1;
 DRAIN TRANSACTIONS PRESERVE;
-# restart: --preserve-trx-enable=ON --preserve-trx-temp-table-enable=ON --debug=d,preserve_trx_simulate_encrypted_tablespace_key_unavailable
+# restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-temp-table-enable=ON --debug=d,preserve_trx_simulate_encrypted_tablespace_key_unavailable
 include/wait_for_pattern_in_file.inc [Preserved transaction .* recovery failed: encrypted tablespace key unavailable]
 SELECT TOKEN, STATE, LAST_ERROR, BINLOG_STATE, WROTE_TO_CACHE,
 BINLOG_CACHE_SIZE > 0 AS BINLOG_CACHE_SIZE_POSITIVE,
@@ -28,7 +28,7 @@ resumable_count
 SELECT * FROM t_keyring_logged_cache_temp ORDER BY a;
 a	b
 1	10
-# restart: --preserve-trx-enable=ON --preserve-trx-temp-table-enable=ON
+# restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-temp-table-enable=ON
 include/wait_for_pattern_in_file.inc [Preserved transaction .* recovery forced rollback: preserved transaction snapshot tainted]
 SELECT COUNT(*) AS preserved_count_after_taint_cleanup
 FROM performance_schema.preserved_transactions;
@@ -38,5 +38,5 @@ SELECT * FROM t_keyring_logged_cache_temp ORDER BY a;
 a	b
 1	10
 DROP TABLE t_keyring_logged_cache_temp;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

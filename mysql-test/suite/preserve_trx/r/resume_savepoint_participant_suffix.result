@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_savepoint_suffix;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_savepoint_suffix(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
 INSERT INTO t_savepoint_suffix VALUES(1, 10), (2, 20);
 RESET MASTER;

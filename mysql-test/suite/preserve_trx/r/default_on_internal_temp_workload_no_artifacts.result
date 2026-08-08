@@ -1,5 +1,5 @@
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 DROP TABLE IF EXISTS t_preserve_default_on_internal_tmp;
 CREATE TABLE t_preserve_default_on_internal_tmp(
 id INT PRIMARY KEY,
@@ -52,5 +52,5 @@ preserved_count
 0
 preserve_artifacts 0
 DROP TABLE t_preserve_default_on_internal_tmp;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;

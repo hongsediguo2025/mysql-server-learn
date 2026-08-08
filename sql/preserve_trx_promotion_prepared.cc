@@ -2771,8 +2771,7 @@ Preserve_trx_prepared_token_registry::purge_token(
     }
     std::lock_guard<std::mutex> entry_guard(found->second->mutex);
     auto expected = found->second->state.load(std::memory_order_acquire);
-    if (found->second->preparing ||
-        found->second->physical_promotion_pins != 0 ||
+    if (found->second->physical_promotion_pins != 0 ||
         prepared_state_has_live_or_ambiguous_owner(expected)) {
       return Preserve_trx_prepared_status::INVALID_STATE;
     }

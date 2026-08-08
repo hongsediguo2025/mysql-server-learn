@@ -8,7 +8,7 @@ DROP TABLE IF EXISTS t_batch_all_or_nothing;
 
 --let MYSQLD_DATADIR= `SELECT @@datadir`
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_batch_all_or_nothing(
   id INT PRIMARY KEY,
@@ -47,4 +47,4 @@ SELECT COUNT(*) AS preserved_count
 SELECT * FROM t_batch_all_or_nothing ORDER BY id;
 
 DROP TABLE t_batch_all_or_nothing;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

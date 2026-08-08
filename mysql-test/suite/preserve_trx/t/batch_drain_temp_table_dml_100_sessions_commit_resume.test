@@ -61,12 +61,8 @@ EOF
 --enable_result_log
 --enable_query_log
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
-SET GLOBAL preserve_trx_lock_warmcopy_enable=OFF;
---let $old_preserve_trx_recovery_max_count= `SELECT @@GLOBAL.preserve_trx_recovery_max_count`
---let $old_preserve_trx_max_temp_sidecar_bytes= `SELECT @@GLOBAL.preserve_trx_max_temp_sidecar_bytes`
-SET GLOBAL preserve_trx_recovery_max_count=200;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 
 --disable_query_log
 --disable_result_log
@@ -81,7 +77,7 @@ SET GLOBAL preserve_trx_recovery_max_count=200;
 DRAIN TRANSACTIONS PRESERVE WITH USER VARS;
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 
---exec echo "restart: --preserve-trx-enable=ON --preserve-trx-temp-table-enable=ON --preserve-trx-lock-warmcopy-enable=OFF --preserve-trx-recovery-max-count=200 --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-temp-table-enable=ON   --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -144,15 +140,12 @@ SELECT COUNT(*) AS checked_sessions,
 --disable_query_log
 --disable_result_log
 --source $MYSQLTEST_VARDIR/tmp/batch_temp_100_cleanup.inc
---eval SET GLOBAL preserve_trx_recovery_max_count=$old_preserve_trx_recovery_max_count
---eval SET GLOBAL preserve_trx_max_temp_sidecar_bytes=$old_preserve_trx_max_temp_sidecar_bytes
 --enable_result_log
 --enable_query_log
 
 --source suite/preserve_trx/include/assert_no_preserve_residue.inc
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
-SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 
 --remove_file $MYSQLTEST_VARDIR/tmp/batch_temp_100_setup.inc
 --remove_file $MYSQLTEST_VARDIR/tmp/batch_temp_100_apps.inc

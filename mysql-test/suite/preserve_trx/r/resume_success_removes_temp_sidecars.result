@@ -1,6 +1,6 @@
 DROP TABLE IF EXISTS t_resume_sidecars_base;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 CREATE TABLE t_resume_sidecars_base(
 id INT PRIMARY KEY,
 v INT
@@ -26,5 +26,5 @@ id	v
 1	11
 DROP TEMPORARY TABLE tmp_resume_sidecars;
 DROP TABLE t_resume_sidecars_base;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;

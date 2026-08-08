@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_mdl_restore;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_mdl_restore(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
 INSERT INTO t_mdl_restore VALUES(1,10);
 START TRANSACTION;
@@ -17,4 +17,4 @@ SELECT * FROM t_mdl_restore ORDER BY id;
 id	v	ddl_marker
 1	11	NULL
 DROP TABLE t_mdl_restore;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

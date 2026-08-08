@@ -23,7 +23,7 @@ CALL mtr.add_suppression("Attempting backtrace");
 CALL mtr.add_suppression("You can use the following information to find out");
 --enable_query_log
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 SHUTDOWN;
@@ -49,7 +49,7 @@ EOF
 
 --let $_server_id= 1
 --let $_expect_file_name= $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
---let $restart_parameters= --preserve-trx-enable=ON --preserve-trx-temp-table-enable=ON
+--let $restart_parameters= --rds-preserve-trx-enable=ON --rds-preserve-trx-temp-table-enable=ON
 --source include/start_mysqld_expecting_crash.inc
 
 --let $grep_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
@@ -70,7 +70,7 @@ chmod 0600, $image or die "cannot restore image sidecar permissions: $!";
 EOF
 
 --source suite/preserve_trx/include/ha_crash_abandon_preserve_artifacts.inc
---exec echo "restart: --preserve-trx-enable=ON --preserve-trx-temp-table-enable=OFF" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-temp-table-enable=OFF" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -101,5 +101,5 @@ for my $name (
 }
 EOF
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;

@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_resume_binlog_import_cleanup;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_resume_binlog_import_cleanup(
 id INT PRIMARY KEY,
 v INT

@@ -2,7 +2,7 @@ DROP TABLE IF EXISTS t_autoinc_reservation_resume;
 DROP TABLE IF EXISTS t_autoinc_reservation_touch;
 DROP TABLE IF EXISTS t_autoinc_forced_resume;
 DROP TABLE IF EXISTS t_autoinc_forced_touch;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_autoinc_reservation_touch(
 id INT PRIMARY KEY,
 v INT
@@ -72,4 +72,4 @@ id	v
 1	2
 DROP TABLE t_autoinc_forced_resume;
 DROP TABLE t_autoinc_forced_touch;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

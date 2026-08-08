@@ -1442,9 +1442,8 @@ class Lock_warmcopy_target_fence_sampler final : public Do_THD_Impl {
 Preserve_trx_lock_warmcopy_options
 preserve_trx_lock_warmcopy_current_options() {
   Preserve_trx_lock_warmcopy_options options;
-  options.enabled = preserve_trx_lock_warmcopy_enable;
-  options.fallback_to_live_export =
-      preserve_trx_lock_warmcopy_fallback_to_live_export;
+  options.enabled = true;
+  options.fallback_to_live_export = true;
   DBUG_EXECUTE_IF(
       "preserve_trx_lock_warmcopy_validate_canonical_equivalence",
       { options.validate_canonical_equivalence = true; });
@@ -1494,7 +1493,7 @@ bool preserve_trx_lock_warmcopy_mdl_namespace_supported(
 }
 
 bool preserve_trx_lock_warmcopy_effective() {
-  return preserve_trx_lock_warmcopy_enable;
+  return true;
 }
 
 bool preserve_trx_lock_warmcopy_requires_two_phase(

@@ -36,7 +36,7 @@ GRANT PROCESS ON *.* TO preserve_trx_ha_admin@localhost;
 CREATE USER standby_transfer_app@localhost;
 GRANT SELECT, UPDATE ON test.* TO standby_transfer_app@localhost;
 
---let $restart_parameters= restart: --preserve-trx-enable=ON --preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --preserve-trx-transfer-target-socket=$SERVER_MYSOCK_2 --preserve-trx-transfer-target-user=preserve_trx_ha_admin --preserve-trx-transfer-credential-name=standby_transfer_no_shutdown --preserve-trx-transfer-credential-secret-file=$credential_file
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$SERVER_MYPORT_2 --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=standby_transfer_no_shutdown --rds-preserve-trx-transfer-credential-secret-file=$credential_file
 --disable_result_log
 --source include/restart_mysqld.inc
 --enable_result_log
@@ -46,9 +46,7 @@ GRANT SELECT, UPDATE ON test.* TO standby_transfer_app@localhost;
 CALL mtr.add_suppression(
   "PRESERVE: rolled back prepared transaction without snapshot during recovery");
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_enable=OFF;
-SET GLOBAL preserve_trx_lock_warmcopy_enable=OFF;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 --connect(standby_transfer_ha,localhost,preserve_trx_ha_admin,standby-transfer-no-shutdown-secret,test)
 
@@ -91,7 +89,7 @@ SELECT 1;
 SHUTDOWN;
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 
---exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect

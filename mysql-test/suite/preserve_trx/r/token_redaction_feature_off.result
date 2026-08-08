@@ -1,4 +1,4 @@
-SELECT @@global.preserve_trx_enable AS preserve_enabled;
+SELECT @@global.rds_preserve_trx_enable AS preserve_enabled;
 preserve_enabled
 0
 SET @feature_off_token='msp_feature_off_redaction_abcd';

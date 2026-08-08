@@ -4,8 +4,8 @@
 DROP TABLE IF EXISTS t_temp_explicit_off_late_preserve;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=OFF;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=OFF;
 
 CREATE TABLE t_temp_explicit_off_late_preserve(
   id INT PRIMARY KEY,
@@ -24,7 +24,7 @@ DROP TEMPORARY TABLE tmp_temp_explicit_off_late_preserve;
 INSERT INTO t_temp_explicit_off_late_preserve VALUES(1, 10);
 
 --connection default
-SET GLOBAL preserve_trx_temp_table_enable=OFF;
+SET GLOBAL rds_preserve_trx_temp_table_enable=OFF;
 
 --connection default
 --error ER_PRESERVE_TRX_UNSUPPORTED
@@ -42,5 +42,5 @@ SELECT COUNT(*) AS preserved_count_after_commit
 SELECT * FROM t_temp_explicit_off_late_preserve ORDER BY id;
 
 DROP TABLE t_temp_explicit_off_late_preserve;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

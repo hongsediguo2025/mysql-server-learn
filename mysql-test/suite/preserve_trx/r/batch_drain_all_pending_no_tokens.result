@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_batch_all_pending_no_tokens;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_batch_all_pending_no_tokens(
 id INT PRIMARY KEY,
 v INT
@@ -25,4 +25,4 @@ id	v
 1	11
 2	21
 DROP TABLE t_batch_all_pending_no_tokens;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

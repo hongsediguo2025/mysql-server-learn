@@ -10,7 +10,7 @@ CALL mtr.add_suppression("Preserved transaction '.*' resume forced rollback: rec
 DROP TABLE IF EXISTS t_timeout_resume_rollback_failure;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_timeout_resume_rollback_failure(a INT PRIMARY KEY, b INT)
   ENGINE=InnoDB;
@@ -27,13 +27,13 @@ UPDATE t_timeout_resume_rollback_failure SET b=11 WHERE a=1;
 
 --sleep 2
 
---exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-grace-seconds=30 --debug=d,preserve_trx_expired_reaper_skip" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON  --debug=d,preserve_trx_expired_reaper_skip" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
 
 --source suite/preserve_trx/include/get_preserved_token.inc
---sleep 31
+--sleep 121
 
 SET SESSION debug="+d,preserve_trx_fail_resume_timeout_rollback";
 --replace_result $preserved_token TOKEN
@@ -56,4 +56,4 @@ SELECT COUNT(*) AS preserved_count_after_retry_cleanup
 SELECT * FROM t_timeout_resume_rollback_failure ORDER BY a;
 
 DROP TABLE t_timeout_resume_rollback_failure;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

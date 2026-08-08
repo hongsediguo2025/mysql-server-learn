@@ -1,6 +1,6 @@
 DROP TABLE IF EXISTS t_mixed_stale_snapshot;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 CREATE TABLE t_mixed_stale_snapshot(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
 INSERT INTO t_mixed_stale_snapshot VALUES(1, 10), (2, 20);
 CREATE TEMPORARY TABLE tmp_mixed_stale_snapshot(
@@ -29,7 +29,7 @@ SELECT v AS second_target_value_before_disconnect
 FROM t_mixed_stale_snapshot WHERE id=2;
 second_target_value_before_disconnect
 21
-# restart: --preserve-trx-enable=ON --preserve-trx-temp-table-enable=ON
+# restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-temp-table-enable=ON
 SELECT COUNT(*) AS preserved_count_after_restart
 FROM performance_schema.preserved_transactions;
 preserved_count_after_restart
@@ -39,5 +39,5 @@ id	v
 1	10
 2	20
 DROP TABLE t_mixed_stale_snapshot;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;

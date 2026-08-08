@@ -1,9 +1,7 @@
 DROP TABLE IF EXISTS t_warmcopy_parameter_matrix;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
-SET GLOBAL preserve_trx_drain_phase2_timeout_ms=5000;
-SET GLOBAL preserve_trx_recovery_max_count=10;
-SET GLOBAL preserve_trx_single_phase_max_binlog_cache_bytes=1048576;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=PROMOTION_PREPARE;
+SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms=5000;
 CREATE TABLE t_warmcopy_parameter_matrix(
 id INT PRIMARY KEY,
 v INT,
@@ -13,9 +11,6 @@ INSERT INTO t_warmcopy_parameter_matrix VALUES
 (1,10,REPEAT('a',32)),
 (2,20,REPEAT('b',32)),
 (3,30,REPEAT('c',32));
-SET GLOBAL preserve_trx_warmcopy_enable=ON;
-SET GLOBAL preserve_trx_lock_warmcopy_enable=OFF;
-SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=ON;
 START TRANSACTION;
 UPDATE t_warmcopy_parameter_matrix
 SET v=11, pad=REPEAT('x',32)
@@ -38,9 +33,6 @@ SELECT COUNT(*) AS preserved_count_after_resume
 FROM performance_schema.preserved_transactions;
 preserved_count_after_resume
 0
-SET GLOBAL preserve_trx_warmcopy_enable=OFF;
-SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
-SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=OFF;
 START TRANSACTION;
 UPDATE t_warmcopy_parameter_matrix
 SET v=22, pad=REPEAT('y',32)
@@ -63,9 +55,6 @@ SELECT COUNT(*) AS preserved_count_after_resume
 FROM performance_schema.preserved_transactions;
 preserved_count_after_resume
 0
-SET GLOBAL preserve_trx_warmcopy_enable=ON;
-SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
-SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=OFF;
 START TRANSACTION;
 UPDATE t_warmcopy_parameter_matrix
 SET v=33, pad=REPEAT('z',32)

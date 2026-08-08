@@ -1,9 +1,7 @@
 DROP TABLE IF EXISTS t_kernel_equiv;
 DROP TABLE IF EXISTS t_kernel_equiv_observed;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_enable=OFF;
-SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
-SET GLOBAL preserve_trx_single_phase_max_binlog_cache_bytes=1048576;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=PROMOTION_PREPARE;
 CREATE TABLE t_kernel_equiv(
 id INT PRIMARY KEY,
 v INT NOT NULL,
@@ -48,10 +46,8 @@ batch_single_phase
 ROLLBACK TO SAVEPOINT s_kernel;
 UPDATE t_kernel_equiv SET v=v+1 WHERE id=2;
 COMMIT;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
-SET GLOBAL preserve_trx_single_phase_max_binlog_cache_bytes=0;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=BUSINESS_FIRST;
 SET @kernel_equiv_var='batch_two_phase';
 START TRANSACTION;
 UPDATE t_kernel_equiv SET v=301, payload=REPEAT('z',64) WHERE id=3;
@@ -85,7 +81,7 @@ mod_tables_count, savepoint_count, warmcopy_state
 FROM t_kernel_equiv_observed
 ORDER BY entry;
 entry	binlog_state	wrote_to_cache	cache_positive	session_sql_log_bin	global_log_bin	isolation_name	mod_tables_count	savepoint_count	warmcopy_state
-batch_single_phase	LOGGED_WITH_CACHE	YES	1	ON	ON	REPEATABLE-READ	1	1	NOT_USED
+batch_single_phase	LOGGED_WITH_CACHE	YES	1	ON	ON	REPEATABLE-READ	1	1	READY
 batch_two_phase	LOGGED_WITH_CACHE	YES	1	ON	ON	REPEATABLE-READ	1	1	READY
 SELECT COUNT(DISTINCT CONCAT_WS('|', session_sql_log_bin, global_log_bin,
 isolation_name, mod_tables_count,

@@ -6,12 +6,9 @@
 DROP TABLE IF EXISTS t_ps_warmcopy_temp_obs;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
-SET GLOBAL preserve_trx_warmcopy_chunk_bytes=1024;
-SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes=8192;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=PROMOTION_PREPARE;
 
 CREATE TABLE t_ps_warmcopy_temp_obs(
   id INT PRIMARY KEY,
@@ -40,7 +37,7 @@ UPDATE t_ps_warmcopy_temp_obs
 DRAIN TRANSACTIONS PRESERVE;
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 
---exec echo "restart: --preserve-trx-enable=ON --preserve-trx-temp-table-enable=ON --preserve-trx-warmcopy-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-temp-table-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -68,9 +65,6 @@ SELECT payload = REPEAT('b', 2048) AS persistent_payload_ok
 
 DROP TABLE t_ps_warmcopy_temp_obs;
 --source suite/preserve_trx/include/assert_no_preserve_residue.inc
-SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes=1048576;
-SET GLOBAL preserve_trx_warmcopy_chunk_bytes=1048576;
-SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
-SET GLOBAL preserve_trx_warmcopy_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=BUSINESS_FIRST;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

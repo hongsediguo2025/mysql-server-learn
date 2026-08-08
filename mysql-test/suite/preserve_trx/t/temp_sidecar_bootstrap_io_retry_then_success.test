@@ -8,7 +8,7 @@
 CALL mtr.add_suppression("TEMP_SIDECAR_IO_RETRY");
 --enable_query_log
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 SHUTDOWN;
@@ -21,7 +21,7 @@ SHUTDOWN;
 --let TEMP_SNAPSHOT_CORRUPT_UNDO= 0
 --source suite/preserve_trx/include/write_temp_table_preserved_snapshot.inc
 
---exec echo "restart: --preserve-trx-enable=ON --preserve-trx-temp-table-enable=ON --debug=d,preserve_trx_simulate_bootstrap_temp_sidecar_io_once" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-temp-table-enable=ON --debug=d,preserve_trx_simulate_bootstrap_temp_sidecar_io_once" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -35,5 +35,5 @@ SELECT COUNT(*) AS preserved_count
   FROM performance_schema.preserved_transactions;
 --source suite/preserve_trx/include/assert_no_preserve_residue.inc
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;

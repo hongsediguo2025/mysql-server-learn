@@ -1,6 +1,6 @@
 DROP TABLE IF EXISTS t_batch_idle_boundary;
 DROP USER IF EXISTS batch_idle_boundary_app@localhost;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_batch_idle_boundary(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 CREATE USER batch_idle_boundary_app@localhost;
 GRANT SELECT, INSERT ON test.* TO batch_idle_boundary_app@localhost;
@@ -32,4 +32,4 @@ SELECT * FROM t_batch_idle_boundary;
 a	b
 DROP USER batch_idle_boundary_app@localhost;
 DROP TABLE t_batch_idle_boundary;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

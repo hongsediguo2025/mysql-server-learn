@@ -3,7 +3,7 @@ DROP TABLE IF EXISTS t_resume_session_child;
 DROP TABLE IF EXISTS t_resume_session_parent;
 DROP TABLE IF EXISTS t_resume_session_autoinc;
 DROP TABLE IF EXISTS t_resume_session_seed;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_resume_session_parent(
 id INT PRIMARY KEY
 ) ENGINE=InnoDB;

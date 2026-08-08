@@ -2,7 +2,7 @@
 --echo # Preserve/resume maintenance commands must not be prepared.
 --echo #
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 --let $raw_ps_policy_client= $MYSQLTEST_VARDIR/tmp/preserve_ps_policy_client.pl
 
@@ -165,4 +165,4 @@ PREPARE show_preserved_stmt FROM 'SHOW PRESERVED TRANSACTIONS';
 --error ER_UNKNOWN_STMT_HANDLER
 DEALLOCATE PREPARE show_preserved_stmt;
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

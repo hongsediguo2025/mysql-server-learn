@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_resume_activate_crash;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_resume_activate_crash(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_resume_activate_crash VALUES(1,10);
 START TRANSACTION;
@@ -19,4 +19,4 @@ SELECT * FROM t_resume_activate_crash ORDER BY a;
 a	b
 1	10
 DROP TABLE t_resume_activate_crash;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

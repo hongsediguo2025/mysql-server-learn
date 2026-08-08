@@ -1,4 +1,4 @@
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 SHUTDOWN;
 SELECT COUNT(*) AS preserved_count
 FROM performance_schema.preserved_transactions;
@@ -13,4 +13,4 @@ SELECT MIN(SPACE) AS min_session_temp_space_id
 FROM INFORMATION_SCHEMA.INNODB_SESSION_TEMP_TABLESPACES;
 min_session_temp_space_id
 4243767282
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

@@ -80,37 +80,40 @@ enum class Preserve_trx_transfer_artifact_decision {
 
 extern char *preserve_trx_transfer_target_host;
 extern uint preserve_trx_transfer_target_port;
-extern char *preserve_trx_transfer_target_socket;
 extern char *preserve_trx_transfer_target_user;
 extern char *preserve_trx_transfer_credential_name;
 extern char *preserve_trx_transfer_credential_secret_file;
 extern ulong preserve_trx_transfer_artifact_mode;
 extern ulong preserve_trx_transfer_runtime_profile;
 extern bool preserve_trx_transfer_prewarm_paused;
-extern uint preserve_trx_transfer_data_sessions;
-extern uint preserve_trx_transfer_sender_workers;
-extern uint preserve_trx_transfer_receiver_workers;
-extern uint preserve_trx_transfer_chunk_bytes;
 extern ulonglong preserve_trx_transfer_max_inflight_bytes;
-extern ulonglong preserve_trx_transfer_io_bytes_per_sec;
-extern uint preserve_trx_transfer_commit_batch_tokens;
-extern uint preserve_trx_transfer_worker_yield_us;
-extern uint preserve_trx_transfer_receiver_prewarm_timeout_ms;
+extern const uint preserve_trx_transfer_receiver_prewarm_timeout_ms;
 extern uint preserve_trx_token_retention_timeout_ms;
-extern ulonglong preserve_trx_transfer_phase1_batch_bytes;
-extern uint preserve_trx_transfer_phase1_batch_linger_ms;
 
-struct Preserve_trx_transfer_runtime_limits {
-  uint64_t transfer_io_bytes_per_sec{0};
-  uint64_t prewarm_io_bytes_per_sec{0};
-  uint64_t prewarm_max_bytes{0};
-  uint32_t commit_batch_tokens{0};
-  uint32_t worker_yield_us{0};
-  uint32_t prewarm_workers{0};
+struct Preserve_trx_transfer_runtime_policy {
+  uint profile{PRESERVE_TRX_TRANSFER_RUNTIME_BUSINESS_FIRST};
+  uint32_t data_sessions{3};
+  uint32_t sender_workers{3};
+  uint32_t receiver_workers{3};
+  uint32_t prewarm_workers{1};
+  uint64_t transfer_io_bytes_per_sec{32ULL * 1024ULL * 1024ULL};
+  uint64_t prewarm_io_bytes_per_sec{32ULL * 1024ULL * 1024ULL};
+  uint64_t prewarm_max_bytes{256ULL * 1024ULL * 1024ULL};
+  uint32_t transfer_chunk_bytes{1024U * 1024U};
+  uint32_t warmcopy_chunk_bytes{1024U * 1024U};
+  uint32_t warmcopy_tail_budget_bytes{1024U * 1024U};
+  uint32_t warmcopy_min_open_ms{1000};
+  uint32_t commit_batch_tokens{8};
+  uint32_t worker_yield_us{1000};
+  uint64_t phase1_batch_bytes{4ULL * 1024ULL * 1024ULL};
+  uint32_t phase1_batch_linger_ms{20};
+  uint32_t promotion_gate_workers{3};
 };
 
-Preserve_trx_transfer_runtime_limits
-preserve_trx_transfer_current_runtime_limits();
+Preserve_trx_transfer_runtime_policy
+preserve_trx_transfer_runtime_policy_for_profile(uint profile);
+Preserve_trx_transfer_runtime_policy
+preserve_trx_transfer_current_runtime_policy();
 void preserve_trx_transfer_set_prewarm_paused(bool paused);
 uint64_t preserve_trx_transfer_throttled_milliseconds_status();
 uint64_t preserve_trx_transfer_last_throttle_reason_status();
@@ -716,6 +719,10 @@ class Preserve_trx_transfer_receiver_registry {
       const std::string &epoch_id, const std::string &authenticated_principal,
       const std::string &receiver_process_nonce,
       uint64_t *accepted_terminal_status_retention_us = nullptr) const;
+  bool online_epoch_runtime_policy(
+      const std::string &epoch_id,
+      Preserve_trx_transfer_runtime_policy *runtime_policy,
+      uint64_t *max_inflight_bytes) const;
 
   Preserve_trx_transfer_status declare_token(const std::string &epoch_id,
                                              uint64_t token);
@@ -948,6 +955,8 @@ class Preserve_trx_transfer_receiver_registry {
     std::string authenticated_principal;
     uint64_t requested_terminal_status_retention_us{0};
     uint64_t accepted_terminal_status_retention_us{0};
+    Preserve_trx_transfer_runtime_policy runtime_policy;
+    uint64_t max_inflight_bytes{0};
   };
   std::map<std::string, Online_epoch> m_online_epochs;
   enum class Terminal_phase : uint8_t {
@@ -1109,6 +1118,9 @@ class Preserve_trx_transfer_encoded_frame_sink {
     (void)timeout_ms;
   }
   virtual void request_cancel() {}
+  virtual Preserve_trx_transfer_status prepare_cancelled_epoch_cleanup() {
+    return Preserve_trx_transfer_status::OK;
+  }
   virtual void release_epoch_transport() {}
 };
 
@@ -1116,6 +1128,7 @@ using Preserve_trx_transfer_source_final_ack_arbiter = bool (*)(void *);
 using Preserve_trx_transfer_source_before_commit_send = bool (*)(void *);
 
 struct Preserve_trx_transfer_source_epoch_options {
+  Preserve_trx_transfer_runtime_policy runtime_policy;
   uint32_t chunk_bytes{0};
   uint64_t max_inflight_bytes{0};
   uint64_t phase1_batch_bytes{0};
@@ -1186,11 +1199,16 @@ class Preserve_trx_transfer_source_epoch_session {
   Preserve_trx_transfer_status abort_token(uint64_t transfer_token,
                                            const std::string &reason);
   Preserve_trx_transfer_status abort_epoch(const std::string &reason);
+  Preserve_trx_transfer_status cleanup_cancelled_epoch(
+      const std::string &reason);
   Preserve_trx_transfer_status commit_epoch();
   std::string epoch_id() const { return m_epoch_id; }
   uint32_t chunk_bytes() const { return m_chunk_bytes; }
   uint64_t max_inflight_bytes() const { return m_max_inflight_bytes; }
   uint64_t phase1_batch_bytes() const { return m_phase1_batch_bytes; }
+  const Preserve_trx_transfer_runtime_policy &runtime_policy() const {
+    return m_runtime_policy;
+  }
   std::string receiver_process_nonce() const {
     std::lock_guard<std::mutex> guard(m_mutex);
     return m_receiver_process_nonce;
@@ -1240,8 +1258,10 @@ class Preserve_trx_transfer_source_epoch_session {
                                                   const std::string &reason,
                                                   bool allow_finalized,
                                                   Pending_frame_cleanup cleanup);
+  Preserve_trx_transfer_status abort_epoch_locked(const std::string &reason);
 
   std::string m_epoch_id;
+  Preserve_trx_transfer_runtime_policy m_runtime_policy;
   uint32_t m_chunk_bytes{0};
   uint64_t m_max_inflight_bytes{0};
   uint64_t m_phase1_batch_bytes{0};
@@ -1279,6 +1299,7 @@ class Preserve_trx_transfer_source_epoch_session {
   std::map<uint64_t, std::set<std::string>> m_streaming_sealed_objects;
   std::set<uint64_t> m_final_metadata_tokens;
   std::vector<Preserve_trx_transfer_frame> m_pending_final_metadata_frames;
+  std::string m_pending_commit_payload_for_abandon;
   std::vector<Preserve_trx_transfer_manifest> m_finalized_manifests;
 #ifndef NDEBUG
   size_t m_pending_frame_cleanup_invocations{0};
@@ -1306,7 +1327,6 @@ Preserve_trx_transfer_status preserve_trx_transfer_stream_prebuilt_blobs_batch(
 struct Preserve_trx_transfer_client_endpoint {
   std::string host;
   uint port{0};
-  std::string socket;
   std::string user;
   std::string credential_name;
   std::string auth_plugin;
@@ -1415,7 +1435,8 @@ using Preserve_trx_transfer_frame_sink_factory =
         std::unique_ptr<Preserve_trx_transfer_encoded_frame_sink> *sink);
 
 Preserve_trx_transfer_status preserve_trx_transfer_make_configured_frame_sink(
-    std::unique_ptr<Preserve_trx_transfer_encoded_frame_sink> *sink);
+    std::unique_ptr<Preserve_trx_transfer_encoded_frame_sink> *sink,
+    const Preserve_trx_transfer_runtime_policy *runtime_policy = nullptr);
 
 void preserve_trx_transfer_set_frame_sink_factory_for_unit_test(
     Preserve_trx_transfer_frame_sink_factory factory);

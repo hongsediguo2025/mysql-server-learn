@@ -6,8 +6,8 @@
 DROP TABLE IF EXISTS t_batch_prepare_temp_binlog;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 
 CREATE TABLE t_batch_prepare_temp_binlog(
   id INT PRIMARY KEY,
@@ -96,5 +96,5 @@ SELECT * FROM t_batch_prepare_temp_binlog ORDER BY id;
 --remove_file $MYSQLTEST_VARDIR/tmp/batch_prepare_temp_binlog.mysqlbinlog
 
 DROP TABLE t_batch_prepare_temp_binlog;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

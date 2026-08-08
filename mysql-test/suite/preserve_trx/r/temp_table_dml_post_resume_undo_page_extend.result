@@ -1,6 +1,5 @@
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
-SET GLOBAL preserve_trx_max_temp_sidecar_bytes=1073741824;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 CREATE TEMPORARY TABLE tmp_preserve_undo_extend(
 id INT PRIMARY KEY,
 v INT NOT NULL,
@@ -21,6 +20,5 @@ FROM tmp_preserve_undo_extend;
 row_count	v_sum	payload_bytes
 200	410100	1638400
 DROP TEMPORARY TABLE tmp_preserve_undo_extend;
-SET GLOBAL preserve_trx_max_temp_sidecar_bytes=1073741824;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

@@ -2234,8 +2234,10 @@ bool preserve_trx_temp_table_build_baseline_image(
   if (err == DB_SUCCESS && use_streaming_writer) {
     failure_step = "acquire_temp_image_stream_buffer";
     const uint64_t stream_buffer_bytes =
-        std::max<uint64_t>(source_metadata.page_size,
-                           preserve_trx_spill_chunk_bytes);
+        std::max<uint64_t>(
+            source_metadata.page_size,
+            std::min<uint64_t>(preserve_trx_spill_chunk_bytes,
+                               preserve_trx_memory_budget_bytes));
     stream_buffer_lease = preserve_trx_acquire_memory_lease(
         *warmcopy_id, Preserve_trx_memory_kind::TEMP_IMAGE_STREAM_BUFFER,
         stream_buffer_bytes);
@@ -2635,8 +2637,10 @@ bool preserve_trx_temp_table_prebuild_phase1_sidecars(
     };
 
     const uint64_t stream_buffer_bytes =
-        std::max<uint64_t>(source_metadata.page_size,
-                           preserve_trx_spill_chunk_bytes);
+        std::max<uint64_t>(
+            source_metadata.page_size,
+            std::min<uint64_t>(preserve_trx_spill_chunk_bytes,
+                               preserve_trx_memory_budget_bytes));
     Preserve_memory_lease stream_buffer_lease = preserve_trx_acquire_memory_lease(
         warmcopy_id, Preserve_trx_memory_kind::TEMP_IMAGE_STREAM_BUFFER,
         stream_buffer_bytes);

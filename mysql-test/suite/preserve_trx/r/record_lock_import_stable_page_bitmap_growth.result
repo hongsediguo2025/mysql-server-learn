@@ -1,9 +1,5 @@
 DROP TABLE IF EXISTS t_record_lock_bitmap_growth;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_enable=OFF;
-SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
-SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=OFF;
-SET GLOBAL preserve_trx_recovery_max_count=10;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_record_lock_bitmap_growth(
 id INT PRIMARY KEY,
 v INT,
@@ -50,5 +46,5 @@ id	v
 1	11
 33	33
 DROP TABLE t_record_lock_bitmap_growth;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 SET DEBUG_SYNC = 'RESET';

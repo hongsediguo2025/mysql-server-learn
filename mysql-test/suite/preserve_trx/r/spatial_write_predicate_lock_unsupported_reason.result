@@ -1,6 +1,6 @@
 DROP TABLE IF EXISTS t_spatial_write_predicate_anchor;
 DROP TABLE IF EXISTS t_spatial_write_predicate;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_spatial_write_predicate_anchor(
 id INT PRIMARY KEY,
 v INT
@@ -45,4 +45,4 @@ id	pos	v
 include/assert_grep.inc [Spatial write predicate unsupported reason is logged]
 DROP TABLE t_spatial_write_predicate;
 DROP TABLE t_spatial_write_predicate_anchor;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

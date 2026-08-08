@@ -1,4 +1,4 @@
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 SET GLOBAL log_output='TABLE';
 SET GLOBAL general_log=ON;
 SET GLOBAL log_raw=ON;
@@ -120,4 +120,4 @@ SET GLOBAL log_slow_admin_statements=0;
 SET GLOBAL log_output='FILE';
 SET GLOBAL general_log=1;
 SET GLOBAL slow_query_log=1;
-SET GLOBAL preserve_trx_enable=1;
+SET GLOBAL rds_preserve_trx_enable=1;

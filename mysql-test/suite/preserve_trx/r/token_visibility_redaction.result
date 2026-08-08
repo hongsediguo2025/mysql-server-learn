@@ -3,7 +3,7 @@ DROP USER IF EXISTS preserve_unprivileged_reader@localhost;
 DROP USER IF EXISTS preserve_process@localhost;
 DROP USER IF EXISTS preserve_resume_any_reader@localhost;
 DROP TABLE IF EXISTS t_preserve_token_visibility;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_preserve_token_visibility(a INT PRIMARY KEY, b INT)
 ENGINE=InnoDB;
 INSERT INTO t_preserve_token_visibility VALUES(1,10);
@@ -89,4 +89,4 @@ DROP USER preserve_unprivileged_reader@localhost;
 DROP USER preserve_process@localhost;
 DROP USER preserve_owner@localhost;
 DROP TABLE t_preserve_token_visibility;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

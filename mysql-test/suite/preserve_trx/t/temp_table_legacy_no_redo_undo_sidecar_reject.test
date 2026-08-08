@@ -8,8 +8,8 @@
 DROP TABLE IF EXISTS t_temp_legacy_undo_base;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 
 CREATE TABLE t_temp_legacy_undo_base(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
 INSERT INTO t_temp_legacy_undo_base VALUES(1,10);
@@ -153,7 +153,7 @@ close($out);
 PreserveSnapshotFiles::refresh_resurrection_index_snapshot_digest($bin_path);
 EOF
 
---exec echo "restart: --preserve-trx-enable=ON --preserve-trx-temp-table-enable=ON --preserve-trx-recovery-grace-seconds=30" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-temp-table-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -204,7 +204,7 @@ for my $path (PreserveSnapshotFiles::preserve_all_files($preserve_dir)) {
 }
 EOF
 
---exec echo "restart: --preserve-trx-enable=ON --preserve-trx-temp-table-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-temp-table-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -220,5 +220,5 @@ DROP TEMPORARY TABLE tmp_legacy_undo;
 --source suite/preserve_trx/include/assert_no_preserve_residue.inc
 
 DROP TABLE t_temp_legacy_undo_base;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

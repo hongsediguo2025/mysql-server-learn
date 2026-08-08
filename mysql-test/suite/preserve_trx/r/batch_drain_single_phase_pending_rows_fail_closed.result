@@ -1,7 +1,5 @@
 DROP TABLE IF EXISTS t_single_phase_pending_rows;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_enable=OFF;
-SET GLOBAL preserve_trx_single_phase_max_binlog_cache_bytes=1073741824;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_single_phase_pending_rows(
 id INT PRIMARY KEY,
 payload VARCHAR(1200)

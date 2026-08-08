@@ -1,8 +1,8 @@
 --source include/not_log_bin.inc
 --source include/force_restart.inc
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 
 CREATE TABLE t_temp_no_redo_truncate_anchor(
   id INT PRIMARY KEY,
@@ -25,7 +25,7 @@ TRUNCATE TABLE tmp_temp_no_redo_truncate_only;
 --source suite/preserve_trx/include/drain_transaction_from_control.inc
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 
---exec echo "restart: --preserve-trx-enable=ON --preserve-trx-temp-table-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-temp-table-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -38,5 +38,5 @@ SELECT * FROM t_temp_no_redo_truncate_anchor ORDER BY id;
 --source suite/preserve_trx/include/assert_no_preserve_residue.inc
 
 DROP TABLE t_temp_no_redo_truncate_anchor;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

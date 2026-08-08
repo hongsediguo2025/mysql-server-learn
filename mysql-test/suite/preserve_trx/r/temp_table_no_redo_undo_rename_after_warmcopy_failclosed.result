@@ -1,7 +1,6 @@
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=PROMOTION_PREPARE;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 CREATE TEMPORARY TABLE tmp_preserve_rename(
 id INT PRIMARY KEY,
 v INT
@@ -29,8 +28,7 @@ id	v
 2	20
 COMMIT;
 DROP TEMPORARY TABLE tmp_preserve_renamed;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
-SET GLOBAL preserve_trx_warmcopy_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=BUSINESS_FIRST;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 SET DEBUG_SYNC = 'RESET';

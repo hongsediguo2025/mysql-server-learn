@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_resume_active_transaction_retryable;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_resume_active_transaction_retryable(
 id INT PRIMARY KEY,
 v INT
@@ -25,4 +25,4 @@ SELECT * FROM t_resume_active_transaction_retryable ORDER BY id;
 id	v
 1	20
 DROP TABLE t_resume_active_transaction_retryable;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

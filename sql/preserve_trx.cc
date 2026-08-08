@@ -127,38 +127,28 @@ using Table_ref = TABLE_LIST;
 
 bool preserve_trx_enable = true;
 bool preserve_trx_temp_table_enable = true;
-uint preserve_trx_max_total = 256;
-uint preserve_trx_max_pending_per_user = 256;
-uint preserve_trx_batch_max_transactions = 256;
-uint preserve_trx_recovery_max_count = 3;
-uint preserve_trx_recovery_grace_seconds = 120;
-ulonglong preserve_trx_max_snapshot_bytes = 16777216;
-ulonglong preserve_trx_max_binlog_cache_bytes = 1073741824;
-ulonglong preserve_trx_max_temp_sidecar_bytes = 1073741824;
-ulonglong preserve_trx_single_phase_max_binlog_cache_bytes = ULLONG_MAX;
-uint preserve_trx_max_lock_count = 2000;
-uint preserve_trx_max_modified_tables = 64;
+const uint preserve_trx_recovery_max_count = 3;
+const uint preserve_trx_recovery_grace_seconds = 120;
+const ulonglong preserve_trx_max_snapshot_bytes = 16777216;
+const ulonglong preserve_trx_max_binlog_cache_bytes = 1073741824;
+const ulonglong preserve_trx_max_temp_sidecar_bytes = 1073741824;
+const ulonglong preserve_trx_single_phase_max_binlog_cache_bytes = ULLONG_MAX;
+const uint preserve_trx_max_lock_count = 1000000;
+const uint preserve_trx_max_modified_tables = 512;
 uint preserve_trx_drain_phase1_timeout_ms = 600000;
 uint preserve_trx_drain_phase2_timeout_ms = 30000;
-bool preserve_trx_transfer_pipeline_enable = true;
-bool preserve_trx_warmcopy_enable = true;
-uint preserve_trx_warmcopy_min_open_ms = 1000;
-uint preserve_trx_warmcopy_chunk_bytes = 1048576;
-uint preserve_trx_warmcopy_tail_budget_bytes = 1048576;
-ulonglong preserve_trx_warmcopy_max_total_bytes = 10737418240ULL;
-uint preserve_trx_warmcopy_pending_range_limit = 1024;
-ulonglong preserve_trx_warmcopy_pending_bytes_limit = 67108864ULL;
-bool preserve_trx_lock_warmcopy_enable = true;
-bool preserve_trx_lock_warmcopy_fallback_to_live_export = true;
-ulonglong preserve_trx_lock_warmcopy_max_memory_bytes = 268435456ULL;
-ulonglong preserve_trx_lock_warmcopy_max_journal_bytes = 1073741824ULL;
-uint preserve_trx_lock_warmcopy_max_dirty_shards = 100000;
-uint preserve_trx_lock_warmcopy_max_mdl_descriptors = 100000;
-uint preserve_trx_lock_warmcopy_seal_threads = 0;
+const ulonglong preserve_trx_warmcopy_max_total_bytes = 10737418240ULL;
+const uint preserve_trx_warmcopy_pending_range_limit = 1024;
+const ulonglong preserve_trx_warmcopy_pending_bytes_limit = 67108864ULL;
+const ulonglong preserve_trx_lock_warmcopy_max_memory_bytes = 268435456ULL;
+const ulonglong preserve_trx_lock_warmcopy_max_journal_bytes = 1073741824ULL;
+const uint preserve_trx_lock_warmcopy_max_dirty_shards = 100000;
+const uint preserve_trx_lock_warmcopy_max_mdl_descriptors = 100000;
+const uint preserve_trx_lock_warmcopy_seal_threads = 0;
 uint preserve_trx_lock_warmcopy_conversion_wait_timeout_ms = 30000;
-uint preserve_trx_parallel_preserve_threads = 0;
-uint preserve_trx_startup_recovery_threads = 0;
-bool preserve_trx_recover_lock_page_prefetch = true;
+const uint preserve_trx_parallel_preserve_threads = 0;
+const uint preserve_trx_startup_recovery_threads = 0;
+const bool preserve_trx_recover_lock_page_prefetch = true;
 extern ulong srv_force_recovery;
 extern ulong srv_rollback_segments;
 extern bool recv_needed_recovery;
@@ -1136,12 +1126,6 @@ static bool preserved_trx_promotion_keys_match(
          lhs.generation == rhs.generation;
 }
 
-struct Preserve_batch_account_count {
-  std::string user;
-  std::string host;
-  uint count{0};
-};
-
 struct Preserve_user_var_snapshot_entry {
   std::string name;
   std::string value;
@@ -1853,35 +1837,6 @@ void preserved_trx_remove_observable_record(
       ++it;
     }
   }
-}
-
-bool preserved_trx_batch_has_capacity(
-    const std::vector<Preserve_batch_account_count> &batch_accounts) {
-  size_t batch_count = 0;
-  for (const Preserve_batch_account_count &account : batch_accounts)
-    batch_count += account.count;
-
-  std::lock_guard<std::mutex> lock(g_preserved_trx_mutex);
-  size_t persistent_count = 0;
-  for (const Preserved_trx_record &record : g_preserved_trx_records) {
-    if (!record.observable_only) ++persistent_count;
-  }
-  if (persistent_count + batch_count > preserve_trx_max_total)
-    return false;
-
-  for (const Preserve_batch_account_count &account : batch_accounts) {
-    size_t existing_count = 0;
-    for (const Preserved_trx_record &record : g_preserved_trx_records) {
-      if (!record.observable_only && record.metadata.owner_user == account.user &&
-          record.metadata.owner_host == account.host) {
-        ++existing_count;
-      }
-    }
-    if (existing_count + account.count > preserve_trx_max_pending_per_user)
-      return false;
-  }
-
-  return true;
 }
 
 void mark_preserved_trx_recovery_complete() {
@@ -5364,20 +5319,6 @@ bool preserve_trx_batch_candidate_is_idle_target(THD *owner, THD *candidate) {
   return true;
 }
 
-void preserve_trx_batch_add_account(
-    THD *candidate, std::vector<Preserve_batch_account_count> *account_counts) {
-  Security_context *sctx = candidate->security_context();
-  const std::string user = lex_cstring_to_string(sctx->priv_user());
-  const std::string host = lex_cstring_to_string(sctx->priv_host());
-  for (Preserve_batch_account_count &account : *account_counts) {
-    if (account.user == user && account.host == host) {
-      ++account.count;
-      return;
-    }
-  }
-  account_counts->push_back({user, host, 1});
-}
-
 class Preserve_batch_target_counter final : public Do_THD_Impl {
  public:
   Preserve_batch_target_counter(THD *owner, ulonglong generation,
@@ -5467,7 +5408,6 @@ class Preserve_batch_target_counter final : public Do_THD_Impl {
         ++m_target_count;
         m_target_thread_ids.push_back(candidate->thread_id());
         m_transaction_target_thread_ids.push_back(candidate->thread_id());
-        preserve_trx_batch_add_account(candidate, &m_account_counts);
         candidate->preserve_trx_batch_generation = m_generation;
         candidate->preserve_trx_batch_state =
             Preserve_trx_batch_thd_state::QUIESCED;
@@ -5481,7 +5421,6 @@ class Preserve_batch_target_counter final : public Do_THD_Impl {
         m_target_thread_ids.push_back(candidate->thread_id());
         if (active_explicit_transaction) {
           m_transaction_target_thread_ids.push_back(candidate->thread_id());
-          preserve_trx_batch_add_account(candidate, &m_account_counts);
         }
         candidate->preserve_trx_batch_generation = m_generation;
         candidate->preserve_trx_batch_state =
@@ -5509,10 +5448,6 @@ class Preserve_batch_target_counter final : public Do_THD_Impl {
   const std::vector<my_thread_id> &transaction_target_thread_ids() const {
     return m_transaction_target_thread_ids;
   }
-  const std::vector<Preserve_batch_account_count> &account_counts() const {
-    return m_account_counts;
-  }
-
  private:
   THD *m_owner;
   ulonglong m_generation;
@@ -5524,7 +5459,6 @@ class Preserve_batch_target_counter final : public Do_THD_Impl {
   bool m_has_unsupported_transaction{false};
   std::vector<my_thread_id> m_target_thread_ids;
   std::vector<my_thread_id> m_transaction_target_thread_ids;
-  std::vector<Preserve_batch_account_count> m_account_counts;
 };
 
 class Preserve_batch_phase1_transfer_target_scanner final : public Do_THD_Impl {
@@ -6013,7 +5947,6 @@ class Preserve_batch_quiesced_target_counter final : public Do_THD_Impl {
         m_has_unsupported_transaction = true;
       } else {
         ++m_target_count;
-        preserve_trx_batch_add_account(candidate, &m_account_counts);
       }
     }
     mysql_mutex_unlock(&candidate->LOCK_thd_data);
@@ -6023,17 +5956,12 @@ class Preserve_batch_quiesced_target_counter final : public Do_THD_Impl {
   bool has_unsupported_transaction() const {
     return m_has_unsupported_transaction;
   }
-  const std::vector<Preserve_batch_account_count> &account_counts() const {
-    return m_account_counts;
-  }
-
  private:
   THD *m_owner;
   ulonglong m_generation;
   const std::vector<my_thread_id> &m_target_thread_ids;
   uint m_target_count{0};
   bool m_has_unsupported_transaction{false};
-  std::vector<Preserve_batch_account_count> m_account_counts;
 };
 
 class Preserve_batch_clear_target_generation final : public Do_THD_Impl {
@@ -6564,8 +6492,10 @@ class Warmcopy_batch_blob_provider final : public PreserveBinlogBlobProvider {
   };
 
  public:
-  Warmcopy_batch_blob_provider(std::string dir,
-                               bool allow_quiesced_rebuild_fallback)
+  Warmcopy_batch_blob_provider(
+      std::string dir, bool allow_quiesced_rebuild_fallback,
+      const Preserve_trx_transfer_runtime_policy &runtime_policy,
+      uint64_t max_inflight_bytes)
       : m_dir(std::move(dir)),
         m_carrier(allow_quiesced_rebuild_fallback
                       ? create_preserved_trx_process_local_warm_external_blob_carrier(
@@ -6575,7 +6505,11 @@ class Warmcopy_batch_blob_provider final : public PreserveBinlogBlobProvider {
         m_max_total_bytes(preserve_trx_warmcopy_max_total_bytes),
         m_max_entry_bytes(preserve_trx_max_binlog_cache_bytes),
         m_reservation_chunk_bytes(
-            std::max<uint64_t>(1, preserve_trx_warmcopy_chunk_bytes)),
+            std::max<uint64_t>(1, runtime_policy.warmcopy_chunk_bytes)),
+        m_copy_chunk_bytes(
+            std::max<uint64_t>(1, runtime_policy.warmcopy_chunk_bytes)),
+        m_tail_budget_bytes(runtime_policy.warmcopy_tail_budget_bytes),
+        m_max_inflight_bytes(max_inflight_bytes),
         m_allow_quiesced_rebuild_fallback(
             allow_quiesced_rebuild_fallback) {
     if (m_carrier == nullptr) m_error = true;
@@ -6697,7 +6631,7 @@ class Warmcopy_batch_blob_provider final : public PreserveBinlogBlobProvider {
     }
     const uint64_t delta_bytes = sampled.size - payload_offset;
     if (delta_bytes < minimum_delta_bytes || delta_bytes == 0 ||
-        delta_bytes > preserve_trx_transfer_max_inflight_bytes) {
+        delta_bytes > m_max_inflight_bytes) {
       return false;
     }
 
@@ -6705,7 +6639,7 @@ class Warmcopy_batch_blob_provider final : public PreserveBinlogBlobProvider {
     if (m_carrier->read_active_warm_external_blob_range(
             sampled.warmcopy_id, sampled.name, sampled.warmcopy_epoch,
             payload_offset, delta_bytes,
-            preserve_trx_transfer_max_inflight_bytes,
+            m_max_inflight_bytes,
             &payload) != Preserved_trx_carrier_status::OK) {
       return false;
     }
@@ -6765,7 +6699,7 @@ class Warmcopy_batch_blob_provider final : public PreserveBinlogBlobProvider {
               << " total_bytes="
               << m_total_bytes.load(std::memory_order_relaxed)
               << " max_total_bytes=" << m_max_total_bytes
-              << " tail_budget=" << preserve_trx_warmcopy_tail_budget_bytes
+              << " tail_budget=" << m_tail_budget_bytes
               << " close_deadline_us=" << observed_close_deadline_us;
       LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG, message.str().c_str());
     };
@@ -6817,7 +6751,7 @@ class Warmcopy_batch_blob_provider final : public PreserveBinlogBlobProvider {
     PrebuiltBinlogCacheBlob finalized;
     uint64_t retained_reservation_bytes = 0;
     const bool finalize_failed = mysql_binlog_preserve_warmcopy_finalize_session(
-        thd, session, preserve_trx_warmcopy_tail_budget_bytes,
+        thd, session, m_tail_budget_bytes,
         context.receiver_prefix_published, context.receiver_prefix_bytes,
         &finalized, &has_final_blob, &retained_reservation_bytes);
     const bool finalized_blob_ready = !finalize_failed && has_final_blob;
@@ -6927,7 +6861,7 @@ class Warmcopy_batch_blob_provider final : public PreserveBinlogBlobProvider {
     Mysql_binlog_warmcopy_session *const session = it->second.session;
     if (session == nullptr) return true;
     return mysql_binlog_preserve_warmcopy_tail_budget_exceeded(
-        thd, session, preserve_trx_warmcopy_tail_budget_bytes, exceeded);
+        thd, session, m_tail_budget_bytes, exceeded);
   }
 
   bool stale_rebuildable_for_thd(const THD *thd) const {
@@ -7083,6 +7017,7 @@ class Warmcopy_batch_blob_provider final : public PreserveBinlogBlobProvider {
     const bool begin_failed = mysql_binlog_preserve_warmcopy_begin_session(
         thd, next_warmcopy_id, epoch, m_carrier.get(), m_max_entry_bytes,
         &m_total_bytes, m_max_total_bytes, m_reservation_chunk_bytes,
+        m_copy_chunk_bytes,
         &new_session, nullptr, nullptr, true);
 
     bool published = false;
@@ -7145,6 +7080,9 @@ class Warmcopy_batch_blob_provider final : public PreserveBinlogBlobProvider {
   const uint64_t m_max_total_bytes;
   const uint64_t m_max_entry_bytes;
   const uint64_t m_reservation_chunk_bytes;
+  const uint64_t m_copy_chunk_bytes;
+  const uint64_t m_tail_budget_bytes;
+  const uint64_t m_max_inflight_bytes;
   mutable std::mutex m_mutex;
   std::condition_variable m_condition;
   std::unordered_map<my_thread_id, Entry> m_entries;
@@ -7214,6 +7152,7 @@ class Warmcopy_batch_blob_provider final : public PreserveBinlogBlobProvider {
     if (mysql_binlog_preserve_warmcopy_begin_session(
             thd, warmcopy_id, epoch, m_carrier.get(), m_max_entry_bytes,
             &m_total_bytes, m_max_total_bytes, m_reservation_chunk_bytes,
+            m_copy_chunk_bytes,
             &session, nullptr, nullptr,
             allow_inflight_statement)) {
       std::lock_guard<std::mutex> guard(m_mutex);
@@ -8331,12 +8270,17 @@ class Warmcopy_batch_drain_participant final
  public:
   Warmcopy_batch_drain_participant(THD *owner, ulonglong generation,
                                    unsigned long close_timeout_ms,
-                                   bool allow_quiesced_rebuild_fallback)
+                                   bool allow_quiesced_rebuild_fallback,
+                                   Preserve_trx_transfer_runtime_policy
+                                       runtime_policy,
+                                   uint64_t max_inflight_bytes)
       : m_owner(owner),
         m_generation(generation),
         m_close_timeout_ms(close_timeout_ms),
         m_allow_quiesced_rebuild_fallback(
-            allow_quiesced_rebuild_fallback) {}
+            allow_quiesced_rebuild_fallback),
+        m_runtime_policy(std::move(runtime_policy)),
+        m_max_inflight_bytes(max_inflight_bytes) {}
 
   bool open_phase1() override {
     preserve_trx_warmcopy_reset_status();
@@ -8345,7 +8289,8 @@ class Warmcopy_batch_drain_participant final
     m_observation.bytes_budget = preserve_trx_warmcopy_max_total_bytes;
     m_observation.phase1_progress = 1;
     m_provider = std::make_shared<Warmcopy_batch_blob_provider>(
-        preserve_trx_default_dir(), m_allow_quiesced_rebuild_fallback);
+        preserve_trx_default_dir(), m_allow_quiesced_rebuild_fallback,
+        m_runtime_policy, m_max_inflight_bytes);
     if (m_provider == nullptr || m_provider->error()) {
       mark_degraded("warm-copy provider open failed");
       return false;
@@ -8353,8 +8298,9 @@ class Warmcopy_batch_drain_participant final
     m_provider->set_close_deadline_us(m_closing_deadline_us);
 
     DEBUG_SYNC(m_owner, "preserve_trx_warmcopy_open");
-    if (preserve_trx_warmcopy_min_open_ms != 0) {
-      my_sleep(static_cast<ulong>(preserve_trx_warmcopy_min_open_ms) * 1000);
+    if (m_runtime_policy.warmcopy_min_open_ms != 0) {
+      my_sleep(static_cast<ulong>(m_runtime_policy.warmcopy_min_open_ms) *
+               1000);
     }
 
     Warmcopy_prepare_idle_participants prepare_warmcopy(m_owner);
@@ -8630,6 +8576,8 @@ class Warmcopy_batch_drain_participant final
   ulonglong m_generation;
   unsigned long m_close_timeout_ms;
   bool m_allow_quiesced_rebuild_fallback;
+  Preserve_trx_transfer_runtime_policy m_runtime_policy;
+  uint64_t m_max_inflight_bytes;
   std::shared_ptr<Warmcopy_batch_blob_provider> m_provider;
   ulonglong m_closing_deadline_us{0};
   bool m_closed{false};
@@ -8651,6 +8599,7 @@ struct Preserve_batch_target_execution {
   bool error{false};
   bool no_token_target{false};
   bool early_objects_staged{false};
+  bool batch_item_collected{false};
   bool lock_artifact_prepared{false};
   bool initial_lock_fence_valid{false};
   lock_warmcopy_trx_lock_fence_t initial_lock_fence;
@@ -16196,7 +16145,10 @@ bool preserve_trx_kernel_preserve_attached_transaction(
     const Preserve_snapshot_status artifact_sink_status =
         preserve_trx_make_artifact_sink_for_decision(
             artifact_decision, &store.store(), metadata.token,
-            token_selection.transfer_token, preserve_trx_transfer_chunk_bytes,
+            token_selection.transfer_token,
+            request.transfer_source_epoch_session == nullptr
+                ? Preserve_trx_transfer_runtime_policy{}.transfer_chunk_bytes
+                : request.transfer_source_epoch_session->chunk_bytes(),
             transfer_frame_sink.get(), &artifact_sink,
             request.transfer_source_epoch_session,
             request.transfer_preserve_dir, transfer_resurrection_entry_ptr);
@@ -16593,6 +16545,10 @@ bool Preserve_trx_drain_service::execute(
   const uint phase2_timeout_ms = preserve_trx_drain_phase2_timeout_ms;
   const uint token_retention_timeout_ms =
       preserve_trx_token_retention_timeout_ms;
+  const Preserve_trx_transfer_runtime_policy transfer_runtime_policy =
+      preserve_trx_transfer_current_runtime_policy();
+  const uint64_t transfer_max_inflight_bytes =
+      preserve_trx_transfer_max_inflight_bytes;
   const ulonglong phase2_long_command_age_us =
       static_cast<ulonglong>(phase2_timeout_ms) * 1000ULL;
   const ulonglong timeout_seconds =
@@ -16600,7 +16556,7 @@ bool Preserve_trx_drain_service::execute(
 
   const ulonglong generation = g_batch_generation.fetch_add(1) + 1;
   const bool binlog_warmcopy_enabled =
-      preserve_trx_warmcopy_enable && opt_bin_log && mysql_bin_log.is_open();
+      opt_bin_log && mysql_bin_log.is_open();
   const bool lock_warmcopy_enabled = preserve_trx_lock_warmcopy_effective();
   const Preserve_trx_transfer_artifact_decision batch_artifact_decision =
       preserve_trx_transfer_artifact_decision();
@@ -16612,8 +16568,6 @@ bool Preserve_trx_drain_service::execute(
   const bool two_phase_enabled =
       standby_transfer_streaming_enabled || temp_table_phase1_enabled ||
       preserve_trx_lock_warmcopy_requires_two_phase(binlog_warmcopy_enabled);
-  const bool transfer_pipeline_enabled =
-      preserve_trx_transfer_pipeline_enable;
   Preserve_trx_drain_orchestrator drain_orchestrator(
       two_phase_enabled ? Preserve_trx_drain_phase_mode::TWO_PHASE
                         : Preserve_trx_drain_phase_mode::SINGLE_PHASE);
@@ -16628,7 +16582,8 @@ bool Preserve_trx_drain_service::execute(
   if (local_binlog_warmcopy_enabled) {
     warmcopy_participant = std::make_unique<Warmcopy_batch_drain_participant>(
         thd, generation, phase2_timeout_ms,
-        standby_transfer_streaming_enabled);
+        standby_transfer_streaming_enabled, transfer_runtime_policy,
+        transfer_max_inflight_bytes);
     drain_orchestrator.add_participant(warmcopy_participant.get());
   }
   std::unique_ptr<Preserve_trx_lock_warmcopy_drain_participant>
@@ -16644,11 +16599,9 @@ bool Preserve_trx_drain_service::execute(
   }
   const bool active_binlog_progress_policy_enabled =
       standby_transfer_streaming_enabled && two_phase_enabled &&
-      transfer_pipeline_enabled &&
       warmcopy_participant != nullptr;
   const bool early_pipeline_policy_enabled =
       standby_transfer_streaming_enabled && two_phase_enabled &&
-      transfer_pipeline_enabled &&
       lock_warmcopy_participant != nullptr &&
       preserve_trx_lock_warmcopy_current_options().fallback_to_live_export;
   PreserveBinlogBlobProvider *warmcopy_provider = nullptr;
@@ -16786,6 +16739,26 @@ bool Preserve_trx_drain_service::execute(
                  .c_str());
     }
   };
+  auto cleanup_cancelled_batch_transfer_epoch = [&](const char *reason) {
+    if (batch_transfer_source_session == nullptr) return;
+    if (batch_transfer_phase1_sender != nullptr) {
+      batch_transfer_phase1_sender->abort();
+      batch_transfer_phase1_sender.reset();
+    }
+    const Preserve_trx_transfer_status cleanup_status =
+        batch_transfer_source_session->cleanup_cancelled_epoch(
+            reason == nullptr ? "reset_cleanup" : reason);
+    if (cleanup_status != Preserve_trx_transfer_status::OK &&
+        cleanup_status != Preserve_trx_transfer_status::NOT_COMMITTED_CLEAN &&
+        cleanup_status != Preserve_trx_transfer_status::UNSUPPORTED &&
+        cleanup_status != Preserve_trx_transfer_status::COMMITTED_READY &&
+        cleanup_status != Preserve_trx_transfer_status::COMMITTED_NOT_READY) {
+      LogErr(WARNING_LEVEL, ER_LOG_PRINTF_MSG,
+             ("PRESERVE: RESET receiver epoch cleanup deferred status=" +
+              std::to_string(static_cast<int>(cleanup_status)))
+                 .c_str());
+    }
+  };
   auto reset_requested = [&]() {
     return preserve_trx_active_drain_reset_requested(active_drain_attempt);
   };
@@ -16850,6 +16823,7 @@ bool Preserve_trx_drain_service::execute(
     Global_THD_manager::get_instance()->do_for_all_thd_copy(&clear);
     preserve_trx_publish_active_drain_reset_barrier(active_drain_attempt);
     abort_drain_participants(stage);
+    cleanup_cancelled_batch_transfer_epoch(stage);
     release_reset_source_resources();
     return finish_reset_manager();
   };
@@ -16866,7 +16840,7 @@ bool Preserve_trx_drain_service::execute(
 
     const Preserve_trx_transfer_status frame_sink_status =
         preserve_trx_transfer_make_configured_frame_sink(
-            &batch_transfer_frame_sink);
+            &batch_transfer_frame_sink, &transfer_runtime_policy);
     if (frame_sink_status != Preserve_trx_transfer_status::OK ||
         batch_transfer_frame_sink == nullptr) {
       abort_drain_participants("standby_transfer_frame_sink_failed");
@@ -16888,11 +16862,11 @@ bool Preserve_trx_drain_service::execute(
       return true;
     }
     batch_transfer_phase1_options.max_batch_bytes =
-        preserve_trx_transfer_phase1_batch_bytes;
+        transfer_runtime_policy.phase1_batch_bytes;
     batch_transfer_phase1_options.linger_ms =
-        preserve_trx_transfer_phase1_batch_linger_ms;
+        transfer_runtime_policy.phase1_batch_linger_ms;
     batch_transfer_phase1_options.max_inflight_bytes =
-        preserve_trx_transfer_max_inflight_bytes;
+        transfer_max_inflight_bytes;
     if (batch_transfer_phase1_options.max_batch_bytes >
         batch_transfer_phase1_options.max_inflight_bytes) {
       LogErr(WARNING_LEVEL, ER_LOG_PRINTF_MSG,
@@ -16904,7 +16878,9 @@ bool Preserve_trx_drain_service::execute(
       return true;
     }
     Preserve_trx_transfer_source_epoch_options source_epoch_options;
-    source_epoch_options.chunk_bytes = preserve_trx_transfer_chunk_bytes;
+    source_epoch_options.runtime_policy = transfer_runtime_policy;
+    source_epoch_options.chunk_bytes =
+        transfer_runtime_policy.transfer_chunk_bytes;
     source_epoch_options.max_inflight_bytes =
         batch_transfer_phase1_options.max_inflight_bytes;
     source_epoch_options.phase1_batch_bytes =
@@ -17485,6 +17461,26 @@ bool Preserve_trx_drain_service::execute(
     source_failed_batch_items.clear();
   };
 
+  auto collect_completed_target_items = [&]() {
+    for (Preserve_batch_target_execution &execution : target_results) {
+      if (execution.batch_item_collected ||
+          execution.result.stage != Preserve_trx_preserve_stage::COMPLETE ||
+          execution.result.token.empty()) {
+        continue;
+      }
+      Preserve_trx_batch_item item;
+      item.original_thread_id = execution.target_thread_id;
+      item.token = execution.result.token;
+      item.logged_binlog_cache = execution.result.logged_binlog_cache;
+      item.local_authority_staged = execution.result.local_authority_staged;
+      item.source_rollback_image =
+          std::move(execution.result.source_rollback_image);
+      preserved_batch_items.push_back(std::move(item));
+      execution.batch_item_collected = true;
+    }
+    preserved_token_count = preserved_batch_items.size();
+  };
+
   auto finish_phase2_reset =
       [&](std::vector<Preserve_trx_batch_item> *items,
           const char *stage) {
@@ -17521,11 +17517,13 @@ bool Preserve_trx_drain_service::execute(
           }
         }
         abort_drain_participants(stage);
+        cleanup_cancelled_batch_transfer_epoch(stage);
         release_reset_source_resources();
         return finish_reset_manager();
       };
 
   auto finish_reset_from_current_items = [&](const char *stage) {
+    collect_completed_target_items();
     return finish_phase2_reset(&preserved_batch_items, stage);
   };
 
@@ -17809,9 +17807,7 @@ bool Preserve_trx_drain_service::execute(
   const bool early_pipeline_enabled =
       early_pipeline_policy_enabled &&
       batch_transfer_source_session != nullptr &&
-      counter.transaction_count() != 0 &&
-      counter.transaction_count() <= preserve_trx_batch_max_transactions &&
-      preserved_trx_batch_has_capacity(counter.account_counts());
+      counter.transaction_count() != 0;
   const bool timeout_exclusion_enabled =
       standby_transfer_streaming_enabled;
   if (early_pipeline_enabled) {
@@ -18347,27 +18343,8 @@ bool Preserve_trx_drain_service::execute(
     join_workers.rollback();
     phase2_metrics.target_worker_wall_us += elapsed_since(worker_started_us);
 
-    auto collect_early_preserved_items = [&]() {
-      preserved_batch_items.clear();
-      for (Preserve_batch_target_execution &execution : target_results) {
-        if (execution.result.stage != Preserve_trx_preserve_stage::COMPLETE ||
-            execution.result.token.empty()) {
-          continue;
-        }
-        Preserve_trx_batch_item item;
-        item.original_thread_id = execution.target_thread_id;
-        item.token = execution.result.token;
-        item.logged_binlog_cache = execution.result.logged_binlog_cache;
-        item.local_authority_staged =
-            execution.result.local_authority_staged;
-        item.source_rollback_image =
-            std::move(execution.result.source_rollback_image);
-        preserved_batch_items.push_back(std::move(item));
-      }
-      preserved_token_count = preserved_batch_items.size();
-    };
     if (reset_requested()) {
-      collect_early_preserved_items();
+      collect_completed_target_items();
       Preserve_batch_clear_generation clear(generation);
       Global_THD_manager::get_instance()->do_for_all_thd_copy(&clear);
       return finish_phase2_reset(
@@ -18507,7 +18484,7 @@ bool Preserve_trx_drain_service::execute(
                      : first_failed->result.failure_reason))
                    .c_str());
       }
-      collect_early_preserved_items();
+      collect_completed_target_items();
       Preserve_batch_clear_generation clear(generation);
       Global_THD_manager::get_instance()->do_for_all_thd_copy(&clear);
       if (reset_requested()) {
@@ -18661,16 +18638,10 @@ bool Preserve_trx_drain_service::execute(
     Preserve_batch_quiesced_target_counter ready_counter(
         thd, generation, quiesced_target_thread_ids);
     Global_THD_manager::get_instance()->do_for_all_thd_copy(&ready_counter);
-    /*
-      Recheck the quiesced set after every pending target reached its boundary.
-      The second pass protects the capacity and account limits from preserving
-      a different set than the one that was counted before the wait.
-    */
+    /* Recheck the exact quiesced set after every pending target converged. */
     if (static_cast<size_t>(ready_counter.target_count()) !=
             quiesced_target_thread_ids.size() ||
-        ready_counter.target_count() > preserve_trx_batch_max_transactions ||
-        ready_counter.has_unsupported_transaction() ||
-        !preserved_trx_batch_has_capacity(ready_counter.account_counts())) {
+        ready_counter.has_unsupported_transaction()) {
       if (reset_requested())
         return finish_reset_from_current_items(
             "reset_during_quiesced_target_validation");
@@ -19359,6 +19330,7 @@ bool Preserve_trx_drain_service::execute(
         failed_item.source_rollback_image =
             std::move(execution.result.source_rollback_image);
         source_failed_batch_items.push_back(std::move(failed_item));
+        execution.batch_item_collected = true;
 
         const auto token_it = batch_tokens_by_thread_id.find(
             execution.target_thread_id);
@@ -19604,22 +19576,9 @@ bool Preserve_trx_drain_service::execute(
 
   const Preserve_batch_target_execution *failed_execution = nullptr;
   const ulonglong result_collect_started_us = preserve_trx_monotonic_us();
+  collect_completed_target_items();
   for (Preserve_batch_target_execution &execution : target_results) {
     apply_target_metrics(execution.result);
-
-    if (execution.result.stage == Preserve_trx_preserve_stage::COMPLETE &&
-        !execution.result.token.empty()) {
-      Preserve_trx_batch_item batch_item;
-      batch_item.original_thread_id = execution.target_thread_id;
-      batch_item.token = execution.result.token;
-      batch_item.logged_binlog_cache = execution.result.logged_binlog_cache;
-      batch_item.local_authority_staged =
-          execution.result.local_authority_staged;
-      batch_item.source_rollback_image =
-          std::move(execution.result.source_rollback_image);
-      preserved_batch_items.push_back(std::move(batch_item));
-      preserved_token_count = preserved_batch_items.size();
-    }
 
     if (execution.pin_error || !execution.visited_target || execution.error ||
         execution.result.stage != Preserve_trx_preserve_stage::COMPLETE) {

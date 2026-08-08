@@ -15,7 +15,7 @@ DROP DATABASE IF EXISTS preserve_batch_session_off;
 DROP DATABASE IF EXISTS preserve_batch_user_vars;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE DATABASE preserve_batch_autoinc;
 CREATE DATABASE preserve_batch_lock;
@@ -130,7 +130,7 @@ UPDATE t SET v=11 WHERE id=1;
 DRAIN TRANSACTIONS PRESERVE WITH USER VARS;
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 
---exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=20" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -284,5 +284,5 @@ DROP DATABASE preserve_batch_rv;
 DROP DATABASE preserve_batch_savepoint;
 DROP DATABASE preserve_batch_session_off;
 DROP DATABASE preserve_batch_user_vars;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 --enable_query_log

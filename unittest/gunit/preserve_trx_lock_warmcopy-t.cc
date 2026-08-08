@@ -208,19 +208,6 @@ std::string make_mdl_payload(const std::vector<std::string> &entries) {
 
 }  // namespace
 
-class ScopedLockWarmcopyEnable {
- public:
-  explicit ScopedLockWarmcopyEnable(bool enabled)
-      : m_saved(preserve_trx_lock_warmcopy_enable) {
-    preserve_trx_lock_warmcopy_enable = enabled;
-  }
-
-  ~ScopedLockWarmcopyEnable() { preserve_trx_lock_warmcopy_enable = m_saved; }
-
- private:
-  bool m_saved;
-};
-
 TEST(PreserveTrxLockWarmcopyConfig, DefaultsMatchDocumentedGateAContract) {
   const Preserve_trx_lock_warmcopy_options options =
       preserve_trx_lock_warmcopy_current_options();
@@ -237,17 +224,8 @@ TEST(PreserveTrxLockWarmcopyConfig, DefaultsMatchDocumentedGateAContract) {
 
 TEST(PreserveTrxLockWarmcopyConfig,
      LockWarmcopyCanRequireTwoPhaseWithoutBinlogWarmcopy) {
-  {
-    ScopedLockWarmcopyEnable lock_warmcopy_on(true);
-    EXPECT_TRUE(preserve_trx_lock_warmcopy_requires_two_phase(false));
-    EXPECT_TRUE(preserve_trx_lock_warmcopy_requires_two_phase(true));
-  }
-
-  {
-    ScopedLockWarmcopyEnable lock_warmcopy_off(false);
-    EXPECT_FALSE(preserve_trx_lock_warmcopy_requires_two_phase(false));
-    EXPECT_TRUE(preserve_trx_lock_warmcopy_requires_two_phase(true));
-  }
+  EXPECT_TRUE(preserve_trx_lock_warmcopy_requires_two_phase(false));
+  EXPECT_TRUE(preserve_trx_lock_warmcopy_requires_two_phase(true));
 }
 
 TEST(PreserveTrxLockWarmcopyDrainParticipant,

@@ -1,6 +1,6 @@
 DROP TABLE IF EXISTS t_batch_prepare_temp_binlog;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 CREATE TABLE t_batch_prepare_temp_binlog(
 id INT PRIMARY KEY,
 v INT
@@ -59,5 +59,5 @@ include/assert_grep.inc [first restored batch transaction post-failure row commi
 include/assert_grep.inc [second restored batch transaction committed once]
 include/assert_grep.inc [second restored batch transaction post-failure row committed once]
 DROP TABLE t_batch_prepare_temp_binlog;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

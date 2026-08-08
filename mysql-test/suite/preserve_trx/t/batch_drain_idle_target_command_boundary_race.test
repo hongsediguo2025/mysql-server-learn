@@ -14,7 +14,7 @@ GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
 --enable_query_log
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_batch_idle_boundary(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 CREATE USER batch_idle_boundary_app@localhost;
@@ -69,7 +69,7 @@ SET DEBUG_SYNC = 'now SIGNAL continue_idle_target_preserved';
 
 --connection default
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
---exec echo "restart: --preserve-trx-enable=ON --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -86,4 +86,4 @@ DROP USER batch_idle_boundary_app@localhost;
 DROP USER preserve_trx_ha_admin@localhost;
 --enable_query_log
 DROP TABLE t_batch_idle_boundary;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

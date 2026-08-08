@@ -106,12 +106,6 @@ class ServerOptions:
     max_connections: int = 1400
     innodb_buffer_pool_size: str = "2G"
     innodb_log_file_size: str = "512M"
-    preserve_recovery_max_count: int = 2500
-    preserve_max_lock_count: int = 200_000_000
-    preserve_max_modified_tables: int = 2000
-    preserve_startup_recovery_threads: int = 0
-    preserve_lock_warmcopy_max_memory_bytes: int = 1_073_741_824
-    preserve_lock_warmcopy_max_journal_bytes: int = 4_294_967_296
     extra_mysqld_options: Sequence[str] = dataclasses.field(default_factory=tuple)
 
 
@@ -174,14 +168,7 @@ def render_my_cnf(paths: Nfr2Paths, options: ServerOptions) -> str:
         "performance-schema-consumer-events-statements-current=ON",
         "performance-schema-consumer-events-transactions-current=ON",
         "performance-schema-consumer-events-waits-current=ON",
-        "preserve-trx-enable=ON",
-        f"preserve-trx-recovery-max-count={options.preserve_recovery_max_count}",
-        f"preserve-trx-max-lock-count={options.preserve_max_lock_count}",
-        f"preserve-trx-max-modified-tables={options.preserve_max_modified_tables}",
-        f"preserve-trx-startup-recovery-threads={options.preserve_startup_recovery_threads}",
-        "preserve-trx-lock-warmcopy-enable=ON",
-        f"preserve-trx-lock-warmcopy-max-memory-bytes={options.preserve_lock_warmcopy_max_memory_bytes}",
-        f"preserve-trx-lock-warmcopy-max-journal-bytes={options.preserve_lock_warmcopy_max_journal_bytes}",
+        "rds-preserve-trx-enable=ON",
     ]
     lines.extend(options.extra_mysqld_options)
     lines.extend(
@@ -221,9 +208,6 @@ def write_config(paths: Nfr2Paths, options: ServerOptions) -> None:
 def server_options_from_args(args: argparse.Namespace) -> ServerOptions:
     return ServerOptions(
         log_bin=not getattr(args, "skip_log_bin", False),
-        preserve_startup_recovery_threads=getattr(
-            args, "preserve_startup_recovery_threads", 0
-        ),
         extra_mysqld_options=tuple(getattr(args, "mysqld_option", []) or ()),
     )
 
@@ -378,7 +362,6 @@ def build_business_smoke_command(
     cycles: int,
     drain_interval_s: float,
     preserve_timeout_s: int,
-    lock_warmcopy_mode: str,
 ) -> List[str]:
     min_pause = (
         statements_per_tx
@@ -408,8 +391,6 @@ def build_business_smoke_command(
         str(drain_interval_s),
         "--preserve-timeout",
         str(preserve_timeout_s),
-        "--lock-warmcopy-mode",
-        lock_warmcopy_mode,
         "--server-error-log",
         str(paths.error_log),
         "--server-pid-file",
@@ -422,10 +403,6 @@ def build_business_smoke_command(
 def build_full_benchmark_command(
     paths: Nfr2Paths,
     output: Path,
-    warmcopy_only: bool = False,
-    preserve_parallel_preserve_threads: int = 0,
-    preserve_startup_recovery_threads: int = 0,
-    preserve_lock_warmcopy_seal_threads: int = 0,
     phase2_p95_max_ms: int = FULL_PHASE2_P95_AROUND_MAX_MS,
 ) -> List[str]:
     command = [
@@ -436,8 +413,6 @@ def build_full_benchmark_command(
         "--user",
         "root",
     ]
-    if not warmcopy_only:
-        command.extend(["--scenario", "live-export-large-lockset"])
     command.extend(
         [
             "--scenario",
@@ -460,29 +435,6 @@ def build_full_benchmark_command(
             "--require-no-warmcopy-fallback",
         ]
     )
-    if not warmcopy_only:
-        command.append("--require-phase2-p95-below-baseline")
-    if preserve_parallel_preserve_threads > 0:
-        command.extend(
-            [
-                "--preserve-parallel-preserve-threads",
-                str(preserve_parallel_preserve_threads),
-            ]
-        )
-    if preserve_startup_recovery_threads > 0:
-        command.extend(
-            [
-                "--preserve-startup-recovery-threads",
-                str(preserve_startup_recovery_threads),
-            ]
-        )
-    if preserve_lock_warmcopy_seal_threads > 0:
-        command.extend(
-            [
-                "--preserve-lock-warmcopy-seal-threads",
-                str(preserve_lock_warmcopy_seal_threads),
-            ]
-        )
     command.extend(["--output", str(output)])
     return command
 
@@ -499,10 +451,6 @@ def build_scaled_benchmark_command(
     drain_interval_s: float,
     business_run_before_drain_s: float,
     preserve_timeout_s: int,
-    warmcopy_only: bool = False,
-    preserve_parallel_preserve_threads: int = 0,
-    preserve_startup_recovery_threads: int = 0,
-    preserve_lock_warmcopy_seal_threads: int = 0,
 ) -> List[str]:
     command = [
         sys.executable,
@@ -512,8 +460,6 @@ def build_scaled_benchmark_command(
         "--user",
         "root",
     ]
-    if not warmcopy_only:
-        command.extend(["--scenario", "scaled-live-lockset"])
     command.extend(
         [
             "--scenario",
@@ -550,29 +496,6 @@ def build_scaled_benchmark_command(
         str(output),
         ]
     )
-    if not warmcopy_only:
-        command.append("--require-phase2-p95-below-baseline")
-    if preserve_parallel_preserve_threads > 0:
-        command.extend(
-            [
-                "--preserve-parallel-preserve-threads",
-                str(preserve_parallel_preserve_threads),
-            ]
-        )
-    if preserve_startup_recovery_threads > 0:
-        command.extend(
-            [
-                "--preserve-startup-recovery-threads",
-                str(preserve_startup_recovery_threads),
-            ]
-        )
-    if preserve_lock_warmcopy_seal_threads > 0:
-        command.extend(
-            [
-                "--preserve-lock-warmcopy-seal-threads",
-                str(preserve_lock_warmcopy_seal_threads),
-            ]
-        )
     return command
 
 
@@ -661,12 +584,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     smoke_parser.add_argument("--cycles", type=int, default=1)
     smoke_parser.add_argument("--drain-interval", type=float, default=0.1)
     smoke_parser.add_argument("--preserve-timeout", type=int, default=120)
-    smoke_parser.add_argument(
-        "--lock-warmcopy-mode",
-        choices=("on", "off", "default"),
-        default="on",
-    )
-
     full_parser = subparsers.add_parser("full-command")
     add_common_args(full_parser)
     full_parser.add_argument(
@@ -674,19 +591,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=Path,
         help="JSON report path; defaults under the NFR2 work directory",
     )
-    full_parser.add_argument("--warmcopy-only", action="store_true")
-    full_parser.add_argument("--preserve-parallel-preserve-threads", type=int, default=0)
-    full_parser.add_argument("--preserve-startup-recovery-threads", type=int, default=0)
-    full_parser.add_argument("--preserve-lock-warmcopy-seal-threads", type=int, default=0)
     add_full_phase2_gate_arg(full_parser)
 
     scaled_parser = subparsers.add_parser("scaled-command")
     add_common_args(scaled_parser)
     add_scaled_args(scaled_parser)
-    scaled_parser.add_argument("--warmcopy-only", action="store_true")
-    scaled_parser.add_argument("--preserve-parallel-preserve-threads", type=int, default=0)
-    scaled_parser.add_argument("--preserve-startup-recovery-threads", type=int, default=0)
-    scaled_parser.add_argument("--preserve-lock-warmcopy-seal-threads", type=int, default=0)
 
     run_full_parser = subparsers.add_parser("run-full")
     add_common_args(run_full_parser)
@@ -695,10 +604,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     run_full_parser.add_argument("--startup-timeout", type=float, default=120.0)
     run_full_parser.add_argument("--shutdown-timeout", type=float, default=120.0)
     run_full_parser.add_argument("--output", type=Path)
-    run_full_parser.add_argument("--warmcopy-only", action="store_true")
-    run_full_parser.add_argument("--preserve-parallel-preserve-threads", type=int, default=0)
-    run_full_parser.add_argument("--preserve-startup-recovery-threads", type=int, default=0)
-    run_full_parser.add_argument("--preserve-lock-warmcopy-seal-threads", type=int, default=0)
     add_full_phase2_gate_arg(run_full_parser)
 
     run_scaled_parser = subparsers.add_parser("run-scaled")
@@ -708,10 +613,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     run_scaled_parser.add_argument("--startup-timeout", type=float, default=120.0)
     run_scaled_parser.add_argument("--shutdown-timeout", type=float, default=120.0)
     add_scaled_args(run_scaled_parser)
-    run_scaled_parser.add_argument("--warmcopy-only", action="store_true")
-    run_scaled_parser.add_argument("--preserve-parallel-preserve-threads", type=int, default=0)
-    run_scaled_parser.add_argument("--preserve-startup-recovery-threads", type=int, default=0)
-    run_scaled_parser.add_argument("--preserve-lock-warmcopy-seal-threads", type=int, default=0)
     return parser.parse_args(argv)
 
 
@@ -753,7 +654,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             cycles=args.cycles,
             drain_interval_s=args.drain_interval,
             preserve_timeout_s=args.preserve_timeout,
-            lock_warmcopy_mode=args.lock_warmcopy_mode,
         )
         try:
             run_command(command)
@@ -766,10 +666,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(shell_join(build_full_benchmark_command(
             paths,
             output,
-            warmcopy_only=args.warmcopy_only,
-            preserve_parallel_preserve_threads=args.preserve_parallel_preserve_threads,
-            preserve_startup_recovery_threads=args.preserve_startup_recovery_threads,
-            preserve_lock_warmcopy_seal_threads=args.preserve_lock_warmcopy_seal_threads,
             phase2_p95_max_ms=args.phase2_p95_max_ms,
         )))
         return 0
@@ -789,10 +685,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     drain_interval_s=args.drain_interval,
                     business_run_before_drain_s=args.business_run_before_drain,
                     preserve_timeout_s=args.preserve_timeout,
-                    warmcopy_only=args.warmcopy_only,
-                    preserve_parallel_preserve_threads=args.preserve_parallel_preserve_threads,
-                    preserve_startup_recovery_threads=args.preserve_startup_recovery_threads,
-                    preserve_lock_warmcopy_seal_threads=args.preserve_lock_warmcopy_seal_threads,
                 )
             )
         )
@@ -806,10 +698,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             run_command(build_full_benchmark_command(
                 paths,
                 output,
-                warmcopy_only=args.warmcopy_only,
-                preserve_parallel_preserve_threads=args.preserve_parallel_preserve_threads,
-                preserve_startup_recovery_threads=args.preserve_startup_recovery_threads,
-                preserve_lock_warmcopy_seal_threads=args.preserve_lock_warmcopy_seal_threads,
                 phase2_p95_max_ms=args.phase2_p95_max_ms,
             ))
         finally:
@@ -832,12 +720,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     lockset_batch_size=args.lockset_batch_size,
                     cycles=args.cycles,
                     drain_interval_s=args.drain_interval,
-                    business_run_before_drain_s=args.business_run_before_drain,
-                    preserve_timeout_s=args.preserve_timeout,
-                        warmcopy_only=args.warmcopy_only,
-                        preserve_parallel_preserve_threads=args.preserve_parallel_preserve_threads,
-                        preserve_startup_recovery_threads=args.preserve_startup_recovery_threads,
-                        preserve_lock_warmcopy_seal_threads=args.preserve_lock_warmcopy_seal_threads,
+                        business_run_before_drain_s=args.business_run_before_drain,
+                        preserve_timeout_s=args.preserve_timeout,
                 )
             )
         finally:

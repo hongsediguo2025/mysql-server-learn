@@ -8,7 +8,7 @@ CALL mtr.add_suppression("Preserved transaction '.*' recovery forced rollback: p
 DROP TABLE IF EXISTS t_startup_resurrection_index;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_startup_resurrection_index(
   id INT PRIMARY KEY,
   v INT
@@ -27,7 +27,7 @@ UPDATE t_startup_resurrection_index SET v=11 WHERE id=1;
 --source suite/preserve_trx/include/drain_transaction_from_control.inc
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 
---exec echo "restart: --preserve-trx-enable=ON --skip-log-bin --debug=d,preserve_trx_fail_xid_lookup_claim" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON --skip-log-bin --debug=d,preserve_trx_fail_xid_lookup_claim" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -65,7 +65,7 @@ UPDATE t_startup_resurrection_index SET v=21 WHERE id=2;
 --source suite/preserve_trx/include/drain_transaction_from_control.inc
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 
---exec echo "restart: --preserve-trx-enable=ON --skip-log-bin --debug=d,preserve_trx_startup_force_resurrection_anchor_mismatch" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON --skip-log-bin --debug=d,preserve_trx_startup_force_resurrection_anchor_mismatch" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect

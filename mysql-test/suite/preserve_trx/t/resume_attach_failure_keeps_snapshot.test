@@ -6,7 +6,7 @@
 DROP TABLE IF EXISTS t_resume_attach_failure;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_resume_attach_failure(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_resume_attach_failure VALUES(1,10);
@@ -19,7 +19,7 @@ UPDATE t_resume_attach_failure SET b=11 WHERE a=1;
 --let $preserve_trx_drain_clause=
 --source suite/preserve_trx/include/drain_transaction_from_control.inc
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
---exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -45,4 +45,4 @@ COMMIT;
 SELECT * FROM t_resume_attach_failure ORDER BY a;
 
 DROP TABLE t_resume_attach_failure;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

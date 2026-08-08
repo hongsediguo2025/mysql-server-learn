@@ -6,7 +6,7 @@
 DROP TABLE IF EXISTS t_preserve_token_redaction;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 --let $old_log_output= `SELECT @@global.log_output`
 --let $old_general_log= `SELECT @@global.general_log`
 --let $old_log_raw= `SELECT @@global.log_raw`
@@ -34,7 +34,7 @@ UPDATE t_preserve_token_redaction SET b=11 WHERE a=1;
 --let $preserve_trx_drain_clause=
 --source suite/preserve_trx/include/drain_transaction_from_control.inc
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
---exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -244,4 +244,4 @@ TRUNCATE TABLE mysql.slow_log;
 --eval SET GLOBAL long_query_time=$old_long_query_time
 --eval SET GLOBAL log_slow_admin_statements=$old_log_slow_admin_statements
 --eval SET GLOBAL log_output='$old_log_output'
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

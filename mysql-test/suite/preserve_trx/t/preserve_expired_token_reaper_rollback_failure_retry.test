@@ -11,7 +11,7 @@ CALL mtr.add_suppression("Preserved transaction '.*' recovery forced rollback: r
 DROP TABLE IF EXISTS t_expired_reaper_rollback_failure;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_expired_reaper_rollback_failure(a INT PRIMARY KEY, b INT)
   ENGINE=InnoDB;
@@ -28,10 +28,12 @@ UPDATE t_expired_reaper_rollback_failure SET b=11 WHERE a=1;
 
 --sleep 2
 
---exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-grace-seconds=30 --debug=d,preserve_trx_fail_expired_reaper_rollback" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON  --debug=d,preserve_trx_fail_expired_reaper_rollback" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
+
+--sleep 121
 
 --let $grep_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
 --let $grep_pattern= Preserved transaction .* expired-token reaper forced rollback: recovery timeout expired
@@ -44,11 +46,13 @@ SELECT STATE,
        LAST_ERROR_AT IS NOT NULL AS last_error_at_set
   FROM performance_schema.preserved_transactions;
 
---let $restart_parameters= restart: --preserve-trx-enable=ON --preserve-trx-recovery-grace-seconds=30
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON
 --let $do_not_echo_parameters= 1
 --source include/restart_mysqld.inc
 --let $do_not_echo_parameters=
 --let $restart_parameters=
+
+--sleep 121
 
 --let $grep_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
 --let $grep_pattern= Preserved transaction .* expired-token reaper forced rollback: recovery timeout expired
@@ -66,9 +70,9 @@ SELECT * FROM t_expired_reaper_rollback_failure ORDER BY a;
 --let $allow_preserved_rows=
 
 DROP TABLE t_expired_reaper_rollback_failure;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
---let $restart_parameters= restart: --preserve-trx-enable=ON --skip-log-bin
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --skip-log-bin
 --let $do_not_echo_parameters= 1
 --source include/restart_mysqld.inc
 --let $do_not_echo_parameters=

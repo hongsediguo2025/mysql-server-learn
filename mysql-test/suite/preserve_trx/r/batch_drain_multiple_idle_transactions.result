@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_batch_multiple;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_batch_multiple(
 a INT PRIMARY KEY,
 b INT,
@@ -33,4 +33,4 @@ FROM t_batch_multiple;
 row_count	distinct_keys	resumed_rows	bumped_rows
 2	2	2	2
 DROP TABLE t_batch_multiple;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

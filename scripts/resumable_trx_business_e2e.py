@@ -619,16 +619,6 @@ class HarnessConfig:
     max_sql_resume_ms: int = 0
     compact_expected_state_row_threshold: int = 1_000_000
     preserve_timeout_s: int = 3600
-    preserve_max_binlog_cache_bytes: int = 1_073_741_824
-    preserve_warmcopy_max_total_bytes: int = 0
-    preserve_max_lock_count: int = 1_000_000
-    preserve_max_modified_tables: int = 512
-    preserve_lock_warmcopy_max_journal_bytes: int = 1_073_741_824
-    preserve_lock_warmcopy_seal_threads: int = 0
-    preserve_parallel_preserve_threads: int = 0
-    preserve_startup_recovery_threads: int = 0
-    transfer_phase1_batch_bytes: Optional[int] = None
-    transfer_phase1_batch_linger_ms: Optional[int] = None
     inflight_drain_probe: bool = False
     inflight_probe_min_waits: int = 1
     inflight_probe_timeout_s: int = 5
@@ -644,7 +634,6 @@ class HarnessConfig:
     server_error_log: Optional[str] = None
     server_pid_file: Optional[str] = None
     warmcopy_required: bool = False
-    lock_warmcopy_mode: str = "default"
     two_phase: bool = False
     max_phase2_pause_ms: int = 5000
     max_phase2_total_ms: int = 0
@@ -1034,36 +1023,6 @@ class HarnessConfig:
             raise ValueError("shutdown_quiet_period_s must be non-negative")
         if self.preserve_timeout_s <= 0 or self.preserve_timeout_s > 3600:
             raise ValueError("preserve_timeout_s must be in [1, 3600]")
-        if self.preserve_max_binlog_cache_bytes <= 0:
-            raise ValueError("preserve_max_binlog_cache_bytes must be positive")
-        if self.preserve_warmcopy_max_total_bytes < 0:
-            raise ValueError(
-                "preserve_warmcopy_max_total_bytes must be non-negative"
-            )
-        if self.preserve_max_lock_count <= 0:
-            raise ValueError("preserve_max_lock_count must be positive")
-        if self.preserve_max_modified_tables <= 0:
-            raise ValueError("preserve_max_modified_tables must be positive")
-        if self.preserve_lock_warmcopy_max_journal_bytes <= 0:
-            raise ValueError(
-                "preserve_lock_warmcopy_max_journal_bytes must be positive"
-            )
-        if self.preserve_lock_warmcopy_seal_threads < 0:
-            raise ValueError("preserve_lock_warmcopy_seal_threads must be non-negative")
-        if self.preserve_parallel_preserve_threads < 0:
-            raise ValueError("preserve_parallel_preserve_threads must be non-negative")
-        if self.preserve_startup_recovery_threads < 0:
-            raise ValueError("preserve_startup_recovery_threads must be non-negative")
-        if (
-            self.transfer_phase1_batch_bytes is not None
-            and not 0 <= self.transfer_phase1_batch_bytes <= 67_108_864
-        ):
-            raise ValueError("transfer phase1 batch bytes must be in 0..67108864")
-        if (
-            self.transfer_phase1_batch_linger_ms is not None
-            and not 0 <= self.transfer_phase1_batch_linger_ms <= 1000
-        ):
-            raise ValueError("transfer phase1 batch linger ms must be in 0..1000")
         if self.inflight_drain_probe and self.sessions < 2:
             raise ValueError("inflight_drain_probe requires at least 2 sessions")
         if self.inflight_probe_min_waits <= 0:
@@ -1096,8 +1055,6 @@ class HarnessConfig:
                 "temp_table_target_mb and temp_table_fill_chunk_kb require more "
                 "than 10000 generated prefill rows"
             )
-        if self.lock_warmcopy_mode not in ("default", "on", "off"):
-            raise ValueError("lock_warmcopy_mode must be default, on, or off")
         if self.max_phase2_pause_ms <= 0:
             raise ValueError("max_phase2_pause_ms must be positive")
         if self.max_phase2_total_ms < 0:
@@ -5987,17 +5944,12 @@ class BusinessE2ERunner:
             self.runtime.execute(
                 conn,
                 "SET GLOBAL "
-                "preserve_trx_transfer_receiver_prewarm_timeout_ms=1000",
-            )
-            self.runtime.execute(
-                conn,
-                "SET GLOBAL "
-                "preserve_trx_token_retention_timeout_ms=1000",
+                "rds_preserve_trx_token_retention_timeout_ms=1000",
             )
             if self.reset_debug_sync_used:
                 self.runtime.execute(
                     conn,
-                    "SET GLOBAL preserve_trx_transfer_prewarm_paused=ON",
+                    "SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=ON",
                 )
                 self.reset_receiver_prewarm_paused = True
         finally:
@@ -6011,7 +5963,7 @@ class BusinessE2ERunner:
             conn = self._receiver_admin_connection()
             self.runtime.execute(
                 conn,
-                "SET GLOBAL preserve_trx_transfer_prewarm_paused=OFF",
+                "SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=OFF",
             )
             self.reset_receiver_prewarm_paused = False
         except BaseException:
@@ -6872,7 +6824,7 @@ class BusinessE2ERunner:
                             label: str) -> Optional[str]:
             if not command:
                 return command
-            if "--preserve-trx-transfer-credential-secret-file" in command:
+            if "--rds-preserve-trx-transfer-credential-secret-file" in command:
                 return command
             if not datadir:
                 raise AssertionError(
@@ -6889,7 +6841,7 @@ class BusinessE2ERunner:
             secret_file.chmod(0o600)
             return (
                 f"{command} "
-                "--preserve-trx-transfer-credential-secret-file="
+                "--rds-preserve-trx-transfer-credential-secret-file="
                 f"{shlex.quote(str(secret_file))}"
             )
 
@@ -7780,12 +7732,6 @@ class BusinessE2ERunner:
                 self.config.lockset_select_for_update
             ),
             "workload_lockset_minimal_table": self.config.lockset_minimal_table,
-            "source_phase1_transfer_batch_bytes_config": (
-                self.config.transfer_phase1_batch_bytes
-            ),
-            "source_phase1_transfer_batch_linger_ms_config": (
-                self.config.transfer_phase1_batch_linger_ms
-            ),
             "completed_stmt_total": completed_stmt_total,
             "phase2_pause_samples_ms": [
                 metric.phase2_pause_ms for metric in metrics
@@ -8667,9 +8613,8 @@ class BusinessE2ERunner:
             self._setup_temp_retryable_schema()
             conn = self.runtime.connect(database=True, autocommit=False)
             try:
-                self.runtime.execute(conn, "SET GLOBAL preserve_trx_warmcopy_enable=OFF")
-                self.runtime.execute(conn, "SET GLOBAL preserve_trx_enable=ON")
-                self.runtime.execute(conn, "SET GLOBAL preserve_trx_temp_table_enable=ON")
+                self.runtime.execute(conn, "SET GLOBAL rds_preserve_trx_enable=ON")
+                self.runtime.execute(conn, "SET GLOBAL rds_preserve_trx_temp_table_enable=ON")
                 self.runtime.execute(
                     conn,
                     "CREATE TEMPORARY TABLE tmp_retryable_resume("
@@ -8713,9 +8658,9 @@ class BusinessE2ERunner:
             disabled_conn = self.runtime.connect(database=True, autocommit=True)
             token = ""
             try:
-                self.runtime.execute(disabled_conn, "SET GLOBAL preserve_trx_enable=ON")
+                self.runtime.execute(disabled_conn, "SET GLOBAL rds_preserve_trx_enable=ON")
                 self.runtime.execute(
-                    disabled_conn, "SET GLOBAL preserve_trx_temp_table_enable=OFF"
+                    disabled_conn, "SET GLOBAL rds_preserve_trx_temp_table_enable=OFF"
                 )
                 tokens = self.read_preserved_tokens()
                 if len(tokens) != 1:
@@ -8744,7 +8689,7 @@ class BusinessE2ERunner:
                         f"disabled RESUME mutated base table unexpectedly: {rows!r}"
                     )
                 self.runtime.execute(
-                    disabled_conn, "SET GLOBAL preserve_trx_temp_table_enable=ON"
+                    disabled_conn, "SET GLOBAL rds_preserve_trx_temp_table_enable=ON"
                 )
             finally:
                 disabled_conn.close()
@@ -8795,8 +8740,7 @@ class BusinessE2ERunner:
             self._setup_purge_readview_schema()
             rr_conn = self.runtime.connect(database=True, autocommit=False)
             try:
-                self.runtime.execute(rr_conn, "SET GLOBAL preserve_trx_warmcopy_enable=OFF")
-                self.runtime.execute(rr_conn, "SET GLOBAL preserve_trx_enable=ON")
+                self.runtime.execute(rr_conn, "SET GLOBAL rds_preserve_trx_enable=ON")
                 self.runtime.execute(
                     rr_conn,
                     "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ",
@@ -9157,102 +9101,34 @@ END
                 plan.drain_phase2_timeout_ms() if plan is not None else 120_000
             )
             token_retention_timeout_ms = self.config.preserve_timeout_s * 1000
-            batch_capacity = max(256, self.config.sessions * 2)
             commands = [
-                "SET GLOBAL preserve_trx_enable=ON",
-                f"SET GLOBAL preserve_trx_recovery_max_count={max(200, self.config.sessions * 2)}",
-                "SET GLOBAL preserve_trx_drain_phase1_timeout_ms=600000",
-                "SET GLOBAL preserve_trx_drain_phase2_timeout_ms="
+                "SET GLOBAL rds_preserve_trx_enable=ON",
+                "SET GLOBAL rds_preserve_trx_drain_phase1_timeout_ms=600000",
+                "SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms="
                 f"{drain_phase2_timeout_ms}",
-                "SET GLOBAL preserve_trx_token_retention_timeout_ms="
+                "SET GLOBAL rds_preserve_trx_token_retention_timeout_ms="
                 f"{token_retention_timeout_ms}",
-                f"SET GLOBAL preserve_trx_max_total={batch_capacity}",
-                f"SET GLOBAL preserve_trx_max_pending_per_user={batch_capacity}",
-                f"SET GLOBAL preserve_trx_batch_max_transactions={batch_capacity}",
-                f"SET GLOBAL preserve_trx_max_binlog_cache_bytes={self.config.preserve_max_binlog_cache_bytes}",
-                f"SET GLOBAL preserve_trx_max_modified_tables={self.config.preserve_max_modified_tables}",
-                f"SET GLOBAL preserve_trx_max_lock_count={self.config.preserve_max_lock_count}",
             ]
             mixed_global_budget = 0
             if self.config.mixed_pressure_workload:
-                mixed_global_budget = max(
-                    2 * 1024**3,
-                    self.config.preserve_max_binlog_cache_bytes * 2,
-                )
+                mixed_global_budget = 2 * 1024**3
                 commands.extend(
                     [
-                        "SET GLOBAL preserve_trx_memory_budget_bytes="
+                        "SET GLOBAL rds_preserve_trx_memory_budget_bytes="
                         f"{mixed_global_budget}",
-                        "SET GLOBAL preserve_trx_memory_per_token_bytes="
-                        f"{self.config.preserve_max_binlog_cache_bytes}",
                     ]
                 )
-            if self.config.preserve_parallel_preserve_threads > 0:
-                commands.append(
-                    "SET GLOBAL preserve_trx_parallel_preserve_threads="
-                    f"{self.config.preserve_parallel_preserve_threads}"
-                )
-            if self.config.preserve_lock_warmcopy_seal_threads > 0:
-                commands.append(
-                    "SET GLOBAL preserve_trx_lock_warmcopy_seal_threads="
-                    f"{self.config.preserve_lock_warmcopy_seal_threads}"
-                )
-            if self.config.transfer_phase1_batch_bytes is not None:
-                commands.append(
-                    "SET GLOBAL preserve_trx_transfer_phase1_batch_bytes="
-                    f"{self.config.transfer_phase1_batch_bytes}"
-                )
-            if self.config.transfer_phase1_batch_linger_ms is not None:
-                commands.append(
-                    "SET GLOBAL preserve_trx_transfer_phase1_batch_linger_ms="
-                    f"{self.config.transfer_phase1_batch_linger_ms}"
-                )
             if self.config.temp_table_workload:
-                commands.append("SET GLOBAL preserve_trx_temp_table_enable=ON")
-                temp_sidecar_budget = plan.temp_table_sidecar_budget_bytes()
-                if temp_sidecar_budget > 0:
-                    commands.append(
-                        "SET GLOBAL preserve_trx_max_temp_sidecar_bytes="
-                        f"{temp_sidecar_budget}"
-                    )
-            if self.config.lock_warmcopy_mode == "on":
-                commands.append("SET GLOBAL preserve_trx_lock_warmcopy_enable=ON")
-                commands.append(
-                    "SET GLOBAL preserve_trx_lock_warmcopy_max_journal_bytes="
-                    f"{self.config.preserve_lock_warmcopy_max_journal_bytes}"
-                )
-            elif self.config.lock_warmcopy_mode == "off":
-                commands.append("SET GLOBAL preserve_trx_lock_warmcopy_enable=OFF")
+                commands.append("SET GLOBAL rds_preserve_trx_temp_table_enable=ON")
             if self.config.scenario == "binlog_equivalence":
                 commands.append("SET GLOBAL binlog_format=ROW")
             if self.config.warmcopy_required:
-                assert plan is not None
-                effective_buckets = plan.effective_large_binlog_cache_buckets_mb()
-                max_bucket_mb = max(effective_buckets) if effective_buckets else 1
-                tail_budget_bytes = plan.warmcopy_tail_budget_bytes(max_bucket_mb)
-                normal_cache_headroom_bytes = self.config.sessions * 1024 * 1024
-                warmcopy_total_bytes = max(
-                    plan.warmcopy_reservation_bytes_for_bucket(
-                        max_bucket_mb, tail_budget_bytes
-                    ) +
-                    normal_cache_headroom_bytes,
-                    plan.max_large_payload_bytes_per_statement(),
-                    mixed_global_budget,
-                    self.config.preserve_warmcopy_max_total_bytes,
-                )
                 commands.extend(
                     [
                         "SET GLOBAL log_error_verbosity=3",
                         "SET GLOBAL binlog_format=ROW",
-                        "SET GLOBAL preserve_trx_warmcopy_enable=ON",
-                        "SET GLOBAL preserve_trx_warmcopy_min_open_ms=1",
-                        "SET GLOBAL preserve_trx_warmcopy_chunk_bytes=16777216",
-                        f"SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes={tail_budget_bytes}",
-                        f"SET GLOBAL preserve_trx_warmcopy_max_total_bytes={warmcopy_total_bytes}",
                     ]
                 )
-            else:
-                commands.append("SET GLOBAL preserve_trx_warmcopy_enable=OFF")
             if (
                 self.config.scenario
                 in {
@@ -9465,17 +9341,16 @@ END
         try:
             source_rows = self.runtime.execute(
                 source_conn,
-                "SELECT @@global.preserve_trx_transfer_artifact_mode, "
-                "@@global.preserve_trx_transfer_target_host, "
-                "@@global.preserve_trx_transfer_target_port, "
-                "@@global.preserve_trx_transfer_target_socket, "
-                "@@global.preserve_trx_transfer_target_user, "
-                "@@global.preserve_trx_transfer_credential_name",
+                "SELECT @@global.rds_preserve_trx_transfer_artifact_mode, "
+                "@@global.rds_preserve_trx_transfer_target_host, "
+                "@@global.rds_preserve_trx_transfer_target_port, "
+                "@@global.rds_preserve_trx_transfer_target_user, "
+                "@@global.rds_preserve_trx_transfer_credential_name",
                 fetch=True,
             )
             receiver_rows = self.runtime.execute(
                 receiver_conn,
-                "SELECT @@global.preserve_trx_dir",
+                "SELECT @@global.datadir",
                 fetch=True,
             )
             if not source_rows or not receiver_rows:
@@ -9485,30 +9360,20 @@ END
             source_artifact_mode = str(source_rows[0][0] or "")
             source_target_host = str(source_rows[0][1] or "")
             source_target_port = int(source_rows[0][2] or 0)
-            source_target_socket = str(source_rows[0][3] or "")
-            source_target_user = str(source_rows[0][4] or "")
-            source_credential_name = str(source_rows[0][5] or "")
-            receiver_preserve_dir = str(receiver_rows[0][0] or "")
+            source_target_user = str(source_rows[0][3] or "")
+            source_credential_name = str(source_rows[0][4] or "")
+            receiver_preserve_dir = str(
+                Path(str(receiver_rows[0][0] or "")) / "preserve"
+            )
             mismatches = []
             if source_artifact_mode != "STANDBY_TRANSFER_SAVE":
                 mismatches.append(
                     f"source artifact mode {source_artifact_mode!r} != "
                     "'STANDBY_TRANSFER_SAVE'"
                 )
-            if self.config.receiver_unix_socket:
-                if (
-                    source_target_socket != self.config.receiver_unix_socket
-                    or source_target_host
-                    or source_target_port
-                ):
-                    mismatches.append(
-                        "source target endpoint does not match receiver unix "
-                        f"socket {self.config.receiver_unix_socket!r}"
-                    )
-            elif (
+            if (
                 source_target_host != self.config.receiver_host
                 or source_target_port != self.config.receiver_port
-                or source_target_socket
             ):
                 mismatches.append(
                     "source target endpoint does not match receiver TCP "
@@ -9537,7 +9402,7 @@ END
                 mismatches.append(
                     "receiver preserve dir mismatch: configured "
                     f"{configured_receiver_preserve_dir!r} != server "
-                    f"@@preserve_trx_dir {actual_receiver_preserve_dir!r}"
+                    f"<datadir>/preserve {actual_receiver_preserve_dir!r}"
                 )
             if mismatches:
                 raise AssertionError(
@@ -9556,12 +9421,12 @@ END
             if self.config.scenario in BINLOG_SCENARIOS:
                 self.runtime.execute(conn, "SET GLOBAL binlog_format=ROW")
             rows = self.runtime.execute(
-                conn, "SELECT @@global.preserve_trx_enable", fetch=True
+                conn, "SELECT @@global.rds_preserve_trx_enable", fetch=True
             )
             if not rows or str(rows[0][0]).upper() not in {"0", "OFF"}:
                 raise AssertionError(
                     "no-preserve baseline requires mysqld to be started with "
-                    f"preserve_trx_enable=OFF; observed {rows!r}"
+                    f"rds_preserve_trx_enable=OFF; observed {rows!r}"
                 )
         finally:
             conn.close()
@@ -9902,7 +9767,7 @@ END
             )
             if (
                 not observed_large_buckets
-                and self.config.lock_warmcopy_mode in ("on", "off")
+                and self.config.lockset_batch_size > 0
             ):
                 self.phase2_pause_samples.append(
                     Phase2PauseSample(bucket_mb=0, phase2_pause_ms=phase2_pause_ms)
@@ -13403,7 +13268,8 @@ Example:
     --host 127.0.0.1 --port 3307 --user root \\
     --cycles 5 --drain-interval 20 \\
     --restart-command '/path/to/mysqld --defaults-file=/tmp/my.cnf \\
-      --preserve-trx-enable=ON --preserve-trx-recovery-max-count=300'
+      --rds-preserve-trx-enable=ON \
+      --rds-preserve-trx-transfer-artifact-mode=LOCAL_CARRIER'
 
 The server should already be running before the harness starts. The restart
 command is used after each DRAIN command shuts that server down.
@@ -13441,17 +13307,7 @@ command is used after each DRAIN command shuts that server down.
     parser.add_argument("--mixed-min-started-sessions", type=int, default=0, help="minimum mixed-pressure connections that must execute SQL before DRAIN")
     parser.add_argument("--mixed-min-completed-statements", type=int, default=0, help="minimum aggregate business SQL count required after warmup before DRAIN")
     parser.add_argument("--max-sql-resume-ms", type=int, default=0, help="maximum individual SQL RESUME latency for local startup evidence; 0 disables the gate")
-    parser.add_argument("--preserve-timeout", dest="preserve_timeout_s", type=int, default=3600, help="READY/FAILED token retention in seconds; configures preserve_trx_token_retention_timeout_ms")
-    parser.add_argument("--preserve-max-binlog-cache-bytes", dest="preserve_max_binlog_cache_bytes", type=int, default=1_073_741_824, help="preserve_trx_max_binlog_cache_bytes for high-cardinality preserve artifacts")
-    parser.add_argument("--preserve-warmcopy-max-total-bytes", dest="preserve_warmcopy_max_total_bytes", type=int, default=0, help="explicit source warm external-artifact byte budget; 0 keeps workload-derived sizing")
-    parser.add_argument("--preserve-max-lock-count", dest="preserve_max_lock_count", type=int, default=1_000_000, help="preserve_trx_max_lock_count for this high-cardinality E2E")
-    parser.add_argument("--preserve-max-modified-tables", dest="preserve_max_modified_tables", type=int, default=512, help="preserve_trx_max_modified_tables for this high-cardinality E2E")
-    parser.add_argument("--preserve-lock-warmcopy-max-journal-bytes", dest="preserve_lock_warmcopy_max_journal_bytes", type=int, default=1_073_741_824, help="preserve_trx_lock_warmcopy_max_journal_bytes for high-cardinality lock warmcopy gates")
-    parser.add_argument("--preserve-lock-warmcopy-seal-threads", dest="preserve_lock_warmcopy_seal_threads", type=int, default=0, help="preserve_trx_lock_warmcopy_seal_threads for lock warmcopy seal tuning; 0 keeps server auto")
-    parser.add_argument("--preserve-parallel-preserve-threads", dest="preserve_parallel_preserve_threads", type=int, default=0, help="preserve_trx_parallel_preserve_threads for lock warmcopy target-preserve tuning; 0 keeps server auto")
-    parser.add_argument("--preserve-startup-recovery-threads", dest="preserve_startup_recovery_threads", type=int, default=0, help="preserve_trx_startup_recovery_threads configured at mysqld startup; 0 keeps server auto")
-    parser.add_argument("--transfer-phase1-batch-bytes", type=int, help="source preserve_trx_transfer_phase1_batch_bytes for the next transfer epoch")
-    parser.add_argument("--transfer-phase1-batch-linger-ms", type=int, help="source preserve_trx_transfer_phase1_batch_linger_ms for the next transfer epoch")
+    parser.add_argument("--preserve-timeout", dest="preserve_timeout_s", type=int, default=3600, help="READY/FAILED token retention in seconds; configures rds_preserve_trx_token_retention_timeout_ms")
     parser.add_argument("--inflight-drain-probe", action="store_true", help="allow even-numbered workers to enter real UPDATE lock waits before each DRAIN")
     parser.add_argument("--inflight-probe-min-waits", dest="inflight_probe_min_waits", type=int, default=1, help="minimum simultaneous harness data_lock_waits required before issuing DRAIN in in-flight probe mode")
     parser.add_argument("--inflight-probe-timeout", dest="inflight_probe_timeout_s", type=int, default=5, help="innodb_lock_wait_timeout used by in-flight probe statements")
@@ -13476,13 +13332,12 @@ command is used after each DRAIN command shuts that server down.
     parser.add_argument("--server-error-log", help="mysqld error log used for server-side warm-copy binlog-cache phase2 timing; defaults to mysqld.err next to the Unix socket")
     parser.add_argument("--warmcopy-required", action="store_true", help="enable warm-copy globals and enforce warm-copy phase2 pause gate")
     parser.add_argument("--warmcopy-mode", choices=("required", "optional", "off"), help="compatibility alias for warm-copy E2E mode; 'required' is equivalent to --warmcopy-required")
-    parser.add_argument("--lock-warmcopy-mode", choices=("default", "on", "off"), default="default", help="explicitly set preserve_trx_lock_warmcopy_enable for this run")
     parser.add_argument("--two-phase", action="store_true", help="compatibility flag documenting that the warmcopy_two_phase_large_cache_equivalence scenario must use the two-phase warm-copy path")
     parser.add_argument("--max-phase2-pause-ms", type=int, default=5000, help="maximum allowed median warm-copy binlog-cache phase2 pause per large-cache bucket")
     parser.add_argument("--max-phase2-total-ms", type=int, default=0, help="optional maximum server-side phase2_total_ms per drain cycle; 0 disables this gate")
     parser.add_argument("--max-receiver-ready-after-phase2-ms", type=int, default=None, help="optional maximum standby receiver ready lag after source phase2 end; 0 disables this gate; standby-transfer receiver evidence defaults to 100ms")
     parser.add_argument("--warmcopy-disabled-baseline-slope-ms-per-mb", type=float, help="optional warmcopy-disabled pause slope baseline; warm-copy slope may be at most 25%% of it")
-    parser.add_argument("--temp-table-workload", action="store_true", help="mix InnoDB user temporary-table operations into each 100-statement transaction; restart command must keep preserve_trx_temp_table_enable available")
+    parser.add_argument("--temp-table-workload", action="store_true", help="mix InnoDB user temporary-table operations into each 100-statement transaction; restart command must keep rds_preserve_trx_temp_table_enable available")
     parser.add_argument("--temp-table-target-mb", type=int, default=0, help="pre-fill each user temporary table to this many MiB before the drainable transaction starts")
     parser.add_argument("--temp-table-fill-chunk-kb", type=int, default=64, help="payload bytes per generated temporary-table prefill row, in KiB")
     parser.add_argument("--temp-table-resume-action", choices=("commit", "rollback", "continue"), default="commit", help="action for a temp-table worker after RESUME returns inside a transaction; continue keeps the resumed transaction open for more temporary-table DML before the worker commits")
@@ -13616,16 +13471,6 @@ command is used after each DRAIN command shuts that server down.
         mixed_min_completed_statements=args.mixed_min_completed_statements,
         max_sql_resume_ms=args.max_sql_resume_ms,
         preserve_timeout_s=args.preserve_timeout_s,
-        preserve_max_binlog_cache_bytes=args.preserve_max_binlog_cache_bytes,
-        preserve_warmcopy_max_total_bytes=args.preserve_warmcopy_max_total_bytes,
-        preserve_max_lock_count=args.preserve_max_lock_count,
-        preserve_max_modified_tables=args.preserve_max_modified_tables,
-        preserve_lock_warmcopy_max_journal_bytes=args.preserve_lock_warmcopy_max_journal_bytes,
-        preserve_lock_warmcopy_seal_threads=args.preserve_lock_warmcopy_seal_threads,
-        preserve_parallel_preserve_threads=args.preserve_parallel_preserve_threads,
-        preserve_startup_recovery_threads=args.preserve_startup_recovery_threads,
-        transfer_phase1_batch_bytes=args.transfer_phase1_batch_bytes,
-        transfer_phase1_batch_linger_ms=args.transfer_phase1_batch_linger_ms,
         inflight_drain_probe=args.inflight_drain_probe,
         inflight_probe_min_waits=args.inflight_probe_min_waits,
         inflight_probe_timeout_s=args.inflight_probe_timeout_s,
@@ -13641,7 +13486,6 @@ command is used after each DRAIN command shuts that server down.
         server_error_log=args.server_error_log,
         server_pid_file=args.server_pid_file,
         warmcopy_required=warmcopy_required,
-        lock_warmcopy_mode=args.lock_warmcopy_mode,
         two_phase=args.two_phase,
         max_phase2_pause_ms=args.max_phase2_pause_ms,
         max_phase2_total_ms=args.max_phase2_total_ms,

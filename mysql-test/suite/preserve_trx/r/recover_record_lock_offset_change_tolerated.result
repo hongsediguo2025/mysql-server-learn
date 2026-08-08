@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_recover_record_lock_offset_change;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_recover_record_lock_offset_change(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_recover_record_lock_offset_change VALUES(1,10),(2,20);
 SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
@@ -9,7 +9,7 @@ SELECT * FROM t_recover_record_lock_offset_change WHERE a=1 FOR SHARE;
 a	b
 1	10
 DRAIN TRANSACTIONS PRESERVE;
-# restart: --preserve-trx-enable=ON --debug=d,preserve_trx_corrupt_import_record_lock_offsets
+# restart: --rds-preserve-trx-enable=ON --debug=d,preserve_trx_corrupt_import_record_lock_offsets
 SELECT COUNT(*) AS preserved_count_after_offset_change
 FROM performance_schema.preserved_transactions;
 preserved_count_after_offset_change
@@ -26,4 +26,4 @@ FROM performance_schema.preserved_transactions;
 remaining_preserved
 0
 DROP TABLE t_recover_record_lock_offset_change;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

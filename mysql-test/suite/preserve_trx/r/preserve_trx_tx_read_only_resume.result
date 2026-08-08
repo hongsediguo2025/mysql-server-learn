@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_preserve_tx_read_only;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_preserve_tx_read_only(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_preserve_tx_read_only VALUES(1,10);
 SET SESSION transaction_read_only=ON;
@@ -28,4 +28,4 @@ SELECT * FROM t_preserve_tx_read_only ORDER BY a;
 a	b
 1	12
 DROP TABLE t_preserve_tx_read_only;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

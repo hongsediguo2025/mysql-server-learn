@@ -10,7 +10,7 @@ DROP TABLE IF EXISTS t_binlog_cache_sidecar_digest;
 CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: corrupt durable transaction snapshot");
 --enable_query_log
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_binlog_cache_sidecar_digest(
   id INT PRIMARY KEY,
@@ -32,7 +32,7 @@ UPDATE t_binlog_cache_sidecar_digest
 --source suite/preserve_trx/include/drain_transaction_from_control.inc
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 
---exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -64,7 +64,7 @@ close($fh) or die "cannot close binlog-cache sidecar: $!";
 print "corrupted_same_size_binlog_cache_sidecar\n1\n";
 EOF
 
---let $restart_parameters= restart: --preserve-trx-enable=ON
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON
 --let $do_not_echo_parameters= 1
 --source include/restart_mysqld.inc
 --let $do_not_echo_parameters=
@@ -78,4 +78,4 @@ SELECT id, payload
 --source suite/preserve_trx/include/assert_no_preserve_residue.inc
 
 DROP TABLE t_binlog_cache_sidecar_digest;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

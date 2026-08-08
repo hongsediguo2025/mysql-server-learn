@@ -1,5 +1,5 @@
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 CREATE TABLE t_temp_no_redo_drop_anchor(
 id INT PRIMARY KEY,
 v INT
@@ -24,5 +24,5 @@ SELECT * FROM t_temp_no_redo_drop_anchor ORDER BY id;
 id	v
 1	12
 DROP TABLE t_temp_no_redo_drop_anchor;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

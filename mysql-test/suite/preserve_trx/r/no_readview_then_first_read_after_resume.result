@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_no_readview_then_first_read;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_no_readview_then_first_read(
 id INT PRIMARY KEY,
 v INT
@@ -37,4 +37,4 @@ id	v
 1	12
 2	20
 DROP TABLE t_no_readview_then_first_read;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

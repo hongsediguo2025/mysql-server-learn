@@ -6,7 +6,7 @@
 DROP TABLE IF EXISTS t_batch_current_durable_log_bin;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_batch_current_durable_log_bin(
   id INT PRIMARY KEY,
@@ -53,4 +53,4 @@ SELECT * FROM t_batch_current_durable_log_bin ORDER BY id;
 --remove_file $MYSQLTEST_VARDIR/tmp/batch_current_durable_log_bin.mysqlbinlog
 
 DROP TABLE t_batch_current_durable_log_bin;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

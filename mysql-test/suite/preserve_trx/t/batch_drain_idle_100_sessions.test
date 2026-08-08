@@ -62,9 +62,7 @@ EOF
 --enable_result_log
 --enable_query_log
 
-SET GLOBAL preserve_trx_enable=ON;
---let $old_preserve_trx_recovery_max_count= `SELECT @@GLOBAL.preserve_trx_recovery_max_count`
-SET GLOBAL preserve_trx_recovery_max_count=200;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 --disable_query_log
 --disable_result_log
@@ -76,7 +74,7 @@ SET GLOBAL preserve_trx_recovery_max_count=200;
 DRAIN TRANSACTIONS PRESERVE;
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 
---exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=200" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -194,9 +192,8 @@ EOF
 --remove_file $MYSQLTEST_VARDIR/tmp/preserve_trx_batch_100_setup.inc
 --remove_file $MYSQLTEST_VARDIR/tmp/preserve_trx_batch_100_cleanup.inc
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 --disable_query_log
 --disable_result_log
---eval SET GLOBAL preserve_trx_recovery_max_count=$old_preserve_trx_recovery_max_count
 --enable_result_log
 --enable_query_log

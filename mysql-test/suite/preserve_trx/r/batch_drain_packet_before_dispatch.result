@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_batch_packet_before_dispatch;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_batch_packet_before_dispatch(
 id INT PRIMARY KEY,
 v INT
@@ -21,4 +21,4 @@ SELECT * FROM t_batch_packet_before_dispatch;
 id	v
 1	11
 DROP TABLE t_batch_packet_before_dispatch;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

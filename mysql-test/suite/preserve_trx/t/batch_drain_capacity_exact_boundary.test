@@ -5,7 +5,7 @@
 DROP TABLE IF EXISTS t_batch_capacity_exact;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_batch_capacity_exact(
   id INT PRIMARY KEY,
@@ -23,15 +23,12 @@ START TRANSACTION;
 INSERT INTO t_batch_capacity_exact VALUES(2,20);
 
 --connection default
-SET GLOBAL preserve_trx_batch_max_transactions=2;
-SET GLOBAL preserve_trx_max_total=2;
-SET GLOBAL preserve_trx_max_pending_per_user=2;
 
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 DRAIN TRANSACTIONS PRESERVE;
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 
---exec echo "restart: --preserve-trx-enable=ON --skip-log-bin --preserve-trx-recovery-max-count=10" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -68,4 +65,4 @@ SELECT COUNT(*) AS committed_rows
 --source suite/preserve_trx/include/assert_no_preserve_residue.inc
 
 DROP TABLE t_batch_capacity_exact;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

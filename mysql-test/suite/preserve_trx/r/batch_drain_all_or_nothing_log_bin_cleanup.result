@@ -3,7 +3,7 @@ CALL mtr.add_suppression("Preserved transaction .* recovery cleanup failed: fail
 CALL mtr.add_suppression("Preserved transaction .* recovery cleanup failed: failed to delete snapshot files");
 CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: preserved transaction snapshot tainted");
 CALL mtr.add_suppression("Preserved transaction batch cleanup failed after target preserve error");
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_batch_log_bin_cleanup(
 id INT PRIMARY KEY,
 v INT
@@ -65,4 +65,4 @@ id	v
 1	12
 include/assert_grep.inc [Reattached delete-before cleanup transaction remains in binlog]
 DROP TABLE t_batch_log_bin_cleanup;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

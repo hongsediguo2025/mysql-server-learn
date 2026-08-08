@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_recover_record_lock_page_reorg;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_recover_record_lock_page_reorg(
 id INT PRIMARY KEY,
 v INT,
@@ -16,7 +16,7 @@ DRAIN TRANSACTIONS PRESERVE;
 SET SESSION debug='+d,do_page_reorganize';
 INSERT INTO t_recover_record_lock_page_reorg VALUES(1000,1000,'trigger');
 SET SESSION debug='-d,do_page_reorganize';
-# restart: --preserve-trx-enable=ON
+# restart: --rds-preserve-trx-enable=ON
 SELECT COUNT(*) AS preserved_count_after_page_reorganize
 FROM performance_schema.preserved_transactions;
 preserved_count_after_page_reorganize
@@ -37,4 +37,4 @@ FROM performance_schema.preserved_transactions;
 remaining_preserved
 0
 DROP TABLE t_recover_record_lock_page_reorg;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

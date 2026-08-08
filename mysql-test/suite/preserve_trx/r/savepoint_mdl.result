@@ -1,6 +1,6 @@
 DROP TABLE IF EXISTS t_savepoint_mdl_anchor;
 DROP TABLE IF EXISTS t_savepoint_mdl_after;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_savepoint_mdl_anchor(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
 CREATE TABLE t_savepoint_mdl_after(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
 INSERT INTO t_savepoint_mdl_anchor VALUES(1,10);
@@ -29,4 +29,4 @@ id	v	ddl_marker
 1	20	NULL
 DROP TABLE t_savepoint_mdl_after;
 DROP TABLE t_savepoint_mdl_anchor;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

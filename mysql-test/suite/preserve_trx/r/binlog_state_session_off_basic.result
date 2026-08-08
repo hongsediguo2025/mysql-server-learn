@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_session_off;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 SET SESSION binlog_format=ROW;
 SET SESSION sql_log_bin=0;
 CREATE TABLE t_session_off(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
@@ -33,4 +33,4 @@ a	b
 1	12
 include/assert_grep.inc [DML stays out of the binlog after SESSION_OFF_NO_CACHE resume]
 DROP TABLE t_session_off;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

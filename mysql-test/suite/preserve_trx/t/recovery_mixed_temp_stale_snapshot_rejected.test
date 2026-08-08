@@ -6,8 +6,8 @@
 DROP TABLE IF EXISTS t_mixed_stale_snapshot;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 --let MYSQLD_DATADIR= `SELECT @@datadir`
 
 --disable_query_log
@@ -78,7 +78,7 @@ SELECT v AS second_target_value_before_disconnect
 --disconnect mixed_stale_second_target
 
 --connection default
---let $restart_parameters= restart: --preserve-trx-enable=ON --preserve-trx-temp-table-enable=ON
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-temp-table-enable=ON
 --let $do_not_echo_parameters= 1
 --source include/restart_mysqld.inc
 --let $do_not_echo_parameters=
@@ -90,5 +90,5 @@ SELECT COUNT(*) AS preserved_count_after_restart
 SELECT * FROM t_mixed_stale_snapshot ORDER BY id;
 
 DROP TABLE t_mixed_stale_snapshot;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;

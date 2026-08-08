@@ -1,4 +1,4 @@
---let $old_preserve_trx_enable= `SELECT @@global.preserve_trx_enable`
+--let $old_rds_preserve_trx_enable= `SELECT @@global.rds_preserve_trx_enable`
 --let $old_log_output= `SELECT @@global.log_output`
 --let $old_general_log= `SELECT @@global.general_log`
 --let $old_log_raw= `SELECT @@global.log_raw`
@@ -6,7 +6,7 @@
 --let $old_long_query_time= `SELECT @@global.long_query_time`
 --let $old_log_slow_admin_statements= `SELECT @@global.log_slow_admin_statements`
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 SET GLOBAL log_output='TABLE';
 SET GLOBAL general_log=ON;
 SET GLOBAL log_raw=ON;
@@ -140,4 +140,4 @@ TRUNCATE TABLE mysql.slow_log;
 --eval SET GLOBAL log_output='$old_log_output'
 --eval SET GLOBAL general_log=$old_general_log
 --eval SET GLOBAL slow_query_log=$old_slow_query_log
---eval SET GLOBAL preserve_trx_enable=$old_preserve_trx_enable
+--eval SET GLOBAL rds_preserve_trx_enable=$old_rds_preserve_trx_enable

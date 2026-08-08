@@ -9,7 +9,7 @@ CALL mtr.add_suppression("Preserved transaction '.*' expired-token reaper forced
 DROP TABLE IF EXISTS t_timeout_live_resume_expiry;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_timeout_live_resume_expiry(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_timeout_live_resume_expiry VALUES(1,10);
@@ -25,7 +25,7 @@ UPDATE t_timeout_live_resume_expiry SET b=11 WHERE a=1;
 
 --sleep 2
 
---exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-grace-seconds=30" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -33,7 +33,7 @@ UPDATE t_timeout_live_resume_expiry SET b=11 WHERE a=1;
 SELECT COUNT(*) AS preserved_count_during_grace
   FROM performance_schema.preserved_transactions;
 
---sleep 31
+--sleep 121
 
 --let $grep_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
 --let $grep_pattern= Preserved transaction .* expired-token reaper forced rollback: recovery timeout expired
@@ -46,4 +46,4 @@ SELECT COUNT(*) AS preserved_count_after_live_timeout
 SELECT * FROM t_timeout_live_resume_expiry ORDER BY a;
 
 DROP TABLE t_timeout_live_resume_expiry;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

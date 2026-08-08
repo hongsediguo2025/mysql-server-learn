@@ -23,7 +23,6 @@ from scripts.resumable_trx_longrun_e2e import (
     KillScenario,
     LIVE_SMOKE_COMMAND_ENV,
     LIVE_SMOKE_OUTPUT_TAIL_BYTES,
-    LONGRUN_NATIVE_WARMCOPY_TAIL_BUDGET_BYTES,
     LongRunConfig,
     LongRunController,
     MysqlConnectionOptions,
@@ -44,7 +43,6 @@ from scripts.resumable_trx_longrun_e2e import (
     build_random_manifest_kill_schedule_specs,
     longrun_native_preserve_runtime_settings,
     longrun_native_preserve_runtime_sql,
-    longrun_native_warmcopy_required_total_bytes,
     build_business_live_command,
     build_business_live_plan,
     main as longrun_main,
@@ -85,27 +83,13 @@ class ResumableTrxLongRunE2ETest(unittest.TestCase):
 
             settings = longrun_native_preserve_runtime_settings(config)
 
-            self.assertEqual("ON", settings["preserve_trx_enable"])
-            self.assertEqual("ON", settings["preserve_trx_temp_table_enable"])
-            self.assertEqual("ON", settings["preserve_trx_warmcopy_enable"])
-            self.assertEqual(
-                LONGRUN_NATIVE_WARMCOPY_TAIL_BUDGET_BYTES,
-                settings["preserve_trx_warmcopy_tail_budget_bytes"],
-            )
-            self.assertGreaterEqual(
-                settings["preserve_trx_batch_max_transactions"],
-                config.sessions,
-            )
-            self.assertGreaterEqual(
-                settings["preserve_trx_max_pending_per_user"],
-                config.sessions,
-            )
-            self.assertGreaterEqual(
-                settings["preserve_trx_warmcopy_max_total_bytes"],
-                longrun_native_warmcopy_required_total_bytes(config),
-            )
+            self.assertEqual("ON", settings["rds_preserve_trx_enable"])
+            self.assertEqual("ON", settings["rds_preserve_trx_temp_table_enable"])
+            self.assertEqual(300000, settings["rds_preserve_trx_drain_phase2_timeout_ms"])
+            self.assertEqual(300000, settings["rds_preserve_trx_token_retention_timeout_ms"])
+            self.assertTrue(all(name.startswith("rds_preserve_trx_") for name in settings))
 
-    def test_native_runtime_sql_resets_oversized_warmcopy_tail_budget(self):
+    def test_native_runtime_sql_uses_only_public_rds_parameters(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             config = LongRunConfig.for_profile(
                 "preserve-resume-longrun", Path(tmpdir), cycles=1
@@ -113,14 +97,8 @@ class ResumableTrxLongRunE2ETest(unittest.TestCase):
 
             sql_text = "\n".join(longrun_native_preserve_runtime_sql(config))
 
-            self.assertIn(
-                "SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes="
-                f"{LONGRUN_NATIVE_WARMCOPY_TAIL_BUDGET_BYTES}",
-                sql_text,
-            )
-            self.assertNotIn(str(64 * 1024 * 1024), sql_text)
-            self.assertIn("SET GLOBAL preserve_trx_batch_max_transactions=", sql_text)
-            self.assertIn("SET GLOBAL preserve_trx_max_total=", sql_text)
+            self.assertIn("SET GLOBAL rds_preserve_trx_enable=ON", sql_text)
+            self.assertNotIn("SET GLOBAL preserve_trx_", sql_text)
 
     def test_manifest_is_seed_stable_and_reports_minimum_hits(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3723,15 +3701,15 @@ class ResumableTrxLongRunE2ETest(unittest.TestCase):
             sql_text = "\n".join(
                 item for item in executed if isinstance(item, str)
             )
-            self.assertIn("SET GLOBAL preserve_trx_enable=ON", sql_text)
-            self.assertIn("SET GLOBAL preserve_trx_temp_table_enable=ON", sql_text)
-            self.assertIn("SET GLOBAL preserve_trx_warmcopy_enable=OFF", sql_text)
+            self.assertIn("SET GLOBAL rds_preserve_trx_enable=ON", sql_text)
+            self.assertIn("SET GLOBAL rds_preserve_trx_temp_table_enable=ON", sql_text)
+            self.assertNotIn("SET GLOBAL preserve_trx_", sql_text)
             self.assertIn(
-                "SET GLOBAL preserve_trx_drain_phase2_timeout_ms=300000",
+                "SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms=300000",
                 sql_text,
             )
             self.assertIn(
-                "SET GLOBAL preserve_trx_token_retention_timeout_ms=300000",
+                "SET GLOBAL rds_preserve_trx_token_retention_timeout_ms=300000",
                 sql_text,
             )
             self.assertIn(

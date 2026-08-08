@@ -1,9 +1,6 @@
 DROP TABLE IF EXISTS t_warmcopy_large;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
-SET GLOBAL preserve_trx_warmcopy_chunk_bytes=1024;
-SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes=4096;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=PROMOTION_PREPARE;
 CREATE TABLE t_warmcopy_large(
 id INT PRIMARY KEY,
 sid INT NOT NULL,
@@ -60,8 +57,5 @@ id	sid	payload_len	payload_ok
 include/assert_grep.inc [committed warm-copy resumed transaction one appears once in binlog]
 include/assert_grep.inc [committed warm-copy resumed transaction two appears once in binlog]
 DROP TABLE t_warmcopy_large;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes=1048576;
-SET GLOBAL preserve_trx_warmcopy_chunk_bytes=1048576;
-SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
-SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=BUSINESS_FIRST;

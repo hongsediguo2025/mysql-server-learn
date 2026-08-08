@@ -11,7 +11,7 @@ CALL mtr.add_suppression("Preserved transaction '.*' recovery forced rollback: p
 DROP TABLE IF EXISTS t_expired_reaper_cleanup_failure;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 --let MYSQLD_DATADIR= `SELECT @@datadir`
 
 CREATE TABLE t_expired_reaper_cleanup_failure(a INT PRIMARY KEY, b INT)
@@ -29,10 +29,12 @@ UPDATE t_expired_reaper_cleanup_failure SET b=11 WHERE a=1;
 
 --sleep 2
 
---exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-grace-seconds=30 --debug=d,preserve_trx_fail_expired_reaper_cleanup" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON  --debug=d,preserve_trx_fail_expired_reaper_cleanup" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
+
+--sleep 121
 
 --let $grep_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
 --let $grep_pattern= Preserved transaction .* expired-token reaper forced rollback: recovery timeout expired
@@ -67,7 +69,7 @@ EOF
 
 SELECT * FROM t_expired_reaper_cleanup_failure ORDER BY a;
 
---let $restart_parameters= restart: --preserve-trx-enable=ON
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON
 --let $do_not_echo_parameters= 1
 --source include/restart_mysqld.inc
 --let $do_not_echo_parameters=
@@ -84,4 +86,4 @@ SELECT * FROM t_expired_reaper_cleanup_failure ORDER BY a;
 --source suite/preserve_trx/include/assert_no_preserve_residue.inc
 
 DROP TABLE t_expired_reaper_cleanup_failure;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

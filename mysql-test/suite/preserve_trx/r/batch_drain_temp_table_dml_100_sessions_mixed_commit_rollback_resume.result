@@ -1,7 +1,5 @@
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
-SET GLOBAL preserve_trx_lock_warmcopy_enable=OFF;
-SET GLOBAL preserve_trx_recovery_max_count=200;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 DRAIN TRANSACTIONS PRESERVE WITH USER VARS;
 SELECT COUNT(*) AS preserved_count
 FROM performance_schema.preserved_transactions;
@@ -35,6 +33,5 @@ FROM t_batch_temp_100_mixed_check
 WHERE should_commit = 0 AND temp_rows <> 0;
 rolled_back_sessions_with_rows
 0
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
-SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;

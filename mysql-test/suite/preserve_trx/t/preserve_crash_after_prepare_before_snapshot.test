@@ -8,7 +8,7 @@ DROP TABLE IF EXISTS t_preserve_prepare_crash;
 
 --let $MYSQLD_DATADIR= `SELECT @@datadir`
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 --disable_query_log
 CALL mtr.add_suppression("Attempting backtrace");
@@ -19,7 +19,7 @@ CALL mtr.add_suppression("PRESERVE: rolled back prepared transaction without sna
 CREATE TABLE t_preserve_prepare_crash(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_preserve_prepare_crash VALUES(1,10);
 --let $MYSQLD_DATADIR= `SELECT @@datadir`
---let PRESERVE_TRX_DIR= `SELECT @@global.preserve_trx_dir`
+--let PRESERVE_TRX_DIR= `SELECT CONCAT(@@global.datadir, 'preserve/')`
 
 --connect(preserve_prepare_crash_app,localhost,root,,test)
 START TRANSACTION;
@@ -34,7 +34,7 @@ DRAIN TRANSACTIONS PRESERVE;
 --source include/wait_until_disconnected.inc
 
 --source suite/preserve_trx/include/ha_crash_abandon_preserve_artifacts.inc
---exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -47,4 +47,4 @@ SELECT COUNT(*) AS remaining_preserved
 SELECT * FROM t_preserve_prepare_crash ORDER BY a;
 
 DROP TABLE t_preserve_prepare_crash;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

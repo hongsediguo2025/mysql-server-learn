@@ -4,7 +4,7 @@
 DROP TABLE IF EXISTS t_mdl_unsupported_namespace;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_mdl_unsupported_namespace(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
 
@@ -18,4 +18,4 @@ ROLLBACK;
 UNLOCK INSTANCE;
 
 DROP TABLE t_mdl_unsupported_namespace;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

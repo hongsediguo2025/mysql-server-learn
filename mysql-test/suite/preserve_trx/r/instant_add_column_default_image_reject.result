@@ -1,6 +1,6 @@
 DROP TABLE IF EXISTS t_instant_default_image;
 DROP TABLE IF EXISTS t_instant_default_marker;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_instant_default_image(
 id INT PRIMARY KEY,
 v INT
@@ -30,4 +30,4 @@ id	v	c
 1	10	7
 DROP TABLE t_instant_default_image;
 DROP TABLE t_instant_default_marker;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

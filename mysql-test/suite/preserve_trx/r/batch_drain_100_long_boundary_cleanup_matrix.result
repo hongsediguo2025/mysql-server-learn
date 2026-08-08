@@ -1,15 +1,4 @@
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_batch_max_transactions=99;
-SELECT @@global.preserve_trx_batch_max_transactions AS batch_target_limit_probe;
-batch_target_limit_probe
-99
-DRAIN TRANSACTIONS PRESERVE;
-ERROR HY000: Resumable transactions across shutdown do not support this operation
-SELECT COUNT(*) AS preserved_count_after_target_limit_probe
-FROM performance_schema.preserved_transactions;
-preserved_count_after_target_limit_probe
-0
-SET GLOBAL preserve_trx_batch_max_transactions=256;
+SET GLOBAL rds_preserve_trx_enable=ON;
 SET SESSION debug="+d,preserve_trx_batch_fail_after_one_target";
 DRAIN TRANSACTIONS PRESERVE;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
@@ -62,4 +51,4 @@ SELECT COUNT(*) = 0 AS preserved_count_final
 FROM performance_schema.preserved_transactions;
 preserved_count_final
 1
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

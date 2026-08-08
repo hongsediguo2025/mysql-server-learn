@@ -7,7 +7,7 @@ DROP TABLE IF EXISTS t_predicate_page_drift_anchor;
 DROP TABLE IF EXISTS t_predicate_page_drift;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 --let MYSQLD_DATADIR= `SELECT @@datadir`
 
 --disable_query_log
@@ -43,7 +43,7 @@ SELECT COUNT(*) AS locked_rows
 
 --let $_server_id= 1
 --let $_expect_file_name= $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
---let $restart_parameters= restart: --preserve-trx-enable=ON --debug=d,preserve_trx_corrupt_import_predicate_page_identity
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --debug=d,preserve_trx_corrupt_import_predicate_page_identity
 --source include/start_mysqld.inc
 
 --let $grep_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
@@ -60,4 +60,4 @@ SELECT id, ST_AsText(pos) AS pos
 
 DROP TABLE t_predicate_page_drift;
 DROP TABLE t_predicate_page_drift_anchor;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

@@ -5,17 +5,9 @@
 DROP TABLE IF EXISTS t_lock_warmcopy_implicit_explicit;
 --enable_warnings
 
---let $old_preserve_trx_enable= `SELECT @@GLOBAL.preserve_trx_enable`
---let $old_preserve_trx_warmcopy_enable= `SELECT @@GLOBAL.preserve_trx_warmcopy_enable`
---let $old_preserve_trx_lock_warmcopy_enable= `SELECT @@GLOBAL.preserve_trx_lock_warmcopy_enable`
---let $old_preserve_trx_lock_warmcopy_fallback= `SELECT @@GLOBAL.preserve_trx_lock_warmcopy_fallback_to_live_export`
---let $old_preserve_trx_recovery_max_count= `SELECT @@GLOBAL.preserve_trx_recovery_max_count`
+--let $old_rds_preserve_trx_enable= `SELECT @@GLOBAL.rds_preserve_trx_enable`
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_enable=OFF;
-SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
-SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=OFF;
-SET GLOBAL preserve_trx_recovery_max_count=10;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_lock_warmcopy_implicit_explicit(
   id INT PRIMARY KEY,
@@ -54,7 +46,7 @@ SELECT COUNT(*) > 0 AS explicit_primary_lock_materialized
 DRAIN TRANSACTIONS PRESERVE;
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 
---exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=10" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -101,9 +93,5 @@ SELECT id, uk, v, pad=REPEAT('b',32) AS pad_ok
 
 DROP TABLE t_lock_warmcopy_implicit_explicit;
 --disable_query_log
---eval SET GLOBAL preserve_trx_recovery_max_count=$old_preserve_trx_recovery_max_count
---eval SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=$old_preserve_trx_lock_warmcopy_fallback
---eval SET GLOBAL preserve_trx_lock_warmcopy_enable=$old_preserve_trx_lock_warmcopy_enable
---eval SET GLOBAL preserve_trx_warmcopy_enable=$old_preserve_trx_warmcopy_enable
---eval SET GLOBAL preserve_trx_enable=$old_preserve_trx_enable
+--eval SET GLOBAL rds_preserve_trx_enable=$old_rds_preserve_trx_enable
 --enable_query_log

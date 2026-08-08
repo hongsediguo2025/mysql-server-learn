@@ -35,7 +35,7 @@ for my $name (
   die "$name must be declared and exposed as a sysvar\n"
     unless ($header =~ /extern\s+uint\s+\Q$name\E/s ||
             $transfer_header =~ /extern\s+uint\s+\Q$name\E/s) &&
-           $sysvars =~ /"\Q$name\E"/s;
+           $sysvars =~ /"rds_\Q$name\E"/s;
 }
 
 for my $obsolete (

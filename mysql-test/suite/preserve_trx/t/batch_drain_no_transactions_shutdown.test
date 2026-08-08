@@ -1,13 +1,13 @@
 --source include/not_log_bin.inc
 --source include/force_restart.inc
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 DRAIN TRANSACTIONS PRESERVE;
 --source include/wait_until_disconnected.inc
 
---exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -15,4 +15,4 @@ DRAIN TRANSACTIONS PRESERVE;
 SELECT COUNT(*) AS preserved_count
   FROM performance_schema.preserved_transactions;
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

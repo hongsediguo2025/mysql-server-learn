@@ -1,7 +1,7 @@
 DROP TABLE IF EXISTS t_preserve_external_field;
 DROP TABLE IF EXISTS t_preserve_instant_field;
 DROP TABLE IF EXISTS t_preserve_instant_marker;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_preserve_external_field(
 id INT PRIMARY KEY,
 v INT,
@@ -48,4 +48,4 @@ id	v	c
 DROP TABLE t_preserve_external_field;
 DROP TABLE t_preserve_instant_field;
 DROP TABLE t_preserve_instant_marker;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

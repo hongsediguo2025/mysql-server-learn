@@ -3,7 +3,7 @@ CALL mtr.add_suppression("Preserved transaction .* recovery cleanup failed: fail
 CALL mtr.add_suppression("Preserved transaction batch cleanup failed after target preserve error");
 CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: preserved transaction snapshot tainted");
 DROP TABLE IF EXISTS t_batch_logged_cache_failure_record;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_batch_logged_cache_failure_record(
 id INT PRIMARY KEY,
 v INT
@@ -19,7 +19,7 @@ SELECT COUNT(*) AS preserved_count_after_failure
 FROM performance_schema.preserved_transactions;
 preserved_count_after_failure
 0
-# restart: --preserve-trx-enable=ON
+# restart: --rds-preserve-trx-enable=ON
 SELECT COUNT(*) AS preserved_count_after_restart
 FROM performance_schema.preserved_transactions;
 preserved_count_after_restart
@@ -28,4 +28,4 @@ SELECT * FROM t_batch_logged_cache_failure_record ORDER BY id;
 id	v
 1	10
 DROP TABLE t_batch_logged_cache_failure_record;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

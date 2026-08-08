@@ -1,5 +1,5 @@
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 CREATE TEMPORARY TABLE tmp_preserve_temp_autoinc(
 id INT AUTO_INCREMENT PRIMARY KEY,
 v INT
@@ -10,4 +10,4 @@ DRAIN TRANSACTIONS PRESERVE;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 ROLLBACK;
 DROP TEMPORARY TABLE tmp_preserve_temp_autoinc;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;

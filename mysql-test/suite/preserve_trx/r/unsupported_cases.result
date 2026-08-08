@@ -2,7 +2,7 @@ DROP TABLE IF EXISTS t_unsupported_innodb;
 DROP TABLE IF EXISTS t_unsupported_myisam;
 DROP FUNCTION IF EXISTS preserve_unsupported_ddl_func;
 DROP TABLE IF EXISTS t_unsupported_ddl;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_unsupported_innodb(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 CREATE TABLE t_unsupported_myisam(a INT PRIMARY KEY, b INT) ENGINE=MyISAM;
 INSERT INTO t_unsupported_innodb VALUES(1,10),(2,20),(3,30),(4,40),(5,50);
@@ -13,7 +13,7 @@ DRAIN TRANSACTIONS PRESERVE;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 XA END 'msp_unsupported_xa';
 XA ROLLBACK 'msp_unsupported_xa';
-SELECT @@global.preserve_trx_enable AS still_running_after_xa;
+SELECT @@global.rds_preserve_trx_enable AS still_running_after_xa;
 still_running_after_xa
 1
 START TRANSACTION;
@@ -22,7 +22,7 @@ INSERT INTO t_unsupported_myisam VALUES(2,20);
 DRAIN TRANSACTIONS PRESERVE;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 ROLLBACK;
-SELECT @@global.preserve_trx_enable AS still_running_after_myisam;
+SELECT @@global.rds_preserve_trx_enable AS still_running_after_myisam;
 still_running_after_myisam
 1
 START TRANSACTION;
@@ -32,7 +32,7 @@ DRAIN TRANSACTIONS PRESERVE;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 ROLLBACK;
 DROP TEMPORARY TABLE IF EXISTS tmp_unsupported;
-SELECT @@global.preserve_trx_enable AS still_running_after_temp;
+SELECT @@global.rds_preserve_trx_enable AS still_running_after_temp;
 still_running_after_temp
 1
 SELECT GET_LOCK('msp_unsupported_user_lock', 0) AS got_user_lock;
@@ -46,7 +46,7 @@ ROLLBACK;
 SELECT RELEASE_LOCK('msp_unsupported_user_lock') AS released_user_lock;
 released_user_lock
 1
-SELECT @@global.preserve_trx_enable AS still_running_after_user_lock;
+SELECT @@global.rds_preserve_trx_enable AS still_running_after_user_lock;
 still_running_after_user_lock
 1
 HANDLER t_unsupported_innodb OPEN;
@@ -56,7 +56,7 @@ DRAIN TRANSACTIONS PRESERVE;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 ROLLBACK;
 HANDLER t_unsupported_innodb CLOSE;
-SELECT @@global.preserve_trx_enable AS still_running_after_handler;
+SELECT @@global.rds_preserve_trx_enable AS still_running_after_handler;
 still_running_after_handler
 1
 LOCK INSTANCE FOR BACKUP;
@@ -66,14 +66,14 @@ DRAIN TRANSACTIONS PRESERVE;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 ROLLBACK;
 UNLOCK INSTANCE;
-SELECT @@global.preserve_trx_enable AS still_running_after_backup_lock;
+SELECT @@global.rds_preserve_trx_enable AS still_running_after_backup_lock;
 still_running_after_backup_lock
 1
 LOCK TABLES t_unsupported_innodb WRITE;
 DRAIN TRANSACTIONS PRESERVE;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 UNLOCK TABLES;
-SELECT @@global.preserve_trx_enable AS still_running_after_lock_tables;
+SELECT @@global.rds_preserve_trx_enable AS still_running_after_lock_tables;
 still_running_after_lock_tables
 1
 CREATE FUNCTION preserve_unsupported_ddl_func() RETURNS INT
@@ -86,7 +86,7 @@ AS SELECT preserve_unsupported_ddl_func() AS a;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 DROP FUNCTION preserve_unsupported_ddl_func;
 DROP TABLE IF EXISTS t_unsupported_ddl;
-SELECT @@global.preserve_trx_enable AS still_running_after_ddl_context;
+SELECT @@global.rds_preserve_trx_enable AS still_running_after_ddl_context;
 still_running_after_ddl_context
 1
 SELECT COUNT(*) AS preserved_after_unsupported_cases
@@ -96,4 +96,4 @@ preserved_after_unsupported_cases
 preserve dir clean after unsupported cases
 DROP TABLE t_unsupported_myisam;
 DROP TABLE t_unsupported_innodb;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

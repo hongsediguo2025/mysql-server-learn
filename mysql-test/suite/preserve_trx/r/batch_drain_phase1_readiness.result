@@ -1,10 +1,8 @@
 DROP USER IF EXISTS phase1_readiness_app@localhost;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_enable=ON;
-SET GLOBAL preserve_trx_lock_warmcopy_enable=OFF;
-SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
-SET GLOBAL preserve_trx_drain_phase1_timeout_ms=5000;
-SET GLOBAL preserve_trx_drain_phase2_timeout_ms=200;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=PROMOTION_PREPARE;
+SET GLOBAL rds_preserve_trx_drain_phase1_timeout_ms=5000;
+SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms=200;
 CREATE USER phase1_readiness_app@localhost;
 GRANT SELECT ON test.* TO phase1_readiness_app@localhost;
 GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO phase1_readiness_app@localhost;
@@ -65,8 +63,8 @@ FROM performance_schema.global_status
 WHERE VARIABLE_NAME='Preserve_trx_phase1_readiness_wait_us';
 readiness_waited
 1
-SET GLOBAL preserve_trx_drain_phase1_timeout_ms=50;
-SET GLOBAL preserve_trx_drain_phase2_timeout_ms=5000;
+SET GLOBAL rds_preserve_trx_drain_phase1_timeout_ms=50;
+SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms=5000;
 SET DEBUG_SYNC=
 'before_execute_sql_command SIGNAL phase1_deadline_old_running WAIT_FOR phase1_deadline_old_continue';
 SELECT 3 AS deadline_command;
@@ -96,8 +94,7 @@ deadline_command
 SET DEBUG_SYNC='now SIGNAL phase1_deadline_closing_continue';
 SET SESSION debug='';
 DROP USER phase1_readiness_app@localhost;
-SET GLOBAL preserve_trx_drain_phase1_timeout_ms=600000;
-SET GLOBAL preserve_trx_drain_phase2_timeout_ms=30000;
-SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
-SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
+SET GLOBAL rds_preserve_trx_drain_phase1_timeout_ms=600000;
+SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms=30000;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=BUSINESS_FIRST;
 SET DEBUG_SYNC='RESET';

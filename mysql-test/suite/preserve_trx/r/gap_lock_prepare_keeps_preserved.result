@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_preserve_gap_prepare;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_preserve_gap_prepare(
 id INT PRIMARY KEY,
 v INT
@@ -30,4 +30,4 @@ id	v
 20	21
 30	30
 DROP TABLE t_preserve_gap_prepare;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

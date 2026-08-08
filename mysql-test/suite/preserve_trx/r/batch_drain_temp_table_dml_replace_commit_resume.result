@@ -1,5 +1,5 @@
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 CREATE TABLE t_batch_temp_replace(
 sid INT NOT NULL,
 k INT NOT NULL,
@@ -56,5 +56,5 @@ sid	k	v	counter	note
 1	100093	10000093	93	s001-t00001-n093
 DROP TEMPORARY TABLE tmp_batch_temp_replace;
 DROP TABLE t_batch_temp_replace;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;

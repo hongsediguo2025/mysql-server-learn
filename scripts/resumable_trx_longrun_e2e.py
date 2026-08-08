@@ -38,9 +38,6 @@ AUDIT_MAX_EVENT_RANGE_BYTES = 8 * 1024 * 1024
 LIVE_SMOKE_SKIP_RETURN_CODE = 77
 LIVE_SMOKE_COMMAND_ENV = "PRESERVE_TRX_LONGRUN_LIVE_SMOKE_COMMAND"
 BUSINESS_LIVE_BASELINE_COMPARE_MAX_INTERVAL_S = 1.0
-LONGRUN_NATIVE_WARMCOPY_TAIL_BUDGET_BYTES = 1024 * 1024
-LONGRUN_NATIVE_WARMCOPY_MAX_TOTAL_BYTES = 10 * 1024 * 1024 * 1024
-LONGRUN_NATIVE_WARMCOPY_TOTAL_HEADROOM_BYTES = 64 * 1024 * 1024
 LONGRUN_NATIVE_MIN_PRESERVE_CAPACITY = 512
 
 
@@ -63,44 +60,18 @@ def canonical_json(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
-def longrun_native_warmcopy_required_total_bytes(config: "LongRunConfig") -> int:
-    if not config.warmcopy_enabled:
-        return 0
-    return (
-        config.sessions * LONGRUN_NATIVE_WARMCOPY_TAIL_BUDGET_BYTES
-        + LONGRUN_NATIVE_WARMCOPY_TOTAL_HEADROOM_BYTES
-    )
-
-
 def longrun_native_preserve_runtime_settings(
     config: "LongRunConfig",
     drain_timeout_s: float = 300.0,
 ) -> Dict[str, object]:
-    preserve_capacity = max(
-        LONGRUN_NATIVE_MIN_PRESERVE_CAPACITY, config.sessions + 64
-    )
-    warmcopy_total = max(
-        LONGRUN_NATIVE_WARMCOPY_MAX_TOTAL_BYTES,
-        longrun_native_warmcopy_required_total_bytes(config),
-    )
     timeout_ms = max(1, int(math.ceil(drain_timeout_s * 1000.0)))
     return {
-        "preserve_trx_enable": "ON" if config.preserve_enabled else "OFF",
-        "preserve_trx_temp_table_enable": (
+        "rds_preserve_trx_enable": "ON" if config.preserve_enabled else "OFF",
+        "rds_preserve_trx_temp_table_enable": (
             "ON" if config.temp_table_enabled else "OFF"
         ),
-        "preserve_trx_max_total": preserve_capacity,
-        "preserve_trx_batch_max_transactions": preserve_capacity,
-        "preserve_trx_max_pending_per_user": preserve_capacity,
-        "preserve_trx_warmcopy_enable": (
-            "ON" if config.warmcopy_enabled else "OFF"
-        ),
-        "preserve_trx_warmcopy_tail_budget_bytes": (
-            LONGRUN_NATIVE_WARMCOPY_TAIL_BUDGET_BYTES
-        ),
-        "preserve_trx_warmcopy_max_total_bytes": warmcopy_total,
-        "preserve_trx_drain_phase2_timeout_ms": timeout_ms,
-        "preserve_trx_token_retention_timeout_ms": min(3_600_000, timeout_ms),
+        "rds_preserve_trx_drain_phase2_timeout_ms": timeout_ms,
+        "rds_preserve_trx_token_retention_timeout_ms": min(3_600_000, timeout_ms),
     }
 
 

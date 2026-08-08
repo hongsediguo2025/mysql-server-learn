@@ -10,7 +10,7 @@ CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: fai
 DROP TABLE IF EXISTS t_recovered_count_rewrite_failclosed;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 --let MYSQLD_DATADIR= `SELECT @@datadir`
 
 CREATE TABLE t_recovered_count_rewrite_failclosed(
@@ -31,7 +31,7 @@ UPDATE t_recovered_count_rewrite_failclosed SET b=11 WHERE a=1;
 
 --let $_server_id= 1
 --let $_expect_file_name= $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
---let $restart_parameters= restart: --preserve-trx-enable=ON --debug=d,preserve_trx_fail_recovered_count_rewrite
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --debug=d,preserve_trx_fail_recovered_count_rewrite
 --source include/start_mysqld.inc
 
 SELECT COUNT(*) AS preserved_count_after_legacy_rewrite_debug
@@ -57,4 +57,4 @@ COMMIT;
 SELECT * FROM t_recovered_count_rewrite_failclosed ORDER BY a;
 
 DROP TABLE t_recovered_count_rewrite_failclosed;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

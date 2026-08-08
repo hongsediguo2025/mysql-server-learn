@@ -8,7 +8,7 @@ DROP TABLE IF EXISTS t_priv;
 CALL mtr.add_suppression("RESUME PRESERVED TRANSACTION .* failed: token not found");
 --enable_query_log
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 --connect(preserve_temp_unsupported_target,localhost,root,,test)
 START TRANSACTION;
@@ -56,4 +56,4 @@ DROP USER preserve_resume_any@localhost;
 DROP USER preserve_resume_denied@localhost;
 DROP USER preserve_u@localhost;
 DROP TABLE t_priv;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

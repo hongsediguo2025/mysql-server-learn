@@ -6,7 +6,7 @@
 DROP TABLE IF EXISTS t_resume_activate_cache_crash;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 --disable_query_log
 CALL mtr.add_suppression("Attempting backtrace");
@@ -31,13 +31,13 @@ INSERT INTO t_resume_activate_cache_crash VALUES(2,11);
 --source suite/preserve_trx/include/drain_transaction_from_control.inc
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 
---exec echo "restart: --preserve-trx-enable=ON --gtid-mode=ON --enforce-gtid-consistency" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON --gtid-mode=ON --enforce-gtid-consistency" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
 
 --source suite/preserve_trx/include/get_preserved_token.inc
---let PRESERVE_TRX_DIR= `SELECT @@global.preserve_trx_dir`
+--let PRESERVE_TRX_DIR= `SELECT CONCAT(@@global.datadir, 'preserve/')`
 --file_exists $PRESERVED_SNAPSHOT_FILE
 --file_exists $PRESERVED_BINLOG_CACHE_FILE
 
@@ -51,7 +51,7 @@ SET SESSION debug="+d,preserve_trx_crash_after_resume_activate_before_snapshot_d
 --source include/wait_until_disconnected.inc
 
 --source suite/preserve_trx/include/ha_crash_abandon_preserve_artifacts.inc
---exec echo "restart: --preserve-trx-enable=ON --gtid-mode=ON --enforce-gtid-consistency" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON --gtid-mode=ON --enforce-gtid-consistency" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -71,4 +71,4 @@ SET SESSION sql_log_bin=0;
 DROP TABLE t_resume_activate_cache_crash;
 SET SESSION sql_log_bin=1;
 RESET MASTER;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

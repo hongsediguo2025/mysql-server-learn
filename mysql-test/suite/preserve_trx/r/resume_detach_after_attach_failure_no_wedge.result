@@ -1,6 +1,6 @@
 DROP TABLE IF EXISTS t_resume_detach_after_attach_failure;
 CALL mtr.add_suppression("Preserved transaction resume failed to detach transaction after savepoint restore failure; retrying cleanup detach");
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_resume_detach_after_attach_failure(
 id INT PRIMARY KEY,
 v INT
@@ -29,4 +29,4 @@ id	v
 1	11
 2	20
 DROP TABLE t_resume_detach_after_attach_failure;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

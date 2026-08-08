@@ -8,7 +8,7 @@ DROP DATABASE IF EXISTS preserve_trx_ignored;
 
 --let MYSQLD_DATADIR= `SELECT @@datadir`
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_dirty_cache(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_dirty_cache VALUES(1,10);
@@ -60,4 +60,4 @@ SET GTID_NEXT=DEFAULT;
 SELECT @@SESSION.GTID_NEXT;
 
 DROP DATABASE preserve_trx_ignored;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

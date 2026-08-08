@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_preserve_enable_off_drain;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_preserve_enable_off_drain(
 id INT PRIMARY KEY,
 v INT
@@ -15,9 +15,9 @@ FROM performance_schema.preserved_transactions
 WHERE STATE = 'DRAINING';
 draining_rows
 1
-SET GLOBAL preserve_trx_enable=OFF;
-ERROR HY000: Incorrect arguments to preserve_trx_enable is a startup-only option
-SELECT @@global.preserve_trx_enable AS preserve_enable_still_on;
+SET GLOBAL rds_preserve_trx_enable=OFF;
+ERROR HY000: Incorrect arguments to rds_preserve_trx_enable is a startup-only option
+SELECT @@global.rds_preserve_trx_enable AS preserve_enable_still_on;
 preserve_enable_still_on
 1
 SELECT 1;
@@ -26,5 +26,5 @@ SET DEBUG_SYNC = 'now SIGNAL continue_enable_off_draining';
 RESUME PRESERVED TRANSACTION 'TOKEN';
 ROLLBACK;
 DROP TABLE t_preserve_enable_off_drain;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 SET DEBUG_SYNC = 'RESET';

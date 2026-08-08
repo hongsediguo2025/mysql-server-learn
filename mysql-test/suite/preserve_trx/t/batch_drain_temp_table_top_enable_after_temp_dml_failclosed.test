@@ -1,6 +1,6 @@
 --source include/force_restart.inc
 
---let $restart_parameters= restart: --preserve-trx-enable=OFF
+--let $restart_parameters= restart: --rds-preserve-trx-enable=OFF
 --source include/restart_mysqld.inc
 --let $restart_parameters=
 
@@ -8,7 +8,7 @@
 DROP TABLE IF EXISTS t_batch_temp_top_enable_after_temp_dml;
 --enable_warnings
 
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 
 CREATE TABLE t_batch_temp_top_enable_after_temp_dml(
   sid INT PRIMARY KEY,
@@ -30,8 +30,8 @@ INSERT INTO t_batch_temp_top_enable_after_temp_dml VALUES(2, 20);
 
 --connection default
 --error ER_WRONG_ARGUMENTS
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 
 --connection batch_temp_top_enable_app1
 INSERT INTO t_batch_temp_top_enable_after_temp_dml VALUES(1, 10);
@@ -61,6 +61,6 @@ SELECT * FROM t_batch_temp_top_enable_after_temp_dml ORDER BY sid;
 
 DROP TABLE t_batch_temp_top_enable_after_temp_dml;
 
---let $restart_parameters= restart: --preserve-trx-enable=ON
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON
 --source include/restart_mysqld.inc
 --let $restart_parameters=

@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_logged_savepoint;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_logged_savepoint(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
 INSERT INTO t_logged_savepoint VALUES(1,10),(2,20),(3,30);
 RESET MASTER;
@@ -22,4 +22,4 @@ id	v
 include/assert_grep.inc [Preserved logged savepoint keeps pre-savepoint row event]
 include/assert_grep.inc [Preserved logged savepoint truncates post-savepoint row event]
 DROP TABLE t_logged_savepoint;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

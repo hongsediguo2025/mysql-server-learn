@@ -6,7 +6,7 @@
 DROP TABLE IF EXISTS t_recover_import_failure;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 --let MYSQLD_DATADIR= `SELECT @@datadir`
 
 --disable_query_log
@@ -29,7 +29,7 @@ UPDATE t_recover_import_failure SET b=21 WHERE a=2;
 
 --let $_server_id= 1
 --let $_expect_file_name= $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
---let $restart_parameters= restart: --preserve-trx-enable=ON --debug=d,preserve_trx_fail_import_read_view
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --debug=d,preserve_trx_fail_import_read_view
 --source include/start_mysqld.inc
 
 --let $grep_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
@@ -41,4 +41,4 @@ UPDATE t_recover_import_failure SET b=21 WHERE a=2;
 SELECT * FROM t_recover_import_failure ORDER BY a;
 
 DROP TABLE t_recover_import_failure;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

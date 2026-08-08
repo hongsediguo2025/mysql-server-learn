@@ -4,7 +4,7 @@
 DROP TABLE IF EXISTS t_non_row_preserve_preflight;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_non_row_preserve_preflight(
   id INT PRIMARY KEY,

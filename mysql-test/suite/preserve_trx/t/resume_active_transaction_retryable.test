@@ -5,7 +5,7 @@
 DROP TABLE IF EXISTS t_resume_active_transaction_retryable;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_resume_active_transaction_retryable(
   id INT PRIMARY KEY,
@@ -21,7 +21,7 @@ UPDATE t_resume_active_transaction_retryable SET v=20 WHERE id=1;
 --source suite/preserve_trx/include/drain_transaction_from_control.inc
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 
---exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -47,4 +47,4 @@ COMMIT;
 SELECT * FROM t_resume_active_transaction_retryable ORDER BY id;
 
 DROP TABLE t_resume_active_transaction_retryable;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

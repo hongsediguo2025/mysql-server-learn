@@ -58,20 +58,17 @@ struct Mysql_binlog_preserve_token_identity;
 
 extern bool preserve_trx_enable;
 extern bool preserve_trx_temp_table_enable;
-extern uint preserve_trx_max_total;
-extern uint preserve_trx_max_pending_per_user;
-extern uint preserve_trx_batch_max_transactions;
-extern uint preserve_trx_recovery_max_count;
-extern uint preserve_trx_recovery_grace_seconds;
-extern ulonglong preserve_trx_max_snapshot_bytes;
-extern ulonglong preserve_trx_max_binlog_cache_bytes;
-extern ulonglong preserve_trx_max_temp_sidecar_bytes;
+extern const uint preserve_trx_recovery_max_count;
+extern const uint preserve_trx_recovery_grace_seconds;
+extern const ulonglong preserve_trx_max_snapshot_bytes;
+extern const ulonglong preserve_trx_max_binlog_cache_bytes;
+extern const ulonglong preserve_trx_max_temp_sidecar_bytes;
 extern ulonglong preserve_trx_memory_budget_bytes;
 extern ulonglong preserve_trx_memory_per_token_bytes;
 extern uint preserve_trx_spill_chunk_bytes;
-extern ulonglong preserve_trx_single_phase_max_binlog_cache_bytes;
-extern uint preserve_trx_max_lock_count;
-extern uint preserve_trx_max_modified_tables;
+extern const ulonglong preserve_trx_single_phase_max_binlog_cache_bytes;
+extern const uint preserve_trx_max_lock_count;
+extern const uint preserve_trx_max_modified_tables;
 
 bool preserved_trx_build_native_binlog_cache_facts(
     const Preserve_snapshot_metadata &metadata,
@@ -85,25 +82,18 @@ enum class Preserved_trx_recover_load_profile {
 };
 extern uint preserve_trx_drain_phase1_timeout_ms;
 extern uint preserve_trx_drain_phase2_timeout_ms;
-extern bool preserve_trx_transfer_pipeline_enable;
-extern bool preserve_trx_warmcopy_enable;
-extern uint preserve_trx_warmcopy_min_open_ms;
-extern uint preserve_trx_warmcopy_chunk_bytes;
-extern uint preserve_trx_warmcopy_tail_budget_bytes;
-extern ulonglong preserve_trx_warmcopy_max_total_bytes;
-extern uint preserve_trx_warmcopy_pending_range_limit;
-extern ulonglong preserve_trx_warmcopy_pending_bytes_limit;
-extern bool preserve_trx_lock_warmcopy_enable;
-extern bool preserve_trx_lock_warmcopy_fallback_to_live_export;
-extern ulonglong preserve_trx_lock_warmcopy_max_memory_bytes;
-extern ulonglong preserve_trx_lock_warmcopy_max_journal_bytes;
-extern uint preserve_trx_lock_warmcopy_max_dirty_shards;
-extern uint preserve_trx_lock_warmcopy_max_mdl_descriptors;
-extern uint preserve_trx_lock_warmcopy_seal_threads;
+extern const ulonglong preserve_trx_warmcopy_max_total_bytes;
+extern const uint preserve_trx_warmcopy_pending_range_limit;
+extern const ulonglong preserve_trx_warmcopy_pending_bytes_limit;
+extern const ulonglong preserve_trx_lock_warmcopy_max_memory_bytes;
+extern const ulonglong preserve_trx_lock_warmcopy_max_journal_bytes;
+extern const uint preserve_trx_lock_warmcopy_max_dirty_shards;
+extern const uint preserve_trx_lock_warmcopy_max_mdl_descriptors;
+extern const uint preserve_trx_lock_warmcopy_seal_threads;
 extern uint preserve_trx_lock_warmcopy_conversion_wait_timeout_ms;
-extern uint preserve_trx_parallel_preserve_threads;
-extern uint preserve_trx_startup_recovery_threads;
-extern bool preserve_trx_recover_lock_page_prefetch;
+extern const uint preserve_trx_parallel_preserve_threads;
+extern const uint preserve_trx_startup_recovery_threads;
+extern const bool preserve_trx_recover_lock_page_prefetch;
 
 uint preserve_trx_auto_parallel_preserve_threads(uint hardware_threads);
 bool preserve_trx_is_enabled();

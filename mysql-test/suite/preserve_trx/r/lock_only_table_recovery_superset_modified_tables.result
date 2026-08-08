@@ -1,6 +1,6 @@
 DROP TABLE IF EXISTS t_lock_only_modified;
 DROP TABLE IF EXISTS t_lock_only_locked;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_lock_only_modified(
 id INT PRIMARY KEY,
 v INT
@@ -38,4 +38,4 @@ id	v
 2	200
 DROP TABLE t_lock_only_modified;
 DROP TABLE t_lock_only_locked;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

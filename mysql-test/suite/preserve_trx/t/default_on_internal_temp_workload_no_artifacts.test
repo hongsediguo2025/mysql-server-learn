@@ -2,8 +2,8 @@
 
 --let MYSQLD_DATADIR= `SELECT @@datadir`
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 
 --disable_warnings
 DROP TABLE IF EXISTS t_preserve_default_on_internal_tmp;
@@ -78,5 +78,5 @@ print "preserve_artifacts 0\n";
 EOF
 
 DROP TABLE t_preserve_default_on_internal_tmp;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;

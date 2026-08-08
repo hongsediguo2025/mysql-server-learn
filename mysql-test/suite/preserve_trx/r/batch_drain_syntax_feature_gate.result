@@ -1,6 +1,6 @@
-# restart: --preserve-trx-enable=OFF
-SELECT @@global.preserve_trx_enable;
-@@global.preserve_trx_enable
+# restart: --rds-preserve-trx-enable=OFF
+SELECT @@global.rds_preserve_trx_enable;
+@@global.rds_preserve_trx_enable
 0
 CREATE TABLE drain(id INT PRIMARY KEY, drain_col INT) ENGINE=InnoDB;
 DROP TABLE drain;
@@ -8,4 +8,4 @@ DRAIN TRANSACTIONS PRESERVE;
 ERROR HY000: Resumable transactions across shutdown are disabled
 DRAIN TRANSACTIONS PRESERVE NO USER VARS;
 ERROR HY000: Resumable transactions across shutdown are disabled
-# restart: --preserve-trx-enable=ON
+# restart: --rds-preserve-trx-enable=ON

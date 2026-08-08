@@ -9,7 +9,7 @@ CALL mtr.add_suppression("Preserved transaction '.*' recovery forced rollback: r
 DROP TABLE IF EXISTS t_recovery_grace;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_recovery_grace(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_recovery_grace VALUES(1,10);
@@ -26,18 +26,16 @@ UPDATE t_recovery_grace SET b=11 WHERE a=1;
 
 --sleep 2
 
---exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-grace-seconds=30" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
-
-SELECT @@global.preserve_trx_recovery_grace_seconds AS recovery_grace_seconds;
 
 --replace_column 1 TOKEN
 SELECT TOKEN, RECOVERED_COUNT AS recovered_count_during_grace
   FROM performance_schema.preserved_transactions;
 
---let $restart_parameters= restart: --preserve-trx-enable=ON --preserve-trx-recovery-grace-seconds=30
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON
 --let $do_not_echo_parameters= 1
 --source include/restart_mysqld.inc
 --let $do_not_echo_parameters=
@@ -55,9 +53,9 @@ SELECT TOKEN, STATE, LAST_ERROR
 SELECT * FROM t_recovery_grace ORDER BY a;
 
 DROP TABLE t_recovery_grace;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
---let $restart_parameters= restart: --preserve-trx-enable=ON --skip-log-bin
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --skip-log-bin
 --let $do_not_echo_parameters= 1
 --source include/restart_mysqld.inc
 --let $do_not_echo_parameters=

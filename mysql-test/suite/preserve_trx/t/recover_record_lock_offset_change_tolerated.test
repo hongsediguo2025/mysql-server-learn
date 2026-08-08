@@ -6,7 +6,7 @@
 DROP TABLE IF EXISTS t_recover_record_lock_offset_change;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 --let MYSQLD_DATADIR= `SELECT @@datadir`
 
 CREATE TABLE t_recover_record_lock_offset_change(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
@@ -25,7 +25,7 @@ SELECT * FROM t_recover_record_lock_offset_change WHERE a=1 FOR SHARE;
 
 --let $_server_id= 1
 --let $_expect_file_name= $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
---let $restart_parameters= restart: --preserve-trx-enable=ON --debug=d,preserve_trx_corrupt_import_record_lock_offsets
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --debug=d,preserve_trx_corrupt_import_record_lock_offsets
 --source include/start_mysqld.inc
 
 SELECT COUNT(*) AS preserved_count_after_offset_change
@@ -43,4 +43,4 @@ SELECT COUNT(*) AS remaining_preserved
 FROM performance_schema.preserved_transactions;
 
 DROP TABLE t_recover_record_lock_offset_change;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

@@ -11,7 +11,7 @@
 DROP TABLE IF EXISTS t_implicit_sec;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_implicit_sec(
   id INT PRIMARY KEY,
@@ -31,7 +31,7 @@ UPDATE t_implicit_sec SET k=250, v=21 WHERE id=2;
 DRAIN TRANSACTIONS PRESERVE;
 --source include/wait_until_disconnected.inc
 
---exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -69,4 +69,4 @@ connection default;
 SELECT * FROM t_implicit_sec ORDER BY id;
 
 DROP TABLE t_implicit_sec;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

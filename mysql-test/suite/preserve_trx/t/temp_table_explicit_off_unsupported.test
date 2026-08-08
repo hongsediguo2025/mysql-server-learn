@@ -1,6 +1,6 @@
-SELECT @@global.preserve_trx_temp_table_enable AS temp_table_gate_default;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=OFF;
+SELECT @@global.rds_preserve_trx_temp_table_enable AS temp_table_gate_default;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=OFF;
 
 CREATE TABLE t_base(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
 CREATE TEMPORARY TABLE tmp_t(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
@@ -30,5 +30,5 @@ ROLLBACK;
 SELECT id, v FROM t_base;
 
 DROP TABLE t_base;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;

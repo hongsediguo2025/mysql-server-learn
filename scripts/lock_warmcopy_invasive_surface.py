@@ -892,7 +892,7 @@ def audit_off_path_helper_guards() -> List[SurfaceFinding]:
                     "modified",
                     "missing_preserve_off_fast_return",
                     "blocker",
-                    f"{signature} must return before lock/state/I/O work when preserve_trx_enable=OFF",
+                    f"{signature} must return before lock/state/I/O work when rds_preserve_trx_enable=OFF",
                     blocks_release=True,
                 )
             )

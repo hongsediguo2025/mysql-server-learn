@@ -1,6 +1,6 @@
 DROP TABLE IF EXISTS t_batch_drained;
 DROP PROCEDURE IF EXISTS p_batch_drained_update;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_batch_drained(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_batch_drained VALUES(1,10);
 CREATE PROCEDURE p_batch_drained_update()
@@ -44,4 +44,4 @@ a	b
 1	10
 DROP TABLE t_batch_drained;
 DROP PROCEDURE p_batch_drained_update;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

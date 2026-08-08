@@ -24,7 +24,7 @@ GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
 CREATE USER receiver_deadline_app@localhost;
 GRANT SELECT, UPDATE ON test.* TO receiver_deadline_app@localhost;
 
---let $restart_parameters= restart: --preserve-trx-enable=ON --preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --preserve-trx-transfer-target-socket=$MASTER_MYSOCK --preserve-trx-transfer-target-user=preserve_trx_ha_admin --preserve-trx-transfer-credential-name=receiver_selection_deadline --preserve-trx-transfer-credential-secret-file=$credential_file
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$MASTER_MYPORT --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=receiver_selection_deadline --rds-preserve-trx-transfer-credential-secret-file=$credential_file
 --disable_result_log
 --source include/restart_mysqld.inc
 --enable_result_log
@@ -33,13 +33,8 @@ GRANT SELECT, UPDATE ON test.* TO receiver_deadline_app@localhost;
 CALL mtr.add_suppression(
   "PRESERVE: rolled back prepared transaction without snapshot during recovery");
 
-SET GLOBAL preserve_trx_batch_max_transactions=3;
-SET GLOBAL preserve_trx_transfer_pipeline_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_enable=OFF;
-SET GLOBAL preserve_trx_lock_warmcopy_enable=OFF;
-SET GLOBAL preserve_trx_transfer_prewarm_paused=ON;
-SET GLOBAL preserve_trx_transfer_receiver_prewarm_timeout_ms=1000;
-SET GLOBAL preserve_trx_token_retention_timeout_ms=120000;
+SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=ON;
+SET GLOBAL rds_preserve_trx_token_retention_timeout_ms=120000;
 
 CREATE TABLE t_receiver_selection_deadline(
   id INT PRIMARY KEY,
@@ -85,7 +80,7 @@ SELECT VARIABLE_VALUE=1 AS epoch_retained
   FROM performance_schema.global_status
  WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs';
 
-SET GLOBAL preserve_trx_transfer_prewarm_paused=OFF;
+SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=OFF;
 --let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_worker_active')=0 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_queued_bytes')=0
 --source include/wait_condition.inc
 SELECT VARIABLE_VALUE=1 AS selection_stays_frozen
@@ -96,7 +91,7 @@ SELECT VARIABLE_VALUE=1 AS selection_stays_frozen
 SHUTDOWN;
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 
---exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect

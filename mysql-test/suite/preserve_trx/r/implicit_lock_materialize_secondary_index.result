@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_implicit_sec;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_implicit_sec(
 id INT PRIMARY KEY,
 k INT,
@@ -31,4 +31,4 @@ id	k	v
 2	200	20
 3	300	30
 DROP TABLE t_implicit_sec;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

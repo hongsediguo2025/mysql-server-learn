@@ -6,17 +6,9 @@
 DROP TABLE IF EXISTS t_lock_warmcopy_conversion_fence;
 --enable_warnings
 
---let $old_preserve_trx_enable= `SELECT @@GLOBAL.preserve_trx_enable`
---let $old_preserve_trx_warmcopy_enable= `SELECT @@GLOBAL.preserve_trx_warmcopy_enable`
---let $old_preserve_trx_lock_warmcopy_enable= `SELECT @@GLOBAL.preserve_trx_lock_warmcopy_enable`
---let $old_preserve_trx_lock_warmcopy_fallback= `SELECT @@GLOBAL.preserve_trx_lock_warmcopy_fallback_to_live_export`
---let $old_preserve_trx_recovery_max_count= `SELECT @@GLOBAL.preserve_trx_recovery_max_count`
+--let $old_rds_preserve_trx_enable= `SELECT @@GLOBAL.rds_preserve_trx_enable`
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_enable=OFF;
-SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
-SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=OFF;
-SET GLOBAL preserve_trx_recovery_max_count=10;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_lock_warmcopy_conversion_fence(
   id INT PRIMARY KEY,
@@ -31,22 +23,33 @@ SET SESSION debug="+d,preserve_trx_lock_warmcopy_simulate_conversion_after_freez
 
 --connection default
 SET SESSION debug="+d,preserve_trx_lock_warmcopy_simulate_conversion_after_freeze";
---error ER_PRESERVE_TRX_UNSUPPORTED
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 DRAIN TRANSACTIONS PRESERVE;
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
 --let $assert_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
 --let $assert_text= lock warmcopy fence mismatch is logged
 --let $assert_select= PRESERVE_LOCK_WARMCOPY.*action=fence_mismatch.*reason=seal_fence_changed
 --let $assert_count_condition= >= 1
 --source include/assert_grep.inc
-SET SESSION debug="-d,preserve_trx_lock_warmcopy_simulate_conversion_after_freeze";
-SELECT COUNT(*) AS preserved_count_after_conversion_fence_reject
+--let $assert_text= lock warmcopy fence mismatch falls back to live export
+--let $assert_select= PRESERVE_LOCK_WARMCOPY.*action=live_fallback.*reason=seal_fence_changed
+--source include/assert_grep.inc
+SELECT COUNT(*) AS preserved_count_after_conversion_fallback
   FROM performance_schema.preserved_transactions;
+--source suite/preserve_trx/include/get_preserved_token.inc
 
---connection lock_wc_conversion_app
-SET SESSION debug="-d,preserve_trx_lock_warmcopy_simulate_conversion_after_freeze";
+--connect(lock_wc_conversion_resume, localhost, root,,test)
+--connection lock_wc_conversion_resume
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
 UPDATE t_lock_warmcopy_conversion_fence SET v=21 WHERE id=2;
 COMMIT;
---disconnect lock_wc_conversion_app
+--disconnect lock_wc_conversion_resume
 
 --connection default
 SELECT id, v FROM t_lock_warmcopy_conversion_fence ORDER BY id;
@@ -75,9 +78,5 @@ SELECT id, v FROM t_lock_warmcopy_conversion_fence ORDER BY id;
 
 DROP TABLE t_lock_warmcopy_conversion_fence;
 --disable_query_log
---eval SET GLOBAL preserve_trx_recovery_max_count=$old_preserve_trx_recovery_max_count
---eval SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=$old_preserve_trx_lock_warmcopy_fallback
---eval SET GLOBAL preserve_trx_lock_warmcopy_enable=$old_preserve_trx_lock_warmcopy_enable
---eval SET GLOBAL preserve_trx_warmcopy_enable=$old_preserve_trx_warmcopy_enable
---eval SET GLOBAL preserve_trx_enable=$old_preserve_trx_enable
+--eval SET GLOBAL rds_preserve_trx_enable=$old_rds_preserve_trx_enable
 --enable_query_log

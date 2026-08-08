@@ -76,12 +76,9 @@ class FullPressureProfileTest(unittest.TestCase):
         self.assertEqual(2 * 1024**3, RESET_FULL_PROFILE.receiver_buffer_pool_bytes)
         self.assertEqual(3, RESET_SMOKE_PROFILE.sessions)
 
-    def test_mixed_full_separates_heap_and_warm_artifact_budgets(self):
+    def test_mixed_full_uses_only_public_resource_controls(self):
         self.assertEqual(
             2 * 1024**3, MIXED_FULL_PROFILE.preserve_memory_budget_bytes
-        )
-        self.assertEqual(
-            8 * 1024**3, MIXED_FULL_PROFILE.warmcopy_artifact_budget_bytes
         )
         self.assertEqual(600_000_000, MIXED_FULL_PROFILE.source_phase2_limit_us)
 
@@ -114,22 +111,21 @@ class FullPressureProfileTest(unittest.TestCase):
             )
 
         self.assertIn(
-            "--preserve-trx-memory-budget-bytes=2147483648", source
+            "--rds-preserve-trx-memory-budget-bytes=2147483648", source
+        )
+        self.assertFalse(
+            any(item.startswith("--preserve-trx-warmcopy-max-total-bytes=")
+                for item in source)
         )
         self.assertIn(
-            "--preserve-trx-warmcopy-max-total-bytes=8589934592", source
-        )
-        self.assertIn(
-            "--preserve-trx-drain-phase2-timeout-ms=600000", source
+            "--rds-preserve-trx-drain-phase2-timeout-ms=600000", source
         )
         for command_line in (source, receiver):
             self.assertIn(
-                "--preserve-trx-token-retention-timeout-ms=1800000",
+                "--rds-preserve-trx-token-retention-timeout-ms=1800000",
                 command_line,
             )
-        option = "--preserve-warmcopy-max-total-bytes"
-        self.assertIn(option, command)
-        self.assertEqual("8589934592", command[command.index(option) + 1])
+        self.assertNotIn("--preserve-warmcopy-max-total-bytes", command)
         self.assertNotIn("--preserve-warmcopy-close-timeout-ms", command)
 
     def test_paths_derive_receiver_preserve_dir_from_datadir(self):
@@ -200,26 +196,15 @@ class FullPressureProfileTest(unittest.TestCase):
         self.assertIn("--log-error-verbosity=3", receiver)
         self.assertIn("--innodb-buffer-pool-size=2147483648", receiver)
         self.assertIn(
-            "--preserve-trx-transfer-runtime-profile=PROMOTION_PREPARE",
+            "--rds-preserve-trx-transfer-runtime-profile=PROMOTION_PREPARE",
             source,
         )
         self.assertIn(
-            "--preserve-trx-transfer-io-bytes-per-sec=1073741824", source
-        )
-        self.assertIn(
-            "--preserve-trx-transfer-runtime-profile=PROMOTION_PREPARE",
+            "--rds-preserve-trx-transfer-runtime-profile=PROMOTION_PREPARE",
             receiver,
         )
-        self.assertIn(
-            "--preserve-trx-transfer-io-bytes-per-sec=1073741824", receiver
-        )
-        self.assertIn(
-            "--preserve-trx-promotion-prewarm-io-bytes-per-sec=1073741824",
-            receiver,
-        )
-        self.assertIn(
-            "--preserve-trx-promotion-prewarm-workers=8", receiver
-        )
+        self.assertFalse(any("transfer-io-bytes-per-sec" in item for item in source + receiver))
+        self.assertFalse(any("promotion-prewarm" in item for item in receiver))
         self.assertIn("--warmcopy-required", command)
 
     def test_transfer_phase2_checklist_requires_process_local_epoch_ready(self):
@@ -274,9 +259,9 @@ class FullPressureProfileTest(unittest.TestCase):
             )
 
         self.assertIn(
-            "--preserve-trx-transfer-target-host=127.0.0.1", source
+            "--rds-preserve-trx-transfer-target-host=127.0.0.1", source
         )
-        self.assertIn("--preserve-trx-transfer-target-port=3512", source)
+        self.assertIn("--rds-preserve-trx-transfer-target-port=3512", source)
         self.assertFalse(
             any(
                 item.startswith("--preserve-trx-transfer-target-socket=")

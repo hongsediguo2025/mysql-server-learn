@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_table_lock_tlv_import_isolated;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_table_lock_tlv_import_isolated(
 id INT PRIMARY KEY,
 v INT
@@ -32,4 +32,4 @@ id	v
 1	10
 2	20
 DROP TABLE t_table_lock_tlv_import_isolated;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

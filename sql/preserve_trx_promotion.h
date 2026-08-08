@@ -37,13 +37,10 @@ struct Preserve_trx_transfer_epoch_fact;
 struct Preserve_trx_transfer_accepted_epoch;
 struct trx_t;
 
-extern uint preserve_trx_promotion_gate_batch_tokens;
-extern uint preserve_trx_promotion_gate_workers;
-extern uint preserve_trx_promotion_gate_timeout_ms;
-extern uint preserve_trx_promotion_prewarm_workers;
-extern ulonglong preserve_trx_promotion_prewarm_io_bytes_per_sec;
-extern ulonglong preserve_trx_promotion_prewarm_max_bytes;
-extern ulonglong preserve_trx_promotion_ready_cache_max_bytes;
+extern const uint preserve_trx_promotion_gate_batch_tokens;
+extern const uint preserve_trx_promotion_gate_workers;
+extern const uint preserve_trx_promotion_gate_timeout_ms;
+extern const ulonglong preserve_trx_promotion_ready_cache_max_bytes;
 
 bool preserved_trx_promotion_start_gate_workers();
 void preserved_trx_promotion_shutdown_gate_workers();
@@ -73,6 +70,9 @@ uint64_t preserve_trx_promotion_ready_cache_evictions_status();
 
 void preserved_trx_promotion_ready_cache_purge_epoch(
     const std::string &preserve_dir, const std::string &epoch_id);
+void preserved_trx_promotion_ready_cache_purge_token(
+    const std::string &preserve_dir, const std::string &epoch_id,
+    uint64_t token);
 
 enum class Preserve_trx_promotion_adopt_status {
   OK,

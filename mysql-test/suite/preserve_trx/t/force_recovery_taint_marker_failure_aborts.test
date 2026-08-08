@@ -6,7 +6,7 @@
 DROP TABLE IF EXISTS t_force_recovery_taint_fail;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 --let MYSQLD_DATADIR= `SELECT @@datadir`
 
 --disable_query_log
@@ -52,7 +52,7 @@ EOF
 
 --let $_server_id= 1
 --let $_expect_file_name= $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
---let $restart_parameters= --preserve-trx-enable=ON --innodb-force-recovery=1 --debug=d,preserve_trx_fail_write_tainted_marker
+--let $restart_parameters= --rds-preserve-trx-enable=ON --innodb-force-recovery=1 --debug=d,preserve_trx_fail_write_tainted_marker
 --source include/start_mysqld_expecting_crash.inc
 
 --let $grep_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
@@ -76,7 +76,7 @@ die "expected one retained binlog cache after taint marker failure in $dir, foun
 EOF
 
 --source suite/preserve_trx/include/ha_crash_abandon_preserve_artifacts.inc
---exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -88,4 +88,4 @@ SELECT COUNT(*) AS preserved_count_after_resume_commit
   FROM performance_schema.preserved_transactions;
 
 DROP TABLE t_force_recovery_taint_fail;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

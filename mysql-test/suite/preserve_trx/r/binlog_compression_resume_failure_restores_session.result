@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_binlog_compress_resume_failure;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_binlog_compress_resume_failure(
 id INT PRIMARY KEY,
 payload TEXT
@@ -53,4 +53,4 @@ FROM t_binlog_compress_resume_failure;
 id	payload_length	payload_prefix
 1	1000	b
 DROP TABLE t_binlog_compress_resume_failure;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

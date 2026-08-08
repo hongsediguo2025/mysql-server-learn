@@ -110,7 +110,7 @@ def cleanup_preserve_artifacts(preserve_dir: Path, execute: bool) -> CleanupResu
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--preserve-dir", required=True,
-                        help="Path to @@global.preserve_trx_dir.")
+                        help="Path to the fixed <datadir>/preserve directory.")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true",
                       help="List artifacts without deleting them.")

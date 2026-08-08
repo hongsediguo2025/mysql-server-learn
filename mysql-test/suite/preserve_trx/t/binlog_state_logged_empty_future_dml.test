@@ -6,7 +6,7 @@ DROP TABLE IF EXISTS t_logged_empty;
 DROP DATABASE IF EXISTS preserve_trx_ignored;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE DATABASE preserve_trx_ignored;
 CREATE TABLE t_logged_empty(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
@@ -22,7 +22,7 @@ UPDATE preserve_trx_ignored.seed SET b=11 WHERE a=1;
 --source suite/preserve_trx/include/drain_transaction_from_control.inc
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 
---exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -60,4 +60,4 @@ SELECT * FROM preserve_trx_ignored.seed WHERE a=1;
 
 DROP TABLE t_logged_empty;
 DROP DATABASE preserve_trx_ignored;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

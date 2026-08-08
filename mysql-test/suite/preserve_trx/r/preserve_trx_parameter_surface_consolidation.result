@@ -1,0 +1,39 @@
+# Preserve/Resume product parameter surface is exactly 16 rds_ names.
+SELECT COUNT(*) AS rds_parameter_count
+FROM performance_schema.global_variables
+WHERE VARIABLE_NAME LIKE 'rds_preserve_trx_%';
+rds_parameter_count
+16
+SELECT COUNT(*) AS legacy_parameter_count
+FROM performance_schema.global_variables
+WHERE VARIABLE_NAME LIKE 'preserve_trx_%';
+legacy_parameter_count
+0
+SELECT @@GLOBAL.rds_preserve_trx_enable AS preserve_enabled,
+@@GLOBAL.rds_preserve_trx_temp_table_enable AS temp_table_enabled,
+@@GLOBAL.rds_preserve_trx_memory_budget_bytes AS memory_budget,
+@@GLOBAL.rds_preserve_trx_drain_phase1_timeout_ms AS phase1_timeout,
+@@GLOBAL.rds_preserve_trx_drain_phase2_timeout_ms AS phase2_timeout,
+@@GLOBAL.rds_preserve_trx_token_retention_timeout_ms AS retention_timeout,
+@@GLOBAL.rds_preserve_trx_transfer_artifact_mode AS artifact_mode,
+@@GLOBAL.rds_preserve_trx_transfer_runtime_profile AS runtime_profile,
+@@GLOBAL.rds_preserve_trx_transfer_prewarm_paused AS prewarm_paused,
+@@GLOBAL.rds_preserve_trx_transfer_max_inflight_bytes AS max_inflight;
+preserve_enabled	temp_table_enabled	memory_budget	phase1_timeout	phase2_timeout	retention_timeout	artifact_mode	runtime_profile	prewarm_paused	max_inflight
+1	1	268435456	600000	30000	30000	STANDBY_TRANSFER_SAVE	BUSINESS_FIRST	0	1073741824
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile='BALANCED';
+SELECT @@GLOBAL.rds_preserve_trx_transfer_runtime_profile AS runtime_profile;
+runtime_profile
+BALANCED
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile='PROMOTION_PREPARE';
+SELECT @@GLOBAL.rds_preserve_trx_transfer_runtime_profile AS runtime_profile;
+runtime_profile
+PROMOTION_PREPARE
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile='BUSINESS_FIRST';
+SELECT @@GLOBAL.rds_preserve_trx_transfer_runtime_profile AS runtime_profile;
+runtime_profile
+BUSINESS_FIRST
+SET GLOBAL preserve_trx_enable=ON;
+ERROR HY000: Unknown system variable 'preserve_trx_enable'
+SET GLOBAL preserve_trx_max_total=1;
+ERROR HY000: Unknown system variable 'preserve_trx_max_total'

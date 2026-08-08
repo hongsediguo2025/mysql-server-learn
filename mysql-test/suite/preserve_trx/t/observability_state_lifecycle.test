@@ -6,7 +6,7 @@
 DROP TABLE IF EXISTS t_preserve_state;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 --disable_query_log
 CALL mtr.add_suppression("Preserved transaction resume failed to validate ACTIVE Undo state");
@@ -24,7 +24,7 @@ UPDATE t_preserve_state SET b=11 WHERE a=1;
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 DRAIN TRANSACTIONS PRESERVE;
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
---exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -64,7 +64,7 @@ UPDATE t_preserve_state SET b=12 WHERE a=1;
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 DRAIN TRANSACTIONS PRESERVE;
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
---exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -117,7 +117,7 @@ SET DEBUG_SYNC = 'now SIGNAL continue_state_draining';
 
 --connection default
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
---exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -128,4 +128,4 @@ SET DEBUG_SYNC = 'now SIGNAL continue_state_draining';
 ROLLBACK;
 
 DROP TABLE t_preserve_state;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

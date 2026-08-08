@@ -6,9 +6,8 @@
 DROP TABLE IF EXISTS t_warmcopy_post_prepare_failure;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=PROMOTION_PREPARE;
 
 CREATE TABLE t_warmcopy_post_prepare_failure(
   id INT PRIMARY KEY,
@@ -64,6 +63,5 @@ SELECT id, v, OCTET_LENGTH(payload) AS payload_len,
 --remove_file $MYSQLTEST_VARDIR/tmp/warmcopy_post_prepare_failure.mysqlbinlog
 
 DROP TABLE t_warmcopy_post_prepare_failure;
-SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
-SET GLOBAL preserve_trx_warmcopy_enable=ON;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=BUSINESS_FIRST;
+SET GLOBAL rds_preserve_trx_enable=ON;

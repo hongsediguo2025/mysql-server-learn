@@ -1,7 +1,7 @@
 DROP TABLE IF EXISTS t_resume_activate_detach_failure;
 CALL mtr.add_suppression("Preserved transaction resume failed to validate ACTIVE Undo state");
 CALL mtr.add_suppression("Preserved transaction resume failed to detach transaction after undo activation failure; retrying cleanup detach");
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_resume_activate_detach_failure(id INT PRIMARY KEY, v INT)
 ENGINE=InnoDB;
 INSERT INTO t_resume_activate_detach_failure VALUES(1,10);
@@ -24,4 +24,4 @@ SELECT * FROM t_resume_activate_detach_failure ORDER BY id;
 id	v
 1	11
 DROP TABLE t_resume_activate_detach_failure;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

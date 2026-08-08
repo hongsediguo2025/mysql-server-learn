@@ -259,24 +259,12 @@ def _base_config(
         business_run_before_drain_s=args.business_run_before_drain,
         duration_s=args.duration,
         preserve_timeout_s=args.preserve_timeout,
-        preserve_max_binlog_cache_bytes=args.preserve_max_binlog_cache_bytes,
-        preserve_max_lock_count=args.preserve_max_lock_count,
-        preserve_max_modified_tables=args.preserve_max_modified_tables,
-        preserve_lock_warmcopy_max_journal_bytes=(
-            args.preserve_lock_warmcopy_max_journal_bytes
-        ),
-        preserve_lock_warmcopy_seal_threads=(
-            args.preserve_lock_warmcopy_seal_threads
-        ),
-        preserve_parallel_preserve_threads=args.preserve_parallel_preserve_threads,
-        preserve_startup_recovery_threads=args.preserve_startup_recovery_threads,
         large_binlog_cache_sessions=0,
         large_binlog_cache_buckets_mb=[],
         artifact_dir=args.artifact_dir,
         server_error_log=args.server_error_log,
         server_pid_file=args.server_pid_file,
         warmcopy_required=False,
-        lock_warmcopy_mode=args.lock_warmcopy_mode,
         max_phase2_pause_ms=args.max_phase2_pause_ms,
         temp_table_workload=False,
         lockset_batch_size=args.lockset_batch_size,
@@ -312,7 +300,7 @@ def _bulk_seed_rows_per_table(
     return math.ceil(operation_count / table_count) * batch_size
 
 
-def _large_lockset_config(args: argparse.Namespace, lock_warmcopy_mode: str) -> HarnessConfig:
+def _large_lockset_config(args: argparse.Namespace) -> HarnessConfig:
     batch_size = args.lockset_batch_size or LARGE_LOCKSET_BATCH_SIZE
     operation_count = _bulk_operation_count(LARGE_LOCKSET_STATEMENTS_PER_TX, batch_size)
     seed_rows = _bulk_seed_rows_per_table(
@@ -323,7 +311,7 @@ def _large_lockset_config(args: argparse.Namespace, lock_warmcopy_mode: str) -> 
     )
     seed_rows = max(seed_rows, LARGE_LOCKSET_STATEMENTS_PER_TX)
     return dataclasses.replace(
-        _base_config(args, lock_warmcopy_mode.replace("-", "_"), validate=False),
+        _base_config(args, "lock_warmcopy", validate=False),
         sessions=LARGE_LOCKSET_SESSIONS,
         table_count=LARGE_LOCKSET_TABLES,
         statements_per_tx=LARGE_LOCKSET_STATEMENTS_PER_TX,
@@ -340,29 +328,10 @@ def _large_lockset_config(args: argparse.Namespace, lock_warmcopy_mode: str) -> 
         lockset_minimal_table=True,
         min_statements_before_drain_pause=operation_count,
         cycles=LARGE_LOCKSET_RUNS,
-        preserve_max_binlog_cache_bytes=max(
-            args.preserve_max_binlog_cache_bytes,
-            LARGE_LOCKSET_PRESERVE_MAX_BLOB_BYTES,
-        ),
-        preserve_max_lock_count=max(
-            args.preserve_max_lock_count,
-            LARGE_LOCKSET_PRESERVE_MAX_LOCK_COUNT,
-        ),
-        preserve_max_modified_tables=max(
-            args.preserve_max_modified_tables,
-            LARGE_LOCKSET_PRESERVE_MAX_MODIFIED_TABLES,
-        ),
-        preserve_lock_warmcopy_max_journal_bytes=max(
-            args.preserve_lock_warmcopy_max_journal_bytes,
-            LARGE_LOCKSET_LOCK_WARMCOPY_MAX_JOURNAL_BYTES,
-        ),
-        lock_warmcopy_mode=lock_warmcopy_mode,
     ).validate()
 
 
-def _scaled_lockset_config(args: argparse.Namespace, lock_warmcopy_mode: str) -> HarnessConfig:
-    minimum_lock_count = max(1, args.sessions * args.statements_per_tx * 2)
-    minimum_modified_tables = max(1, args.table_count * 2)
+def _scaled_lockset_config(args: argparse.Namespace) -> HarnessConfig:
     operation_count = _bulk_operation_count(args.statements_per_tx, args.lockset_batch_size)
     seed_rows = _bulk_seed_rows_per_table(
         args.statements_per_tx,
@@ -371,21 +340,13 @@ def _scaled_lockset_config(args: argparse.Namespace, lock_warmcopy_mode: str) ->
         args.sessions,
     )
     return dataclasses.replace(
-        _base_config(
-            args, f"scaled_{lock_warmcopy_mode.replace('-', '_')}", validate=False
-        ),
+        _base_config(args, "scaled_lock_warmcopy", validate=False),
         min_statements_before_drain_pause=operation_count,
         max_transactions_per_worker=args.cycles,
         seed_rows_per_table_per_session=max(
             args.seed_rows_per_table_per_session,
             seed_rows,
         ),
-        preserve_max_lock_count=max(args.preserve_max_lock_count, minimum_lock_count),
-        preserve_max_modified_tables=max(
-            args.preserve_max_modified_tables,
-            minimum_modified_tables,
-        ),
-        lock_warmcopy_mode=lock_warmcopy_mode,
     ).validate()
 
 
@@ -408,27 +369,11 @@ def build_scenarios(args: argparse.Namespace) -> List[BenchmarkScenario]:
         ).validate()
         scenarios.append(BenchmarkScenario("warmcopy-large-cache", config))
 
-    if "live-export-large-lockset" in requested:
-        scenarios.append(
-            BenchmarkScenario(
-                "live-export-large-lockset",
-                _large_lockset_config(args, "off"),
-            )
-        )
-
     if "lock-warmcopy-large-lockset" in requested:
         scenarios.append(
             BenchmarkScenario(
                 "lock-warmcopy-large-lockset",
-                _large_lockset_config(args, "on"),
-            )
-        )
-
-    if "scaled-live-lockset" in requested:
-        scenarios.append(
-            BenchmarkScenario(
-                "scaled-live-lockset",
-                _scaled_lockset_config(args, "off"),
+                _large_lockset_config(args),
             )
         )
 
@@ -436,7 +381,7 @@ def build_scenarios(args: argparse.Namespace) -> List[BenchmarkScenario]:
         scenarios.append(
             BenchmarkScenario(
                 "scaled-lock-warmcopy-lockset",
-                _scaled_lockset_config(args, "on"),
+                _scaled_lockset_config(args),
             )
         )
 
@@ -948,13 +893,6 @@ def run_scenario(scenario: BenchmarkScenario) -> Dict[str, object]:
          for metric in warmcopy_metrics),
         default=0,
     )
-    preserve_lock_warmcopy_seal_threads = getattr(
-        scenario.config, "preserve_lock_warmcopy_seal_threads", 0
-    )
-    preserve_startup_recovery_threads = getattr(
-        scenario.config, "preserve_startup_recovery_threads", 0
-    )
-
     return {
         "name": scenario.name,
         "wall_ms": round(wall_ms, 3),
@@ -973,22 +911,6 @@ def run_scenario(scenario: BenchmarkScenario) -> Dict[str, object]:
             scenario.config.lockset_batch_size,
         ),
         "min_statements_before_drain_pause": scenario.config.min_statements_before_drain_pause,
-        "lock_warmcopy_mode": scenario.config.lock_warmcopy_mode,
-        "preserve_max_binlog_cache_bytes": scenario.config.preserve_max_binlog_cache_bytes,
-        "preserve_max_lock_count": scenario.config.preserve_max_lock_count,
-        "preserve_max_modified_tables": scenario.config.preserve_max_modified_tables,
-        "preserve_lock_warmcopy_max_journal_bytes": (
-            scenario.config.preserve_lock_warmcopy_max_journal_bytes
-        ),
-        "preserve_lock_warmcopy_seal_threads": (
-            preserve_lock_warmcopy_seal_threads
-        ),
-        "preserve_parallel_preserve_threads": (
-            scenario.config.preserve_parallel_preserve_threads
-        ),
-        "preserve_startup_recovery_threads": (
-            preserve_startup_recovery_threads
-        ),
         "latency_scope": {
             "wall_ms": "whole E2E scenario, including workload, DRAIN, restart, RESUME, and validation",
             "warmcopy_metrics.phase1_us": "server-side warm-copy phase 1 before phase-2 preserve",
@@ -1261,9 +1183,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         choices=(
             "baseline",
             "warmcopy-large-cache",
-            "live-export-large-lockset",
             "lock-warmcopy-large-lockset",
-            "scaled-live-lockset",
             "scaled-lock-warmcopy-lockset",
             "temp-image",
             "none",
@@ -1297,32 +1217,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=3600,
         help="READY/FAILED token retention in seconds",
     )
-    parser.add_argument("--preserve-max-binlog-cache-bytes", type=int, default=1_073_741_824)
-    parser.add_argument("--preserve-max-lock-count", type=int, default=1_000_000)
-    parser.add_argument("--preserve-max-modified-tables", type=int, default=512)
-    parser.add_argument(
-        "--preserve-lock-warmcopy-max-journal-bytes",
-        type=int,
-        default=1_073_741_824,
-    )
-    parser.add_argument(
-        "--preserve-parallel-preserve-threads",
-        type=int,
-        default=0,
-        help="preserve_trx_parallel_preserve_threads for lock warmcopy target-preserve tuning; 0 keeps server auto",
-    )
-    parser.add_argument(
-        "--preserve-startup-recovery-threads",
-        type=int,
-        default=0,
-        help="preserve_trx_startup_recovery_threads configured at mysqld startup; 0 keeps server auto",
-    )
-    parser.add_argument(
-        "--preserve-lock-warmcopy-seal-threads",
-        type=int,
-        default=0,
-        help="preserve_trx_lock_warmcopy_seal_threads for lock warmcopy seal tuning; 0 keeps server auto",
-    )
     parser.add_argument("--large-binlog-cache-sessions", type=int, default=1)
     parser.add_argument(
         "--large-binlog-cache-buckets-mb",
@@ -1339,12 +1233,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--restart-command")
     parser.add_argument("--no-setup-schema", dest="setup_schema", action="store_false")
     parser.add_argument("--keep-schema", action="store_true")
-    parser.add_argument(
-        "--lock-warmcopy-mode",
-        choices=("default", "on", "off"),
-        default="default",
-        help="explicit lock warmcopy mode for non-large-lockset scenarios",
-    )
     parser.add_argument(
         "--phase2-live-baseline-scenario",
         default="baseline",
@@ -1411,20 +1299,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("--restart-command is required when workload scenarios run")
     requested_scenarios = set(args.scenario)
     if (
-        args.phase2_live_baseline_scenario == "baseline"
-        and "live-export-large-lockset" in requested_scenarios
-    ):
-        args.phase2_live_baseline_scenario = "live-export-large-lockset"
-    if (
         args.phase2_warmcopy_scenario == "warmcopy-large-cache"
         and "lock-warmcopy-large-lockset" in requested_scenarios
     ):
         args.phase2_warmcopy_scenario = "lock-warmcopy-large-lockset"
-    if (
-        args.phase2_live_baseline_scenario == "baseline"
-        and "scaled-live-lockset" in requested_scenarios
-    ):
-        args.phase2_live_baseline_scenario = "scaled-live-lockset"
     if (
         args.phase2_warmcopy_scenario == "warmcopy-large-cache"
         and "scaled-lock-warmcopy-lockset" in requested_scenarios

@@ -10,7 +10,7 @@ DROP TABLE IF EXISTS t_rtv_mdl_audit;
 DROP TABLE IF EXISTS t_rtv_mdl_base;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_rtv_mdl_base(
   id INT PRIMARY KEY,
@@ -55,7 +55,7 @@ UPDATE v_rtv_mdl_base SET v=v+30 WHERE id=3;
 --source suite/preserve_trx/include/drain_transaction_from_control.inc
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 
---exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -76,4 +76,4 @@ DROP FUNCTION f_rtv_mdl_delta;
 DROP PROCEDURE p_rtv_mdl_bump;
 DROP TABLE t_rtv_mdl_audit;
 DROP TABLE t_rtv_mdl_base;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

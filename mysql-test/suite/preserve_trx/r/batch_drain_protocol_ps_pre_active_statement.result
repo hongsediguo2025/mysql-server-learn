@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_batch_drain_protocol_ps;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_batch_drain_protocol_ps(a INT PRIMARY KEY, b INT)
 ENGINE=InnoDB;
 INSERT INTO t_batch_drain_protocol_ps VALUES(1,10),(2,20);
@@ -20,5 +20,5 @@ a	b
 1	10
 2	21
 DROP TABLE t_batch_drain_protocol_ps;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 SET DEBUG_SYNC = 'RESET';

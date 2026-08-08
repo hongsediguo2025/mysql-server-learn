@@ -5,7 +5,7 @@
 DROP TABLE IF EXISTS t_preserve_upgrade_context;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_preserve_upgrade_context(a INT PRIMARY KEY, b INT)
   ENGINE=InnoDB;
@@ -33,4 +33,4 @@ SELECT COUNT(*) AS preserved_count
   FROM performance_schema.preserved_transactions;
 
 DROP TABLE t_preserve_upgrade_context;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

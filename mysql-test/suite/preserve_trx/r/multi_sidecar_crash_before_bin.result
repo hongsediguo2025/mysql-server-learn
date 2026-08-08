@@ -1,6 +1,6 @@
 DROP TABLE IF EXISTS t_multi_sidecar_crash_before_bin;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 CREATE TABLE t_multi_sidecar_crash_before_bin(
 id INT PRIMARY KEY,
 v INT,
@@ -30,5 +30,5 @@ SELECT id, v, payload FROM t_multi_sidecar_crash_before_bin ORDER BY id;
 id	v	payload
 1	10	seed
 DROP TABLE t_multi_sidecar_crash_before_bin;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;

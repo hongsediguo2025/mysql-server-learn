@@ -1,11 +1,8 @@
-SELECT @@global.preserve_trx_enable AS preserve_enable_default_on;
+SELECT @@global.rds_preserve_trx_enable AS preserve_enable_default_on;
 preserve_enable_default_on
 1
-SELECT @@global.preserve_trx_temp_table_enable AS temp_table_enable_default_on;
+SELECT @@global.rds_preserve_trx_temp_table_enable AS temp_table_enable_default_on;
 temp_table_enable_default_on
-1
-SELECT @@global.preserve_trx_warmcopy_enable AS warmcopy_enable_default_on;
-warmcopy_enable_default_on
 1
 DROP TABLE IF EXISTS t_preserve_default_on;
 CREATE TABLE t_preserve_default_on(
@@ -16,14 +13,11 @@ INSERT INTO t_preserve_default_on VALUES(1, 10);
 START TRANSACTION;
 UPDATE t_preserve_default_on SET v = 11 WHERE id = 1;
 DRAIN TRANSACTIONS PRESERVE;
-SELECT @@global.preserve_trx_enable AS preserve_enable_after_restart;
+SELECT @@global.rds_preserve_trx_enable AS preserve_enable_after_restart;
 preserve_enable_after_restart
 1
-SELECT @@global.preserve_trx_temp_table_enable AS temp_table_enable_after_restart;
+SELECT @@global.rds_preserve_trx_temp_table_enable AS temp_table_enable_after_restart;
 temp_table_enable_after_restart
-1
-SELECT @@global.preserve_trx_warmcopy_enable AS warmcopy_enable_after_restart;
-warmcopy_enable_after_restart
 1
 RESUME PRESERVED TRANSACTION 'TOKEN';
 COMMIT;

@@ -143,15 +143,7 @@ EOF
 
 --connection default
 --let MYSQLD_DATADIR= `SELECT @@datadir`
---let $old_batch_max= `SELECT @@GLOBAL.preserve_trx_batch_max_transactions`
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_batch_max_transactions=99;
-SELECT @@global.preserve_trx_batch_max_transactions AS batch_target_limit_probe;
---error ER_PRESERVE_TRX_UNSUPPORTED
-DRAIN TRANSACTIONS PRESERVE;
-SELECT COUNT(*) AS preserved_count_after_target_limit_probe
-  FROM performance_schema.preserved_transactions;
-SET GLOBAL preserve_trx_batch_max_transactions=256;
+SET GLOBAL rds_preserve_trx_enable=ON;
 SET SESSION debug="+d,preserve_trx_batch_fail_after_one_target";
 --error ER_PRESERVE_TRX_UNSUPPORTED
 DRAIN TRANSACTIONS PRESERVE;
@@ -192,9 +184,8 @@ SELECT COUNT(*) AS rolled_back_extra_rows
 SELECT COUNT(*) = 0 AS preserved_count_final
   FROM performance_schema.preserved_transactions;
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 --disable_query_log
---eval SET GLOBAL preserve_trx_batch_max_transactions=$old_batch_max
 --enable_query_log
 --disable_query_log
 --disable_result_log

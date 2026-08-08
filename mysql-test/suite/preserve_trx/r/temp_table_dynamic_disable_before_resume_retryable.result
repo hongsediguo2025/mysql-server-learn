@@ -1,6 +1,6 @@
 DROP TABLE IF EXISTS t_temp_dynamic_disable_base;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 CREATE TABLE t_temp_dynamic_disable_base(id INT PRIMARY KEY, v INT)
 ENGINE=InnoDB;
 INSERT INTO t_temp_dynamic_disable_base VALUES(1,10);
@@ -26,7 +26,7 @@ preserved_count_after_disabled_resume
 SELECT * FROM t_temp_dynamic_disable_base ORDER BY id;
 id	v
 1	10
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 RESUME PRESERVED TRANSACTION 'TOKEN';
 SELECT * FROM tmp_dynamic_disable_before_resume ORDER BY id;
 id	v
@@ -42,5 +42,5 @@ id	v
 1	11
 DROP TEMPORARY TABLE tmp_dynamic_disable_before_resume;
 DROP TABLE t_temp_dynamic_disable_base;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

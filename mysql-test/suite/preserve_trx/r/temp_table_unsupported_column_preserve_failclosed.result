@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_temp_unsupported_column_base;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_temp_unsupported_column_base(
 id INT PRIMARY KEY,
 v INT
@@ -24,4 +24,4 @@ id	v
 1	11
 DROP TEMPORARY TABLE tmp_temp_unsupported_column;
 DROP TABLE t_temp_unsupported_column_base;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

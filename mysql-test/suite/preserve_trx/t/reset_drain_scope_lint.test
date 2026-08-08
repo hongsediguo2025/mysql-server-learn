@@ -201,7 +201,7 @@ die "RESET before artifact publication must discard warm blobs and reuse snapsho
 
 die "early workers must collect completed items and enter RESET completion immediately after join\n"
   unless $preserve =~
-         /join_workers\.rollback\(\);[\s\S]*?if \(reset_requested\(\)\) \{[\s\S]*?collect_early_preserved_items\(\);[\s\S]*?return finish_phase2_reset\(\s*&preserved_batch_items,\s*"reset_during_early_target_pipeline"\);[\s\S]*?const size_t expected_completed_workers/s;
+         /join_workers\.rollback\(\);[\s\S]*?if \(reset_requested\(\)\) \{[\s\S]*?collect_completed_target_items\(\);[\s\S]*?return finish_phase2_reset\(\s*&preserved_batch_items,\s*"reset_during_early_target_pipeline"\);[\s\S]*?const size_t expected_completed_workers/s;
 die "phase-2 workers must enter RESET completion before ordinary target failure handling\n"
   unless $preserve =~
          /const Preserve_batch_target_execution \*failed_execution[\s\S]*if \(reset_requested\(\)\)\s*return finish_phase2_reset\(&preserved_batch_items,\s*"reset_after_phase2_workers"\);\s*if \(failed_execution != nullptr\)/s;

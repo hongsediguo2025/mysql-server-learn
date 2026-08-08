@@ -1,7 +1,6 @@
 DROP TABLE IF EXISTS t_warmcopy_missing_prebuilt;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=PROMOTION_PREPARE;
 CREATE TABLE t_warmcopy_missing_prebuilt(id INT PRIMARY KEY, v INT)
 ENGINE=InnoDB;
 INSERT INTO t_warmcopy_missing_prebuilt VALUES(1,10);
@@ -33,7 +32,6 @@ WHERE VARIABLE_NAME =
 full_copy_to_count
 0
 DROP TABLE t_warmcopy_missing_prebuilt;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
-SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=BUSINESS_FIRST;
 SET DEBUG_SYNC = 'RESET';

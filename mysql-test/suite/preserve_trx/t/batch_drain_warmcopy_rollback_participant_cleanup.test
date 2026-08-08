@@ -6,9 +6,8 @@
 DROP TABLE IF EXISTS t_warmcopy_rollback;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=PROMOTION_PREPARE;
 
 CREATE TABLE t_warmcopy_rollback(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
 INSERT INTO t_warmcopy_rollback VALUES(1,10),(2,20);
@@ -43,7 +42,7 @@ SET DEBUG_SYNC = 'now SIGNAL warmcopy_rollback_continue';
 
 --connection default
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
---exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=10" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -65,7 +64,6 @@ SELECT COUNT(*) AS preserved_count_after_resume
 --source suite/preserve_trx/include/assert_no_snapshot_file.inc
 
 DROP TABLE t_warmcopy_rollback;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
-SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=BUSINESS_FIRST;
 SET DEBUG_SYNC = 'RESET';

@@ -218,7 +218,7 @@ def _expected_transfer_control_frame(frame_type, sequence, epoch_id, token, lsn)
 
 
 def _fake_fetch_rows(sql):
-    if sql == "SELECT @@global.preserve_trx_enable":
+    if sql == "SELECT @@global.rds_preserve_trx_enable":
         return [(0,)]
     if "COUNT(*), COALESCE(SUM(v),0)" in sql:
         return [(1, 1)]
@@ -458,7 +458,7 @@ class _ReceiverTransferCodecConfigRuntime(_EndpointFakeRuntime):
     def execute(self, conn, sql, fetch=False):
         self.sql.append(sql)
         self.calls.append((sql, fetch))
-        if fetch and "@@global.preserve_trx_transfer_credential_name" in sql:
+        if fetch and "@@global.rds_preserve_trx_transfer_credential_name" in sql:
             return [(self.credential_name, self.target_user)]
         if fetch:
             return _fake_fetch_rows(sql)
@@ -470,37 +470,34 @@ class _StandbyTransferEndpointConfigRuntime(_ReceiverTransferCodecConfigRuntime)
         self,
         *,
         source_artifact_mode: str = "STANDBY_TRANSFER_SAVE",
-        source_target_host: str = "",
-        source_target_port: int = 0,
-        source_target_socket: str = "/tmp/receiver.sock",
+        source_target_host: str = "127.0.0.1",
+        source_target_port: int = 3306,
         credential_name: str = "transfer_credential",
         target_user: str = "transfer_user",
-        receiver_preserve_dir: str = "/tmp/receiver-data/preserve",
+        receiver_datadir: str = "/tmp/receiver-data",
     ):
         super().__init__(credential_name=credential_name, target_user=target_user)
         self.source_artifact_mode = source_artifact_mode
         self.source_target_host = source_target_host
         self.source_target_port = source_target_port
-        self.source_target_socket = source_target_socket
-        self.receiver_preserve_dir = receiver_preserve_dir
+        self.receiver_datadir = receiver_datadir
 
     def execute(self, conn, sql, fetch=False):
         self.sql.append(sql)
         self.calls.append((sql, fetch))
-        if fetch and "@@global.preserve_trx_transfer_artifact_mode" in sql:
+        if fetch and "@@global.rds_preserve_trx_transfer_artifact_mode" in sql:
             return [
                 (
                     self.source_artifact_mode,
                     self.source_target_host,
                     self.source_target_port,
-                    self.source_target_socket,
                     self.target_user,
                     self.credential_name,
                 )
             ]
-        if fetch and "@@global.preserve_trx_dir" in sql:
-            return [(self.receiver_preserve_dir,)]
-        if fetch and "@@global.preserve_trx_transfer_credential_name" in sql:
+        if fetch and "@@global.datadir" in sql:
+            return [(self.receiver_datadir,)]
+        if fetch and "@@global.rds_preserve_trx_transfer_credential_name" in sql:
             return [(self.credential_name, self.target_user)]
         if fetch:
             return _fake_fetch_rows(sql)
@@ -1574,10 +1571,10 @@ class _TempRetryableScenarioRuntime(_FakeRuntime):
     def execute(self, conn, sql, fetch=False):
         self.sql.append(sql)
         self.calls.append((sql, fetch))
-        if sql == "SET GLOBAL preserve_trx_temp_table_enable=ON":
+        if sql == "SET GLOBAL rds_preserve_trx_temp_table_enable=ON":
             self.temp_enabled = True
             return ()
-        if sql == "SET GLOBAL preserve_trx_temp_table_enable=OFF":
+        if sql == "SET GLOBAL rds_preserve_trx_temp_table_enable=OFF":
             self.temp_enabled = False
             return ()
         if sql.startswith("DRAIN TRANSACTIONS PRESERVE"):
@@ -1962,8 +1959,6 @@ class WorkloadPlanTest(unittest.TestCase):
             sessions=1000,
             table_count=100,
             statements_per_tx=100000,
-            preserve_max_lock_count=200_000_000,
-            preserve_max_modified_tables=2000,
         ).validate()
         plan = WorkloadPlan(cfg)
 
@@ -2930,40 +2925,9 @@ class WorkloadPlanTest(unittest.TestCase):
         runner.runtime = _FakeRuntime()
         runner.configure_preserve_globals()
         sql_text = "\n".join(runner.runtime.sql)
-        self.assertNotIn("preserve_trx_temp_table_enable", sql_text)
+        self.assertNotIn("rds_preserve_trx_temp_table_enable", sql_text)
 
-    def test_lock_warmcopy_mode_controls_preserve_global(self):
-        off_runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
-        off_runner.config = HarnessConfig(lock_warmcopy_mode="off")
-        off_runner.runtime = _FakeRuntime()
-        off_runner.configure_preserve_globals()
-
-        on_runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
-        on_runner.config = HarnessConfig(lock_warmcopy_mode="on")
-        on_runner.runtime = _FakeRuntime()
-        on_runner.configure_preserve_globals()
-
-        self.assertIn(
-            "SET GLOBAL preserve_trx_lock_warmcopy_enable=OFF",
-            off_runner.runtime.sql,
-        )
-        self.assertIn(
-            "SET GLOBAL preserve_trx_lock_warmcopy_enable=ON",
-            on_runner.runtime.sql,
-        )
-
-    def test_parallel_preserve_threads_controls_preserve_global(self):
-        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
-        runner.config = HarnessConfig(preserve_parallel_preserve_threads=32)
-        runner.runtime = _FakeRuntime()
-        runner.configure_preserve_globals()
-
-        self.assertIn(
-            "SET GLOBAL preserve_trx_parallel_preserve_threads=32",
-            runner.runtime.sql,
-        )
-
-    def test_explicit_warmcopy_artifact_budget_does_not_raise_heap_budget(self):
+    def test_mixed_pressure_heap_budget_is_public_and_warmcopy_limit_internal(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
         runner.config = HarnessConfig(
             sessions=1000,
@@ -2976,18 +2940,17 @@ class WorkloadPlanTest(unittest.TestCase):
             mixed_min_completed_statements=1,
             business_run_before_drain_s=1.0,
             warmcopy_required=True,
-            preserve_warmcopy_max_total_bytes=8 * 1024**3,
         )
         runner.runtime = _FakeRuntime()
         runner.configure_preserve_globals()
 
         self.assertIn(
-            "SET GLOBAL preserve_trx_memory_budget_bytes=2147483648",
+            "SET GLOBAL rds_preserve_trx_memory_budget_bytes=2147483648",
             runner.runtime.sql,
         )
-        self.assertIn(
-            "SET GLOBAL preserve_trx_warmcopy_max_total_bytes=8589934592",
-            runner.runtime.sql,
+        self.assertFalse(
+            any("preserve_trx_warmcopy_max_total_bytes" in sql
+                for sql in runner.runtime.sql)
         )
 
     def test_expected_state_tracks_exact_committed_fingerprints_across_all_tables(self):
@@ -3065,13 +3028,7 @@ class WorkloadPlanTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             HarnessConfig(statements_per_tx=0).validate()
         with self.assertRaises(ValueError):
-            HarnessConfig(lock_warmcopy_mode="bad").validate()
-        with self.assertRaises(ValueError):
             HarnessConfig(duration_s=-1).validate()
-        with self.assertRaises(ValueError):
-            HarnessConfig(preserve_max_binlog_cache_bytes=0).validate()
-        with self.assertRaises(ValueError):
-            HarnessConfig(preserve_lock_warmcopy_max_journal_bytes=0).validate()
         with self.assertRaises(ValueError):
             HarnessConfig(
                 inflight_drain_probe=True,
@@ -3758,7 +3715,7 @@ class WorkloadPlanTest(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.assertIs(result["conn"], fresh)
 
-    def test_release_e2e_configures_shared_preserve_limits_only(self):
+    def test_release_e2e_configures_only_public_preserve_controls(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
         runner.config = HarnessConfig()
         runner.runtime = _FakeRuntime()
@@ -3766,8 +3723,9 @@ class WorkloadPlanTest(unittest.TestCase):
         runner.configure_preserve_globals()
 
         sql_text = "\n".join(runner.runtime.sql)
-        self.assertIn("SET GLOBAL preserve_trx_max_lock_count=1000000", sql_text)
-        self.assertIn("SET GLOBAL preserve_trx_max_modified_tables=512", sql_text)
+        self.assertIn("SET GLOBAL rds_preserve_trx_enable=ON", sql_text)
+        self.assertNotIn("preserve_trx_max_lock_count", sql_text)
+        self.assertNotIn("preserve_trx_max_modified_tables", sql_text)
         self.assertNotIn("preserve_trx_drain_grace_ms", sql_text)
         self.assertNotIn("preserve_trx_max_scan_pages", sql_text)
         self.assertNotIn("preserve_trx_materialize_timeout_ms", sql_text)
@@ -3780,7 +3738,7 @@ class WorkloadPlanTest(unittest.TestCase):
         runner.configure_preserve_globals()
 
         sql_text = "\n".join(runner.runtime.sql)
-        self.assertIn("SET GLOBAL preserve_trx_temp_table_enable=ON", sql_text)
+        self.assertIn("SET GLOBAL rds_preserve_trx_temp_table_enable=ON", sql_text)
 
     def test_large_temp_table_workload_configures_sidecar_budget(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
@@ -3794,15 +3752,8 @@ class WorkloadPlanTest(unittest.TestCase):
         runner.configure_preserve_globals()
 
         sql_text = "\n".join(runner.runtime.sql)
-        self.assertIn("SET GLOBAL preserve_trx_temp_table_enable=ON", sql_text)
-        expected_target = 20 * 200 * 1024 * 1024
-        expected_budget = expected_target * 2 + max(
-            1024 * 1024 * 1024, expected_target // 5
-        )
-        self.assertIn(
-            f"SET GLOBAL preserve_trx_max_temp_sidecar_bytes={expected_budget}",
-            sql_text,
-        )
+        self.assertIn("SET GLOBAL rds_preserve_trx_temp_table_enable=ON", sql_text)
+        self.assertNotIn("preserve_trx_max_temp_sidecar_bytes", sql_text)
 
     def test_large_temp_table_workload_rejects_when_disk_budget_exceeds_usable_space(self):
         cfg = HarnessConfig(
@@ -4274,7 +4225,7 @@ class WorkloadPlanTest(unittest.TestCase):
         runner.restart_server.assert_called_once()
         self.assertIn("DROP TEMPORARY TABLE tmp_retryable_resume", runner.runtime.sql)
         self.assertLess(
-            runner.runtime.sql.index("SET GLOBAL preserve_trx_warmcopy_enable=OFF"),
+            runner.runtime.sql.index("SET GLOBAL rds_preserve_trx_enable=ON"),
             runner.runtime.sql.index(
                 "DRAIN TRANSACTIONS PRESERVE WITH USER VARS"
             ),
@@ -4299,7 +4250,7 @@ class WorkloadPlanTest(unittest.TestCase):
         )
         self.assertIn("SELECT v FROM t_temp_retryable_base WHERE id=1", runner.runtime.sql)
         self.assertLess(
-            runner.runtime.sql.index("SET GLOBAL preserve_trx_warmcopy_enable=OFF"),
+            runner.runtime.sql.index("SET GLOBAL rds_preserve_trx_enable=ON"),
             runner.runtime.sql.index(
                 "DRAIN TRANSACTIONS PRESERVE WITH USER VARS"
             ),
@@ -4320,7 +4271,7 @@ class WorkloadPlanTest(unittest.TestCase):
         self.assertIn("UPDATE t_purge_readview SET v=99 WHERE id=1", runner.runtime.sql)
         runner.restart_server.assert_called_once()
         self.assertLess(
-            runner.runtime.sql.index("SET GLOBAL preserve_trx_warmcopy_enable=OFF"),
+            runner.runtime.sql.index("SET GLOBAL rds_preserve_trx_enable=ON"),
             runner.runtime.sql.index(
                 "DRAIN TRANSACTIONS PRESERVE WITH USER VARS"
             ),
@@ -5209,27 +5160,6 @@ class WorkloadPlanTest(unittest.TestCase):
 
         self.assertTrue(worker.join_called)
 
-    def test_cli_shared_preserve_budget_overrides_are_applied(self):
-        cfg = parse_args(
-            [
-                "--preserve-max-lock-count",
-                "1234",
-                "--preserve-max-modified-tables",
-                "345",
-            ]
-        )
-        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
-        runner.config = cfg
-        runner.runtime = _FakeRuntime()
-
-        runner.configure_preserve_globals()
-
-        sql_text = "\n".join(runner.runtime.sql)
-        self.assertIn("SET GLOBAL preserve_trx_max_lock_count=1234", sql_text)
-        self.assertIn("SET GLOBAL preserve_trx_max_modified_tables=345", sql_text)
-        self.assertNotIn("preserve_trx_max_scan_pages", sql_text)
-        self.assertNotIn("preserve_trx_materialize_timeout_ms", sql_text)
-
     def test_cli_inflight_drain_probe_flags_are_applied(self):
         cfg = parse_args(
             [
@@ -5344,10 +5274,6 @@ class WorkloadPlanTest(unittest.TestCase):
                 "transfer_credential",
                 "--max-receiver-ready-after-phase2-ms",
                 "100",
-                "--transfer-phase1-batch-bytes",
-                "8388608",
-                "--transfer-phase1-batch-linger-ms",
-                "50",
                 "--receiver-read-load-threads",
                 "8",
                 "--receiver-read-load-baseline-seconds",
@@ -5366,8 +5292,6 @@ class WorkloadPlanTest(unittest.TestCase):
         self.assertEqual(cfg.standby_transfer_password, "transfer_secret")
         self.assertEqual(cfg.standby_transfer_credential_name, "transfer_credential")
         self.assertEqual(cfg.max_receiver_ready_after_phase2_ms, 100)
-        self.assertEqual(cfg.transfer_phase1_batch_bytes, 8388608)
-        self.assertEqual(cfg.transfer_phase1_batch_linger_ms, 50)
         self.assertEqual(cfg.receiver_read_load_threads, 8)
         self.assertEqual(cfg.receiver_read_load_baseline_s, 5.0)
         self.assertEqual(cfg.receiver_read_load_max_qps_drop_pct, 5.0)
@@ -6039,8 +5963,6 @@ class WorkloadPlanTest(unittest.TestCase):
                 lockset_minimal_table=True,
                 receiver_unix_socket="/tmp/receiver.sock",
                 receiver_preserve_dir=str(Path(tmpdir) / "preserve"),
-                transfer_phase1_batch_bytes=8388608,
-                transfer_phase1_batch_linger_ms=50,
                 report_json=str(report_path),
             ).validate()
             runner.warmcopy_drain_metrics = [
@@ -6227,12 +6149,6 @@ class WorkloadPlanTest(unittest.TestCase):
             self.assertTrue(report["workload_lockset_noop_update"])
             self.assertTrue(report["workload_lockset_touch_one_row"])
             self.assertTrue(report["workload_lockset_minimal_table"])
-            self.assertEqual(
-                report["source_phase1_transfer_batch_bytes_config"], 8388608
-            )
-            self.assertEqual(
-                report["source_phase1_transfer_batch_linger_ms_config"], 50
-            )
             self.assertEqual(report["receiver_standby_pending_tokens"], 2)
             self.assertEqual(report["standby_tokens"], 2)
             self.assertEqual(report["receiver_epoch_fact_count"], 1)
@@ -7849,23 +7765,23 @@ class WorkloadPlanTest(unittest.TestCase):
             runner.prepare_standby_transfer_credential_secret_files()
 
             self.assertIn(
-                "--preserve-trx-transfer-credential-secret-file=",
+                "--rds-preserve-trx-transfer-credential-secret-file=",
                 runner.config.source_start_command,
             )
             self.assertIn(
-                "--preserve-trx-transfer-credential-secret-file=",
+                "--rds-preserve-trx-transfer-credential-secret-file=",
                 runner.config.restart_command,
             )
             self.assertNotIn(
-                "--preserve-trx-transfer-credential-secret-file=",
+                "--rds-preserve-trx-transfer-credential-secret-file=",
                 runner.config.receiver_start_command,
             )
             self.assertNotIn(
-                "--preserve-trx-transfer-credential-secret-file=",
+                "--rds-preserve-trx-transfer-credential-secret-file=",
                 runner.config.receiver_restart_command,
             )
             secret_arg = runner.config.source_start_command.split(
-                "--preserve-trx-transfer-credential-secret-file=", 1
+                "--rds-preserve-trx-transfer-credential-secret-file=", 1
             )[1].split()[0].strip("'\"")
             self.assertEqual(
                 Path(secret_arg).read_text(encoding="utf-8"),
@@ -7895,7 +7811,7 @@ class WorkloadPlanTest(unittest.TestCase):
         self.assertNotIn("CHANGE MASTER TO", sql_text)
         self.assertNotIn("FOR CHANNEL 'transfer_credential'", sql_text)
         self.assertNotIn(
-            "@@global.preserve_trx_transfer_credential_name", sql_text
+            "@@global.rds_preserve_trx_transfer_credential_name", sql_text
         )
         self.assertEqual(len(runner.runtime.endpoint_calls), 1)
         self.assertEqual(
@@ -7927,7 +7843,7 @@ class WorkloadPlanTest(unittest.TestCase):
             standby_transfer_credential_name="transfer_credential",
         ).validate()
         runner.runtime = _StandbyTransferEndpointConfigRuntime(
-            source_target_socket="/tmp/wrong-receiver.sock",
+            source_target_port=3307,
         )
 
         with self.assertRaisesRegex(
@@ -7967,7 +7883,7 @@ class WorkloadPlanTest(unittest.TestCase):
             standby_transfer_credential_name="transfer_credential",
         ).validate()
         runner.runtime = _StandbyTransferEndpointConfigRuntime(
-            receiver_preserve_dir="/tmp/rx/data/preserve",
+            receiver_datadir="/tmp/rx/data",
         )
 
         with self.assertRaisesRegex(
@@ -8521,7 +8437,7 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
             with self.assertRaises(SystemExit):
                 parse_args(["--large-binlog-cache-buckets-mb", "64,not-a-number"])
 
-    def test_warmcopy_required_conditionally_configures_warmcopy_globals(self):
+    def test_warmcopy_required_uses_fixed_policy_and_enables_binlog_observability(self):
         default_runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
         default_runner.config = HarnessConfig()
         default_runner.runtime = _FakeRuntime()
@@ -8529,8 +8445,7 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
         default_runner.configure_preserve_globals()
 
         default_sql_text = "\n".join(default_runner.runtime.sql)
-        self.assertIn("SET GLOBAL preserve_trx_warmcopy_enable=OFF", default_sql_text)
-        self.assertNotIn("preserve_trx_warmcopy_tail_budget_bytes", default_sql_text)
+        self.assertNotIn("preserve_trx_warmcopy_", default_sql_text)
 
         cfg = HarnessConfig(
             warmcopy_required=True,
@@ -8554,27 +8469,7 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
         self.assertIn("SET GLOBAL binlog_format=ROW", sql_text)
         self.assertNotIn("SET GLOBAL binlog_format=STATEMENT", sql_text)
         self.assertIn("SET GLOBAL log_error_verbosity=3", sql_text)
-        self.assertIn("SET GLOBAL preserve_trx_warmcopy_enable=ON", sql_text)
-        self.assertIn("SET GLOBAL preserve_trx_warmcopy_chunk_bytes=16777216", sql_text)
-        self.assertIn(
-            "SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes="
-            f"{WARMCOPY_TAIL_BUDGET_BYTES}",
-            sql_text,
-        )
-        total_settings = [
-            sql for sql in runner.runtime.sql
-            if sql.startswith("SET GLOBAL preserve_trx_warmcopy_max_total_bytes=")
-        ]
-        self.assertEqual(len(total_settings), 1)
-        configured_total = int(total_settings[0].split("=")[1])
-        effective_buckets = runner.plan.effective_large_binlog_cache_buckets_mb()
-        max_bucket_mb = max(effective_buckets) if effective_buckets else 1
-        expected_total = max(
-            runner.plan.warmcopy_reservation_bytes_for_bucket(max_bucket_mb)
-            + cfg.sessions * 1024 * 1024,
-            runner.plan.max_large_payload_bytes_per_statement(),
-        )
-        self.assertEqual(configured_total, expected_total)
+        self.assertNotIn("preserve_trx_warmcopy_", sql_text)
 
     def test_standby_receiver_metrics_enable_info_log(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
@@ -8582,24 +8477,16 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
             scenario="standby_transfer_receiver_drain_metrics",
             receiver_unix_socket="/tmp/receiver.sock",
             receiver_preserve_dir="/tmp/receiver-data/preserve",
-            transfer_phase1_batch_bytes=8388608,
-            transfer_phase1_batch_linger_ms=50,
         )
         runner.runtime = _FakeRuntime()
 
         runner.configure_preserve_globals()
 
         self.assertIn("SET GLOBAL log_error_verbosity=3", runner.runtime.sql)
-        self.assertIn(
-            "SET GLOBAL preserve_trx_transfer_phase1_batch_bytes=8388608",
-            runner.runtime.sql,
-        )
-        self.assertIn(
-            "SET GLOBAL preserve_trx_transfer_phase1_batch_linger_ms=50",
-            runner.runtime.sql,
-        )
+        self.assertFalse(any("preserve_trx_transfer_phase1_batch" in sql
+                             for sql in runner.runtime.sql))
 
-    def test_large_batch_configures_preserve_capacity_for_all_sessions(self):
+    def test_large_batch_does_not_configure_removed_capacity_gates(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
         runner.config = HarnessConfig(sessions=320)
         runner.runtime = _FakeRuntime()
@@ -8607,11 +8494,10 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
         runner.configure_preserve_globals()
 
         sql_text = "\n".join(runner.runtime.sql)
-        self.assertIn("SET GLOBAL preserve_trx_max_total=640", sql_text)
-        self.assertIn("SET GLOBAL preserve_trx_max_pending_per_user=640", sql_text)
-        self.assertIn(
-            "SET GLOBAL preserve_trx_batch_max_transactions=640", sql_text
-        )
+        self.assertIn("SET GLOBAL rds_preserve_trx_enable=ON", sql_text)
+        self.assertNotIn("preserve_trx_max_total", sql_text)
+        self.assertNotIn("preserve_trx_max_pending_per_user", sql_text)
+        self.assertNotIn("preserve_trx_batch_max_transactions", sql_text)
 
     def test_warmcopy_required_budgets_tail_for_every_session(self):
         cfg = HarnessConfig(
@@ -8634,25 +8520,9 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
             self.assertEqual(runner.plan.effective_large_binlog_cache_buckets_mb(), [64])
             runner.configure_preserve_globals()
 
-        total_settings = [
-            sql for sql in runner.runtime.sql
-            if sql.startswith("SET GLOBAL preserve_trx_warmcopy_max_total_bytes=")
-        ]
-        tail_settings = [
-            sql for sql in runner.runtime.sql
-            if sql.startswith("SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes=")
-        ]
-        self.assertEqual(len(total_settings), 1)
-        self.assertEqual(len(tail_settings), 1)
-        configured_tail = int(tail_settings[0].split("=")[1])
-        configured_total = int(total_settings[0].split("=")[1])
-        self.assertEqual(configured_tail, 1024 * 1024)
-        self.assertGreaterEqual(
-            configured_total,
-            (100 * configured_tail) + (2 * 64 * 1024 * 1024) +
-            (100 * 1024 * 1024),
-        )
-        self.assertLess(configured_total, (100 + 2) * 64 * 1024 * 1024)
+        self.assertFalse(any("preserve_trx_warmcopy_" in sql
+                             for sql in runner.runtime.sql))
+        self.assertEqual(runner.plan.warmcopy_tail_budget_bytes(64), 1024 * 1024)
 
     def test_warmcopy_required_full_profile_avoids_per_session_large_tail(self):
         cfg = HarnessConfig(
@@ -8675,25 +8545,9 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
         ):
             runner.configure_preserve_globals()
 
-        total_settings = [
-            sql for sql in runner.runtime.sql
-            if sql.startswith("SET GLOBAL preserve_trx_warmcopy_max_total_bytes=")
-        ]
-        tail_settings = [
-            sql for sql in runner.runtime.sql
-            if sql.startswith("SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes=")
-        ]
-        self.assertEqual(len(total_settings), 1)
-        self.assertEqual(len(tail_settings), 1)
-        configured_tail = int(tail_settings[0].split("=")[1])
-        configured_total = int(total_settings[0].split("=")[1])
-        self.assertEqual(configured_tail, 1024 * 1024)
-        self.assertGreaterEqual(
-            configured_total,
-            (320 * configured_tail) + (8 * 64 * 1024 * 1024) +
-            (320 * 1024 * 1024),
-        )
-        self.assertLess(configured_total, 2 * 1024 * 1024 * 1024)
+        self.assertFalse(any("preserve_trx_warmcopy_" in sql
+                             for sql in runner.runtime.sql))
+        self.assertEqual(runner.plan.warmcopy_tail_budget_bytes(64), 1024 * 1024)
 
     def test_warmcopy_required_scales_phase2_timeout_for_full_profile(self):
         cfg = HarnessConfig(
@@ -8719,7 +8573,7 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
         phase2_timeout_settings = [
             sql
             for sql in runner.runtime.sql
-            if sql.startswith("SET GLOBAL preserve_trx_drain_phase2_timeout_ms=")
+            if sql.startswith("SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms=")
         ]
         self.assertEqual(len(phase2_timeout_settings), 1)
         configured_timeout_ms = int(phase2_timeout_settings[0].split("=")[1])
@@ -8762,11 +8616,11 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
             sql
             for sql in runner.runtime.sql
             if sql.startswith(
-                "SET GLOBAL preserve_trx_token_retention_timeout_ms="
+                "SET GLOBAL rds_preserve_trx_token_retention_timeout_ms="
             )
         ]
         self.assertEqual(
-            ["SET GLOBAL preserve_trx_token_retention_timeout_ms=600000"],
+            ["SET GLOBAL rds_preserve_trx_token_retention_timeout_ms=600000"],
             retention_settings,
         )
 
@@ -8785,13 +8639,8 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
 
         runner.configure_preserve_globals()
 
-        total_settings = [
-            sql for sql in runner.runtime.sql
-            if sql.startswith("SET GLOBAL preserve_trx_warmcopy_max_total_bytes=")
-        ]
-        self.assertEqual(len(total_settings), 1)
-        configured_total = int(total_settings[0].split("=")[1])
-        self.assertGreaterEqual(configured_total, 200 * 1024 * 1024)
+        self.assertFalse(any("preserve_trx_warmcopy_" in sql
+                             for sql in runner.runtime.sql))
 
     def test_mixed_pressure_keeps_its_warmcopy_capacity_budget(self):
         cfg = HarnessConfig(
@@ -8814,12 +8663,12 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
 
         runner.configure_preserve_globals()
 
-        total_settings = [
-            sql for sql in runner.runtime.sql
-            if sql.startswith("SET GLOBAL preserve_trx_warmcopy_max_total_bytes=")
-        ]
-        self.assertEqual(len(total_settings), 1)
-        self.assertEqual(int(total_settings[0].split("=")[1]), 2 * 1024**3)
+        self.assertIn(
+            "SET GLOBAL rds_preserve_trx_memory_budget_bytes=2147483648",
+            runner.runtime.sql,
+        )
+        self.assertFalse(any("preserve_trx_warmcopy_" in sql
+                             for sql in runner.runtime.sql))
 
     def test_mixed_long_command_is_visible_before_execute_completes(self):
         class BlockingLongCommandRuntime(_FakeRuntime):
@@ -8972,8 +8821,8 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
         runner.configure_no_preserve_baseline_globals()
 
         self.assertIn("SET GLOBAL binlog_format=ROW", runner.runtime.sql)
-        self.assertIn("SELECT @@global.preserve_trx_enable", runner.runtime.sql)
-        self.assertNotIn("SET GLOBAL preserve_trx_enable=OFF", runner.runtime.sql)
+        self.assertIn("SELECT @@global.rds_preserve_trx_enable", runner.runtime.sql)
+        self.assertNotIn("SET GLOBAL rds_preserve_trx_enable=OFF", runner.runtime.sql)
         self.assertNotIn("SET GLOBAL preserve_trx_warmcopy_enable=OFF", runner.runtime.sql)
         self.assertFalse(
             any(
@@ -8987,7 +8836,7 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
             def execute(self, conn, sql, fetch=False):
                 self.sql.append(sql)
                 self.calls.append((sql, fetch))
-                if fetch and sql == "SELECT @@global.preserve_trx_enable":
+                if fetch and sql == "SELECT @@global.rds_preserve_trx_enable":
                     return [(1,)]
                 if fetch:
                     return _fake_fetch_rows(sql)
@@ -9001,10 +8850,10 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
         )
         runner.runtime = PreserveEnabledRuntime()
 
-        with self.assertRaisesRegex(AssertionError, "started with preserve_trx_enable=OFF"):
+        with self.assertRaisesRegex(AssertionError, "started with rds_preserve_trx_enable=OFF"):
             runner.configure_no_preserve_baseline_globals()
 
-        self.assertNotIn("SET GLOBAL preserve_trx_enable=OFF", runner.runtime.sql)
+        self.assertNotIn("SET GLOBAL rds_preserve_trx_enable=OFF", runner.runtime.sql)
 
     def test_binlog_equivalence_configures_row_binlog_format(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
@@ -9256,7 +9105,8 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
         runner.config = HarnessConfig(
             sessions=2,
             strict_token_count=True,
-            lock_warmcopy_mode="on",
+            lockset_batch_size=1,
+            seed_rows_per_table_per_session=100,
         )
         runner.plan = WorkloadPlan(runner.config)
         runner.runtime = _ResumeMappingRuntime([(1, 10, 0), (2, 10, 0)])
@@ -9878,7 +9728,6 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
             runner.config = HarnessConfig(
                 sessions=2,
                 strict_token_count=True,
-                lock_warmcopy_mode="on",
                 server_error_log=error_log.name,
                 max_phase2_total_ms=2000,
             )
@@ -10142,7 +9991,6 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
                 temp_table_workload=True,
                 temp_table_target_mb=200,
                 temp_table_resume_action="continue",
-                lock_warmcopy_mode="on",
                 max_phase2_total_ms=2000,
                 report_json=str(report_path),
             )
@@ -10881,16 +10729,11 @@ class ResetDrainHarnessTest(unittest.TestCase):
                 mock.call(
                     connection,
                     "SET GLOBAL "
-                    "preserve_trx_transfer_receiver_prewarm_timeout_ms=1000",
+                    "rds_preserve_trx_token_retention_timeout_ms=1000",
                 ),
                 mock.call(
                     connection,
-                    "SET GLOBAL "
-                    "preserve_trx_token_retention_timeout_ms=1000",
-                ),
-                mock.call(
-                    connection,
-                    "SET GLOBAL preserve_trx_transfer_prewarm_paused=ON",
+                    "SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=ON",
                 ),
             ],
         )
@@ -10908,7 +10751,7 @@ class ResetDrainHarnessTest(unittest.TestCase):
 
         runner.runtime.execute.assert_called_once_with(
             connection,
-            "SET GLOBAL preserve_trx_transfer_prewarm_paused=OFF",
+            "SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=OFF",
         )
         self.assertFalse(runner.reset_receiver_prewarm_paused)
         self.assertTrue(connection.closed)

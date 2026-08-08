@@ -1,10 +1,9 @@
 DROP TABLE IF EXISTS t_closing_command_cutoff;
 DROP USER IF EXISTS closing_command_app@localhost;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
-SET GLOBAL preserve_trx_drain_phase2_timeout_ms=5000;
-SET GLOBAL preserve_trx_drain_phase2_timeout_ms=30000;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=PROMOTION_PREPARE;
+SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms=5000;
+SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms=30000;
 CREATE TABLE t_closing_command_cutoff(
 id INT PRIMARY KEY,
 v INT NOT NULL
@@ -68,7 +67,7 @@ id	v
 1	10
 DROP TABLE t_closing_command_cutoff;
 DROP USER closing_command_app@localhost;
-SET GLOBAL preserve_trx_drain_phase2_timeout_ms=30000;
-SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
-SET GLOBAL preserve_trx_drain_phase2_timeout_ms=1000;
+SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms=30000;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=BUSINESS_FIRST;
+SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms=1000;
 SET DEBUG_SYNC = 'RESET';

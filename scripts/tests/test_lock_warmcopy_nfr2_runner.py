@@ -36,24 +36,10 @@ class LockWarmcopyNfr2RunnerTest(unittest.TestCase):
         self.assertIn(f"log-bin={paths.run_dir / 'mysql-bin'}", rendered)
         self.assertIn("loose-mysqlx=0", rendered)
         self.assertIn(f"loose-mysqlx-socket={paths.mysqlx_socket}", rendered)
-        self.assertIn("preserve-trx-enable=ON", rendered)
-        self.assertIn("preserve-trx-lock-warmcopy-enable=ON", rendered)
+        self.assertIn("rds-preserve-trx-enable=ON", rendered)
         self.assertIn("max-connections=17", rendered)
         self.assertNotIn("preserve-trx-max-scan-pages", rendered)
         self.assertNotIn("preserve-trx-materialize-timeout-ms", rendered)
-
-    def test_render_my_cnf_supports_startup_recovery_thread_override(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            repo = Path(tmpdir) / "repo"
-            build = repo / "build-release"
-            work = build / "lock-warmcopy-nfr2"
-            paths = resolve_paths(repo, build, work)
-
-            rendered = render_my_cnf(
-                paths, ServerOptions(preserve_startup_recovery_threads=16)
-            )
-
-        self.assertIn("preserve-trx-startup-recovery-threads=16", rendered)
 
     def test_render_my_cnf_supports_extra_startup_options(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -66,13 +52,13 @@ class LockWarmcopyNfr2RunnerTest(unittest.TestCase):
                 paths,
                 ServerOptions(
                     extra_mysqld_options=[
-                        "preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE",
+                        "rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE",
                     ]
                 ),
             )
 
         self.assertIn(
-            "preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE",
+            "rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE",
             rendered,
         )
 
@@ -197,7 +183,6 @@ class LockWarmcopyNfr2RunnerTest(unittest.TestCase):
                 cycles=1,
                 drain_interval_s=0.25,
                 preserve_timeout_s=60,
-                lock_warmcopy_mode="on",
             )
 
         self.assertIn(
@@ -211,8 +196,7 @@ class LockWarmcopyNfr2RunnerTest(unittest.TestCase):
         self.assertIn("--server-pid-file", command)
         pid_file_index = command.index("--server-pid-file")
         self.assertEqual(str(paths.pid_file), command[pid_file_index + 1])
-        self.assertIn("--lock-warmcopy-mode", command)
-        self.assertIn("on", command)
+        self.assertNotIn("--lock-warmcopy-mode", command)
         self.assertIn("--min-statements-before-drain-pause", command)
         min_pause_index = command.index("--min-statements-before-drain-pause")
         self.assertEqual("5", command[min_pause_index + 1])
@@ -231,7 +215,6 @@ class LockWarmcopyNfr2RunnerTest(unittest.TestCase):
                 cycles=1,
                 drain_interval_s=0.25,
                 preserve_timeout_s=60,
-                lock_warmcopy_mode="on",
             )
 
         min_pause_index = command.index("--min-statements-before-drain-pause")
@@ -249,8 +232,8 @@ class LockWarmcopyNfr2RunnerTest(unittest.TestCase):
             str(paths.repo_root / "scripts" / "resumable_trx_nfr2_benchmark.py"),
             command,
         )
-        self.assertEqual(2, command.count("--scenario"))
-        self.assertIn("live-export-large-lockset", command)
+        self.assertEqual(1, command.count("--scenario"))
+        self.assertNotIn("live-export-large-lockset", command)
         self.assertIn("lock-warmcopy-large-lockset", command)
         lockset_batch_index = command.index("--lockset-batch-size")
         self.assertEqual("100000", command[lockset_batch_index + 1])
@@ -262,7 +245,7 @@ class LockWarmcopyNfr2RunnerTest(unittest.TestCase):
         self.assertIn("--server-pid-file", command)
         pid_file_index = command.index("--server-pid-file")
         self.assertEqual(str(paths.pid_file), command[pid_file_index + 1])
-        self.assertIn("--require-phase2-p95-below-baseline", command)
+        self.assertNotIn("--require-phase2-p95-below-baseline", command)
         self.assertIn("--require-phase2-p95-under-ms", command)
         strict_p95_index = command.index("--require-phase2-p95-under-ms")
         self.assertEqual("5000", command[strict_p95_index + 1])
@@ -283,53 +266,6 @@ class LockWarmcopyNfr2RunnerTest(unittest.TestCase):
         strict_p95_index = command.index("--require-phase2-p95-under-ms")
         self.assertEqual("1000", command[strict_p95_index + 1])
 
-    def test_full_benchmark_command_supports_warmcopy_only_large_lockset_gate(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            repo = Path(tmpdir) / "repo"
-            output = Path(tmpdir) / "warmcopy-report.json"
-            paths = resolve_paths(repo, Path("build-release"), None)
-
-            command = build_full_benchmark_command(
-                paths,
-                output,
-                warmcopy_only=True,
-                preserve_parallel_preserve_threads=32,
-            )
-
-        self.assertEqual(1, command.count("--scenario"))
-        self.assertNotIn("live-export-large-lockset", command)
-        self.assertIn("lock-warmcopy-large-lockset", command)
-        self.assertIn("--lockset-noop-update", command)
-        self.assertIn("--lockset-touch-one-row", command)
-        self.assertIn("--lockset-minimal-table", command)
-        self.assertNotIn("--require-phase2-p95-below-baseline", command)
-        self.assertIn("--require-phase2-p95-under-ms", command)
-        strict_p95_index = command.index("--require-phase2-p95-under-ms")
-        self.assertEqual("5000", command[strict_p95_index + 1])
-        self.assertIn("--require-no-warmcopy-fallback", command)
-        self.assertNotIn("--require-phase2-slo-guaranteed", command)
-        parallel_index = command.index("--preserve-parallel-preserve-threads")
-        self.assertEqual("32", command[parallel_index + 1])
-        resume_timeout_index = command.index("--resume-timeout")
-        self.assertEqual("1800", command[resume_timeout_index + 1])
-        self.assertIn(str(output), command)
-
-    def test_full_benchmark_command_supports_startup_recovery_thread_override(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            repo = Path(tmpdir) / "repo"
-            output = Path(tmpdir) / "warmcopy-report.json"
-            paths = resolve_paths(repo, Path("build-release"), None)
-
-            command = build_full_benchmark_command(
-                paths,
-                output,
-                warmcopy_only=True,
-                preserve_startup_recovery_threads=16,
-            )
-
-        startup_index = command.index("--preserve-startup-recovery-threads")
-        self.assertEqual("16", command[startup_index + 1])
-
     def test_scaled_benchmark_command_uses_configurable_lockset_gate(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir) / "repo"
@@ -348,16 +284,15 @@ class LockWarmcopyNfr2RunnerTest(unittest.TestCase):
                 drain_interval_s=0.25,
                 business_run_before_drain_s=7.5,
                 preserve_timeout_s=300,
-                preserve_parallel_preserve_threads=32,
             )
 
-        self.assertEqual(2, command.count("--scenario"))
-        self.assertIn("scaled-live-lockset", command)
+        self.assertEqual(1, command.count("--scenario"))
+        self.assertNotIn("scaled-live-lockset", command)
         self.assertIn("scaled-lock-warmcopy-lockset", command)
         self.assertIn("--server-pid-file", command)
         pid_file_index = command.index("--server-pid-file")
         self.assertEqual(str(paths.pid_file), command[pid_file_index + 1])
-        self.assertIn("--require-phase2-p95-below-baseline", command)
+        self.assertNotIn("--require-phase2-p95-below-baseline", command)
         for flag, value in (
             ("--sessions", "12"),
             ("--table-count", "6"),
@@ -368,39 +303,10 @@ class LockWarmcopyNfr2RunnerTest(unittest.TestCase):
             ("--drain-interval", "0.25"),
             ("--business-run-before-drain", "7.5"),
             ("--preserve-timeout", "300"),
-            ("--preserve-parallel-preserve-threads", "32"),
         ):
             index = command.index(flag)
             self.assertEqual(value, command[index + 1])
         self.assertIn(str(output), command)
-
-    def test_scaled_benchmark_command_supports_warmcopy_only(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            repo = Path(tmpdir) / "repo"
-            output = Path(tmpdir) / "scaled-warmcopy-report.json"
-            paths = resolve_paths(repo, Path("build-release"), None)
-
-            command = build_scaled_benchmark_command(
-                paths,
-                output,
-                sessions=12,
-                tables=6,
-                statements_per_tx=40,
-                seed_rows_per_table_per_session=20,
-                lockset_batch_size=10,
-                cycles=2,
-                drain_interval_s=0.25,
-                business_run_before_drain_s=0.0,
-                preserve_timeout_s=300,
-                warmcopy_only=True,
-            )
-
-        self.assertEqual(1, command.count("--scenario"))
-        self.assertNotIn("scaled-live-lockset", command)
-        self.assertIn("scaled-lock-warmcopy-lockset", command)
-        self.assertNotIn("--require-phase2-p95-below-baseline", command)
-        self.assertIn(str(output), command)
-
 
 if __name__ == "__main__":
     unittest.main()

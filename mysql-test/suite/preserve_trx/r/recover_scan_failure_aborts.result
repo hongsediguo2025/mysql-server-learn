@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_recover_scan_failure;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_recover_scan_failure(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_recover_scan_failure VALUES(1,10);
 START TRANSACTION;
@@ -8,7 +8,7 @@ a	b
 1	10
 UPDATE t_recover_scan_failure SET b=11 WHERE a=1;
 DRAIN TRANSACTIONS PRESERVE;
-# restart_abort: --preserve-trx-enable=ON --debug=d,preserve_trx_fail_recover_scan
+# restart_abort: --rds-preserve-trx-enable=ON --debug=d,preserve_trx_fail_recover_scan
 include/wait_for_pattern_in_file.inc [Failed to scan preserved transaction directory .* during recovery]
 include/wait_for_expected_crash.inc [safe_process]
 SELECT COUNT(*) AS remaining_preserved
@@ -19,4 +19,4 @@ SELECT * FROM t_recover_scan_failure ORDER BY a;
 a	b
 1	10
 DROP TABLE t_recover_scan_failure;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

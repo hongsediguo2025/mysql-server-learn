@@ -1,1 +1,2 @@
 --skip-log-bin
+--rds-preserve-trx-transfer-artifact-mode=LOCAL_CARRIER

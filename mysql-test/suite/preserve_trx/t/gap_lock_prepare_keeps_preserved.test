@@ -6,7 +6,7 @@
 DROP TABLE IF EXISTS t_preserve_gap_prepare;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_preserve_gap_prepare(
   id INT PRIMARY KEY,
@@ -26,7 +26,7 @@ SET SESSION debug="+d,ib_force_release_gap_lock_prepare";
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 DRAIN TRANSACTIONS PRESERVE;
 --source include/wait_until_disconnected.inc
---exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -52,4 +52,4 @@ INSERT INTO t_preserve_gap_prepare VALUES(15,15);
 SELECT * FROM t_preserve_gap_prepare ORDER BY id;
 
 DROP TABLE t_preserve_gap_prepare;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

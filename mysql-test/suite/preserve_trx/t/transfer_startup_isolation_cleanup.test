@@ -2,7 +2,7 @@
 --source include/force_restart.inc
 
 --let MYSQLD_DATADIR= `SELECT @@datadir`
---let $PRESERVE_TRX_DIR= `SELECT @@global.preserve_trx_dir`
+--let $PRESERVE_TRX_DIR= `SELECT CONCAT(@@global.datadir, 'preserve/')`
 --let $UNKNOWN_SENTINEL= $PRESERVE_TRX_DIR/startup-isolation.unknown
 --let $KNOWN_TOKEN= 91001
 --let $KNOWN_MARKER= $PRESERVE_TRX_DIR/$KNOWN_TOKEN.standby_pending
@@ -19,7 +19,7 @@ CALL mtr.add_suppression("PRESERVE: transfer startup cleanup incomplete");
 --exec printf snapshot > "$KNOWN_SNAPSHOT"
 --exec printf staged > "$TRANSFER_OBJECT"
 
---let $restart_parameters= restart: --preserve-trx-enable=ON --preserve-trx-transfer-artifact-mode=LOCAL_CARRIER --skip-log-bin
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=LOCAL_CARRIER --skip-log-bin
 --source include/restart_mysqld.inc
 --let $restart_parameters=
 
@@ -34,7 +34,7 @@ CALL mtr.add_suppression("PRESERVE: transfer startup cleanup incomplete");
 --exec printf corrupt > "$KNOWN_SNAPSHOT"
 --exec printf staged > "$TRANSFER_OBJECT"
 
---let $restart_parameters= restart: --preserve-trx-enable=ON --preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --skip-log-bin
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --skip-log-bin
 --source include/restart_mysqld.inc
 --let $restart_parameters=
 

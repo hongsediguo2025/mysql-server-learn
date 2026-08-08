@@ -6,7 +6,7 @@
 DROP TABLE IF EXISTS t_resume_delete_failure;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 --disable_query_log
 CALL mtr.add_suppression("Preserved transaction .* snapshot cleanup failed after resume; transaction remains attached");
@@ -24,14 +24,14 @@ UPDATE t_resume_delete_failure SET b=11 WHERE a=1;
 --let $preserve_trx_drain_clause=
 --source suite/preserve_trx/include/drain_transaction_from_control.inc
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
---exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
 
 --source suite/preserve_trx/include/get_preserved_token.inc
---let $PRESERVED_TAINTED_FILE= `SELECT CONCAT(@@global.preserve_trx_dir, '$preserved_token', '.tainted')`
---let $CONSUME_FILE= `SELECT CONCAT(@@global.preserve_trx_dir, '$preserved_token', '.consume_state')`
+--let $PRESERVED_TAINTED_FILE= `SELECT CONCAT(@@global.datadir, 'preserve/', '$preserved_token', '.tainted')`
+--let $CONSUME_FILE= `SELECT CONCAT(@@global.datadir, 'preserve/', '$preserved_token', '.consume_state')`
 
 SET SESSION debug="+d,preserve_trx_fail_delete_snapshot_files";
 
@@ -66,7 +66,7 @@ EOF
 
 COMMIT;
 
---let $restart_parameters= restart: --preserve-trx-enable=ON --skip-log-bin
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --skip-log-bin
 --source include/restart_mysqld.inc
 --let $restart_parameters=
 
@@ -88,4 +88,4 @@ EOF
 SELECT * FROM t_resume_delete_failure ORDER BY a;
 
 DROP TABLE t_resume_delete_failure;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

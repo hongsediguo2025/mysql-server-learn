@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_read_view_pin;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_read_view_pin(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_read_view_pin VALUES(1,10),(2,20);
 SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
@@ -18,4 +18,4 @@ a	b
 1	10
 2	21
 DROP TABLE t_read_view_pin;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

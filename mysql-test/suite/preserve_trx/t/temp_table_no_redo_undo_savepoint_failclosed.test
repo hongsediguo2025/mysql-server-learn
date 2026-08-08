@@ -1,8 +1,8 @@
 --source include/not_log_bin.inc
 --source include/force_restart.inc
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 
 CREATE TEMPORARY TABLE tmp_preserve_savepoint(
   id INT PRIMARY KEY,
@@ -31,5 +31,5 @@ SELECT * FROM tmp_preserve_savepoint ORDER BY id;
 
 DROP TEMPORARY TABLE tmp_preserve_savepoint;
 --source suite/preserve_trx/include/assert_no_preserve_residue.inc
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;

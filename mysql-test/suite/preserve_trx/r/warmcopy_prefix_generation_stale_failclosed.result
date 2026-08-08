@@ -1,9 +1,6 @@
 DROP TABLE IF EXISTS t_warmcopy_prefix_stale;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
-SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes=4096;
-SET GLOBAL preserve_trx_warmcopy_chunk_bytes=1024;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=PROMOTION_PREPARE;
 CREATE TABLE t_warmcopy_prefix_stale(
 id INT PRIMARY KEY,
 v INT,
@@ -39,9 +36,6 @@ ORDER BY id;
 id	v	payload_len	payload_ok
 1	11	1024	1
 DROP TABLE t_warmcopy_prefix_stale;
-SET GLOBAL preserve_trx_warmcopy_chunk_bytes=1048576;
-SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes=1048576;
-SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
-SET GLOBAL preserve_trx_warmcopy_enable=ON;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=BUSINESS_FIRST;
+SET GLOBAL rds_preserve_trx_enable=ON;
 SET DEBUG_SYNC = 'RESET';

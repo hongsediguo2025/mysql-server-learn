@@ -3,7 +3,7 @@ CALL mtr.add_suppression("Preserved transaction .* recovery cleanup failed: fail
 CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: preserved transaction snapshot tainted");
 CALL mtr.add_suppression("Preserved transaction batch cleanup failed after debug injected target error");
 DROP TABLE IF EXISTS t_batch_reattach_cleanup_delete;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_batch_reattach_cleanup_delete(
 id INT PRIMARY KEY,
 v INT
@@ -45,7 +45,7 @@ SELECT 1;
 1
 1
 COMMIT;
-# restart: --preserve-trx-enable=ON
+# restart: --rds-preserve-trx-enable=ON
 SELECT COUNT(*) AS preserved_count_after_before_unlink_restart
 FROM performance_schema.preserved_transactions;
 preserved_count_after_before_unlink_restart
@@ -55,4 +55,4 @@ id	v
 1	10
 3	30
 DROP TABLE t_batch_reattach_cleanup_delete;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

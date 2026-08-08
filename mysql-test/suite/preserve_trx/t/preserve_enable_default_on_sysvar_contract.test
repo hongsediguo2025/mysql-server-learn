@@ -1,8 +1,7 @@
 --source include/force_restart.inc
 
-SELECT @@global.preserve_trx_enable AS preserve_enable_default_on;
-SELECT @@global.preserve_trx_temp_table_enable AS temp_table_enable_default_on;
-SELECT @@global.preserve_trx_warmcopy_enable AS warmcopy_enable_default_on;
+SELECT @@global.rds_preserve_trx_enable AS preserve_enable_default_on;
+SELECT @@global.rds_preserve_trx_temp_table_enable AS temp_table_enable_default_on;
 
 --disable_warnings
 DROP TABLE IF EXISTS t_preserve_default_on;
@@ -27,9 +26,8 @@ UPDATE t_preserve_default_on SET v = 11 WHERE id = 1;
 --source include/wait_until_connected_again.inc
 --disable_reconnect
 
-SELECT @@global.preserve_trx_enable AS preserve_enable_after_restart;
-SELECT @@global.preserve_trx_temp_table_enable AS temp_table_enable_after_restart;
-SELECT @@global.preserve_trx_warmcopy_enable AS warmcopy_enable_after_restart;
+SELECT @@global.rds_preserve_trx_enable AS preserve_enable_after_restart;
+SELECT @@global.rds_preserve_trx_temp_table_enable AS temp_table_enable_after_restart;
 
 --source suite/preserve_trx/include/get_preserved_token.inc
 --replace_result $preserved_token TOKEN

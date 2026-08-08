@@ -4,7 +4,7 @@ DROP FUNCTION IF EXISTS f_rtv_mdl_delta;
 DROP PROCEDURE IF EXISTS p_rtv_mdl_bump;
 DROP TABLE IF EXISTS t_rtv_mdl_audit;
 DROP TABLE IF EXISTS t_rtv_mdl_base;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_rtv_mdl_base(
 id INT PRIMARY KEY,
 v INT NOT NULL
@@ -56,4 +56,4 @@ DROP FUNCTION f_rtv_mdl_delta;
 DROP PROCEDURE p_rtv_mdl_bump;
 DROP TABLE t_rtv_mdl_audit;
 DROP TABLE t_rtv_mdl_base;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

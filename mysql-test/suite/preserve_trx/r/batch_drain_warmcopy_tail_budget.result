@@ -1,9 +1,7 @@
 DROP TABLE IF EXISTS t_warmcopy_tail;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
-SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes=8;
-CREATE TABLE t_warmcopy_tail(id INT PRIMARY KEY, payload VARBINARY(1024))
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=PROMOTION_PREPARE;
+CREATE TABLE t_warmcopy_tail(id INT PRIMARY KEY, payload VARBINARY(60000))
 ENGINE=InnoDB;
 INSERT INTO t_warmcopy_tail VALUES(1,REPEAT('a',512));
 START TRANSACTION;
@@ -13,7 +11,6 @@ SET DEBUG_SYNC =
 DRAIN TRANSACTIONS PRESERVE;
 SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_tail_hwm TIMEOUT 10';
 include/assert.inc [warm-copy tail-budget test has an admitted prebuilt prefix before tail update]
-UPDATE t_warmcopy_tail SET payload=REPEAT('c',1024) WHERE id=1;
 SET DEBUG_SYNC = 'RESET';
 SET DEBUG_SYNC = 'now SIGNAL warmcopy_tail_continue';
 ERROR HY000: Resumable transactions across shutdown do not support this operation
@@ -24,10 +21,8 @@ preserved_count
 0
 SELECT OCTET_LENGTH(payload) AS payload_len FROM t_warmcopy_tail;
 payload_len
-1024
+60000
 DROP TABLE t_warmcopy_tail;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes=1048576;
-SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
-SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=BUSINESS_FIRST;
 SET DEBUG_SYNC = 'RESET';

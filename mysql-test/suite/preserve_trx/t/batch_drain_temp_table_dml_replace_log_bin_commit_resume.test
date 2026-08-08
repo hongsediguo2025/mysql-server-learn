@@ -1,7 +1,7 @@
 --source include/force_restart.inc
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 
 CREATE TABLE t_batch_temp_replace_split(
   sid INT NOT NULL,
@@ -51,7 +51,7 @@ VALUES
 DRAIN TRANSACTIONS PRESERVE WITH USER VARS;
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 
---exec echo "restart: --preserve-trx-enable=ON --preserve-trx-temp-table-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-temp-table-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -74,5 +74,5 @@ SELECT sid,k,v,counter,note FROM t_batch_temp_replace_split ORDER BY sid,k;
 DROP TEMPORARY TABLE tmp_batch_temp_replace_split;
 DROP TABLE t_batch_temp_replace_split;
 --source suite/preserve_trx/include/assert_no_preserve_residue.inc
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;

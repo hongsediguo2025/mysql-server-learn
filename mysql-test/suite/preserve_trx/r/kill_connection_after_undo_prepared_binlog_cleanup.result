@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_preserve_kill_after_undo_binlog;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_preserve_kill_after_undo_binlog(a INT PRIMARY KEY, b INT)
 ENGINE=InnoDB;
 INSERT INTO t_preserve_kill_after_undo_binlog VALUES(1,10);
@@ -31,4 +31,4 @@ a	b
 include/assert_grep.inc [New transaction remains in binlog after post-prepare kill cleanup]
 include/assert_grep.inc [Killed post-prepare preserve transaction is discarded from binlog cache]
 DROP TABLE t_preserve_kill_after_undo_binlog;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

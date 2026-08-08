@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_recover_enable_off;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_recover_enable_off(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_recover_enable_off VALUES(1,10);
 START TRANSACTION;
@@ -8,7 +8,7 @@ a	b
 1	10
 UPDATE t_recover_enable_off SET b=11 WHERE a=1;
 DRAIN TRANSACTIONS PRESERVE;
-SELECT @@global.preserve_trx_enable AS enable_after_restart;
+SELECT @@global.rds_preserve_trx_enable AS enable_after_restart;
 enable_after_restart
 0
 SELECT COUNT(*) AS recovered_while_disabled
@@ -18,8 +18,8 @@ recovered_while_disabled
 SELECT * FROM t_recover_enable_off ORDER BY a;
 a	b
 1	10
-# restart: --preserve-trx-enable=ON --skip-log-bin
-SELECT @@global.preserve_trx_enable AS enable_after_enabled_restart;
+# restart: --rds-preserve-trx-enable=ON --skip-log-bin
+SELECT @@global.rds_preserve_trx_enable AS enable_after_enabled_restart;
 enable_after_enabled_restart
 1
 SELECT COUNT(*) AS recovered_after_enabled_restart
@@ -30,4 +30,4 @@ SELECT * FROM t_recover_enable_off ORDER BY a;
 a	b
 1	10
 DROP TABLE t_recover_enable_off;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

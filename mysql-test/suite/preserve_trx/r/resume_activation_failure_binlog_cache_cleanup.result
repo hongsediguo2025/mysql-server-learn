@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_resume_activation_binlog;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_resume_activation_binlog(a INT PRIMARY KEY, b INT)
 ENGINE=InnoDB;
 INSERT INTO t_resume_activation_binlog VALUES(1,10),(2,20);
@@ -40,4 +40,4 @@ SET SESSION sql_log_bin=0;
 DROP TABLE t_resume_activation_binlog;
 SET SESSION sql_log_bin=1;
 RESET MASTER;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

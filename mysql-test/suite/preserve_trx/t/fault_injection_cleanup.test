@@ -9,7 +9,7 @@ CALL mtr.add_suppression(
 DROP TABLE IF EXISTS t_preserve_fault_cleanup;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_preserve_fault_cleanup(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_preserve_fault_cleanup VALUES(1,10);
@@ -41,4 +41,4 @@ INSERT INTO t_preserve_fault_cleanup VALUES(1,10);
 --source suite/preserve_trx/include/preserve_fault_cleanup_case.inc
 
 DROP TABLE t_preserve_fault_cleanup;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

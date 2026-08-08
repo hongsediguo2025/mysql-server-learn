@@ -1,5 +1,4 @@
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_recovery_max_count=200;
+SET GLOBAL rds_preserve_trx_enable=ON;
 SELECT COUNT(*) AS session_count
 FROM t_batch_long_control;
 session_count
@@ -219,4 +218,4 @@ case_id	ok
 18	1
 19	1
 20	1
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

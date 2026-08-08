@@ -572,7 +572,7 @@ class ResumableTrxNfr2BenchmarkTest(unittest.TestCase):
         self.assertEqual("not_available", comparison["status"])
         self.assertEqual("missing_live_baseline_samples", comparison["reason"])
 
-    def test_run_scenario_reports_workload_dimensions_and_lock_mode(self):
+    def test_run_scenario_reports_workload_dimensions(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             log_path = Path(tmpdir) / "mysqld.err"
             log_path.write_text("", encoding="utf-8")
@@ -592,13 +592,6 @@ class ResumableTrxNfr2BenchmarkTest(unittest.TestCase):
                 lockset_select_for_update=False,
                 lockset_minimal_table=True,
                 min_statements_before_drain_pause=1,
-                preserve_max_binlog_cache_bytes=8 * 1024 * 1024 * 1024,
-                preserve_max_lock_count=200_000_000,
-                preserve_max_modified_tables=2000,
-                preserve_lock_warmcopy_max_journal_bytes=8 * 1024 * 1024 * 1024,
-                preserve_lock_warmcopy_seal_threads=16,
-                preserve_parallel_preserve_threads=32,
-                lock_warmcopy_mode="on",
                 append_log_during_run=(
                     "PRESERVE: warm-copy drain metrics phase2_total_us=1000000 "
                     "phase2_target_preserve_us=700000 "
@@ -644,16 +637,6 @@ class ResumableTrxNfr2BenchmarkTest(unittest.TestCase):
         self.assertTrue(report["lockset_touch_one_row"])
         self.assertEqual(1, report["transaction_operation_count"])
         self.assertEqual(1, report["min_statements_before_drain_pause"])
-        self.assertEqual("on", report["lock_warmcopy_mode"])
-        self.assertEqual(8 * 1024 * 1024 * 1024, report["preserve_max_binlog_cache_bytes"])
-        self.assertEqual(200_000_000, report["preserve_max_lock_count"])
-        self.assertEqual(2000, report["preserve_max_modified_tables"])
-        self.assertEqual(
-            8 * 1024 * 1024 * 1024,
-            report["preserve_lock_warmcopy_max_journal_bytes"],
-        )
-        self.assertEqual(16, report["preserve_lock_warmcopy_seal_threads"])
-        self.assertEqual(32, report["preserve_parallel_preserve_threads"])
         self.assertEqual(
             {"warmcopy_success": 1},
             report["warmcopy_action_summary"]["by_action"],
@@ -1210,13 +1193,11 @@ class ResumableTrxNfr2BenchmarkTest(unittest.TestCase):
             Path(scenarios[1].config.artifact_dir).is_absolute()
         )
 
-    def test_build_scenarios_adds_large_lockset_live_and_warmcopy_defaults(self):
+    def test_build_scenarios_adds_large_lockset_warmcopy_defaults(self):
         args = parse_args(
             [
                 "--restart-command",
                 "mysqld --defaults-file=/tmp/nfr2.cnf",
-                "--scenario",
-                "live-export-large-lockset",
                 "--scenario",
                 "lock-warmcopy-large-lockset",
                 "--server-pid-file",
@@ -1227,59 +1208,27 @@ class ResumableTrxNfr2BenchmarkTest(unittest.TestCase):
         scenarios = build_scenarios(args)
 
         self.assertEqual(
-            ["live-export-large-lockset", "lock-warmcopy-large-lockset"],
+            ["lock-warmcopy-large-lockset"],
             [scenario.name for scenario in scenarios],
         )
-        for scenario in scenarios:
-            self.assertEqual(1000, scenario.config.sessions)
-            self.assertEqual(100, scenario.config.table_count)
-            self.assertEqual(100000, scenario.config.statements_per_tx)
-            self.assertEqual(100000, scenario.config.seed_rows_per_table_per_session)
-            self.assertEqual(100000, scenario.config.lockset_batch_size)
-            self.assertTrue(scenario.config.lockset_session_table_shards)
-            self.assertTrue(scenario.config.lockset_noop_update)
-            self.assertTrue(scenario.config.lockset_touch_one_row)
-            self.assertFalse(scenario.config.lockset_select_for_update)
-            self.assertTrue(scenario.config.lockset_minimal_table)
-            self.assertEqual(
-                1,
-                scenario.config.min_statements_before_drain_pause,
-            )
-            self.assertEqual(3, scenario.config.cycles)
-            self.assertEqual(
-                scenario.config.cycles,
-                scenario.config.max_transactions_per_worker,
-            )
-            self.assertEqual(
-                8 * 1024 * 1024 * 1024,
-                scenario.config.preserve_max_binlog_cache_bytes,
-            )
-            self.assertEqual(
-                8 * 1024 * 1024 * 1024,
-                scenario.config.preserve_lock_warmcopy_max_journal_bytes,
-            )
-            self.assertEqual(200_000_000, scenario.config.preserve_max_lock_count)
-            self.assertEqual(2000, scenario.config.preserve_max_modified_tables)
-            self.assertEqual("/tmp/nfr2.pid", scenario.config.server_pid_file)
-        self.assertEqual("off", scenarios[0].config.lock_warmcopy_mode)
-        self.assertEqual("on", scenarios[1].config.lock_warmcopy_mode)
-
-    def test_large_lockset_scenarios_default_to_large_lockset_comparison(self):
-        args = parse_args(
-            [
-                "--restart-command",
-                "mysqld --defaults-file=/tmp/nfr2.cnf",
-                "--scenario",
-                "live-export-large-lockset",
-                "--scenario",
-                "lock-warmcopy-large-lockset",
-            ]
-        )
-
+        scenario = scenarios[0]
+        self.assertEqual(1000, scenario.config.sessions)
+        self.assertEqual(100, scenario.config.table_count)
+        self.assertEqual(100000, scenario.config.statements_per_tx)
+        self.assertEqual(100000, scenario.config.seed_rows_per_table_per_session)
+        self.assertEqual(100000, scenario.config.lockset_batch_size)
+        self.assertTrue(scenario.config.lockset_session_table_shards)
+        self.assertTrue(scenario.config.lockset_noop_update)
+        self.assertTrue(scenario.config.lockset_touch_one_row)
+        self.assertFalse(scenario.config.lockset_select_for_update)
+        self.assertTrue(scenario.config.lockset_minimal_table)
+        self.assertEqual(1, scenario.config.min_statements_before_drain_pause)
+        self.assertEqual(3, scenario.config.cycles)
         self.assertEqual(
-            "live-export-large-lockset",
-            args.phase2_live_baseline_scenario,
+            scenario.config.cycles,
+            scenario.config.max_transactions_per_worker,
         )
+        self.assertEqual("/tmp/nfr2.pid", scenario.config.server_pid_file)
         self.assertEqual(
             "lock-warmcopy-large-lockset",
             args.phase2_warmcopy_scenario,
@@ -1300,13 +1249,11 @@ class ResumableTrxNfr2BenchmarkTest(unittest.TestCase):
             args.phase2_warmcopy_scenario,
         )
 
-    def test_build_scenarios_adds_scaled_lockset_live_and_warmcopy(self):
+    def test_build_scenarios_adds_scaled_lockset_warmcopy(self):
         args = parse_args(
             [
                 "--restart-command",
                 "mysqld --defaults-file=/tmp/nfr2.cnf",
-                "--scenario",
-                "scaled-live-lockset",
                 "--scenario",
                 "scaled-lock-warmcopy-lockset",
                 "--sessions",
@@ -1317,8 +1264,6 @@ class ResumableTrxNfr2BenchmarkTest(unittest.TestCase):
                 "40",
                 "--cycles",
                 "2",
-                "--preserve-parallel-preserve-threads",
-                "32",
                 "--server-pid-file",
                 "/tmp/nfr2.pid",
             ]
@@ -1327,30 +1272,24 @@ class ResumableTrxNfr2BenchmarkTest(unittest.TestCase):
         scenarios = build_scenarios(args)
 
         self.assertEqual(
-            ["scaled-live-lockset", "scaled-lock-warmcopy-lockset"],
+            ["scaled-lock-warmcopy-lockset"],
             [scenario.name for scenario in scenarios],
         )
-        for scenario in scenarios:
-            self.assertEqual(12, scenario.config.sessions)
-            self.assertEqual(6, scenario.config.table_count)
-            self.assertEqual(40, scenario.config.statements_per_tx)
-            self.assertEqual(
-                scenario.config.statements_per_tx,
-                scenario.config.min_statements_before_drain_pause,
-            )
-            self.assertEqual(0, scenario.config.lockset_batch_size)
-            self.assertEqual(2, scenario.config.cycles)
-            self.assertEqual(
-                scenario.config.cycles,
-                scenario.config.max_transactions_per_worker,
-            )
-            self.assertGreaterEqual(scenario.config.preserve_max_lock_count, 960)
-            self.assertGreaterEqual(scenario.config.preserve_max_modified_tables, 12)
-            self.assertEqual(32, scenario.config.preserve_parallel_preserve_threads)
-            self.assertEqual("/tmp/nfr2.pid", scenario.config.server_pid_file)
-        self.assertEqual("off", scenarios[0].config.lock_warmcopy_mode)
-        self.assertEqual("on", scenarios[1].config.lock_warmcopy_mode)
-        self.assertEqual("scaled-live-lockset", args.phase2_live_baseline_scenario)
+        scenario = scenarios[0]
+        self.assertEqual(12, scenario.config.sessions)
+        self.assertEqual(6, scenario.config.table_count)
+        self.assertEqual(40, scenario.config.statements_per_tx)
+        self.assertEqual(
+            scenario.config.statements_per_tx,
+            scenario.config.min_statements_before_drain_pause,
+        )
+        self.assertEqual(0, scenario.config.lockset_batch_size)
+        self.assertEqual(2, scenario.config.cycles)
+        self.assertEqual(
+            scenario.config.cycles,
+            scenario.config.max_transactions_per_worker,
+        )
+        self.assertEqual("/tmp/nfr2.pid", scenario.config.server_pid_file)
         self.assertEqual(
             "scaled-lock-warmcopy-lockset",
             args.phase2_warmcopy_scenario,
@@ -1377,7 +1316,7 @@ class ResumableTrxNfr2BenchmarkTest(unittest.TestCase):
                 "--restart-command",
                 "mysqld --defaults-file=/tmp/nfr2.cnf",
                 "--scenario",
-                "scaled-live-lockset",
+                "scaled-lock-warmcopy-lockset",
                 "--sessions",
                 "4",
                 "--table-count",

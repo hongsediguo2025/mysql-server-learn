@@ -7,7 +7,7 @@ DROP TABLE IF EXISTS t_global_off_to_on;
 
 --let MYSQLD_DATADIR= `SELECT @@datadir`
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 --disable_query_log
 CALL mtr.add_suppression("Preserved transaction .* rejected because snapshot binlog_state=GLOBAL_OFF_NO_CACHE requires log_bin=OFF");
@@ -29,7 +29,7 @@ UPDATE t_global_off_to_on SET b=11 WHERE a=1;
 
 --let $_server_id= 1
 --let $_expect_file_name= $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
---let $restart_parameters= restart: --preserve-trx-enable=ON --log-bin=$MYSQLTEST_VARDIR/log/preserve_trx_on-bin
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --log-bin=$MYSQLTEST_VARDIR/log/preserve_trx_on-bin
 --replace_result $MYSQLTEST_VARDIR MYSQLTEST_VARDIR
 --source include/start_mysqld.inc
 
@@ -41,8 +41,8 @@ UPDATE t_global_off_to_on SET b=11 WHERE a=1;
 
 SELECT * FROM t_global_off_to_on WHERE a=1;
 
---let $restart_parameters= restart: --preserve-trx-enable=ON --skip-log-bin
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --skip-log-bin
 --source include/restart_mysqld.inc
 
 DROP TABLE t_global_off_to_on;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_resume_failure;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_resume_failure(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_resume_failure VALUES(1,10);
 START TRANSACTION;
@@ -37,4 +37,4 @@ SELECT * FROM t_resume_failure ORDER BY a;
 a	b
 1	11
 DROP TABLE t_resume_failure;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_batch_blocked;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_batch_blocked(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 SET DEBUG_SYNC =
 'preserve_trx_batch_after_one_target_preserved SIGNAL batch_preserve_paused WAIT_FOR continue_batch_preserve';
@@ -19,4 +19,4 @@ SELECT * FROM t_batch_blocked;
 a	b
 1	11
 DROP TABLE t_batch_blocked;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

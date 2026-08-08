@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_recovered_count_rewrite_failclosed;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_recovered_count_rewrite_failclosed(
 a INT PRIMARY KEY,
 b INT
@@ -11,7 +11,7 @@ a	b
 1	10
 UPDATE t_recovered_count_rewrite_failclosed SET b=11 WHERE a=1;
 DRAIN TRANSACTIONS PRESERVE;
-# restart: --preserve-trx-enable=ON --debug=d,preserve_trx_fail_recovered_count_rewrite
+# restart: --rds-preserve-trx-enable=ON --debug=d,preserve_trx_fail_recovered_count_rewrite
 SELECT COUNT(*) AS preserved_count_after_legacy_rewrite_debug
 FROM performance_schema.preserved_transactions;
 preserved_count_after_legacy_rewrite_debug
@@ -20,7 +20,7 @@ SELECT TOKEN, RECOVERED_COUNT AS recovered_count_after_legacy_rewrite_debug
 FROM performance_schema.preserved_transactions;
 TOKEN	recovered_count_after_legacy_rewrite_debug
 TOKEN	1
-# restart: --preserve-trx-enable=ON --debug=d,preserve_trx_fail_recovered_count_rewrite
+# restart: --rds-preserve-trx-enable=ON --debug=d,preserve_trx_fail_recovered_count_rewrite
 SELECT COUNT(*) AS preserved_count_after_second_restart
 FROM performance_schema.preserved_transactions;
 preserved_count_after_second_restart
@@ -35,4 +35,4 @@ SELECT * FROM t_recovered_count_rewrite_failclosed ORDER BY a;
 a	b
 1	11
 DROP TABLE t_recovered_count_rewrite_failclosed;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

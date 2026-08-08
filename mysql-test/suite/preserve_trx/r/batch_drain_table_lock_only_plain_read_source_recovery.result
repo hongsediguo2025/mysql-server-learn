@@ -1,7 +1,7 @@
 DROP TABLE IF EXISTS t_plain_lock_tokens;
 DROP TABLE IF EXISTS t_plain_lock_modified;
 DROP TABLE IF EXISTS t_plain_lock_source;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_plain_lock_modified(
 id INT PRIMARY KEY,
 v INT,
@@ -44,4 +44,4 @@ row_count	base_rows	copied_rows	copied_note_rows
 DROP TABLE t_plain_lock_tokens;
 DROP TABLE t_plain_lock_modified;
 DROP TABLE t_plain_lock_source;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

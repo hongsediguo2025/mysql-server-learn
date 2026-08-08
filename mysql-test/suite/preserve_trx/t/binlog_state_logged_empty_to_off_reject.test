@@ -8,7 +8,7 @@ DROP DATABASE IF EXISTS preserve_trx_ignored;
 
 --let MYSQLD_DATADIR= `SELECT @@datadir`
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 --disable_query_log
 CALL mtr.add_suppression("Preserved transaction .* rejected because snapshot binlog_state=LOGGED_EMPTY requires log_bin=ON");
@@ -33,7 +33,7 @@ UPDATE preserve_trx_ignored.seed SET b=11 WHERE a=1;
 
 --let $_server_id= 1
 --let $_expect_file_name= $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
---let $restart_parameters= restart: --preserve-trx-enable=ON --skip-log-bin
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --skip-log-bin
 --replace_result $MYSQLTEST_VARDIR MYSQLTEST_VARDIR
 --source include/start_mysqld.inc
 
@@ -46,9 +46,9 @@ UPDATE preserve_trx_ignored.seed SET b=11 WHERE a=1;
 SELECT * FROM t_logged_empty_to_off WHERE a=1;
 SELECT * FROM preserve_trx_ignored.seed WHERE a=1;
 
---let $restart_parameters= restart: --preserve-trx-enable=ON
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON
 --source include/restart_mysqld.inc
 
 DROP TABLE t_logged_empty_to_off;
 DROP DATABASE preserve_trx_ignored;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

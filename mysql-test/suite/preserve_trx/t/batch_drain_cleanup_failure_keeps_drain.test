@@ -8,7 +8,7 @@ CALL mtr.add_suppression("Preserved transaction batch cleanup failed after debug
 DROP TABLE IF EXISTS t_batch_cleanup_failure;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_batch_cleanup_failure(
   id INT PRIMARY KEY,
@@ -58,7 +58,7 @@ SHOW VARIABLES LIKE 'pid_file';
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --shutdown_server
 --source include/wait_until_disconnected.inc
---exec echo "restart: --preserve-trx-enable=ON --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -69,4 +69,4 @@ SELECT * FROM t_batch_cleanup_failure ORDER BY id;
 --source suite/preserve_trx/include/assert_no_preserve_residue.inc
 
 DROP TABLE t_batch_cleanup_failure;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

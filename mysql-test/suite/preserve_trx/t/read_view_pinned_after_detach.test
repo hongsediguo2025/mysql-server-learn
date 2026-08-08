@@ -6,7 +6,7 @@
 DROP TABLE IF EXISTS t_read_view_pin;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_read_view_pin(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_read_view_pin VALUES(1,10),(2,20);
@@ -23,7 +23,7 @@ SET SESSION debug="+d,preserve_trx_assert_read_view_pinned_after_detach";
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 DRAIN TRANSACTIONS PRESERVE;
 --source include/wait_until_disconnected.inc
---exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -41,4 +41,4 @@ COMMIT;
 SELECT * FROM t_read_view_pin ORDER BY a;
 
 DROP TABLE t_read_view_pin;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

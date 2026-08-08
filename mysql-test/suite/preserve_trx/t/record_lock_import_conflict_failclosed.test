@@ -5,7 +5,7 @@
 DROP TABLE IF EXISTS t_record_lock_import_conflict;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 --let MYSQLD_DATADIR= `SELECT @@datadir`
 
 --disable_query_log
@@ -209,7 +209,7 @@ for my $bin_path (@bin_paths) {
 die "did not find a shared record lock to mutate" unless $mutated;
 EOF
 
---exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=10" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -240,4 +240,4 @@ SELECT COUNT(*) AS row_count,
 --source suite/preserve_trx/include/assert_no_preserve_residue.inc
 
 DROP TABLE t_record_lock_import_conflict;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

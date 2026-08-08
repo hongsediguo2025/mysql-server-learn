@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_resume_logged_cache_hydrate;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_resume_logged_cache_hydrate(a INT PRIMARY KEY, b INT)
 ENGINE=InnoDB;
 INSERT INTO t_resume_logged_cache_hydrate VALUES(1,10);
@@ -14,4 +14,4 @@ SELECT * FROM t_resume_logged_cache_hydrate ORDER BY a;
 a	b
 1	11
 DROP TABLE t_resume_logged_cache_hydrate;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

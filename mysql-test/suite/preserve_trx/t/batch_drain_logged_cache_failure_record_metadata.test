@@ -11,7 +11,7 @@ CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: pre
 DROP TABLE IF EXISTS t_batch_logged_cache_failure_record;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 --let MYSQLD_DATADIR= `SELECT @@datadir`
 
 CREATE TABLE t_batch_logged_cache_failure_record(
@@ -59,7 +59,7 @@ EOF
 --disconnect batch_logged_cache_failure_app
 
 --connection default
---let $restart_parameters= restart: --preserve-trx-enable=ON
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON
 --let $do_not_echo_parameters= 1
 --source include/restart_mysqld.inc
 --let $do_not_echo_parameters=
@@ -71,4 +71,4 @@ SELECT * FROM t_batch_logged_cache_failure_record ORDER BY id;
 --source suite/preserve_trx/include/assert_no_preserve_residue.inc
 
 DROP TABLE t_batch_logged_cache_failure_record;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

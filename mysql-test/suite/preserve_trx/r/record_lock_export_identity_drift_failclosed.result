@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_record_lock_export_identity_drift;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_record_lock_export_identity_drift(
 id INT PRIMARY KEY,
 v INT
@@ -25,4 +25,4 @@ id	v
 2	20
 include/assert_grep.inc [Record-lock export drift reason is logged]
 DROP TABLE t_record_lock_export_identity_drift;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

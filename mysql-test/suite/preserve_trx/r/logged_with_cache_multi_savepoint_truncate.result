@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_logged_multi_savepoint;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_logged_multi_savepoint(id INT PRIMARY KEY, v INT)
 ENGINE=InnoDB;
 INSERT INTO t_logged_multi_savepoint VALUES(1,10),(2,20),(3,30),(4,40);
@@ -28,4 +28,4 @@ include/assert_grep.inc [replacement row id 2 is logged after rollback-to-savepo
 include/assert_grep.inc [truncated row id 3 is absent from binlog]
 include/assert_grep.inc [truncated row id 4 is absent from binlog]
 DROP TABLE t_logged_multi_savepoint;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

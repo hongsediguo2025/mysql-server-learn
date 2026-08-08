@@ -1,6 +1,6 @@
 DROP TABLE IF EXISTS t_predicate_lock_anchor;
 DROP TABLE IF EXISTS t_predicate_lock_after_resume;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_predicate_lock_anchor(
 id INT PRIMARY KEY,
 v INT
@@ -55,4 +55,4 @@ id	v
 1	0
 DROP TABLE t_predicate_lock_after_resume;
 DROP TABLE t_predicate_lock_anchor;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

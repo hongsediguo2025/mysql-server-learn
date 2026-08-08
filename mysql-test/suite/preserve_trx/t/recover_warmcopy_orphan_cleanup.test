@@ -7,7 +7,7 @@
 --exec printf descriptor > "$MYSQLD_DATADIR/preserve/warmcopy_orphan.binlog_cache.warm.7.desc"
 --exec printf temp > "$MYSQLD_DATADIR/preserve/warmcopy_orphan.binlog_cache.warm.7.tmp"
 
---let $restart_parameters= restart: --preserve-trx-enable=ON
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON
 --source include/restart_mysqld.inc
 --let $restart_parameters=
 
@@ -16,4 +16,4 @@ SELECT COUNT(*) AS preserved_count
 --exec test ! -e "$MYSQLD_DATADIR/preserve/warmcopy_orphan.binlog_cache.warm.7"
 --exec test ! -e "$MYSQLD_DATADIR/preserve/warmcopy_orphan.binlog_cache.warm.7.desc"
 --exec test ! -e "$MYSQLD_DATADIR/preserve/warmcopy_orphan.binlog_cache.warm.7.tmp"
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

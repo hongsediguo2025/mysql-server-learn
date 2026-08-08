@@ -1,4 +1,4 @@
-# restart: --preserve-trx-enable=OFF
+# restart: --rds-preserve-trx-enable=OFF
 DROP USER IF EXISTS preserve_pfs_denied@localhost;
 CREATE USER preserve_pfs_denied@localhost;
 SELECT COUNT(*) FROM performance_schema.preserved_transactions;
@@ -22,4 +22,4 @@ ERROR 42000: You have an error in your SQL syntax; check the manual that corresp
 DRAIN TRANSACTIONS PRESERVE WITH NO USER VARS WITH USER VARS;
 ERROR 42000: You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'WITH USER VARS' at line 1
 DROP USER preserve_pfs_denied@localhost;
-# restart: --preserve-trx-enable=ON
+# restart: --rds-preserve-trx-enable=ON

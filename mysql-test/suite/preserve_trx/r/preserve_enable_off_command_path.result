@@ -1,6 +1,6 @@
-# restart: --preserve-trx-enable=OFF
-SELECT @@global.preserve_trx_enable;
-@@global.preserve_trx_enable
+# restart: --rds-preserve-trx-enable=OFF
+SELECT @@global.rds_preserve_trx_enable;
+@@global.rds_preserve_trx_enable
 0
 CREATE TABLE t_off_command_path (id INT PRIMARY KEY) ENGINE=InnoDB;
 INSERT INTO t_off_command_path VALUES (1);
@@ -15,4 +15,4 @@ XA END X'4d53505f50524553', X'746f6b656e', 1836281843;
 XA PREPARE X'4d53505f50524553', X'746f6b656e', 1836281843;
 XA ROLLBACK X'4d53505f50524553', X'746f6b656e', 1836281843;
 DROP TABLE t_off_command_path_xa;
-# restart: --preserve-trx-enable=ON
+# restart: --rds-preserve-trx-enable=ON

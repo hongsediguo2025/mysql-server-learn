@@ -7,7 +7,7 @@ DROP DATABASE IF EXISTS preserve_trx_ignored;
 
 --let MYSQLD_DATADIR= `SELECT @@datadir`
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 SET SESSION sql_log_bin=0;
 CREATE DATABASE preserve_trx_ignored;
@@ -53,4 +53,4 @@ DROP TABLE t_no_cache_gtid;
 DROP DATABASE preserve_trx_ignored;
 SET SESSION sql_log_bin=1;
 RESET MASTER;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

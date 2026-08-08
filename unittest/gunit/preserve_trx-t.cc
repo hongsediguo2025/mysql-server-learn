@@ -1244,11 +1244,6 @@ TEST(PreservedTrxPreparedRegistry, ResourceSubpoolsEnforceSixtyThirtyTen) {
                       Preserve_trx_memory_kind::PROMOTION_LOCK_PLAN));
   EXPECT_EQ(300U, preserve_trx_resource_kind_current_bytes_for_unit_test(
                       Preserve_trx_memory_kind::PROMOTION_BINLOG_NATIVE_CACHE));
-  EXPECT_EQ(600U, preserve_trx_resource_kind_cap_bytes_for_unit_test(
-                      Preserve_trx_memory_kind::PROMOTION_LOCK_PLAN));
-  EXPECT_EQ(300U, preserve_trx_resource_kind_cap_bytes_for_unit_test(
-                      Preserve_trx_memory_kind::PROMOTION_BINLOG_NATIVE_CACHE));
-
   Preserve_trx_prepared_token_resources rejected;
   auto key2 = make_prepared_token_key(1);
   key2.token = "token-2";
@@ -2730,6 +2725,29 @@ TEST(PreservedTrxPreparedRegistry,
             registry.snapshot(key, &snapshot));
 }
 
+TEST(PreservedTrxPreparedRegistry,
+     ExactTokenPurgeCancelsActivePrepareAndRejectsLatePublish) {
+  preserve_trx_resource_manager_reset_for_unit_test();
+  Preserve_trx_prepared_token_registry registry;
+  auto key = make_prepared_token_key(1);
+  Preserve_trx_prepare_lease prepare;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_prepare(key, key.generation, &prepare));
+
+  ASSERT_EQ(Preserve_trx_prepared_status::OK, registry.purge_token(key));
+  Preserve_trx_prepared_token_snapshot snapshot;
+  EXPECT_EQ(Preserve_trx_prepared_status::NOT_FOUND,
+            registry.snapshot(key, &snapshot));
+
+  EXPECT_EQ(Preserve_trx_prepared_status::STALE_GENERATION,
+            registry.publish_prewarmed(
+                &prepare, std::string(64, 'e'),
+                acquire_prepared_resources(key)));
+  EXPECT_FALSE(prepare.active());
+  EXPECT_EQ(0U, preserve_trx_memory_current_bytes_status());
+  preserve_trx_resource_manager_reset_for_unit_test();
+}
+
 #ifndef NDEBUG
 TEST(PreservedTrxPreparedRegistry,
      PurgeAfterLookupCannotCreateOrphanPrepareLease) {
@@ -3004,7 +3022,6 @@ class Transfer_source_config_guard {
         m_mode(preserve_trx_transfer_artifact_mode),
         m_target_host(preserve_trx_transfer_target_host),
         m_target_port(preserve_trx_transfer_target_port),
-        m_target_socket(preserve_trx_transfer_target_socket),
         m_target_user(preserve_trx_transfer_target_user),
         m_credential_name(preserve_trx_transfer_credential_name),
         m_credential_secret_file(
@@ -3015,7 +3032,6 @@ class Transfer_source_config_guard {
     preserve_trx_transfer_artifact_mode = m_mode;
     preserve_trx_transfer_target_host = m_target_host;
     preserve_trx_transfer_target_port = m_target_port;
-    preserve_trx_transfer_target_socket = m_target_socket;
     preserve_trx_transfer_target_user = m_target_user;
     preserve_trx_transfer_credential_name = m_credential_name;
     preserve_trx_transfer_credential_secret_file = m_credential_secret_file;
@@ -3032,18 +3048,6 @@ class Transfer_source_config_guard {
     standby_mode();
     preserve_trx_transfer_target_host = const_cast<char *>(host);
     preserve_trx_transfer_target_port = port;
-    preserve_trx_transfer_target_socket = const_cast<char *>("");
-    preserve_trx_transfer_target_user = const_cast<char *>(user);
-    preserve_trx_transfer_credential_name =
-        const_cast<char *>(credential_name);
-  }
-
-  void socket(const char *socket_path, const char *user,
-              const char *credential_name) {
-    standby_mode();
-    preserve_trx_transfer_target_host = const_cast<char *>("");
-    preserve_trx_transfer_target_port = 0;
-    preserve_trx_transfer_target_socket = const_cast<char *>(socket_path);
     preserve_trx_transfer_target_user = const_cast<char *>(user);
     preserve_trx_transfer_credential_name =
         const_cast<char *>(credential_name);
@@ -3055,7 +3059,6 @@ class Transfer_source_config_guard {
   ulong m_mode;
   char *m_target_host;
   uint m_target_port;
-  char *m_target_socket;
   char *m_target_user;
   char *m_credential_name;
   char *m_credential_secret_file;
@@ -3860,6 +3863,7 @@ TEST(PreservedTrxRedaction, RawResumeRewriteRedactsWhenFeatureDisabled) {
   preserve_trx_enable = old_enable;
 }
 
+#ifndef NDEBUG
 TEST(PreservedTrxResourceBudget, LeaseTracksCurrentPeakAndPerTokenLimits) {
   preserve_trx_resource_manager_reset_for_unit_test();
   Preserve_trx_resource_limits limits;
@@ -3929,6 +3933,7 @@ TEST(PreservedTrxResourceBudget,
   preserve_trx_resource_manager_set_limits_for_unit_test(
       Preserve_trx_resource_limits{});
 }
+#endif
 
 TEST(PreservedTrxResourceBudget,
      BinlogPayloadPeakRejectsLargeWholeReadBeforeAllocation) {
@@ -4700,9 +4705,6 @@ TEST(PreservedTrxDeadline, OperationalDeadlineUsesMonotonicElapsedTime) {
 }
 
 TEST(PreservedTrxDeadline, RecoveryDeadlineUsesMonotonicAnchor) {
-  const uint old_grace_seconds = preserve_trx_recovery_grace_seconds;
-  preserve_trx_recovery_grace_seconds = 0;
-
   Preserve_snapshot_metadata input = {};
   input.created_at_us = 1000;
   input.expires_at_us = 2000;
@@ -4713,7 +4715,6 @@ TEST(PreservedTrxDeadline, RecoveryDeadlineUsesMonotonicAnchor) {
   EXPECT_TRUE(preserved_trx_recovery_deadline_expired_for_unit_test(
       input, 1000, 5000, 6000));
 
-  preserve_trx_recovery_grace_seconds = old_grace_seconds;
 }
 
 TEST(PreservedTrxExpiredReaper, FailedObservableRecordsAreGarbageCollected) {
@@ -6180,19 +6181,7 @@ TEST(PreservedTrxTransfer,
   EXPECT_EQ(Preserve_trx_transfer_artifact_decision::UNSUPPORTED,
             preserve_trx_transfer_artifact_decision());
 
-  guard.socket("/tmp/mysql-standby.sock", "transfer_user",
-               "transfer_credential");
-  EXPECT_EQ(Preserve_trx_transfer_artifact_decision::STANDBY_TRANSFER_SAVE,
-            preserve_trx_transfer_artifact_decision());
-
-  guard.socket("", "transfer_user", "transfer_credential");
-  EXPECT_EQ(Preserve_trx_transfer_artifact_decision::UNSUPPORTED,
-            preserve_trx_transfer_artifact_decision());
-
-  guard.tcp("127.0.0.1", 3307, "transfer_user",
-            "transfer_credential");
-  preserve_trx_transfer_target_socket =
-      const_cast<char *>("/tmp/mysql-standby.sock");
+  guard.tcp("", 3307, "transfer_user", "transfer_credential");
   EXPECT_EQ(Preserve_trx_transfer_artifact_decision::UNSUPPORTED,
             preserve_trx_transfer_artifact_decision());
 }
@@ -6267,13 +6256,24 @@ class Capturing_transfer_frame_sink final
  public:
   Preserve_trx_transfer_status send_encoded_frame(
       const std::string &encoded_frame) override {
+    if (m_cancelled) return Preserve_trx_transfer_status::UNSUPPORTED;
     m_frames.push_back(encoded_frame);
     return Preserve_trx_transfer_status::OK;
   }
 
+  void request_cancel() override { m_cancelled = true; }
+  Preserve_trx_transfer_status prepare_cancelled_epoch_cleanup() override {
+    ++m_cleanup_prepare_count;
+    m_cancelled = false;
+    return Preserve_trx_transfer_status::OK;
+  }
+
   const std::vector<std::string> &frames() const { return m_frames; }
+  size_t cleanup_prepare_count() const { return m_cleanup_prepare_count; }
 
  private:
+  bool m_cancelled{false};
+  size_t m_cleanup_prepare_count{0};
   std::vector<std::string> m_frames;
 };
 
@@ -6778,12 +6778,14 @@ bool final_ack_arbiter_probe(void *context) {
 struct Before_commit_send_state {
   uint calls{0};
   bool allow{false};
+  Preserve_trx_transfer_encoded_frame_sink *cancel_sink{nullptr};
 };
 
 bool before_commit_send_probe(void *context) {
   auto *state = static_cast<Before_commit_send_state *>(context);
   if (state == nullptr) return false;
   ++state->calls;
+  if (state->cancel_sink != nullptr) state->cancel_sink->request_cancel();
   return state->allow;
 }
 
@@ -7075,7 +7077,6 @@ TEST(PreservedTrxTransfer, ConfiguredFrameSinkUsesClientOpsByDefault) {
   EXPECT_EQ(1, client_state.connect_count);
   EXPECT_EQ("127.0.0.1", client_state.endpoint.host);
   EXPECT_EQ(3307U, client_state.endpoint.port);
-  EXPECT_EQ("", client_state.endpoint.socket);
   EXPECT_EQ("transfer_user", client_state.endpoint.user);
   EXPECT_EQ("transfer_credential", client_state.endpoint.credential_name);
   EXPECT_EQ(2, client_state.send_count);
@@ -7376,11 +7377,12 @@ TEST(PreservedTrxTransfer, ConfiguredFrameSinkUsesConfiguredDataSessions) {
              "transfer_credential");
   Fake_transfer_client_state client_state;
   Transfer_client_ops_guard client_ops(&client_state);
-  const uint saved_data_sessions = preserve_trx_transfer_data_sessions;
-  preserve_trx_transfer_data_sessions = 3;
+  Preserve_trx_transfer_runtime_policy policy =
+      preserve_trx_transfer_current_runtime_policy();
+  policy.data_sessions = 3;
   std::unique_ptr<Preserve_trx_transfer_encoded_frame_sink> sink;
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
-            preserve_trx_transfer_make_configured_frame_sink(&sink));
+            preserve_trx_transfer_make_configured_frame_sink(&sink, &policy));
 
   uint64_t sequence = 1;
   for (uint64_t token : {3ULL, 4ULL, 5ULL}) {
@@ -7396,7 +7398,6 @@ TEST(PreservedTrxTransfer, ConfiguredFrameSinkUsesConfiguredDataSessions) {
     ASSERT_EQ(Preserve_trx_transfer_status::OK,
               sink->send_encoded_frame(encoded));
   }
-  preserve_trx_transfer_data_sessions = saved_data_sessions;
   EXPECT_EQ(3, client_state.connect_count);
 }
 
@@ -7407,13 +7408,12 @@ TEST(PreservedTrxTransfer,
              "transfer_credential");
   Fake_transfer_client_state client_state;
   Transfer_client_ops_guard client_ops(&client_state);
-  const uint saved_data_sessions = preserve_trx_transfer_data_sessions;
-  auto restore_data_sessions = create_scope_guard(
-      [&] { preserve_trx_transfer_data_sessions = saved_data_sessions; });
-  preserve_trx_transfer_data_sessions = 3;
+  Preserve_trx_transfer_runtime_policy policy =
+      preserve_trx_transfer_current_runtime_policy();
+  policy.data_sessions = 3;
   std::unique_ptr<Preserve_trx_transfer_encoded_frame_sink> sink;
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
-            preserve_trx_transfer_make_configured_frame_sink(&sink));
+            preserve_trx_transfer_make_configured_frame_sink(&sink, &policy));
 
   std::vector<std::string> encoded_frames;
   uint64_t sequence = 1;
@@ -7459,13 +7459,12 @@ TEST(PreservedTrxTransfer,
              "transfer_credential");
   Fake_transfer_client_state client_state;
   Transfer_client_ops_guard client_ops(&client_state);
-  const uint saved_data_sessions = preserve_trx_transfer_data_sessions;
-  auto restore_data_sessions = create_scope_guard(
-      [&] { preserve_trx_transfer_data_sessions = saved_data_sessions; });
-  preserve_trx_transfer_data_sessions = 3;
+  Preserve_trx_transfer_runtime_policy policy =
+      preserve_trx_transfer_current_runtime_policy();
+  policy.data_sessions = 3;
   std::unique_ptr<Preserve_trx_transfer_encoded_frame_sink> sink;
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
-            preserve_trx_transfer_make_configured_frame_sink(&sink));
+            preserve_trx_transfer_make_configured_frame_sink(&sink, &policy));
 
   Preserve_trx_transfer_frame frame;
   frame.type = Preserve_trx_transfer_frame_type::ABORT;
@@ -7618,8 +7617,7 @@ TEST(PreservedTrxTransfer,
 
 TEST(PreservedTrxTransfer, ConfiguredFrameSinkDefaultClientUsesCredentialStore) {
   Transfer_source_config_guard config;
-  config.socket("/tmp/mysql-preserve-transfer-missing.sock",
-                "transfer_user", "transfer_credential");
+  config.tcp("127.0.0.1", 1, "transfer_user", "transfer_credential");
   Transfer_credentials_guard credentials;
   credentials.store("transfer_credential", "transfer_user",
                     "shared-transfer-secret");
@@ -7652,8 +7650,7 @@ TEST(PreservedTrxTransfer, ConfiguredFrameSinkDefaultTcpClientDoesNotRequireTls)
 
 TEST(PreservedTrxTransfer, ConfiguredFrameSinkRejectsMissingCredentialSecret) {
   Transfer_source_config_guard config;
-  config.socket("/tmp/mysql-preserve-transfer-missing.sock",
-                "transfer_user", "transfer_credential");
+  config.tcp("127.0.0.1", 1, "transfer_user", "transfer_credential");
   Transfer_credentials_guard credentials;
 
   std::unique_ptr<Preserve_trx_transfer_encoded_frame_sink> sink;
@@ -7675,8 +7672,7 @@ TEST(PreservedTrxTransfer, ConfiguredFrameSinkUsesCredentialSecretFile) {
   ASSERT_EQ(0, my_close(secret_file, MYF(0)));
 
   Transfer_source_config_guard config;
-  config.socket("/tmp/mysql-preserve-transfer-missing.sock",
-                "transfer_user", "transfer_credential");
+  config.tcp("127.0.0.1", 1, "transfer_user", "transfer_credential");
   preserve_trx_transfer_credential_secret_file = secret_path;
   Transfer_credentials_guard credentials;
 
@@ -9762,33 +9758,6 @@ TEST_F(PreserveSnapshotTest, PromotionReadyCacheMakesTokenGateReady) {
                     &stat_area, MYF(0)));
   preserved_trx_promotion_ready_cache_clear_for_unit_test();
   preserve_trx_set_enable_value(true);
-}
-
-TEST_F(PreserveSnapshotTest, PromotionReadyCacheEnforcesByteCap) {
-  const ulonglong saved_cap = preserve_trx_promotion_ready_cache_max_bytes;
-  auto restore_cap = create_scope_guard([&] {
-    preserve_trx_promotion_ready_cache_max_bytes = saved_cap;
-    preserved_trx_promotion_ready_cache_clear_for_unit_test();
-  });
-  preserve_trx_promotion_ready_cache_max_bytes = 512;
-  preserved_trx_promotion_ready_cache_clear_for_unit_test();
-  const uint64_t evictions_before =
-      preserve_trx_promotion_ready_cache_evictions_status();
-
-  Preserved_trx_bundle bundle;
-  bundle.metadata = metadata();
-  bundle.metadata.binlog_cache_payload.assign(4096, 'x');
-  preserved_trx_promotion_ready_cache_put_bundle_for_unit_test(
-      m_dir, "epoch-cache-cap", 991,
-      Preserve_trx_promotion_ready_state::READY, 10, bundle);
-  preserved_trx_promotion_ready_cache_put_bundle_for_unit_test(
-      m_dir, "epoch-cache-cap", 992,
-      Preserve_trx_promotion_ready_state::READY, 10, bundle);
-
-  EXPECT_LE(preserve_trx_promotion_ready_cache_bytes_status(),
-            preserve_trx_promotion_ready_cache_max_bytes);
-  EXPECT_GT(preserve_trx_promotion_ready_cache_evictions_status(),
-            evictions_before);
 }
 
 TEST_F(PreserveSnapshotTest, PromotionReadyCachePurgeEpochIsExact) {
@@ -13117,7 +13086,21 @@ TEST_F(PreserveSnapshotTest,
 TEST_F(PreserveSnapshotTest,
        LocalStoreRejectsEncodedSnapshotOverCurrentLimitBeforeWrite) {
   Preserve_snapshot_metadata large_metadata = metadata();
-  large_metadata.user_vars_payload = null_user_vars_payload(16);
+  std::string large_user_vars_payload;
+  append_le16(&large_user_vars_payload, 2);
+  append_le32(&large_user_vars_payload, 1);
+  append_le16(&large_user_vars_payload, 9);
+  large_user_vars_payload.push_back(static_cast<char>(STRING_RESULT));
+  append_le16(&large_user_vars_payload,
+              static_cast<uint16_t>(my_charset_bin.number));
+  large_user_vars_payload.push_back(0);
+  large_user_vars_payload.push_back(0);
+  large_user_vars_payload.push_back(0);
+  append_le32(&large_user_vars_payload,
+              static_cast<uint32_t>(preserve_trx_max_snapshot_bytes));
+  large_user_vars_payload.append("large_var");
+  large_user_vars_payload.append(preserve_trx_max_snapshot_bytes, 'x');
+  large_metadata.user_vars_payload = std::move(large_user_vars_payload);
 
   Preserved_trx_bundle bundle;
   Preserved_trx_bundle_build_input input;
@@ -13132,15 +13115,12 @@ TEST_F(PreserveSnapshotTest,
                                         nullptr));
   ASSERT_GT(encoded.snapshot_bytes.size(), 1U);
 
-  const ulonglong old_limit = preserve_trx_max_snapshot_bytes;
-  preserve_trx_max_snapshot_bytes = encoded.snapshot_bytes.size() - 1;
+  ASSERT_GT(encoded.snapshot_bytes.size(), preserve_trx_max_snapshot_bytes);
 
   Local_file_preserved_trx_carrier carrier(m_dir);
   Preserved_trx_store store(&carrier);
   EXPECT_EQ(Preserve_snapshot_status::INVALID_ARGUMENT,
             store.write(bundle, 300, nullptr));
-
-  preserve_trx_max_snapshot_bytes = old_limit;
 
   MY_STAT stat_area;
   EXPECT_EQ(nullptr, my_stat((m_dir + "msp_snapshot_gunit.bin").c_str(),
@@ -17577,13 +17557,6 @@ TEST_F(PreserveSnapshotTest,
        TransferReceiverV1StagedPrewarmBuildsMetadataProofWithoutPageIo) {
   Transfer_codec_context_guard codec_guard;
   preserved_trx_promotion_ready_cache_clear_for_unit_test();
-  const ulonglong saved_prewarm_io_bytes_per_sec =
-      preserve_trx_promotion_prewarm_io_bytes_per_sec;
-  preserve_trx_promotion_prewarm_io_bytes_per_sec = 0;
-  auto restore_prewarm_io = create_scope_guard([&] {
-    preserve_trx_promotion_prewarm_io_bytes_per_sec =
-        saved_prewarm_io_bytes_per_sec;
-  });
   const uint64_t transfer_token = 1026;
   Preserve_snapshot_metadata meta = metadata();
   meta.token = test_transfer_token_string(transfer_token);
@@ -21763,22 +21736,61 @@ TEST_F(PreserveSnapshotTest,
 }
 
 #ifndef NDEBUG
+TEST(PreserveTrxTransferRuntimePolicy, MapsCompleteProfiles) {
+  const auto business = preserve_trx_transfer_runtime_policy_for_profile(
+      PRESERVE_TRX_TRANSFER_RUNTIME_BUSINESS_FIRST);
+  EXPECT_EQ(3U, business.data_sessions);
+  EXPECT_EQ(3U, business.receiver_workers);
+  EXPECT_EQ(1U, business.prewarm_workers);
+  EXPECT_EQ(32ULL * 1024ULL * 1024ULL,
+            business.transfer_io_bytes_per_sec);
+  EXPECT_EQ(1024U * 1024U, business.warmcopy_chunk_bytes);
+  EXPECT_EQ(1000U, business.warmcopy_min_open_ms);
+  EXPECT_EQ(8U, business.commit_batch_tokens);
+
+  const auto balanced = preserve_trx_transfer_runtime_policy_for_profile(
+      PRESERVE_TRX_TRANSFER_RUNTIME_BALANCED);
+  EXPECT_EQ(4U, balanced.receiver_workers);
+  EXPECT_EQ(3U, balanced.prewarm_workers);
+  EXPECT_EQ(256ULL * 1024ULL * 1024ULL,
+            balanced.transfer_io_bytes_per_sec);
+  EXPECT_EQ(512ULL * 1024ULL * 1024ULL,
+            balanced.prewarm_io_bytes_per_sec);
+  EXPECT_EQ(4U * 1024U * 1024U, balanced.warmcopy_chunk_bytes);
+  EXPECT_EQ(100U, balanced.warmcopy_min_open_ms);
+  EXPECT_EQ(16U, balanced.commit_batch_tokens);
+
+  const auto promotion = preserve_trx_transfer_runtime_policy_for_profile(
+      PRESERVE_TRX_TRANSFER_RUNTIME_PROMOTION_PREPARE);
+  EXPECT_EQ(8U, promotion.receiver_workers);
+  EXPECT_EQ(8U, promotion.prewarm_workers);
+  EXPECT_EQ(4ULL * 1024ULL * 1024ULL * 1024ULL,
+            promotion.transfer_io_bytes_per_sec);
+  EXPECT_EQ(1024ULL * 1024ULL * 1024ULL,
+            promotion.prewarm_max_bytes);
+  EXPECT_EQ(16U * 1024U * 1024U, promotion.warmcopy_chunk_bytes);
+  EXPECT_EQ(32U, promotion.commit_batch_tokens);
+  EXPECT_EQ(8ULL * 1024ULL * 1024ULL,
+            promotion.phase1_batch_bytes);
+  EXPECT_EQ(50U, promotion.phase1_batch_linger_ms);
+
+  const auto invalid =
+      preserve_trx_transfer_runtime_policy_for_profile(UINT_MAX32);
+  EXPECT_EQ(PRESERVE_TRX_TRANSFER_RUNTIME_BUSINESS_FIRST, invalid.profile);
+  EXPECT_EQ(business.transfer_io_bytes_per_sec,
+            invalid.transfer_io_bytes_per_sec);
+}
+
 TEST_F(PreserveSnapshotTest,
        TransferReceiverPoolShutdownCancelsBlockedBusinessFirstBacklog) {
   preserve_trx_transfer_shutdown_receiver_prewarm_workers();
   const ulong saved_profile = preserve_trx_transfer_runtime_profile;
-  const uint saved_receiver_workers = preserve_trx_transfer_receiver_workers;
-  const uint saved_prewarm_workers = preserve_trx_promotion_prewarm_workers;
   auto restore = create_scope_guard([&] {
     preserve_trx_transfer_runtime_profile = saved_profile;
-    preserve_trx_transfer_receiver_workers = saved_receiver_workers;
-    preserve_trx_promotion_prewarm_workers = saved_prewarm_workers;
     preserve_trx_transfer_shutdown_receiver_prewarm_workers();
   });
   preserve_trx_transfer_runtime_profile =
       PRESERVE_TRX_TRANSFER_RUNTIME_BUSINESS_FIRST;
-  preserve_trx_transfer_receiver_workers = 3;
-  preserve_trx_promotion_prewarm_workers = 1;
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
             preserve_trx_transfer_start_receiver_workers_for_unit_test(3, -1,
                                                                        -1));
@@ -21798,10 +21810,6 @@ TEST_F(PreserveSnapshotTest,
   }
   const bool shutdown_cancelled_backlog =
       shutdown_done.load(std::memory_order_acquire);
-  if (!shutdown_cancelled_backlog) {
-    preserve_trx_transfer_runtime_profile =
-        PRESERVE_TRX_TRANSFER_RUNTIME_PROMOTION_PREPARE;
-  }
   shutdown.join();
   EXPECT_TRUE(shutdown_cancelled_backlog);
 }
@@ -22298,16 +22306,12 @@ TEST_F(PreserveSnapshotTest,
 
   const ulonglong saved_max_inflight =
       preserve_trx_transfer_max_inflight_bytes;
-  const ulonglong saved_batch_bytes =
-      preserve_trx_transfer_phase1_batch_bytes;
   preserve_trx_transfer_max_inflight_bytes = 1;
-  preserve_trx_transfer_phase1_batch_bytes = 1;
   EXPECT_EQ(Preserve_trx_transfer_status::OK,
             session.declare_tokens_batch({811, 812}));
   EXPECT_EQ(8U * 1024U * 1024U, session.max_inflight_bytes());
   EXPECT_EQ(4U * 1024U * 1024U, session.phase1_batch_bytes());
   preserve_trx_transfer_max_inflight_bytes = saved_max_inflight;
-  preserve_trx_transfer_phase1_batch_bytes = saved_batch_bytes;
 }
 
 TEST_F(PreserveSnapshotTest,
@@ -22486,6 +22490,38 @@ TEST_F(PreserveSnapshotTest, TransferFrameAckPreservesCommittedOutcome) {
                 encoded_ack, "00112233445566778899aabbccddeeff",
                 encoded_frame, &verified));
   EXPECT_EQ(Preserve_trx_transfer_status::COMMITTED_NOT_READY,
+            verified.status);
+}
+
+TEST_F(PreserveSnapshotTest, TransferFrameAckPreservesCleanAbandonOutcome) {
+  Transfer_codec_context_guard codec_guard;
+  const std::string nonce = "00112233445566778899aabbccddeeff";
+  Preserve_trx_transfer_frame frame;
+  frame.type =
+      Preserve_trx_transfer_frame_type::ABANDON_EPOCH_IF_NOT_COMMITTED;
+  frame.sequence = 8;
+  frame.epoch_id = "epoch-clean-abandon-ack";
+  frame.receiver_process_nonce = nonce;
+  frame.token = 812;
+  frame.terminal_fact_digest = test_sha256("terminal-fact");
+  std::string encoded_frame;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_encode_frame(frame, &encoded_frame));
+
+  Preserve_trx_transfer_frame_ack ack;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_build_frame_ack(
+                nonce, encoded_frame,
+                Preserve_trx_transfer_status::NOT_COMMITTED_CLEAN, &ack));
+  std::string encoded_ack;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_encode_frame_ack(ack, &encoded_ack));
+
+  Preserve_trx_transfer_frame_ack verified;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_verify_frame_ack(
+                encoded_ack, nonce, encoded_frame, &verified));
+  EXPECT_EQ(Preserve_trx_transfer_status::NOT_COMMITTED_CLEAN,
             verified.status);
 }
 
@@ -23085,6 +23121,7 @@ TEST(PreservedTrxTransfer, TransferFrameBatchCountMustFitRemainingPayload) {
           2, 2 * sizeof(uint64_t)));
 }
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferFrameBatchDecoderRejectsCountBombAndUsesMemoryLease) {
   Transfer_codec_context_guard codec_guard;
@@ -23123,6 +23160,7 @@ TEST_F(PreserveSnapshotTest,
   preserve_trx_resource_manager_set_limits_for_unit_test(
       Preserve_trx_resource_limits{});
 }
+#endif
 
 TEST_F(PreserveSnapshotTest,
        TransferOnlineHandlerHoldsPayloadLeaseThroughApplyCallback) {
@@ -23156,6 +23194,7 @@ TEST_F(PreserveSnapshotTest,
       Preserve_trx_resource_limits{});
 }
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferManifestDecoderRejectsCountBombAndUsesMemoryLease) {
   Transfer_codec_context_guard codec_guard;
@@ -23200,6 +23239,7 @@ TEST_F(PreserveSnapshotTest,
   preserve_trx_resource_manager_set_limits_for_unit_test(
       Preserve_trx_resource_limits{});
 }
+#endif
 
 TEST_F(PreserveSnapshotTest,
        TransferOnlinePayloadRequiresReceiverNonceAndOrdering) {
@@ -24341,9 +24381,10 @@ TEST_F(PreserveSnapshotTest,
 
   Final_ack_arbiter_state arbiter;
   Preserve_trx_transfer_source_epoch_options options;
+  options.runtime_policy = preserve_trx_transfer_current_runtime_policy();
   options.chunk_bytes = 7;
   options.max_inflight_bytes = preserve_trx_transfer_max_inflight_bytes;
-  options.phase1_batch_bytes = preserve_trx_transfer_phase1_batch_bytes;
+  options.phase1_batch_bytes = options.runtime_policy.phase1_batch_bytes;
   options.final_ack_arbiter = final_ack_arbiter_probe;
   options.final_ack_arbiter_context = &arbiter;
   Commit_outcome_transfer_frame_sink sink;
@@ -24610,9 +24651,10 @@ TEST_F(PreserveSnapshotTest,
 
   Before_commit_send_state before_commit;
   Preserve_trx_transfer_source_epoch_options options;
+  options.runtime_policy = preserve_trx_transfer_current_runtime_policy();
   options.chunk_bytes = 7;
   options.max_inflight_bytes = preserve_trx_transfer_max_inflight_bytes;
-  options.phase1_batch_bytes = preserve_trx_transfer_phase1_batch_bytes;
+  options.phase1_batch_bytes = options.runtime_policy.phase1_batch_bytes;
   options.before_commit_send = before_commit_send_probe;
   options.before_commit_send_context = &before_commit;
   Capturing_transfer_frame_sink sink;
@@ -24658,6 +24700,48 @@ TEST_F(PreserveSnapshotTest,
 }
 
 TEST_F(PreserveSnapshotTest,
+       TransferResetCleanupAbandonsFinalMetadataWithoutCommit) {
+  Transfer_codec_context_guard codec_guard;
+  const uint64_t transfer_token = 7104;
+  Preserve_snapshot_metadata meta = metadata();
+  meta.token = test_transfer_token_string(transfer_token);
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = meta;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  Capturing_transfer_frame_sink sink;
+  Before_commit_send_state before_commit;
+  before_commit.cancel_sink = &sink;
+  Preserve_trx_transfer_source_epoch_options options;
+  options.runtime_policy = preserve_trx_transfer_current_runtime_policy();
+  options.chunk_bytes = 7;
+  options.max_inflight_bytes = preserve_trx_transfer_max_inflight_bytes;
+  options.phase1_batch_bytes = options.runtime_policy.phase1_batch_bytes;
+  options.before_commit_send = before_commit_send_probe;
+  options.before_commit_send_context = &before_commit;
+  Preserve_trx_transfer_source_epoch_session session(
+      "epoch-reset-abandon-before-commit", options, &sink);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.declare_token(transfer_token));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.send_token_bundle(bundle, transfer_token));
+
+  EXPECT_EQ(Preserve_trx_transfer_status::UNSUPPORTED,
+            session.commit_epoch());
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.cleanup_cancelled_epoch("reset_before_commit"));
+  EXPECT_EQ(1U, sink.cleanup_prepare_count());
+  Preserve_trx_transfer_frame abandon;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_decode_frame(sink.frames().back(), &abandon));
+  EXPECT_EQ(Preserve_trx_transfer_frame_type::ABANDON_EPOCH_IF_NOT_COMMITTED,
+            abandon.type);
+  EXPECT_EQ(session.epoch_id(), abandon.epoch_id);
+}
+
+TEST_F(PreserveSnapshotTest,
        TransferSourceEpochSessionDoesNotAcceptCommittedCorrupt) {
   Transfer_codec_context_guard codec_guard;
   const uint64_t transfer_token = 7101;
@@ -24690,9 +24774,14 @@ TEST_F(PreserveSnapshotTest,
        TransferSourceEpochSessionSendsFinalTokenPayloadsInParallel) {
   Transfer_codec_context_guard codec_guard;
   Parallel_probe_transfer_frame_sink sink;
+  Preserve_trx_transfer_source_epoch_options options;
+  options.runtime_policy = preserve_trx_transfer_current_runtime_policy();
+  options.runtime_policy.sender_workers = 3;
+  options.chunk_bytes = 1024;
+  options.max_inflight_bytes = preserve_trx_transfer_max_inflight_bytes;
+  options.phase1_batch_bytes = options.runtime_policy.phase1_batch_bytes;
   Preserve_trx_transfer_source_epoch_session session(
-      "epoch-session-parallel-final", 1024,
-      &sink);
+      "epoch-session-parallel-final", options, &sink);
 
   for (uint64_t token : {711ULL, 712ULL, 713ULL}) {
     Preserve_snapshot_metadata meta = metadata();
@@ -24712,11 +24801,8 @@ TEST_F(PreserveSnapshotTest,
               session.send_token_objects_batch(manifest, objects, {}, true));
   }
 
-  const uint saved_sender_workers = preserve_trx_transfer_sender_workers;
-  preserve_trx_transfer_sender_workers = 3;
   sink.reset_probe();
   EXPECT_EQ(Preserve_trx_transfer_status::OK, session.commit_epoch());
-  preserve_trx_transfer_sender_workers = saved_sender_workers;
   EXPECT_EQ(3U, sink.payload_sends());
   EXPECT_GE(sink.max_active(), 2U);
 }
@@ -24731,9 +24817,14 @@ TEST_F(PreserveSnapshotTest,
   Preserve_trx_transfer_receiver_registry registry;
   Reordering_receiver_loopback_transfer_frame_sink sink(m_dir, &store,
                                                         &registry, 3);
+  Preserve_trx_transfer_source_epoch_options options;
+  options.runtime_policy = preserve_trx_transfer_current_runtime_policy();
+  options.runtime_policy.sender_workers = 3;
+  options.chunk_bytes = 1024;
+  options.max_inflight_bytes = preserve_trx_transfer_max_inflight_bytes;
+  options.phase1_batch_bytes = options.runtime_policy.phase1_batch_bytes;
   Preserve_trx_transfer_source_epoch_session session(
-      "epoch-parallel-receiver-order", 1024,
-      &sink);
+      "epoch-parallel-receiver-order", options, &sink);
 
   const std::vector<uint64_t> tokens{721ULL, 722ULL, 723ULL};
   std::vector<Preserve_trx_transfer_manifest> manifests;
@@ -24765,11 +24856,6 @@ TEST_F(PreserveSnapshotTest,
                   manifests[index], objects_by_token[index], {}, true));
   }
 
-  const uint saved_sender_workers = preserve_trx_transfer_sender_workers;
-  auto restore_sender_workers = create_scope_guard([&] {
-    preserve_trx_transfer_sender_workers = saved_sender_workers;
-  });
-  preserve_trx_transfer_sender_workers = 3;
   sink.arm_reorder();
   ASSERT_EQ(Preserve_trx_transfer_status::OK, session.commit_epoch());
 
@@ -25268,14 +25354,11 @@ TEST_F(PreserveSnapshotTest,
   Transfer_receiver_config_guard receiver_config;
   receiver_config.allow();
 
-  const uint saved_receiver_workers = preserve_trx_transfer_receiver_workers;
-  preserve_trx_transfer_receiver_workers = 2;
-  struct Receiver_workers_restore {
-    uint saved;
-    ~Receiver_workers_restore() {
-      preserve_trx_transfer_receiver_workers = saved;
-    }
-  } restore_workers{saved_receiver_workers};
+  const ulong saved_profile = preserve_trx_transfer_runtime_profile;
+  preserve_trx_transfer_runtime_profile =
+      PRESERVE_TRX_TRANSFER_RUNTIME_BUSINESS_FIRST;
+  auto restore_profile = create_scope_guard(
+      [&] { preserve_trx_transfer_runtime_profile = saved_profile; });
   preserve_trx_transfer_set_receiver_object_prewarm_delay_ms_for_unit_test(200);
 
   Local_file_preserved_trx_carrier carrier(m_dir);
@@ -26653,20 +26736,16 @@ TEST_F(PreserveSnapshotTest,
 TEST_F(PreserveSnapshotTest,
        TransferSourceEpochSessionAggregatesFinalMetadataToSenderWorkers) {
   Transfer_codec_context_guard codec_guard;
-  const uint saved_commit_batch_tokens =
-      preserve_trx_transfer_commit_batch_tokens;
-  const uint saved_sender_workers = preserve_trx_transfer_sender_workers;
-  auto restore_transfer_limits = create_scope_guard([&] {
-    preserve_trx_transfer_commit_batch_tokens = saved_commit_batch_tokens;
-    preserve_trx_transfer_sender_workers = saved_sender_workers;
-  });
-  preserve_trx_transfer_commit_batch_tokens = 2;
-  preserve_trx_transfer_sender_workers = 3;
-
   Capturing_transfer_frame_sink frame_sink;
+  Preserve_trx_transfer_source_epoch_options options;
+  options.runtime_policy = preserve_trx_transfer_current_runtime_policy();
+  options.runtime_policy.commit_batch_tokens = 2;
+  options.runtime_policy.sender_workers = 3;
+  options.chunk_bytes = 4096;
+  options.max_inflight_bytes = preserve_trx_transfer_max_inflight_bytes;
+  options.phase1_batch_bytes = options.runtime_policy.phase1_batch_bytes;
   Preserve_trx_transfer_source_epoch_session session(
-      "epoch-final-metadata-token-batches", 4096,
-      &frame_sink);
+      "epoch-final-metadata-token-batches", options, &frame_sink);
   for (uint64_t transfer_token = 930; transfer_token < 939;
        ++transfer_token) {
     Preserve_snapshot_metadata meta = metadata();
@@ -27182,14 +27261,13 @@ TEST_F(PreserveSnapshotTest, TransferSourceUsesTokenDataAndControlSessions) {
              "transfer_credential");
   Fake_transfer_client_state client_state;
   Transfer_client_ops_guard client_ops(&client_state);
-  const uint saved_data_sessions = preserve_trx_transfer_data_sessions;
-  preserve_trx_transfer_data_sessions = 3;
-  auto restore_data_sessions = create_scope_guard(
-      [&] { preserve_trx_transfer_data_sessions = saved_data_sessions; });
+  Preserve_trx_transfer_runtime_policy policy =
+      preserve_trx_transfer_current_runtime_policy();
+  policy.data_sessions = 3;
 
   std::unique_ptr<Preserve_trx_transfer_encoded_frame_sink> sink;
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
-            preserve_trx_transfer_make_configured_frame_sink(&sink));
+            preserve_trx_transfer_make_configured_frame_sink(&sink, &policy));
   ASSERT_NE(nullptr, sink.get());
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
             preserve_trx_transfer_send_bundle_frames(
@@ -27218,14 +27296,13 @@ TEST_F(PreserveSnapshotTest,
              "transfer_credential");
   Fake_transfer_client_state client_state;
   Transfer_client_ops_guard client_ops(&client_state);
-  const uint saved_data_sessions = preserve_trx_transfer_data_sessions;
-  preserve_trx_transfer_data_sessions = 3;
-  auto restore_data_sessions = create_scope_guard(
-      [&] { preserve_trx_transfer_data_sessions = saved_data_sessions; });
+  Preserve_trx_transfer_runtime_policy policy =
+      preserve_trx_transfer_current_runtime_policy();
+  policy.data_sessions = 3;
 
   std::unique_ptr<Preserve_trx_transfer_encoded_frame_sink> sink;
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
-            preserve_trx_transfer_make_configured_frame_sink(&sink));
+            preserve_trx_transfer_make_configured_frame_sink(&sink, &policy));
   Preserve_trx_transfer_source_epoch_session session(
       "epoch-final-ack-release", 4096,
       sink.get());
@@ -27248,14 +27325,13 @@ TEST_F(PreserveSnapshotTest,
              "transfer_credential");
   Blocking_transfer_client_state client_state;
   Blocking_transfer_client_ops_guard client_ops(&client_state);
-  const uint saved_data_sessions = preserve_trx_transfer_data_sessions;
-  preserve_trx_transfer_data_sessions = 1;
-  auto restore_data_sessions = create_scope_guard(
-      [&] { preserve_trx_transfer_data_sessions = saved_data_sessions; });
+  Preserve_trx_transfer_runtime_policy policy =
+      preserve_trx_transfer_current_runtime_policy();
+  policy.data_sessions = 1;
 
   std::unique_ptr<Preserve_trx_transfer_encoded_frame_sink> sink;
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
-            preserve_trx_transfer_make_configured_frame_sink(&sink));
+            preserve_trx_transfer_make_configured_frame_sink(&sink, &policy));
   ASSERT_NE(nullptr, sink.get());
 
   Preserve_trx_transfer_frame commit;
@@ -29566,9 +29642,6 @@ TEST_F(PreserveSnapshotTest, ZeroSnapshotDeadlineIsInvalid) {
 }
 
 TEST_F(PreserveSnapshotTest, ResumeDeadlineGraceAppliesOnlyAfterRecovery) {
-  const uint old_grace_seconds = preserve_trx_recovery_grace_seconds;
-  preserve_trx_recovery_grace_seconds = 120;
-
   Preserve_snapshot_metadata input = metadata();
   const uint64_t now_us = my_micro_time();
   input.created_at_us = now_us - 2 * 1000 * 1000ULL;
@@ -29582,8 +29655,6 @@ TEST_F(PreserveSnapshotTest, ResumeDeadlineGraceAppliesOnlyAfterRecovery) {
 
   input.recovered_count = 2;
   EXPECT_TRUE(preserved_trx_resume_deadline_expired(input));
-
-  preserve_trx_recovery_grace_seconds = old_grace_seconds;
 }
 
 TEST_F(PreserveSnapshotTest, LoggedCachePostTimestampInvalidCleansSidecar) {
@@ -29604,11 +29675,12 @@ TEST_F(PreserveSnapshotTest, LoggedCachePostTimestampInvalidCleansSidecar) {
 }
 
 TEST_F(PreserveSnapshotTest, SnapshotSizeLimitRejectsBeforeWritingFiles) {
-  const ulonglong old_limit = preserve_trx_max_snapshot_bytes;
-  preserve_trx_max_snapshot_bytes = 1;
+  std::vector<Preserve_snapshot_tlv> oversized_tlvs = required_tlvs();
+  oversized_tlvs[2].value.append(
+      static_cast<size_t>(preserve_trx_max_snapshot_bytes), 'x');
 
   EXPECT_EQ(Preserve_snapshot_status::INVALID_ARGUMENT,
-            test_write_snapshot(m_dir, metadata(), required_tlvs()));
+            test_write_snapshot(m_dir, metadata(), oversized_tlvs));
 
   MY_STAT stat_area;
   EXPECT_EQ(nullptr, my_stat((m_dir + "msp_snapshot_gunit.bin").c_str(),
@@ -29616,26 +29688,6 @@ TEST_F(PreserveSnapshotTest, SnapshotSizeLimitRejectsBeforeWritingFiles) {
   EXPECT_EQ(nullptr, my_stat((m_dir + "msp_snapshot_gunit.binlog_cache").c_str(),
                              &stat_area, MYF(0)));
 
-  preserve_trx_max_snapshot_bytes = old_limit;
-}
-
-TEST_F(PreserveSnapshotTest, BinlogCacheSizeLimitRejectsBeforeWritingFiles) {
-  const ulonglong old_limit = preserve_trx_max_binlog_cache_bytes;
-  preserve_trx_max_binlog_cache_bytes = 1;
-  const std::string binlog_payload("0123456789abcdef");
-
-  EXPECT_EQ(Preserve_snapshot_status::INVALID_ARGUMENT,
-            test_write_snapshot(m_dir, logged_with_cache_metadata(),
-                                         logged_with_cache_tlvs(),
-                                         &binlog_payload));
-
-  MY_STAT stat_area;
-  EXPECT_EQ(nullptr, my_stat((m_dir + "msp_snapshot_gunit.bin").c_str(),
-                             &stat_area, MYF(0)));
-  EXPECT_EQ(nullptr, my_stat((m_dir + "msp_snapshot_gunit.binlog_cache").c_str(),
-                             &stat_area, MYF(0)));
-
-  preserve_trx_max_binlog_cache_bytes = old_limit;
 }
 
 TEST_F(PreserveSnapshotTest, BundleBuilderNoCacheProducesTlvsWithoutBlob) {

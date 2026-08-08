@@ -1,5 +1,4 @@
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_recovery_max_count=20;
+SET GLOBAL rds_preserve_trx_enable=ON;
 DRAIN TRANSACTIONS PRESERVE;
 SELECT COUNT(*) AS preserved_count
 FROM performance_schema.preserved_transactions;
@@ -23,4 +22,4 @@ SUM(v >= 100000) AS bumped_rows
 FROM t_batch_8;
 row_count	distinct_keys	resumed_rows	bumped_rows
 8	8	8	8
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_global_off;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_global_off(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_global_off VALUES(1,10);
 START TRANSACTION;
@@ -31,4 +31,4 @@ SELECT * FROM t_global_off WHERE a=1;
 a	b
 1	12
 DROP TABLE t_global_off;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

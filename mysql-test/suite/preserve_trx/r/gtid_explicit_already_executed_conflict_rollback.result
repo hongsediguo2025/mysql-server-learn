@@ -1,6 +1,6 @@
 DROP TABLE IF EXISTS t_gtid_conflict_preserved;
 DROP TABLE IF EXISTS t_gtid_conflict_marker;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 SET SESSION sql_log_bin=0;
 CREATE TABLE t_gtid_conflict_preserved(a INT PRIMARY KEY, b INT)
 ENGINE=InnoDB;
@@ -33,4 +33,4 @@ SET SESSION sql_log_bin=0;
 DROP TABLE t_gtid_conflict_preserved, t_gtid_conflict_marker;
 SET SESSION sql_log_bin=1;
 RESET MASTER;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

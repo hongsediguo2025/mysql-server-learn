@@ -1,6 +1,6 @@
-# restart: --preserve-trx-enable=OFF
-SELECT @@global.preserve_trx_enable;
-@@global.preserve_trx_enable
+# restart: --rds-preserve-trx-enable=OFF
+SELECT @@global.rds_preserve_trx_enable;
+@@global.rds_preserve_trx_enable
 0
 DRAIN TRANSACTIONS PRESERVE;
 ERROR HY000: Resumable transactions across shutdown are disabled
@@ -12,4 +12,4 @@ SELECT COUNT(*) AS rows_seen
 FROM performance_schema.preserved_transactions;
 rows_seen
 0
-# restart: --preserve-trx-enable=ON
+# restart: --rds-preserve-trx-enable=ON

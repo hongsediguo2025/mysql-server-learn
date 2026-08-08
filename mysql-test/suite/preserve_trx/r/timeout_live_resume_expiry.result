@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_timeout_live_resume_expiry;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_timeout_live_resume_expiry(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_timeout_live_resume_expiry VALUES(1,10);
 START TRANSACTION;
@@ -18,4 +18,4 @@ SELECT * FROM t_timeout_live_resume_expiry ORDER BY a;
 a	b
 1	10
 DROP TABLE t_timeout_live_resume_expiry;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

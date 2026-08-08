@@ -10,8 +10,8 @@ CALL mtr.add_suppression("RESUME PRESERVED TRANSACTION '.*' failed: token is pen
 DROP TABLE IF EXISTS t_temp_dynamic_disable_base;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 
 CREATE TABLE t_temp_dynamic_disable_base(id INT PRIMARY KEY, v INT)
   ENGINE=InnoDB;
@@ -35,7 +35,7 @@ UPDATE t_temp_dynamic_disable_base SET v=11 WHERE id=1;
 
 --sleep 2
 
---exec echo "restart: --preserve-trx-enable=ON --preserve-trx-temp-table-enable=OFF --preserve-trx-recovery-grace-seconds=30" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-temp-table-enable=OFF" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -51,7 +51,7 @@ SELECT COUNT(*) AS preserved_count_after_disabled_resume
   FROM performance_schema.preserved_transactions;
 SELECT * FROM t_temp_dynamic_disable_base ORDER BY id;
 
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 --replace_result $preserved_token TOKEN
 --eval RESUME PRESERVED TRANSACTION '$preserved_token'
 SELECT * FROM tmp_dynamic_disable_before_resume ORDER BY id;
@@ -63,5 +63,5 @@ DROP TEMPORARY TABLE tmp_dynamic_disable_before_resume;
 --source suite/preserve_trx/include/assert_no_preserve_residue.inc
 
 DROP TABLE t_temp_dynamic_disable_base;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

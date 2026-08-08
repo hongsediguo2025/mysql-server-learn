@@ -1,6 +1,5 @@
 DROP TABLE IF EXISTS t_prepare_failure_gap;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_lock_warmcopy_enable=OFF;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_prepare_failure_gap(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
 INSERT INTO t_prepare_failure_gap VALUES(10, 10), (30, 30);
 SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
@@ -28,4 +27,3 @@ id	v
 20	20
 30	30
 DROP TABLE t_prepare_failure_gap;
-SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;

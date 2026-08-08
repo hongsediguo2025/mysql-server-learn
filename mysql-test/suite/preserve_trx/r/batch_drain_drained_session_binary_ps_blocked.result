@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_batch_drained_ps;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_batch_drained_ps(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_batch_drained_ps VALUES(1,10);
 include/wait_for_pattern_in_file.inc [raw_ps_client_ready]
@@ -22,4 +22,4 @@ SELECT * FROM t_batch_drained_ps;
 a	b
 1	10
 DROP TABLE t_batch_drained_ps;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

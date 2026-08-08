@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_gap_next_key_after_resume;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_gap_next_key_after_resume(
 id INT PRIMARY KEY,
 v INT
@@ -29,4 +29,4 @@ id	v
 20	21
 30	30
 DROP TABLE t_gap_next_key_after_resume;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

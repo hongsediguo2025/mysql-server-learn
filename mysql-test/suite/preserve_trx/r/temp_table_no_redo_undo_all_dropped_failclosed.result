@@ -1,6 +1,6 @@
 DROP TABLE IF EXISTS t_temp_no_redo_drop_all_base;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 CREATE TABLE t_temp_no_redo_drop_all_base(
 id INT PRIMARY KEY,
 v INT
@@ -46,5 +46,5 @@ id	v
 3	30
 4	40
 DROP TABLE t_temp_no_redo_drop_all_base;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

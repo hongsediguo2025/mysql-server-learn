@@ -1,30 +1,30 @@
 --source include/not_log_bin.inc
 
-SET @saved_phase1_timeout_ms=@@GLOBAL.preserve_trx_drain_phase1_timeout_ms;
-SET @saved_phase2_timeout_ms=@@GLOBAL.preserve_trx_drain_phase2_timeout_ms;
+SET @saved_phase1_timeout_ms=@@GLOBAL.rds_preserve_trx_drain_phase1_timeout_ms;
+SET @saved_phase2_timeout_ms=@@GLOBAL.rds_preserve_trx_drain_phase2_timeout_ms;
 SET @saved_token_retention_timeout_ms=
-  @@GLOBAL.preserve_trx_token_retention_timeout_ms;
+  @@GLOBAL.rds_preserve_trx_token_retention_timeout_ms;
 
-SET GLOBAL preserve_trx_drain_phase1_timeout_ms=1234;
-SET GLOBAL preserve_trx_drain_phase2_timeout_ms=2345;
-SET GLOBAL preserve_trx_token_retention_timeout_ms=3456;
+SET GLOBAL rds_preserve_trx_drain_phase1_timeout_ms=1234;
+SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms=2345;
+SET GLOBAL rds_preserve_trx_token_retention_timeout_ms=3456;
 
-SELECT @@GLOBAL.preserve_trx_drain_phase1_timeout_ms AS phase1_timeout_ms,
-       @@GLOBAL.preserve_trx_drain_phase2_timeout_ms AS phase2_timeout_ms,
-       @@GLOBAL.preserve_trx_token_retention_timeout_ms
+SELECT @@GLOBAL.rds_preserve_trx_drain_phase1_timeout_ms AS phase1_timeout_ms,
+       @@GLOBAL.rds_preserve_trx_drain_phase2_timeout_ms AS phase2_timeout_ms,
+       @@GLOBAL.rds_preserve_trx_token_retention_timeout_ms
          AS token_retention_timeout_ms;
 
 --error ER_GLOBAL_VARIABLE
-SET SESSION preserve_trx_drain_phase1_timeout_ms=1234;
+SET SESSION rds_preserve_trx_drain_phase1_timeout_ms=1234;
 --error ER_GLOBAL_VARIABLE
-SET SESSION preserve_trx_drain_phase2_timeout_ms=2345;
+SET SESSION rds_preserve_trx_drain_phase2_timeout_ms=2345;
 --error ER_GLOBAL_VARIABLE
-SET SESSION preserve_trx_token_retention_timeout_ms=3456;
+SET SESSION rds_preserve_trx_token_retention_timeout_ms=3456;
 
 --error ER_PARSE_ERROR
 DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 9;
 
-SET GLOBAL preserve_trx_drain_phase1_timeout_ms=@saved_phase1_timeout_ms;
-SET GLOBAL preserve_trx_drain_phase2_timeout_ms=@saved_phase2_timeout_ms;
-SET GLOBAL preserve_trx_token_retention_timeout_ms=
+SET GLOBAL rds_preserve_trx_drain_phase1_timeout_ms=@saved_phase1_timeout_ms;
+SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms=@saved_phase2_timeout_ms;
+SET GLOBAL rds_preserve_trx_token_retention_timeout_ms=
   @saved_token_retention_timeout_ms;

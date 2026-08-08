@@ -9,7 +9,7 @@ CALL mtr.add_suppression("Preserved transaction batch cleanup failed to activate
 DROP TABLE IF EXISTS t_batch_reattach_activate_failure;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_batch_reattach_activate_failure(
   id INT PRIMARY KEY,
@@ -54,4 +54,4 @@ ROLLBACK;
 SELECT * FROM t_batch_reattach_activate_failure ORDER BY id;
 
 DROP TABLE t_batch_reattach_activate_failure;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

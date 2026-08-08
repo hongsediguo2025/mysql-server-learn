@@ -1,7 +1,7 @@
 --source include/not_log_bin.inc
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 
 CREATE TEMPORARY TABLE tmp_preserve_temp_autoinc(
   id INT AUTO_INCREMENT PRIMARY KEY,
@@ -18,4 +18,4 @@ INSERT INTO tmp_preserve_temp_autoinc(v) VALUES(10),(20);
 ROLLBACK;
 DROP TEMPORARY TABLE tmp_preserve_temp_autoinc;
 
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;

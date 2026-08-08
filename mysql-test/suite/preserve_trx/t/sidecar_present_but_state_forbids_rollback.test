@@ -11,7 +11,7 @@ CALL mtr.add_suppression("Preserved transaction .* resume forced rollback: corru
 CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: corrupt durable transaction snapshot");
 --enable_query_log
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 --let MYSQLD_DATADIR= `SELECT @@datadir`
 
 CREATE TABLE t_sidecar_state_forbid(
@@ -46,7 +46,7 @@ open(my $fh, '>', File::Spec->catfile($dir, "$token.binlog_cache"))
 print {$fh} "unexpected";
 close($fh) or die "cannot close forbidden sidecar: $!";
 EOF
---exec echo "restart: --preserve-trx-enable=ON --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -58,4 +58,4 @@ SELECT * FROM t_sidecar_state_forbid ORDER BY id;
 --source suite/preserve_trx/include/assert_no_preserve_residue.inc
 
 DROP TABLE t_sidecar_state_forbid;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

@@ -6,19 +6,9 @@
 DROP TABLE IF EXISTS t_lock_warmcopy_record_page_drift;
 --enable_warnings
 
---let $old_preserve_trx_enable= `SELECT @@GLOBAL.preserve_trx_enable`
---let $old_preserve_trx_warmcopy_enable= `SELECT @@GLOBAL.preserve_trx_warmcopy_enable`
---let $old_preserve_trx_lock_warmcopy_enable= `SELECT @@GLOBAL.preserve_trx_lock_warmcopy_enable`
---let $old_preserve_trx_lock_warmcopy_fallback= `SELECT @@GLOBAL.preserve_trx_lock_warmcopy_fallback_to_live_export`
---let $old_preserve_trx_lock_warmcopy_max_dirty_shards= `SELECT @@GLOBAL.preserve_trx_lock_warmcopy_max_dirty_shards`
---let $old_preserve_trx_recovery_max_count= `SELECT @@GLOBAL.preserve_trx_recovery_max_count`
+--let $old_rds_preserve_trx_enable= `SELECT @@GLOBAL.rds_preserve_trx_enable`
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_enable=OFF;
-SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
-SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=OFF;
-SET GLOBAL preserve_trx_lock_warmcopy_max_dirty_shards=0;
-SET GLOBAL preserve_trx_recovery_max_count=10;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_lock_warmcopy_record_page_drift(
   id INT PRIMARY KEY,
@@ -28,51 +18,6 @@ CREATE TABLE t_lock_warmcopy_record_page_drift(
 INSERT INTO t_lock_warmcopy_record_page_drift VALUES
   (1,10,REPEAT('a',32)),
   (2,20,REPEAT('b',32));
-
---connect(lock_wc_page_drift_strict_app, localhost, root,,test)
-START TRANSACTION;
-UPDATE t_lock_warmcopy_record_page_drift
-  SET v=11, pad=REPEAT('x',32)
-  WHERE id=1;
-
---connect(lock_wc_page_drift_strict_owner, localhost, root,,test)
---connection lock_wc_page_drift_strict_owner
-SET DEBUG_SYNC =
-  'preserve_trx_warmcopy_after_phase1_open SIGNAL lock_wc_page_drift_strict_open WAIT_FOR lock_wc_page_drift_strict_continue';
---send DRAIN TRANSACTIONS PRESERVE
-
---connection default
-SET DEBUG_SYNC = 'now WAIT_FOR lock_wc_page_drift_strict_open TIMEOUT 10';
-
---connection lock_wc_page_drift_strict_app
-UPDATE t_lock_warmcopy_record_page_drift
-  SET v=12, pad=REPEAT('w',32)
-  WHERE id=2;
-
---connection default
-SET DEBUG_SYNC = 'now SIGNAL lock_wc_page_drift_strict_continue';
-
---connection lock_wc_page_drift_strict_owner
---error ER_PRESERVE_TRX_UNSUPPORTED
---reap
---disconnect lock_wc_page_drift_strict_owner
-
---connection default
-SELECT VARIABLE_NAME, CAST(VARIABLE_VALUE AS UNSIGNED) > 0 AS positive
-  FROM performance_schema.global_status
-  WHERE VARIABLE_NAME IN (
-    'Preserve_trx_lock_warmcopy_attempts',
-    'Preserve_trx_lock_warmcopy_resource_limit',
-    'Preserve_trx_lock_warmcopy_sealed_invalid',
-    'Preserve_trx_lock_warmcopy_strict_reject')
-  ORDER BY VARIABLE_NAME;
-
---connection lock_wc_page_drift_strict_app
-ROLLBACK;
---disconnect lock_wc_page_drift_strict_app
-
---connection default
-SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=ON;
 
 --connect(lock_wc_page_drift_fallback_app, localhost, root,,test)
 START TRANSACTION;
@@ -105,7 +50,7 @@ SET DEBUG_SYNC = 'now SIGNAL lock_wc_page_drift_fallback_continue';
 --connection default
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 
---exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=10" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -130,11 +75,6 @@ SELECT id, v, pad=REPEAT('y',32) AS pad_ok
 
 DROP TABLE t_lock_warmcopy_record_page_drift;
 --disable_query_log
---eval SET GLOBAL preserve_trx_recovery_max_count=$old_preserve_trx_recovery_max_count
---eval SET GLOBAL preserve_trx_lock_warmcopy_max_dirty_shards=$old_preserve_trx_lock_warmcopy_max_dirty_shards
---eval SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=$old_preserve_trx_lock_warmcopy_fallback
---eval SET GLOBAL preserve_trx_lock_warmcopy_enable=$old_preserve_trx_lock_warmcopy_enable
---eval SET GLOBAL preserve_trx_warmcopy_enable=$old_preserve_trx_warmcopy_enable
---eval SET GLOBAL preserve_trx_enable=$old_preserve_trx_enable
+--eval SET GLOBAL rds_preserve_trx_enable=$old_rds_preserve_trx_enable
 --enable_query_log
 SET DEBUG_SYNC = 'RESET';

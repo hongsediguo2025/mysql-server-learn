@@ -1,6 +1,6 @@
 DROP USER IF EXISTS preserve_wrong_user@localhost;
 DROP TABLE IF EXISTS t_wrong_user;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_wrong_user(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_wrong_user VALUES(1,10);
 CREATE USER preserve_wrong_user@localhost;
@@ -17,4 +17,4 @@ a	b
 1	10
 DROP USER preserve_wrong_user@localhost;
 DROP TABLE t_wrong_user;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

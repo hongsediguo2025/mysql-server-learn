@@ -3,44 +3,27 @@ ERROR 42000: Access denied; you need (at least one of) the PRESERVE_TRX_HA_ADMIN
 CREATE USER preserve_trx_ha_admin@localhost;
 GRANT SHUTDOWN ON *.* TO preserve_trx_ha_admin@localhost;
 RESET DRAIN;
-SELECT @@GLOBAL.preserve_trx_transfer_receiver_prewarm_timeout_ms;
-@@GLOBAL.preserve_trx_transfer_receiver_prewarm_timeout_ms
-10000
-SELECT @@GLOBAL.preserve_trx_token_retention_timeout_ms;
-@@GLOBAL.preserve_trx_token_retention_timeout_ms
+SELECT @@GLOBAL.rds_preserve_trx_token_retention_timeout_ms;
+@@GLOBAL.rds_preserve_trx_token_retention_timeout_ms
 30000
-SET GLOBAL preserve_trx_transfer_receiver_prewarm_timeout_ms=1000;
-SET GLOBAL preserve_trx_token_retention_timeout_ms=3600000;
-SELECT @@GLOBAL.preserve_trx_transfer_receiver_prewarm_timeout_ms;
-@@GLOBAL.preserve_trx_transfer_receiver_prewarm_timeout_ms
-1000
-SELECT @@GLOBAL.preserve_trx_token_retention_timeout_ms;
-@@GLOBAL.preserve_trx_token_retention_timeout_ms
+SET GLOBAL rds_preserve_trx_token_retention_timeout_ms=3600000;
+SELECT @@GLOBAL.rds_preserve_trx_token_retention_timeout_ms;
+@@GLOBAL.rds_preserve_trx_token_retention_timeout_ms
 3600000
-SET GLOBAL preserve_trx_transfer_receiver_prewarm_timeout_ms=999;
-Warnings:
-Warning	1292	Truncated incorrect preserve_trx_transfer_receiver_prewarm_timeout_ms value: '999'
 SHOW WARNINGS;
 Level	Code	Message
-Warning	1292	Truncated incorrect preserve_trx_transfer_receiver_prewarm_timeout_ms value: '999'
-SELECT @@GLOBAL.preserve_trx_transfer_receiver_prewarm_timeout_ms;
-@@GLOBAL.preserve_trx_transfer_receiver_prewarm_timeout_ms
-1000
-SET GLOBAL preserve_trx_token_retention_timeout_ms=3600001;
+SET GLOBAL rds_preserve_trx_token_retention_timeout_ms=3600001;
 Warnings:
-Warning	1292	Truncated incorrect preserve_trx_token_retention_timeout_ms value: '3600001'
+Warning	1292	Truncated incorrect rds_preserve_trx_token_retention_timeout_ms value: '3600001'
 SHOW WARNINGS;
 Level	Code	Message
-Warning	1292	Truncated incorrect preserve_trx_token_retention_timeout_ms value: '3600001'
-SELECT @@GLOBAL.preserve_trx_token_retention_timeout_ms;
-@@GLOBAL.preserve_trx_token_retention_timeout_ms
+Warning	1292	Truncated incorrect rds_preserve_trx_token_retention_timeout_ms value: '3600001'
+SELECT @@GLOBAL.rds_preserve_trx_token_retention_timeout_ms;
+@@GLOBAL.rds_preserve_trx_token_retention_timeout_ms
 3600000
-SET SESSION preserve_trx_transfer_receiver_prewarm_timeout_ms=1000;
-ERROR HY000: Variable 'preserve_trx_transfer_receiver_prewarm_timeout_ms' is a GLOBAL variable and should be set with SET GLOBAL
-SET SESSION preserve_trx_token_retention_timeout_ms=1000;
-ERROR HY000: Variable 'preserve_trx_token_retention_timeout_ms' is a GLOBAL variable and should be set with SET GLOBAL
-SET GLOBAL preserve_trx_transfer_receiver_prewarm_timeout_ms=10000;
-SET GLOBAL preserve_trx_token_retention_timeout_ms=30000;
+SET SESSION rds_preserve_trx_token_retention_timeout_ms=1000;
+ERROR HY000: Variable 'rds_preserve_trx_token_retention_timeout_ms' is a GLOBAL variable and should be set with SET GLOBAL
+SET GLOBAL rds_preserve_trx_token_retention_timeout_ms=30000;
 SHOW GLOBAL STATUS LIKE 'Preserve_trx_reset_drain_wins';
 Variable_name	Value
 Preserve_trx_reset_drain_wins	0
@@ -53,9 +36,9 @@ Preserve_trx_transfer_receiver_active_epochs	0
 SHOW GLOBAL STATUS LIKE 'Preserve_trx_transfer_receiver_expired_epochs';
 Variable_name	Value
 Preserve_trx_transfer_receiver_expired_epochs	0
-# restart: --preserve-trx-enable=OFF
+# restart: --rds-preserve-trx-enable=OFF
 RESET DRAIN;
-# restart: --preserve-trx-enable=ON
+# restart: --rds-preserve-trx-enable=ON
 START TRANSACTION;
 SAVEPOINT ha_reset_guard;
 RESET DRAIN;

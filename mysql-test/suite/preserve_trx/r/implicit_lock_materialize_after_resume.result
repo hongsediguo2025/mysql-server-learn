@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_implicit_lock_after_resume;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_implicit_lock_after_resume(
 id INT PRIMARY KEY,
 v INT
@@ -24,4 +24,4 @@ id	v
 2	20
 3	31
 DROP TABLE t_implicit_lock_after_resume;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

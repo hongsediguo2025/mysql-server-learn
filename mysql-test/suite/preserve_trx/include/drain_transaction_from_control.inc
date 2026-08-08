@@ -11,7 +11,7 @@
 --connect(preserve_trx_drain_control,localhost,root,,test)
 if ($preserve_trx_one_second_retention) {
   --disable_query_log
-  SET GLOBAL preserve_trx_token_retention_timeout_ms=1000;
+  SET GLOBAL rds_preserve_trx_token_retention_timeout_ms=1000;
   --enable_query_log
 }
 if (!$preserve_trx_drain_clause) {

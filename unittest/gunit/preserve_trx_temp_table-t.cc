@@ -230,36 +230,6 @@ class PreserveTrxEnableGuard {
   bool m_saved_enable{false};
 };
 
-class PreserveTrxMaxBinlogCacheBytesGuard {
- public:
-  explicit PreserveTrxMaxBinlogCacheBytesGuard(ulonglong value)
-      : m_saved_limit(preserve_trx_max_binlog_cache_bytes) {
-    preserve_trx_max_binlog_cache_bytes = value;
-  }
-
-  ~PreserveTrxMaxBinlogCacheBytesGuard() {
-    preserve_trx_max_binlog_cache_bytes = m_saved_limit;
-  }
-
- private:
-  ulonglong m_saved_limit{0};
-};
-
-class PreserveTrxMaxTempSidecarBytesGuard {
- public:
-  explicit PreserveTrxMaxTempSidecarBytesGuard(ulonglong value)
-      : m_saved_limit(preserve_trx_max_temp_sidecar_bytes) {
-    preserve_trx_max_temp_sidecar_bytes = value;
-  }
-
-  ~PreserveTrxMaxTempSidecarBytesGuard() {
-    preserve_trx_max_temp_sidecar_bytes = m_saved_limit;
-  }
-
- private:
-  ulonglong m_saved_limit{0};
-};
-
 void mark_active_transaction(THD *thd) {
   thd->server_status |= SERVER_STATUS_IN_TRANS;
   thd->variables.option_bits |= OPTION_BEGIN;
@@ -4571,6 +4541,7 @@ TEST(TempDirtyPageStreamTest, CoalescesSamePageToLatestImage) {
   expect_temp_dirty_stream_clean(descriptor, participant);
 }
 
+#ifndef NDEBUG
 TEST(TempDirtyPageStreamTest, DirtyPageCaptureObeysGlobalMemoryBudget) {
   PreserveTempTableGateForDirtyStreamGuard enable_guard(true);
   constexpr uint32_t kPageSize = 1024;
@@ -4623,6 +4594,7 @@ TEST(TempDirtyPageStreamTest, DirtyPageCaptureObeysGlobalMemoryBudget) {
   preserve_trx_resource_manager_set_limits_for_unit_test(
       Preserve_trx_resource_limits{});
 }
+#endif
 
 TEST(TempDirtyPageStreamTest, QueueLimitMarksParticipantDegraded) {
   PreserveTempTableGateForDirtyStreamGuard enable_guard(true);
@@ -11954,58 +11926,6 @@ TEST_F(TempPhysicalImageCarrierTest,
       make_temp_file_page_for_sidecar(descriptor.source_space_id, page2)));
 }
 
-TEST_F(TempPhysicalImageCarrierTest,
-       SidecarReadLimitIsIndependentOfBinlogCacheLimit) {
-  PreserveTrxMaxBinlogCacheBytesGuard low_binlog_limit(1);
-  const std::string token = "temp_sidecar_limit_token";
-  const std::string warmcopy_id = "warmSidecarLimit";
-  const uint32_t table_ordinal = 3;
-  const uint32_t space_id = 52;
-  const std::string image_payload = "physical-image-larger-than-binlog-limit";
-  Local_file_preserved_temp_table_image_carrier carrier(m_dir);
-
-  ASSERT_EQ(Preserved_trx_carrier_status::OK,
-            carrier.write_warm_image(
-                warmcopy_id, space_id,
-                reinterpret_cast<const unsigned char *>(image_payload.data()),
-                image_payload.length()));
-
-  Preserved_temp_table_image_descriptor image_desc =
-      physical_image_descriptor(
-          table_ordinal, space_id, image_payload,
-          token + ".tempts." + std::to_string(space_id) + ".image");
-
-  ASSERT_EQ(Preserved_trx_carrier_status::OK,
-            carrier.seal_warm_image(warmcopy_id, token, image_desc));
-
-  std::string read_image;
-  EXPECT_EQ(Preserved_trx_carrier_status::OK,
-            carrier.read_sealed_image(token, image_desc, &read_image));
-  EXPECT_EQ(image_payload, read_image);
-}
-
-TEST_F(TempPhysicalImageCarrierTest, SidecarReadLimitRejectsTempSidecarLimit) {
-  PreserveTrxMaxTempSidecarBytesGuard low_temp_limit(1);
-  const std::string warmcopy_id = "warmTempSidecarLimit";
-  const uint32_t space_id = 53;
-  const std::string image_payload = "physical-image-over-temp-sidecar-limit";
-  const std::string undo_payload = "physical-undo-over-temp-sidecar-limit";
-  Local_file_preserved_temp_table_image_carrier carrier(m_dir);
-
-  EXPECT_EQ(Preserved_trx_carrier_status::CORRUPT,
-            carrier.write_warm_image(
-                warmcopy_id, space_id,
-                reinterpret_cast<const unsigned char *>(image_payload.data()),
-                image_payload.length()));
-  EXPECT_EQ(Preserved_trx_carrier_status::CORRUPT,
-            carrier.write_warm_undo(
-                warmcopy_id, space_id,
-                reinterpret_cast<const unsigned char *>(undo_payload.data()),
-                undo_payload.length()));
-  EXPECT_FALSE(exists(warm_image_path(warmcopy_id, space_id)));
-  EXPECT_FALSE(exists(warm_physical_undo_path(warmcopy_id, space_id)));
-}
-
 TEST_F(TempPhysicalImageCarrierTest, RejectsDigestMismatch) {
   const std::string token = "temp_token";
   const std::string warmcopy_id = "warmPhysicalB";
@@ -13288,76 +13208,6 @@ TEST_F(PreserveTrxTempTableCarrierTest, SealRejectsSizeMismatch) {
             carrier.seal_warm_image("warmG", token, desc));
   EXPECT_TRUE(exists(warm_image_path("warmG", 9)));
   EXPECT_FALSE(exists(sealed_image_path(token, 9)));
-}
-
-TEST_F(PreserveTrxTempTableCarrierTest,
-       SealRejectsSidecarsAboveConfiguredReadLimit) {
-  const std::string token = "temp_token";
-  const std::string image_payload = "oversized-image";
-  const std::string undo_payload = "oversized-undo";
-  Local_file_preserved_temp_table_image_carrier carrier(m_dir);
-  ASSERT_EQ(Preserved_trx_carrier_status::OK,
-            carrier.write_warm_image(
-                "warmH", 11,
-                reinterpret_cast<const unsigned char *>(image_payload.data()),
-                image_payload.length()));
-  ASSERT_EQ(Preserved_trx_carrier_status::OK,
-            carrier.write_warm_undo(
-                "warmH", 11,
-                reinterpret_cast<const unsigned char *>(undo_payload.data()),
-                undo_payload.length()));
-
-  Preserved_temp_table_image_descriptor image_desc =
-      descriptor(11, image_payload, token + ".tempts.11.image");
-  Preserved_temp_table_undo_descriptor undo_desc =
-      undo_descriptor(11, undo_payload, token + ".tempts.11.undo");
-
-  PreserveTrxMaxTempSidecarBytesGuard limit_guard(1);
-  EXPECT_EQ(Preserved_trx_carrier_status::CORRUPT,
-            carrier.seal_warm_image("warmH", token, image_desc));
-  EXPECT_EQ(Preserved_trx_carrier_status::CORRUPT,
-            carrier.seal_warm_undo("warmH", token, undo_desc));
-  EXPECT_TRUE(exists(warm_image_path("warmH", 11)));
-  EXPECT_TRUE(exists(warm_physical_undo_path("warmH", 11)));
-  EXPECT_FALSE(exists(sealed_image_path(token, 11)));
-  EXPECT_FALSE(exists(sealed_physical_undo_path(token, 11)));
-}
-
-TEST_F(PreserveTrxTempTableCarrierTest,
-       ReadSealedSidecarsRejectsConfiguredOversizeBeforePayload) {
-  const std::string token = "temp_token";
-  const std::string image_payload = "read-oversized-image";
-  const std::string undo_payload = "read-oversized-undo";
-  Local_file_preserved_temp_table_image_carrier carrier(m_dir);
-  ASSERT_EQ(Preserved_trx_carrier_status::OK,
-            carrier.write_warm_image(
-                "warmI", 12,
-                reinterpret_cast<const unsigned char *>(image_payload.data()),
-                image_payload.length()));
-  ASSERT_EQ(Preserved_trx_carrier_status::OK,
-            carrier.write_warm_undo(
-                "warmI", 12,
-                reinterpret_cast<const unsigned char *>(undo_payload.data()),
-                undo_payload.length()));
-
-  Preserved_temp_table_image_descriptor image_desc =
-      descriptor(12, image_payload, token + ".tempts.12.image");
-  Preserved_temp_table_undo_descriptor undo_desc =
-      undo_descriptor(12, undo_payload, token + ".tempts.12.undo");
-  ASSERT_EQ(Preserved_trx_carrier_status::OK,
-            carrier.seal_warm_image("warmI", token, image_desc));
-  ASSERT_EQ(Preserved_trx_carrier_status::OK,
-            carrier.seal_warm_undo("warmI", token, undo_desc));
-
-  std::string image_out = "unchanged-image";
-  std::string undo_out = "unchanged-undo";
-  PreserveTrxMaxTempSidecarBytesGuard limit_guard(1);
-  EXPECT_EQ(Preserved_trx_carrier_status::CORRUPT,
-            carrier.read_sealed_image(token, image_desc, &image_out));
-  EXPECT_EQ(Preserved_trx_carrier_status::CORRUPT,
-            carrier.read_sealed_undo(token, undo_desc, &undo_out));
-  EXPECT_EQ("unchanged-image", image_out);
-  EXPECT_EQ("unchanged-undo", undo_out);
 }
 
 TEST_F(PreserveTrxTempTableCarrierTest, SealRejectsMissingWarmImage) {

@@ -7,17 +7,10 @@ DROP TABLE IF EXISTS t_warmcopy_parallel_finalize_tokens;
 DROP TABLE IF EXISTS t_warmcopy_parallel_finalize;
 --enable_warnings
 
---let $old_preserve_trx_enable= `SELECT @@GLOBAL.preserve_trx_enable`
---let $old_preserve_trx_warmcopy_enable= `SELECT @@GLOBAL.preserve_trx_warmcopy_enable`
---let $old_preserve_trx_lock_warmcopy_enable= `SELECT @@GLOBAL.preserve_trx_lock_warmcopy_enable`
---let $old_preserve_trx_parallel_preserve_threads= `SELECT @@GLOBAL.preserve_trx_parallel_preserve_threads`
+--let $old_rds_preserve_trx_enable= `SELECT @@GLOBAL.rds_preserve_trx_enable`
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
-SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
-SET GLOBAL preserve_trx_parallel_preserve_threads=2;
-SET GLOBAL preserve_trx_recovery_max_count=10;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=PROMOTION_PREPARE;
 
 CREATE TABLE t_warmcopy_parallel_finalize(
   id INT PRIMARY KEY,
@@ -70,7 +63,7 @@ $metrics =~ /phase2_preserve_worker_count=2(?:\D|$)/
   or die "parallel preserve workers were not exercised\n";
 EOF
 
---exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=10" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -103,11 +96,7 @@ DROP TABLE t_warmcopy_parallel_finalize_tokens;
 DROP TABLE t_warmcopy_parallel_finalize;
 
 --disable_query_log
---eval SET GLOBAL preserve_trx_parallel_preserve_threads=$old_preserve_trx_parallel_preserve_threads
---eval SET GLOBAL preserve_trx_lock_warmcopy_enable=$old_preserve_trx_lock_warmcopy_enable
---eval SET GLOBAL preserve_trx_warmcopy_enable=$old_preserve_trx_warmcopy_enable
---eval SET GLOBAL preserve_trx_enable=$old_preserve_trx_enable
+--eval SET GLOBAL rds_preserve_trx_enable=$old_rds_preserve_trx_enable
 --enable_query_log
-SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
-SET GLOBAL preserve_trx_recovery_max_count=1000;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=BUSINESS_FIRST;
 SET DEBUG_SYNC = 'RESET';

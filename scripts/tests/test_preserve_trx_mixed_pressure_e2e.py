@@ -744,8 +744,8 @@ class MixedPressureCommandTest(unittest.TestCase):
         self.assertNotIn("--receiver-start-command", command)
         self.assertEqual([], receiver)
         self.assertNotIn("STANDBY_TRANSFER_SAVE", " ".join(source))
-        self.assertNotIn("preserve-trx-transfer-target-host", " ".join(source))
-        self.assertNotIn("preserve-trx-transfer-target-user", " ".join(source))
+        self.assertNotIn("rds-preserve-trx-transfer-target-host", " ".join(source))
+        self.assertNotIn("rds-preserve-trx-transfer-target-user", " ".join(source))
         self.assertTrue(any(value.startswith("--log-bin=") for value in source))
         self.assertIn("--binlog-format=ROW", source)
         self.assertNotIn("--gtid-mode=ON", source)
@@ -795,7 +795,7 @@ class MixedPressureCommandTest(unittest.TestCase):
             "--standalone-transfer-accept-committed-not-ready", command
         )
         self.assertIn("--allow-partial-tokens", command)
-        self.assertIn("--preserve-trx-transfer-target-host=127.0.0.1", source)
+        self.assertIn("--rds-preserve-trx-transfer-target-host=127.0.0.1", source)
         self.assertTrue(any(value.startswith("--log-bin=") for value in source))
         self.assertTrue(any(value.startswith("--log-bin=") for value in receiver))
         self.assertIn("--binlog-format=ROW", source)
@@ -807,12 +807,14 @@ class MixedPressureCommandTest(unittest.TestCase):
         self.assertNotIn("--receiver-unix-socket", command)
         self.assertIn("--warmcopy-required", command)
         self.assertIn(
-            "--preserve-trx-transfer-runtime-profile=PROMOTION_PREPARE",
+            "--rds-preserve-trx-transfer-runtime-profile=PROMOTION_PREPARE",
             source,
         )
         self.assertIn(
-            "--preserve-trx-promotion-prewarm-workers=2", receiver
+            "--rds-preserve-trx-transfer-runtime-profile=PROMOTION_PREPARE",
+            receiver,
         )
+        self.assertFalse(any("promotion-prewarm-workers" in item for item in receiver))
 
     def test_mixed_transfer_requires_truthful_post_command_and_cleanup_metrics(self):
         report = self._valid_transfer_report()

@@ -1,25 +1,25 @@
-SET @saved_phase1_timeout_ms=@@GLOBAL.preserve_trx_drain_phase1_timeout_ms;
-SET @saved_phase2_timeout_ms=@@GLOBAL.preserve_trx_drain_phase2_timeout_ms;
+SET @saved_phase1_timeout_ms=@@GLOBAL.rds_preserve_trx_drain_phase1_timeout_ms;
+SET @saved_phase2_timeout_ms=@@GLOBAL.rds_preserve_trx_drain_phase2_timeout_ms;
 SET @saved_token_retention_timeout_ms=
-@@GLOBAL.preserve_trx_token_retention_timeout_ms;
-SET GLOBAL preserve_trx_drain_phase1_timeout_ms=1234;
-SET GLOBAL preserve_trx_drain_phase2_timeout_ms=2345;
-SET GLOBAL preserve_trx_token_retention_timeout_ms=3456;
-SELECT @@GLOBAL.preserve_trx_drain_phase1_timeout_ms AS phase1_timeout_ms,
-@@GLOBAL.preserve_trx_drain_phase2_timeout_ms AS phase2_timeout_ms,
-@@GLOBAL.preserve_trx_token_retention_timeout_ms
+@@GLOBAL.rds_preserve_trx_token_retention_timeout_ms;
+SET GLOBAL rds_preserve_trx_drain_phase1_timeout_ms=1234;
+SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms=2345;
+SET GLOBAL rds_preserve_trx_token_retention_timeout_ms=3456;
+SELECT @@GLOBAL.rds_preserve_trx_drain_phase1_timeout_ms AS phase1_timeout_ms,
+@@GLOBAL.rds_preserve_trx_drain_phase2_timeout_ms AS phase2_timeout_ms,
+@@GLOBAL.rds_preserve_trx_token_retention_timeout_ms
 AS token_retention_timeout_ms;
 phase1_timeout_ms	phase2_timeout_ms	token_retention_timeout_ms
 1234	2345	3456
-SET SESSION preserve_trx_drain_phase1_timeout_ms=1234;
-ERROR HY000: Variable 'preserve_trx_drain_phase1_timeout_ms' is a GLOBAL variable and should be set with SET GLOBAL
-SET SESSION preserve_trx_drain_phase2_timeout_ms=2345;
-ERROR HY000: Variable 'preserve_trx_drain_phase2_timeout_ms' is a GLOBAL variable and should be set with SET GLOBAL
-SET SESSION preserve_trx_token_retention_timeout_ms=3456;
-ERROR HY000: Variable 'preserve_trx_token_retention_timeout_ms' is a GLOBAL variable and should be set with SET GLOBAL
+SET SESSION rds_preserve_trx_drain_phase1_timeout_ms=1234;
+ERROR HY000: Variable 'rds_preserve_trx_drain_phase1_timeout_ms' is a GLOBAL variable and should be set with SET GLOBAL
+SET SESSION rds_preserve_trx_drain_phase2_timeout_ms=2345;
+ERROR HY000: Variable 'rds_preserve_trx_drain_phase2_timeout_ms' is a GLOBAL variable and should be set with SET GLOBAL
+SET SESSION rds_preserve_trx_token_retention_timeout_ms=3456;
+ERROR HY000: Variable 'rds_preserve_trx_token_retention_timeout_ms' is a GLOBAL variable and should be set with SET GLOBAL
 DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 9;
 ERROR 42000: You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'TIMEOUT 9' at line 1
-SET GLOBAL preserve_trx_drain_phase1_timeout_ms=@saved_phase1_timeout_ms;
-SET GLOBAL preserve_trx_drain_phase2_timeout_ms=@saved_phase2_timeout_ms;
-SET GLOBAL preserve_trx_token_retention_timeout_ms=
+SET GLOBAL rds_preserve_trx_drain_phase1_timeout_ms=@saved_phase1_timeout_ms;
+SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms=@saved_phase2_timeout_ms;
+SET GLOBAL rds_preserve_trx_token_retention_timeout_ms=
 @saved_token_retention_timeout_ms;

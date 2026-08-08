@@ -44,7 +44,7 @@
 #include "sql/preserve_trx_transfer.h"
 
 ulonglong preserve_trx_memory_budget_bytes = 256ULL * 1024ULL * 1024ULL;
-ulonglong preserve_trx_memory_per_token_bytes = 64ULL * 1024ULL * 1024ULL;
+ulonglong preserve_trx_memory_per_token_bytes = 1024ULL * 1024ULL * 1024ULL;
 uint preserve_trx_spill_chunk_bytes = 4U * 1024U * 1024U;
 
 namespace {
@@ -377,7 +377,7 @@ bool preserve_trx_sysvar_check_enable(sys_var *, THD *, set_var *var) {
   const bool requested_enabled = var->save_result.ulonglong_value != 0;
   if (requested_enabled != preserve_trx_is_enabled()) {
     my_error(ER_WRONG_ARGUMENTS, MYF(0),
-             "preserve_trx_enable is a startup-only option");
+             "rds_preserve_trx_enable is a startup-only option");
     return true;
   }
   return false;

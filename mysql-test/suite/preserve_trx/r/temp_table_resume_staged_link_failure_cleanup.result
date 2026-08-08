@@ -1,6 +1,6 @@
 DROP TABLE IF EXISTS t_preserve_staged_link_base;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 CREATE TABLE t_preserve_staged_link_base(
 id INT PRIMARY KEY,
 v INT
@@ -78,5 +78,5 @@ b_rows_after_commit	b_sum_after_commit
 DROP TEMPORARY TABLE tmp_preserve_staged_link_a;
 DROP TEMPORARY TABLE tmp_preserve_staged_link_b;
 DROP TABLE t_preserve_staged_link_base;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;

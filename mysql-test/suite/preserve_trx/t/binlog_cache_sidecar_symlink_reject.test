@@ -12,7 +12,7 @@ CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: cor
 
 --let MYSQLD_DATADIR= `SELECT @@datadir`
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_binlog_cache_sidecar_symlink_reject(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
 INSERT INTO t_binlog_cache_sidecar_symlink_reject VALUES(1,10);
@@ -43,8 +43,8 @@ symlink($real, $sidecar) or die "cannot create binlog cache symlink: $!";
 print "binlog cache sidecar symlink installed\n";
 EOF
 
---echo # restart: --preserve-trx-enable=ON
---exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--echo # restart: --rds-preserve-trx-enable=ON
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect

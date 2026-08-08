@@ -3,10 +3,8 @@ server_id=1
 
 [mysqld.2]
 server_id=2
-preserve-trx-enable=ON
-preserve-trx-warmcopy-enable=OFF
-preserve-trx-lock-warmcopy-enable=OFF
-preserve-trx-transfer-prewarm-paused=ON
+rds-preserve-trx-enable=ON
+rds-preserve-trx-transfer-prewarm-paused=ON
 
 [ENV]
 SERVER_MYPORT_2=@mysqld.2.port

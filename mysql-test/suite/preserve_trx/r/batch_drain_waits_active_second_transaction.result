@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_batch_active_second;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_batch_active_second(
 a INT PRIMARY KEY,
 b INT,
@@ -42,4 +42,4 @@ FROM t_batch_active_second;
 row_count	idle_resumed	inflight_resumed	resume_sessions
 2	1	1	2
 DROP TABLE t_batch_active_second;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

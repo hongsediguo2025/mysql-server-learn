@@ -5,7 +5,7 @@
 DROP TABLE IF EXISTS t_lock_export_record_failclosed;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 --let MYSQLD_DATADIR= `SELECT @@datadir`
 
 CREATE TABLE t_lock_export_record_failclosed(
@@ -36,4 +36,4 @@ SELECT COUNT(*) AS preserved_count
 --source suite/preserve_trx/include/assert_no_snapshot_file.inc
 
 DROP TABLE t_lock_export_record_failclosed;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

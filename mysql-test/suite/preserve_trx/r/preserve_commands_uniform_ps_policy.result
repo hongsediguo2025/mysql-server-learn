@@ -1,7 +1,7 @@
 #
 # Preserve/resume maintenance commands must not be prepared.
 #
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 binary_ps_prepare_drain_unsupported
 binary_ps_prepare_resume_unsupported
 binary_ps_prepare_show_unsupported
@@ -17,4 +17,4 @@ PREPARE show_preserved_stmt FROM 'SHOW PRESERVED TRANSACTIONS';
 ERROR HY000: This command is not supported in the prepared statement protocol yet
 DEALLOCATE PREPARE show_preserved_stmt;
 ERROR HY000: Unknown prepared statement handler (show_preserved_stmt) given to DEALLOCATE PREPARE
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

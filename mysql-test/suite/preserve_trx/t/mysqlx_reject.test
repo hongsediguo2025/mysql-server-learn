@@ -7,7 +7,7 @@
 DROP SCHEMA IF EXISTS xtest;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 --write_file $MYSQL_TMP_DIR/preserve_trx_mysqlx_reject.xpl
 -->stmtsql CREATE SCHEMA xtest;
@@ -36,4 +36,4 @@ EOF
 --remove_file $MYSQL_TMP_DIR/preserve_trx_mysqlx_reject.xpl
 DROP SCHEMA xtest;
 --source include/xplugin_drop_user.inc
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

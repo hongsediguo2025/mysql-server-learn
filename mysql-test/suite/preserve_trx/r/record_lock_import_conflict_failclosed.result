@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_record_lock_import_conflict;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_record_lock_import_conflict(
 id INT PRIMARY KEY,
 v INT
@@ -36,4 +36,4 @@ FROM t_record_lock_import_conflict;
 row_count	committed_updates	rolled_back_updates
 3	1	1
 DROP TABLE t_record_lock_import_conflict;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

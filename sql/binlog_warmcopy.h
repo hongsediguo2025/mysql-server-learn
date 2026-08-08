@@ -114,6 +114,7 @@ bool mysql_binlog_preserve_warmcopy_begin_session(
     Preserved_trx_warm_external_blob_carrier *carrier,
     uint64_t max_blob_bytes, std::atomic<uint64_t> *total_reserved_bytes,
     uint64_t max_total_bytes, uint64_t reservation_chunk_bytes,
+    uint64_t copy_chunk_bytes,
     Mysql_binlog_warmcopy_session **session, bool *has_blob,
     uint64_t *prefix_bytes, bool allow_inflight_statement);
 /*

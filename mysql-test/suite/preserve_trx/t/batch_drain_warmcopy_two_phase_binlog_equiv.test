@@ -5,11 +5,8 @@
 DROP TABLE IF EXISTS t_warmcopy_two_phase_equiv;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
-SET GLOBAL preserve_trx_warmcopy_chunk_bytes=1024;
-SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes=1024;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=PROMOTION_PREPARE;
 --disable_query_log
 --let $old_global_binlog_format= query_get_value(SHOW GLOBAL VARIABLES LIKE 'binlog_format', Value, 1)
 --enable_query_log
@@ -65,7 +62,7 @@ INSERT INTO t_warmcopy_two_phase_equiv VALUES(101,101,REPEAT('p',4096));
 
 --connection default
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
---exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=10" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -132,11 +129,8 @@ SELECT id, v, OCTET_LENGTH(payload) AS payload_len
 --remove_file $MYSQLTEST_VARDIR/tmp/batch_drain_warmcopy_two_phase_resumed.mysqlbinlog
 
 DROP TABLE t_warmcopy_two_phase_equiv;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes=1048576;
-SET GLOBAL preserve_trx_warmcopy_chunk_bytes=1048576;
-SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
-SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=BUSINESS_FIRST;
 --disable_query_log
 --disable_warnings
 --eval SET GLOBAL binlog_format=$old_global_binlog_format

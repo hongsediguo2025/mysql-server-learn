@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_preflight_corrupt_snapshot;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_preflight_corrupt_snapshot(a INT PRIMARY KEY, b INT)
 ENGINE=InnoDB;
 INSERT INTO t_preflight_corrupt_snapshot VALUES(1,10);
@@ -9,7 +9,7 @@ a	b
 1	10
 UPDATE t_preflight_corrupt_snapshot SET b=11 WHERE a=1;
 DRAIN TRANSACTIONS PRESERVE;
-# restart: --preserve-trx-enable=ON --skip-log-bin
+# restart: --rds-preserve-trx-enable=ON --skip-log-bin
 include/wait_for_pattern_in_file.inc [Preserved transaction .* recovery forced rollback: preserved transaction snapshot tainted: startup snapshot is unreadable or mismatched]
 SELECT COUNT(*) AS preserved_count_after_corrupt_preflight
 FROM performance_schema.preserved_transactions;
@@ -19,4 +19,4 @@ SELECT * FROM t_preflight_corrupt_snapshot ORDER BY a;
 a	b
 1	10
 DROP TABLE t_preflight_corrupt_snapshot;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

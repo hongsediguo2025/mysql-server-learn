@@ -8,7 +8,7 @@ DROP FUNCTION IF EXISTS preserve_unsupported_ddl_func;
 DROP TABLE IF EXISTS t_unsupported_ddl;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 --let MYSQLD_DATADIR= `SELECT @@datadir`
 
 CREATE TABLE t_unsupported_innodb(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
@@ -24,7 +24,7 @@ UPDATE t_unsupported_innodb SET b=11 WHERE a=1;
 --source suite/preserve_trx/include/drain_transaction_from_control_expect_error.inc
 XA END 'msp_unsupported_xa';
 XA ROLLBACK 'msp_unsupported_xa';
-SELECT @@global.preserve_trx_enable AS still_running_after_xa;
+SELECT @@global.rds_preserve_trx_enable AS still_running_after_xa;
 
 START TRANSACTION;
 UPDATE t_unsupported_innodb SET b=21 WHERE a=2;
@@ -35,7 +35,7 @@ INSERT INTO t_unsupported_myisam VALUES(2,20);
 --disable_warnings
 ROLLBACK;
 --enable_warnings
-SELECT @@global.preserve_trx_enable AS still_running_after_myisam;
+SELECT @@global.rds_preserve_trx_enable AS still_running_after_myisam;
 
 START TRANSACTION;
 CREATE TEMPORARY TABLE tmp_unsupported(a INT) ENGINE=InnoDB;
@@ -47,7 +47,7 @@ UPDATE t_unsupported_innodb SET b=31 WHERE a=3;
 ROLLBACK;
 --enable_warnings
 DROP TEMPORARY TABLE IF EXISTS tmp_unsupported;
-SELECT @@global.preserve_trx_enable AS still_running_after_temp;
+SELECT @@global.rds_preserve_trx_enable AS still_running_after_temp;
 
 SELECT GET_LOCK('msp_unsupported_user_lock', 0) AS got_user_lock;
 START TRANSACTION;
@@ -57,7 +57,7 @@ UPDATE t_unsupported_innodb SET b=41 WHERE a=4;
 --source suite/preserve_trx/include/drain_transaction_from_control_expect_error.inc
 ROLLBACK;
 SELECT RELEASE_LOCK('msp_unsupported_user_lock') AS released_user_lock;
-SELECT @@global.preserve_trx_enable AS still_running_after_user_lock;
+SELECT @@global.rds_preserve_trx_enable AS still_running_after_user_lock;
 
 HANDLER t_unsupported_innodb OPEN;
 START TRANSACTION;
@@ -67,7 +67,7 @@ UPDATE t_unsupported_innodb SET b=12 WHERE a=1;
 --source suite/preserve_trx/include/drain_transaction_from_control_expect_error.inc
 ROLLBACK;
 HANDLER t_unsupported_innodb CLOSE;
-SELECT @@global.preserve_trx_enable AS still_running_after_handler;
+SELECT @@global.rds_preserve_trx_enable AS still_running_after_handler;
 
 LOCK INSTANCE FOR BACKUP;
 START TRANSACTION;
@@ -77,13 +77,13 @@ UPDATE t_unsupported_innodb SET b=22 WHERE a=2;
 --source suite/preserve_trx/include/drain_transaction_from_control_expect_error.inc
 ROLLBACK;
 UNLOCK INSTANCE;
-SELECT @@global.preserve_trx_enable AS still_running_after_backup_lock;
+SELECT @@global.rds_preserve_trx_enable AS still_running_after_backup_lock;
 
 LOCK TABLES t_unsupported_innodb WRITE;
 --error ER_PRESERVE_TRX_UNSUPPORTED
 DRAIN TRANSACTIONS PRESERVE;
 UNLOCK TABLES;
-SELECT @@global.preserve_trx_enable AS still_running_after_lock_tables;
+SELECT @@global.rds_preserve_trx_enable AS still_running_after_lock_tables;
 
 delimiter |;
 CREATE FUNCTION preserve_unsupported_ddl_func() RETURNS INT
@@ -99,7 +99,7 @@ DROP FUNCTION preserve_unsupported_ddl_func;
 --disable_warnings
 DROP TABLE IF EXISTS t_unsupported_ddl;
 --enable_warnings
-SELECT @@global.preserve_trx_enable AS still_running_after_ddl_context;
+SELECT @@global.rds_preserve_trx_enable AS still_running_after_ddl_context;
 
 SELECT COUNT(*) AS preserved_after_unsupported_cases
   FROM performance_schema.preserved_transactions;
@@ -120,4 +120,4 @@ EOF
 
 DROP TABLE t_unsupported_myisam;
 DROP TABLE t_unsupported_innodb;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

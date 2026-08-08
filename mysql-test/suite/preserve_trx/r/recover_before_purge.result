@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_recover_before_purge;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_recover_before_purge(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_recover_before_purge VALUES(1,10);
 START TRANSACTION;
@@ -22,4 +22,4 @@ SELECT * FROM t_recover_before_purge ORDER BY a;
 a	b
 1	11
 DROP TABLE t_recover_before_purge;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

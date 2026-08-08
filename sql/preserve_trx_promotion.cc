@@ -58,13 +58,10 @@
 #include "scope_guard.h"
 #include "storage/innobase/include/trx0preserve.h"
 
-uint preserve_trx_promotion_gate_batch_tokens = 3;
-uint preserve_trx_promotion_gate_workers = 3;
-uint preserve_trx_promotion_gate_timeout_ms = 1000;
-uint preserve_trx_promotion_prewarm_workers = 1;
-ulonglong preserve_trx_promotion_prewarm_io_bytes_per_sec = 33554432ULL;
-ulonglong preserve_trx_promotion_prewarm_max_bytes = 268435456ULL;
-ulonglong preserve_trx_promotion_ready_cache_max_bytes = 536870912ULL;
+const uint preserve_trx_promotion_gate_batch_tokens = 3;
+const uint preserve_trx_promotion_gate_workers = 3;
+const uint preserve_trx_promotion_gate_timeout_ms = 1000;
+const ulonglong preserve_trx_promotion_ready_cache_max_bytes = 536870912ULL;
 
 Preserve_trx_promotion_adopt_all_request::
     Preserve_trx_promotion_adopt_all_request()
@@ -1645,6 +1642,21 @@ void preserved_trx_promotion_ready_cache_purge_epoch(
     entry = g_ready_cache.erase(entry);
   }
   g_ready_cache_bytes.store(current_bytes);
+}
+
+void preserved_trx_promotion_ready_cache_purge_token(
+    const std::string &preserve_dir, const std::string &epoch_id,
+    uint64_t token) {
+  if (preserve_dir.empty() || epoch_id.empty() || token == 0) return;
+  std::lock_guard<std::mutex> guard(g_ready_cache_mutex);
+  const auto entry = g_ready_cache.find(
+      Promotion_ready_cache_key{preserve_dir, epoch_id, token});
+  if (entry == g_ready_cache.end()) return;
+  const uint64_t current_bytes = g_ready_cache_bytes.load();
+  g_ready_cache_bytes.store(current_bytes >= entry->second.estimated_bytes
+                                ? current_bytes - entry->second.estimated_bytes
+                                : 0);
+  g_ready_cache.erase(entry);
 }
 
 void preserved_trx_set_promotion_apply_state_provider(

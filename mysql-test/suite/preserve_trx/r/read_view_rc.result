@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_read_view_rc;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_read_view_rc(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_read_view_rc VALUES(1,10),(2,200);
 SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
@@ -38,4 +38,4 @@ a	b
 1	40
 2	201
 DROP TABLE t_read_view_rc;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

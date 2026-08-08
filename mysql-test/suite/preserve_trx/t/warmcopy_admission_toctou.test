@@ -15,10 +15,9 @@ GRANT SHUTDOWN ON *.* TO preserve_trx_ha_admin@localhost;
 GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
 --enable_query_log
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
-SET GLOBAL preserve_trx_drain_phase2_timeout_ms=5000;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=PROMOTION_PREPARE;
+SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms=5000;
 
 CREATE TABLE t_warmcopy_toctou(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
 INSERT INTO t_warmcopy_toctou VALUES(1,10),(2,20);
@@ -60,7 +59,7 @@ SET DEBUG_SYNC = 'now SIGNAL warmcopy_toctou_continue';
 
 --connection default
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
---exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=10" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -77,8 +76,7 @@ DROP TABLE t_warmcopy_toctou;
 --disable_query_log
 DROP USER preserve_trx_ha_admin@localhost;
 --enable_query_log
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_drain_phase2_timeout_ms=30000;
-SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
-SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms=30000;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=BUSINESS_FIRST;
 SET DEBUG_SYNC = 'RESET';

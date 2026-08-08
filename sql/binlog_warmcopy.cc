@@ -57,6 +57,7 @@
 #include "template_utils.h"
 
 namespace {
+constexpr uint64_t kBinlogWarmcopyDefaultChunkBytes = 1024ULL * 1024ULL;
 
 constexpr size_t kWarmcopyActivePrefixSnapshotBytes = 64 * 1024;
 
@@ -242,7 +243,7 @@ class Mysql_binlog_warmcopy_session final
       Preserved_trx_warm_external_blob_carrier *carrier,
       uint64_t max_blob_bytes, std::atomic<uint64_t> *total_reserved_bytes,
       uint64_t max_total_bytes, uint64_t reservation_chunk_bytes,
-      bool allow_inflight_statement)
+      uint64_t copy_chunk_bytes, bool allow_inflight_statement)
       : m_thd(thd),
         m_warmcopy_id(std::move(warmcopy_id)),
         m_epoch(epoch),
@@ -251,6 +252,7 @@ class Mysql_binlog_warmcopy_session final
         m_total_reserved_bytes(total_reserved_bytes),
         m_max_total_bytes(max_total_bytes),
         m_reservation_chunk_bytes(reservation_chunk_bytes),
+        m_copy_chunk_bytes(copy_chunk_bytes),
         m_allow_inflight_statement(allow_inflight_statement),
         m_digest_ctx(EVP_MD_CTX_new()) {
     if (m_digest_ctx == nullptr ||
@@ -320,7 +322,7 @@ class Mysql_binlog_warmcopy_session final
       const size_t bytes_to_copy = static_cast<size_t>(
           std::min<uint64_t>(
               remaining,
-              std::min<uint64_t>(preserve_trx_warmcopy_chunk_bytes,
+              std::min<uint64_t>(m_copy_chunk_bytes,
                                  kWarmcopyActivePrefixSnapshotBytes)));
       Warmcopy_prefix_buffer_ostream ostream(bytes_to_copy);
       if (mysql_binlog_warmcopy_source_copy_range(
@@ -782,6 +784,7 @@ class Mysql_binlog_warmcopy_session final
   std::atomic<uint64_t> *m_total_reserved_bytes{nullptr};
   uint64_t m_max_total_bytes{0};
   uint64_t m_reservation_chunk_bytes{0};
+  uint64_t m_copy_chunk_bytes{0};
   uint64_t m_reserved_bytes{0};
   bool m_reservation_transferred{false};
   bool m_allow_inflight_statement{false};
@@ -857,7 +860,7 @@ bool mysql_binlog_preserve_warmcopy_build_blob(
   while (copied < cache_length) {
     const uint64_t remaining = cache_length - copied;
     const size_t bytes_to_copy = static_cast<size_t>(
-        std::min<uint64_t>(remaining, preserve_trx_warmcopy_chunk_bytes));
+        std::min<uint64_t>(remaining, kBinlogWarmcopyDefaultChunkBytes));
     if (mysql_binlog_warmcopy_source_copy_range(
             thd, copied, bytes_to_copy, &ostream, truncate_generation,
             &stale_generation) ||
@@ -906,6 +909,7 @@ bool mysql_binlog_preserve_warmcopy_begin_session(
     Preserved_trx_warm_external_blob_carrier *carrier,
     uint64_t max_blob_bytes, std::atomic<uint64_t> *total_reserved_bytes,
     uint64_t max_total_bytes, uint64_t reservation_chunk_bytes,
+    uint64_t copy_chunk_bytes,
     Mysql_binlog_warmcopy_session **session, bool *has_blob,
     uint64_t *prefix_bytes,
     bool allow_inflight_statement) {
@@ -914,7 +918,8 @@ bool mysql_binlog_preserve_warmcopy_begin_session(
   if (prefix_bytes != nullptr) *prefix_bytes = 0;
   if (thd == nullptr || carrier == nullptr ||
       total_reserved_bytes == nullptr || max_total_bytes == 0 ||
-      reservation_chunk_bytes == 0 || session == nullptr) {
+      reservation_chunk_bytes == 0 || copy_chunk_bytes == 0 ||
+      session == nullptr) {
     return true;
   }
 
@@ -923,6 +928,7 @@ bool mysql_binlog_preserve_warmcopy_begin_session(
                                         max_blob_bytes, total_reserved_bytes,
                                         max_total_bytes,
                                         reservation_chunk_bytes,
+                                        copy_chunk_bytes,
                                         allow_inflight_statement));
   if (owned_session->begin(has_blob)) return true;
   if (prefix_bytes != nullptr) *prefix_bytes = owned_session->prefix_bytes();

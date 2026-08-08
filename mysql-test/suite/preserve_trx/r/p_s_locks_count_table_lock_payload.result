@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_p_s_locks_count_table_lock;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_p_s_locks_count_table_lock(
 id INT PRIMARY KEY,
 v INT
@@ -28,4 +28,4 @@ id	v
 1	10
 2	20
 DROP TABLE t_p_s_locks_count_table_lock;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

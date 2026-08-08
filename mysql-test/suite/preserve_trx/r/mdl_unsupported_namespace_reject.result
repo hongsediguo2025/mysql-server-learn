@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_mdl_unsupported_namespace;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_mdl_unsupported_namespace(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
 LOCK INSTANCE FOR BACKUP;
 START TRANSACTION;
@@ -9,4 +9,4 @@ ERROR HY000: Resumable transactions across shutdown do not support this operatio
 ROLLBACK;
 UNLOCK INSTANCE;
 DROP TABLE t_mdl_unsupported_namespace;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

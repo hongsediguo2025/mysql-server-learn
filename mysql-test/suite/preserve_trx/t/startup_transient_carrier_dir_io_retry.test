@@ -9,7 +9,7 @@ my $path = $ENV{'error_log'} || '';
 unlink $path if $path ne '' && -e $path;
 EOF
 
---exec $MYSQLD_CMD --validate-config --preserve-trx-enable=ON --debug=d,preserve_trx_simulate_startup_dir_stat_io_once --log-error=$error_log > $error_log 2>&1
+--exec $MYSQLD_CMD --validate-config --rds-preserve-trx-enable=ON --debug=d,preserve_trx_simulate_startup_dir_stat_io_once --log-error=$error_log > $error_log 2>&1
 
 --let SEARCH_FILE= $error_log
 --let SEARCH_PATTERN= preserve_trx startup support transient I/O retry succeeded

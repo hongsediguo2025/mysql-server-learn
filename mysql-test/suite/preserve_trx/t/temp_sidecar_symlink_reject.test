@@ -12,8 +12,8 @@ CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: pre
 CALL mtr.add_suppression("Preserved transaction .* rejected because snapshot binlog_state=.* requires log_bin=ON");
 --enable_query_log
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 
 --echo # image sidecar symlink is rejected
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
@@ -40,7 +40,7 @@ symlink($real, $image) or die "cannot create image sidecar symlink: $!";
 print "temp image sidecar symlink installed\n";
 EOF
 
---exec echo "restart: --preserve-trx-enable=ON --preserve-trx-temp-table-enable=OFF" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-temp-table-enable=OFF" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -79,7 +79,7 @@ symlink($real, $undo) or die "cannot create undo sidecar symlink: $!";
 print "temp undo sidecar symlink installed\n";
 EOF
 
---exec echo "restart: --preserve-trx-enable=ON --preserve-trx-temp-table-enable=OFF" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-temp-table-enable=OFF" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -93,5 +93,5 @@ SELECT COUNT(*) AS preserved_count_after_undo_symlink
   FROM performance_schema.preserved_transactions;
 --source suite/preserve_trx/include/assert_no_preserve_residue.inc
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;

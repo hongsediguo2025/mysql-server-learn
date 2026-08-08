@@ -1,6 +1,6 @@
 DROP TABLE IF EXISTS t_predicate_tlv32_anchor;
 DROP TABLE IF EXISTS t_predicate_tlv32;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_predicate_tlv32_anchor(
 id INT PRIMARY KEY,
 v INT
@@ -60,4 +60,4 @@ id	v
 1	0
 DROP TABLE t_predicate_tlv32;
 DROP TABLE t_predicate_tlv32_anchor;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

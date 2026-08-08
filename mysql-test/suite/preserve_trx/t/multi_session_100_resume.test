@@ -10,11 +10,19 @@ use File::Spec;
 my $vardir = $ENV{'MYSQLTEST_VARDIR'} or die "MYSQLTEST_VARDIR is not set";
 my $setup_file = File::Spec->catfile($vardir, 'tmp',
                                      'preserve_trx_multi_session_100_setup.inc');
+my $apps_file = File::Spec->catfile($vardir, 'tmp',
+                                    'preserve_trx_multi_session_100_preserve.inc');
+my $apps_disconnect_file = File::Spec->catfile(
+    $vardir, 'tmp', 'preserve_trx_multi_session_100_apps_disconnect.inc');
 my $cleanup_file = File::Spec->catfile($vardir, 'tmp',
                                        'preserve_trx_multi_session_100_cleanup.inc');
 
 open(my $setup, '>', $setup_file)
   or die "cannot open $setup_file for write: $!";
+open(my $apps, '>', $apps_file)
+  or die "cannot open $apps_file for write: $!";
+open(my $apps_disconnect, '>', $apps_disconnect_file)
+  or die "cannot open $apps_disconnect_file for write: $!";
 open(my $cleanup, '>', $cleanup_file)
   or die "cannot open $cleanup_file for write: $!";
 
@@ -26,10 +34,24 @@ print $setup "CREATE TABLE t_multi_session_100_resume(" .
              "v INT, " .
              "resumed_by INT DEFAULT NULL) ENGINE=InnoDB;\n";
 print $setup "CREATE TABLE t_multi_session_100_tokens(" .
-             "session_id INT PRIMARY KEY, " .
+             "session_id INT PRIMARY KEY AUTO_INCREMENT, " .
              "token VARCHAR(255) NOT NULL UNIQUE) ENGINE=InnoDB;\n";
 
+for my $i (1 .. 100) {
+  my $app_name = sprintf("multi_session_app_%03d", $i);
+  print $apps "--connect($app_name,localhost,root,,test)\n";
+  print $apps "--connection $app_name\n";
+  print $apps "START TRANSACTION;\n";
+  print $apps "INSERT INTO t_multi_session_100_resume VALUES($i, " .
+              ($i * 10) . ", NULL);\n";
+  print $apps_disconnect "--disconnect $app_name\n";
+}
+print $apps "--connection default\n";
+print $apps_disconnect "--connection default\n";
+
 close($setup);
+close($apps);
+close($apps_disconnect);
 close($cleanup);
 EOF
 
@@ -40,60 +62,34 @@ EOF
 --enable_result_log
 --enable_query_log
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_token_retention_timeout_ms=3600000;
---let $old_preserve_trx_recovery_max_count= `SELECT @@GLOBAL.preserve_trx_recovery_max_count`
-SET GLOBAL preserve_trx_recovery_max_count=200;
-
---perl
-use strict;
-use warnings;
-use File::Spec;
-
-my $vardir = $ENV{'MYSQLTEST_VARDIR'} or die "MYSQLTEST_VARDIR is not set";
-my $file = File::Spec->catfile($vardir, 'tmp',
-                               'preserve_trx_multi_session_100_preserve.inc');
-
-open(my $fh, '>', $file) or die "cannot open $file for write: $!";
-for my $i (1 .. 100) {
-  print $fh "START TRANSACTION;\n";
-  print $fh "INSERT INTO t_multi_session_100_resume VALUES($i, " .
-            ($i * 10) . ", NULL);\n";
-  print $fh "--exec echo \"wait\" > " .
-            "$vardir/tmp/mysqld.1.expect\n";
-  print $fh "--let \$preserve_trx_drain_clause=\n";
-  print $fh "--source suite/preserve_trx/include/drain_transaction_from_control.inc\n";
-  print $fh "--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc\n";
-  print $fh "--exec echo \"restart: --preserve-trx-enable=ON " .
-            "--preserve-trx-recovery-max-count=200 " .
-            "--preserve-trx-token-retention-timeout-ms=3600000\" > " .
-            "$vardir/tmp/mysqld.1.expect\n";
-  print $fh "--enable_reconnect\n";
-  print $fh "--source include/wait_until_connected_again.inc\n";
-  print $fh "--disable_reconnect\n";
-  print $fh "--disable_query_log\n";
-  print $fh "--disable_result_log\n";
-  print $fh "SET \@new_preserved_token = NULL;\n";
-  print $fh "SELECT TOKEN INTO \@new_preserved_token " .
-            "FROM performance_schema.preserved_transactions p " .
-            "WHERE NOT EXISTS (" .
-            "SELECT 1 FROM t_multi_session_100_tokens m " .
-            "WHERE m.token = p.TOKEN) " .
-            "ORDER BY TOKEN LIMIT 1;\n";
-  print $fh "INSERT INTO t_multi_session_100_tokens " .
-            "VALUES($i, \@new_preserved_token);\n";
-  print $fh "--let \$mapped_rows= `SELECT ROW_COUNT()`\n";
-  print $fh "if (\$mapped_rows != 1)\n";
-  print $fh "{\n";
-  print $fh "--die Expected one newly mapped preserved transaction token\n";
-  print $fh "}\n";
-}
-close($fh);
-EOF
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_token_retention_timeout_ms=3600000;
 
 --disable_query_log
 --disable_result_log
 --source $MYSQLTEST_VARDIR/tmp/preserve_trx_multi_session_100_preserve.inc
+--enable_result_log
+--enable_query_log
+
+--let $wait_condition= SELECT COUNT(*) = 100 FROM performance_schema.threads WHERE PROCESSLIST_USER = 'root' AND PROCESSLIST_DB = 'test' AND PROCESSLIST_COMMAND = 'Sleep'
+--source include/wait_condition.inc
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+DRAIN TRANSACTIONS PRESERVE;
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+
+--exec echo "restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=LOCAL_CARRIER --rds-preserve-trx-token-retention-timeout-ms=3600000 --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+--disable_query_log
+--disable_result_log
+--source $MYSQLTEST_VARDIR/tmp/preserve_trx_multi_session_100_apps_disconnect.inc
+INSERT INTO t_multi_session_100_tokens(token)
+SELECT TOKEN
+  FROM performance_schema.preserved_transactions
+ ORDER BY TOKEN;
 --enable_result_log
 --enable_query_log
 
@@ -108,7 +104,7 @@ SELECT COUNT(*) AS preserved_count_after_generation
 --disable_query_log
 SET SESSION group_concat_max_len=1000000;
 --let $write_to_file= $MYSQLTEST_VARDIR/tmp/preserve_trx_multi_session_100_resume.inc
---let $write_var= `SELECT GROUP_CONCAT(CONCAT('--connect(resume_', LPAD(session_id, 3, '0'), ',localhost,root,,test)\\n', '--connection resume_', LPAD(session_id, 3, '0'), '\\n', 'RESUME PRESERVED TRANSACTION \"', token, '\";\\n', 'UPDATE t_multi_session_100_resume SET v = v + 100000, resumed_by = ', session_id, ' WHERE id = ', session_id, ';\\n', 'COMMIT;\\n') ORDER BY session_id SEPARATOR '') FROM t_multi_session_100_tokens`
+--let $write_var= `SELECT GROUP_CONCAT(CONCAT('--connect(resume_', LPAD(session_id, 3, '0'), ',localhost,root,,test)\\n', '--connection resume_', LPAD(session_id, 3, '0'), '\\n', 'RESUME PRESERVED TRANSACTION \"', token, '\";\\n', 'SET @multi_session_row_id = NULL;\\n', 'SELECT id INTO @multi_session_row_id FROM t_multi_session_100_resume WHERE resumed_by IS NULL ORDER BY id LIMIT 1;\\n', 'UPDATE t_multi_session_100_resume SET v = v + 100000, resumed_by = @multi_session_row_id WHERE id = @multi_session_row_id;\\n', 'COMMIT;\\n') ORDER BY session_id SEPARATOR '') FROM t_multi_session_100_tokens`
 --source include/write_var_to_file.inc
 --enable_query_log
 
@@ -187,6 +183,7 @@ if (-d $preserve_dir) {
 EOF
 
 --remove_file $MYSQLTEST_VARDIR/tmp/preserve_trx_multi_session_100_preserve.inc
+--remove_file $MYSQLTEST_VARDIR/tmp/preserve_trx_multi_session_100_apps_disconnect.inc
 --remove_file $MYSQLTEST_VARDIR/tmp/preserve_trx_multi_session_100_resume.inc
 --remove_file $MYSQLTEST_VARDIR/tmp/preserve_trx_multi_session_100_disconnect.inc
 
@@ -199,9 +196,8 @@ EOF
 --remove_file $MYSQLTEST_VARDIR/tmp/preserve_trx_multi_session_100_setup.inc
 --remove_file $MYSQLTEST_VARDIR/tmp/preserve_trx_multi_session_100_cleanup.inc
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 --disable_query_log
 --disable_result_log
---eval SET GLOBAL preserve_trx_recovery_max_count=$old_preserve_trx_recovery_max_count
 --enable_result_log
 --enable_query_log

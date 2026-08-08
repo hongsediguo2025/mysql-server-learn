@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_preserve_replication_context;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_preserve_replication_context(a INT PRIMARY KEY, b INT)
 ENGINE=InnoDB;
 INSERT INTO t_preserve_replication_context VALUES(1,10), (2,20);
@@ -36,4 +36,4 @@ FROM performance_schema.preserved_transactions;
 preserved_count
 0
 DROP TABLE t_preserve_replication_context;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

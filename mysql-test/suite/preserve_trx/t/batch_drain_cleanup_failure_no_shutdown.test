@@ -8,7 +8,7 @@ CALL mtr.add_suppression("Preserved transaction batch cleanup failed after debug
 DROP TABLE IF EXISTS t_batch_cleanup_no_shutdown;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_batch_cleanup_no_shutdown(
   id INT PRIMARY KEY,
@@ -48,7 +48,7 @@ SELECT TOKEN, STATE, LAST_ERROR IS NOT NULL AS has_last_error
 
 --connection default
 --error ER_WRONG_ARGUMENTS
-SET GLOBAL preserve_trx_enable=OFF;
+SET GLOBAL rds_preserve_trx_enable=OFF;
 
 --connect(batch_cleanup_no_shutdown_new,localhost,root,,test)
 --connection batch_cleanup_no_shutdown_new
@@ -63,7 +63,7 @@ ROLLBACK;
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --shutdown_server
 --source include/wait_until_disconnected.inc
---exec echo "restart: --preserve-trx-enable=ON --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -74,4 +74,4 @@ SELECT * FROM t_batch_cleanup_no_shutdown ORDER BY id;
 --source suite/preserve_trx/include/assert_no_preserve_residue.inc
 
 DROP TABLE t_batch_cleanup_no_shutdown;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

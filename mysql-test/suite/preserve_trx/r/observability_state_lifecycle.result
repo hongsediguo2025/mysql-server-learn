@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_preserve_state;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_preserve_state(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_preserve_state VALUES(1,10);
 START TRANSACTION;
@@ -46,4 +46,4 @@ SET DEBUG_SYNC = 'now SIGNAL continue_state_draining';
 RESUME PRESERVED TRANSACTION 'TOKEN';
 ROLLBACK;
 DROP TABLE t_preserve_state;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

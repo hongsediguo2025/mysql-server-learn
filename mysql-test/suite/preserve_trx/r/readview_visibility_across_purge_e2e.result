@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_readview_visibility_purge;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_readview_visibility_purge(
 id INT PRIMARY KEY,
 v INT
@@ -47,4 +47,4 @@ id	v
 6	6000
 100	1001
 DROP TABLE t_readview_visibility_purge;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

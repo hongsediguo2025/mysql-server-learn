@@ -13,7 +13,7 @@ CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: pre
 
 --let MYSQLD_DATADIR= `SELECT @@datadir`
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_snapshot_header_corrupt_matrix(
   id INT PRIMARY KEY,
@@ -60,4 +60,4 @@ INSERT INTO t_snapshot_header_corrupt_matrix VALUES(1,10);
 SELECT * FROM t_snapshot_header_corrupt_matrix ORDER BY id;
 
 DROP TABLE t_snapshot_header_corrupt_matrix;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

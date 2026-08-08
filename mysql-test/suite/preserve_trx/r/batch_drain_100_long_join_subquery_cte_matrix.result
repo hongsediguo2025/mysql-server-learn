@@ -1,5 +1,4 @@
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_recovery_max_count=200;
+SET GLOBAL rds_preserve_trx_enable=ON;
 SELECT COUNT(*) AS session_count
 FROM t_batch_long_control;
 session_count
@@ -91,4 +90,4 @@ ON p.sid = c.sid AND p.pid = c.pid
 WHERE c.pid BETWEEN 0 AND 8 AND p.pid IS NULL;
 parent_child_invariants_ok
 1
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

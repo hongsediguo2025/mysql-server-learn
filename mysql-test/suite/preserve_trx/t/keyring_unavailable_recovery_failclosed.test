@@ -11,7 +11,7 @@ CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: pre
 DROP TABLE IF EXISTS t_keyring_unavailable_recovery;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 --let MYSQLD_DATADIR= `SELECT @@datadir`
 
 CREATE TABLE t_keyring_unavailable_recovery(a INT PRIMARY KEY, b INT)
@@ -30,7 +30,7 @@ UPDATE t_keyring_unavailable_recovery SET b=11 WHERE a=1;
 
 --let $_server_id= 1
 --let $_expect_file_name= $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
---let $restart_parameters= restart: --preserve-trx-enable=ON --debug=d,preserve_trx_simulate_encrypted_tablespace_key_unavailable
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --debug=d,preserve_trx_simulate_encrypted_tablespace_key_unavailable
 --source include/start_mysqld.inc
 
 --let $grep_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
@@ -69,7 +69,7 @@ EOF
 
 SELECT * FROM t_keyring_unavailable_recovery ORDER BY a;
 
---let $restart_parameters= restart: --preserve-trx-enable=ON
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON
 --let $do_not_echo_parameters= 1
 --source include/restart_mysqld.inc
 --let $do_not_echo_parameters=
@@ -86,4 +86,4 @@ SELECT * FROM t_keyring_unavailable_recovery ORDER BY a;
 --source suite/preserve_trx/include/assert_no_preserve_residue.inc
 
 DROP TABLE t_keyring_unavailable_recovery;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

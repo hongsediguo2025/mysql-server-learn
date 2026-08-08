@@ -11,7 +11,7 @@ CALL mtr.add_suppression("Preserved transaction batch cleanup failed after debug
 DROP TABLE IF EXISTS t_batch_reattach_cleanup_delete;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_batch_reattach_cleanup_delete(
   id INT PRIMARY KEY,
@@ -79,7 +79,7 @@ COMMIT;
 --disconnect batch_cleanup_before_unlink_a
 
 --connection default
---let $restart_parameters= restart: --preserve-trx-enable=ON
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON
 --let $do_not_echo_parameters= 1
 --source include/restart_mysqld.inc
 --let $do_not_echo_parameters=
@@ -92,4 +92,4 @@ SELECT COUNT(*) AS preserved_count_after_before_unlink_restart
 SELECT * FROM t_batch_reattach_cleanup_delete ORDER BY id;
 
 DROP TABLE t_batch_reattach_cleanup_delete;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

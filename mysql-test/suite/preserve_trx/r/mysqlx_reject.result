@@ -1,5 +1,5 @@
 DROP SCHEMA IF EXISTS xtest;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 RUN CREATE SCHEMA xtest;
 
 1 rows affected
@@ -34,4 +34,4 @@ Mysqlx.Ok {
 }
 ok
 DROP SCHEMA xtest;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

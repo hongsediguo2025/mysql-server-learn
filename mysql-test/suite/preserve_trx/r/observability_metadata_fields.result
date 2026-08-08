@@ -1,6 +1,6 @@
 DROP TABLE IF EXISTS t_preserve_obs_a;
 DROP TABLE IF EXISTS t_preserve_obs_b;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_preserve_obs_a(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 CREATE TABLE t_preserve_obs_b(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_preserve_obs_a VALUES(1,10);
@@ -24,4 +24,4 @@ RESUME PRESERVED TRANSACTION 'TOKEN';
 ROLLBACK;
 DROP TABLE t_preserve_obs_a;
 DROP TABLE t_preserve_obs_b;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

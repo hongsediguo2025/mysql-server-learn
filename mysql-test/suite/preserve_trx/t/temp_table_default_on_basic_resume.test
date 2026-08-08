@@ -6,8 +6,8 @@
 DROP TABLE IF EXISTS t_temp_default_on_base;
 --enable_warnings
 
-SELECT @@global.preserve_trx_temp_table_enable AS temp_table_gate_default;
-SET GLOBAL preserve_trx_enable=ON;
+SELECT @@global.rds_preserve_trx_temp_table_enable AS temp_table_gate_default;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_temp_default_on_base(
   id INT PRIMARY KEY,
@@ -30,12 +30,12 @@ UPDATE t_temp_default_on_base SET v = 11 WHERE id = 1;
 --source suite/preserve_trx/include/drain_transaction_from_control.inc
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 
---exec echo "restart: --preserve-trx-enable=ON --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
 
-SELECT @@global.preserve_trx_temp_table_enable AS temp_table_gate_after_restart;
+SELECT @@global.rds_preserve_trx_temp_table_enable AS temp_table_gate_after_restart;
 --source suite/preserve_trx/include/get_preserved_token.inc
 --replace_result $preserved_token TOKEN
 --eval RESUME PRESERVED TRANSACTION '$preserved_token'
@@ -49,4 +49,4 @@ DROP TEMPORARY TABLE tmp_temp_default_on;
 --source suite/preserve_trx/include/assert_no_preserve_residue.inc
 
 DROP TABLE t_temp_default_on_base;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

@@ -1,4 +1,4 @@
-# restart: --preserve-trx-enable=OFF
+# restart: --rds-preserve-trx-enable=OFF
 SET GLOBAL log_output='TABLE';
 SET GLOBAL log_raw=ON;
 SET GLOBAL general_log=ON;
@@ -23,4 +23,4 @@ TRUNCATE TABLE mysql.general_log;
 SET GLOBAL log_raw=0;
 SET GLOBAL log_output='FILE';
 SET GLOBAL general_log=1;
-# restart: --preserve-trx-enable=ON
+# restart: --rds-preserve-trx-enable=ON

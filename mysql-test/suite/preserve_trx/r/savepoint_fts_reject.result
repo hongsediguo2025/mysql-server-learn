@@ -1,6 +1,6 @@
 DROP TABLE IF EXISTS t_savepoint_fts_reject;
 DROP TABLE IF EXISTS t_savepoint_fts_before_engine;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_savepoint_fts_reject(
 id INT PRIMARY KEY AUTO_INCREMENT,
 body TEXT,
@@ -32,4 +32,4 @@ row_count
 0
 DROP TABLE t_savepoint_fts_reject;
 DROP TABLE t_savepoint_fts_before_engine;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

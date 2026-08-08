@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_recover_record_lock_page_n_heap_diag;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_recover_record_lock_page_n_heap_diag(
 a INT PRIMARY KEY,
 b INT
@@ -12,7 +12,7 @@ SELECT * FROM t_recover_record_lock_page_n_heap_diag WHERE a=1 FOR SHARE;
 a	b
 1	10
 DRAIN TRANSACTIONS PRESERVE;
-# restart: --preserve-trx-enable=ON --debug=d,preserve_trx_corrupt_import_record_lock_page_n_heap
+# restart: --rds-preserve-trx-enable=ON --debug=d,preserve_trx_corrupt_import_record_lock_page_n_heap
 SELECT COUNT(*) AS preserved_count_after_page_n_heap_diag
 FROM performance_schema.preserved_transactions;
 preserved_count_after_page_n_heap_diag
@@ -31,4 +31,4 @@ FROM performance_schema.preserved_transactions;
 remaining_preserved
 0
 DROP TABLE t_recover_record_lock_page_n_heap_diag;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

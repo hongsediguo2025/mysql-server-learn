@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_resume_savepoint_failure;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_resume_savepoint_failure(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
 INSERT INTO t_resume_savepoint_failure VALUES(1,10),(2,20);
 START TRANSACTION;
@@ -25,4 +25,4 @@ id	v
 1	11
 2	20
 DROP TABLE t_resume_savepoint_failure;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

@@ -6,7 +6,7 @@
 DROP TABLE IF EXISTS t_recover_record_lock_page_n_heap_diag;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 --let MYSQLD_DATADIR= `SELECT @@datadir`
 
 CREATE TABLE t_recover_record_lock_page_n_heap_diag(
@@ -28,7 +28,7 @@ SELECT * FROM t_recover_record_lock_page_n_heap_diag WHERE a=1 FOR SHARE;
 
 --let $_server_id= 1
 --let $_expect_file_name= $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
---let $restart_parameters= restart: --preserve-trx-enable=ON --debug=d,preserve_trx_corrupt_import_record_lock_page_n_heap
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --debug=d,preserve_trx_corrupt_import_record_lock_page_n_heap
 --source include/start_mysqld.inc
 
 --source suite/preserve_trx/include/get_preserved_token.inc
@@ -52,4 +52,4 @@ SELECT COUNT(*) AS remaining_preserved
   FROM performance_schema.preserved_transactions;
 
 DROP TABLE t_recover_record_lock_page_n_heap_diag;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

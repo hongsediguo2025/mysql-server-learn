@@ -1,6 +1,6 @@
 --source include/force_restart.inc
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 --let MYSQLD_DATADIR= `SELECT @@datadir`
 
 --perl
@@ -19,7 +19,7 @@ EOF
 
 --file_exists $MYSQLD_DATADIR/preserve/orphan_cache_token.binlog_cache
 
---let $restart_parameters= restart: --preserve-trx-enable=ON
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON
 --let $do_not_echo_parameters= 1
 --source include/restart_mysqld.inc
 --let $do_not_echo_parameters=
@@ -31,4 +31,4 @@ EOF
 SELECT COUNT(*) AS preserved_count
   FROM performance_schema.preserved_transactions;
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

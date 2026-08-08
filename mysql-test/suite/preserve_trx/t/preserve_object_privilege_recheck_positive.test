@@ -7,7 +7,7 @@ DROP ROLE IF EXISTS preserve_obj_role;
 DROP DATABASE IF EXISTS preserve_obj_db;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE DATABASE preserve_obj_db;
 USE preserve_obj_db;
@@ -32,7 +32,7 @@ UPDATE t_preserve_obj_priv_ok SET b=11 WHERE a=1;
 --source suite/preserve_trx/include/drain_transaction_from_control.inc
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 
---exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -60,4 +60,4 @@ DROP USER preserve_obj_user@localhost;
 DROP ROLE preserve_obj_role;
 USE test;
 DROP DATABASE preserve_obj_db;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

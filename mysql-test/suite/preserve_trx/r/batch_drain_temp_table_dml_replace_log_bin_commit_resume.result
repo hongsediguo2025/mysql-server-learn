@@ -1,5 +1,5 @@
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 CREATE TABLE t_batch_temp_replace_split(
 sid INT NOT NULL,
 k INT NOT NULL,
@@ -55,5 +55,5 @@ sid	k	v	counter	note
 1	100063	10000063	63	s001-t00001-n063
 DROP TEMPORARY TABLE tmp_batch_temp_replace_split;
 DROP TABLE t_batch_temp_replace_split;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;

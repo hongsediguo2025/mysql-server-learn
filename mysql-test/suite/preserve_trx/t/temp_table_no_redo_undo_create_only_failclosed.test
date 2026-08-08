@@ -1,7 +1,7 @@
 --source include/not_log_bin.inc
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 
 CREATE TABLE t_temp_no_redo_create_anchor(
   id INT PRIMARY KEY,
@@ -29,5 +29,5 @@ SELECT * FROM t_temp_no_redo_create_anchor ORDER BY id;
 
 DROP TEMPORARY TABLE tmp_temp_no_redo_create_only;
 DROP TABLE t_temp_no_redo_create_anchor;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

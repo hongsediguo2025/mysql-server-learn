@@ -1,8 +1,5 @@
-SELECT @@global.preserve_trx_dir = CONCAT(@@global.datadir, 'preserve/') AS default_dir;
-default_dir
-1
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 preserve dir exists
 no preserve key
 no preserve temp files
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

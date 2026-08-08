@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_batch_single;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_batch_single(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
 START TRANSACTION;
 INSERT INTO t_batch_single VALUES(1, 10);
@@ -19,4 +19,4 @@ SELECT * FROM t_batch_single;
 id	v
 1	11
 DROP TABLE t_batch_single;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

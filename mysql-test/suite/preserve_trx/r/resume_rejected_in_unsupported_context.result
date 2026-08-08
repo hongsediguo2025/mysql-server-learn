@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_resume_unsupported_context;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 SELECT GET_LOCK('resume_unsupported_missing_token_lock', 0)
 AS got_missing_token_lock;
 got_missing_token_lock
@@ -34,4 +34,4 @@ SELECT * FROM t_resume_unsupported_context ORDER BY id;
 id	v
 1	10
 DROP TABLE t_resume_unsupported_context;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

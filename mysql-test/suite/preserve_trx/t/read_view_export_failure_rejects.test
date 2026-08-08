@@ -5,7 +5,7 @@
 DROP TABLE IF EXISTS t_read_view_export_fail;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_read_view_export_fail(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_read_view_export_fail VALUES(1,10),(2,20);
@@ -31,4 +31,4 @@ SELECT COUNT(*) AS preserved_count
 --source suite/preserve_trx/include/assert_no_snapshot_file.inc
 
 DROP TABLE t_read_view_export_fail;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

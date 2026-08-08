@@ -10,7 +10,7 @@
 DROP TABLE IF EXISTS t_table_lock_tlv_import_isolated;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_table_lock_tlv_import_isolated(
   id INT PRIMARY KEY,
   v INT
@@ -25,7 +25,7 @@ UPDATE t_table_lock_tlv_import_isolated SET v=21 WHERE id=2;
 --source suite/preserve_trx/include/drain_transaction_from_control.inc
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 
---let $restart_parameters= restart: --preserve-trx-enable=ON --debug=d,preserve_trx_skip_record_lock_table_resurrect
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --debug=d,preserve_trx_skip_record_lock_table_resurrect
 --exec echo "$restart_parameters" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
@@ -54,4 +54,4 @@ ROLLBACK;
 SELECT * FROM t_table_lock_tlv_import_isolated ORDER BY id;
 
 DROP TABLE t_table_lock_tlv_import_isolated;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

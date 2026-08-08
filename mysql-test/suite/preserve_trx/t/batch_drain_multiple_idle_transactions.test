@@ -5,7 +5,7 @@
 DROP TABLE IF EXISTS t_batch_multiple;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_batch_multiple(
   a INT PRIMARY KEY,
@@ -28,7 +28,7 @@ INSERT INTO t_batch_multiple VALUES(2,20,NULL);
 DRAIN TRANSACTIONS PRESERVE;
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 
---exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=10" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -90,4 +90,4 @@ SELECT COUNT(*) AS row_count,
   FROM t_batch_multiple;
 
 DROP TABLE t_batch_multiple;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

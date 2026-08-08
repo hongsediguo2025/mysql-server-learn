@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_read_view_export_fail;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_read_view_export_fail(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_read_view_export_fail VALUES(1,10),(2,20);
 SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
@@ -25,4 +25,4 @@ FROM performance_schema.preserved_transactions;
 preserved_count
 0
 DROP TABLE t_read_view_export_fail;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

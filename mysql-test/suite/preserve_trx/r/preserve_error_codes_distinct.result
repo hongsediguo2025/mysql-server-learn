@@ -1,6 +1,6 @@
 DROP USER IF EXISTS preserve_error_reader@localhost;
 DROP TABLE IF EXISTS t_preserve_error_codes;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 RESUME PRESERVED TRANSACTION 'missing_token_for_not_found';
 ERROR HY000: Preserved transaction was not found
 CREATE TABLE t_preserve_error_codes(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
@@ -26,4 +26,4 @@ a	b
 1	11
 DROP USER preserve_error_reader@localhost;
 DROP TABLE t_preserve_error_codes;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

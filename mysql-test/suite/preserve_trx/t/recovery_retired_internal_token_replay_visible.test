@@ -8,7 +8,7 @@ CALL mtr.add_suppression("Found 1 prepared XA transactions");
 
 --let $MYSQLD_DATADIR= `SELECT @@datadir`
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_retired_token_replay(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
 INSERT INTO t_retired_token_replay VALUES(1, 10);
 
@@ -21,7 +21,7 @@ UPDATE t_retired_token_replay SET v=20 WHERE id=1;
 DRAIN TRANSACTIONS PRESERVE;
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 
---exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=10 --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON  --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -38,7 +38,7 @@ ROLLBACK;
 --connection default
 SELECT COUNT(*) AS preserved_after_retire
   FROM performance_schema.preserved_transactions;
---let $restart_parameters= restart: --preserve-trx-enable=OFF --skip-log-bin
+--let $restart_parameters= restart: --rds-preserve-trx-enable=OFF --skip-log-bin
 --let $do_not_echo_parameters= 1
 --source include/restart_mysqld.inc
 --let $do_not_echo_parameters=
@@ -56,7 +56,7 @@ UPDATE t_retired_token_replay SET v=30 WHERE id=1;
 --disconnect xa_client
 
 --connection default
---let $restart_parameters= restart: --preserve-trx-enable=ON --skip-log-bin
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --skip-log-bin
 --let $do_not_echo_parameters= 1
 --source include/restart_mysqld.inc
 --let $do_not_echo_parameters=

@@ -5,7 +5,7 @@
 DROP TABLE IF EXISTS t_gtid_auto;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 SET SESSION sql_log_bin=0;
 CREATE TABLE t_gtid_auto(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
@@ -23,7 +23,7 @@ UPDATE t_gtid_auto SET b=11 WHERE a=1;
 --source suite/preserve_trx/include/drain_transaction_from_control.inc
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 
---exec echo "restart: --preserve-trx-enable=ON --gtid-mode=ON --enforce-gtid-consistency" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON --gtid-mode=ON --enforce-gtid-consistency" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -44,4 +44,4 @@ SET SESSION sql_log_bin=0;
 DROP TABLE t_gtid_auto;
 SET SESSION sql_log_bin=1;
 RESET MASTER;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

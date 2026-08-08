@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_logged_cache;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_logged_cache(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_logged_cache VALUES(1,10);
 START TRANSACTION;
@@ -20,4 +20,4 @@ a	b
 1	11
 include/assert_grep.inc [Preserved LOGGED_WITH_CACHE update is written on final COMMIT]
 DROP TABLE t_logged_cache;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

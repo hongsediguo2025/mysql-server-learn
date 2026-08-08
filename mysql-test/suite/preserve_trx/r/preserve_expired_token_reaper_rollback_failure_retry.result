@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_expired_reaper_rollback_failure;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_expired_reaper_rollback_failure(a INT PRIMARY KEY, b INT)
 ENGINE=InnoDB;
 INSERT INTO t_expired_reaper_rollback_failure VALUES(1,10);
@@ -14,7 +14,7 @@ LAST_ERROR_AT IS NOT NULL AS last_error_at_set
 FROM performance_schema.preserved_transactions;
 STATE	last_error_preserved	last_error_at_set
 PRESERVED	1	1
-# restart: --preserve-trx-enable=ON --preserve-trx-recovery-grace-seconds=30
+# restart: --rds-preserve-trx-enable=ON
 include/wait_for_pattern_in_file.inc [Preserved transaction .* expired-token reaper forced rollback: recovery timeout expired]
 SELECT COUNT(*) AS preserved_count_after_retry_cleanup
 FROM performance_schema.preserved_transactions;
@@ -28,5 +28,5 @@ SELECT * FROM t_expired_reaper_rollback_failure ORDER BY a;
 a	b
 1	10
 DROP TABLE t_expired_reaper_rollback_failure;
-SET GLOBAL preserve_trx_enable=ON;
-# restart: --preserve-trx-enable=ON --skip-log-bin
+SET GLOBAL rds_preserve_trx_enable=ON;
+# restart: --rds-preserve-trx-enable=ON --skip-log-bin

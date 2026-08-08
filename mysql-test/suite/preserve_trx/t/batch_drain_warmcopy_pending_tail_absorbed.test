@@ -6,10 +6,8 @@
 DROP TABLE IF EXISTS t_warmcopy_pending_tail;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
-SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes=4096;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=PROMOTION_PREPARE;
 
 CREATE TABLE t_warmcopy_pending_tail(
   id INT PRIMARY KEY,
@@ -46,7 +44,7 @@ SET DEBUG_SYNC = 'now SIGNAL warmcopy_pending_tail_continue';
 
 --connection default
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
---exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=10" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -68,8 +66,6 @@ SELECT id, v, OCTET_LENGTH(payload) AS payload_len, payload=REPEAT('c',1024) AS 
   ORDER BY id;
 
 DROP TABLE t_warmcopy_pending_tail;
-SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes=1048576;
-SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
-SET GLOBAL preserve_trx_warmcopy_enable=ON;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=BUSINESS_FIRST;
+SET GLOBAL rds_preserve_trx_enable=ON;
 SET DEBUG_SYNC = 'RESET';

@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_force_recovery_unsupported;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_force_recovery_unsupported(a INT PRIMARY KEY, b INT)
 ENGINE=InnoDB;
 INSERT INTO t_force_recovery_unsupported VALUES(1,10);
@@ -22,7 +22,7 @@ ERROR HY000: Resumable transactions across shutdown do not support this operatio
 ROLLBACK;
 DRAIN TRANSACTIONS PRESERVE;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
-# restart: --preserve-trx-enable=ON --innodb-force-recovery=0
+# restart: --rds-preserve-trx-enable=ON --innodb-force-recovery=0
 SELECT @@global.innodb_force_recovery AS force_recovery_after_normal_restart;
 force_recovery_after_normal_restart
 0
@@ -38,4 +38,4 @@ FROM performance_schema.preserved_transactions;
 preserved_count_after_tainted_rollback
 0
 DROP TABLE t_force_recovery_unsupported;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

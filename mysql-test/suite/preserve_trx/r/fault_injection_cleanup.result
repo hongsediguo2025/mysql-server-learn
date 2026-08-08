@@ -1,7 +1,7 @@
 CALL mtr.add_suppression(
 "Preserved transaction batch cleanup failed after target preserve error");
 DROP TABLE IF EXISTS t_preserve_fault_cleanup;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_preserve_fault_cleanup(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_preserve_fault_cleanup VALUES(1,10);
 START TRANSACTION;
@@ -141,4 +141,4 @@ SELECT * FROM t_preserve_fault_cleanup WHERE a=1;
 a	b
 1	10
 DROP TABLE t_preserve_fault_cleanup;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

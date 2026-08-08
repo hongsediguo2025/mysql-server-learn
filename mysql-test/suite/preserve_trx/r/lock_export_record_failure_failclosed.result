@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_lock_export_record_failclosed;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_lock_export_record_failclosed(
 id INT PRIMARY KEY,
 v INT
@@ -26,4 +26,4 @@ FROM performance_schema.preserved_transactions;
 preserved_count
 0
 DROP TABLE t_lock_export_record_failclosed;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

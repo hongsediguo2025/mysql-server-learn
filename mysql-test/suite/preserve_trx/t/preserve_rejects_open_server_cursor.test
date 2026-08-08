@@ -5,7 +5,7 @@
 DROP TABLE IF EXISTS t_preserve_open_cursor;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_preserve_open_cursor(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
 INSERT INTO t_preserve_open_cursor VALUES(1,10),(2,20),(3,30);
@@ -215,7 +215,7 @@ DRAIN TRANSACTIONS PRESERVE;
 SELECT * FROM t_preserve_open_cursor ORDER BY id;
 
 DROP TABLE t_preserve_open_cursor;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 --remove_file $raw_cursor_client
 --remove_file $raw_cursor_output

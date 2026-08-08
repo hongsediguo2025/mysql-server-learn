@@ -5,7 +5,7 @@
 DROP TABLE IF EXISTS t_batch_single;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 CREATE TABLE t_batch_single(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
 
@@ -17,7 +17,7 @@ INSERT INTO t_batch_single VALUES(1, 10);
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 DRAIN TRANSACTIONS PRESERVE;
 --source include/wait_until_disconnected.inc
---exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -39,4 +39,4 @@ COMMIT;
 SELECT * FROM t_batch_single;
 
 DROP TABLE t_batch_single;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

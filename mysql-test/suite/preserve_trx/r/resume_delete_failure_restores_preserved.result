@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS t_resume_delete_failure;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 CREATE TABLE t_resume_delete_failure(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_resume_delete_failure VALUES(1,10);
 START TRANSACTION;
@@ -17,9 +17,9 @@ FROM performance_schema.preserved_transactions;
 remaining_preserved
 0
 COMMIT;
-# restart: --preserve-trx-enable=ON --skip-log-bin
+# restart: --rds-preserve-trx-enable=ON --skip-log-bin
 SELECT * FROM t_resume_delete_failure ORDER BY a;
 a	b
 1	11
 DROP TABLE t_resume_delete_failure;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

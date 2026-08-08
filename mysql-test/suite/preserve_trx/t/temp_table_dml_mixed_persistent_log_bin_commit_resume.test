@@ -1,7 +1,7 @@
 --source include/force_restart.inc
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 
 CREATE TEMPORARY TABLE tmp_preserve_mixed_logbin(
   id INT PRIMARY KEY,
@@ -24,7 +24,7 @@ INSERT INTO t_preserve_mixed_logbin VALUES(1, 100);
 --source suite/preserve_trx/include/drain_transaction_from_control.inc
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 
---exec echo "restart: --preserve-trx-enable=ON --preserve-trx-temp-table-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-temp-table-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -41,5 +41,5 @@ SELECT * FROM t_preserve_mixed_logbin ORDER BY id;
 DROP TABLE t_preserve_mixed_logbin;
 DROP TEMPORARY TABLE tmp_preserve_mixed_logbin;
 --source suite/preserve_trx/include/assert_no_preserve_residue.inc
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;

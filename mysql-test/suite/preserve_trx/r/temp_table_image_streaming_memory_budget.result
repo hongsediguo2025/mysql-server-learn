@@ -1,9 +1,7 @@
 DROP TABLE IF EXISTS t_temp_streaming_budget_base;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_temp_table_enable=OFF;
-SET GLOBAL preserve_trx_memory_budget_bytes=524288;
-SET GLOBAL preserve_trx_memory_per_token_bytes=524288;
-SET GLOBAL preserve_trx_spill_chunk_bytes=16384;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=OFF;
+SET GLOBAL rds_preserve_trx_memory_budget_bytes=524288;
 CREATE TABLE t_temp_streaming_budget_base(
 id INT PRIMARY KEY,
 v INT
@@ -14,7 +12,7 @@ id INT PRIMARY KEY,
 v INT,
 KEY idx_v(v)
 ) ENGINE=InnoDB;
-SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
 START TRANSACTION;
 UPDATE t_temp_streaming_budget_base SET v = 11 WHERE id = 1;
 DRAIN TRANSACTIONS PRESERVE;
@@ -32,4 +30,4 @@ id	v
 1	11
 DROP TEMPORARY TABLE tmp_temp_streaming_budget;
 DROP TABLE t_temp_streaming_budget_base;
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

@@ -5,7 +5,7 @@
 DROP TABLE IF EXISTS t_gtid_mode_flip;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
 
 --disable_query_log
 CALL mtr.add_suppression("Preserved transaction .* rejected because snapshot binlog_state=LOGGED_WITH_CACHE requires gtid_mode=ON");
@@ -30,7 +30,7 @@ UPDATE t_gtid_mode_flip SET b=11 WHERE a=1;
 
 --let $_server_id= 1
 --let $_expect_file_name= $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
---let $restart_parameters= restart: --preserve-trx-enable=ON --gtid-mode=OFF --enforce-gtid-consistency=OFF
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --gtid-mode=OFF --enforce-gtid-consistency=OFF
 --source include/start_mysqld.inc
 
 SELECT @@GLOBAL.GTID_MODE AS gtid_mode_after_restart;
@@ -44,7 +44,7 @@ DROP TABLE t_gtid_mode_flip;
 SET SESSION sql_log_bin=1;
 RESET MASTER;
 
---let $restart_parameters= restart: --preserve-trx-enable=ON --gtid-mode=ON --enforce-gtid-consistency
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --gtid-mode=ON --enforce-gtid-consistency
 --source include/restart_mysqld.inc
 
-SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;

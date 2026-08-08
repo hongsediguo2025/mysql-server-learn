@@ -1,2 +1,2 @@
---preserve-trx-enable=OFF
+--rds-preserve-trx-enable=OFF
 --skip-log-bin

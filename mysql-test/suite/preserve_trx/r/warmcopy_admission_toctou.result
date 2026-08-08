@@ -1,8 +1,7 @@
 DROP TABLE IF EXISTS t_warmcopy_toctou;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_enable=ON;
-SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
-SET GLOBAL preserve_trx_drain_phase2_timeout_ms=5000;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=PROMOTION_PREPARE;
+SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms=5000;
 CREATE TABLE t_warmcopy_toctou(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
 INSERT INTO t_warmcopy_toctou VALUES(1,10),(2,20);
 PREPARE warmcopy_toctou_stmt FROM
@@ -35,8 +34,7 @@ id	v
 1	11
 2	20
 DROP TABLE t_warmcopy_toctou;
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_drain_phase2_timeout_ms=30000;
-SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
-SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms=30000;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=BUSINESS_FIRST;
 SET DEBUG_SYNC = 'RESET';

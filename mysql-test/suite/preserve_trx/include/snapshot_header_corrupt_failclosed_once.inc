@@ -41,8 +41,8 @@ EOF
 --source $MYSQLTEST_VARDIR/tmp/snapshot_header_corrupt_token.inc
 --source suite/preserve_trx/include/corrupt_preserved_snapshot_byte.inc
 
---echo # restart: --preserve-trx-enable=ON --skip-log-bin
---exec echo "restart: --preserve-trx-enable=ON --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--echo # restart: --rds-preserve-trx-enable=ON --skip-log-bin
+--exec echo "restart: --rds-preserve-trx-enable=ON --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
