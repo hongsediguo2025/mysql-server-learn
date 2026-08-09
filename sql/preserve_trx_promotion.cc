@@ -2999,24 +2999,6 @@ bool strict_prepared_snapshot_matches_accepted_epoch(
          facts.target_boot_incarnation == accepted.receiver_process_generation;
 }
 
-bool write_strict_promotion_intent(
-    Preserved_trx_store *store,
-    const Preserve_trx_strict_promotion_intent_epoch &intent,
-    bool final_rewrite) {
-  if (store == nullptr) return false;
-  std::string encoded;
-  if (!preserved_trx_encode_strict_promotion_intent_v1(intent, &encoded)) {
-    return false;
-  }
-  if (final_rewrite) {
-    DBUG_EXECUTE_IF(
-        "preserve_trx_fail_write_final_strict_promotion_intent_epoch",
-        return false;);
-  }
-  return store->write_promotion_intent_epoch(intent.epoch_id, encoded) ==
-         Preserve_snapshot_status::OK;
-}
-
 Preserve_trx_physical_promotion_gate_status
 adopt_ready_epoch_for_physical_promotion_impl(
     const std::string &preserve_dir,
@@ -3177,7 +3159,7 @@ adopt_ready_epoch_for_physical_promotion_impl(
   if (fence_revalidate_status != Preserve_trx_physical_fence_status::OK) {
     return finish(
         Preserve_trx_physical_promotion_gate_status::PHYSICAL_FENCE_MISMATCH,
-        "physical-fence revalidation failed before intent");
+        "physical-fence revalidation failed before adopt");
   }
   for (const Preserve_trx_prepared_token_key &key : request.tokens) {
     const auto ready_status =
@@ -3186,7 +3168,7 @@ adopt_ready_epoch_for_physical_promotion_impl(
         ready_status != Preserve_trx_prepared_status::IDEMPOTENT) {
       return finish(
           Preserve_trx_physical_promotion_gate_status::REGISTRY_NOT_READY,
-          "strict prepared-token state changed before intent");
+          "strict prepared-token state changed before adopt");
     }
   }
 
@@ -3195,23 +3177,6 @@ adopt_ready_epoch_for_physical_promotion_impl(
   if (!ensure_promotion_gate_workers(worker_count)) {
     return finish(Preserve_trx_physical_promotion_gate_status::ADOPT_FAILED,
                   "promotion gate worker pool is unavailable");
-  }
-
-  auto store = create_preserved_trx_process_local_store(preserve_dir);
-  Preserve_trx_strict_promotion_intent_epoch intent;
-  intent.epoch_id = request.epoch_id;
-  intent.physical_fence = request.expected_fence;
-  intent.generated_at_us = my_micro_time();
-  intent.tokens.reserve(request.tokens.size());
-  for (const Preserve_trx_prepared_token_key &key : request.tokens) {
-    intent.tokens.push_back(
-        {key.token, key.generation,
-         Preserve_trx_strict_promotion_intent_state::ADOPTING});
-  }
-  if (use_test_provider &&
-      !write_strict_promotion_intent(&store.store(), intent, false)) {
-    return finish(Preserve_trx_physical_promotion_gate_status::INTENT_IO_ERROR,
-                  "failed to write strict promotion intent");
   }
 
   const uint64_t deadline_us =
@@ -3225,8 +3190,8 @@ adopt_ready_epoch_for_physical_promotion_impl(
           ? preserved_trx_import_reserved_for_physical_promotion
           : g_strict_physical_adopt_executor_for_unit_test;
   struct Strict_adopt_task {
-    Preserve_trx_strict_promotion_intent_state state{
-        Preserve_trx_strict_promotion_intent_state::CLEANUP_TAINTED};
+    Preserve_trx_prepared_token_state state{
+        Preserve_trx_prepared_token_state::CLEANUP_TAINTED};
     uint64_t token{0};
   };
   std::vector<Strict_adopt_task> tasks(request.tokens.size());
@@ -3265,16 +3230,15 @@ adopt_ready_epoch_for_physical_promotion_impl(
         if (adopt_status == Preserved_trx_physical_adopt_status::OK &&
             registry.commit_gate_adopt(&adopt_lease) ==
                 Preserve_trx_prepared_status::OK) {
-          tasks[i].state =
-              Preserve_trx_strict_promotion_intent_state::ADOPTED_LOCKED;
+          tasks[i].state = Preserve_trx_prepared_token_state::ADOPTED_LOCKED;
         } else if (adopt_result.rolled_back &&
                    registry.abort_gate_adopt(
                        &adopt_lease,
                        Preserve_trx_gate_abort_outcome::
                            ABANDONED_ROLLED_BACK) ==
                        Preserve_trx_prepared_status::OK) {
-          tasks[i].state = Preserve_trx_strict_promotion_intent_state::
-              ABANDONED_ROLLED_BACK;
+          tasks[i].state =
+              Preserve_trx_prepared_token_state::ABANDONED_ROLLED_BACK;
         } else {
           if (adopt_lease.active()) {
             (void)registry.abort_gate_adopt(
@@ -3309,7 +3273,7 @@ adopt_ready_epoch_for_physical_promotion_impl(
     bool complete = true;
     for (size_t i = 0; i < tasks.size(); ++i) {
       if (tasks[i].state !=
-          Preserve_trx_strict_promotion_intent_state::ADOPTED_LOCKED) {
+          Preserve_trx_prepared_token_state::ADOPTED_LOCKED) {
         continue;
       }
       Preserve_trx_cleanup_lease cleanup;
@@ -3329,13 +3293,12 @@ adopt_ready_epoch_for_physical_promotion_impl(
       if (reversed &&
           registry.commit_cleanup(&cleanup, true) ==
               Preserve_trx_prepared_status::OK) {
-        tasks[i].state = Preserve_trx_strict_promotion_intent_state::
-            ABANDONED_ROLLED_BACK;
+        tasks[i].state =
+            Preserve_trx_prepared_token_state::ABANDONED_ROLLED_BACK;
         continue;
       }
       if (cleanup.active()) (void)registry.commit_cleanup(&cleanup, false);
-      tasks[i].state =
-          Preserve_trx_strict_promotion_intent_state::CLEANUP_TAINTED;
+      tasks[i].state = Preserve_trx_prepared_token_state::CLEANUP_TAINTED;
       complete = false;
     }
     return complete;
@@ -3350,13 +3313,11 @@ adopt_ready_epoch_for_physical_promotion_impl(
     result->rolled_back_count = 0;
     result->tainted_count = 0;
     for (size_t i = 0; i < tasks.size(); ++i) {
-      intent.tokens[i].state = tasks[i].state;
       switch (tasks[i].state) {
-        case Preserve_trx_strict_promotion_intent_state::ADOPTED_LOCKED:
+        case Preserve_trx_prepared_token_state::ADOPTED_LOCKED:
           ++result->adopted_count;
           break;
-        case Preserve_trx_strict_promotion_intent_state::
-            ABANDONED_ROLLED_BACK:
+        case Preserve_trx_prepared_token_state::ABANDONED_ROLLED_BACK:
           ++result->rolled_back_count;
           break;
         default:
@@ -3366,49 +3327,6 @@ adopt_ready_epoch_for_physical_promotion_impl(
     }
   };
   summarize_tasks();
-
-  intent.generated_at_us = my_micro_time();
-  if (use_test_provider &&
-      !write_strict_promotion_intent(&store.store(), intent, true)) {
-    if (use_test_provider) {
-      const bool reversed = reverse_adopted_tokens();
-      summarize_tasks();
-      return finish(
-          reversed && result->tainted_count == 0
-              ? Preserve_trx_physical_promotion_gate_status::INTENT_IO_ERROR
-              : Preserve_trx_physical_promotion_gate_status::CLEANUP_TAINTED,
-          reversed && result->tainted_count == 0
-              ? "strict final process-local intent write failed; simulator "
-                "epoch was "
-                "fully reversed"
-              : "strict final process-local intent write failed; simulator "
-                "cleanup is "
-                "tainted");
-    }
-    uint64_t newly_tainted = 0;
-    for (size_t i = 0; i < request.tokens.size(); ++i) {
-      if (intent.tokens[i].state !=
-          Preserve_trx_strict_promotion_intent_state::ADOPTED_LOCKED) {
-        continue;
-      }
-      Preserve_trx_cleanup_lease cleanup;
-      if (registry.begin_cleanup(
-              request.tokens[i], request.tokens[i].generation,
-              Preserve_trx_prepared_token_state::ADOPTED_LOCKED,
-              &cleanup) == Preserve_trx_prepared_status::OK &&
-          registry.commit_cleanup(&cleanup, false) ==
-              Preserve_trx_prepared_status::OK) {
-        ++newly_tainted;
-      }
-    }
-    result->tainted_count += newly_tainted;
-    result->adopted_count =
-        result->adopted_count >= newly_tainted
-            ? result->adopted_count - newly_tainted
-            : 0;
-    return finish(Preserve_trx_physical_promotion_gate_status::CLEANUP_TAINTED,
-                  "strict final process-local intent write failed");
-  }
   if (result->tainted_count != 0) {
     return finish(Preserve_trx_physical_promotion_gate_status::CLEANUP_TAINTED,
                   "strict promotion left tainted tokens");
@@ -3421,10 +3339,9 @@ adopt_ready_epoch_for_physical_promotion_impl(
     result->adopted_tokens.reserve(result->adopted_count);
     result->ordinary_recovery_tokens.reserve(result->rolled_back_count);
     for (const Strict_adopt_task &task : tasks) {
-      if (task.state ==
-          Preserve_trx_strict_promotion_intent_state::ADOPTED_LOCKED) {
+      if (task.state == Preserve_trx_prepared_token_state::ADOPTED_LOCKED) {
         result->adopted_tokens.push_back(task.token);
-      } else if (task.state == Preserve_trx_strict_promotion_intent_state::
+      } else if (task.state == Preserve_trx_prepared_token_state::
                                    ABANDONED_ROLLED_BACK) {
         result->ordinary_recovery_tokens.push_back(task.token);
       }

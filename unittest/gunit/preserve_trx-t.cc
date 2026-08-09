@@ -1298,30 +1298,30 @@ TEST(PreservedTrxPreparedRegistry, GateAndAttachLeasesEnforceStateMachine) {
             registry.abort_attach_after_full_unwind(&attach));
   ASSERT_EQ(Preserve_trx_prepared_status::OK,
             registry.begin_attach(key, 1, &attach));
-  bool durable_activation_intent = false;
+  bool process_local_intent_write_succeeds = false;
   ASSERT_EQ(Preserve_trx_prepared_status::INTENT_IO_ERROR,
             registry.begin_activation(&attach,
                                       activation_intent_writer_for_test,
-                                      &durable_activation_intent));
+                                      &process_local_intent_write_succeeds));
   EXPECT_TRUE(attach.active());
   EXPECT_FALSE(attach.activation_started());
-  durable_activation_intent = true;
+  process_local_intent_write_succeeds = true;
   ASSERT_EQ(Preserve_trx_prepared_status::OK,
             registry.begin_activation(&attach,
                                       activation_intent_writer_for_test,
-                                      &durable_activation_intent));
-  durable_activation_intent = false;
+                                      &process_local_intent_write_succeeds));
+  process_local_intent_write_succeeds = false;
   ASSERT_EQ(Preserve_trx_prepared_status::INTENT_IO_ERROR,
             registry.commit_attach(&attach,
                                    activation_intent_writer_for_test,
-                                   &durable_activation_intent));
+                                   &process_local_intent_write_succeeds));
   EXPECT_TRUE(attach.active());
   EXPECT_TRUE(attach.activation_started());
-  durable_activation_intent = true;
+  process_local_intent_write_succeeds = true;
   ASSERT_EQ(Preserve_trx_prepared_status::OK,
             registry.commit_attach(&attach,
                                    activation_intent_writer_for_test,
-                                   &durable_activation_intent));
+                                   &process_local_intent_write_succeeds));
 
   Preserve_trx_prepared_token_snapshot snapshot;
   ASSERT_EQ(Preserve_trx_prepared_status::OK,
@@ -1507,6 +1507,30 @@ Preserved_trx_physical_adopt_status strict_adopt_fail_token_202_for_test(
   return result->status;
 }
 
+Preserved_trx_physical_adopt_status
+strict_adopt_global_fail_token_202_for_test(
+    const std::string &dir, Preserve_trx_gate_adopt_lease *adopt_lease,
+    trx_t *exact_trx,
+    Preserve_trx_physical_fence_lease *physical_lease, uint64_t deadline_us,
+    Preserved_trx_physical_adopt_result *result) {
+  Preserve_trx_prepared_token_key key;
+  Preserve_trx_final_token_facts facts;
+  if (adopt_lease == nullptr || result == nullptr ||
+      adopt_lease->copy_publication(&key, &facts) !=
+          Preserve_trx_prepared_status::OK) {
+    return Preserved_trx_physical_adopt_status::INVALID_ARGUMENT;
+  }
+  if (key.token != "202") {
+    return strict_adopt_success_for_test(dir, adopt_lease, exact_trx,
+                                         physical_lease, deadline_us, result);
+  }
+  *result = {};
+  result->status =
+      Preserved_trx_physical_adopt_status::SEMANTIC_IMPORT_FAILED;
+  result->reason = "injected epoch-global adopt failure";
+  return result->status;
+}
+
 bool strict_adopt_reversal_success_for_test(
     const Preserve_trx_prepared_token_key &key, trx_t *exact_trx,
     Preserve_trx_cleanup_lease *, Preserve_trx_physical_fence_lease *,
@@ -1516,6 +1540,15 @@ bool strict_adopt_reversal_success_for_test(
   }
   g_strict_adopt_reversal_calls.fetch_add(1);
   return true;
+}
+
+bool strict_adopt_reversal_failure_for_test(
+    const Preserve_trx_prepared_token_key &, trx_t *,
+    Preserve_trx_cleanup_lease *, Preserve_trx_physical_fence_lease *,
+    std::string *reason) {
+  g_strict_adopt_reversal_calls.fetch_add(1);
+  if (reason != nullptr) *reason = "injected reversal failure";
+  return false;
 }
 
 Preserved_trx_physical_adopt_status
@@ -1618,7 +1651,7 @@ TEST(PreservedTrxPreparedRegistry, AttachAndCleanupUseOneStateClaim) {
 }
 
 TEST(PreservedTrxPreparedRegistry,
-     ActivatedAttachRollbackRequiresDurableTerminalIntent) {
+     ActivatedAttachRollbackRequiresTerminalIntentWrite) {
   preserve_trx_resource_manager_reset_for_unit_test();
   Preserve_trx_prepared_token_registry registry;
   auto key = make_prepared_token_key(88);
@@ -1639,22 +1672,22 @@ TEST(PreservedTrxPreparedRegistry,
   Preserve_trx_attach_lease attach;
   ASSERT_EQ(Preserve_trx_prepared_status::OK,
             registry.begin_attach(key, key.generation, &attach));
-  bool durable_intent = true;
+  bool process_local_intent_write_succeeds = true;
   ASSERT_EQ(Preserve_trx_prepared_status::OK,
             registry.begin_activation(&attach,
                                       activation_intent_writer_for_test,
-                                      &durable_intent));
-  durable_intent = false;
+                                      &process_local_intent_write_succeeds));
+  process_local_intent_write_succeeds = false;
   EXPECT_EQ(Preserve_trx_prepared_status::INTENT_IO_ERROR,
             registry.rollback_attach_after_activation(
                 &attach, activation_intent_writer_for_test,
-                &durable_intent));
+                &process_local_intent_write_succeeds));
   EXPECT_TRUE(attach.active());
-  durable_intent = true;
+  process_local_intent_write_succeeds = true;
   ASSERT_EQ(Preserve_trx_prepared_status::OK,
             registry.rollback_attach_after_activation(
                 &attach, activation_intent_writer_for_test,
-                &durable_intent));
+                &process_local_intent_write_succeeds));
   Preserve_trx_prepared_token_snapshot snapshot;
   ASSERT_EQ(Preserve_trx_prepared_status::OK,
             registry.snapshot(key, &snapshot));
@@ -1863,15 +1896,15 @@ TEST(PreservedTrxPreparedRegistry, ActiveExpiryOnlyCleansPreserveArtifacts) {
   Preserve_trx_attach_lease attach;
   ASSERT_EQ(Preserve_trx_prepared_status::OK,
             registry.begin_attach(key, key.generation, &attach));
-  bool durable_intent = true;
+  bool process_local_intent_write_succeeds = true;
   ASSERT_EQ(Preserve_trx_prepared_status::OK,
             registry.begin_activation(&attach,
                                       activation_intent_writer_for_test,
-                                      &durable_intent));
+                                      &process_local_intent_write_succeeds));
   ASSERT_EQ(Preserve_trx_prepared_status::OK,
             registry.commit_attach(&attach,
                                    activation_intent_writer_for_test,
-                                   &durable_intent));
+                                   &process_local_intent_write_succeeds));
 
   const auto expired = registry.expire_once(facts.client_resume_deadline_us);
   EXPECT_EQ(0U, expired.ready_expired);
@@ -5140,80 +5173,6 @@ TEST(PreservedTrxPromotion, IntentEpochMarkerRejectsInvalidStatePairs) {
                            "tainted state must carry tainted cleanup"});
   EXPECT_FALSE(preserved_trx_encode_promotion_intent_epoch_marker(marker,
                                                                   &encoded));
-}
-
-TEST(PreservedTrxPromotion,
-     StrictIntentProductV1RoundTripsFenceAndGeneration) {
-  Preserve_trx_strict_promotion_intent_epoch marker;
-  marker.epoch_id = "strict-epoch";
-  marker.physical_fence = make_test_physical_fence_proof(
-      Preserve_trx_physical_consistency_mode::PRODUCTION_REDO_APPLY_FENCE);
-  marker.generated_at_us = 7788;
-  marker.tokens.push_back(
-      {"token-2", 2,
-       Preserve_trx_strict_promotion_intent_state::ADOPTED_LOCKED});
-  marker.tokens.push_back(
-      {"token-1", 1,
-       Preserve_trx_strict_promotion_intent_state::ADOPTING});
-
-  std::string encoded;
-  ASSERT_TRUE(preserved_trx_encode_strict_promotion_intent_v1(marker,
-                                                              &encoded));
-  Preserve_trx_strict_promotion_intent_epoch decoded;
-  ASSERT_TRUE(preserved_trx_decode_strict_promotion_intent_v1(encoded,
-                                                              &decoded));
-  EXPECT_EQ(marker.epoch_id, decoded.epoch_id);
-  EXPECT_EQ(marker.physical_fence.source_lineage_uuid,
-            decoded.physical_fence.source_lineage_uuid);
-  EXPECT_EQ(marker.physical_fence.target_server_uuid,
-            decoded.physical_fence.target_server_uuid);
-  EXPECT_EQ(marker.physical_fence.target_boot_incarnation,
-            decoded.physical_fence.target_boot_incarnation);
-  EXPECT_EQ(marker.physical_fence.provider_generation,
-            decoded.physical_fence.provider_generation);
-  EXPECT_EQ(marker.physical_fence.source_fence_lsn,
-            decoded.physical_fence.source_fence_lsn);
-  EXPECT_EQ(marker.generated_at_us, decoded.generated_at_us);
-  ASSERT_EQ(2U, decoded.tokens.size());
-  EXPECT_EQ("token-1", decoded.tokens[0].token);
-  EXPECT_EQ(1U, decoded.tokens[0].generation);
-  EXPECT_EQ(Preserve_trx_strict_promotion_intent_state::ADOPTING,
-            decoded.tokens[0].state);
-  EXPECT_EQ("token-2", decoded.tokens[1].token);
-  EXPECT_EQ(Preserve_trx_strict_promotion_intent_state::ADOPTED_LOCKED,
-            decoded.tokens[1].state);
-
-  encoded[20] ^= 1;
-  EXPECT_FALSE(preserved_trx_decode_strict_promotion_intent_v1(encoded,
-                                                               &decoded));
-}
-
-TEST(PreservedTrxPromotion,
-     StrictIntentProductV1RejectsPrototypeAndLegacyDomains) {
-  Preserve_trx_strict_promotion_intent_epoch marker;
-  marker.epoch_id = "strict-epoch";
-  marker.physical_fence = make_test_physical_fence_proof(
-      Preserve_trx_physical_consistency_mode::PRODUCTION_REDO_APPLY_FENCE);
-  marker.generated_at_us = 1;
-  marker.tokens.push_back(
-      {"token-1", 1,
-       Preserve_trx_strict_promotion_intent_state::CLEANUP_TAINTED});
-  std::string encoded;
-  ASSERT_TRUE(preserved_trx_encode_strict_promotion_intent_v1(marker,
-                                                              &encoded));
-  Preserve_trx_promotion_intent_epoch_marker legacy;
-  EXPECT_FALSE(
-      preserved_trx_decode_promotion_intent_epoch_marker(encoded, &legacy));
-
-  const std::string product_magic =
-      "PTRX_STRICT_PROMOTION_INTENT_EPOCH_PRODUCT_V1";
-  ASSERT_EQ(0U, encoded.find(product_magic));
-  std::string prototype =
-      "PTRX_STRICT_PROMOTION_INTENT_EPOCH_V2" +
-      encoded.substr(product_magic.size());
-  Preserve_trx_strict_promotion_intent_epoch decoded;
-  EXPECT_FALSE(
-      preserved_trx_decode_strict_promotion_intent_v1(prototype, &decoded));
 }
 
 TEST(PreservedTrxPromotion,
@@ -9844,7 +9803,7 @@ TEST_F(PreserveSnapshotTest, PromotionGateRejectsMoreThanBatchTokens) {
 }
 
 TEST_F(PreserveSnapshotTest,
-       StrictPhysicalGateRejectsMissingBootstrapBeforeIntent) {
+       StrictPhysicalGateRejectsMissingBootstrapBeforeAdopt) {
   preserve_trx_set_enable_value(true);
   Preserve_trx_physical_promotion_gate_result result;
   Preserve_trx_physical_promotion_bootstrap_attempt attempt;
@@ -9853,10 +9812,6 @@ TEST_F(PreserveSnapshotTest,
                 &attempt, &result));
   EXPECT_EQ(0U, result.adopted_count);
   EXPECT_EQ(0U, result.tainted_count);
-  MY_STAT stat_area;
-  EXPECT_EQ(nullptr,
-            my_stat((m_dir + "missing-bootstrap.promotion_intent").c_str(),
-                    &stat_area, MYF(0)));
 }
 
 TEST_F(PreserveSnapshotTest,
@@ -9895,30 +9850,6 @@ TEST_F(PreserveSnapshotTest,
 }
 
 TEST_F(PreserveSnapshotTest,
-       CarrierListsStrictPromotionIntentProductV1Tokens) {
-  Preserve_trx_strict_promotion_intent_epoch marker;
-  marker.epoch_id = "strict-listing";
-  marker.physical_fence = make_test_physical_fence_proof(
-      Preserve_trx_physical_consistency_mode::
-          TEST_ONLY_PHYSICAL_FENCE_SIMULATOR);
-  marker.generated_at_us = 123;
-  marker.tokens.push_back(
-      {"strict-token", 1,
-       Preserve_trx_strict_promotion_intent_state::ADOPTED_LOCKED});
-  std::string encoded;
-  ASSERT_TRUE(
-      preserved_trx_encode_strict_promotion_intent_v1(marker, &encoded));
-
-  Local_file_preserved_trx_carrier carrier(m_dir);
-  ASSERT_EQ(Preserved_trx_carrier_status::OK,
-            carrier.write_promotion_intent_epoch(marker.epoch_id, encoded));
-  Preserved_trx_carrier_listing listing;
-  ASSERT_EQ(Preserved_trx_carrier_status::OK,
-            carrier.list_tokens(&listing));
-  EXPECT_EQ(1U, listing.promotion_intent_tokens.count("strict-token"));
-}
-
-TEST_F(PreserveSnapshotTest,
        StrictAttachIntentProtectsTokenUntilTerminalRemoval) {
   Preserve_trx_strict_attach_intent intent;
   intent.key.preserve_dir = m_dir;
@@ -9950,8 +9881,7 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_EQ(0U, listing.promotion_intent_tokens.count("token-attach"));
 }
 
-TEST_F(PreserveSnapshotTest,
-       StrictPhysicalFenceWritesOneEpochIntentAndAdoptsReadyRegistryToken) {
+TEST_F(PreserveSnapshotTest, StrictPhysicalFenceAdoptsReadyRegistryToken) {
   preserve_trx_set_enable_value(true);
   preserve_trx_resource_manager_reset_for_unit_test();
   preserved_trx_promotion_prepared_metrics_reset_for_unit_test();
@@ -10016,15 +9946,6 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_EQ(static_cast<uint64_t>(Preserve_trx_physical_consistency_mode::
                                       TEST_ONLY_PHYSICAL_FENCE_SIMULATOR),
             preserve_trx_resume_physical_consistency_mode_status());
-
-  const std::string encoded =
-      read_file(m_dir + request.epoch_id + ".promotion_intent");
-  Preserve_trx_strict_promotion_intent_epoch intent;
-  ASSERT_TRUE(
-      preserved_trx_decode_strict_promotion_intent_v1(encoded, &intent));
-  ASSERT_EQ(1U, intent.tokens.size());
-  EXPECT_EQ(Preserve_trx_strict_promotion_intent_state::ADOPTED_LOCKED,
-            intent.tokens[0].state);
 
   Preserve_trx_prepared_token_snapshot snapshot;
   ASSERT_EQ(Preserve_trx_prepared_status::OK,
@@ -10196,20 +10117,6 @@ TEST_F(PreserveSnapshotTest,
             result.ordinary_recovery_tokens);
   EXPECT_EQ(0, g_strict_adopt_reversal_calls.load());
 
-  const std::string encoded =
-      read_file(m_dir + request.epoch_id + ".promotion_intent");
-  Preserve_trx_strict_promotion_intent_epoch intent;
-  ASSERT_TRUE(
-      preserved_trx_decode_strict_promotion_intent_v1(encoded, &intent));
-  ASSERT_EQ(3U, intent.tokens.size());
-  EXPECT_EQ(Preserve_trx_strict_promotion_intent_state::ADOPTED_LOCKED,
-            intent.tokens[0].state);
-  EXPECT_EQ(Preserve_trx_strict_promotion_intent_state::
-                ABANDONED_ROLLED_BACK,
-            intent.tokens[1].state);
-  EXPECT_EQ(Preserve_trx_strict_promotion_intent_state::ADOPTED_LOCKED,
-            intent.tokens[2].state);
-
   Preserve_trx_prepared_token_snapshot snapshot;
   ASSERT_EQ(Preserve_trx_prepared_status::OK,
             registry.snapshot(request.tokens[0], &snapshot));
@@ -10240,6 +10147,113 @@ TEST_F(PreserveSnapshotTest,
       nullptr);
   preserved_trx_set_strict_physical_adopt_executor_for_unit_test(nullptr);
   preserved_trx_set_physical_fence_provider_for_unit_test(nullptr);
+}
+
+TEST_F(PreserveSnapshotTest,
+       StrictPhysicalGateGlobalFailureReversesOrTaintsAdoptedToken) {
+  preserve_trx_set_enable_value(true);
+  preserve_trx_resource_manager_reset_for_unit_test();
+  Preserve_trx_physical_fence_provider_ops ops;
+  ops.consistency_mode = Preserve_trx_physical_consistency_mode::
+      TEST_ONLY_PHYSICAL_FENCE_SIMULATOR;
+  ops.acquire = test_physical_fence_acquire;
+  ops.revalidate = test_physical_fence_revalidate;
+  ops.release = test_physical_fence_release;
+  preserved_trx_set_physical_fence_provider_for_unit_test(&ops);
+  preserved_trx_set_strict_physical_adopt_executor_for_unit_test(
+      strict_adopt_global_fail_token_202_for_test);
+  auto reset_hooks = create_scope_guard([] {
+    preserved_trx_set_strict_physical_adopt_reversal_executor_for_unit_test(
+        nullptr);
+    preserved_trx_set_strict_physical_adopt_executor_for_unit_test(nullptr);
+    preserved_trx_set_physical_fence_provider_for_unit_test(nullptr);
+  });
+
+  struct Reversal_case {
+    const char *epoch_id;
+    Preserve_trx_strict_physical_adopt_reversal_executor executor;
+    uint64_t rolled_back_count;
+    uint64_t tainted_count;
+    Preserve_trx_prepared_token_state first_token_state;
+  };
+  const Reversal_case cases[] = {
+      {"global-failure-reversal-success",
+       strict_adopt_reversal_success_for_test, 1, 1,
+       Preserve_trx_prepared_token_state::CLEANUP_ROLLED_BACK},
+      {"global-failure-reversal-failure",
+       strict_adopt_reversal_failure_for_test, 0, 2,
+       Preserve_trx_prepared_token_state::CLEANUP_TAINTED}};
+
+  auto &registry = preserved_trx_strict_prepared_token_registry();
+  ASSERT_EQ(0U, registry.discard_all_for_process_shutdown());
+  for (const Reversal_case &test_case : cases) {
+    auto proof = make_test_physical_fence_proof(
+        Preserve_trx_physical_consistency_mode::
+            TEST_ONLY_PHYSICAL_FENCE_SIMULATOR);
+    Preserve_trx_physical_promotion_gate_request request;
+    request.epoch_id = test_case.epoch_id;
+    request.operation_deadline_us = my_micro_time() + 1000000;
+    request.worker_count = 1;
+    std::vector<Preserve_trx_epoch_physical_digest_input> digest_inputs;
+    for (uint64_t i = 1; i <= 2; ++i) {
+      auto key = make_prepared_token_key(i);
+      key.preserve_dir = m_dir;
+      key.epoch_scope = proof.source_lineage_uuid;
+      key.epoch_id = request.epoch_id;
+      key.token = std::to_string(200 + i);
+      key.target_boot_incarnation = proof.target_boot_incarnation;
+      request.tokens.push_back(key);
+
+      auto facts = make_final_token_facts(proof.source_fence_lsn);
+      facts.epoch_fact_digest = proof.epoch_fact_digest;
+      facts.final_lock_generation_digest.assign(64,
+                                                static_cast<char>('0' + i));
+      facts.page_layout_digest.assign(64, static_cast<char>('3' + i));
+      facts.dictionary_generation_digest.assign(64,
+                                                static_cast<char>('6' + i));
+      facts.target_boot_incarnation = proof.target_boot_incarnation;
+      facts.canonical_digest.clear();
+      ASSERT_TRUE(preserved_trx_finalize_token_facts(&facts));
+      digest_inputs.push_back(
+          {key.token, key.generation, facts.final_lock_generation_digest,
+           facts.page_layout_digest, facts.dictionary_generation_digest});
+      Preserve_trx_prepare_lease prepare;
+      ASSERT_EQ(Preserve_trx_prepared_status::OK,
+                registry.begin_prepare(key, key.generation, &prepare));
+      ASSERT_EQ(Preserve_trx_prepared_status::OK,
+                registry.publish_ready(&prepare, facts,
+                                       acquire_strict_prepared_resources(
+                                           key, proof.source_fence_lsn)));
+    }
+    ASSERT_TRUE(preserved_trx_compute_epoch_physical_digest_commitments(
+        digest_inputs, &proof.final_lock_generation_digest,
+        &proof.page_layout_digest, &proof.dictionary_generation_digest));
+    request.expected_fence = proof;
+    preserved_trx_set_strict_physical_adopt_reversal_executor_for_unit_test(
+        test_case.executor);
+    g_strict_adopt_reversal_calls.store(0);
+
+    Preserve_trx_physical_promotion_gate_result result;
+    EXPECT_EQ(Preserve_trx_physical_promotion_gate_status::CLEANUP_TAINTED,
+              preserved_trx_adopt_ready_epoch_for_physical_promotion_for_unit_test(
+                  m_dir, request, &result))
+        << result.message;
+    EXPECT_EQ(0U, result.adopted_count);
+    EXPECT_EQ(test_case.rolled_back_count, result.rolled_back_count);
+    EXPECT_EQ(test_case.tainted_count, result.tainted_count);
+    EXPECT_EQ(1, g_strict_adopt_reversal_calls.load());
+
+    Preserve_trx_prepared_token_snapshot snapshot;
+    ASSERT_EQ(Preserve_trx_prepared_status::OK,
+              registry.snapshot(request.tokens[0], &snapshot));
+    EXPECT_EQ(test_case.first_token_state, snapshot.state);
+    ASSERT_EQ(Preserve_trx_prepared_status::OK,
+              registry.snapshot(request.tokens[1], &snapshot));
+    EXPECT_EQ(Preserve_trx_prepared_token_state::CLEANUP_TAINTED,
+              snapshot.state);
+    EXPECT_EQ(2U, registry.discard_all_for_process_shutdown());
+    EXPECT_EQ(0U, preserve_trx_memory_current_bytes_status());
+  }
 }
 
 TEST_F(PreserveSnapshotTest,
@@ -10510,80 +10524,6 @@ TEST_F(PreserveSnapshotTest,
       nullptr);
   preserved_trx_set_strict_physical_adopt_executor_for_unit_test(nullptr);
 }
-
-#ifndef NDEBUG
-TEST_F(PreserveSnapshotTest,
-       StrictPhysicalFenceFinalIntentFailureTaintsAdoptedToken) {
-  preserve_trx_set_enable_value(true);
-  preserve_trx_resource_manager_reset_for_unit_test();
-  auto proof = make_test_physical_fence_proof(
-      Preserve_trx_physical_consistency_mode::
-          TEST_ONLY_PHYSICAL_FENCE_SIMULATOR);
-  Preserve_trx_physical_fence_provider_ops ops;
-  ops.consistency_mode = proof.consistency_mode;
-  ops.acquire = test_physical_fence_acquire;
-  ops.revalidate = test_physical_fence_revalidate;
-  ops.release = test_physical_fence_release;
-  preserved_trx_set_physical_fence_provider_for_unit_test(&ops);
-  preserved_trx_set_strict_physical_adopt_executor_for_unit_test(
-      strict_adopt_success_for_test);
-
-  Preserve_trx_physical_promotion_gate_request request;
-  request.epoch_id = "strict-final-intent-failure";
-  request.operation_deadline_us = my_micro_time() + 1000000;
-  auto key = make_prepared_token_key(1);
-  key.preserve_dir = m_dir;
-  key.epoch_scope = proof.source_lineage_uuid;
-  key.epoch_id = request.epoch_id;
-  key.token = "121";
-  key.target_boot_incarnation = proof.target_boot_incarnation;
-  request.tokens.push_back(key);
-
-  auto facts = make_final_token_facts(proof.source_fence_lsn);
-  facts.epoch_fact_digest = proof.epoch_fact_digest;
-  facts.final_lock_generation_digest =
-      proof.final_lock_generation_digest;
-  facts.page_layout_digest = proof.page_layout_digest;
-  facts.dictionary_generation_digest =
-      proof.dictionary_generation_digest;
-  facts.target_boot_incarnation = proof.target_boot_incarnation;
-  facts.canonical_digest.clear();
-  ASSERT_TRUE(preserved_trx_finalize_token_facts(&facts));
-  ASSERT_TRUE(preserved_trx_compute_epoch_physical_digest_commitments(
-      {{key.token, key.generation, facts.final_lock_generation_digest,
-        facts.page_layout_digest, facts.dictionary_generation_digest}},
-      &proof.final_lock_generation_digest, &proof.page_layout_digest,
-      &proof.dictionary_generation_digest));
-  request.expected_fence = proof;
-
-  auto &registry = preserved_trx_strict_prepared_token_registry();
-  registry.purge_epoch(key.epoch_scope, key.epoch_id);
-  Preserve_trx_prepare_lease prepare;
-  ASSERT_EQ(Preserve_trx_prepared_status::OK,
-            registry.begin_prepare(key, key.generation, &prepare));
-  ASSERT_EQ(Preserve_trx_prepared_status::OK,
-            registry.publish_ready(&prepare, facts,
-                                   acquire_strict_prepared_resources(
-                                       key, proof.source_fence_lsn)));
-
-  DBUG_SET("+d,preserve_trx_fail_write_final_strict_promotion_intent_epoch");
-  Preserve_trx_physical_promotion_gate_result result;
-  EXPECT_EQ(Preserve_trx_physical_promotion_gate_status::CLEANUP_TAINTED,
-            preserved_trx_adopt_ready_epoch_for_physical_promotion_for_unit_test(
-                m_dir, request, &result));
-  DBUG_SET("-d,preserve_trx_fail_write_final_strict_promotion_intent_epoch");
-  EXPECT_EQ(0U, result.adopted_count);
-  EXPECT_EQ(1U, result.tainted_count);
-  Preserve_trx_prepared_token_snapshot snapshot;
-  ASSERT_EQ(Preserve_trx_prepared_status::OK,
-            registry.snapshot(key, &snapshot));
-  EXPECT_EQ(Preserve_trx_prepared_token_state::CLEANUP_TAINTED,
-            snapshot.state);
-
-  preserved_trx_set_strict_physical_adopt_executor_for_unit_test(nullptr);
-  preserved_trx_set_physical_fence_provider_for_unit_test(nullptr);
-}
-#endif
 
 TEST_F(PreserveSnapshotTest, StrictPhysicalFenceUsesRequestedWorkers) {
   preserve_trx_set_enable_value(true);

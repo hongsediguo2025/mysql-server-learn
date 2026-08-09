@@ -175,15 +175,12 @@ uint64_t prepared_monotonic_us() {
           .count());
 }
 
-constexpr char kStrictPromotionIntentProductV1Magic[] =
-    "PTRX_STRICT_PROMOTION_INTENT_EPOCH_PRODUCT_V1";
 constexpr char kStrictAttachIntentProductV1Magic[] =
     "PTRX_STRICT_PROMOTION_ATTACH_INTENT_PRODUCT_V1";
-constexpr size_t kStrictPromotionIntentDigestHexLength =
-    SHA256_DIGEST_LENGTH * 2;
-constexpr size_t kStrictPromotionIntentMaxBytes = 64U * 1024U * 1024U;
-constexpr uint32_t kStrictPromotionIntentMaxTokens = 1000000;
-constexpr uint32_t kStrictPromotionIntentMaxStringBytes = 4096;
+constexpr size_t kStrictAttachIntentDigestHexLength = SHA256_DIGEST_LENGTH * 2;
+constexpr size_t kStrictAttachIntentMaxBytes = 64U * 1024U * 1024U;
+constexpr uint32_t kStrictEpochMaxTokens = 1000000;
+constexpr uint32_t kStrictAttachIntentMaxStringBytes = 4096;
 
 constexpr std::array<uint64_t, 20> kResumeCoreHistogramUpperBoundsUs{{
     10,
@@ -427,34 +424,13 @@ bool read_canonical_string(const std::string &encoded, size_t *offset,
                            std::string *value) {
   uint32_t length = 0;
   if (value == nullptr || !read_canonical_u32(encoded, offset, &length) ||
-      length == 0 || length > kStrictPromotionIntentMaxStringBytes ||
+      length == 0 || length > kStrictAttachIntentMaxStringBytes ||
       encoded.size() - std::min(*offset, encoded.size()) < length) {
     return false;
   }
   value->assign(encoded.data() + *offset, length);
   *offset += length;
   return true;
-}
-
-bool strict_intent_state_is_valid(
-    Preserve_trx_strict_promotion_intent_state state) {
-  switch (state) {
-    case Preserve_trx_strict_promotion_intent_state::ADOPTING:
-    case Preserve_trx_strict_promotion_intent_state::ADOPTED_LOCKED:
-    case Preserve_trx_strict_promotion_intent_state::ABANDONED_ROLLED_BACK:
-    case Preserve_trx_strict_promotion_intent_state::
-        ABANDONED_NOT_FOUND_PROVEN:
-    case Preserve_trx_strict_promotion_intent_state::CLEANUP_TAINTED:
-      return true;
-  }
-  return false;
-}
-
-bool strict_intent_token_is_valid(
-    const Preserve_trx_strict_promotion_intent_token &token) {
-  return !token.token.empty() &&
-         token.token.size() <= kStrictPromotionIntentMaxStringBytes &&
-         token.generation != 0 && strict_intent_state_is_valid(token.state);
 }
 
 bool strict_attach_intent_state_is_valid(
@@ -477,7 +453,7 @@ bool strict_attach_intent_is_valid(
     const Preserve_trx_strict_attach_intent &intent) {
   const auto string_is_valid = [](const std::string &value) {
     return !value.empty() &&
-           value.size() <= kStrictPromotionIntentMaxStringBytes;
+           value.size() <= kStrictAttachIntentMaxStringBytes;
   };
   return prepared_token_key_is_valid(intent.key) &&
          string_is_valid(intent.key.preserve_dir) &&
@@ -607,7 +583,7 @@ bool preserved_trx_compute_epoch_physical_digest_commitments(
     std::string *final_lock_generation_digest,
     std::string *page_layout_digest,
     std::string *dictionary_generation_digest) {
-  if (inputs.empty() || inputs.size() > kStrictPromotionIntentMaxTokens ||
+  if (inputs.empty() || inputs.size() > kStrictEpochMaxTokens ||
       final_lock_generation_digest == nullptr ||
       page_layout_digest == nullptr ||
       dictionary_generation_digest == nullptr) {
@@ -809,164 +785,6 @@ bool preserved_trx_physical_fence_proof_is_valid(
          proof.apply_frozen && proof.implicit_native_continuity_proven;
 }
 
-bool preserved_trx_encode_strict_promotion_intent_v1(
-    const Preserve_trx_strict_promotion_intent_epoch &marker,
-    std::string *encoded) {
-  if (encoded == nullptr || marker.epoch_id.empty() ||
-      marker.epoch_id.size() > kStrictPromotionIntentMaxStringBytes ||
-      marker.generated_at_us == 0 || marker.tokens.empty() ||
-      marker.tokens.size() > kStrictPromotionIntentMaxTokens ||
-      !preserved_trx_physical_fence_proof_is_valid(marker.physical_fence)) {
-    return false;
-  }
-  std::vector<Preserve_trx_strict_promotion_intent_token> tokens =
-      marker.tokens;
-  std::sort(tokens.begin(), tokens.end(),
-            [](const Preserve_trx_strict_promotion_intent_token &left,
-               const Preserve_trx_strict_promotion_intent_token &right) {
-              return left.token < right.token;
-            });
-  for (size_t i = 0; i < tokens.size(); ++i) {
-    if (!strict_intent_token_is_valid(tokens[i]) ||
-        (i != 0 && tokens[i - 1].token == tokens[i].token)) {
-      return false;
-    }
-  }
-
-  std::string body(kStrictPromotionIntentProductV1Magic,
-                   sizeof(kStrictPromotionIntentProductV1Magic) - 1);
-  body.push_back(static_cast<char>(marker.physical_fence.consistency_mode));
-  if (!append_canonical_string(&body, marker.epoch_id) ||
-      !append_canonical_string(&body,
-                               marker.physical_fence.source_lineage_uuid) ||
-      !append_canonical_string(&body,
-                               marker.physical_fence.target_server_uuid) ||
-      !append_canonical_string(
-          &body, marker.physical_fence.target_boot_incarnation)) {
-    return false;
-  }
-  append_canonical_u64(&body, marker.physical_fence.provider_generation);
-  append_canonical_u64(&body, marker.physical_fence.source_fence_lsn);
-  append_canonical_u64(&body, marker.physical_fence.target_frozen_lsn);
-  if (!append_canonical_string(&body,
-                               marker.physical_fence.epoch_fact_digest) ||
-      !append_canonical_string(
-          &body, marker.physical_fence.final_lock_generation_digest) ||
-      !append_canonical_string(&body,
-                               marker.physical_fence.page_layout_digest) ||
-      !append_canonical_string(
-          &body, marker.physical_fence.dictionary_generation_digest)) {
-    return false;
-  }
-  append_canonical_bool(&body, marker.physical_fence.apply_frozen);
-  append_canonical_bool(
-      &body, marker.physical_fence.implicit_native_continuity_proven);
-  append_canonical_u64(&body, marker.generated_at_us);
-  append_canonical_u32(&body, static_cast<uint32_t>(tokens.size()));
-  for (const auto &token : tokens) {
-    if (!append_canonical_string(&body, token.token)) return false;
-    append_canonical_u64(&body, token.generation);
-    body.push_back(static_cast<char>(token.state));
-  }
-  if (body.size() >
-      kStrictPromotionIntentMaxBytes - kStrictPromotionIntentDigestHexLength) {
-    return false;
-  }
-  *encoded = body;
-  encoded->append(sha256_hex_string(body));
-  return true;
-}
-
-bool preserved_trx_decode_strict_promotion_intent_v1(
-    const std::string &encoded,
-    Preserve_trx_strict_promotion_intent_epoch *marker) {
-  constexpr size_t kMagicLength =
-      sizeof(kStrictPromotionIntentProductV1Magic) - 1;
-  if (marker == nullptr ||
-      encoded.size() <= kMagicLength + kStrictPromotionIntentDigestHexLength ||
-      encoded.size() > kStrictPromotionIntentMaxBytes) {
-    return false;
-  }
-  const size_t body_length =
-      encoded.size() - kStrictPromotionIntentDigestHexLength;
-  const std::string body = encoded.substr(0, body_length);
-  if (body.compare(0, kMagicLength,
-                   kStrictPromotionIntentProductV1Magic) != 0 ||
-      encoded.compare(body_length, kStrictPromotionIntentDigestHexLength,
-                      sha256_hex_string(body)) != 0) {
-    return false;
-  }
-
-  Preserve_trx_strict_promotion_intent_epoch parsed;
-  size_t offset = kMagicLength;
-  uint8_t mode = 0;
-  uint8_t apply_frozen = 0;
-  uint8_t implicit_native_continuity_proven = 0;
-  uint32_t token_count = 0;
-  if (!read_canonical_u8(body, &offset, &mode) ||
-      !read_canonical_string(body, &offset, &parsed.epoch_id) ||
-      !read_canonical_string(
-          body, &offset, &parsed.physical_fence.source_lineage_uuid) ||
-      !read_canonical_string(
-          body, &offset, &parsed.physical_fence.target_server_uuid) ||
-      !read_canonical_string(
-          body, &offset, &parsed.physical_fence.target_boot_incarnation) ||
-      !read_canonical_u64(
-          body, &offset, &parsed.physical_fence.provider_generation) ||
-      !read_canonical_u64(body, &offset,
-                          &parsed.physical_fence.source_fence_lsn) ||
-      !read_canonical_u64(body, &offset,
-                          &parsed.physical_fence.target_frozen_lsn) ||
-      !read_canonical_string(body, &offset,
-                             &parsed.physical_fence.epoch_fact_digest) ||
-      !read_canonical_string(
-          body, &offset,
-          &parsed.physical_fence.final_lock_generation_digest) ||
-      !read_canonical_string(body, &offset,
-                             &parsed.physical_fence.page_layout_digest) ||
-      !read_canonical_string(
-          body, &offset,
-          &parsed.physical_fence.dictionary_generation_digest) ||
-      !read_canonical_u8(body, &offset, &apply_frozen) ||
-      !read_canonical_u8(body, &offset,
-                         &implicit_native_continuity_proven) ||
-      !read_canonical_u64(body, &offset, &parsed.generated_at_us) ||
-      !read_canonical_u32(body, &offset, &token_count) || token_count == 0 ||
-      token_count > kStrictPromotionIntentMaxTokens) {
-    return false;
-  }
-  parsed.physical_fence.consistency_mode =
-      static_cast<Preserve_trx_physical_consistency_mode>(mode);
-  if (apply_frozen > 1 || implicit_native_continuity_proven > 1) return false;
-  parsed.physical_fence.apply_frozen = apply_frozen != 0;
-  parsed.physical_fence.implicit_native_continuity_proven =
-      implicit_native_continuity_proven != 0;
-  parsed.tokens.reserve(token_count);
-  for (uint32_t i = 0; i < token_count; ++i) {
-    Preserve_trx_strict_promotion_intent_token token;
-    uint8_t state = 0;
-    if (!read_canonical_string(body, &offset, &token.token) ||
-        !read_canonical_u64(body, &offset, &token.generation) ||
-        !read_canonical_u8(body, &offset, &state)) {
-      return false;
-    }
-    token.state =
-        static_cast<Preserve_trx_strict_promotion_intent_state>(state);
-    if (!strict_intent_token_is_valid(token) ||
-        (!parsed.tokens.empty() &&
-         parsed.tokens.back().token >= token.token)) {
-      return false;
-    }
-    parsed.tokens.push_back(std::move(token));
-  }
-  if (offset != body.size() || parsed.generated_at_us == 0 ||
-      !preserved_trx_physical_fence_proof_is_valid(parsed.physical_fence)) {
-    return false;
-  }
-  *marker = std::move(parsed);
-  return true;
-}
-
 bool preserved_trx_encode_strict_attach_intent_v1(
     const Preserve_trx_strict_attach_intent &intent, std::string *encoded) {
   if (encoded == nullptr || !strict_attach_intent_is_valid(intent)) {
@@ -987,7 +805,7 @@ bool preserved_trx_encode_strict_attach_intent_v1(
   append_canonical_u64(&body, intent.target_connection_id);
   append_canonical_u64(&body, intent.generated_at_us);
   if (body.size() >
-      kStrictPromotionIntentMaxBytes - kStrictPromotionIntentDigestHexLength) {
+      kStrictAttachIntentMaxBytes - kStrictAttachIntentDigestHexLength) {
     return false;
   }
   *encoded = body;
@@ -1000,15 +818,15 @@ bool preserved_trx_decode_strict_attach_intent_v1(
   constexpr size_t kMagicLength =
       sizeof(kStrictAttachIntentProductV1Magic) - 1;
   if (intent == nullptr ||
-      encoded.size() <= kMagicLength + kStrictPromotionIntentDigestHexLength ||
-      encoded.size() > kStrictPromotionIntentMaxBytes) {
+      encoded.size() <= kMagicLength + kStrictAttachIntentDigestHexLength ||
+      encoded.size() > kStrictAttachIntentMaxBytes) {
     return false;
   }
   const size_t body_length =
-      encoded.size() - kStrictPromotionIntentDigestHexLength;
+      encoded.size() - kStrictAttachIntentDigestHexLength;
   const std::string body = encoded.substr(0, body_length);
   if (body.compare(0, kMagicLength, kStrictAttachIntentProductV1Magic) != 0 ||
-      encoded.compare(body_length, kStrictPromotionIntentDigestHexLength,
+      encoded.compare(body_length, kStrictAttachIntentDigestHexLength,
                       sha256_hex_string(body)) != 0) {
     return false;
   }

@@ -722,15 +722,6 @@ bool intent_marker_tokens_from_payload(const std::vector<unsigned char> &bytes,
                                        std::set<std::string> *tokens) {
   if (tokens == nullptr) return false;
   const std::string encoded(bytes.begin(), bytes.end());
-  Preserve_trx_strict_promotion_intent_epoch strict_intent;
-  if (preserved_trx_decode_strict_promotion_intent_v1(encoded,
-                                                       &strict_intent)) {
-    for (const Preserve_trx_strict_promotion_intent_token &token :
-         strict_intent.tokens) {
-      tokens->insert(token.token);
-    }
-    return !tokens->empty();
-  }
   Preserve_trx_strict_attach_intent attach_intent;
   if (preserved_trx_decode_strict_attach_intent_v1(encoded,
                                                     &attach_intent)) {

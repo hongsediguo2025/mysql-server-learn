@@ -320,7 +320,6 @@ enum class Preserve_trx_physical_promotion_gate_status : uint8_t {
   PHYSICAL_FENCE_NOT_AVAILABLE,
   PHYSICAL_FENCE_MISMATCH,
   REGISTRY_NOT_READY,
-  INTENT_IO_ERROR,
   ADOPT_FAILED,
   CLEANUP_TAINTED
 };

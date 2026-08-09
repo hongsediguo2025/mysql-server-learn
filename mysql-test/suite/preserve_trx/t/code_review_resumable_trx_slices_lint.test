@@ -233,16 +233,25 @@ die "resurrection index v1 must bind the complete snapshot digest without an XID
   unless $resurrection_index_header =~ /snapshot_digest/s &&
          $preserve =~ /read_snapshot_payload_digest/s &&
          $preserve !~ /preserve_trx_hmac_hex|preserve_trx_xid_codec_context|xid_provenance/is;
-die "lock-plan and promotion intent contracts must use independent product-v1 domains\n"
+die "lock-plan and strict attach intent contracts must use independent product-v1 domains\n"
   unless $bundle_header =~
            /kPreservedTrxLockPlanContractVersion\s*=\s*1/s &&
          $sql_lock_warmcopy =~ /PRESERVE_LOCK_PLAN_LIVE_PRODUCT_V1/s &&
          $promotion_prepared =~
-           /PTRX_STRICT_PROMOTION_INTENT_EPOCH_PRODUCT_V1/s &&
-         $promotion_prepared =~
            /PTRX_STRICT_PROMOTION_ATTACH_INTENT_PRODUCT_V1/s &&
          $promotion_prepared !~
-           /PTRX_STRICT_PROMOTION_INTENT_EPOCH_V2|PTRX_STRICT_PROMOTION_ATTACH_INTENT_V1/s;
+           /PTRX_STRICT_PROMOTION_ATTACH_INTENT_V1/s;
+die "simulator strict promotion intent must not remain in production sources\n"
+  if $promotion =~
+       /write_strict_promotion_intent|preserve_trx_fail_write_final_strict_promotion_intent_epoch/s ||
+     $promotion_prepared =~
+       /PTRX_STRICT_PROMOTION_INTENT_EPOCH_PRODUCT_V1|preserved_trx_(?:encode|decode)_strict_promotion_intent_v1/s ||
+     $promotion_prepared_header =~
+       /Preserve_trx_strict_promotion_intent|preserved_trx_(?:encode|decode)_strict_promotion_intent_v1/s ||
+     $carrier_file =~ /preserved_trx_decode_strict_promotion_intent_v1/s;
+die "physical promotion gate must not expose an unreachable intent I/O status\n"
+  if $promotion_header =~
+       /enum\s+class\s+Preserve_trx_physical_promotion_gate_status[\s\S]{0,500}\bINTENT_IO_ERROR\b/s;
 my ($decode_object_descriptor) =
   $transfer =~ /(Preserve_trx_transfer_status decode_transfer_object_descriptor\([\s\S]*?^})/m
   or die "could not isolate transfer object descriptor decoder\n";
@@ -3021,8 +3030,6 @@ die "process-local promotion markers must defer file and directory fsync\n"
          /write_promotion_abandoned_epoch[\s\S]{0,900}m_write_options/s &&
          $carrier_file =~
          /write_promotion_intent_epoch[\s\S]{0,900}m_write_options/s &&
-         $promotion =~
-         /adopt_ready_epoch_for_physical_promotion_impl[\s\S]{0,9000}create_preserved_trx_process_local_store/s &&
          $preserve =~
          /write_strict_attach_intent[\s\S]{0,1800}create_preserved_trx_process_local_store/s;
 $carrier_file =~
@@ -3071,6 +3078,9 @@ my $strict_physical_promotion_gate = $&;
 die "strict physical promotion must be bound to current-process prepared facts and boot incarnation\n"
   unless $strict_physical_promotion_gate =~
              /target_boot_incarnation[\s\S]*preserved_trx_strict_prepared_token_registry[\s\S]*registry\.snapshot/s;
+die "strict physical promotion gate must not persist simulator intent files\n"
+  if $strict_physical_promotion_gate =~
+       /create_preserved_trx_process_local_store|write_promotion_intent_epoch|Preserve_trx_strict_promotion_intent/s;
 $promotion =~
   /bool\s+strict_prepared_snapshot_matches_accepted_epoch\s*\([^\{]*\)\s*\{([\s\S]*?)^}/m
   or die "could not isolate accepted-epoch prepared-token predicate\n";
@@ -3097,29 +3107,32 @@ die "physical promotion pre-init GTID gate must follow READY classification and 
          $promotion_preinit_gtid_gate > $promotion_preinit_classification &&
          $promotion_preinit_pin > $promotion_preinit_gtid_gate &&
          $promotion_preinit_candidate_registration > $promotion_preinit_pin;
-my $promotion_adopt_start =
-  index($promotion, 'adopt_ready_epoch_for_physical_promotion_impl(');
-my $promotion_adopt_snapshot = $promotion_adopt_start < 0 ? -1 :
-  index($promotion, 'registry.snapshot(', $promotion_adopt_start);
+my $promotion_adopt_snapshot =
+  index($strict_physical_promotion_gate, 'registry.snapshot(');
 my $promotion_adopt_accepted_predicate = $promotion_adopt_snapshot < 0 ? -1 :
-  index($promotion, 'strict_prepared_snapshot_matches_accepted_epoch(',
+  index($strict_physical_promotion_gate,
+        'strict_prepared_snapshot_matches_accepted_epoch(',
         $promotion_adopt_snapshot);
 my $promotion_adopt_mark_ready =
   $promotion_adopt_accepted_predicate < 0 ? -1 :
-  index($promotion, 'registry.mark_ready_for_gate(',
+  index($strict_physical_promotion_gate, 'registry.mark_ready_for_gate(',
         $promotion_adopt_accepted_predicate);
-my $promotion_adopt_intent = $promotion_adopt_mark_ready < 0 ? -1 :
-  index($promotion, 'write_strict_promotion_intent(',
+my $promotion_adopt_begin = $promotion_adopt_mark_ready < 0 ? -1 :
+  index($strict_physical_promotion_gate, 'registry.begin_gate_adopt(',
         $promotion_adopt_mark_ready);
-my $promotion_adopt_begin = $promotion_adopt_intent < 0 ? -1 :
-  index($promotion, 'registry.begin_gate_adopt(', $promotion_adopt_intent);
-die "physical promotion post-trx_sys GTID gate must stay in the snapshot loop before ready, intent, and adopt\n"
-  unless $promotion_adopt_start >= 0 &&
-         $promotion_adopt_snapshot > $promotion_adopt_start &&
+my $promotion_adopt_commit = $promotion_adopt_begin < 0 ? -1 :
+  index($strict_physical_promotion_gate, 'registry.commit_gate_adopt(',
+        $promotion_adopt_begin);
+my $promotion_adopt_abort = $promotion_adopt_begin < 0 ? -1 :
+  index($strict_physical_promotion_gate, 'registry.abort_gate_adopt(',
+        $promotion_adopt_begin);
+die "physical promotion post-trx_sys gate must preserve snapshot, ready, adopt and terminal ordering\n"
+  unless $promotion_adopt_snapshot >= 0 &&
          $promotion_adopt_accepted_predicate > $promotion_adopt_snapshot &&
          $promotion_adopt_mark_ready > $promotion_adopt_accepted_predicate &&
-         $promotion_adopt_intent > $promotion_adopt_mark_ready &&
-         $promotion_adopt_begin > $promotion_adopt_intent;
+         $promotion_adopt_begin > $promotion_adopt_mark_ready &&
+         $promotion_adopt_commit > $promotion_adopt_begin &&
+         $promotion_adopt_abort > $promotion_adopt_begin;
 $transfer =~
   /Preserve_trx_transfer_strict_eligibility_status\s+preserve_trx_transfer_validate_strict_eligibility\s*\([\s\S]*?^}/m
   or die "could not isolate strict transfer eligibility validation\n";
