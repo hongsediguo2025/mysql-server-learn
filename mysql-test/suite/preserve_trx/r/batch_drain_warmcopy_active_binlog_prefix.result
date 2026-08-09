@@ -5,9 +5,11 @@ WHERE VARIABLE_NAME=
 'Preserve_trx_recv_binlog_obj_prewarm_first_start_us';
 active_binlog_prefix_streamed_before_command_boundary
 1
+include/wait_for_pattern_in_file.inc [PRESERVE: drain-owned active binlog mirror rebuild target=[0-9]+ prepared=1]
 include/assert_grep.inc [quiesced target closed on a final or already-published receiver high watermark]
 include/assert_grep.inc [quiesced final high watermark joined the coordinator batch]
+include/assert_grep.inc [final HWM admission overlapped local Preserve]
 include/assert_grep.inc [contiguous active binlog appends did not exhaust the pending range limit]
 ERROR HY000: DRAIN TRANSACTIONS PRESERVE was reset before shutdown handoff
 row_count	value_sum	min_payload_bytes	max_payload_bytes
-865	1281	4096	4096
+433	849	4096	4096

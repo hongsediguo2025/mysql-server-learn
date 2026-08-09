@@ -454,6 +454,8 @@ class Preserve_trx_lock_warmcopy_drain_participant final
   bool build_phase1_record_blob_for_target(uint64_t thread_id,
                                            Target_session *target,
                                            const std::string &payload);
+  void discard_phase1_record_blobs(
+      const std::vector<Target_session *> &targets);
   void discard_phase1_record_blob(Target_session *target);
   void clear_record_stores_for_targets();
 };

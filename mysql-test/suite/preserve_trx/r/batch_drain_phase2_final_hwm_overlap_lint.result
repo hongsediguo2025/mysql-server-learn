@@ -1,0 +1,4 @@
+# Source-shape guard for Phase2 final-HWM/local-Preserve overlap.
+SELECT 'ok' AS batch_drain_phase2_final_hwm_overlap_lint;
+batch_drain_phase2_final_hwm_overlap_lint
+ok

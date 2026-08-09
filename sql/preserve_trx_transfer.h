@@ -1717,7 +1717,9 @@ preserve_trx_transfer_stage_deferred_candidate_external_objects(
     Preserve_trx_transfer_source_epoch_session *session,
     const std::string &preserve_dir,
     Preserve_trx_deferred_transfer_candidate *candidate,
-    Preserve_trx_transfer_phase1_batch_sender *batch_sender = nullptr);
+    Preserve_trx_transfer_phase1_batch_sender *batch_sender = nullptr,
+    const Preserve_trx_transfer_object_descriptor
+        *pending_final_binlog_descriptor = nullptr);
 
 Preserve_trx_transfer_status
 preserve_trx_transfer_replace_deferred_candidate_record_locks(

@@ -847,6 +847,7 @@ class Preserve_trx_transfer_phase1_batch_sender::Impl {
   void abort() {
     if (!m_batching_enabled) return;
     std::lock_guard<std::mutex> guard(m_mutex);
+    m_status = Preserve_trx_transfer_status::UNSUPPORTED;
     m_stop = true;
     m_queue.clear();
     m_queued_bytes = 0;
@@ -12175,6 +12176,9 @@ Preserve_trx_transfer_source_epoch_session::stream_prebuilt_blobs_batch(
   std::map<uint64_t,
            std::map<std::string, Preserve_trx_transfer_object_descriptor>>
       projected_declared_objects;
+  std::map<uint64_t, std::map<std::string, uint64_t>>
+      projected_written_bytes;
+  std::map<uint64_t, std::set<std::string>> projected_sealed_objects;
   const uint64_t first_sequence = m_next_sequence;
   uint64_t acknowledged_next_sequence = first_sequence;
   auto sequence_guard = create_scope_guard([&] {
@@ -12259,27 +12263,58 @@ Preserve_trx_transfer_source_epoch_session::stream_prebuilt_blobs_batch(
                  .c_str());
       return Preserve_trx_transfer_status::UNSUPPORTED;
     }
-    bool already_presealed = false;
-    const auto declared_token =
-        m_streaming_declared_objects.find(transfer_token);
-    if (declared_token != m_streaming_declared_objects.end()) {
-      const auto declared_object =
-          declared_token->second.find(prepared.descriptor.object_id);
-      const auto sealed_token = m_streaming_sealed_objects.find(transfer_token);
-      const auto written_token =
-          m_streaming_object_written_bytes.find(transfer_token);
-      if (declared_object != declared_token->second.end() &&
-          transfer_object_descriptor_equal(declared_object->second,
-                                           prepared.descriptor) &&
-          sealed_token != m_streaming_sealed_objects.end() &&
-          sealed_token->second.count(prepared.descriptor.object_id) != 0 &&
-          written_token != m_streaming_object_written_bytes.end()) {
-        const auto written_object =
-            written_token->second.find(prepared.descriptor.object_id);
-        already_presealed =
-            written_object != written_token->second.end() &&
-            written_object->second == prepared.descriptor.total_size;
+
+    auto projected = projected_declared_objects.find(transfer_token);
+    if (projected == projected_declared_objects.end()) {
+      std::map<std::string, Preserve_trx_transfer_object_descriptor> objects;
+      const auto existing =
+          m_streaming_declared_objects.find(transfer_token);
+      if (existing != m_streaming_declared_objects.end()) {
+        objects = existing->second;
       }
+      projected =
+          projected_declared_objects
+              .emplace(transfer_token, std::move(objects))
+              .first;
+    }
+    auto projected_written = projected_written_bytes.find(transfer_token);
+    if (projected_written == projected_written_bytes.end()) {
+      std::map<std::string, uint64_t> written;
+      const auto existing =
+          m_streaming_object_written_bytes.find(transfer_token);
+      if (existing != m_streaming_object_written_bytes.end()) {
+        written = existing->second;
+      }
+      projected_written =
+          projected_written_bytes
+              .emplace(transfer_token, std::move(written))
+              .first;
+    }
+    auto projected_sealed = projected_sealed_objects.find(transfer_token);
+    if (projected_sealed == projected_sealed_objects.end()) {
+      std::set<std::string> sealed;
+      const auto existing = m_streaming_sealed_objects.find(transfer_token);
+      if (existing != m_streaming_sealed_objects.end()) {
+        sealed = existing->second;
+      }
+      projected_sealed =
+          projected_sealed_objects
+              .emplace(transfer_token, std::move(sealed))
+              .first;
+    }
+
+    bool already_presealed = false;
+    const auto declared_object =
+        projected->second.find(prepared.descriptor.object_id);
+    if (declared_object != projected->second.end() &&
+        transfer_object_descriptor_equal(declared_object->second,
+                                           prepared.descriptor) &&
+        projected_sealed->second.count(prepared.descriptor.object_id) != 0) {
+      const auto written_object =
+          projected_written->second.find(prepared.descriptor.object_id);
+      already_presealed =
+          written_object != projected_written->second.end() &&
+          written_object->second == prepared.descriptor.total_size;
     }
     if (already_presealed) continue;
     if (prepared.payload_offset != 0) {
@@ -12289,25 +12324,17 @@ Preserve_trx_transfer_source_epoch_session::stream_prebuilt_blobs_batch(
       prefix_descriptor.digest =
           prepared.request.preserved_prefix_digest;
       bool prefix_presealed = false;
-      if (declared_token != m_streaming_declared_objects.end()) {
-        const auto declared_object =
-            declared_token->second.find(prefix_descriptor.object_id);
-        const auto sealed_token =
-            m_streaming_sealed_objects.find(transfer_token);
-        const auto written_token =
-            m_streaming_object_written_bytes.find(transfer_token);
-        if (declared_object != declared_token->second.end() &&
-            transfer_object_descriptor_equal(declared_object->second,
+      const auto prefix_object =
+          projected->second.find(prefix_descriptor.object_id);
+      if (prefix_object != projected->second.end() &&
+          transfer_object_descriptor_equal(prefix_object->second,
                                              prefix_descriptor) &&
-            sealed_token != m_streaming_sealed_objects.end() &&
-            sealed_token->second.count(prefix_descriptor.object_id) != 0 &&
-            written_token != m_streaming_object_written_bytes.end()) {
-          const auto written_object =
-              written_token->second.find(prefix_descriptor.object_id);
-          prefix_presealed =
-              written_object != written_token->second.end() &&
-              written_object->second == prefix_descriptor.total_size;
-        }
+          projected_sealed->second.count(prefix_descriptor.object_id) != 0) {
+        const auto written_object =
+            projected_written->second.find(prefix_descriptor.object_id);
+        prefix_presealed =
+            written_object != projected_written->second.end() &&
+            written_object->second == prefix_descriptor.total_size;
       }
       if (!prefix_presealed) {
         return Preserve_trx_transfer_status::CORRUPT;
@@ -12339,19 +12366,6 @@ Preserve_trx_transfer_source_epoch_session::stream_prebuilt_blobs_batch(
         append_encoded_frame(transfer_token, std::move(encoded_declare));
     if (status != Preserve_trx_transfer_status::OK) return status;
 
-    auto projected = projected_declared_objects.find(transfer_token);
-    if (projected == projected_declared_objects.end()) {
-      std::map<std::string, Preserve_trx_transfer_object_descriptor> objects;
-      const auto existing =
-          m_streaming_declared_objects.find(transfer_token);
-      if (existing != m_streaming_declared_objects.end()) {
-        objects = existing->second;
-      }
-      projected =
-          projected_declared_objects
-              .emplace(transfer_token, std::move(objects))
-              .first;
-    }
     projected->second[prepared.descriptor.object_id] = prepared.descriptor;
 
     const bool record_lock_object =
@@ -12472,6 +12486,9 @@ Preserve_trx_transfer_source_epoch_session::stream_prebuilt_blobs_batch(
     if (status != Preserve_trx_transfer_status::OK) return status;
     status = append_encoded_frame(transfer_token, std::move(encoded_seal));
     if (status != Preserve_trx_transfer_status::OK) return status;
+    projected_written->second[prepared.descriptor.object_id] =
+        prepared.descriptor.total_size;
+    projected_sealed->second.insert(prepared.descriptor.object_id);
     sent_request_indexes.push_back(request_index);
   }
   if (sent_request_indexes.empty()) {
@@ -12606,14 +12623,50 @@ preserve_trx_transfer_stage_deferred_candidate_external_objects(
     Preserve_trx_transfer_source_epoch_session *session,
     const std::string &preserve_dir,
     Preserve_trx_deferred_transfer_candidate *candidate,
-    Preserve_trx_transfer_phase1_batch_sender *batch_sender) {
+    Preserve_trx_transfer_phase1_batch_sender *batch_sender,
+    const Preserve_trx_transfer_object_descriptor
+        *pending_final_binlog_descriptor) {
   if (session == nullptr || candidate == nullptr || !candidate->captured ||
       candidate->finalized || candidate->transfer_token == 0 ||
       candidate->epoch_id != session->epoch_id()) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
-  if (candidate->external_objects_staged)
-    return Preserve_trx_transfer_status::OK;
+  if (candidate->external_objects_staged) {
+    return pending_final_binlog_descriptor == nullptr
+               ? Preserve_trx_transfer_status::OK
+               : Preserve_trx_transfer_status::CORRUPT;
+  }
+
+  if (pending_final_binlog_descriptor != nullptr) {
+    const auto pending_blob = std::find_if(
+        candidate->bundle.external_blobs.begin(),
+        candidate->bundle.external_blobs.end(),
+        [](const Preserved_trx_external_blob &blob) {
+          return blob.name == kPreservedTrxBlobBinlogCache;
+        });
+    if (pending_final_binlog_descriptor->object_id !=
+            kPreservedTrxBlobBinlogCache ||
+        pending_final_binlog_descriptor->kind !=
+            Preserve_trx_transfer_object_kind::EXTERNAL_BLOB ||
+        pending_blob == candidate->bundle.external_blobs.end() ||
+        std::count_if(candidate->bundle.external_blobs.begin(),
+                      candidate->bundle.external_blobs.end(),
+                      [](const Preserved_trx_external_blob &blob) {
+                        return blob.name == kPreservedTrxBlobBinlogCache;
+                      }) != 1) {
+      return Preserve_trx_transfer_status::CORRUPT;
+    }
+    const Preserve_trx_transfer_object_descriptor descriptor =
+        transfer_external_blob_descriptor(candidate->epoch_id,
+                                          candidate->transfer_token,
+                                          *pending_blob);
+    if (descriptor.object_id != pending_final_binlog_descriptor->object_id ||
+        descriptor.kind != pending_final_binlog_descriptor->kind ||
+        descriptor.total_size != pending_final_binlog_descriptor->total_size ||
+        descriptor.digest != pending_final_binlog_descriptor->digest) {
+      return Preserve_trx_transfer_status::CORRUPT;
+    }
+  }
 
   std::string binlog_seed_payload;
   Preserve_trx_transfer_object_descriptor binlog_seed_descriptor;
@@ -12645,6 +12698,10 @@ preserve_trx_transfer_stage_deferred_candidate_external_objects(
     const Preserve_trx_transfer_object_descriptor descriptor =
         transfer_external_blob_descriptor(candidate->epoch_id,
                                           candidate->transfer_token, blob);
+    if (pending_final_binlog_descriptor != nullptr &&
+        blob.name == kPreservedTrxBlobBinlogCache) {
+      continue;
+    }
     if (session->object_presealed_for_token(candidate->transfer_token,
                                             descriptor)) {
       continue;

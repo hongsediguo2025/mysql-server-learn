@@ -2378,9 +2378,12 @@ void Preserve_trx_lock_warmcopy_drain_participant::
   for (const uint64_t thread_id : m_target_thread_ids) {
     lock_warmcopy_record_store_clear_for_target(thread_id);
   }
+  std::vector<Target_session *> targets;
+  targets.reserve(m_targets.size());
   for (auto &target : m_targets) {
-    discard_phase1_record_blob(&target.second);
+    targets.push_back(&target.second);
   }
+  discard_phase1_record_blobs(targets);
   m_record_store_cleanup_deferred_for_shutdown = false;
 }
 
@@ -2572,28 +2575,39 @@ bool Preserve_trx_lock_warmcopy_drain_participant::
   return true;
 }
 
-void Preserve_trx_lock_warmcopy_drain_participant::discard_phase1_record_blob(
-    Target_session *target) {
-  if (target == nullptr) return;
-
-  if (target->has_phase1_record_prebuilt_blob &&
-      !m_options.preserve_dir.empty() &&
-      !target->phase1_record_prebuilt_blob.warmcopy_id.empty()) {
+void Preserve_trx_lock_warmcopy_drain_participant::
+    discard_phase1_record_blobs(
+        const std::vector<Target_session *> &targets) {
+  std::set<std::string> warmcopy_ids;
+  for (const Target_session *target : targets) {
+    if (target != nullptr && target->has_phase1_record_prebuilt_blob &&
+        !target->phase1_record_prebuilt_blob.warmcopy_id.empty()) {
+      warmcopy_ids.insert(target->phase1_record_prebuilt_blob.warmcopy_id);
+    }
+  }
+  if (!warmcopy_ids.empty() && !m_options.preserve_dir.empty()) {
     std::unique_ptr<Preserved_trx_warm_external_blob_carrier> carrier =
         create_preserved_trx_default_warm_external_blob_carrier(
             m_options.preserve_dir);
     if (carrier != nullptr) {
-      (void)carrier->remove_warm_external_blob(
-          target->phase1_record_prebuilt_blob.warmcopy_id,
-          target->phase1_record_prebuilt_blob.name);
+      (void)carrier->remove_warm_external_blobs(
+          warmcopy_ids, kPreservedTrxBlobRecordLocks);
     }
   }
-  target->has_phase1_record_prebuilt_blob = false;
-  target->phase1_record_prebuilt_blob = PrebuiltRecordLocksBlob{};
-  target->phase1_record_prebuilt_fence_valid = false;
-  target->phase1_record_prebuilt_fence = lock_warmcopy_record_store_fence_t{};
-  target->phase1_record_live_fence_valid = false;
-  target->phase1_record_live_fence = lock_warmcopy_trx_lock_fence_t{};
+  for (Target_session *target : targets) {
+    if (target == nullptr) continue;
+    target->has_phase1_record_prebuilt_blob = false;
+    target->phase1_record_prebuilt_blob = PrebuiltRecordLocksBlob{};
+    target->phase1_record_prebuilt_fence_valid = false;
+    target->phase1_record_prebuilt_fence = lock_warmcopy_record_store_fence_t{};
+    target->phase1_record_live_fence_valid = false;
+    target->phase1_record_live_fence = lock_warmcopy_trx_lock_fence_t{};
+  }
+}
+
+void Preserve_trx_lock_warmcopy_drain_participant::discard_phase1_record_blob(
+    Target_session *target) {
+  discard_phase1_record_blobs({target});
 }
 
 bool Preserve_trx_lock_warmcopy_drain_participant::
@@ -3009,17 +3023,24 @@ bool Preserve_trx_lock_warmcopy_drain_participant::prepare_quiesced_targets(
     their store entries and prebuilt blobs before rebuilding the target map, so
     no stale artifact can be selected by thread id reuse in a later drain.
   */
+  std::set<uint64_t> obsolete_thread_ids;
   for (const uint64_t old_thread_id : m_target_thread_ids) {
-    if (final_thread_ids.count(old_thread_id) == 0) {
-      auto old_it = m_targets.find(old_thread_id);
-      if (old_it != m_targets.end()) discard_phase1_record_blob(&old_it->second);
-      lock_warmcopy_record_store_clear_for_target(old_thread_id);
+    if (final_thread_ids.count(old_thread_id) == 0)
+      obsolete_thread_ids.insert(old_thread_id);
+  }
+  std::vector<Target_session *> obsolete_targets;
+  for (auto &target : m_targets) {
+    if (final_thread_ids.count(target.first) == 0) {
+      obsolete_thread_ids.insert(target.first);
+      obsolete_targets.push_back(&target.second);
     }
+  }
+  discard_phase1_record_blobs(obsolete_targets);
+  for (const uint64_t old_thread_id : obsolete_thread_ids) {
+    lock_warmcopy_record_store_clear_for_target(old_thread_id);
   }
   for (auto it = m_targets.begin(); it != m_targets.end();) {
     if (final_thread_ids.count(it->first) == 0) {
-      discard_phase1_record_blob(&it->second);
-      lock_warmcopy_record_store_clear_for_target(it->first);
       it = m_targets.erase(it);
     } else {
       ++it;
@@ -3267,12 +3288,23 @@ bool Preserve_trx_lock_warmcopy_drain_participant::
     Phase 1 may observe transactions that commit before CLOSING selects the
     final survivor set. Early preparation is already complete for every
     survivor, so only discard process-local state owned by non-survivors; do
-    not rebuild or clear the survivor artifacts.
+    not rebuild or clear the survivor artifacts. Batch file removal avoids one
+    directory scan and fsync per discarded token.
   */
+  std::set<uint64_t> obsolete_thread_ids;
+  std::vector<Target_session *> obsolete_targets;
   for (const uint64_t old_thread_id : m_target_thread_ids) {
-    if (completed.count(old_thread_id) != 0) continue;
-    auto old_it = m_targets.find(old_thread_id);
-    if (old_it != m_targets.end()) discard_phase1_record_blob(&old_it->second);
+    if (completed.count(old_thread_id) == 0)
+      obsolete_thread_ids.insert(old_thread_id);
+  }
+  for (auto &target : m_targets) {
+    if (completed.count(target.first) == 0) {
+      obsolete_thread_ids.insert(target.first);
+      obsolete_targets.push_back(&target.second);
+    }
+  }
+  discard_phase1_record_blobs(obsolete_targets);
+  for (const uint64_t old_thread_id : obsolete_thread_ids) {
     lock_warmcopy_record_store_clear_for_target(old_thread_id);
     m_artifacts.erase(old_thread_id);
   }

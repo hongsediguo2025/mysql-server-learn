@@ -22069,6 +22069,55 @@ TEST_F(PreserveSnapshotTest,
 }
 
 TEST_F(PreserveSnapshotTest,
+       TransferPhase1BatchAbortWakesFlushWithNonOkStatus) {
+  Blocking_phase1_transfer_batch_probe probe;
+  Preserve_trx_transfer_phase1_batch_options options;
+  options.max_batch_bytes = 100;
+  options.linger_ms = 1000;
+  options.max_inflight_bytes = 100;
+  Preserve_trx_transfer_phase1_batch_sender sender(
+      options, blocking_phase1_transfer_batch_flush, &probe);
+
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            sender.enqueue(phase1_batch_request(34, 100)));
+  {
+    std::unique_lock<std::mutex> guard(probe.mutex);
+    ASSERT_TRUE(probe.condition.wait_for(
+        guard, std::chrono::milliseconds(500),
+        [&]() { return probe.first_entered; }));
+  }
+
+  std::mutex flush_mutex;
+  std::condition_variable flush_condition;
+  bool flush_done = false;
+  Preserve_trx_transfer_status flush_status =
+      Preserve_trx_transfer_status::OK;
+  std::thread flusher([&]() {
+    const Preserve_trx_transfer_status status = sender.flush();
+    std::lock_guard<std::mutex> guard(flush_mutex);
+    flush_status = status;
+    flush_done = true;
+    flush_condition.notify_all();
+  });
+  sender.abort();
+  bool abort_woke_flush = false;
+  {
+    std::unique_lock<std::mutex> guard(flush_mutex);
+    abort_woke_flush = flush_condition.wait_for(
+        guard, std::chrono::milliseconds(500), [&]() { return flush_done; });
+  }
+
+  {
+    std::lock_guard<std::mutex> guard(probe.mutex);
+    probe.release_first = true;
+    probe.condition.notify_all();
+  }
+  flusher.join();
+  EXPECT_TRUE(abort_woke_flush);
+  EXPECT_NE(Preserve_trx_transfer_status::OK, flush_status);
+}
+
+TEST_F(PreserveSnapshotTest,
        TransferPhase1OversizeItemReturnsRetryableBackpressure) {
   Phase1_transfer_batch_probe probe;
   Preserve_trx_transfer_phase1_batch_options options;
@@ -23559,10 +23608,6 @@ TEST_F(PreserveSnapshotTest,
   middle_request.preserved_prefix_size = prefix_blob.size;
   middle_request.preserved_prefix_digest = prefix_blob.digest;
   middle_request.inline_payload = middle;
-  ASSERT_EQ(Preserve_trx_transfer_status::OK,
-            preserve_trx_transfer_stream_prebuilt_blobs_batch(
-                &session, m_dir, {middle_request}, 1024 * 1024));
-
   Preserve_trx_transfer_phase1_blob_request final_request;
   final_request.transfer_token = 837;
   final_request.object_id = prefix_blob.name;
@@ -23575,7 +23620,8 @@ TEST_F(PreserveSnapshotTest,
   final_request.inline_payload = tail;
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
             preserve_trx_transfer_stream_prebuilt_blobs_batch(
-                &session, m_dir, {final_request}, 1024 * 1024));
+                &session, m_dir, {middle_request, final_request},
+                1024 * 1024));
 
   uint64_t tail_bytes = 0;
   size_t append_declare_count = 0;
@@ -28744,6 +28790,134 @@ TEST_F(PreserveSnapshotTest,
                                                                &candidate));
   EXPECT_EQ(staged_frame_count, frame_sink.frames().size())
       << "final snapshot and manifest must remain queued until COMMIT_EPOCH";
+}
+
+TEST_F(PreserveSnapshotTest,
+       DeferredTransferSkipsExactPendingFinalBinlogDescriptor) {
+  Transfer_codec_context_guard codec_guard;
+  constexpr uint64_t kTransferToken = 7131;
+  Mysql_binlog_preserve_snapshot snapshot;
+  snapshot.cache_payload = "pending-final-binlog-cache";
+  snapshot.gtid_next = "AUTOMATIC";
+  snapshot.event_counter = 2;
+  snapshot.with_rbr = true;
+  snapshot.with_start = true;
+  snapshot.with_content = true;
+  Preserve_snapshot_metadata meta = logged_with_cache_metadata();
+  meta.token = test_transfer_token_string(kTransferToken);
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = meta;
+  input.logged_binlog_snapshot = &snapshot;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+  ASSERT_EQ(1U, bundle.external_blobs.size());
+
+  Capturing_transfer_frame_sink frame_sink;
+  Preserve_trx_transfer_source_epoch_session session(
+      "epoch-deferred-pending-final", 17, &frame_sink);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.declare_token(kTransferToken));
+  Preserve_trx_deferred_transfer_candidate candidate;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            preserve_trx_transfer_capture_deferred_candidate(
+                session.epoch_id(), kTransferToken, std::move(bundle), 300,
+                nullptr, &candidate, nullptr));
+
+  const Preserved_trx_external_blob &binlog_blob =
+      candidate.bundle.external_blobs.front();
+  Preserve_trx_transfer_object_descriptor pending_descriptor;
+  pending_descriptor.object_id = binlog_blob.name;
+  pending_descriptor.kind = Preserve_trx_transfer_object_kind::EXTERNAL_BLOB;
+  pending_descriptor.total_size = binlog_blob.payload.size();
+  pending_descriptor.digest = test_sha256(binlog_blob.payload);
+  const size_t frames_before_stage = frame_sink.frames().size();
+
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_stage_deferred_candidate_external_objects(
+                &session, m_dir, &candidate, nullptr, &pending_descriptor));
+  EXPECT_TRUE(candidate.external_objects_staged);
+  EXPECT_FALSE(
+      session.object_presealed_for_token(kTransferToken, pending_descriptor));
+
+  for (size_t index = frames_before_stage; index < frame_sink.frames().size();
+       ++index) {
+    std::vector<std::string> encoded_frames;
+    Preserve_trx_transfer_frame single;
+    if (preserve_trx_transfer_decode_frame(frame_sink.frames()[index], &single) ==
+        Preserve_trx_transfer_status::OK) {
+      encoded_frames.push_back(frame_sink.frames()[index]);
+    } else {
+      ASSERT_EQ(Preserve_trx_transfer_status::OK,
+                preserve_trx_transfer_decode_frame_batch(
+                    frame_sink.frames()[index], &encoded_frames));
+    }
+    for (const std::string &encoded_frame : encoded_frames) {
+      Preserve_trx_transfer_frame frame;
+      ASSERT_EQ(Preserve_trx_transfer_status::OK,
+                preserve_trx_transfer_decode_frame(encoded_frame, &frame));
+      EXPECT_NE(kPreservedTrxBlobBinlogCache, frame.object_id);
+    }
+  }
+}
+
+TEST_F(PreserveSnapshotTest,
+       DeferredTransferRejectsInexactPendingFinalBinlogDescriptor) {
+  Transfer_codec_context_guard codec_guard;
+  constexpr uint64_t kTransferToken = 7132;
+  Mysql_binlog_preserve_snapshot snapshot;
+  snapshot.cache_payload = "pending-final-binlog-cache-mismatch";
+  snapshot.gtid_next = "AUTOMATIC";
+  snapshot.event_counter = 2;
+  snapshot.with_rbr = true;
+  snapshot.with_start = true;
+  snapshot.with_content = true;
+  Preserve_snapshot_metadata meta = logged_with_cache_metadata();
+  meta.token = test_transfer_token_string(kTransferToken);
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = meta;
+  input.logged_binlog_snapshot = &snapshot;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  Capturing_transfer_frame_sink frame_sink;
+  Preserve_trx_transfer_source_epoch_session session(
+      "epoch-deferred-pending-mismatch", 17, &frame_sink);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.declare_token(kTransferToken));
+  Preserve_trx_deferred_transfer_candidate candidate;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            preserve_trx_transfer_capture_deferred_candidate(
+                session.epoch_id(), kTransferToken, std::move(bundle), 300,
+                nullptr, &candidate, nullptr));
+
+  const Preserved_trx_external_blob &binlog_blob =
+      candidate.bundle.external_blobs.front();
+  Preserve_trx_transfer_object_descriptor pending_descriptor;
+  pending_descriptor.object_id = binlog_blob.name;
+  pending_descriptor.kind = Preserve_trx_transfer_object_kind::EXTERNAL_BLOB;
+  pending_descriptor.total_size = binlog_blob.payload.size();
+  pending_descriptor.digest = test_sha256(binlog_blob.payload);
+  const size_t frames_before_stage = frame_sink.frames().size();
+
+  Preserve_trx_transfer_object_descriptor mismatch = pending_descriptor;
+  ++mismatch.total_size;
+  EXPECT_EQ(Preserve_trx_transfer_status::CORRUPT,
+            preserve_trx_transfer_stage_deferred_candidate_external_objects(
+                &session, m_dir, &candidate, nullptr, &mismatch));
+  mismatch = pending_descriptor;
+  mismatch.digest[0] ^= 0xff;
+  EXPECT_EQ(Preserve_trx_transfer_status::CORRUPT,
+            preserve_trx_transfer_stage_deferred_candidate_external_objects(
+                &session, m_dir, &candidate, nullptr, &mismatch));
+  mismatch = pending_descriptor;
+  mismatch.object_id = kPreservedTrxBlobRecordLocks;
+  EXPECT_EQ(Preserve_trx_transfer_status::CORRUPT,
+            preserve_trx_transfer_stage_deferred_candidate_external_objects(
+                &session, m_dir, &candidate, nullptr, &mismatch));
+  EXPECT_EQ(frames_before_stage, frame_sink.frames().size());
+  EXPECT_FALSE(candidate.external_objects_staged);
 }
 
 TEST_F(PreserveSnapshotTest,

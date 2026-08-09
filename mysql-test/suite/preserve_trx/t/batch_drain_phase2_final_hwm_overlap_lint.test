@@ -1,0 +1,130 @@
+--echo # Source-shape guard for Phase2 final-HWM/local-Preserve overlap.
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $source_root = File::Spec->rel2abs(
+  File::Spec->catdir($mysql_test_dir, '..'));
+my $path = File::Spec->catfile($source_root, 'sql', 'preserve_trx.cc');
+open(my $fh, '<', $path) or die "cannot open $path: $!";
+my $src = do { local $/; <$fh> };
+close($fh);
+
+die "Phase2 execution must own one pending final-HWM publication\n"
+  unless $src =~
+    /Preserve_batch_target_execution[\s\S]{0,1400}pending_final_binlog_publication/s;
+die "attached worker must capture final HWM through the batch sender\n"
+  unless $src =~
+    /prepare_attached_target[\s\S]{0,900}stream_quiesced_transfer_binlog_cache_catchup[\s\S]{0,500}batch_transfer_phase1_sender/s;
+die "coordinator must not finalize ready-target binlog HWM before enqueue\n"
+  if $src =~
+    /ready_binlog_targets[\s\S]{0,900}stream_active_transfer_binlog_cache_progress/s;
+die "async final HWM must retain cleanup-owning publications on the synchronous path\n"
+  unless $src =~
+    /final_hwm_async_capable[\s\S]{0,900}!pending\.owns_cleanup[\s\S]{0,300}!pending\.release_live_artifact/s;
+die "stale inline final HWM must not be excluded from async overlap\n"
+  if $src =~
+    /final_hwm_async_capable[\s\S]{0,900}!pending\.remote_presealed/s;
+die "deferred staging must consume the exact pending final-HWM descriptor\n"
+  unless $src =~
+    /preserve_trx_transfer_stage_deferred_candidate_external_objects[\s\S]{0,500}pending_final_binlog_descriptor/s;
+die "Phase2 active-prefix progress must defer ACK convergence to the terminal sender barrier\n"
+  unless $src =~
+    /stream_active_transfer_binlog_cache_progress\([\s\S]{0,500}defer_ack_until_barrier/s;
+my $active_progress_start = index(
+  $src, 'static bool stream_active_transfer_binlog_cache_progress(');
+my $active_progress_end = index(
+  $src, 'enum class Preserve_trx_binlog_catchup_result',
+  $active_progress_start);
+my $active_progress_body =
+  $active_progress_start >= 0 && $active_progress_end > $active_progress_start
+    ? substr($src, $active_progress_start,
+             $active_progress_end - $active_progress_start)
+    : '';
+die "Phase2 active-prefix progress still unconditionally waits for sender flush\n"
+  if $active_progress_body =~
+    /if\s*\(queued_count\s*!=\s*0\s*&&\s*batch_sender->flush\(\)/s;
+die "active-prefix progress must divide the aggregate batch target across active tokens\n"
+  unless $active_progress_body =~
+    /progress_batch_target_bytes\s*\/\s*active_target_count/s &&
+    $active_progress_body =~
+    /progress_batch_target_bytes\s*%\s*active_target_count/s;
+die "active-prefix batching must count only commands still executing\n"
+  unless $active_progress_body =~
+    /for\s*\([^\)]*targets\.targets\(\)[\s\S]{0,300}!target\.idle[\s\S]{0,200}\+\+active_target_count/s;
+die "active-prefix progress must not require one aggregate batch per token\n"
+  if $active_progress_body =~
+    /minimum_delta_bytes\s*=\s*std::max<uint64_t>\(source_session->chunk_bytes\(\)/s;
+die "Phase2 active-prefix progress must explicitly allow stale mirror rebuild\n"
+  unless $src =~
+    /stream_one_active_transfer_binlog_cache_progress\([\s\S]{0,300}bool\s+allow_stale_rebuild[\s\S]{0,1800}!allow_stale_rebuild\s*&&[\s\S]{0,200}stale_rebuildable_for_thd/s;
+die "Phase1 readiness must not rebuild stale mirrors\n"
+  unless $src =~
+    /active_binlog_progress\s*=\s*\[&\]\(\)[\s\S]{0,900}stream_active_transfer_binlog_cache_progress\([\s\S]{0,500}false,\s*false,\s*false\)/s;
+die "CLOSING progress must rebuild stale mirrors while the command still runs\n"
+  unless $src =~
+    /if\s*\(!enqueue_failed\s*&&\s*!pending\.empty\(\)[\s\S]{0,700}stream_active_transfer_binlog_cache_progress\([\s\S]{0,600}false,\s*true,\s*final_hwm_async_capable\)/s;
+
+die "per-token active binlog progress logging must be Debug-only\n"
+  unless $src =~
+    /#ifndef\s+NDEBUG\s+static\s+void\s+log_acked_active_binlog_progress[\s\S]{0,900}#endif/s;
+die "deferred active binlog publication logging must be Debug-only\n"
+  unless $src =~
+    /#ifndef\s+NDEBUG\s+if\s*\(pending\.report_active_progress\)[\s\S]{0,350}log_acked_active_binlog_progress[\s\S]{0,200}#endif/s;
+die "synchronous active binlog publication logging must be Debug-only\n"
+  unless $src =~
+    /#ifndef\s+NDEBUG\s+log_acked_active_binlog_progress\(\s*target->thread_id\(\)[\s\S]{0,250}#endif/s;
+die "terminal final-HWM publication logging must be Debug-only\n"
+  unless $src =~
+    /else\s*\{\s*#ifndef\s+NDEBUG\s+log_acked_active_binlog_progress\(\s*publication\.thread_id[\s\S]{0,300}#endif/s;
+
+die "join guard must cancel sink and abort sender before joining workers\n"
+  unless $src =~
+    /auto\s+join_workers[\s\S]{0,900}preserve_trx_cancel_active_drain_sink[\s\S]{0,300}batch_transfer_phase1_sender->abort\(\)[\s\S]{0,500}queue_condition\.notify_all\(\)[\s\S]{0,300}worker\.join\(\)/s;
+die "prejoin result must control the join guard cancellation path\n"
+  unless $src =~
+    /const\s+bool\s+prejoin_failure[\s\S]{0,500}cancel_workers_before_join\s*=\s*prejoin_failure[\s\S]{0,200}join_workers\.rollback\(\)/s;
+
+die "CLOSING coordinator must not synchronously prune Phase1 lock candidates\n"
+  if $src =~ /retain_early_candidate_targets\(/s;
+
+my $lock_path = File::Spec->catfile(
+  $source_root, 'sql', 'preserve_trx_lock_warmcopy.cc');
+open(my $lock_fh, '<', $lock_path)
+  or die "cannot open $lock_path: $!";
+my $lock_src = do { local $/; <$lock_fh> };
+close($lock_fh);
+my $lock_prune_start = index(
+  $lock_src, 'complete_early_prepared_targets(');
+my $lock_prune_end = index(
+  $lock_src, 'bind_early_live_record_blob(', $lock_prune_start);
+my $lock_prune_body =
+  $lock_prune_start >= 0 && $lock_prune_end > $lock_prune_start
+    ? substr($lock_src, $lock_prune_start,
+             $lock_prune_end - $lock_prune_start)
+    : '';
+die "final survivor pruning must batch process-local record-blob removal\n"
+  unless $lock_prune_body =~ /discard_phase1_record_blobs\(/s;
+die "final survivor pruning must not delete one record blob per token\n"
+  if $lock_prune_body =~ /discard_phase1_record_blob\(/s;
+
+my $join_pos = index($src, 'join_workers.rollback()');
+my $flush_pos = index($src, 'batch_transfer_phase1_sender->flush()', $join_pos);
+my $preseal_pos = index($src, 'object_presealed_for_token', $flush_pos);
+my $publish_pos = index($src,
+  'publish_acked_transfer_binlog_cache_progress', $preseal_pos);
+my $commit_pos = index($src, 'batch_transfer_source_session->commit_epoch()',
+                       $flush_pos);
+die "terminal final-HWM barrier must flush, verify exact preseal, then commit\n"
+  if $flush_pos < 0 || $preseal_pos < $flush_pos ||
+     $commit_pos < $preseal_pos;
+die "stale ownership side effects must publish after exact preseal validation\n"
+  if $publish_pos < $preseal_pos || $publish_pos > $commit_pos;
+
+EOF
+
+SELECT 'ok' AS batch_drain_phase2_final_hwm_overlap_lint;
