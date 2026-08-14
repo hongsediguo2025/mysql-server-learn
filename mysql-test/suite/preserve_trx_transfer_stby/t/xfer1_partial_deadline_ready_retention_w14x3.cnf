@@ -1,0 +1,4 @@
+!include ../my.cnf
+
+[ENV]
+SERVER_MYPORT_1=@mysqld.1.port

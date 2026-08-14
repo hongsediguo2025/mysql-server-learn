@@ -1,0 +1,18 @@
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+# X6-02 / W04 / O01 / O02 / O10 / T1 debug-contract / I06
+#
+# mysqltest cannot submit a raw COM_PRESERVE_TRX_TRANSFER frame, so the cnf
+# enables the source DBUG hook preserve_trx_transfer_drop_commit_ack_once.  Its
+# exact contract is:
+# make the first successful COMMIT_EPOCH ACK invisible to the source, then let
+# the normal sender reconnect and replay the byte-identical operation/frame.
+# The original W04 epoch must remain READY with exactly one prepared/cache
+# publication.  The bounded counter wait proves the replay was classified as
+# one duplicate without replacing the original terminal result.
+
+--let $terminal_cas_case= 1
+--source suite/preserve_trx_transfer_stby/include/run_terminal_cas_w01.inc

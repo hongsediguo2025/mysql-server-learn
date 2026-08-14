@@ -1,0 +1,177 @@
+# X1-01 / X1-02 / W01 / O01 / O02 / T1
+# Each source restart omits exactly one startup-only endpoint field. DRAIN must
+# reject before TCP connect or receiver admission while the original RR owner,
+# its writes, and its record lock remain intact.
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+--disable_query_log
+--let $credential_file= $MYSQL_TMP_DIR/xfer2-endpoint-incomplete.secret
+--write_file $credential_file
+xfer2-endpoint-incomplete-secret
+EOF
+--exec chmod 600 $credential_file
+
+--connect(xfer2_endpoint_receiver,127.0.0.1,root,,test,$SERVER_MYPORT_2,)
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_endpoint_receiver@localhost;
+DROP TABLE IF EXISTS xfer2_endpoint_receiver_native;
+--enable_warnings
+CREATE USER preserve_trx_endpoint_receiver@localhost
+  IDENTIFIED BY 'xfer2-endpoint-incomplete-secret';
+GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.*
+  TO preserve_trx_endpoint_receiver@localhost;
+GRANT SELECT ON performance_schema.*
+  TO preserve_trx_endpoint_receiver@localhost;
+CREATE TABLE xfer2_endpoint_receiver_native(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO xfer2_endpoint_receiver_native VALUES(1,40),(2,60);
+
+SET @receiver_connections_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME='Connections');
+SET @receiver_admitted_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_admitted_frames');
+SET @receiver_active_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs');
+SET @receiver_inflight_tokens_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens');
+SET @receiver_inflight_bytes_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes');
+SET @receiver_staged_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes');
+SET @receiver_terminal_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins');
+SET @receiver_prepared_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens');
+--let $receiver_connection= xfer2_endpoint_receiver
+--source suite/preserve_trx_transfer_stby/include/capture_receiver_admission_extras.inc
+
+# X1-01a: an empty host alone makes the endpoint incomplete.
+--let $endpoint_scenario= X1-01
+--let $endpoint_variant= missing_host
+--let $endpoint_owner_connection= xfer2_endpoint_owner_host
+--let $endpoint_outsider_connection= xfer2_endpoint_outsider_host
+--let $endpoint_waiter_connection= xfer2_endpoint_waiter_host
+--let $endpoint_host_predicate= @@GLOBAL.rds_preserve_trx_transfer_target_host=''
+--let $endpoint_port_predicate= @@GLOBAL.rds_preserve_trx_transfer_target_port=$SERVER_MYPORT_2
+--let $endpoint_user_predicate= @@GLOBAL.rds_preserve_trx_transfer_target_user='preserve_trx_endpoint_receiver'
+--let $endpoint_credential_predicate= @@GLOBAL.rds_preserve_trx_transfer_credential_name='xfer2_endpoint_incomplete'
+--let $endpoint_restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-port=$SERVER_MYPORT_2 --rds-preserve-trx-transfer-target-user=preserve_trx_endpoint_receiver --rds-preserve-trx-transfer-credential-name=xfer2_endpoint_incomplete --rds-preserve-trx-transfer-credential-secret-file=$credential_file --rds-preserve-trx-drain-phase1-timeout-ms=1000 --rds-preserve-trx-drain-phase2-timeout-ms=1000
+--source suite/preserve_trx_transfer_stby/include/run_endpoint_incomplete_w01.inc
+
+# X1-01b: a zero port alone makes the endpoint incomplete.
+--let $endpoint_scenario= X1-01
+--let $endpoint_variant= missing_port
+--let $endpoint_owner_connection= xfer2_endpoint_owner_port
+--let $endpoint_outsider_connection= xfer2_endpoint_outsider_port
+--let $endpoint_waiter_connection= xfer2_endpoint_waiter_port
+--let $endpoint_host_predicate= @@GLOBAL.rds_preserve_trx_transfer_target_host='127.0.0.1'
+--let $endpoint_port_predicate= @@GLOBAL.rds_preserve_trx_transfer_target_port=0
+--let $endpoint_user_predicate= @@GLOBAL.rds_preserve_trx_transfer_target_user='preserve_trx_endpoint_receiver'
+--let $endpoint_credential_predicate= @@GLOBAL.rds_preserve_trx_transfer_credential_name='xfer2_endpoint_incomplete'
+--let $endpoint_restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-user=preserve_trx_endpoint_receiver --rds-preserve-trx-transfer-credential-name=xfer2_endpoint_incomplete --rds-preserve-trx-transfer-credential-secret-file=$credential_file --rds-preserve-trx-drain-phase1-timeout-ms=1000 --rds-preserve-trx-drain-phase2-timeout-ms=1000
+--source suite/preserve_trx_transfer_stby/include/run_endpoint_incomplete_w01.inc
+
+# X1-02: an empty credential name is rejected before reading the valid file.
+--let $endpoint_scenario= X1-02
+--let $endpoint_variant= missing_credential_name
+--let $endpoint_owner_connection= xfer2_endpoint_owner_credential
+--let $endpoint_outsider_connection= xfer2_endpoint_outsider_credential
+--let $endpoint_waiter_connection= xfer2_endpoint_waiter_credential
+--let $endpoint_host_predicate= @@GLOBAL.rds_preserve_trx_transfer_target_host='127.0.0.1'
+--let $endpoint_port_predicate= @@GLOBAL.rds_preserve_trx_transfer_target_port=$SERVER_MYPORT_2
+--let $endpoint_user_predicate= @@GLOBAL.rds_preserve_trx_transfer_target_user='preserve_trx_endpoint_receiver'
+--let $endpoint_credential_predicate= @@GLOBAL.rds_preserve_trx_transfer_credential_name=''
+--let $endpoint_restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$SERVER_MYPORT_2 --rds-preserve-trx-transfer-target-user=preserve_trx_endpoint_receiver --rds-preserve-trx-transfer-credential-secret-file=$credential_file --rds-preserve-trx-drain-phase1-timeout-ms=1000 --rds-preserve-trx-drain-phase2-timeout-ms=1000
+--source suite/preserve_trx_transfer_stby/include/run_endpoint_incomplete_w01.inc
+
+--connection xfer2_endpoint_receiver
+--enable_query_log
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Connections')=@receiver_connections_before
+         AS no_receiver_connection_accepted;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_admitted_frames')
+         =@receiver_admitted_before AS no_frame_admitted,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')
+         =@receiver_active_before AS no_receiver_epoch,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')
+         =@receiver_inflight_tokens_before AS no_inflight_token,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')
+         =@receiver_inflight_bytes_before AS no_inflight_byte,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes')
+         =@receiver_staged_before AS no_staged_memory;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins')
+         =@receiver_terminal_before AS no_terminal_fact,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')
+         =@receiver_prepared_before AS no_prepared_entry;
+--let $receiver_connection= xfer2_endpoint_receiver
+--source suite/preserve_trx_transfer_stby/include/assert_receiver_admission_extras_unchanged.inc
+--source suite/preserve_trx_transfer_stby/include/assert_receiver_quiescent.inc
+START TRANSACTION;
+UPDATE xfer2_endpoint_receiver_native SET v=v+id;
+COMMIT;
+SELECT COUNT(*)=2 AND SUM(v)=103 AS receiver_native_dml_works
+  FROM xfer2_endpoint_receiver_native;
+--disable_query_log
+
+--let $assert_text= incomplete endpoints stayed before TCP connect
+--let $assert_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--let $assert_select= PRESERVE: standby transfer client connect failed
+--let $assert_count_condition= == 0
+--source include/assert_grep.inc
+--let $assert_count_condition=
+
+--let $assert_text= endpoint credential is absent from source error log
+--let $assert_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--let $assert_select= xfer2-endpoint-incomplete-secret
+--let $assert_count_condition= == 0
+--source include/assert_grep.inc
+--let $assert_count_condition=
+
+--let $assert_text= endpoint credential is absent from receiver error log
+--let $assert_file= $MYSQLTEST_VARDIR/log/mysqld.2.err
+--let $assert_select= xfer2-endpoint-incomplete-secret
+--let $assert_count_condition= == 0
+--source include/assert_grep.inc
+--let $assert_count_condition=
+
+--connection default
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--let $restart_parameters=
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+
+--connection xfer2_endpoint_receiver
+DROP TABLE xfer2_endpoint_receiver_native;
+DROP USER preserve_trx_endpoint_receiver@localhost;
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.2.expect
+--shutdown_server
+--source include/wait_until_disconnected.inc
+--exec echo "restart:" > $MYSQLTEST_VARDIR/tmp/mysqld.2.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+--source suite/preserve_trx_transfer_stby/include/assert_receiver_restart_clean.inc
+
+--connection default
+--remove_file $credential_file
+--disconnect xfer2_endpoint_receiver
+--enable_query_log

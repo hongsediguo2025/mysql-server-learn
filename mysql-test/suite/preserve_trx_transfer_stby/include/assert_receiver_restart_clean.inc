@@ -1,0 +1,6 @@
+# The caller is connected to the receiver generation started after the
+# scenario's terminal restart. Process-local transfer, prepared, cache, and
+# memory state must all begin empty. Old-generation residue must be checked
+# before restart by the scenario that owns that lifecycle claim.
+--replace_result no_receiver_epoch no_receiver_epoch_after_restart no_inflight_token no_inflight_token_after_restart no_inflight_byte no_inflight_byte_after_restart no_staged_memory no_staged_memory_after_restart no_prepared_entry no_prepared_entry_after_restart no_prewarm_pending no_prewarm_pending_after_restart no_prepared_ready no_prepared_ready_after_restart no_ready_cache no_ready_cache_after_restart no_preserve_memory no_preserve_memory_after_restart no_active_worker no_active_worker_after_restart no_queued_byte no_queued_byte_after_restart
+--source suite/preserve_trx_transfer_stby/include/assert_receiver_empty.inc

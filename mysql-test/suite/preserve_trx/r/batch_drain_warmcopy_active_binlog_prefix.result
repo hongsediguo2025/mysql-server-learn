@@ -10,6 +10,6 @@ include/assert_grep.inc [quiesced target closed on a final or already-published 
 include/assert_grep.inc [quiesced final high watermark joined the coordinator batch]
 include/assert_grep.inc [final HWM admission overlapped local Preserve]
 include/assert_grep.inc [contiguous active binlog appends did not exhaust the pending range limit]
-ERROR HY000: DRAIN TRANSACTIONS PRESERVE was reset before shutdown handoff
+ERROR HY000: DRAIN TRANSACTIONS PRESERVE was reset before ownership became irreversible
 row_count	value_sum	min_payload_bytes	max_payload_bytes
 433	849	4096	4096

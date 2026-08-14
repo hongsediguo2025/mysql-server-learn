@@ -1,0 +1,382 @@
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+# X12-06 / W01 / O06 / O09 / T1 debug-contract / I02 / I14 / I15
+#
+# Pause a real two-mysqld transfer after OPEN and the first token declaration.
+# While DRAIN is parked, an ordinary non-target source transaction and an
+# unrelated receiver-native transaction must both commit and become visible.
+# Releasing DRAIN may classify only the original W01 target.  Source restart
+# rolls that target back while both foreground commits survive their respective
+# server restarts.
+
+--source suite/preserve_trx_transfer_stby/include/w01_setup.inc
+
+--disable_query_log
+
+# Independent native foreground tables are not transfer artifacts.  The source
+# app account already has test.* DML grants; the receiver uses a dedicated
+# ordinary account rather than the HA control principal.
+--connection default
+--disable_warnings
+DROP TABLE IF EXISTS xfer2_scale_source_native;
+--enable_warnings
+CREATE TABLE xfer2_scale_source_native(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO xfer2_scale_source_native
+WITH RECURSIVE seq(n) AS (
+  SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<64
+)
+SELECT n,n FROM seq;
+
+--connection xfer2_receiver
+--disable_warnings
+DROP USER IF EXISTS xfer2_scale_receiver_app@localhost;
+DROP TABLE IF EXISTS xfer2_scale_receiver_native;
+--enable_warnings
+CREATE USER xfer2_scale_receiver_app@localhost;
+CREATE TABLE xfer2_scale_receiver_native(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO xfer2_scale_receiver_native
+WITH RECURSIVE seq(n) AS (
+  SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<64
+)
+SELECT n,n*2 FROM seq;
+GRANT SELECT, INSERT, UPDATE, DELETE ON test.xfer2_scale_receiver_native
+  TO xfer2_scale_receiver_app@localhost;
+SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=OFF;
+
+SET @scale_online_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_online_epochs');
+SET @scale_active_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_active_epochs');
+SET @scale_admitted_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_admitted_frames');
+SET @scale_inflight_tokens_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_inflight_tokens');
+SET @scale_inflight_bytes_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_inflight_bytes');
+SET @scale_staged_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_staged_memory_bytes');
+SET @scale_classified_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_auto_prewarm_tokens');
+SET @scale_ready_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens');
+SET @scale_not_ready_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens');
+SET @scale_saved_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_saved_online_tokens');
+SET @scale_failed_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_failed_tokens');
+SET @scale_terminal_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_terminal_cas_wins');
+SET @scale_prepared_registered_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_promotion_prepared_registered_tokens');
+SET @scale_prepared_pending_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_promotion_prepared_prewarm_pending_tokens');
+SET @scale_prepared_ready_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_promotion_prepared_ready_tokens');
+SET @scale_ready_cache_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_promotion_ready_cache_bytes');
+SET @scale_memory_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_memory_current_bytes');
+SET @scale_cleanup_debt_tokens_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_cleanup_debt_tokens');
+SET @scale_cleanup_debt_bytes_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_cleanup_debt_bytes');
+
+--connection xfer2_source_ha
+--let $scale_old_retention= query_get_value(SELECT @@GLOBAL.rds_preserve_trx_token_retention_timeout_ms AS v,v,1)
+SET GLOBAL rds_preserve_trx_token_retention_timeout_ms=120000;
+SET @scale_handoff_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_source_handoff_pending_epochs');
+SET @scale_unknown_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_source_commit_unknown_epochs');
+
+# W01 target and O01 visibility boundary.
+--connect(xfer2_scale_owner,localhost,xfer2_w01_app,,test)
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+--enable_query_log
+SELECT balance=1000 AND version=0 AS owner_rr_initial
+  FROM xfer2_w01_accounts WHERE id=32;
+--disable_query_log
+
+--connect(xfer2_scale_outsider,localhost,root,,test)
+UPDATE xfer2_w01_accounts
+   SET balance=balance+1,version=version+1 WHERE id=32;
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION WITH CONSISTENT SNAPSHOT;
+
+--connection xfer2_scale_owner
+--enable_query_log
+SELECT balance=1000 AND version=0 AS owner_rr_stays_old
+  FROM xfer2_w01_accounts WHERE id=32;
+--disable_query_log
+UPDATE xfer2_w01_accounts
+   SET balance=balance-9,version=version+1 WHERE id=3;
+UPDATE xfer2_w01_accounts
+   SET balance=balance+4,version=version+1 WHERE id=11;
+UPDATE xfer2_w01_accounts
+   SET balance=balance+5,version=version+1 WHERE id=27;
+INSERT INTO xfer2_w01_audit(account_id,delta) VALUES(3,0);
+--enable_query_log
+SELECT COUNT(*)=3 AND SUM(balance)=3000 AND SUM(version)=3
+         AS owner_w01_three_updates
+  FROM xfer2_w01_accounts WHERE id IN (3,11,27);
+SELECT COUNT(*)=1 AND SUM(delta)=0 AS owner_w01_one_audit
+  FROM xfer2_w01_audit;
+--disable_query_log
+
+--connection xfer2_scale_outsider
+--enable_query_log
+SELECT COUNT(*)=32 AND SUM(balance)=32001 AND SUM(version)=1
+         AS observer_sees_background_only,
+       SUM(id IN (3,11,27) AND version<>0)=0
+         AS observer_hides_owner_updates
+  FROM xfer2_w01_accounts;
+SELECT COUNT(*)=0 AS observer_hides_owner_audit FROM xfer2_w01_audit;
+--disable_query_log
+COMMIT;
+
+# Both foreground connections exist but are idle when the first Phase1 target
+# scan runs.  Their transactions begin only after DRAIN is parked.
+--connect(xfer2_scale_source_native,localhost,xfer2_w01_app,,test)
+--connect(xfer2_scale_receiver_native,127.0.0.1,xfer2_scale_receiver_app,,test,$SERVER_MYPORT_2,)
+
+--connect(xfer2_scale_drain,localhost,root,,test)
+--let $scale_drain_id= query_get_value(SELECT CONNECTION_ID() AS id,id,1)
+SET DEBUG_SYNC=
+  'preserve_trx_warmcopy_after_phase1_open SIGNAL xfer2_scale_phase1_open WAIT_FOR xfer2_scale_phase1_release';
+--send DRAIN TRANSACTIONS PRESERVE
+
+# The receiver has admitted exactly the W01 token declaration, but final
+# accepted/prepared state does not exist while the source hook is parked.  Wait
+# here before consuming the sticky DEBUG_SYNC signal so the HA control command
+# cannot be speculatively declared by the initial Phase1 scan.
+--connection xfer2_receiver
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_online_epochs')=@scale_online_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')=@scale_active_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_admitted_frames')=@scale_admitted_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')=@scale_inflight_tokens_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')>@scale_inflight_bytes_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes')=@scale_staged_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')=@scale_prepared_registered_before
+--let $wait_timeout= 30
+--source include/wait_condition_or_abort.inc
+
+--connection xfer2_source_ha
+SET DEBUG_SYNC='now WAIT_FOR xfer2_scale_phase1_open TIMEOUT 60';
+--let $scale_sync_warning_count= query_get_value("SELECT @@warning_count AS c",c,1)
+--let $scale_sync_failed= 0
+if ($scale_sync_warning_count != 0)
+{
+  --let $scale_sync_failed= 1
+}
+
+--connection xfer2_receiver
+--enable_query_log
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_online_epochs')
+         =@scale_online_before+1 AS one_open_epoch_while_paused,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_admitted_frames')
+         =@scale_admitted_before+1 AS one_declared_token_while_paused,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')
+         =@scale_active_before AS no_accepted_epoch_while_paused,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')
+         =@scale_prepared_registered_before AS no_prepared_state_while_paused;
+--disable_query_log
+
+# O06: a source transaction that was not in the frozen target set commits and
+# is visible before DRAIN can leave its Phase1 hook.
+--connection xfer2_scale_source_native
+START TRANSACTION;
+UPDATE xfer2_scale_source_native SET v=v+10;
+DELETE FROM xfer2_scale_source_native WHERE id=64;
+INSERT INTO xfer2_scale_source_native VALUES(65,2036);
+COMMIT;
+
+--connection default
+--enable_query_log
+SELECT COUNT(*)=64 AND SUM(v)=4682 AS source_foreground_commit_visible
+  FROM xfer2_scale_source_native;
+CHECK TABLE xfer2_scale_source_native;
+--disable_query_log
+
+# O09: ordinary receiver DML remains independent from its transfer registry and
+# is also committed and observed before DRAIN is released.
+--connection xfer2_scale_receiver_native
+START TRANSACTION;
+UPDATE xfer2_scale_receiver_native SET v=v+20;
+DELETE FROM xfer2_scale_receiver_native WHERE id=64;
+INSERT INTO xfer2_scale_receiver_native VALUES(65,4072);
+COMMIT;
+
+--connection xfer2_receiver
+--enable_query_log
+SELECT COUNT(*)=64 AND SUM(v)=9364 AS receiver_foreground_commit_visible
+  FROM xfer2_scale_receiver_native;
+CHECK TABLE xfer2_scale_receiver_native;
+--disable_query_log
+
+# Prove both commits completed while the DRAIN THD was still parked, rather
+# than racing after release.  The dynamic process id never reaches the result.
+--connection default
+--replace_result $scale_drain_id DRAIN_ID
+--enable_query_log
+--eval SELECT COUNT(*)=1 AS drain_still_paused_after_both_foreground_commits FROM information_schema.processlist WHERE ID=$scale_drain_id AND STATE LIKE 'debug sync point:%'
+--disable_query_log
+
+--connection xfer2_source_ha
+SET DEBUG_SYNC='now SIGNAL xfer2_scale_phase1_release';
+
+--connection xfer2_scale_drain
+--replace_column 1 GENERATION 3 SOURCE_ID 6 CLOSING_STARTED_US 7 CLOSING_DEADLINE_US
+--reap
+
+--connection xfer2_source_ha
+SET DEBUG_SYNC='RESET';
+--eval SET GLOBAL rds_preserve_trx_token_retention_timeout_ms=$scale_old_retention
+
+# Exactly one W01 target reaches terminal classification.  The committed O06
+# source transaction and O09 receiver transaction are not transfer tokens.
+--connection xfer2_receiver
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')=@scale_active_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins')=@scale_terminal_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_tokens')=@scale_classified_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens')=@scale_ready_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens')=@scale_not_ready_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_saved_online_tokens')=@scale_saved_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_failed_tokens')=@scale_failed_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')=@scale_inflight_tokens_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')=@scale_inflight_bytes_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes')=@scale_staged_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')=@scale_prepared_registered_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_prewarm_pending_tokens')=@scale_prepared_pending_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_ready_tokens')=@scale_prepared_ready_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_ready_cache_bytes')>@scale_ready_cache_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_memory_current_bytes')>@scale_memory_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_tokens')=@scale_cleanup_debt_tokens_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_bytes')=@scale_cleanup_debt_bytes_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_worker_active')=0 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_queued_bytes')=0
+--let $wait_timeout= 30
+--source include/wait_condition_or_abort.inc
+--enable_query_log
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')
+         =@scale_active_before+1 AS exactly_one_accepted_epoch,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_tokens')
+         =@scale_classified_before+1 AS exactly_one_classified_target,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens')
+         =@scale_ready_before+1 AS exactly_one_ready_target,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens')
+         =@scale_not_ready_before AS no_not_ready_target,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins')
+         =@scale_terminal_before+1 AS one_terminal_epoch;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')
+         =@scale_inflight_tokens_before AS no_inflight_token_residue,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes')
+         =@scale_staged_before AS no_staged_memory_residue,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_saved_online_tokens')
+         =@scale_saved_before+1 AS one_saved_online_token,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_failed_tokens')
+         =@scale_failed_before AS no_failed_token,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')
+         =@scale_prepared_registered_before+1 AS one_prepared_entry,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_ready_tokens')
+         =@scale_prepared_ready_before+1 AS one_prepared_ready_entry,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_promotion_ready_cache_bytes')
+         >@scale_ready_cache_before AS ready_cache_retained,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_tokens')
+         =@scale_cleanup_debt_tokens_before AS no_cleanup_debt;
+--disable_query_log
+
+--connection xfer2_source_ha
+--enable_query_log
+SELECT VARIABLE_VALUE+0=0 AS no_closing_command_completion
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_closing_completed_before_deadline';
+SELECT VARIABLE_VALUE+0=0 AS no_closing_excluded_token
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_closing_excluded_tokens';
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_source_handoff_pending_epochs')
+         =@scale_handoff_before AS no_handoff_pending,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_source_commit_unknown_epochs')
+         =@scale_unknown_before AS no_commit_unknown;
+--disable_query_log
+
+--connection xfer2_scale_owner
+--enable_query_log
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT 1;
+--disable_query_log
+
+# The source fence intentionally blocks every ordinary source session after
+# handoff.  Receiver-native data remains independently readable here; the
+# source-native commit is checked again after the source restart below.
+--connection xfer2_receiver
+--enable_query_log
+SELECT COUNT(*)=64 AND SUM(v)=9364 AS receiver_foreground_still_exact
+  FROM xfer2_scale_receiver_native;
+--disable_query_log
+
+--disconnect xfer2_scale_owner
+--disconnect xfer2_scale_outsider
+--disconnect xfer2_scale_source_native
+--disconnect xfer2_scale_receiver_native
+--disconnect xfer2_scale_drain
+
+--source suite/preserve_trx_transfer_stby/include/w01_teardown.inc
+
+# The shared teardown restarts both mysqld processes.  The W01 owner is rolled
+# back by assert_w01_baseline.inc, while each native foreground commit remains.
+--connection xfer2_cleanup
+--enable_query_log
+SELECT COUNT(*)=64 AND SUM(v)=4682 AS source_foreground_survives_restart
+  FROM xfer2_scale_source_native;
+CHECK TABLE xfer2_scale_source_native;
+--disable_query_log
+
+--connection xfer2_receiver
+--enable_query_log
+SELECT COUNT(*)=64 AND SUM(v)=9364 AS receiver_foreground_survives_restart
+  FROM xfer2_scale_receiver_native;
+UPDATE xfer2_scale_receiver_native SET v=v+7 WHERE id=1;
+SELECT COUNT(*)=64 AND SUM(v)=9371 AS receiver_foreground_remains_writable
+  FROM xfer2_scale_receiver_native;
+CHECK TABLE xfer2_scale_receiver_native;
+--disable_query_log
+
+DROP TABLE xfer2_scale_receiver_native;
+DROP USER xfer2_scale_receiver_app@localhost;
+
+--connection xfer2_cleanup
+DROP TABLE xfer2_scale_source_native;
+
+if ($scale_sync_failed)
+{
+  --die phase1-open debug synchronization timed out
+}
+
+--enable_query_log

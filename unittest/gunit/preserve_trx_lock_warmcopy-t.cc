@@ -25,6 +25,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <fcntl.h>
 #include <string>
 #include <unistd.h>
@@ -635,6 +636,177 @@ TEST(PreserveTrxLockWarmcopyDrainParticipant,
   ASSERT_EQ(1U, callback_tokens.size());
   EXPECT_EQ(42U, callback_tokens[0]);
 
+  participant.finalize_phase();
+  (void)rmdir(options.preserve_dir.c_str());
+}
+
+TEST(PreserveTrxLockWarmcopyDrainParticipant,
+     Phase1RecordStoreFalseExportPreservesCompactPrebuiltCandidate) {
+  lock_warmcopy_reset_for_unit_test();
+  const std::string compact_payload = make_record_payload(
+      {make_record_entry(100, 200, 11, 2, 'c', 0x0102030405060708ULL, 6,
+                         false, 35)});
+
+  Preserve_trx_lock_warmcopy_options options =
+      preserve_trx_lock_warmcopy_current_options();
+  options.preserve_dir =
+      unique_dir_for_test("preserve-lock-warmcopy-compact-prebuilt-record");
+  Preserve_trx_lock_warmcopy_drain_participant participant(options);
+  ASSERT_TRUE(participant.open_phase1());
+  ASSERT_TRUE(participant.prepare_phase1_record_payload_for_thread_for_unit_test(
+      42, compact_payload));
+
+  PrebuiltRecordLocksBlob before;
+  ASSERT_TRUE(participant.phase1_record_prebuilt_blob_for_thread(42, &before));
+  ASSERT_EQ(1ULL,
+            participant.observation().phase1_record_prebuilt_target_count);
+
+  std::string exported_payload;
+  uint32_t exported_lock_count = 0;
+  EXPECT_FALSE(lock_warmcopy_record_store_export_record_payload_for_target(
+      42, &exported_payload, &exported_lock_count));
+  EXPECT_TRUE(exported_payload.empty());
+  EXPECT_EQ(0U, exported_lock_count);
+
+  size_t callback_count = 0;
+  ASSERT_TRUE(participant.prepare_phase1_record_store_targets(
+      [&](uint64_t, const PrebuiltRecordLocksBlob &) {
+        ++callback_count;
+        return true;
+      }));
+  EXPECT_EQ(0U, callback_count);
+
+  PrebuiltRecordLocksBlob after;
+  const bool prebuilt_preserved =
+      participant.phase1_record_prebuilt_blob_for_thread(42, &after);
+  EXPECT_TRUE(prebuilt_preserved);
+  if (prebuilt_preserved) {
+    EXPECT_EQ(before.warmcopy_id, after.warmcopy_id);
+    EXPECT_EQ(before.size, after.size);
+    EXPECT_EQ(before.lock_plan_contract_version,
+              after.lock_plan_contract_version);
+  }
+  EXPECT_EQ(1ULL,
+            participant.observation().phase1_record_prebuilt_target_count);
+
+  std::vector<uint64_t> target_ids;
+  lock_warmcopy_record_store_target_ids(&target_ids);
+  EXPECT_NE(target_ids.end(), std::find(target_ids.begin(), target_ids.end(),
+                                        42));
+
+  participant.finalize_phase();
+  (void)rmdir(options.preserve_dir.c_str());
+}
+
+TEST(PreserveTrxLockWarmcopyDrainParticipant,
+     Phase1RecordStoreFalseExportDropsCompactPrebuiltAfterFenceChange) {
+  lock_warmcopy_reset_for_unit_test();
+  const std::string compact_payload = make_record_payload(
+      {make_record_entry(100, 200, 11, 2, 'c', 0x0102030405060708ULL, 6,
+                         false, 35)});
+
+  Preserve_trx_lock_warmcopy_options options =
+      preserve_trx_lock_warmcopy_current_options();
+  options.preserve_dir =
+      unique_dir_for_test("preserve-lock-warmcopy-stale-compact-prebuilt");
+  Preserve_trx_lock_warmcopy_drain_participant participant(options);
+  ASSERT_TRUE(participant.open_phase1());
+  ASSERT_TRUE(participant.prepare_phase1_record_payload_for_thread_for_unit_test(
+      42, compact_payload));
+
+  PrebuiltRecordLocksBlob before;
+  ASSERT_TRUE(participant.phase1_record_prebuilt_blob_for_thread(42, &before));
+
+  lock_warmcopy_record_shard_key_t key;
+  key.table_id = 100;
+  key.index_id = 200;
+  key.space_id = 7;
+  key.page_no = 11;
+  key.lock_type_mode = 35;
+  key.n_bits = 8;
+  lock_warmcopy_record_image_digest_t digest;
+  digest.bytes[0] = 0xb7;
+  ASSERT_TRUE(lock_warmcopy_record_bitmap_set_for_target_for_unit_test(
+      42, key, 3, digest));
+
+  std::string exported_payload;
+  uint32_t exported_lock_count = 0;
+  EXPECT_FALSE(lock_warmcopy_record_store_export_record_payload_for_target(
+      42, &exported_payload, &exported_lock_count));
+  EXPECT_TRUE(exported_payload.empty());
+  EXPECT_EQ(0U, exported_lock_count);
+
+  ASSERT_TRUE(participant.prepare_phase1_record_store_targets());
+
+  PrebuiltRecordLocksBlob after;
+  EXPECT_FALSE(participant.phase1_record_prebuilt_blob_for_thread(42, &after));
+  EXPECT_EQ(0ULL,
+            participant.observation().phase1_record_prebuilt_target_count);
+  std::vector<uint64_t> target_ids;
+  lock_warmcopy_record_store_target_ids(&target_ids);
+  EXPECT_EQ(target_ids.end(), std::find(target_ids.begin(), target_ids.end(),
+                                        42));
+
+  participant.finalize_phase();
+  (void)rmdir(options.preserve_dir.c_str());
+}
+
+TEST(PreserveTrxLockWarmcopyDrainParticipant,
+     Phase1RecordStorePrunesEmptyStoreTarget) {
+  lock_warmcopy_reset_for_unit_test();
+  const std::string compact_payload = make_record_payload(
+      {make_record_entry(100, 200, 11, 2, 'e', 0x0102030405060708ULL, 6,
+                         false, 35)});
+  lock_warmcopy_record_shard_key_t key;
+  key.table_id = 100;
+  key.index_id = 200;
+  key.space_id = 7;
+  key.page_no = 11;
+  key.lock_type_mode = 35;
+  key.n_bits = 8;
+
+  Preserve_trx_lock_warmcopy_options options =
+      preserve_trx_lock_warmcopy_current_options();
+  options.preserve_dir =
+      unique_dir_for_test("preserve-lock-warmcopy-empty-store-target");
+  Preserve_trx_lock_warmcopy_drain_participant participant(options);
+  ASSERT_TRUE(participant.open_phase1());
+  ASSERT_TRUE(participant.prepare_phase1_record_payload_for_thread_for_unit_test(
+      42, compact_payload));
+  PrebuiltRecordLocksBlob before;
+  ASSERT_TRUE(participant.phase1_record_prebuilt_blob_for_thread(42, &before));
+  ASSERT_EQ(1ULL,
+            participant.observation().phase1_record_prebuilt_target_count);
+
+  ASSERT_TRUE(lock_warmcopy_record_journal_delete_for_target_for_unit_test(
+      42, 1, key, 2));
+  std::string exported_payload;
+  uint32_t exported_lock_count = 0;
+  EXPECT_TRUE(lock_warmcopy_record_store_export_record_payload_for_target(
+      42, &exported_payload, &exported_lock_count));
+  EXPECT_TRUE(exported_payload.empty());
+  EXPECT_EQ(0U, exported_lock_count);
+  std::vector<uint64_t> target_ids;
+  lock_warmcopy_record_store_target_ids(&target_ids);
+  EXPECT_NE(target_ids.end(), std::find(target_ids.begin(), target_ids.end(),
+                                        42));
+
+  size_t callback_count = 0;
+  ASSERT_TRUE(participant.prepare_phase1_record_store_targets(
+      [&](uint64_t, const PrebuiltRecordLocksBlob &) {
+        ++callback_count;
+        return true;
+      }));
+
+  EXPECT_EQ(0U, callback_count);
+  EXPECT_EQ(0ULL,
+            participant.observation().phase1_record_prebuilt_target_count);
+  PrebuiltRecordLocksBlob after;
+  EXPECT_FALSE(participant.phase1_record_prebuilt_blob_for_thread(42, &after));
+  target_ids.clear();
+  lock_warmcopy_record_store_target_ids(&target_ids);
+  EXPECT_EQ(target_ids.end(), std::find(target_ids.begin(), target_ids.end(),
+                                        42));
   participant.finalize_phase();
   (void)rmdir(options.preserve_dir.c_str());
 }

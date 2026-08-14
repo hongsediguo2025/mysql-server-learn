@@ -211,7 +211,8 @@ enum class Preserve_trx_prepared_status : uint8_t {
   STALE_GENERATION,
   DIGEST_CONFLICT,
   RESOURCE_EXHAUSTED,
-  INTENT_IO_ERROR
+  INTENT_IO_ERROR,
+  READ_VIEW_HORIZON_MISMATCH
 };
 
 enum class Preserve_trx_gate_abort_outcome : uint8_t {
@@ -498,6 +499,8 @@ class Preserve_trx_physical_promotion_pin_lease {
   ~Preserve_trx_physical_promotion_pin_lease();
 
   bool active() const { return m_active; }
+  Preserve_trx_prepared_status renew_client_resume_deadline(
+      uint64_t now_monotonic_us, uint64_t deadline_monotonic_us);
   void release_atomically() noexcept;
   void release_for_abandon() noexcept;
 
@@ -534,6 +537,9 @@ class Preserve_trx_prepared_token_registry {
   Preserve_trx_prepared_status update_epoch_prepare_deadline(
       const std::string &epoch_scope, const std::string &epoch_id,
       size_t expected_token_count, uint64_t deadline_monotonic_us);
+  Preserve_trx_prepared_status update_selected_prepare_deadline(
+      const std::vector<Preserve_trx_prepared_token_key> &keys,
+      uint64_t deadline_monotonic_us);
   Preserve_trx_prepared_status pin_epoch_for_physical_promotion(
       const std::vector<Preserve_trx_prepared_token_key> &keys,
       uint64_t now_monotonic_us,

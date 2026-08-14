@@ -3,7 +3,7 @@ accepted_epoch_delta_before_final_ack
 0
 early_object_sealed_before_second_boundary
 1
-ERROR HY000: DRAIN TRANSACTIONS PRESERVE was reset before shutdown handoff
+ERROR HY000: DRAIN TRANSACTIONS PRESERVE was reset before ownership became irreversible
 SELECT GROUP_CONCAT(CONCAT(id, ':', v) ORDER BY id) AS committed_values
 FROM t_closing_early_pipeline;
 committed_values

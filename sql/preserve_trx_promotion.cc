@@ -330,68 +330,6 @@ void add_ready_cache_string(const std::string &value, uint64_t *total) {
   add_ready_cache_bytes(value.capacity(), total);
 }
 
-uint64_t ready_cache_bundle_bytes(const Preserved_trx_bundle &bundle) {
-  uint64_t total = sizeof(bundle);
-  const Preserve_snapshot_metadata &metadata = bundle.metadata;
-  const std::string *metadata_strings[] = {
-      &metadata.token,
-      &metadata.owner_user,
-      &metadata.owner_host,
-      &metadata.schema_name,
-      &metadata.binlog_cache_payload,
-      &metadata.binlog_gtid_next,
-      &metadata.binlog_owned_gtid,
-      &metadata.time_zone_name,
-      &metadata.read_view_payload,
-      &metadata.record_locks_payload,
-      &metadata.predicate_locks_payload,
-      &metadata.table_locks_payload,
-      &metadata.mdl_descriptors_payload,
-      &metadata.user_vars_payload,
-      &metadata.sql_savepoints_payload,
-      &metadata.innodb_savepoints_payload,
-      &metadata.temp_table_manifest_payload};
-  for (const std::string *value : metadata_strings) {
-    add_ready_cache_string(*value, &total);
-  }
-  add_ready_cache_bytes(metadata.modified_table_names.capacity() *
-                            sizeof(Preserve_snapshot_modified_table_name),
-                        &total);
-  for (const Preserve_snapshot_modified_table_name &table :
-       metadata.modified_table_names) {
-    add_ready_cache_string(table.schema_name, &total);
-    add_ready_cache_string(table.table_name, &total);
-  }
-  add_ready_cache_bytes(metadata.session_participant_order.capacity() *
-                            sizeof(Preserve_savepoint_participant),
-                        &total);
-  add_ready_cache_bytes(metadata.savepoint_suffix_ordinals.capacity() *
-                            sizeof(uint16_t),
-                        &total);
-  add_ready_cache_bytes(bundle.tlvs.capacity() * sizeof(Preserve_snapshot_tlv),
-                        &total);
-  for (const Preserve_snapshot_tlv &tlv : bundle.tlvs) {
-    add_ready_cache_string(tlv.value, &total);
-  }
-  add_ready_cache_bytes(bundle.external_blobs.capacity() *
-                            sizeof(Preserved_trx_external_blob),
-                        &total);
-  for (const Preserved_trx_external_blob &blob : bundle.external_blobs) {
-    add_ready_cache_string(blob.name, &total);
-    add_ready_cache_string(blob.payload, &total);
-    add_ready_cache_string(blob.descriptor.name, &total);
-    add_ready_cache_string(blob.warmcopy_id, &total);
-  }
-  add_ready_cache_bytes(bundle.blob_descriptors.capacity() *
-                            sizeof(Preserved_trx_external_blob_descriptor),
-                        &total);
-  for (const Preserved_trx_external_blob_descriptor &descriptor :
-       bundle.blob_descriptors) {
-    add_ready_cache_string(descriptor.name, &total);
-  }
-  return total;
-}
-
 uint64_t ready_cache_entry_bytes(const Promotion_ready_cache_key &key,
                                  const Promotion_ready_cache_entry &entry) {
   uint64_t total = sizeof(key) + sizeof(entry);
@@ -399,7 +337,8 @@ uint64_t ready_cache_entry_bytes(const Promotion_ready_cache_key &key,
   add_ready_cache_string(key.epoch_id, &total);
   add_ready_cache_string(entry.reason, &total);
   if (entry.has_ready_bundle) {
-    add_ready_cache_bytes(ready_cache_bundle_bytes(entry.ready_bundle),
+    add_ready_cache_bytes(
+        preserved_trx_bundle_capacity_bytes(entry.ready_bundle),
                           &total);
   }
   return total;
@@ -3510,13 +3449,29 @@ bool Preserve_trx_physical_promotion_bootstrap_attempt::
     complete_gate_handoff() {
   if (m_impl == nullptr || !m_impl->active) return false;
   if (!m_impl->accepted_epoch_completed) {
+    if (m_impl->prepared_token_pin.active()) {
+      const uint64_t now_us = promotion_monotonic_us();
+      const uint64_t retention_us =
+          static_cast<uint64_t>(preserve_trx_token_retention_timeout_ms) *
+          1000ULL;
+      const uint64_t resume_deadline_us =
+          retention_us > std::numeric_limits<uint64_t>::max() - now_us
+              ? std::numeric_limits<uint64_t>::max()
+              : now_us + retention_us;
+      if (m_impl->prepared_token_pin.renew_client_resume_deadline(
+              now_us, resume_deadline_us) !=
+          Preserve_trx_prepared_status::OK) {
+        return false;
+      }
+    }
     if (preserve_trx_transfer_complete_receiver_promotion_lease_process_local(
             m_impl->accepted_epoch) != Preserve_trx_transfer_status::OK) {
       return false;
     }
     m_impl->accepted_epoch_completed = true;
+    m_impl->prepared_token_pin.release_atomically();
+    preserved_trx_request_expired_reaper_scan();
   }
-  m_impl->prepared_token_pin.release_atomically();
   trx_preserve_startup_resurrection_reset();
   m_impl->accepted_epoch = {};
   m_impl->gate_request = {};

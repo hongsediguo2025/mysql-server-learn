@@ -1,0 +1,167 @@
+--source include/have_debug.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+# X6-08a / W14 / O01 / T1 debug-contract
+# Final token metadata reaches the receiver, but the source classifies its ACK
+# as uncertain before the COMMIT_EPOCH ownership barrier. DRAIN must retain the
+# source transaction behind the existing fence, send no later receiver control
+# frame, and leave explicit RESET DRAIN as the only source restore operation.
+# Receiver residue is process-local and is retired by the existing restart
+# cleanup; this case does not claim an online pre-COMMIT orphan TTL.
+
+--source suite/preserve_trx_transfer_stby/include/w01_setup.inc
+CALL mtr.add_suppression(
+  "PRESERVE: standby transfer source entered PRECOMMIT_ACK_UNCERTAIN");
+
+--connection xfer2_receiver
+SET @active_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_active_epochs');
+SET @saved_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_saved_online_tokens');
+SET @inflight_tokens_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_inflight_tokens');
+SET @inflight_bytes_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_inflight_bytes');
+SET @admitted_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_admitted_frames');
+SET @terminal_wins_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_terminal_cas_wins');
+SET @tombstones_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_terminal_status_tombstones');
+
+--connect(xfer2_uncertain_owner,localhost,xfer2_w01_app,,test)
+--let $owner_id= query_get_value(SELECT CONNECTION_ID() AS id, id, 1)
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+SELECT balance=1000 AND version=0 AS owner_rr_initial
+  FROM xfer2_w01_accounts WHERE id=32;
+UPDATE xfer2_w01_accounts
+   SET balance=balance-19, version=version+1 WHERE id=3;
+SELECT ROW_COUNT()=1 AS owner_debit;
+UPDATE xfer2_w01_accounts
+   SET balance=balance+11, version=version+1 WHERE id=3;
+SELECT ROW_COUNT()=1 AS owner_partial_credit;
+UPDATE xfer2_w01_accounts
+   SET balance=balance+8, version=version+1 WHERE id=3;
+SELECT ROW_COUNT()=1 AS owner_balance_restored;
+INSERT INTO xfer2_w01_audit(account_id,delta) VALUES(3,0);
+SELECT ROW_COUNT()=1 AS owner_audit_inserted;
+
+--connect(xfer2_uncertain_outsider,localhost,root,,test)
+UPDATE xfer2_w01_accounts
+   SET balance=balance+1, version=version+1 WHERE id=32;
+SELECT ROW_COUNT()=1 AS outsider_commit;
+
+--connection xfer2_uncertain_owner
+SELECT balance=1000 AND version=0 AS owner_rr_stays_old
+  FROM xfer2_w01_accounts WHERE id=32;
+SELECT balance=1000 AND version=3 AS owner_sees_three_updates
+  FROM xfer2_w01_accounts WHERE id=3;
+
+--connection xfer2_uncertain_outsider
+--source suite/preserve_trx_transfer_stby/include/assert_w01_baseline.inc
+
+--connect(xfer2_uncertain_drain,localhost,root,,test)
+SET SESSION debug='+d,preserve_trx_transfer_fail_final_metadata_ack_uncertain';
+--error ER_PRESERVE_TRX_UNSUPPORTED
+DRAIN TRANSACTIONS PRESERVE;
+SET SESSION debug='-d,preserve_trx_transfer_fail_final_metadata_ack_uncertain';
+
+--connection xfer2_uncertain_owner
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT 1;
+
+--connection xfer2_receiver
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')
+         = @active_before AS no_commit_epoch,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+           'Preserve_trx_transfer_receiver_saved_online_tokens')
+         = @saved_before AS no_ready_or_saved_token,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins')
+         = @terminal_wins_before AS no_terminal_cleanup_cas,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+           'Preserve_trx_transfer_receiver_terminal_status_tombstones')
+         = @tombstones_before AS no_terminal_tombstone,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')
+         = @inflight_tokens_before+1 AS one_precommit_inflight_token,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')
+         > @inflight_bytes_before AS precommit_bytes_retained,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_admitted_frames')
+         > @admitted_before AS receiver_saw_precommit_frames;
+SET @admitted_after_failure=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_admitted_frames');
+SET @inflight_tokens_after_failure=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_inflight_tokens');
+SET @inflight_bytes_after_failure=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_inflight_bytes');
+
+--connect(xfer2_uncertain_reset,localhost,preserve_trx_ha_admin,xfer2-smoke-w01-secret,test)
+RESET DRAIN;
+
+--connection xfer2_receiver
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_admitted_frames')
+         = @admitted_after_failure AS reset_sent_no_sequence_frame,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')
+         = @active_before AS reset_sent_no_commit_epoch,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins')
+         = @terminal_wins_before AS reset_sent_no_abandon,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+           'Preserve_trx_transfer_receiver_terminal_status_tombstones')
+         = @tombstones_before AS reset_created_no_tombstone,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+           'Preserve_trx_transfer_receiver_saved_online_tokens')
+         = @saved_before AS reset_created_no_ready_token,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')
+         = @inflight_tokens_after_failure AS reset_kept_inflight_token_ledger,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')
+         = @inflight_bytes_after_failure AS reset_kept_inflight_byte_ledger;
+
+--connection xfer2_uncertain_owner
+--replace_result $owner_id OWNER_ID
+--eval SELECT CONNECTION_ID()=$owner_id AS original_owner_restored
+SELECT balance=1000 AND version=3 AS owner_writes_survive_reset
+  FROM xfer2_w01_accounts WHERE id=3;
+UPDATE xfer2_w01_accounts
+   SET pad=CONCAT(pad,'-after-reset'), version=version+1 WHERE id=3;
+SELECT ROW_COUNT()=1 AS owner_can_continue_after_reset;
+ROLLBACK;
+
+--connection xfer2_uncertain_outsider
+--source suite/preserve_trx_transfer_stby/include/assert_w01_baseline.inc
+
+--disconnect xfer2_uncertain_owner
+--disconnect xfer2_uncertain_outsider
+--disconnect xfer2_uncertain_drain
+--disconnect xfer2_uncertain_reset
+
+--source suite/preserve_trx_transfer_stby/include/w01_teardown.inc
+
+--connection xfer2_receiver
+SELECT VARIABLE_VALUE=0 AS no_saved_online_token_after_restart
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_saved_online_tokens';

@@ -42,7 +42,7 @@ die "shared helper must only publish PENDING_QUIESCE targets at an idle boundary
   unless $shared_helper =~ /Preserve_trx_batch_thd_state::PENDING_QUIESCE/s &&
          $shared_helper =~ /m_server_idle/s;
 die "shared helper must publish both active and transactionless target states\n"
-  unless $shared_helper =~ /preserve_trx_has_explicit_active_transaction/s &&
+  unless $shared_helper =~ /preserve_trx_has_active_multi_stmt_transaction/s &&
          $shared_helper =~ /Preserve_trx_batch_thd_state::QUIESCED/s &&
          $shared_helper =~ /Preserve_trx_batch_thd_state::DRAINED_NO_TRANSACTION/s;
 

@@ -1,0 +1,25 @@
+--source include/have_debug.inc
+--source include/have_log_bin.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+# X2-14 / W01 + W08B(log-bin/GTID) / O01 / O02 / O10 / T1
+#
+# W08B is used despite the assigned _w01 stem: the 6 MiB logged LONGBLOB
+# creates the SQL-reachable external transfer object and forces multiple 1 MiB
+# chunks and multiple phase1 batches.  At the named
+# receiver apply-before-ACK point, the one-shot selector may fire only for a
+# payload containing an applied OBJECT_CHUNK while that object is still
+# unsealed.  Closing the real data connection therefore occurs in the middle
+# of a real object, not before OPEN/DECLARE and not after SEAL.
+#
+# This test selects the supported idempotent-continuation outcome: the source
+# reconnects and resends only the byte-identical uncertain payload, the receiver
+# returns its ALREADY_APPLIED result, later chunks complete, and DRAIN succeeds.
+# A clean-abort implementation would need a separate expected-result branch;
+# ACK_UNCERTAIN, partial READY/publication, log evidence, or a loose counter
+# delta is never accepted here.  Stable hook and replay projections must prove
+# the exact applied-before-disconnect continuation path.
+
+--let $phase1_ack_case= 2
+--source suite/preserve_trx_transfer_stby/include/run_phase1_ack_connection_w01.inc

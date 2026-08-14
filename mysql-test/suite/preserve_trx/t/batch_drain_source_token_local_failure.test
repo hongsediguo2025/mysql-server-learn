@@ -58,6 +58,9 @@ START TRANSACTION;
 UPDATE t_source_token_local_failure SET v=31 WHERE id=3;
 
 --connection source_token_local_ha
+SET @reset_too_late_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME='Preserve_trx_reset_drain_too_late');
 SET GLOBAL debug='+d,preserve_trx_early_fail_candidate_finalize';
 
 --connection default
@@ -74,25 +77,33 @@ SELECT VARIABLE_VALUE=2 AS two_source_survivors
   FROM performance_schema.global_status
  WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens';
 
+--disable_result_log
+--error ER_PRESERVE_TRX_RESET_TOO_LATE
 RESET DRAIN;
+--enable_result_log
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+        WHERE VARIABLE_NAME='Preserve_trx_reset_drain_too_late')
+       - @reset_too_late_before AS post_commit_reset_too_late;
 
 --connection source_token_local_app1
-UPDATE t_source_token_local_failure SET v=v+100 WHERE id=1;
-COMMIT;
---eval SELECT CONNECTION_ID()=$app1_id AS app1_same_connection
+--disable_result_log
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT 1;
+--enable_result_log
 
 --connection source_token_local_app2
-UPDATE t_source_token_local_failure SET v=v+100 WHERE id=2;
-COMMIT;
---eval SELECT CONNECTION_ID()=$app2_id AS app2_same_connection
+--disable_result_log
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT 1;
+--enable_result_log
 
 --connection source_token_local_app3
-UPDATE t_source_token_local_failure SET v=v+100 WHERE id=3;
-COMMIT;
---eval SELECT CONNECTION_ID()=$app3_id AS app3_same_connection
+--disable_result_log
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT 1;
+--enable_result_log
 
 --connection source_token_local_ha
-SELECT v FROM t_source_token_local_failure ORDER BY id;
 SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=OFF;
 
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
@@ -106,6 +117,9 @@ SHUTDOWN;
 --disable_query_log
 
 --connect(source_token_local_cleanup,localhost,root,,test)
+SELECT GROUP_CONCAT(CONCAT(id, ':', v) ORDER BY id)
+         AS source_rows_after_restart
+  FROM t_source_token_local_failure;
 DROP TABLE t_source_token_local_failure;
 DROP USER source_token_local_app@localhost;
 DROP USER preserve_trx_ha_admin@localhost;

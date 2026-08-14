@@ -1,0 +1,25 @@
+--source include/have_debug.inc
+--source include/have_log_bin.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+# X2-04 / W01 + W08B(log-bin/GTID) / O01 / O02 / T1 / I05
+#
+# Debug contract: on the independent receiver, the named control point runs only
+# after a payload containing a real W08B binlog OBJECT_CHUNK has been semantically
+# applied, its sequence results are recorded, and its apply reservation is
+# released, but before the positive process-bound ACK is sent.  The selected
+# payload must be non-final for that object: it contains no matching SEAL.  The
+# source must reconnect and resend the byte-identical payload; receiver sequence
+# admission must classify every replayed sequence ALREADY_APPLIED and ACK the
+# stable result without re-admitting frames/bytes or reapplying object state.
+#
+# The assigned _w01 stem is retained, but X2 object-flow coverage deliberately
+# adds a 6 MiB W08B payload so this is not control-only.  W08B is used here
+# because persistent-table row bytes are not transfer objects in no-bin mode;
+# the logged cache is the SQL-reachable external object that crosses chunks.
+# Stable replay/fault projections fail hard if the hook ABI is unavailable;
+# no log-only or ACK_UNCERTAIN result is accepted as success.
+
+--let $phase1_ack_case= 1
+--source suite/preserve_trx_transfer_stby/include/run_phase1_ack_connection_w01.inc

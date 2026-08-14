@@ -437,6 +437,10 @@ struct Preserved_trx_bundle {
   bool owns_current_temp_sidecars{false};
 };
 
+/* Conservative heap capacity retained by an in-memory semantic bundle. */
+uint64_t preserved_trx_bundle_capacity_bytes(
+    const Preserved_trx_bundle &bundle);
+
 /* Result of encoding: authenticated snapshot bytes plus blobs to write or adopt. */
 struct Preserved_trx_encoded_bundle {
   std::vector<unsigned char> snapshot_bytes;

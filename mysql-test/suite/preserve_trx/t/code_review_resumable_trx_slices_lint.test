@@ -513,7 +513,7 @@ die "staged-token retry must not bypass dependency gating through the object que
   if $receiver_staged_finish =~ /g_receiver_prewarm_jobs\.push_back/s;
 die "receiver token-local failure injection state must be compiled only with DBUG\n"
   unless $transfer =~
-         /#ifndef DBUG_OFF\s+bool debug_failure_injected\{false\};\s+bool debug_retry_injected\{false\};\s+#endif/s;
+         /#ifndef DBUG_OFF\s+bool debug_failure_injected\{false\};\s+bool debug_retry_injected\{false\};[\s\S]*?bool debug_deadline_delay_injected\{false\};[\s\S]*?bool debug_selection_cleanup_failure_injected\{false\};\s+#endif/s;
 die "receiver partial selection must use O(1) classified and failed token counters\n"
   unless $transfer =~ /classified_fact_token_count/s &&
          $transfer =~ /failed_fact_token_count/s;
@@ -2699,7 +2699,9 @@ die "standby transfer multi-session receiver must serialize process-local sequen
              /preserve_trx_transfer_handle_receiver_payload_batch[\s\S]*begin_payload_sequence[\s\S]*end_payload_sequence[\s\S]*pre_admit_receiver_batch_sequence[\s\S]*preserve_trx_transfer_apply_receiver_frame_batch_with_workers/s;
 die "standby transfer receiver must register same-token apply order before releasing sequence admission and wait only after ACK\n"
   unless $receiver_payload_batch =~
-         /pre_admit_receiver_batch_sequence[\s\S]*reserve_payload_apply[\s\S]*payload_sequence_guard\.rollback[\s\S]*after_admission[\s\S]*wait_for_payload_apply_turn[\s\S]*preserve_trx_transfer_apply_receiver_frame_batch_with_workers/s;
+             /auto release_payload_sequence[\s\S]*payload_sequence_guard\.rollback/s &&
+         $receiver_payload_batch =~
+             /reserve_payload_apply[\s\S]*pre_admit_receiver_batch_sequence[\s\S]*release_payload_sequence[\s\S]*after_admission[\s\S]*wait_for_payload_apply_turn[\s\S]*preserve_trx_transfer_apply_receiver_frame_batch_with_workers/s;
 die "standby transfer wire compatibility must retain the legacy promotion frame identifiers\n"
   unless $transfer_header =~ /PROMOTION_PREWARM_TOKEN/s &&
          $transfer_header =~ /PROMOTION_GATE_EPOCH/s;
@@ -3294,8 +3296,7 @@ die "online NOT_COMMITTED_CLEAN restore must publish SOURCE_RESTORED only after 
   unless $preserve =~
          /standby_transfer_not_committed_clean_restore_failed[\s\S]{0,500}complete_source_restore\(\)[\s\S]{0,300}standby_transfer_not_committed_clean_state_failed/s;
 $preserve =~
-  /finalize_drain_participants_for_terminal_handoff\s*\(
-     \s*"standby_transfer_commit_unknown"\s*\)/sx
+  /finalize_drain_participants_for_terminal_handoff\s*\([\s\S]{0,240}"standby_transfer_commit_unknown"[\s\S]{0,160}\)/s
   or die "COMMIT_UNKNOWN must use terminal-handoff participant finalization\n";
 my $unknown_finalize = index($preserve, $&);
 my $resolution_ready_publish =

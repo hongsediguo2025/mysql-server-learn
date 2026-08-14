@@ -684,6 +684,9 @@ DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_promotion_gate_ready_cache_miss_count,
     preserve_trx_promotion_gate_ready_cache_miss_count_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_promotion_ready_cache_bytes,
+    preserve_trx_promotion_ready_cache_bytes_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_promotion_gate_over_budget_count,
     preserve_trx_promotion_gate_over_budget_count_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
@@ -820,6 +823,30 @@ DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_transfer_receiver_inflight_bytes,
     preserve_trx_transfer_receiver_inflight_bytes_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_staged_memory_bytes,
+    preserve_trx_transfer_receiver_staged_memory_bytes_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_cleanup_retry_completions,
+    preserve_trx_transfer_receiver_cleanup_retry_completions_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_cleanup_debt_tokens,
+    preserve_trx_transfer_receiver_cleanup_debt_tokens_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_cleanup_debt_bytes,
+    preserve_trx_transfer_receiver_cleanup_debt_bytes_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_cleanup_debt_oldest_age_us,
+    preserve_trx_transfer_receiver_cleanup_debt_oldest_age_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_cleanup_debt_max_attempts,
+    preserve_trx_transfer_receiver_cleanup_debt_max_attempts_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_token_metadata_admission_rejects,
+    preserve_trx_transfer_receiver_token_metadata_admission_rejects_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_cleanup_tainted_transitions,
+    preserve_trx_transfer_receiver_cleanup_tainted_transitions_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_transfer_receiver_saved_online_tokens,
     preserve_trx_transfer_receiver_saved_online_tokens_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
@@ -834,6 +861,24 @@ int show_preserve_trx_transfer_receiver_last_failed_reason(THD *,
                                                            char *buf) {
   const std::string reason =
       preserve_trx_transfer_receiver_last_failed_reason_status();
+  var->type = SHOW_CHAR;
+  var->value = buf;
+  strmake(buf, reason.c_str(), SHOW_VAR_FUNC_BUFF_SIZE - 1);
+  return 0;
+}
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_process_generation,
+    preserve_trx_transfer_receiver_process_generation_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_online_epochs,
+    preserve_trx_transfer_receiver_online_epochs_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_nonce_mismatch_rejects,
+    preserve_trx_transfer_receiver_nonce_mismatch_rejects_status())
+int show_preserve_trx_transfer_receiver_last_identity_reject_reason(
+    THD *, SHOW_VAR *var, char *buf) {
+  const std::string reason =
+      preserve_trx_transfer_receiver_last_identity_reject_reason_status();
   var->type = SHOW_CHAR;
   var->value = buf;
   strmake(buf, reason.c_str(), SHOW_VAR_FUNC_BUFF_SIZE - 1);
@@ -873,6 +918,12 @@ DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_transfer_receiver_admitted_bytes,
     preserve_trx_transfer_receiver_admitted_bytes_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_sequence_already_applied,
+    preserve_trx_transfer_receiver_sequence_already_applied_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_after_apply_before_ack_faults,
+    preserve_trx_transfer_receiver_after_apply_before_ack_faults_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_transfer_source_handoff_pending_epochs,
     preserve_trx_transfer_source_handoff_pending_epochs_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
@@ -896,6 +947,18 @@ DEFINE_PRESERVE_TRX_SHOW_FUNC(
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_transfer_receiver_terminal_status_tombstone_expiries,
     preserve_trx_transfer_receiver_terminal_status_tombstone_expiries_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_terminal_status_not_found,
+    preserve_trx_transfer_receiver_terminal_status_not_found_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_precommit_abandon_cleanup_deferred,
+    preserve_trx_transfer_receiver_precommit_abandon_cleanup_deferred_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_precommit_abandon_reaper_attempts,
+    preserve_trx_transfer_receiver_precommit_abandon_reaper_attempts_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_precommit_abandon_reaper_completions,
+    preserve_trx_transfer_receiver_precommit_abandon_reaper_completions_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_transfer_quarantine_epochs,
     preserve_trx_transfer_quarantine_epochs_status())
@@ -1037,6 +1100,9 @@ DEFINE_PRESERVE_TRX_SHOW_FUNC(
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_transfer_receiver_epoch_ready_bind_attempts,
     preserve_trx_transfer_receiver_epoch_ready_bind_attempts_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_read_view_horizon_rejects,
+    preserve_trx_transfer_receiver_read_view_horizon_rejects_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_transfer_phase2_bulk_bytes,
                               preserve_trx_transfer_phase2_bulk_bytes_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
@@ -1132,6 +1198,10 @@ DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_memory_current_bytes,
                               preserve_trx_memory_current_bytes_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_memory_peak_bytes,
                               preserve_trx_memory_peak_bytes_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_promotion_semantic_bundle_bytes,
+    preserve_trx_resource_kind_current_bytes(
+        Preserve_trx_memory_kind::PROMOTION_SEMANTIC_BUNDLE))
 DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_spill_bytes,
                               preserve_trx_spill_bytes_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_spill_failures,

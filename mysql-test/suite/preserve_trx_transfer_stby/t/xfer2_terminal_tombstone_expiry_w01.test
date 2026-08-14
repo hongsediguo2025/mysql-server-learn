@@ -1,0 +1,22 @@
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+# X6-12 / W04 / O01 / O02 / O10 / T1 terminal-only debug-contract / I05 / I06
+#
+# The receiver clamps terminal retention to at least 60 seconds and mysqltest
+# cannot issue an authenticated QUERY_EPOCH_STATUS frame.  The cnf therefore
+# enables narrow debug-only COMMIT-query and receiver reaper-clock hooks.  They
+# establish one
+# authenticated COMMITTED query before expiry, pause the source, advance the
+# receiver reaper through terminal/accepted retention, and reissue the same
+# authenticated query.  The first query observes one retained READY W04 epoch;
+# the future-clock reaper must release its prepared/cache/memory state back to
+# baseline before returning NOT_FOUND.  All waits are bounded; this test never
+# waits out the production 60-second retention interval.  The fail-hard
+# projection preflight prevents a missing NOT_FOUND metric from timing out as a
+# generic wait failure.
+
+--let $terminal_cas_case= 3
+--source suite/preserve_trx_transfer_stby/include/run_terminal_cas_w01.inc

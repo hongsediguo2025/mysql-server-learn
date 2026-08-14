@@ -1,0 +1,291 @@
+# X1-07 / W01 / O01 / O02 / T1
+# The receiver account authenticates successfully but lacks
+# PRESERVE_TRX_TRANSFER_ADMIN. Rejection must happen before frame admission,
+# while the original InnoDB transaction and its locks remain source-owned.
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+--disable_query_log
+--let $credential_file= $MYSQL_TMP_DIR/xfer2-auth-missing-privilege.secret
+--write_file $credential_file
+xfer2-auth-missing-privilege-secret
+EOF
+--exec chmod 600 $credential_file
+
+--connect(xfer2_auth_receiver,127.0.0.1,root,,test,$SERVER_MYPORT_2,)
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_auth_receiver@localhost;
+DROP TABLE IF EXISTS xfer2_auth_receiver_native;
+--enable_warnings
+CREATE USER preserve_trx_auth_receiver@localhost
+  IDENTIFIED BY 'xfer2-auth-missing-privilege-secret';
+# Deliberately omit PRESERVE_TRX_TRANSFER_ADMIN.
+GRANT SELECT ON performance_schema.* TO preserve_trx_auth_receiver@localhost;
+CREATE TABLE xfer2_auth_receiver_native(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO xfer2_auth_receiver_native VALUES(1,10);
+
+SET @receiver_admitted_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_admitted_frames');
+SET @receiver_active_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs');
+SET @receiver_inflight_tokens_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens');
+SET @receiver_inflight_bytes_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes');
+SET @receiver_staged_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes');
+SET @receiver_terminal_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins');
+SET @receiver_tombstones_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_status_tombstones');
+SET @receiver_prepared_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens');
+SET @receiver_ready_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_ready_tokens');
+--let $receiver_connection= xfer2_auth_receiver
+--source suite/preserve_trx_transfer_stby/include/capture_receiver_admission_extras.inc
+
+--connection default
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+DROP USER IF EXISTS xfer2_auth_app@localhost;
+DROP TABLE IF EXISTS xfer2_auth_audit;
+DROP TABLE IF EXISTS xfer2_auth_accounts;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'xfer2-auth-missing-privilege-secret';
+GRANT SHUTDOWN, SYSTEM_VARIABLES_ADMIN, PROCESS,
+      PRESERVE_TRX_TRANSFER_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+CREATE USER xfer2_auth_app@localhost;
+GRANT SELECT, INSERT, UPDATE, DELETE ON test.* TO xfer2_auth_app@localhost;
+
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$SERVER_MYPORT_2 --rds-preserve-trx-transfer-target-user=preserve_trx_auth_receiver --rds-preserve-trx-transfer-credential-name=xfer2_auth_missing_privilege --rds-preserve-trx-transfer-credential-secret-file=$credential_file
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--let $restart_parameters=
+
+CALL mtr.add_suppression(
+  "PRESERVE: standby transfer client send failed errno=1227");
+CALL mtr.add_suppression(
+  "PRESERVE: standby transfer OPEN_EPOCH failed status=9");
+
+CREATE TABLE xfer2_auth_accounts(
+  id INT PRIMARY KEY,
+  balance INT NOT NULL,
+  version INT NOT NULL DEFAULT 0,
+  pad VARCHAR(64) NOT NULL
+) ENGINE=InnoDB;
+CREATE TABLE xfer2_auth_audit(
+  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  account_id INT NOT NULL,
+  delta INT NOT NULL,
+  KEY(account_id)
+) ENGINE=InnoDB;
+INSERT INTO xfer2_auth_accounts
+WITH RECURSIVE seq(n) AS (
+  SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<32
+)
+SELECT n,1000,0,CONCAT('account-',n) FROM seq;
+
+--connect(xfer2_auth_source_ha,localhost,preserve_trx_ha_admin,xfer2-auth-missing-privilege-secret,test)
+--connect(xfer2_auth_owner,localhost,xfer2_auth_app,,test)
+--let $owner_connection_id= query_get_value(SELECT CONNECTION_ID() AS id,id,1)
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+--enable_query_log
+SELECT balance=1000 AND version=0 AS owner_rr_initial
+  FROM xfer2_auth_accounts WHERE id=32;
+--disable_query_log
+
+--connect(xfer2_auth_outsider,localhost,root,,test)
+UPDATE xfer2_auth_accounts
+   SET balance=balance+1,version=version+1 WHERE id=32;
+
+--connection xfer2_auth_owner
+--enable_query_log
+SELECT balance=1000 AND version=0 AS owner_rr_repeatable
+  FROM xfer2_auth_accounts WHERE id=32;
+--disable_query_log
+UPDATE xfer2_auth_accounts
+   SET balance=balance-7,version=version+1 WHERE id=3;
+UPDATE xfer2_auth_accounts
+   SET balance=balance+4,version=version+1 WHERE id=7;
+UPDATE xfer2_auth_accounts
+   SET balance=balance+3,version=version+1 WHERE id=11;
+INSERT INTO xfer2_auth_audit(account_id,delta) VALUES(3,0);
+
+--connection xfer2_auth_outsider
+--enable_query_log
+SELECT COUNT(*)=32 AS outsider_row_count,
+       SUM(balance)=32001 AS outsider_sees_background_only,
+       SUM(version)=1 AS outsider_hides_owner_versions,
+       SUM(id IN (3,7,11) AND version<>0)=0 AS owner_rows_not_dirty
+  FROM xfer2_auth_accounts;
+SELECT COUNT(*)=0 AS owner_audit_not_dirty FROM xfer2_auth_audit;
+--disable_query_log
+
+--connect(xfer2_auth_waiter,localhost,root,,test)
+SET SESSION innodb_lock_wait_timeout=60;
+--let $waiter_connection_id= query_get_value(SELECT CONNECTION_ID() AS id,id,1)
+--send UPDATE xfer2_auth_accounts SET balance=balance+10,version=version+1 WHERE id=3
+
+--connection default
+--let $wait_condition= SELECT COUNT(*)=1 FROM performance_schema.data_lock_waits w JOIN performance_schema.threads t ON t.THREAD_ID=w.REQUESTING_THREAD_ID WHERE t.PROCESSLIST_ID=$waiter_connection_id
+--let $wait_timeout= 10
+--source include/wait_condition_or_abort.inc
+--replace_result $waiter_connection_id WAITER_ID
+--enable_query_log
+--eval SELECT COUNT(*)=1 AS waiter_blocked_before_drain FROM performance_schema.data_lock_waits w JOIN performance_schema.threads t ON t.THREAD_ID=w.REQUESTING_THREAD_ID WHERE t.PROCESSLIST_ID=$waiter_connection_id
+--error ER_PRESERVE_TRX_UNSUPPORTED
+DRAIN TRANSACTIONS PRESERVE;
+--replace_result $waiter_connection_id WAITER_ID
+--eval SELECT COUNT(*)=1 AS waiter_still_blocked_after_rejection FROM performance_schema.data_lock_waits w JOIN performance_schema.threads t ON t.THREAD_ID=w.REQUESTING_THREAD_ID WHERE t.PROCESSLIST_ID=$waiter_connection_id
+--disable_query_log
+
+--connection xfer2_auth_receiver
+--enable_query_log
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_admitted_frames')
+         =@receiver_admitted_before AS no_frame_admitted,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')
+         =@receiver_active_before AS no_receiver_epoch,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')
+         =@receiver_inflight_tokens_before AS no_inflight_token,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')
+         =@receiver_inflight_bytes_before AS no_inflight_byte,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes')
+         =@receiver_staged_before AS no_staged_memory;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins')
+         =@receiver_terminal_before AS no_terminal_fact,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_status_tombstones')
+         =@receiver_tombstones_before AS no_terminal_tombstone,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')
+         =@receiver_prepared_before AS no_prepared_entry,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_ready_tokens')
+         =@receiver_ready_before AS no_ready_token;
+--let $receiver_connection= xfer2_auth_receiver
+--source suite/preserve_trx_transfer_stby/include/assert_receiver_admission_extras_unchanged.inc
+--source suite/preserve_trx_transfer_stby/include/assert_receiver_quiescent.inc
+START TRANSACTION;
+UPDATE xfer2_auth_receiver_native SET v=v+1 WHERE id=1;
+COMMIT;
+SELECT v=11 AS receiver_native_dml_works
+  FROM xfer2_auth_receiver_native WHERE id=1;
+--disable_query_log
+
+--connection default
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+
+--connection xfer2_auth_owner
+--enable_query_log
+--replace_result $owner_connection_id OWNER_ID
+SELECT CONNECTION_ID() AS same_owner_connection_after_rejection;
+SELECT balance=1000 AND version=0 AS owner_rr_survives_rejection
+  FROM xfer2_auth_accounts WHERE id=32;
+UPDATE xfer2_auth_accounts SET pad=CONCAT(pad,'-continued') WHERE id=11;
+SELECT ROW_COUNT()=1 AS owner_can_continue_dml;
+COMMIT;
+--disable_query_log
+
+--connection xfer2_auth_waiter
+--reap
+
+--connection xfer2_auth_outsider
+--enable_query_log
+SELECT COUNT(*)=32 AS final_row_count,
+       SUM(balance)=32011 AS final_balance_once,
+       SUM(version)=5 AS final_version_once,
+       SUM(id IN (3,7,11,32) AND version>0)=4 AS exact_changed_rows,
+       MAX(CASE WHEN id=3 THEN version END)=2 AS waiter_ran_once,
+       MAX(CASE WHEN id=11 THEN pad END)='account-11-continued'
+         AS continued_owner_dml_persisted
+  FROM xfer2_auth_accounts;
+SELECT COUNT(*)=1 AND SUM(delta)=0 AS one_owner_audit
+  FROM xfer2_auth_audit;
+CHECK TABLE xfer2_auth_accounts,xfer2_auth_audit;
+--disable_query_log
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+
+--let $assert_text= runtime transfer privilege rejection reached the receiver command gate
+--let $assert_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--let $assert_select= PRESERVE: standby transfer client send failed errno=1227.*PRESERVE_TRX_TRANSFER_ADMIN
+--let $assert_count_condition= >= 1
+--source include/assert_grep.inc
+--let $assert_count_condition=
+
+--let $assert_text= transfer credential is absent from source error log
+--let $assert_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--let $assert_select= xfer2-auth-missing-privilege-secret
+--let $assert_count_condition= == 0
+--source include/assert_grep.inc
+--let $assert_count_condition=
+
+--let $assert_text= transfer credential is absent from receiver error log
+--let $assert_file= $MYSQLTEST_VARDIR/log/mysqld.2.err
+--let $assert_select= xfer2-auth-missing-privilege-secret
+--let $assert_count_condition= == 0
+--source include/assert_grep.inc
+--let $assert_count_condition=
+
+--connection xfer2_auth_source_ha
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+SHUTDOWN;
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+--connect(xfer2_auth_cleanup,localhost,root,,test)
+--enable_query_log
+SELECT SUM(balance)=32011 AND SUM(version)=5 AS source_restart_keeps_final_data
+  FROM xfer2_auth_accounts;
+SELECT COUNT(*)=1 AS source_restart_keeps_one_audit FROM xfer2_auth_audit;
+--disable_query_log
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+DROP TABLE xfer2_auth_audit;
+DROP TABLE xfer2_auth_accounts;
+DROP USER xfer2_auth_app@localhost;
+DROP USER preserve_trx_ha_admin@localhost;
+
+--connection xfer2_auth_receiver
+DROP TABLE xfer2_auth_receiver_native;
+DROP USER preserve_trx_auth_receiver@localhost;
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.2.expect
+--shutdown_server
+--source include/wait_until_disconnected.inc
+--exec echo "restart:" > $MYSQLTEST_VARDIR/tmp/mysqld.2.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+--source suite/preserve_trx_transfer_stby/include/assert_receiver_restart_clean.inc
+
+--connection xfer2_auth_cleanup
+--remove_file $credential_file
+--disconnect xfer2_auth_waiter
+--disconnect xfer2_auth_outsider
+--disconnect xfer2_auth_owner
+--disconnect xfer2_auth_source_ha
+--enable_query_log

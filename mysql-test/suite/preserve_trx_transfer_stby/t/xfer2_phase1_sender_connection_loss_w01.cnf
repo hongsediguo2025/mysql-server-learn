@@ -1,0 +1,17 @@
+!include ../my.cnf
+
+[mysqld.1]
+log-bin=preserve-trx-phase1-connection-loss-bin
+binlog-format=ROW
+gtid-mode=ON
+enforce-gtid-consistency=ON
+max_allowed_packet=67108864
+rds-preserve-trx-transfer-runtime-profile=BUSINESS_FIRST
+
+[mysqld.2]
+skip-log-bin
+max_allowed_packet=67108864
+# Debug ABI.  The selector closes exactly one receiver data connection
+# after an applied batch with OBJECT_CHUNK data but before that object's SEAL;
+# it must not match OPEN, DECLARE, a final chunk+SEAL batch, or terminal frames.
+debug=d,preserve_trx_transfer_receiver_after_frame_apply_before_ack,preserve_trx_transfer_receiver_disconnect_nonfinal_object_batch_once

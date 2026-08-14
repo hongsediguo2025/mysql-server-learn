@@ -1,0 +1,14 @@
+!include ../my.cnf
+
+[mysqld.1]
+# If the obsolete token-ABORT-first ordering is restored, both ABORT responses
+# become uncertain and occupy the data session, so the terminal epoch ABANDON
+# cannot be sent and the online cleanup assertions fail.
+debug=d,preserve_trx_transfer_drop_abort_ack
+
+[mysqld.2]
+# The first accepted token receives a debug-only extra 512-byte metadata
+# lease. With a 2048-byte cap, its 1536-byte reservation leaves less than one
+# complete 1024-byte DECLARE lease for the late token.
+rds-preserve-trx-transfer-max-inflight-bytes=2048
+debug=d,preserve_trx_receiver_expand_first_declared_token_lease

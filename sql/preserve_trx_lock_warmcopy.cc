@@ -2944,15 +2944,53 @@ bool Preserve_trx_lock_warmcopy_drain_participant::
 
   std::vector<uint64_t> target_ids;
   std::vector<uint64_t> prebuilt_target_ids;
+  std::vector<uint64_t> record_store_prebuilt_target_ids;
   lock_warmcopy_record_store_target_ids(&target_ids);
   for (const uint64_t target_id : target_ids) {
     if (target_id == 0) continue;
 
     std::string record_locks_payload;
     uint32_t record_lock_count = 0;
-    if (!lock_warmcopy_record_store_export_record_payload_for_target(
-            target_id, &record_locks_payload, &record_lock_count) ||
-        record_locks_payload.empty()) {
+    const bool store_exported =
+        lock_warmcopy_record_store_export_record_payload_for_target(
+            target_id, &record_locks_payload, &record_lock_count);
+    if (!store_exported) {
+      /*
+        A stable-page phase-1 seed deliberately omits record images, so the
+        generic store exporter cannot rebuild its bytes. Retain that prebuilt
+        candidate only while its exact store fence is still current; every
+        other export failure keeps the existing fail-safe invalidation.
+      */
+      auto target_it = m_targets.find(target_id);
+      lock_warmcopy_record_store_fence_t current_store_fence;
+      const bool retain_compact_prebuilt =
+          target_it != m_targets.end() &&
+          target_it->second.record_locks_candidate_valid &&
+          target_it->second.record_locks_seeded_in_phase1 &&
+          target_it->second.has_phase1_record_prebuilt_blob &&
+          target_it->second.phase1_record_prebuilt_fence_valid &&
+          !target_it->second.phase1_record_prebuilt_blob.warmcopy_id.empty() &&
+          target_it->second.phase1_record_prebuilt_blob.size != 0 &&
+          lock_warmcopy_record_store_fence_for_target(
+              target_id, &current_store_fence) &&
+          lock_warmcopy_record_store_fence_equal(
+              target_it->second.phase1_record_prebuilt_fence,
+              current_store_fence);
+      if (retain_compact_prebuilt) {
+        prebuilt_target_ids.push_back(target_id);
+      } else {
+        (void)seed_phase1_record_payload_for_thread(target_id, std::string());
+      }
+      continue;
+    }
+    if (record_locks_payload.empty()) {
+      /*
+        A successfully exported empty store has no live record-lock bits.
+        Invalidate its phase-1 candidate through the participant helper before
+        pruning the store, so a concurrent late hook can only force the final
+        target onto the live-export fallback.
+      */
+      (void)seed_phase1_record_payload_for_thread(target_id, std::string());
       continue;
     }
     if (!seed_phase1_record_payload_for_thread(target_id,
@@ -2960,16 +2998,19 @@ bool Preserve_trx_lock_warmcopy_drain_participant::
       lock_warmcopy_record_store_clear_for_target(target_id);
     } else {
       prebuilt_target_ids.push_back(target_id);
+      record_store_prebuilt_target_ids.push_back(target_id);
     }
   }
-  if (!target_ids.empty() && Global_THD_manager::get_instance() != nullptr) {
-    const std::set<uint64_t> skip_record_export_thread_ids(target_ids.begin(),
-                                                           target_ids.end());
+  if (!prebuilt_target_ids.empty() &&
+      Global_THD_manager::get_instance() != nullptr) {
+    const std::set<uint64_t> skip_record_export_thread_ids(
+        prebuilt_target_ids.begin(), prebuilt_target_ids.end());
     Lock_warmcopy_target_fence_sampler non_record_sampler(
-        target_ids, m_options.max_lock_count, skip_record_export_thread_ids);
+        prebuilt_target_ids, m_options.max_lock_count,
+        skip_record_export_thread_ids);
     Global_THD_manager::get_instance()->do_for_all_thd_copy(
         &non_record_sampler);
-    for (const uint64_t target_id : target_ids) {
+    for (const uint64_t target_id : prebuilt_target_ids) {
       auto target_it = m_targets.find(target_id);
       if (target_it != m_targets.end()) {
         target_it->second.phase1_record_live_fence_valid =
@@ -3002,7 +3043,7 @@ bool Preserve_trx_lock_warmcopy_drain_participant::
     }
   }
   if (blob_ready) {
-    for (const uint64_t target_id : prebuilt_target_ids) {
+    for (const uint64_t target_id : record_store_prebuilt_target_ids) {
       PrebuiltRecordLocksBlob blob;
       if (!phase1_record_prebuilt_blob_for_thread(target_id, &blob) ||
           !blob_ready(target_id, blob)) {

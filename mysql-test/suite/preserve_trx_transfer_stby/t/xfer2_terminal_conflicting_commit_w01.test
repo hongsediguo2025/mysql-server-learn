@@ -1,0 +1,20 @@
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+# X6-03 / W04 / O01 / O02 / O10 / T1 debug-contract / I05 / I06
+#
+# mysqltest cannot construct a second COMMIT_EPOCH frame with the same
+# epoch/operation/sequence and a different terminal fact digest.  The cnf
+# enables debug-only source transport hooks: lose the first successful COMMIT
+# ACK, let the transport first complete
+# its built-in byte-identical retry, then submit one additional copy with only
+# terminal fact digest changed.  The same contract must issue the pinned
+# original-digest authenticated status query after that rejection.  The
+# conflicting send is a diagnostic probe: DRAIN returns the authenticated
+# original COMMITTED result, not the probe error, and the original W04 epoch
+# remains the sole READY/prepared/cache publication.
+
+--let $terminal_cas_case= 2
+--source suite/preserve_trx_transfer_stby/include/run_terminal_cas_w01.inc

@@ -320,6 +320,11 @@ dberr_t trx_preserve_debug_replace_current_thd_read_view(
     THD *thd, const std::string &payload);
 bool trx_preserve_read_view_payload_is_valid_for_import(
     const std::string &payload);
+bool trx_preserve_read_view_payload_semantics_are_valid(
+    const std::string &payload, uint64_t expected_low_limit_no,
+    uint64_t expected_creator_trx_id = 0);
+bool trx_preserve_read_view_payload_fits_source_horizon(
+    const std::string &payload, uint64_t source_safe_next_trx_id_floor);
 dberr_t trx_preserve_export_record_locks(trx_t *trx, std::string *payload);
 dberr_t trx_preserve_export_record_locks(trx_t *trx, std::string *payload,
                                          uint32_t max_lock_count);

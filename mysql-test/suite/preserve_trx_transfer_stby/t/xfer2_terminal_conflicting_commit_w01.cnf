@@ -1,0 +1,17 @@
+!include ../my.cnf
+
+[mysqld.1]
+skip-log-bin
+rds-preserve-trx-transfer-runtime-profile=BUSINESS_FIRST
+max_allowed_packet=67108864
+# Debug-contract source fault and diagnostic transport probe.
+# First make the accepted COMMIT ACK invisible.  Let the normal byte-identical
+# retry complete successfully, then send one extra same-epoch/operation/sequence
+# copy with only terminal_fact_digest changed.  After its rejection issue an
+# authenticated QUERY_EPOCH_STATUS from the pinned original bytes; signal only
+# after it returns the original COMMITTED result, which remains DRAIN's result.
+debug=d,preserve_trx_transfer_drop_commit_ack_once,preserve_trx_transfer_send_conflicting_commit_after_exact_retry,preserve_trx_transfer_query_original_commit_after_conflict
+
+[mysqld.2]
+skip-log-bin
+max_allowed_packet=67108864

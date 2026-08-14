@@ -1,0 +1,5 @@
+!include ../my.cnf
+
+[mysqld.2]
+#!use-slave-opt
+rds-preserve-trx-enable=OFF

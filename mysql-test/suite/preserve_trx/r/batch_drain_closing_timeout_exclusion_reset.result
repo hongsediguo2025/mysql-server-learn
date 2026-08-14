@@ -6,7 +6,7 @@ survivor_was_staged
 1
 excluded_old_command
 2
-ERROR HY000: DRAIN TRANSACTIONS PRESERVE was reset before shutdown handoff
+ERROR HY000: DRAIN TRANSACTIONS PRESERVE was reset before ownership became irreversible
 SELECT GROUP_CONCAT(CONCAT(id, ':', v) ORDER BY id) AS committed_values
 FROM t_closing_timeout_exclusion_reset;
 committed_values

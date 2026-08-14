@@ -1,0 +1,7 @@
+!include ../my.cnf
+
+[mysqld.1]
+debug=d,preserve_trx_receiver_delay_one_token_past_deadline,preserve_trx_receiver_fail_cleanup_until_tainted,preserve_trx_receiver_cleanup_retry_fast,preserve_trx_receiver_cleanup_tainted_retry_fast
+
+[ENV]
+SERVER_MYPORT_1=@mysqld.1.port

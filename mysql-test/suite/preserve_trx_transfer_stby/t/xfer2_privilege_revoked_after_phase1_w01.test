@@ -1,0 +1,514 @@
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+# X1-08 / W01 / O01 / O02 / T1 debug-contract
+# I03/I04: receiver admits no COMMIT, while the source keeps the original
+# transaction fenced behind authenticated COMMIT_UNKNOWN resolution.
+# I09 (process-local subset): receiver restart invalidates observed inflight,
+# staging, prepared, and cache state; this case makes no promotion-lease claim.
+# I10: failed terminal delivery is visible as source quarantine and retained
+# receiver process-local staging; it is never reported as clean.
+# I14/I15: process-local residue is measured before restart and zero afterward.
+# Revoke the authenticated receiver principal after phase1, Phase2 object
+# catch-up, and final-metadata admission, but before COMMIT. The COMMIT command
+# must fail before receiver admission. The original source owner remains
+# conservatively fenced while receiver restart retires the already staged
+# process-local state.
+
+--source suite/preserve_trx_transfer_stby/include/w01_setup.inc
+CALL mtr.add_suppression(
+  "PRESERVE: standby transfer client send failed errno=1227");
+CALL mtr.add_suppression(
+  "PRESERVE: standby transfer source entered COMMIT_UNKNOWN");
+
+--connection xfer2_receiver
+--disable_warnings
+DROP TABLE IF EXISTS xfer2_revoke_receiver_native;
+--enable_warnings
+CREATE TABLE xfer2_revoke_receiver_native(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO xfer2_revoke_receiver_native VALUES(1,40),(2,60);
+SET @active_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_active_epochs');
+SET @admitted_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_admitted_frames');
+SET @admitted_bytes_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_admitted_bytes');
+SET @inflight_tokens_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_inflight_tokens');
+SET @inflight_bytes_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_inflight_bytes');
+SET @staged_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_staged_memory_bytes');
+SET @cleanup_debt_tokens_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_cleanup_debt_tokens');
+SET @cleanup_debt_bytes_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_cleanup_debt_bytes');
+SET @cleanup_tainted_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_cleanup_tainted_transitions');
+SET @terminal_wins_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_terminal_cas_wins');
+SET @tombstones_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_terminal_status_tombstones');
+SET @saved_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_saved_online_tokens');
+SET @prepared_registered_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_promotion_prepared_registered_tokens');
+SET @prepared_pending_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_promotion_prepared_prewarm_pending_tokens');
+SET @prepared_ready_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_promotion_prepared_ready_tokens');
+SET @ready_cache_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_promotion_ready_cache_bytes');
+SET @memory_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_memory_current_bytes');
+
+--connection xfer2_source_ha
+--let $old_phase2_timeout= `SELECT @@GLOBAL.rds_preserve_trx_drain_phase2_timeout_ms`
+SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms=5000;
+SET @reset_wins_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_reset_drain_wins');
+SET @reset_too_late_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_reset_drain_too_late');
+SET @quarantine_epochs_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_quarantine_epochs');
+SET @quarantine_tokens_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_quarantine_tokens');
+
+--connect(xfer2_revoke_owner,localhost,xfer2_w01_app,,test)
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+--enable_query_log
+SELECT balance=1000 AND version=0 AS owner_rr_initial
+  FROM xfer2_w01_accounts WHERE id=32;
+--disable_query_log
+UPDATE xfer2_w01_accounts
+   SET balance=balance-29,version=version+1 WHERE id=3;
+UPDATE xfer2_w01_accounts
+   SET balance=balance+17,version=version+1 WHERE id=7;
+UPDATE xfer2_w01_accounts
+   SET balance=balance+12,version=version+1 WHERE id=11;
+INSERT INTO xfer2_w01_audit(account_id,delta) VALUES(3,0);
+
+--connect(xfer2_revoke_outsider,localhost,root,,test)
+UPDATE xfer2_w01_accounts
+   SET balance=balance+1,version=version+1 WHERE id=32;
+
+--connection xfer2_revoke_owner
+--enable_query_log
+SELECT balance=1000 AND version=0 AS owner_rr_stays_old
+  FROM xfer2_w01_accounts WHERE id=32;
+SELECT SUM(balance)=3000 AND SUM(version)=3 AS owner_sees_three_writes
+  FROM xfer2_w01_accounts WHERE id IN (3,7,11);
+SELECT COUNT(*)=1 AND SUM(delta)=0 AS owner_sees_one_audit
+  FROM xfer2_w01_audit;
+--disable_query_log
+
+--connection xfer2_revoke_outsider
+--enable_query_log
+SELECT COUNT(*)=32 AS outsider_row_count,
+       SUM(balance)=32001 AS outsider_sees_background_only,
+       SUM(version)=1 AS outsider_hides_owner_versions,
+       SUM(id IN (3,7,11) AND version<>0)=0 AS owner_rows_not_dirty
+  FROM xfer2_w01_accounts;
+SELECT COUNT(*)=0 AS owner_audit_not_dirty FROM xfer2_w01_audit;
+--disable_query_log
+
+--connect(xfer2_revoke_waiter,localhost,root,,test)
+SET SESSION innodb_lock_wait_timeout=3600;
+--let $waiter_id= query_get_value(SELECT CONNECTION_ID() AS id,id,1)
+--send UPDATE xfer2_w01_accounts SET balance=balance+10,version=version+1 WHERE id=3
+
+--connection default
+--let $wait_condition= SELECT COUNT(*)=1 FROM performance_schema.data_lock_waits w JOIN performance_schema.threads t ON t.THREAD_ID=w.REQUESTING_THREAD_ID WHERE t.PROCESSLIST_ID=$waiter_id
+--let $wait_timeout= 10
+--source include/wait_condition_or_abort.inc
+--replace_result $waiter_id WAITER_ID
+--enable_query_log
+--eval SELECT COUNT(*)=1 AS waiter_blocked_before_drain FROM performance_schema.data_lock_waits w JOIN performance_schema.threads t ON t.THREAD_ID=w.REQUESTING_THREAD_ID WHERE t.PROCESSLIST_ID=$waiter_id
+--disable_query_log
+
+--connect(xfer2_revoke_drain,localhost,root,,test)
+SET DEBUG_SYNC=
+  'preserve_trx_after_final_metadata_accepted_local SIGNAL xfer2_revoke_phase1_done WAIT_FOR xfer2_revoke_release';
+--send DRAIN TRANSACTIONS PRESERVE
+
+--connection xfer2_source_ha
+SET DEBUG_SYNC='now WAIT_FOR xfer2_revoke_phase1_done TIMEOUT 60';
+--enable_query_log
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+          'Preserve_trx_transfer_source_handoff_pending_epochs')=0
+         AS no_handoff_pending_at_final_metadata_boundary,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+          'Preserve_trx_transfer_source_commit_unknown_epochs')=0
+         AS no_commit_unknown_at_final_metadata_boundary;
+--disable_query_log
+
+# All phase1 work, Phase2 object catch-up, and final metadata precede this
+# boundary, while terminal COMMIT remains later. A fail-hard receiver wait
+# excludes scheduling-only observations.
+--connection xfer2_receiver
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')>@inflight_tokens_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')>@inflight_bytes_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes')>@staged_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')=@prepared_registered_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_prewarm_pending_tokens')=@prepared_pending_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_ready_tokens')=@prepared_ready_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_ready_cache_bytes')>@ready_cache_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_memory_current_bytes')>@memory_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_worker_active')=0 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_queued_bytes')=0
+--let $wait_timeout= 30
+--source include/wait_condition_or_abort.inc
+--enable_query_log
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_admitted_frames')
+         >@admitted_before AS phase1_frames_admitted_before_revoke,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')
+         >@inflight_tokens_before AS phase1_tokens_accounted_before_revoke,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')
+         >@inflight_bytes_before AS phase1_bytes_accounted_before_revoke,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes')
+         >@staged_before AS phase1_payload_staged_before_revoke;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')
+         =@active_before AS no_commit_at_phase_boundary,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins')
+         =@terminal_wins_before AS no_terminal_cas_at_phase_boundary,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+          'Preserve_trx_transfer_receiver_terminal_status_tombstones')
+         =@tombstones_before AS no_terminal_tombstone_at_phase_boundary;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')
+         =@prepared_registered_before+1 AS prepared_state_staged_before_revoke,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+          'Preserve_trx_promotion_prepared_prewarm_pending_tokens')
+         =@prepared_pending_before+1 AS prewarm_pending_before_revoke,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_ready_tokens')
+         =@prepared_ready_before AS no_ready_token_before_commit,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_promotion_ready_cache_bytes')
+         >@ready_cache_before AS ready_cache_staged_before_revoke,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_memory_current_bytes')
+         >@memory_before AS preserve_memory_staged_before_revoke;
+--disable_query_log
+SET @admitted_at_revoke=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_admitted_frames');
+SET @admitted_bytes_at_revoke=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_admitted_bytes');
+SET @inflight_tokens_at_revoke=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_inflight_tokens');
+SET @inflight_bytes_at_revoke=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_inflight_bytes');
+SET @staged_at_revoke=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_staged_memory_bytes');
+SET @prepared_registered_at_revoke=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_promotion_prepared_registered_tokens');
+SET @prepared_pending_at_revoke=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_promotion_prepared_prewarm_pending_tokens');
+SET @prepared_ready_at_revoke=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_promotion_prepared_ready_tokens');
+SET @ready_cache_at_revoke=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_promotion_ready_cache_bytes');
+SET @memory_at_revoke=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_memory_current_bytes');
+REVOKE PRESERVE_TRX_TRANSFER_ADMIN ON *.*
+  FROM preserve_trx_ha_admin@localhost;
+
+--connection xfer2_revoke_owner
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT 1;
+
+--connection xfer2_source_ha
+--replace_result $waiter_id WAITER_ID
+--enable_query_log
+--eval SELECT COUNT(*)=1 AS waiter_blocked_at_phase_boundary FROM performance_schema.data_lock_waits w JOIN performance_schema.threads t ON t.THREAD_ID=w.REQUESTING_THREAD_ID WHERE t.PROCESSLIST_ID=$waiter_id
+--disable_query_log
+
+SET DEBUG_SYNC='now SIGNAL xfer2_revoke_release';
+
+--connection xfer2_revoke_drain
+--error ER_PRESERVE_TRX_UNSUPPORTED
+--reap
+SET DEBUG_SYNC='RESET';
+
+# The receiver privilege gate precedes decoding and sequence admission. No
+# frame, terminal fact, cleanup command, or READY publication may pass after
+# REVOKE; the earlier staged state remains explicit process-local residue.
+--connection xfer2_receiver
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_worker_active')=0 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_queued_bytes')=0
+--let $wait_timeout= 30
+--source include/wait_condition_or_abort.inc
+--enable_query_log
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_admitted_frames')
+         =@admitted_at_revoke AS no_post_revoke_frame_admitted,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_admitted_bytes')
+         =@admitted_bytes_at_revoke AS no_post_revoke_byte_admitted,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')
+         =@active_before AS no_committed_receiver_epoch,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins')
+         =@terminal_wins_before AS no_terminal_cas,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+          'Preserve_trx_transfer_receiver_terminal_status_tombstones')
+         =@tombstones_before AS no_terminal_tombstone;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')
+         =@inflight_tokens_at_revoke AS precommit_token_ledger_retained,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')
+         =@inflight_bytes_at_revoke AS precommit_byte_ledger_retained,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes')
+         =@staged_at_revoke AS staged_payload_retained,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_tokens')
+         =@cleanup_debt_tokens_before AS rejected_cleanup_created_no_false_debt,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_bytes')
+         =@cleanup_debt_bytes_before AS rejected_cleanup_created_no_false_debt_bytes,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+          'Preserve_trx_transfer_receiver_cleanup_tainted_transitions')
+         =@cleanup_tainted_before AS rejected_cleanup_created_no_false_taint;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+          'Preserve_trx_transfer_receiver_saved_online_tokens')
+         =@saved_before AS no_saved_online_token,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')
+         =@prepared_registered_at_revoke AS prepared_registration_retained,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+          'Preserve_trx_promotion_prepared_prewarm_pending_tokens')
+         =@prepared_pending_at_revoke AS prewarm_pending_retained,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_ready_tokens')
+         =@prepared_ready_at_revoke AS no_ready_publication_after_revoke,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_promotion_ready_cache_bytes')
+         =@ready_cache_at_revoke AS ready_cache_retained,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_memory_current_bytes')
+         =@memory_at_revoke AS preserve_memory_retained;
+GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.*
+  TO preserve_trx_ha_admin@localhost;
+START TRANSACTION;
+UPDATE xfer2_revoke_receiver_native SET v=v+id;
+COMMIT;
+SELECT SUM(v)=103 AS receiver_native_dml_works
+  FROM xfer2_revoke_receiver_native;
+--disable_query_log
+
+# COMMIT crossed the source ownership send barrier. Although the receiver gate
+# rejected it before admission, the source transport classifies the response as
+# uncertain and must retain a fenced quarantine until authoritative resolution.
+--connection xfer2_source_ha
+--eval SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms=$old_phase2_timeout
+--enable_query_log
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+          'Preserve_trx_transfer_source_handoff_pending_epochs')=0
+         AS no_handoff_pending_after_rejection,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+          'Preserve_trx_transfer_source_commit_unknown_epochs')=1
+         AS one_commit_unknown_epoch,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_quarantine_epochs')
+         =@quarantine_epochs_before+1 AS one_quarantine_epoch,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_quarantine_tokens')
+         =@quarantine_tokens_before+1 AS one_quarantined_token;
+--error ER_PRESERVE_TRX_RESET_TOO_LATE
+RESET DRAIN;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_reset_drain_wins')
+         =@reset_wins_before AS reset_did_not_win,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_reset_drain_too_late')
+         =@reset_too_late_before+1 AS reset_was_too_late_once;
+--disable_query_log
+
+--connection xfer2_source_ha
+--replace_result $waiter_id WAITER_ID
+--enable_query_log
+--eval SELECT COUNT(*)=1 AS waiter_still_blocked_after_rejection FROM performance_schema.data_lock_waits w JOIN performance_schema.threads t ON t.THREAD_ID=w.REQUESTING_THREAD_ID WHERE t.PROCESSLIST_ID=$waiter_id
+--disable_query_log
+
+--connection xfer2_revoke_owner
+--enable_query_log
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT 1;
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+UPDATE xfer2_w01_accounts
+   SET pad=CONCAT(pad,'-after-revoke') WHERE id=11;
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+ROLLBACK;
+--disable_query_log
+
+--connection xfer2_revoke_outsider
+--enable_query_log
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT 1;
+--disable_query_log
+
+# Run the file assertion from receiver root: ordinary source sessions are
+# intentionally fenced, while the HA source account does not carry FILE.
+--connection xfer2_receiver
+--let $assert_text= revoked transfer privilege rejected terminal COMMIT before receiver admission
+--let $assert_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--let $assert_select= PRESERVE: standby transfer client send failed errno=1227.*PRESERVE_TRX_TRANSFER_ADMIN
+--let $assert_count_condition= >= 1
+--source include/assert_grep.inc
+--let $assert_count_condition=
+
+--let $assert_text= rejected terminal delivery entered explicit source quarantine
+--let $assert_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--let $assert_select= PRESERVE: standby transfer source entered COMMIT_UNKNOWN status=9 token_count=1
+--let $assert_count_condition= == 1
+--source include/assert_grep.inc
+--let $assert_count_condition=
+
+--disconnect xfer2_revoke_owner
+--disconnect xfer2_revoke_outsider
+--disconnect xfer2_revoke_drain
+
+# No online owner can clear a command that the revoked principal never
+# delivered. Prove the residue immediately before the receiver generation ends.
+--connection xfer2_receiver
+--enable_query_log
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')
+         =@inflight_tokens_at_revoke AS residue_token_until_restart,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')
+         =@inflight_bytes_at_revoke AS residue_bytes_until_restart,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes')
+         =@staged_at_revoke AS residue_payload_until_restart,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')
+         =@prepared_registered_at_revoke AS prepared_state_until_restart,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+          'Preserve_trx_promotion_prepared_prewarm_pending_tokens')
+         =@prepared_pending_at_revoke AS prewarm_pending_until_restart,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_promotion_ready_cache_bytes')
+         =@ready_cache_at_revoke AS ready_cache_until_restart,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_memory_current_bytes')
+         =@memory_at_revoke AS preserve_memory_until_restart,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_worker_active')=0
+         AS no_worker_before_restart,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_queued_bytes')=0
+         AS no_queue_before_restart;
+--disable_query_log
+DROP USER preserve_trx_ha_admin@localhost;
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.2.expect
+--shutdown_server
+--source include/wait_until_disconnected.inc
+--exec echo "restart:" > $MYSQLTEST_VARDIR/tmp/mysqld.2.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+--source suite/preserve_trx_transfer_stby/include/assert_receiver_restart_clean.inc
+--enable_query_log
+SELECT VARIABLE_VALUE=0 AS no_saved_online_token_after_restart
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_saved_online_tokens';
+SELECT SUM(v)=103 AS receiver_native_data_survives_restart
+  FROM xfer2_revoke_receiver_native;
+--disable_query_log
+DROP TABLE xfer2_revoke_receiver_native;
+
+--connection xfer2_source_ha
+--enable_query_log
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+          'Preserve_trx_transfer_source_commit_unknown_epochs')=1
+         AS source_stays_commit_unknown_after_receiver_restart,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_quarantine_epochs')=1
+         AS source_quarantine_survives_receiver_restart;
+--replace_result $waiter_id WAITER_ID
+--eval SELECT COUNT(*)=1 AS waiter_blocked_until_source_restart FROM performance_schema.data_lock_waits w JOIN performance_schema.threads t ON t.THREAD_ID=w.REQUESTING_THREAD_ID WHERE t.PROCESSLIST_ID=$waiter_id
+--disable_query_log
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+SHUTDOWN;
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+
+# The unresolved source generation, not receiver privilege restoration, releases
+# the O02 waiter. It must never execute its update; the exact disconnect error is
+# allowed to vary across the source shutdown race.
+--connection xfer2_revoke_waiter
+--error 1053,2006,2013
+--reap
+--disconnect xfer2_revoke_waiter
+
+--connection xfer2_source_ha
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+--connect(xfer2_cleanup,localhost,root,,test)
+--source suite/preserve_trx_transfer_stby/include/assert_w01_baseline.inc
+CHECK TABLE xfer2_w01_accounts,xfer2_w01_audit;
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+          'Preserve_trx_transfer_source_commit_unknown_epochs')=0
+         AS no_commit_unknown_after_source_restart,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_quarantine_epochs')=0
+         AS no_quarantine_after_source_restart;
+DROP TABLE xfer2_w01_audit;
+DROP TABLE xfer2_w01_accounts;
+DROP USER xfer2_w01_app@localhost;
+DROP USER preserve_trx_ha_admin@localhost;
+--remove_file $credential_file
+--disconnect xfer2_source_ha
+--enable_query_log

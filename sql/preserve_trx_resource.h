@@ -52,6 +52,8 @@ enum class Preserve_trx_memory_kind {
   PROMOTION_LOCK_PLAN,
   /* Native binlog cache manager/buffer prepared before connection attach. */
   PROMOTION_BINLOG_NATIVE_CACHE,
+  /* Immutable semantic bundle retained by the strict promotion registry. */
+  PROMOTION_SEMANTIC_BUNDLE,
   /* Snapshot encode/decode working memory. */
   SNAPSHOT_CODEC_BUFFER,
   COUNT
@@ -421,6 +423,8 @@ int show_preserve_trx_promotion_gate_record_lock_cold_page_gets(THD *thd,
 int show_preserve_trx_promotion_gate_ready_cache_miss_count(THD *thd,
                                                             SHOW_VAR *var,
                                                             char *buf);
+int show_preserve_trx_promotion_ready_cache_bytes(THD *thd, SHOW_VAR *var,
+                                                  char *buf);
 int show_preserve_trx_promotion_gate_over_budget_count(THD *thd, SHOW_VAR *var,
                                                        char *buf);
 int show_preserve_trx_promotion_gate_worker_count(THD *thd, SHOW_VAR *var,
@@ -542,6 +546,25 @@ int show_preserve_trx_transfer_receiver_inflight_tokens(THD *thd,
 int show_preserve_trx_transfer_receiver_inflight_bytes(THD *thd,
                                                        SHOW_VAR *var,
                                                        char *buf);
+int show_preserve_trx_transfer_receiver_staged_memory_bytes(THD *thd,
+                                                            SHOW_VAR *var,
+                                                            char *buf);
+int show_preserve_trx_transfer_receiver_cleanup_retry_completions(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_cleanup_debt_tokens(THD *thd,
+                                                           SHOW_VAR *var,
+                                                           char *buf);
+int show_preserve_trx_transfer_receiver_cleanup_debt_bytes(THD *thd,
+                                                          SHOW_VAR *var,
+                                                          char *buf);
+int show_preserve_trx_transfer_receiver_cleanup_debt_oldest_age_us(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_cleanup_debt_max_attempts(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_token_metadata_admission_rejects(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_cleanup_tainted_transitions(
+    THD *thd, SHOW_VAR *var, char *buf);
 int show_preserve_trx_transfer_receiver_saved_online_tokens(THD *thd,
                                                             SHOW_VAR *var,
                                                             char *buf);
@@ -554,6 +577,16 @@ int show_preserve_trx_transfer_receiver_last_failed_token(THD *thd,
 int show_preserve_trx_transfer_receiver_last_failed_reason(THD *thd,
                                                            SHOW_VAR *var,
                                                            char *buf);
+int show_preserve_trx_transfer_receiver_process_generation(THD *thd,
+                                                           SHOW_VAR *var,
+                                                           char *buf);
+int show_preserve_trx_transfer_receiver_online_epochs(THD *thd,
+                                                      SHOW_VAR *var,
+                                                      char *buf);
+int show_preserve_trx_transfer_receiver_nonce_mismatch_rejects(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_last_identity_reject_reason(
+    THD *thd, SHOW_VAR *var, char *buf);
 int show_preserve_trx_transfer_receiver_auto_prewarm_tokens(THD *thd,
                                                             SHOW_VAR *var,
                                                             char *buf);
@@ -580,6 +613,10 @@ int show_preserve_trx_transfer_receiver_admitted_frames(THD *thd,
 int show_preserve_trx_transfer_receiver_admitted_bytes(THD *thd,
                                                        SHOW_VAR *var,
                                                        char *buf);
+int show_preserve_trx_transfer_receiver_sequence_already_applied(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_after_apply_before_ack_faults(
+    THD *thd, SHOW_VAR *var, char *buf);
 int show_preserve_trx_transfer_source_handoff_pending_epochs(THD *thd,
                                                              SHOW_VAR *var,
                                                              char *buf);
@@ -599,6 +636,14 @@ int show_preserve_trx_transfer_receiver_terminal_cas_conflicts(
 int show_preserve_trx_transfer_receiver_terminal_status_tombstones(
     THD *thd, SHOW_VAR *var, char *buf);
 int show_preserve_trx_transfer_receiver_terminal_status_tombstone_expiries(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_terminal_status_not_found(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_precommit_abandon_cleanup_deferred(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_precommit_abandon_reaper_attempts(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_precommit_abandon_reaper_completions(
     THD *thd, SHOW_VAR *var, char *buf);
 int show_preserve_trx_transfer_quarantine_epochs(THD *thd, SHOW_VAR *var,
                                                  char *buf);
@@ -697,6 +742,8 @@ int show_preserve_trx_transfer_receiver_projection_token_state_us(
     THD *thd, SHOW_VAR *var, char *buf);
 int show_preserve_trx_transfer_receiver_epoch_ready_bind_attempts(
     THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_read_view_horizon_rejects(
+    THD *thd, SHOW_VAR *var, char *buf);
 int show_preserve_trx_transfer_phase2_bulk_bytes(THD *thd, SHOW_VAR *var,
                                                  char *buf);
 int show_preserve_trx_transfer_phase2_final_metadata_fsync_count(
@@ -771,6 +818,9 @@ int show_preserve_trx_lock_warmcopy_unsupported_family(THD *thd, SHOW_VAR *var,
                                                        char *buf);
 int show_preserve_trx_memory_current_bytes(THD *thd, SHOW_VAR *var, char *buf);
 int show_preserve_trx_memory_peak_bytes(THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_promotion_semantic_bundle_bytes(THD *thd,
+                                                      SHOW_VAR *var,
+                                                      char *buf);
 int show_preserve_trx_spill_bytes(THD *thd, SHOW_VAR *var, char *buf);
 int show_preserve_trx_spill_failures(THD *thd, SHOW_VAR *var, char *buf);
 

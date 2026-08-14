@@ -94,13 +94,13 @@ $target_counter =~ /const bool ignored\s*=.*?;/s
   or die "could not find batch target ignored predicate\n";
 my $ignored_predicate = $&;
 die "batch target enumeration must not ignore in-flight statements before statement boundary\n"
-  if $ignored_predicate =~ /!\s*preserve_trx_has_explicit_active_transaction/s;
+  if $ignored_predicate =~ /!\s*preserve_trx_has_active_multi_stmt_transaction/s;
 die "batch target enumeration must include in-flight risky statements\n"
   unless $target_counter =~ /pending_target/s &&
          $target_counter =~ /preserve_trx_thd_has_batch_inflight_statement/s;
-die "batch target enumeration must wait explicit transactions that are already inside an unmarked command packet\n"
+die "batch target enumeration must wait active multi-statement transactions already inside an unmarked command packet\n"
   unless $target_counter =~ /pending_target/s &&
-         $target_counter =~ /active_explicit_transaction/s &&
+         $target_counter =~ /active_multi_stmt_transaction/s &&
          $target_counter =~ /!\s*candidate->m_server_idle/s;
 die "batch target enumeration must wait non-idle unclassified classic command packets\n"
   unless $target_counter =~ /nonidle_unclassified_command_packet/s &&

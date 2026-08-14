@@ -2061,6 +2061,48 @@ bool trx_preserve_read_view_payload_is_valid_for_import(
   return trx_preserve_parse_read_view_payload(payload, &snapshot);
 }
 
+bool trx_preserve_read_view_payload_semantics_are_valid(
+    const std::string &payload, uint64_t expected_low_limit_no,
+    uint64_t expected_creator_trx_id) {
+  Preserve_read_view_snapshot snapshot;
+  if (payload.empty() ||
+      !trx_preserve_parse_read_view_payload(payload, &snapshot) ||
+      snapshot.creator_trx_id == 0 ||
+      snapshot.low_limit_no > snapshot.low_limit_id ||
+      snapshot.up_limit_id > snapshot.low_limit_id ||
+      snapshot.low_limit_no != expected_low_limit_no ||
+      (expected_creator_trx_id != 0 &&
+       snapshot.creator_trx_id != expected_creator_trx_id)) {
+    return false;
+  }
+  if (snapshot.ids.empty()) {
+    return snapshot.up_limit_id == snapshot.low_limit_id;
+  }
+  if (snapshot.ids.front() != snapshot.up_limit_id) return false;
+  for (size_t i = 0; i < snapshot.ids.size(); ++i) {
+    if (snapshot.ids[i] == 0 ||
+        snapshot.ids[i] == snapshot.creator_trx_id ||
+        snapshot.ids[i] >= snapshot.low_limit_id ||
+        (i > 0 && snapshot.ids[i - 1] >= snapshot.ids[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool trx_preserve_read_view_payload_fits_source_horizon(
+    const std::string &payload, uint64_t source_safe_next_trx_id_floor) {
+  DBUG_EXECUTE_IF(
+      "preserve_trx_receiver_force_read_view_horizon_mismatch",
+      return false;);
+  Preserve_read_view_snapshot snapshot;
+  return source_safe_next_trx_id_floor != 0 &&
+         trx_preserve_parse_read_view_payload(payload, &snapshot) &&
+         snapshot.creator_trx_id < source_safe_next_trx_id_floor &&
+         snapshot.low_limit_id <= source_safe_next_trx_id_floor &&
+         snapshot.low_limit_no <= source_safe_next_trx_id_floor;
+}
+
 dberr_t trx_preserve_export_record_locks(trx_t *trx, std::string *payload) {
   return lock_preserve_export_record_locks(trx, payload);
 }
@@ -2258,15 +2300,39 @@ dberr_t trx_preserve_export_table_locks(trx_t *trx, std::string *payload,
                                           already_used);
 }
 
+static trx_t *trx_preserve_reference_active_attached_thd(THD *thd) {
+  trx_t *trx = thd == nullptr ? nullptr : thd_to_trx(thd);
+  if (trx == nullptr) return nullptr;
+
+  trx_mutex_enter(trx);
+  if (trx->state != TRX_STATE_ACTIVE || trx->mysql_thd != thd ||
+      trx->preserve_trx_claimed || trx_is_autocommit_non_locking(trx)) {
+    trx_mutex_exit(trx);
+    return nullptr;
+  }
+  ut_ad(trx->n_ref >= 0);
+  ++trx->n_ref;
+  trx_mutex_exit(trx);
+  return trx;
+}
+
 dberr_t trx_preserve_export_table_locks(THD *thd, std::string *payload,
                                         uint32_t max_lock_count,
                                         uint32_t already_used) {
-  if (thd == nullptr) {
+  if (thd == nullptr || payload == nullptr) {
     if (payload != nullptr) payload->clear();
     return DB_ERROR;
   }
-  return trx_preserve_export_table_locks(thd_to_trx(thd), payload,
-                                         max_lock_count, already_used);
+
+  trx_t *trx = trx_preserve_reference_active_attached_thd(thd);
+  if (trx == nullptr) {
+    payload->clear();
+    return DB_ERROR;
+  }
+  const dberr_t status = trx_preserve_export_table_locks(
+      trx, payload, max_lock_count, already_used);
+  trx_release_reference(trx);
+  return status;
 }
 
 dberr_t trx_preserve_import_table_locks(trx_t *trx,

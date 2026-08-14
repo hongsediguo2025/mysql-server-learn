@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <limits>
 #include <set>
 #include <utility>
 
@@ -46,6 +47,90 @@
 #include "sql/sql_const.h"
 #include "sql/preserve_trx_temp_table_carrier.h"
 #include "sql/system_variables.h"
+
+namespace {
+
+void add_bundle_capacity(uint64_t value, uint64_t *total) {
+  if (total == nullptr) return;
+  *total = value > std::numeric_limits<uint64_t>::max() - *total
+               ? std::numeric_limits<uint64_t>::max()
+               : *total + value;
+}
+
+void add_bundle_string_capacity(const std::string &value, uint64_t *total) {
+  add_bundle_capacity(static_cast<uint64_t>(value.capacity()), total);
+}
+
+void add_bundle_vector_capacity(size_t capacity, size_t element_size,
+                                uint64_t *total) {
+  if (capacity > std::numeric_limits<uint64_t>::max() / element_size) {
+    if (total != nullptr) *total = std::numeric_limits<uint64_t>::max();
+    return;
+  }
+  add_bundle_capacity(static_cast<uint64_t>(capacity) * element_size, total);
+}
+
+}  // namespace
+
+uint64_t preserved_trx_bundle_capacity_bytes(
+    const Preserved_trx_bundle &bundle) {
+  uint64_t total = sizeof(bundle);
+  const Preserve_snapshot_metadata &metadata = bundle.metadata;
+  const std::string *metadata_strings[] = {
+      &metadata.token,
+      &metadata.owner_user,
+      &metadata.owner_host,
+      &metadata.schema_name,
+      &metadata.binlog_cache_payload,
+      &metadata.binlog_gtid_next,
+      &metadata.binlog_owned_gtid,
+      &metadata.time_zone_name,
+      &metadata.read_view_payload,
+      &metadata.record_locks_payload,
+      &metadata.predicate_locks_payload,
+      &metadata.table_locks_payload,
+      &metadata.mdl_descriptors_payload,
+      &metadata.user_vars_payload,
+      &metadata.sql_savepoints_payload,
+      &metadata.innodb_savepoints_payload,
+      &metadata.temp_table_manifest_payload};
+  for (const std::string *value : metadata_strings) {
+    add_bundle_string_capacity(*value, &total);
+  }
+  add_bundle_vector_capacity(metadata.modified_table_names.capacity(),
+                             sizeof(Preserve_snapshot_modified_table_name),
+                             &total);
+  for (const Preserve_snapshot_modified_table_name &table :
+       metadata.modified_table_names) {
+    add_bundle_string_capacity(table.schema_name, &total);
+    add_bundle_string_capacity(table.table_name, &total);
+  }
+  add_bundle_vector_capacity(metadata.session_participant_order.capacity(),
+                             sizeof(Preserve_savepoint_participant), &total);
+  add_bundle_vector_capacity(metadata.savepoint_suffix_ordinals.capacity(),
+                             sizeof(uint16_t), &total);
+  add_bundle_vector_capacity(bundle.tlvs.capacity(),
+                             sizeof(Preserve_snapshot_tlv), &total);
+  for (const Preserve_snapshot_tlv &tlv : bundle.tlvs) {
+    add_bundle_string_capacity(tlv.value, &total);
+  }
+  add_bundle_vector_capacity(bundle.external_blobs.capacity(),
+                             sizeof(Preserved_trx_external_blob), &total);
+  for (const Preserved_trx_external_blob &blob : bundle.external_blobs) {
+    add_bundle_string_capacity(blob.name, &total);
+    add_bundle_string_capacity(blob.payload, &total);
+    add_bundle_string_capacity(blob.descriptor.name, &total);
+    add_bundle_string_capacity(blob.warmcopy_id, &total);
+  }
+  add_bundle_vector_capacity(
+      bundle.blob_descriptors.capacity(),
+      sizeof(Preserved_trx_external_blob_descriptor), &total);
+  for (const Preserved_trx_external_blob_descriptor &descriptor :
+       bundle.blob_descriptors) {
+    add_bundle_string_capacity(descriptor.name, &total);
+  }
+  return total;
+}
 
 bool preserve_snapshot_gtid_state_is_strict_transfer_safe(
     const Preserve_snapshot_metadata &metadata) {

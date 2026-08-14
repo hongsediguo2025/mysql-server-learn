@@ -1,0 +1,202 @@
+CALL mtr.add_suppression(
+"PRESERVE: standby transfer client connect failed errno=2003");
+CALL mtr.add_suppression(
+"PRESERVE: standby transfer OPEN_EPOCH failed status=3");
+CREATE TABLE xfer2_unavailable_accounts(
+id INT PRIMARY KEY,
+balance INT NOT NULL,
+version INT NOT NULL DEFAULT 0,
+pad VARCHAR(64) NOT NULL
+) ENGINE=InnoDB;
+CREATE TABLE xfer2_unavailable_ledger(
+id BIGINT AUTO_INCREMENT PRIMARY KEY,
+transfer_id INT NOT NULL,
+account_id INT NOT NULL,
+delta INT NOT NULL,
+KEY(transfer_id),
+KEY(account_id)
+) ENGINE=InnoDB;
+INSERT INTO xfer2_unavailable_accounts
+WITH RECURSIVE seq(n) AS (
+SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<32
+)
+SELECT n,1000,0,CONCAT('unavailable-',n) FROM seq;
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+SELECT balance=1000 AND version=0 AS owner_rr_initial
+FROM xfer2_unavailable_accounts WHERE id=30;
+owner_rr_initial
+1
+SELECT balance=1000 AND version=0 AS owner_rr_repeatable
+FROM xfer2_unavailable_accounts WHERE id=30;
+owner_rr_repeatable
+1
+SELECT COUNT(*)=32 AS outsider_row_count,
+SUM(balance)=32005 AS outsider_sees_background_only,
+SUM(version)=1 AS outsider_hides_owner_versions,
+SUM(id IN (1,2,6) AND version<>0)=0 AS owner_rows_not_dirty
+FROM xfer2_unavailable_accounts;
+outsider_row_count	outsider_sees_background_only	outsider_hides_owner_versions	owner_rows_not_dirty
+1	1	1	1
+SELECT COUNT(*)=0 AS owner_ledger_not_dirty
+FROM xfer2_unavailable_ledger;
+owner_ledger_not_dirty
+1
+no_receiver_epoch	no_inflight_token	no_inflight_byte	no_staged_memory	no_prepared_entry	no_prewarm_pending	no_prepared_ready	no_ready_cache	no_preserve_memory	no_active_worker	no_queued_byte
+1	1	1	1	1	1	1	1	1	1	1
+no_admitted_frame	no_admitted_byte	no_failed_token	no_terminal_fact	no_terminal_tombstone	no_cleanup_debt	no_cleanup_debt_byte
+1	1	1	1	1	1	1
+SELECT COUNT(*)=1 AS waiter_blocked_before_drain FROM performance_schema.data_lock_waits w JOIN performance_schema.threads t ON t.THREAD_ID=w.REQUESTING_THREAD_ID WHERE t.PROCESSLIST_ID=WAITER_ID;
+waiter_blocked_before_drain
+1
+DRAIN TRANSACTIONS PRESERVE;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SELECT COUNT(*)=1 AS waiter_still_blocked_after_receiver_outage FROM performance_schema.data_lock_waits w JOIN performance_schema.threads t ON t.THREAD_ID=w.REQUESTING_THREAD_ID WHERE t.PROCESSLIST_ID=WAITER_ID;
+waiter_still_blocked_after_receiver_outage
+1
+RESET DRAIN;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_reset_drain_wins')=0 AS reset_did_not_win_after_receiver_outage,(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_reset_drain_too_late')=0 AS reset_not_too_late_after_receiver_outage;
+reset_did_not_win_after_receiver_outage	reset_not_too_late_after_receiver_outage
+1	1
+SELECT CONNECTION_ID() AS same_owner_connection_after_receiver_outage;
+same_owner_connection_after_receiver_outage
+OWNER_ID
+SELECT balance=1000 AND version=0 AS owner_rr_survives_receiver_outage
+FROM xfer2_unavailable_accounts WHERE id=30;
+owner_rr_survives_receiver_outage
+1
+SELECT SUM(id=1 AND balance=960 AND version=1)=1
+AND SUM(id=2 AND balance=1040 AND version=1)=1
+AND SUM(id=6 AND version=1 AND pad='unavailable-6-owner')=1
+AS owner_writes_survive_receiver_outage
+FROM xfer2_unavailable_accounts WHERE id IN (1,2,6);
+owner_writes_survive_receiver_outage
+1
+SELECT COUNT(*)=2 AND SUM(delta)=0 AS owner_ledger_survives_receiver_outage
+FROM xfer2_unavailable_ledger WHERE transfer_id=6001;
+owner_ledger_survives_receiver_outage
+1
+UPDATE xfer2_unavailable_accounts
+SET pad=CONCAT(pad,'-continued') WHERE id=2;
+SELECT ROW_COUNT()=1 AS owner_can_continue_dml;
+owner_can_continue_dml
+1
+SELECT SUM(id IN (1,2,6) AND version<>0)=0
+AS owner_changes_still_isolated_after_receiver_outage
+FROM xfer2_unavailable_accounts;
+owner_changes_still_isolated_after_receiver_outage
+1
+SELECT COUNT(*)=0 AS owner_ledger_still_isolated_after_receiver_outage
+FROM xfer2_unavailable_ledger;
+owner_ledger_still_isolated_after_receiver_outage
+1
+SELECT COUNT(*)=32 AS final_row_count,
+SUM(balance)=32012 AS final_balance_once,
+SUM(version)=5 AS final_version_once,
+SUM(id IN (1,2,6,30) AND version>0)=4 AS exact_changed_rows,
+MAX(CASE WHEN id=1 THEN balance END)=967 AS waiter_ran_once,
+MAX(CASE WHEN id=2 THEN pad END)='unavailable-2-continued'
+         AS continued_owner_dml_persisted
+FROM xfer2_unavailable_accounts;
+final_row_count	final_balance_once	final_version_once	exact_changed_rows	waiter_ran_once	continued_owner_dml_persisted
+1	1	1	1	1	1
+SELECT COUNT(*)=2 AND SUM(delta)=0 AS balanced_ledger_once
+FROM xfer2_unavailable_ledger WHERE transfer_id=6001;
+balanced_ledger_once
+1
+CHECK TABLE xfer2_unavailable_accounts,xfer2_unavailable_ledger;
+Table	Op	Msg_type	Msg_text
+test.xfer2_unavailable_accounts	check	status	OK
+test.xfer2_unavailable_ledger	check	status	OK
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')=0
+AS no_receiver_epoch_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')=0
+AS no_inflight_token_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')=0
+AS no_inflight_byte_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_staged_memory_bytes')=0
+AS no_staged_memory_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')=0
+AS no_prepared_entry_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_promotion_prepared_prewarm_pending_tokens')=0
+AS no_prewarm_pending_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_ready_tokens')=0
+AS no_prepared_ready_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_promotion_ready_cache_bytes')=0
+AS no_ready_cache_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_memory_current_bytes')=0
+AS no_preserve_memory_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_worker_active')=0
+AS no_active_worker_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_queued_bytes')=0
+AS no_queued_byte_after_restart;
+no_receiver_epoch_after_restart	no_inflight_token_after_restart	no_inflight_byte_after_restart	no_staged_memory_after_restart	no_prepared_entry_after_restart	no_prewarm_pending_after_restart	no_prepared_ready_after_restart	no_ready_cache_after_restart	no_preserve_memory_after_restart	no_active_worker_after_restart	no_queued_byte_after_restart
+1	1	1	1	1	1	1	1	1	1	1
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_admitted_frames')=0
+AS no_admitted_frame,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_admitted_bytes')=0
+AS no_admitted_byte,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_failed_tokens')=0
+AS no_failed_token,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins')=0
+AS no_terminal_fact,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_terminal_status_tombstones')=0
+AS no_terminal_tombstone,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_cleanup_debt_tokens')=0
+AS no_cleanup_debt,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_bytes')=0
+AS no_cleanup_debt_byte;
+no_admitted_frame	no_admitted_byte	no_failed_token	no_terminal_fact	no_terminal_tombstone	no_cleanup_debt	no_cleanup_debt_byte
+1	1	1	1	1	1	1
+SELECT 1 AS configured_receiver_credential_works_after_restart;
+configured_receiver_credential_works_after_restart
+1
+SELECT COUNT(*)=2 AND SUM(v)=30 AS receiver_native_data_survives_restart
+FROM xfer2_unavailable_receiver_native;
+receiver_native_data_survives_restart
+1
+START TRANSACTION;
+UPDATE xfer2_unavailable_receiver_native SET v=v+1;
+INSERT INTO xfer2_unavailable_receiver_native VALUES(3,30);
+COMMIT;
+SELECT COUNT(*)=3 AND SUM(v)=62 AS receiver_native_dml_works_after_restart
+FROM xfer2_unavailable_receiver_native;
+receiver_native_dml_works_after_restart
+1
+include/assert_grep.inc [stopped receiver caused a transport connect failure]
+include/assert_grep.inc [outage failed at OPEN before any command send]
+include/assert_grep.inc [outage did not reach the receiver command path]
+include/assert_grep.inc [outage credential is absent from source error log]
+include/assert_grep.inc [outage credential is absent from receiver error log]
+SELECT SUM(balance)=32012 AND SUM(version)=5
+AS source_restart_keeps_final_data
+FROM xfer2_unavailable_accounts;
+source_restart_keeps_final_data
+1
+SELECT COUNT(*)=2 AND SUM(delta)=0
+AS source_restart_keeps_balanced_ledger
+FROM xfer2_unavailable_ledger;
+source_restart_keeps_balanced_ledger
+1

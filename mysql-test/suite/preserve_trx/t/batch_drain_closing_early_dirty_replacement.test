@@ -81,9 +81,6 @@ SET GLOBAL debug='-d,preserve_trx_early_force_one_coordinate_drift';
 --enable_query_log
 SELECT
   (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
-   WHERE VARIABLE_NAME='Preserve_trx_lock_warmcopy_sealed_valid')>=1
-    AS early_prebuilt_sealed,
-  (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
    WHERE VARIABLE_NAME='Preserve_trx_early_staged_tokens')=1
     AS replacement_staged_one,
   (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status

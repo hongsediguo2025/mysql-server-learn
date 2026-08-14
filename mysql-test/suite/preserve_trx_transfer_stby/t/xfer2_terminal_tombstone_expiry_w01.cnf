@@ -1,0 +1,17 @@
+!include ../my.cnf
+
+[mysqld.1]
+skip-log-bin
+# Debug-contract: lose both COMMIT ACK observations so the normal transport
+# authenticates
+# QUERY_EPOCH_STATUS, pause after its COMMITTED result, then reissue the
+# identical authenticated query after the test releases it.
+debug=d,preserve_trx_transfer_drop_commit_ack_twice,preserve_trx_transfer_requery_commit_status_after_debug_sync
+
+[mysqld.2]
+skip-log-bin
+# On the second authenticated status query only, run the normal receiver reaper
+# with a debug future clock that is
+# beyond terminal and accepted-epoch retention before performing the lookup.
+# This is deterministic clock control, not a wait for the 60-second minimum.
+debug=d,preserve_trx_receiver_expire_terminal_before_second_status_query

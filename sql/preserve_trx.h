@@ -284,13 +284,15 @@ enum class Preserve_trx_drain_terminal : uint8_t {
   SOURCE_RESTORE_PENDING,
   SOURCE_RESTORED,
   RESET_REQUESTED,
-  SHUTDOWN_HANDOFF
+  SHUTDOWN_HANDOFF,
+  COMMITTED_HANDOFF
 };
 
 enum class Preserve_trx_drain_reset_request : uint8_t {
   WON,
   JOINED,
   ALREADY_RESTORED,
+  TOO_LATE,
   INVALID
 };
 

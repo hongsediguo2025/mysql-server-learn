@@ -1,0 +1,164 @@
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+# X5-11a / W14 RR ReadView plus multi-statement updates / O01 / T1
+# Coverage delta: unlike standby_transfer_drain_no_shutdown, this case verifies
+# three successive DML statements, a nonempty owner MVCC ReadView, and outsider
+# visibility before transfer.
+
+--source suite/preserve_trx_transfer_stby/include/w01_setup.inc
+
+--connection xfer2_receiver
+SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=OFF;
+SELECT @@GLOBAL.rds_preserve_trx_transfer_prewarm_paused=0
+         AS receiver_prewarm_explicitly_running;
+SET @active_epochs_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs');
+SET @classified_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_tokens');
+SET @ready_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME=
+     'Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens');
+SET @not_ready_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME=
+     'Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens');
+SET @bind_attempts_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME=
+     'Preserve_trx_transfer_receiver_epoch_ready_bind_attempts');
+SET @prepared_ready_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_ready_tokens');
+SET @horizon_rejects_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME=
+     'Preserve_trx_transfer_receiver_read_view_horizon_rejects');
+SET @inflight_tokens_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens');
+SET @inflight_bytes_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes');
+SET @staged_memory_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME=
+     'Preserve_trx_transfer_receiver_staged_memory_bytes');
+SET @failed_records_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_failed_tokens');
+SET @prepared_registered_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens');
+SET @prepared_pending_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME=
+     'Preserve_trx_promotion_prepared_prewarm_pending_tokens');
+SET @ready_cache_bytes_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME='Preserve_trx_promotion_ready_cache_bytes');
+SET @memory_bytes_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME='Preserve_trx_memory_current_bytes');
+
+--connect(xfer2_smoke_owner,localhost,xfer2_w01_app,,test)
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+SELECT balance=1000 AND version=0 AS rr_initial_version
+  FROM xfer2_w01_accounts WHERE id=32;
+
+--connect(xfer2_smoke_outsider,localhost,root,,test)
+UPDATE xfer2_w01_accounts SET balance=balance+1, version=version+1 WHERE id=32;
+
+--connection xfer2_smoke_owner
+SELECT balance=1000 AND version=0 AS rr_keeps_initial_version
+  FROM xfer2_w01_accounts WHERE id=32;
+UPDATE xfer2_w01_accounts SET balance=balance-7, version=version+1 WHERE id=3;
+SELECT ROW_COUNT()=1 AS first_update_applied;
+UPDATE xfer2_w01_accounts SET balance=balance+4, version=version+1 WHERE id=3;
+SELECT ROW_COUNT()=1 AS second_update_applied;
+UPDATE xfer2_w01_accounts SET balance=balance+3, version=version+1 WHERE id=3;
+SELECT ROW_COUNT()=1 AS third_update_applied;
+SELECT balance=1000 AND version=3 AS owner_sees_own_writes
+  FROM xfer2_w01_accounts WHERE id=3;
+INSERT INTO xfer2_w01_audit(account_id, delta) VALUES(3, 0);
+SELECT ROW_COUNT()=1 AS audit_insert_applied;
+
+--connection xfer2_smoke_outsider
+--source suite/preserve_trx_transfer_stby/include/assert_w01_baseline.inc
+
+--connection default
+--replace_column 1 GENERATION 3 SOURCE_ID 6 CLOSING_STARTED_US 7 CLOSING_DEADLINE_US
+DRAIN TRANSACTIONS PRESERVE;
+
+--connection xfer2_receiver
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')=@active_epochs_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_tokens')=@classified_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens')=@ready_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens')=@not_ready_before+1
+--source include/wait_condition.inc
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')
+         = @active_epochs_before+1 AS one_receiver_epoch,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_tokens')
+         = @classified_before+1 AS one_classified_token,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+           'Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens')
+         = @ready_before AS no_ready_token,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+           'Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens')
+         = @not_ready_before+1 AS one_not_ready_token;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+           'Preserve_trx_transfer_receiver_epoch_ready_bind_attempts')
+         = @bind_attempts_before AS no_final_fact_bind,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_ready_tokens')
+         = @prepared_ready_before AS no_prepared_ready_token,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+           'Preserve_trx_transfer_receiver_read_view_horizon_rejects')
+         = @horizon_rejects_before AS no_read_view_horizon_rejection;
+SELECT VARIABLE_VALUE='receiver_selection_failed:3'
+         AS prewarm_deadline_is_exact_reason
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_last_failed_reason';
+
+--connection xfer2_smoke_owner
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT 1;
+
+--let $receiver_connection= xfer2_receiver
+--source suite/preserve_trx_transfer_stby/include/assert_receiver_quiescent.inc
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')=@inflight_tokens_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')=@inflight_bytes_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes')=@staged_memory_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')=@prepared_registered_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_prewarm_pending_tokens')=@prepared_pending_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_ready_cache_bytes')=@ready_cache_bytes_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_memory_current_bytes')=@memory_bytes_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_failed_tokens')=@failed_records_before+1
+--source include/wait_condition.inc
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')
+         = @inflight_tokens_before AS no_inflight_token,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')
+         = @inflight_bytes_before AS no_inflight_byte,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+           'Preserve_trx_transfer_receiver_staged_memory_bytes')
+         = @staged_memory_before AS no_staged_memory,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')
+         = @prepared_registered_before AS no_prepared_residue,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+           'Preserve_trx_promotion_prepared_prewarm_pending_tokens')
+         = @prepared_pending_before AS no_prewarm_pending_residue,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_promotion_ready_cache_bytes')
+         = @ready_cache_bytes_before AS no_ready_cache_residue,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_memory_current_bytes')
+         = @memory_bytes_before AS no_preserve_memory_residue,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_failed_tokens')
+         = @failed_records_before+1 AS one_terminal_failed_record;
+--source suite/preserve_trx_transfer_stby/include/w01_teardown.inc

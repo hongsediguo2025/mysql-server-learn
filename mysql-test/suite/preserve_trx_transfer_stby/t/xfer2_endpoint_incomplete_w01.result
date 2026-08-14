@@ -1,0 +1,577 @@
+DROP USER IF EXISTS xfer2_endpoint_app@localhost;
+DROP TABLE IF EXISTS xfer2_endpoint_audit;
+DROP TABLE IF EXISTS xfer2_endpoint_accounts;
+CREATE USER xfer2_endpoint_app@localhost;
+GRANT SELECT, INSERT, UPDATE, DELETE ON test.* TO xfer2_endpoint_app@localhost;
+CREATE TABLE xfer2_endpoint_accounts(
+id INT PRIMARY KEY,
+balance INT NOT NULL,
+version INT NOT NULL DEFAULT 0,
+pad VARCHAR(64) NOT NULL
+) ENGINE=InnoDB;
+CREATE TABLE xfer2_endpoint_audit(
+id BIGINT AUTO_INCREMENT PRIMARY KEY,
+account_id INT NOT NULL,
+delta INT NOT NULL,
+KEY(account_id)
+) ENGINE=InnoDB;
+INSERT INTO xfer2_endpoint_accounts
+WITH RECURSIVE seq(n) AS (
+SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<32
+)
+SELECT n,1000,0,CONCAT('endpoint-',n) FROM seq;
+SET @source_phase1_frames_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_phase1_frame_count');
+SET @source_phase1_sends_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_phase1_network_send_count');
+SET @source_handoff_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_source_handoff_pending_epochs');
+SET @source_unknown_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_source_commit_unknown_epochs');
+SET @source_restore_guard_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_source_restore_guard_rejects');
+SET @source_readiness_samples_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_phase1_readiness_samples');
+SET @source_readiness_wait_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_phase1_readiness_wait_us');
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+SCENARIO X1-01 missing_host BEGIN
+endpoint_host_as_configured	endpoint_port_as_configured	endpoint_user_as_configured	endpoint_credential_as_configured
+1	1	1	1
+SELECT balance=1000 AND version=0 AS owner_rr_initial
+FROM xfer2_endpoint_accounts WHERE id=32;
+owner_rr_initial
+1
+SELECT balance=1000 AND version=0 AS owner_rr_repeatable
+FROM xfer2_endpoint_accounts WHERE id=32;
+owner_rr_repeatable
+1
+SELECT COUNT(*)=32 AS outsider_row_count,
+SUM(balance)=32009 AS outsider_sees_background_only,
+SUM(version)=1 AS outsider_hides_owner_versions,
+SUM(id IN (2,5,9) AND version<>0)=0 AS owner_rows_not_dirty
+FROM xfer2_endpoint_accounts;
+outsider_row_count	outsider_sees_background_only	outsider_hides_owner_versions	owner_rows_not_dirty
+1	1	1	1
+SELECT COUNT(*)=0 AS owner_audit_not_dirty FROM xfer2_endpoint_audit;
+owner_audit_not_dirty
+1
+SELECT COUNT(*)=1 AS waiter_blocked_before_drain FROM performance_schema.data_lock_waits w JOIN performance_schema.threads t ON t.THREAD_ID=w.REQUESTING_THREAD_ID WHERE t.PROCESSLIST_ID=WAITER_ID;
+waiter_blocked_before_drain
+1
+DRAIN TRANSACTIONS PRESERVE;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SELECT COUNT(*)=1 AS waiter_still_blocked_after_rejection FROM performance_schema.data_lock_waits w JOIN performance_schema.threads t ON t.THREAD_ID=w.REQUESTING_THREAD_ID WHERE t.PROCESSLIST_ID=WAITER_ID;
+waiter_still_blocked_after_rejection
+1
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_phase1_frame_count')
+=@source_phase1_frames_before AS no_source_phase1_frame,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_phase1_network_send_count')
+=@source_phase1_sends_before AS no_source_network_send;
+no_source_phase1_frame	no_source_network_send
+1	1
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_source_handoff_pending_epochs')
+=@source_handoff_before AS no_source_handoff,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_source_commit_unknown_epochs')
+=@source_unknown_before AS no_source_commit_unknown,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_source_restore_guard_rejects')
+=@source_restore_guard_before AS no_source_restore_guard_reject;
+no_source_handoff	no_source_commit_unknown	no_source_restore_guard_reject
+1	1	1
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_phase1_readiness_samples')
+=@source_readiness_samples_before AS no_readiness_sample,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_phase1_readiness_wait_us')
+=@source_readiness_wait_before AS no_readiness_wait;
+no_readiness_sample	no_readiness_wait
+1	1
+SELECT CONNECTION_ID() AS same_owner_connection_after_rejection;
+same_owner_connection_after_rejection
+OWNER_ID
+SELECT balance=1000 AND version=0 AS owner_rr_survives_rejection
+FROM xfer2_endpoint_accounts WHERE id=32;
+owner_rr_survives_rejection
+1
+SELECT SUM(id=2 AND balance=995 AND version=1)=1
+AND SUM(id=5 AND balance=1002 AND version=1)=1
+AND SUM(id=9 AND balance=1003 AND version=1)=1
+AS owner_updates_survive_rejection
+FROM xfer2_endpoint_accounts WHERE id IN (2,5,9);
+owner_updates_survive_rejection
+1
+SELECT COUNT(*)=1 AND SUM(delta)=-5 AS owner_audit_survives_rejection
+FROM xfer2_endpoint_audit;
+owner_audit_survives_rejection
+1
+SELECT SUM(id IN (2,5,9) AND version<>0)=0
+AS owner_changes_still_isolated
+FROM xfer2_endpoint_accounts;
+owner_changes_still_isolated
+1
+SELECT COUNT(*)=0 AS owner_audit_still_isolated
+FROM xfer2_endpoint_audit;
+owner_audit_still_isolated
+1
+UPDATE xfer2_endpoint_accounts
+SET pad=CONCAT(pad,'-continued') WHERE id=9;
+SELECT ROW_COUNT()=1 AS owner_can_continue_dml;
+owner_can_continue_dml
+1
+ROLLBACK;
+SELECT COUNT(*)=32 AS final_row_count,
+SUM(balance)=32019 AS outsider_and_waiter_balance_once,
+SUM(version)=2 AS outsider_and_waiter_versions_once,
+SUM(id IN (2,32) AND version=1)=2 AS exact_changed_rows,
+MAX(CASE WHEN id=2 THEN balance END)=1010 AS waiter_ran_once,
+MAX(CASE WHEN id=5 THEN balance END)=1000 AS owner_credit_rolled_back,
+MAX(CASE WHEN id=9 THEN pad END)='endpoint-9'
+         AS continued_owner_dml_rolled_back
+FROM xfer2_endpoint_accounts;
+final_row_count	outsider_and_waiter_balance_once	outsider_and_waiter_versions_once	exact_changed_rows	waiter_ran_once	owner_credit_rolled_back	continued_owner_dml_rolled_back
+1	1	1	1	1	1	1
+SELECT COUNT(*)=0 AS owner_audit_rolled_back FROM xfer2_endpoint_audit;
+owner_audit_rolled_back
+1
+CHECK TABLE xfer2_endpoint_accounts,xfer2_endpoint_audit;
+Table	Op	Msg_type	Msg_text
+test.xfer2_endpoint_accounts	check	status	OK
+test.xfer2_endpoint_audit	check	status	OK
+SCENARIO X1-01 missing_host END
+DROP USER IF EXISTS xfer2_endpoint_app@localhost;
+DROP TABLE IF EXISTS xfer2_endpoint_audit;
+DROP TABLE IF EXISTS xfer2_endpoint_accounts;
+CREATE USER xfer2_endpoint_app@localhost;
+GRANT SELECT, INSERT, UPDATE, DELETE ON test.* TO xfer2_endpoint_app@localhost;
+CREATE TABLE xfer2_endpoint_accounts(
+id INT PRIMARY KEY,
+balance INT NOT NULL,
+version INT NOT NULL DEFAULT 0,
+pad VARCHAR(64) NOT NULL
+) ENGINE=InnoDB;
+CREATE TABLE xfer2_endpoint_audit(
+id BIGINT AUTO_INCREMENT PRIMARY KEY,
+account_id INT NOT NULL,
+delta INT NOT NULL,
+KEY(account_id)
+) ENGINE=InnoDB;
+INSERT INTO xfer2_endpoint_accounts
+WITH RECURSIVE seq(n) AS (
+SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<32
+)
+SELECT n,1000,0,CONCAT('endpoint-',n) FROM seq;
+SET @source_phase1_frames_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_phase1_frame_count');
+SET @source_phase1_sends_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_phase1_network_send_count');
+SET @source_handoff_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_source_handoff_pending_epochs');
+SET @source_unknown_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_source_commit_unknown_epochs');
+SET @source_restore_guard_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_source_restore_guard_rejects');
+SET @source_readiness_samples_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_phase1_readiness_samples');
+SET @source_readiness_wait_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_phase1_readiness_wait_us');
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+SCENARIO X1-01 missing_port BEGIN
+endpoint_host_as_configured	endpoint_port_as_configured	endpoint_user_as_configured	endpoint_credential_as_configured
+1	1	1	1
+SELECT balance=1000 AND version=0 AS owner_rr_initial
+FROM xfer2_endpoint_accounts WHERE id=32;
+owner_rr_initial
+1
+SELECT balance=1000 AND version=0 AS owner_rr_repeatable
+FROM xfer2_endpoint_accounts WHERE id=32;
+owner_rr_repeatable
+1
+SELECT COUNT(*)=32 AS outsider_row_count,
+SUM(balance)=32009 AS outsider_sees_background_only,
+SUM(version)=1 AS outsider_hides_owner_versions,
+SUM(id IN (2,5,9) AND version<>0)=0 AS owner_rows_not_dirty
+FROM xfer2_endpoint_accounts;
+outsider_row_count	outsider_sees_background_only	outsider_hides_owner_versions	owner_rows_not_dirty
+1	1	1	1
+SELECT COUNT(*)=0 AS owner_audit_not_dirty FROM xfer2_endpoint_audit;
+owner_audit_not_dirty
+1
+SELECT COUNT(*)=1 AS waiter_blocked_before_drain FROM performance_schema.data_lock_waits w JOIN performance_schema.threads t ON t.THREAD_ID=w.REQUESTING_THREAD_ID WHERE t.PROCESSLIST_ID=WAITER_ID;
+waiter_blocked_before_drain
+1
+DRAIN TRANSACTIONS PRESERVE;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SELECT COUNT(*)=1 AS waiter_still_blocked_after_rejection FROM performance_schema.data_lock_waits w JOIN performance_schema.threads t ON t.THREAD_ID=w.REQUESTING_THREAD_ID WHERE t.PROCESSLIST_ID=WAITER_ID;
+waiter_still_blocked_after_rejection
+1
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_phase1_frame_count')
+=@source_phase1_frames_before AS no_source_phase1_frame,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_phase1_network_send_count')
+=@source_phase1_sends_before AS no_source_network_send;
+no_source_phase1_frame	no_source_network_send
+1	1
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_source_handoff_pending_epochs')
+=@source_handoff_before AS no_source_handoff,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_source_commit_unknown_epochs')
+=@source_unknown_before AS no_source_commit_unknown,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_source_restore_guard_rejects')
+=@source_restore_guard_before AS no_source_restore_guard_reject;
+no_source_handoff	no_source_commit_unknown	no_source_restore_guard_reject
+1	1	1
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_phase1_readiness_samples')
+=@source_readiness_samples_before AS no_readiness_sample,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_phase1_readiness_wait_us')
+=@source_readiness_wait_before AS no_readiness_wait;
+no_readiness_sample	no_readiness_wait
+1	1
+SELECT CONNECTION_ID() AS same_owner_connection_after_rejection;
+same_owner_connection_after_rejection
+OWNER_ID
+SELECT balance=1000 AND version=0 AS owner_rr_survives_rejection
+FROM xfer2_endpoint_accounts WHERE id=32;
+owner_rr_survives_rejection
+1
+SELECT SUM(id=2 AND balance=995 AND version=1)=1
+AND SUM(id=5 AND balance=1002 AND version=1)=1
+AND SUM(id=9 AND balance=1003 AND version=1)=1
+AS owner_updates_survive_rejection
+FROM xfer2_endpoint_accounts WHERE id IN (2,5,9);
+owner_updates_survive_rejection
+1
+SELECT COUNT(*)=1 AND SUM(delta)=-5 AS owner_audit_survives_rejection
+FROM xfer2_endpoint_audit;
+owner_audit_survives_rejection
+1
+SELECT SUM(id IN (2,5,9) AND version<>0)=0
+AS owner_changes_still_isolated
+FROM xfer2_endpoint_accounts;
+owner_changes_still_isolated
+1
+SELECT COUNT(*)=0 AS owner_audit_still_isolated
+FROM xfer2_endpoint_audit;
+owner_audit_still_isolated
+1
+UPDATE xfer2_endpoint_accounts
+SET pad=CONCAT(pad,'-continued') WHERE id=9;
+SELECT ROW_COUNT()=1 AS owner_can_continue_dml;
+owner_can_continue_dml
+1
+ROLLBACK;
+SELECT COUNT(*)=32 AS final_row_count,
+SUM(balance)=32019 AS outsider_and_waiter_balance_once,
+SUM(version)=2 AS outsider_and_waiter_versions_once,
+SUM(id IN (2,32) AND version=1)=2 AS exact_changed_rows,
+MAX(CASE WHEN id=2 THEN balance END)=1010 AS waiter_ran_once,
+MAX(CASE WHEN id=5 THEN balance END)=1000 AS owner_credit_rolled_back,
+MAX(CASE WHEN id=9 THEN pad END)='endpoint-9'
+         AS continued_owner_dml_rolled_back
+FROM xfer2_endpoint_accounts;
+final_row_count	outsider_and_waiter_balance_once	outsider_and_waiter_versions_once	exact_changed_rows	waiter_ran_once	owner_credit_rolled_back	continued_owner_dml_rolled_back
+1	1	1	1	1	1	1
+SELECT COUNT(*)=0 AS owner_audit_rolled_back FROM xfer2_endpoint_audit;
+owner_audit_rolled_back
+1
+CHECK TABLE xfer2_endpoint_accounts,xfer2_endpoint_audit;
+Table	Op	Msg_type	Msg_text
+test.xfer2_endpoint_accounts	check	status	OK
+test.xfer2_endpoint_audit	check	status	OK
+SCENARIO X1-01 missing_port END
+DROP USER IF EXISTS xfer2_endpoint_app@localhost;
+DROP TABLE IF EXISTS xfer2_endpoint_audit;
+DROP TABLE IF EXISTS xfer2_endpoint_accounts;
+CREATE USER xfer2_endpoint_app@localhost;
+GRANT SELECT, INSERT, UPDATE, DELETE ON test.* TO xfer2_endpoint_app@localhost;
+CREATE TABLE xfer2_endpoint_accounts(
+id INT PRIMARY KEY,
+balance INT NOT NULL,
+version INT NOT NULL DEFAULT 0,
+pad VARCHAR(64) NOT NULL
+) ENGINE=InnoDB;
+CREATE TABLE xfer2_endpoint_audit(
+id BIGINT AUTO_INCREMENT PRIMARY KEY,
+account_id INT NOT NULL,
+delta INT NOT NULL,
+KEY(account_id)
+) ENGINE=InnoDB;
+INSERT INTO xfer2_endpoint_accounts
+WITH RECURSIVE seq(n) AS (
+SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<32
+)
+SELECT n,1000,0,CONCAT('endpoint-',n) FROM seq;
+SET @source_phase1_frames_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_phase1_frame_count');
+SET @source_phase1_sends_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_phase1_network_send_count');
+SET @source_handoff_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_source_handoff_pending_epochs');
+SET @source_unknown_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_source_commit_unknown_epochs');
+SET @source_restore_guard_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_source_restore_guard_rejects');
+SET @source_readiness_samples_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_phase1_readiness_samples');
+SET @source_readiness_wait_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_phase1_readiness_wait_us');
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+SCENARIO X1-02 missing_credential_name BEGIN
+endpoint_host_as_configured	endpoint_port_as_configured	endpoint_user_as_configured	endpoint_credential_as_configured
+1	1	1	1
+SELECT balance=1000 AND version=0 AS owner_rr_initial
+FROM xfer2_endpoint_accounts WHERE id=32;
+owner_rr_initial
+1
+SELECT balance=1000 AND version=0 AS owner_rr_repeatable
+FROM xfer2_endpoint_accounts WHERE id=32;
+owner_rr_repeatable
+1
+SELECT COUNT(*)=32 AS outsider_row_count,
+SUM(balance)=32009 AS outsider_sees_background_only,
+SUM(version)=1 AS outsider_hides_owner_versions,
+SUM(id IN (2,5,9) AND version<>0)=0 AS owner_rows_not_dirty
+FROM xfer2_endpoint_accounts;
+outsider_row_count	outsider_sees_background_only	outsider_hides_owner_versions	owner_rows_not_dirty
+1	1	1	1
+SELECT COUNT(*)=0 AS owner_audit_not_dirty FROM xfer2_endpoint_audit;
+owner_audit_not_dirty
+1
+SELECT COUNT(*)=1 AS waiter_blocked_before_drain FROM performance_schema.data_lock_waits w JOIN performance_schema.threads t ON t.THREAD_ID=w.REQUESTING_THREAD_ID WHERE t.PROCESSLIST_ID=WAITER_ID;
+waiter_blocked_before_drain
+1
+DRAIN TRANSACTIONS PRESERVE;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SELECT COUNT(*)=1 AS waiter_still_blocked_after_rejection FROM performance_schema.data_lock_waits w JOIN performance_schema.threads t ON t.THREAD_ID=w.REQUESTING_THREAD_ID WHERE t.PROCESSLIST_ID=WAITER_ID;
+waiter_still_blocked_after_rejection
+1
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_phase1_frame_count')
+=@source_phase1_frames_before AS no_source_phase1_frame,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_phase1_network_send_count')
+=@source_phase1_sends_before AS no_source_network_send;
+no_source_phase1_frame	no_source_network_send
+1	1
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_source_handoff_pending_epochs')
+=@source_handoff_before AS no_source_handoff,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_source_commit_unknown_epochs')
+=@source_unknown_before AS no_source_commit_unknown,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_source_restore_guard_rejects')
+=@source_restore_guard_before AS no_source_restore_guard_reject;
+no_source_handoff	no_source_commit_unknown	no_source_restore_guard_reject
+1	1	1
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_phase1_readiness_samples')
+=@source_readiness_samples_before AS no_readiness_sample,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_phase1_readiness_wait_us')
+=@source_readiness_wait_before AS no_readiness_wait;
+no_readiness_sample	no_readiness_wait
+1	1
+SELECT CONNECTION_ID() AS same_owner_connection_after_rejection;
+same_owner_connection_after_rejection
+OWNER_ID
+SELECT balance=1000 AND version=0 AS owner_rr_survives_rejection
+FROM xfer2_endpoint_accounts WHERE id=32;
+owner_rr_survives_rejection
+1
+SELECT SUM(id=2 AND balance=995 AND version=1)=1
+AND SUM(id=5 AND balance=1002 AND version=1)=1
+AND SUM(id=9 AND balance=1003 AND version=1)=1
+AS owner_updates_survive_rejection
+FROM xfer2_endpoint_accounts WHERE id IN (2,5,9);
+owner_updates_survive_rejection
+1
+SELECT COUNT(*)=1 AND SUM(delta)=-5 AS owner_audit_survives_rejection
+FROM xfer2_endpoint_audit;
+owner_audit_survives_rejection
+1
+SELECT SUM(id IN (2,5,9) AND version<>0)=0
+AS owner_changes_still_isolated
+FROM xfer2_endpoint_accounts;
+owner_changes_still_isolated
+1
+SELECT COUNT(*)=0 AS owner_audit_still_isolated
+FROM xfer2_endpoint_audit;
+owner_audit_still_isolated
+1
+UPDATE xfer2_endpoint_accounts
+SET pad=CONCAT(pad,'-continued') WHERE id=9;
+SELECT ROW_COUNT()=1 AS owner_can_continue_dml;
+owner_can_continue_dml
+1
+ROLLBACK;
+SELECT COUNT(*)=32 AS final_row_count,
+SUM(balance)=32019 AS outsider_and_waiter_balance_once,
+SUM(version)=2 AS outsider_and_waiter_versions_once,
+SUM(id IN (2,32) AND version=1)=2 AS exact_changed_rows,
+MAX(CASE WHEN id=2 THEN balance END)=1010 AS waiter_ran_once,
+MAX(CASE WHEN id=5 THEN balance END)=1000 AS owner_credit_rolled_back,
+MAX(CASE WHEN id=9 THEN pad END)='endpoint-9'
+         AS continued_owner_dml_rolled_back
+FROM xfer2_endpoint_accounts;
+final_row_count	outsider_and_waiter_balance_once	outsider_and_waiter_versions_once	exact_changed_rows	waiter_ran_once	owner_credit_rolled_back	continued_owner_dml_rolled_back
+1	1	1	1	1	1	1
+SELECT COUNT(*)=0 AS owner_audit_rolled_back FROM xfer2_endpoint_audit;
+owner_audit_rolled_back
+1
+CHECK TABLE xfer2_endpoint_accounts,xfer2_endpoint_audit;
+Table	Op	Msg_type	Msg_text
+test.xfer2_endpoint_accounts	check	status	OK
+test.xfer2_endpoint_audit	check	status	OK
+SCENARIO X1-02 missing_credential_name END
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Connections')=@receiver_connections_before
+AS no_receiver_connection_accepted;
+no_receiver_connection_accepted
+1
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_admitted_frames')
+=@receiver_admitted_before AS no_frame_admitted,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')
+=@receiver_active_before AS no_receiver_epoch,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')
+=@receiver_inflight_tokens_before AS no_inflight_token,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')
+=@receiver_inflight_bytes_before AS no_inflight_byte,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes')
+=@receiver_staged_before AS no_staged_memory;
+no_frame_admitted	no_receiver_epoch	no_inflight_token	no_inflight_byte	no_staged_memory
+1	1	1	1	1
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins')
+=@receiver_terminal_before AS no_terminal_fact,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')
+=@receiver_prepared_before AS no_prepared_entry;
+no_terminal_fact	no_prepared_entry
+1	1
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_admitted_bytes')
+=@receiver_extra_admitted_bytes_before AS no_admitted_byte,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_cleanup_debt_tokens')
+=@receiver_extra_cleanup_debt_tokens_before AS no_cleanup_debt,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_bytes')
+=@receiver_extra_cleanup_debt_bytes_before AS no_cleanup_debt_byte,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_terminal_status_tombstones')
+=@receiver_extra_tombstones_before AS no_terminal_tombstone,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_promotion_prepared_prewarm_pending_tokens')
+=@receiver_extra_prepared_pending_before AS no_prepared_pending,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_ready_tokens')
+=@receiver_extra_prepared_ready_before AS no_prepared_ready,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_promotion_ready_cache_bytes')
+=@receiver_extra_ready_cache_before AS no_ready_cache,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_memory_current_bytes')
+=@receiver_extra_memory_before AS no_preserve_memory;
+no_admitted_byte	no_cleanup_debt	no_cleanup_debt_byte	no_terminal_tombstone	no_prepared_pending	no_prepared_ready	no_ready_cache	no_preserve_memory
+1	1	1	1	1	1	1	1
+SELECT VARIABLE_VALUE=0 AS no_active_receiver_worker
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_worker_active';
+no_active_receiver_worker
+1
+SELECT VARIABLE_VALUE=0 AS no_receiver_queue
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_queued_bytes';
+no_receiver_queue
+1
+START TRANSACTION;
+UPDATE xfer2_endpoint_receiver_native SET v=v+id;
+COMMIT;
+SELECT COUNT(*)=2 AND SUM(v)=103 AS receiver_native_dml_works
+FROM xfer2_endpoint_receiver_native;
+receiver_native_dml_works
+1
+include/assert_grep.inc [incomplete endpoints stayed before TCP connect]
+include/assert_grep.inc [endpoint credential is absent from source error log]
+include/assert_grep.inc [endpoint credential is absent from receiver error log]
+DROP TABLE xfer2_endpoint_receiver_native;
+DROP USER preserve_trx_endpoint_receiver@localhost;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')=0
+AS no_receiver_epoch_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')=0
+AS no_inflight_token_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')=0
+AS no_inflight_byte_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_staged_memory_bytes')=0
+AS no_staged_memory_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')=0
+AS no_prepared_entry_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_promotion_prepared_prewarm_pending_tokens')=0
+AS no_prewarm_pending_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_ready_tokens')=0
+AS no_prepared_ready_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_promotion_ready_cache_bytes')=0
+AS no_ready_cache_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_memory_current_bytes')=0
+AS no_preserve_memory_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_worker_active')=0
+AS no_active_worker_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_queued_bytes')=0
+AS no_queued_byte_after_restart;
+no_receiver_epoch_after_restart	no_inflight_token_after_restart	no_inflight_byte_after_restart	no_staged_memory_after_restart	no_prepared_entry_after_restart	no_prewarm_pending_after_restart	no_prepared_ready_after_restart	no_ready_cache_after_restart	no_preserve_memory_after_restart	no_active_worker_after_restart	no_queued_byte_after_restart
+1	1	1	1	1	1	1	1	1	1	1

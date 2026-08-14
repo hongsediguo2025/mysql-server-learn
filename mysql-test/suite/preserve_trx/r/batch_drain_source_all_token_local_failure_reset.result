@@ -1,6 +1,6 @@
 no_receiver_epoch
 1
-ERROR HY000: DRAIN TRANSACTIONS PRESERVE was reset before shutdown handoff
+ERROR HY000: DRAIN TRANSACTIONS PRESERVE was reset before ownership became irreversible
 same_connection
 1
 v

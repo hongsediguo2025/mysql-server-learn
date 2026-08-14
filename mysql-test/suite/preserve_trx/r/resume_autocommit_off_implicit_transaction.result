@@ -1,0 +1,24 @@
+DROP TABLE IF EXISTS t_resume_autocommit_off_implicit;
+SET GLOBAL rds_preserve_trx_enable=ON;
+CREATE TABLE t_resume_autocommit_off_implicit(
+id INT PRIMARY KEY,
+v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_resume_autocommit_off_implicit VALUES(1, 10), (2, 20);
+SET SESSION autocommit=0;
+UPDATE t_resume_autocommit_off_implicit SET v=11 WHERE id=1;
+SET SESSION autocommit=0;
+DRAIN TRANSACTIONS PRESERVE;
+RESUME PRESERVED TRANSACTION 'TOKEN';
+SELECT @@session.autocommit AS restored_autocommit;
+restored_autocommit
+0
+COMMIT;
+UPDATE t_resume_autocommit_off_implicit SET v=12 WHERE id=1;
+ROLLBACK;
+SELECT * FROM t_resume_autocommit_off_implicit ORDER BY id;
+id	v
+1	11
+2	20
+SET SESSION autocommit=1;
+DROP TABLE t_resume_autocommit_off_implicit;

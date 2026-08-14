@@ -1,0 +1,48 @@
+--source include/have_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_resume_autocommit_off_implicit;
+--enable_warnings
+
+SET GLOBAL rds_preserve_trx_enable=ON;
+
+CREATE TABLE t_resume_autocommit_off_implicit(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_resume_autocommit_off_implicit VALUES(1, 10), (2, 20);
+
+--connect(active_implicit,localhost,root,,test)
+SET SESSION autocommit=0;
+UPDATE t_resume_autocommit_off_implicit SET v=11 WHERE id=1;
+
+--connect(empty_implicit,localhost,root,,test)
+SET SESSION autocommit=0;
+
+--connection default
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+DRAIN TRANSACTIONS PRESERVE;
+--source include/wait_until_disconnected.inc
+
+--exec echo "restart: --rds-preserve-trx-enable=ON --log-bin=preserve-trx-autocommit-off-bin --server-id=1 --binlog-format=ROW" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+# The active implicit transaction is preserved; the empty autocommit=0
+# session is not a drain target.
+--source suite/preserve_trx/include/get_preserved_token.inc
+
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+SELECT @@session.autocommit AS restored_autocommit;
+COMMIT;
+
+# autocommit=0 remains effective after the preserved transaction commits.
+UPDATE t_resume_autocommit_off_implicit SET v=12 WHERE id=1;
+ROLLBACK;
+SELECT * FROM t_resume_autocommit_off_implicit ORDER BY id;
+
+SET SESSION autocommit=1;
+DROP TABLE t_resume_autocommit_off_implicit;

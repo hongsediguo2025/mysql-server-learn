@@ -1,0 +1,7 @@
+!include ../my.cnf
+
+[mysqld.1]
+debug=d,preserve_trx_receiver_force_read_view_horizon_mismatch
+
+[ENV]
+SERVER_MYPORT_1=@mysqld.1.port

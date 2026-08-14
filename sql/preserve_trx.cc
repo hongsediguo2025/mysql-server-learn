@@ -256,6 +256,8 @@ Preserve_trx_drain_ownership_state::request_reset() {
         break;
       case Preserve_trx_drain_terminal::HANDOFF_PENDING:
       case Preserve_trx_drain_terminal::COMMIT_UNKNOWN:
+      case Preserve_trx_drain_terminal::COMMITTED_HANDOFF:
+        return Preserve_trx_drain_reset_request::TOO_LATE;
       case Preserve_trx_drain_terminal::SHUTDOWN_HANDOFF:
         desired = Preserve_trx_drain_terminal::SOURCE_RESTORE_PENDING;
         result = Preserve_trx_drain_reset_request::WON;
@@ -338,15 +340,15 @@ bool Preserve_trx_drain_ownership_state::acknowledge_commit() {
   Preserve_trx_drain_terminal expected =
       Preserve_trx_drain_terminal::HANDOFF_PENDING;
   if (m_state.compare_exchange_strong(
-          expected, Preserve_trx_drain_terminal::SHUTDOWN_HANDOFF)) {
+          expected, Preserve_trx_drain_terminal::COMMITTED_HANDOFF)) {
     return true;
   }
   if (expected == Preserve_trx_drain_terminal::COMMIT_UNKNOWN) {
     return m_state.compare_exchange_strong(
-               expected, Preserve_trx_drain_terminal::SHUTDOWN_HANDOFF) ||
-           expected == Preserve_trx_drain_terminal::SHUTDOWN_HANDOFF;
+               expected, Preserve_trx_drain_terminal::COMMITTED_HANDOFF) ||
+           expected == Preserve_trx_drain_terminal::COMMITTED_HANDOFF;
   }
-  return expected == Preserve_trx_drain_terminal::SHUTDOWN_HANDOFF;
+  return expected == Preserve_trx_drain_terminal::COMMITTED_HANDOFF;
 }
 
 bool Preserve_trx_drain_ownership_state::shutdown_without_commit() {
@@ -368,6 +370,7 @@ bool Preserve_trx_drain_ownership_state::restore_allowed() const {
     case Preserve_trx_drain_terminal::COMMIT_UNKNOWN:
     case Preserve_trx_drain_terminal::SOURCE_RESTORED:
     case Preserve_trx_drain_terminal::SHUTDOWN_HANDOFF:
+    case Preserve_trx_drain_terminal::COMMITTED_HANDOFF:
       return false;
   }
   return false;
@@ -1029,6 +1032,9 @@ Preserve_trx_reset_drain_result preserve_trx_request_active_drain_reset_impl(
     case Preserve_trx_drain_reset_request::JOINED:
     case Preserve_trx_drain_reset_request::ALREADY_RESTORED:
       break;
+    case Preserve_trx_drain_reset_request::TOO_LATE:
+      g_reset_drain_too_late.fetch_add(1);
+      return Preserve_trx_reset_drain_result::TOO_LATE;
     case Preserve_trx_drain_reset_request::INVALID:
       preserve_trx_reset_invariant_failure("invalid_reset_ownership", attempt);
   }
@@ -2080,13 +2086,21 @@ static bool preserve_trx_register_resurrection_candidate(
 }
 
 static bool preserve_trx_resurrection_metadata_is_strict(
-    const Preserve_snapshot_metadata &metadata) {
+    const Preserve_snapshot_metadata &metadata, uint64_t expected_trx_id) {
+  const bool read_view_is_valid =
+      metadata.has_read_view
+          ? !metadata.read_view_payload.empty() &&
+                trx_preserve_read_view_payload_semantics_are_valid(
+                    metadata.read_view_payload, metadata.rv_low_limit_no,
+                    expected_trx_id)
+          : metadata.read_view_payload.empty() &&
+                metadata.rv_low_limit_no == 0;
   return metadata.engine_shape ==
              Preserve_snapshot_engine_shape::PERSISTENT_ONLY &&
          metadata.has_persistent_engine_state &&
          !metadata.has_temp_engine_state &&
          metadata.temp_table_manifest_payload.empty() &&
-         !metadata.has_read_view && metadata.read_view_payload.empty() &&
+         read_view_is_valid &&
          metadata.predicate_locks_payload.empty() &&
          preserve_snapshot_gtid_state_is_strict_transfer_safe(metadata);
 }
@@ -4827,9 +4841,9 @@ bool preserve_trx_has_only_supported_transaction_engines(
   return true;
 }
 
-bool preserve_trx_has_explicit_active_transaction(THD *thd) {
-  return thd->in_active_multi_stmt_transaction() &&
-         (thd->variables.option_bits & OPTION_BEGIN);
+bool preserve_trx_has_active_multi_stmt_transaction(THD *thd) {
+  return thd != nullptr && thd->in_active_multi_stmt_transaction() &&
+         thd->in_multi_stmt_transaction_mode();
 }
 
 bool preserve_trx_has_rw_transaction_participant(THD *thd) {
@@ -4845,7 +4859,7 @@ bool preserve_trx_has_rw_transaction_participant(THD *thd) {
 static bool preserve_trx_has_lock_warmcopy_phase1_candidate_transaction(
     THD *thd) {
   if (thd == nullptr) return false;
-  if (preserve_trx_has_explicit_active_transaction(thd)) return true;
+  if (preserve_trx_has_active_multi_stmt_transaction(thd)) return true;
 
   /*
     Phase-1 lock warmcopy is a best-effort prebuild pass that runs before the
@@ -5315,7 +5329,7 @@ bool preserve_trx_batch_candidate_is_idle_target(THD *owner, THD *candidate) {
   if (preserve_trx_is_unsupported_common_context(candidate)) return false;
   if (candidate->killed != THD::NOT_KILLED) return false;
   if (!candidate->m_server_idle) return false;
-  if (!preserve_trx_has_explicit_active_transaction(candidate)) return false;
+  if (!preserve_trx_has_active_multi_stmt_transaction(candidate)) return false;
   return true;
 }
 
@@ -5350,8 +5364,8 @@ class Preserve_batch_target_counter final : public Do_THD_Impl {
         return;
       }
 
-      const bool active_explicit_transaction =
-          preserve_trx_has_explicit_active_transaction(candidate);
+      const bool active_multi_stmt_transaction =
+          preserve_trx_has_active_multi_stmt_transaction(candidate);
       const bool command_packet_before_closing =
           candidate->preserve_trx_command_packet_before_closing.load(
               std::memory_order_acquire);
@@ -5360,38 +5374,39 @@ class Preserve_batch_target_counter final : public Do_THD_Impl {
           (candidate->preserve_trx_inflight_unknown_query_depth > 0 &&
            command_packet_before_closing);
       if (preserve_trx_is_ha_control_connection(candidate)) {
-        if (active_explicit_transaction ||
+        if (active_multi_stmt_transaction ||
             preserve_trx_has_rw_transaction_participant(candidate)) {
           m_has_unsupported_transaction = true;
         }
         mysql_mutex_unlock(&candidate->LOCK_thd_data);
         return;
       }
-      const bool nonidle_explicit_transaction =
-          active_explicit_transaction && !candidate->m_server_idle;
+      const bool nonidle_multi_stmt_transaction =
+          active_multi_stmt_transaction && !candidate->m_server_idle;
       const bool nonidle_unclassified_command_packet =
           command_packet_before_closing && candidate->is_classic_protocol();
-      if (!active_explicit_transaction && !batch_inflight_statement &&
+      if (!active_multi_stmt_transaction && !batch_inflight_statement &&
           !nonidle_unclassified_command_packet) {
         mysql_mutex_unlock(&candidate->LOCK_thd_data);
         return;
       }
 
       /*
-        Batch drain classifies sessions before it starts waiting. Idle explicit
-        transactions can publish QUIESCED immediately; sessions that are inside
-        a command or have an unclassified classic packet are admitted as pending
-        targets and must publish their final state at the command boundary.
+        Batch drain classifies sessions before it starts waiting. Idle active
+        multi-statement transactions can publish QUIESCED immediately; sessions
+        that are inside a command or have an unclassified classic packet are
+        admitted as pending targets and must publish their final state at the
+        command boundary.
         Unsupported or unstable sessions fail the whole batch instead of being
         silently skipped.
       */
-      if (active_explicit_transaction) ++m_transaction_count;
+      if (active_multi_stmt_transaction) ++m_transaction_count;
       const bool unstable_unsupported =
           candidate->preserve_trx_batch_state !=
               Preserve_trx_batch_thd_state::NONE ||
           candidate->killed != THD::NOT_KILLED;
       const bool idle_unsupported =
-          active_explicit_transaction && !batch_inflight_statement &&
+          active_multi_stmt_transaction && !batch_inflight_statement &&
           preserve_trx_is_unsupported_common_context(candidate);
       const bool unsupported = unstable_unsupported || idle_unsupported;
       const bool idle_target =
@@ -5399,7 +5414,7 @@ class Preserve_batch_target_counter final : public Do_THD_Impl {
           preserve_trx_batch_candidate_is_idle_target(m_owner, candidate);
       const bool pending_target =
           !unsupported && !idle_target &&
-          (batch_inflight_statement || nonidle_explicit_transaction ||
+          (batch_inflight_statement || nonidle_multi_stmt_transaction ||
            nonidle_unclassified_command_packet);
 
       if (unsupported) {
@@ -5419,7 +5434,7 @@ class Preserve_batch_target_counter final : public Do_THD_Impl {
         ++m_target_count;
         ++m_pending_target_count;
         m_target_thread_ids.push_back(candidate->thread_id());
-        if (active_explicit_transaction) {
+        if (active_multi_stmt_transaction) {
           m_transaction_target_thread_ids.push_back(candidate->thread_id());
         }
         candidate->preserve_trx_batch_generation = m_generation;
@@ -5475,8 +5490,8 @@ class Preserve_batch_phase1_transfer_target_scanner final : public Do_THD_Impl {
                          candidate->killed == THD::KILL_CONNECTION ||
                          candidate->is_system_thread();
     if (!ignored) {
-      const bool active_explicit_transaction =
-          preserve_trx_has_explicit_active_transaction(candidate);
+      const bool active_multi_stmt_transaction =
+          preserve_trx_has_active_multi_stmt_transaction(candidate);
       const bool batch_inflight_statement =
           preserve_trx_thd_has_batch_inflight_statement(candidate);
       const bool nonidle_unclassified_command_packet =
@@ -5489,7 +5504,7 @@ class Preserve_batch_phase1_transfer_target_scanner final : public Do_THD_Impl {
         quiesce/admission decision and any token not in the final target set is
         explicitly aborted.
       */
-      if (active_explicit_transaction || batch_inflight_statement ||
+      if (active_multi_stmt_transaction || batch_inflight_statement ||
           nonidle_unclassified_command_packet) {
         m_target_thread_ids.push_back(candidate->thread_id());
       }
@@ -5571,9 +5586,10 @@ static bool preserve_trx_publish_pending_quiesce_at_idle_boundary(THD *thd) {
     A pending target is allowed to finish the command that was already in
     flight when the drain selected it. Once the command reaches an idle
     boundary, the target either becomes a quiesced transaction or is removed
-    from the batch if the command ended without an explicit transaction.
+    from the batch if the command ended without an active multi-statement
+    transaction.
   */
-  if (preserve_trx_has_explicit_active_transaction(thd)) {
+  if (preserve_trx_has_active_multi_stmt_transaction(thd)) {
     thd->preserve_trx_batch_state = Preserve_trx_batch_thd_state::QUIESCED;
   } else {
     thd->preserve_trx_batch_state =
@@ -5736,7 +5752,7 @@ bool preserve_trx_quiesced_batch_target_is_stably_owned_locked(
              Preserve_trx_batch_thd_state::QUIESCED &&
          !candidate->release_resources_done() && !candidate->is_system_thread() &&
          candidate->killed == THD::NOT_KILLED &&
-         preserve_trx_has_explicit_active_transaction(candidate) &&
+         preserve_trx_has_active_multi_stmt_transaction(candidate) &&
          !preserve_trx_temp_table_has_batch_unsupported_boundary(candidate);
 }
 
@@ -5805,7 +5821,7 @@ bool preserve_trx_attached_batch_target_is_valid(
           Preserve_trx_batch_thd_state::ATTACHING &&
       !candidate->release_resources_done() && !candidate->is_system_thread() &&
       candidate->killed == THD::NOT_KILLED && candidate->m_server_idle &&
-      preserve_trx_has_explicit_active_transaction(candidate) &&
+      preserve_trx_has_active_multi_stmt_transaction(candidate) &&
       !preserve_trx_temp_table_has_batch_unsupported_boundary(candidate) &&
       !preserve_trx_is_unsupported_common_context(candidate) &&
       preserve_trx_batch_thread_id_in_targets(candidate->thread_id(),
@@ -5939,7 +5955,7 @@ class Preserve_batch_quiesced_target_counter final : public Do_THD_Impl {
           candidate->preserve_trx_batch_state !=
               Preserve_trx_batch_thd_state::QUIESCED ||
           !candidate->m_server_idle ||
-          !preserve_trx_has_explicit_active_transaction(candidate) ||
+          !preserve_trx_has_active_multi_stmt_transaction(candidate) ||
           !preserved_trx_binlog_format_is_supported(
               candidate->variables.binlog_format) ||
           preserve_trx_is_unsupported_common_context(candidate);
@@ -8385,7 +8401,7 @@ class Warmcopy_batch_drain_participant final
     Global_THD_manager::get_instance()->do_for_all_thd_copy(&prepare_warmcopy);
     for (const Preserve_trx_pinned_thd &target : prepare_warmcopy.targets()) {
       if (target.thd == nullptr ||
-          !preserve_trx_has_explicit_active_transaction(target.thd) ||
+          !preserve_trx_has_active_multi_stmt_transaction(target.thd) ||
           preserve_trx_is_unsupported_common_context(target.thd)) {
         continue;
       }
@@ -8600,13 +8616,14 @@ class Warmcopy_batch_drain_participant final
     if (targets.error()) return false;
 
     for (const auto &target : targets.targets()) {
-      const bool explicit_transaction =
+      const bool active_multi_stmt_transaction =
           target.thd != nullptr &&
-          preserve_trx_has_explicit_active_transaction(target.thd);
+          preserve_trx_has_active_multi_stmt_transaction(target.thd);
       const bool unsupported =
           target.thd != nullptr &&
           preserve_trx_is_unsupported_common_context(target.thd, true);
-      if (target.thd == nullptr || target.idle || !explicit_transaction ||
+      if (target.thd == nullptr || target.idle ||
+          !active_multi_stmt_transaction ||
           unsupported) {
         continue;
       }
@@ -10252,7 +10269,7 @@ bool preserved_trx_mark_inflight_risky_statement(THD *thd, LEX *lex,
                                                  enum_sql_command sql_command) {
   if (thd == nullptr) return false;
   if (!preserve_trx_is_enabled()) return false;
-  if (!preserve_trx_has_explicit_active_transaction(thd) &&
+  if (!preserve_trx_has_active_multi_stmt_transaction(thd) &&
       !preserve_trx_sql_command_may_create_trx_or_lock(lex, sql_command))
     return false;
 
@@ -12104,6 +12121,10 @@ static bool preserve_trx_try_restore_quarantined_reset(
           expected, false, std::memory_order_acq_rel)) {
     return false;
   }
+  auto reset_restore_guard = create_scope_guard([&] {
+    preserve_trx_reset_invariant_failure(
+        "quarantined_reset_exited_before_release_barrier", attempt);
+  });
   if (!attempt->ownership.begin_source_restore()) {
     preserve_trx_reset_invariant_failure(
         "quarantined_reset_source_restore_transition_failed", attempt);
@@ -12117,6 +12138,7 @@ static bool preserve_trx_try_restore_quarantined_reset(
   restore_preserved_batch_items_for_reset(attempt->generation,
                                           std::move(items), attempt);
   preserve_trx_publish_active_drain_reset_barrier(attempt);
+  reset_restore_guard.commit();
   preserved_trx_request_expired_reaper_scan();
   return true;
 }
@@ -12301,13 +12323,19 @@ Preserve_trx_transfer_status preserved_trx_resolve_handoff_unknown(
     return Preserve_trx_transfer_status::CORRUPT;
   }
 
+  const bool source_owns =
+      proof.resolution ==
+      Preserve_trx_handoff_resolution::RECEIVER_FENCED_SOURCE_OWNS;
   Preserve_trx_transfer_status result = Preserve_trx_transfer_status::CORRUPT;
-  if (proof.resolution ==
-      Preserve_trx_handoff_resolution::RECEIVER_FENCED_SOURCE_OWNS) {
+  if (source_owns) {
     if (!attempt->ownership.begin_source_restore()) {
       (void)attempt->handoff_resolution.complete(proof, result);
       return result;
     }
+    auto source_restore_guard = create_scope_guard([&] {
+      preserve_trx_reset_invariant_failure(
+          "handoff_resolution_source_restore_incomplete", attempt);
+    });
     {
       std::lock_guard<std::mutex> quarantine_guard(attempt->quarantine_mutex);
       if (restore_preserved_batch_items_to_original_thds(
@@ -12328,11 +12356,12 @@ Preserve_trx_transfer_status preserved_trx_resolve_handoff_unknown(
     }
     result = Preserve_trx_transfer_status::NOT_COMMITTED_CLEAN;
     preserve_trx_publish_active_drain_reset_barrier(attempt);
+    source_restore_guard.commit();
   } else {
     if (!attempt->ownership.acknowledge_commit() ||
         !preserve_trx_transition_manager_after_handoff_resolution(
-            *attempt, Preserve_trx_manager_state::SHUTDOWN_REQUESTED,
-            attempt->owner_thread_id)) {
+            *attempt, Preserve_trx_manager_state::TRANSFER_HANDOFF_COMPLETE,
+            0)) {
       (void)attempt->handoff_resolution.complete(proof, result);
       return result;
     }
@@ -12353,8 +12382,10 @@ Preserve_trx_transfer_status preserved_trx_resolve_handoff_unknown(
   if (!attempt->handoff_resolution.complete(proof, result)) {
     return Preserve_trx_transfer_status::CORRUPT;
   }
-  g_active_drain_attempt.reset();
-  g_last_resolved_drain_attempt = std::move(attempt);
+  if (source_owns) {
+    g_active_drain_attempt.reset();
+    g_last_resolved_drain_attempt = std::move(attempt);
+  }
   return result;
 }
 
@@ -16149,7 +16180,8 @@ bool preserve_trx_kernel_preserve_attached_transaction(
     const Preserve_snapshot_metadata &transfer_metadata = bundle.metadata;
     const bool strict_semantics =
         has_resurrection_facts &&
-        preserve_trx_resurrection_metadata_is_strict(transfer_metadata) &&
+        preserve_trx_resurrection_metadata_is_strict(
+            transfer_metadata, resurrection_facts.trx_id) &&
         !preserve_trx_build_resurrection_index_entry(
             std::to_string(token_selection.transfer_token), resurrection_facts,
             &transfer_resurrection_entry);
@@ -16628,7 +16660,7 @@ bool Preserve_trx_drain_service::execute(
   if (preserve_trx_is_unsupported_common_context(thd))
     return preserve_trx_reject_unsupported();
 
-  if (preserve_trx_has_explicit_active_transaction(thd)) {
+  if (preserve_trx_has_active_multi_stmt_transaction(thd)) {
     my_error(ER_PRESERVE_TRX_INVALID_STATE, MYF(0));
     return true;
   }
@@ -16653,6 +16685,10 @@ bool Preserve_trx_drain_service::execute(
   const bool lock_warmcopy_enabled = preserve_trx_lock_warmcopy_effective();
   const Preserve_trx_transfer_artifact_decision batch_artifact_decision =
       preserve_trx_transfer_artifact_decision();
+  if (batch_artifact_decision ==
+      Preserve_trx_transfer_artifact_decision::UNSUPPORTED) {
+    return preserve_trx_reject_unsupported();
+  }
   const bool standby_transfer_streaming_enabled =
       batch_artifact_decision ==
       Preserve_trx_transfer_artifact_decision::STANDBY_TRANSFER_SAVE;
@@ -17012,6 +17048,9 @@ bool Preserve_trx_drain_service::execute(
       abort_drain_participants("standby_transfer_open_epoch_failed");
       return true;
     }
+    DEBUG_SYNC(
+        thd,
+        "preserve_trx_transfer_after_open_epoch_ack_before_first_frame");
     batch_transfer_source_session->set_phase1_metrics_enabled(true);
     batch_transfer_phase1_flush_context.session =
         batch_transfer_source_session.get();
@@ -17680,8 +17719,10 @@ bool Preserve_trx_drain_service::execute(
     publish_phase2_metrics();
 #if defined(ENABLED_DEBUG_SYNC)
     if (active_drain_attempt != nullptr &&
-        active_drain_attempt->ownership.state() ==
-            Preserve_trx_drain_terminal::SHUTDOWN_HANDOFF) {
+        (active_drain_attempt->ownership.state() ==
+             Preserve_trx_drain_terminal::SHUTDOWN_HANDOFF ||
+         active_drain_attempt->ownership.state() ==
+             Preserve_trx_drain_terminal::COMMITTED_HANDOFF)) {
       DEBUG_SYNC(thd, "preserve_trx_drain_after_shutdown_handoff");
     }
 #endif
@@ -17770,7 +17811,6 @@ bool Preserve_trx_drain_service::execute(
       }
       return preserve_trx_reject_unsupported();
     }
-
     if (standby_transfer_streaming_enabled) {
       draining->dismiss();
       return false;
@@ -17795,6 +17835,111 @@ bool Preserve_trx_drain_service::execute(
                             0);
     draining->dismiss();
     return preserve_trx_reject_batch_cleanup_failed();
+  };
+
+  auto quarantine_retained_bytes = [&]() {
+    uint64_t retained_bytes = 0;
+    for (const Preserve_trx_batch_item &item : preserved_batch_items) {
+      if (item.source_rollback_image == nullptr) continue;
+      const uint64_t item_bytes =
+          !item.source_rollback_image->binlog_snapshot.cache_payload.empty()
+              ? item.source_rollback_image->binlog_snapshot.cache_payload.size()
+              : item.source_rollback_image->has_prebuilt_binlog_blob
+                    ? item.source_rollback_image->prebuilt_binlog_blob.size
+                    : 0;
+      retained_bytes =
+          item_bytes > std::numeric_limits<uint64_t>::max() - retained_bytes
+              ? std::numeric_limits<uint64_t>::max()
+              : retained_bytes + item_bytes;
+    }
+    return retained_bytes;
+  };
+  auto enter_uncertain = [&](Preserve_trx_transfer_status status,
+                             bool commit_may_have_reached_receiver) {
+    if (active_drain_attempt == nullptr) {
+      LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+             "PRESERVE: standby transfer has no active attempt for "
+             "uncertain handoff");
+      return finish_cleanup_failure_without_shutdown(
+          "standby_transfer_commit_unknown_state_failed");
+    }
+
+    const uint64_t retained_bytes = quarantine_retained_bytes();
+    const uint64_t retained_token_count = preserved_batch_items.size();
+    {
+      std::lock_guard<std::mutex> lock(
+          active_drain_attempt->quarantine_mutex);
+      active_drain_attempt->quarantine_started_monotonic_us =
+          preserve_trx_monotonic_us();
+      active_drain_attempt->quarantined_items =
+          std::move(preserved_batch_items);
+    }
+    auto uncertain_restore_context_guard = create_scope_guard([&] {
+      preserve_trx_reset_invariant_failure(
+          "uncertain_handoff_exited_before_source_restore_context",
+          active_drain_attempt);
+    });
+    active_drain_attempt_cleanup.commit();
+    draining->dismiss();
+    auto release_drain_scope = create_scope_guard([&] {
+      active_drain_attempt->drain_scope_released.store(
+          true, std::memory_order_release);
+    });
+    if (batch_transfer_binlog_blob_provider != nullptr) {
+      std::set<std::string> retained_warmcopy_ids =
+          batch_transfer_binlog_blob_provider
+              ->release_phase1_blobs_for_deferred_cleanup();
+      std::lock_guard<std::mutex> lock(
+          active_drain_attempt->quarantine_mutex);
+      active_drain_attempt->quarantined_source_warmcopy_ids =
+          std::move(retained_warmcopy_ids);
+    }
+    bool resolution_armed = false;
+    bool commit_unknown_published = false;
+    if (commit_may_have_reached_receiver) {
+      const Preserve_trx_handoff_resolution_context handoff_context =
+          batch_transfer_source_session->handoff_resolution_context();
+      resolution_armed =
+          active_drain_attempt->handoff_resolution.arm(handoff_context);
+      commit_unknown_published =
+          active_drain_attempt->ownership.mark_commit_unknown();
+      if (!resolution_armed || !commit_unknown_published) {
+        LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+               "PRESERVE: standby transfer could not publish COMMIT_UNKNOWN");
+      }
+      preserve_trx_transfer_note_source_commit_unknown(retained_token_count,
+                                                       retained_bytes);
+    }
+
+    release_reset_source_resources();
+    finalize_drain_participants_for_terminal_handoff(
+        commit_may_have_reached_receiver
+            ? "standby_transfer_commit_unknown"
+            : "standby_transfer_precommit_ack_uncertain");
+    drain_orchestrator.cleanup_after_failed_shutdown();
+
+    active_drain_attempt->source_restore_context_ready.store(
+        true, std::memory_order_release);
+    uncertain_restore_context_guard.commit();
+    if (reset_requested()) {
+      (void)preserve_trx_try_restore_quarantined_reset(active_drain_attempt);
+      return finish_phase2_reset(nullptr,
+                                 "reset_during_commit_unknown_publication");
+    }
+    active_drain_attempt->handoff_resolution_ready.store(
+        commit_may_have_reached_receiver && resolution_armed &&
+            commit_unknown_published,
+        std::memory_order_release);
+    LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+           ("PRESERVE: standby transfer source entered " +
+            std::string(commit_may_have_reached_receiver
+                            ? "COMMIT_UNKNOWN "
+                            : "PRECOMMIT_ACK_UNCERTAIN ") +
+            "status=" + std::to_string(static_cast<int>(status)) +
+            " token_count=" + std::to_string(retained_token_count) +
+            " retained_bytes=" + std::to_string(retained_bytes))
+               .c_str());
+    return preserve_trx_reject_unsupported();
   };
 
   auto close_warmcopy_participants_for_shutdown = [&](const char *stage) {
@@ -19620,6 +19765,12 @@ bool Preserve_trx_drain_service::execute(
                    .c_str());
       }
     }
+    if (batch_transfer_source_session->precommit_ack_uncertain()) {
+      collect_completed_target_items();
+      retain_source_failed_items_in_source_context();
+      return enter_uncertain(Preserve_trx_transfer_status::ACK_UNCERTAIN,
+                             false);
+    }
     if (!retained_failed_targets.empty()) {
       quiesced_target_thread_ids.erase(
           std::remove_if(quiesced_target_thread_ids.begin(),
@@ -19839,6 +19990,12 @@ bool Preserve_trx_drain_service::execute(
   const Preserve_batch_target_execution *failed_execution = nullptr;
   const ulonglong result_collect_started_us = preserve_trx_monotonic_us();
   collect_completed_target_items();
+  if (batch_transfer_source_session != nullptr &&
+      batch_transfer_source_session->precommit_ack_uncertain()) {
+    retain_source_failed_items_in_source_context();
+    return enter_uncertain(Preserve_trx_transfer_status::ACK_UNCERTAIN,
+                           false);
+  }
   for (Preserve_batch_target_execution &execution : target_results) {
     apply_target_metrics(execution.result);
 
@@ -20049,107 +20206,18 @@ bool Preserve_trx_drain_service::execute(
                                         "reset_before_transfer_commit");
   retain_source_failed_items_in_source_context();
   if (batch_transfer_source_session != nullptr) {
-    auto quarantine_retained_bytes = [&]() {
-      uint64_t retained_bytes = 0;
-      for (const Preserve_trx_batch_item &item : preserved_batch_items) {
-        if (item.source_rollback_image == nullptr) continue;
-        const uint64_t item_bytes =
-            !item.source_rollback_image->binlog_snapshot.cache_payload.empty()
-                ? item.source_rollback_image->binlog_snapshot.cache_payload
-                      .size()
-                : item.source_rollback_image->has_prebuilt_binlog_blob
-                      ? item.source_rollback_image->prebuilt_binlog_blob.size
-                      : 0;
-        retained_bytes =
-            item_bytes > std::numeric_limits<uint64_t>::max() - retained_bytes
-                ? std::numeric_limits<uint64_t>::max()
-                : retained_bytes + item_bytes;
-      }
-      return retained_bytes;
-    };
-    auto enter_commit_unknown = [&](Preserve_trx_transfer_status status) {
-      if (active_drain_attempt == nullptr) {
-        LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
-               "PRESERVE: standby transfer has no active attempt for "
-               "COMMIT_UNKNOWN");
-        return finish_cleanup_failure_without_shutdown(
-            "standby_transfer_commit_unknown_state_failed");
-      }
-
-      const Preserve_trx_handoff_resolution_context handoff_context =
-          batch_transfer_source_session->handoff_resolution_context();
-      const uint64_t retained_bytes = quarantine_retained_bytes();
-      const uint64_t retained_token_count = preserved_batch_items.size();
-      std::set<std::string> retained_warmcopy_ids;
-      if (batch_transfer_binlog_blob_provider != nullptr) {
-        retained_warmcopy_ids =
-            batch_transfer_binlog_blob_provider
-                ->release_phase1_blobs_for_deferred_cleanup();
-      }
-      {
-        std::lock_guard<std::mutex> lock(
-            active_drain_attempt->quarantine_mutex);
-        active_drain_attempt->quarantine_started_monotonic_us =
-            preserve_trx_monotonic_us();
-        active_drain_attempt->quarantined_items =
-            std::move(preserved_batch_items);
-        active_drain_attempt->quarantined_source_warmcopy_ids =
-            std::move(retained_warmcopy_ids);
-      }
-      const bool resolution_armed =
-          active_drain_attempt->handoff_resolution.arm(handoff_context);
-      if (!resolution_armed) {
-        LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
-               "PRESERVE: standby transfer could not arm HA handoff "
-               "resolution context");
-      }
-      const bool commit_unknown_published =
-          active_drain_attempt->ownership.mark_commit_unknown();
-      if (!commit_unknown_published) {
-        LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
-               "PRESERVE: standby transfer could not publish COMMIT_UNKNOWN");
-      }
-      preserve_trx_transfer_note_source_commit_unknown(
-          retained_token_count, retained_bytes);
-
-      batch_transfer_phase1_flush_context.session = nullptr;
-      batch_transfer_source_session.reset();
-      release_batch_transfer_frame_sink();
-      batch_transfer_binlog_blob_provider.reset();
-      batch_transfer_phase1_declared_tokens.clear();
-      finalize_drain_participants_for_terminal_handoff(
-          "standby_transfer_commit_unknown");
-
-      active_drain_attempt->source_restore_context_ready.store(
-          true, std::memory_order_release);
-      if (reset_requested()) {
-        (void)preserve_trx_try_restore_quarantined_reset(
-            active_drain_attempt);
-        return finish_phase2_reset(nullptr,
-                                   "reset_during_commit_unknown_publication");
-      }
-      active_drain_attempt_cleanup.commit();
-      draining->dismiss();
-      active_drain_attempt->drain_scope_released.store(
-          true, std::memory_order_release);
-      active_drain_attempt->handoff_resolution_ready.store(
-          resolution_armed && commit_unknown_published,
-          std::memory_order_release);
-      LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
-             ("PRESERVE: standby transfer source entered COMMIT_UNKNOWN "
-              "status=" +
-              std::to_string(static_cast<int>(status)) + " token_count=" +
-              std::to_string(retained_token_count) +
-              " retained_bytes=" + std::to_string(retained_bytes))
-                 .c_str());
-      return preserve_trx_reject_unsupported();
-    };
-
     const ulonglong commit_epoch_started_us = preserve_trx_monotonic_us();
     const Preserve_trx_transfer_status commit_status =
         batch_transfer_source_session->commit_epoch();
     phase2_metrics.transfer_commit_epoch_us +=
         elapsed_since(commit_epoch_started_us);
+    if (commit_status == Preserve_trx_transfer_status::ACK_UNCERTAIN &&
+        batch_transfer_source_session->precommit_ack_uncertain() &&
+        active_drain_attempt != nullptr &&
+        active_drain_attempt->ownership.state() ==
+            Preserve_trx_drain_terminal::RUNNING) {
+      return enter_uncertain(commit_status, false);
+    }
     const bool receiver_committed =
         commit_status == Preserve_trx_transfer_status::COMMITTED_READY ||
         commit_status == Preserve_trx_transfer_status::COMMITTED_NOT_READY;
@@ -20165,7 +20233,7 @@ bool Preserve_trx_drain_service::execute(
           Preserve_trx_transfer_status::NOT_COMMITTED_CLEAN) {
         if (active_drain_attempt == nullptr ||
             !active_drain_attempt->ownership.resolve_not_committed_clean()) {
-          return enter_commit_unknown(commit_status);
+          return enter_uncertain(commit_status, true);
         }
         preserve_trx_transfer_note_source_handoff_committed();
         const bool cleanup_error = restore_current_items_to_original_thds();
@@ -20177,6 +20245,8 @@ bool Preserve_trx_drain_service::execute(
           return finish_cleanup_failure_without_shutdown(
               "standby_transfer_not_committed_clean_state_failed");
         }
+        preserve_trx_publish_active_drain_reset_barrier(
+            active_drain_attempt);
         abort_drain_participants(
             "standby_transfer_receiver_not_committed_clean");
         return preserve_trx_reject_unsupported();
@@ -20186,7 +20256,7 @@ bool Preserve_trx_drain_service::execute(
                Preserve_trx_drain_terminal::HANDOFF_PENDING ||
            active_drain_attempt->ownership.state() ==
                Preserve_trx_drain_terminal::COMMIT_UNKNOWN)) {
-        return enter_commit_unknown(commit_status);
+        return enter_uncertain(commit_status, true);
       }
       LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
              ("PRESERVE: standby transfer source epoch commit failed status=" +
@@ -20210,7 +20280,7 @@ bool Preserve_trx_drain_service::execute(
     transfer_final_ack_accepted =
         active_drain_attempt != nullptr &&
         active_drain_attempt->ownership.state() ==
-            Preserve_trx_drain_terminal::SHUTDOWN_HANDOFF;
+            Preserve_trx_drain_terminal::COMMITTED_HANDOFF;
     if (!transfer_final_ack_accepted) {
       LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
              "PRESERVE: receiver accepted transfer without terminal source "
