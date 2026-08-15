@@ -1,0 +1,19 @@
+!include ../my.cnf
+
+[mysqld.1]
+log-bin=xfer2-x1008-source-bin
+binlog-format=ROW
+gtid-mode=ON
+enforce-gtid-consistency=ON
+max_allowed_packet=67108864
+rds-preserve-trx-transfer-runtime-profile=PROMOTION_PREPARE
+rds-preserve-trx-transfer-max-inflight-bytes=67108864
+
+[mysqld.2]
+log-bin=xfer2-x1008-receiver-bin
+binlog-format=ROW
+gtid-mode=ON
+enforce-gtid-consistency=ON
+max_allowed_packet=67108864
+rds-preserve-trx-transfer-runtime-profile=PROMOTION_PREPARE
+rds-preserve-trx-transfer-max-inflight-bytes=67108864

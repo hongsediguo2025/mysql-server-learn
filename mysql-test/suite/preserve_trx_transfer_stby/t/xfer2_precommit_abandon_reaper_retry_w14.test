@@ -3,11 +3,13 @@
 --source include/not_windows.inc
 --source include/force_restart.inc
 
-# X7-04a / W14 / O01 / T1 debug-contract
+# X6-05 / X7-04a / W14 / O01 / T1 debug-contract
 # A true two-mysqld RESET wins after final metadata is accepted locally but
 # before COMMIT admission. The receiver already owns real staged payload.
-# Foreground ABANDON cleanup is deferred, then the online reaper consumes the
-# same authenticated tombstone and retires staging without a receiver restart.
+# Foreground ABANDON cleanup is deferred. The source retries the byte-identical
+# authenticated ABANDON, then the online reaper re-enters the same operation
+# and retires staging without a receiver restart. Both duplicate paths must be
+# idempotent: one terminal winner, one tombstone and no terminal conflict.
 # This is distinct from X5-12b selected-token cleanup debt and X12-07's
 # DECLARE_TOKEN rejection before payload staging.
 
@@ -53,6 +55,12 @@ SET @memory_before=(SELECT VARIABLE_VALUE+0
 SET @terminal_wins_before=(SELECT VARIABLE_VALUE+0
   FROM performance_schema.global_status WHERE VARIABLE_NAME=
   'Preserve_trx_transfer_receiver_terminal_cas_wins');
+SET @terminal_duplicates_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_terminal_cas_duplicates');
+SET @terminal_conflicts_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_terminal_cas_conflicts');
 SET @terminal_tombstones_before=(SELECT VARIABLE_VALUE+0
   FROM performance_schema.global_status WHERE VARIABLE_NAME=
   'Preserve_trx_transfer_receiver_terminal_status_tombstones');
@@ -162,6 +170,15 @@ SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
          WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins')
          = @terminal_wins_before+1 AS abandon_terminal_cas_won_once,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+          'Preserve_trx_transfer_receiver_terminal_cas_duplicates')
+         = @terminal_duplicates_before+2
+         AS exact_sender_retry_and_reaper_reentry,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+          'Preserve_trx_transfer_receiver_terminal_cas_conflicts')
+         = @terminal_conflicts_before AS duplicate_abandon_is_not_conflict,
        (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
          WHERE VARIABLE_NAME=
           'Preserve_trx_transfer_receiver_terminal_status_tombstones')

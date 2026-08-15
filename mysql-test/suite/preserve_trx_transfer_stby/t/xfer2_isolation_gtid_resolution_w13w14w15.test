@@ -1,0 +1,779 @@
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/have_log_bin.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+# X9-12 / W13 / W14 / W15 / O01 / O09 / O10 / T1 debug-contract /
+# I02 / I05 / I06 / I10 / I14.
+#
+# Four disjoint source owners exercise RC statement visibility, a nonempty RR
+# ReadView, one logged AUTOMATIC-GTID cache, and one permitted sql_log_bin=0
+# comparison transaction.  Pause after every final-token payload is ACKed but
+# before receiver COMMIT_EPOCH ownership CAS.  RESET must restore all original
+# THDs, retire receiver staging without READY publication, preserve the logged
+# cache/GTID session state, and allow exactly one legal source commit per owner.
+
+--source suite/preserve_trx_transfer_stby/include/w01_setup.inc
+
+--disable_query_log
+
+--connection default
+GRANT SESSION_VARIABLES_ADMIN ON *.* TO xfer2_w01_app@localhost;
+SET SESSION sql_log_bin=0;
+--disable_warnings
+DROP TABLE IF EXISTS xfer2_x912_audit;
+DROP TABLE IF EXISTS xfer2_x912_accounts;
+--enable_warnings
+CREATE TABLE xfer2_x912_accounts(
+  id INT PRIMARY KEY,
+  workload VARCHAR(16) NOT NULL,
+  balance INT NOT NULL,
+  version INT NOT NULL,
+  state VARCHAR(24) NOT NULL,
+  KEY k_workload_balance(workload,balance)
+) ENGINE=InnoDB;
+CREATE TABLE xfer2_x912_audit(
+  owner_tag VARCHAR(16) NOT NULL,
+  account_id INT NOT NULL,
+  delta INT NOT NULL,
+  PRIMARY KEY(owner_tag,account_id),
+  KEY k_account(account_id)
+) ENGINE=InnoDB;
+INSERT INTO xfer2_x912_accounts
+WITH RECURSIVE seq(n) AS (
+  SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<64
+)
+SELECT n,
+       CASE WHEN n<=16 THEN 'rc'
+            WHEN n<=32 THEN 'rr'
+            WHEN n<=48 THEN 'gtid'
+            ELSE 'nobin' END,
+       1000,0,'seed'
+  FROM seq;
+SET SESSION sql_log_bin=1;
+RESET MASTER;
+
+--enable_query_log
+SELECT @@GLOBAL.log_bin=1 AND @@GLOBAL.gtid_mode='ON'
+         AND @@GLOBAL.enforce_gtid_consistency='ON'
+         AS x912_source_gtid_profile;
+SELECT @@GLOBAL.GTID_EXECUTED='' AS x912_gtid_empty_before_owners;
+SELECT COUNT(*)=64 AND SUM(balance)=64000 AND SUM(version)=0
+         AND SUM(state='seed')=64 AS x912_seed_exact
+  FROM xfer2_x912_accounts;
+SELECT COUNT(*)=0 AS x912_audit_empty FROM xfer2_x912_audit;
+--disable_query_log
+
+--connection xfer2_receiver
+SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=ON;
+--disable_warnings
+DROP USER IF EXISTS xfer2_x912_receiver_app@localhost;
+DROP TABLE IF EXISTS xfer2_x912_receiver_native;
+--enable_warnings
+CREATE USER xfer2_x912_receiver_app@localhost;
+CREATE TABLE xfer2_x912_receiver_native(
+  id INT PRIMARY KEY,
+  v INT NOT NULL,
+  KEY(v)
+) ENGINE=InnoDB;
+INSERT INTO xfer2_x912_receiver_native
+WITH RECURSIVE seq(n) AS (
+  SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<24
+)
+SELECT n,n*4 FROM seq;
+GRANT SELECT,INSERT,UPDATE,DELETE ON test.xfer2_x912_receiver_native
+  TO xfer2_x912_receiver_app@localhost;
+
+SET @x912_online_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_online_epochs');
+SET @x912_active_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_active_epochs');
+SET @x912_admitted_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_admitted_frames');
+SET @x912_admitted_bytes_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_admitted_bytes');
+SET @x912_inflight_tokens_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_inflight_tokens');
+SET @x912_inflight_bytes_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_inflight_bytes');
+SET @x912_staged_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_staged_memory_bytes');
+SET @x912_saved_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_saved_online_tokens');
+SET @x912_terminal_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_terminal_cas_wins');
+SET @x912_duplicates_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_terminal_cas_duplicates');
+SET @x912_conflicts_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_terminal_cas_conflicts');
+SET @x912_tombstones_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_terminal_status_tombstones');
+SET @x912_classified_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_auto_prewarm_tokens');
+SET @x912_ready_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens');
+SET @x912_not_ready_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens');
+SET @x912_prepared_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_promotion_prepared_registered_tokens');
+SET @x912_prepared_pending_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_promotion_prepared_prewarm_pending_tokens');
+SET @x912_prepared_ready_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_promotion_prepared_ready_tokens');
+SET @x912_ready_cache_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_promotion_ready_cache_bytes');
+SET @x912_memory_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_memory_current_bytes');
+SET @x912_debt_tokens_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_cleanup_debt_tokens');
+SET @x912_debt_bytes_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_cleanup_debt_bytes');
+SET @x912_last_seal_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_last_object_seal_monotonic_us');
+
+--connection xfer2_source_ha
+SET @x912_reset_wins_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_reset_drain_wins');
+SET @x912_reset_too_late_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_reset_drain_too_late');
+SET @x912_handoff_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_source_handoff_pending_epochs');
+SET @x912_unknown_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_source_commit_unknown_epochs');
+SET @x912_quarantine_epochs_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_quarantine_epochs');
+SET @x912_quarantine_tokens_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_quarantine_tokens');
+SET @x912_preserved_before=(SELECT COUNT(*)
+  FROM performance_schema.preserved_transactions);
+
+# W13: RC owner writes three rows.  An independent autocommit RC reader must
+# remain at the committed baseline until the restored owner actually commits.
+--connect(xfer2_x912_rc_owner,localhost,xfer2_w01_app,,test)
+SET SESSION sql_log_bin=0;
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+--let $x912_rc_owner_id= query_get_value(SELECT CONNECTION_ID() AS id,id,1)
+START TRANSACTION;
+UPDATE xfer2_x912_accounts
+   SET balance=balance+10,version=version+1,state='rc-owner' WHERE id=1;
+UPDATE xfer2_x912_accounts
+   SET balance=balance+20,version=version+1,state='rc-owner' WHERE id=3;
+UPDATE xfer2_x912_accounts
+   SET balance=balance-5,version=version+1,state='rc-owner' WHERE id=5;
+INSERT INTO xfer2_x912_audit VALUES
+ ('rc',1,10),('rc',3,20),('rc',5,-5);
+
+--connect(xfer2_x912_rc_reader,localhost,root,,test)
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+--enable_query_log
+SELECT COUNT(*)=16 AND SUM(balance)=16000 AND SUM(version)=0
+         AS rc_reader_before_resolution_baseline
+  FROM xfer2_x912_accounts FORCE INDEX(k_workload_balance)
+ WHERE workload='rc';
+SELECT COUNT(*)=0 AS rc_reader_hides_uncommitted_audit
+  FROM xfer2_x912_audit WHERE owner_tag='rc';
+--disable_query_log
+
+# W14: establish a nonempty RR ReadView, commit an independent control change,
+# then write three disjoint rows while the owner keeps the old control version.
+--connect(xfer2_x912_rr_owner,localhost,xfer2_w01_app,,test)
+SET SESSION sql_log_bin=0;
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+--let $x912_rr_owner_id= query_get_value(SELECT CONNECTION_ID() AS id,id,1)
+START TRANSACTION;
+--enable_query_log
+SELECT balance=1000 AND version=0 AS rr_owner_initial_control
+  FROM xfer2_x912_accounts WHERE id=32;
+--disable_query_log
+
+--connect(xfer2_x912_outsider,localhost,root,,test)
+SET SESSION sql_log_bin=0;
+UPDATE xfer2_x912_accounts
+   SET balance=balance+1,version=version+1,state='rr-background'
+ WHERE id=32;
+UPDATE xfer2_w01_accounts
+   SET balance=balance+1,version=version+1 WHERE id=32;
+
+--connection xfer2_x912_rr_owner
+--enable_query_log
+SELECT balance=1000 AND version=0 AS rr_owner_keeps_old_control
+  FROM xfer2_x912_accounts WHERE id=32;
+--disable_query_log
+UPDATE xfer2_x912_accounts
+   SET balance=balance+14,version=version+1,state='rr-owner' WHERE id=17;
+UPDATE xfer2_x912_accounts
+   SET balance=balance+28,version=version+1,state='rr-owner' WHERE id=19;
+UPDATE xfer2_x912_accounts
+   SET balance=balance-7,version=version+1,state='rr-owner' WHERE id=21;
+INSERT INTO xfer2_x912_audit VALUES
+ ('rr',17,14),('rr',19,28),('rr',21,-7);
+
+# W15 logged owner: AUTOMATIC GTID remains unowned until this transaction's
+# restored binlog cache commits after RESET.
+--connect(xfer2_x912_gtid_owner,localhost,xfer2_w01_app,,test)
+SET SESSION sql_log_bin=1;
+SET GTID_NEXT=AUTOMATIC;
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+--let $x912_gtid_owner_id= query_get_value(SELECT CONNECTION_ID() AS id,id,1)
+START TRANSACTION;
+UPDATE xfer2_x912_accounts
+   SET balance=balance+15,version=version+1,state='gtid-owner' WHERE id=33;
+UPDATE xfer2_x912_accounts
+   SET balance=balance+30,version=version+1,state='gtid-owner' WHERE id=35;
+UPDATE xfer2_x912_accounts
+   SET balance=balance-10,version=version+1,state='gtid-owner' WHERE id=37;
+INSERT INTO xfer2_x912_audit VALUES
+ ('gtid',33,15),('gtid',35,30),('gtid',37,-10);
+
+# W15 comparison: global binlog remains ON but this otherwise equivalent
+# transaction is session-off and must never allocate a GTID.
+--connect(xfer2_x912_nobin_owner,localhost,xfer2_w01_app,,test)
+SET SESSION sql_log_bin=0;
+SET GTID_NEXT=AUTOMATIC;
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+--let $x912_nobin_owner_id= query_get_value(SELECT CONNECTION_ID() AS id,id,1)
+START TRANSACTION;
+UPDATE xfer2_x912_accounts
+   SET balance=balance+16,version=version+1,state='nobin-owner' WHERE id=49;
+UPDATE xfer2_x912_accounts
+   SET balance=balance+32,version=version+1,state='nobin-owner' WHERE id=51;
+UPDATE xfer2_x912_accounts
+   SET balance=balance-8,version=version+1,state='nobin-owner' WHERE id=53;
+INSERT INTO xfer2_x912_audit VALUES
+ ('nobin',49,16),('nobin',51,32),('nobin',53,-8);
+
+# Exact owner and outsider views before transfer.
+--connection xfer2_x912_rc_owner
+--enable_query_log
+SELECT COUNT(*)=16 AND SUM(balance)=16025 AND SUM(version)=3
+         AND SUM(state='rc-owner')=3 AS rc_owner_exact_before_drain
+  FROM xfer2_x912_accounts FORCE INDEX(k_workload_balance)
+ WHERE workload='rc';
+SELECT COUNT(*)=3 AND SUM(delta)=25 AS rc_owner_audit_exact
+  FROM xfer2_x912_audit WHERE owner_tag='rc';
+--disable_query_log
+
+--connection xfer2_x912_rr_owner
+--enable_query_log
+SELECT COUNT(*)=16 AND SUM(balance)=16035 AND SUM(version)=3
+         AND SUM(state='rr-owner')=3 AS rr_owner_exact_before_drain
+  FROM xfer2_x912_accounts FORCE INDEX(k_workload_balance)
+ WHERE workload='rr';
+SELECT COUNT(*)=3 AND SUM(delta)=35 AS rr_owner_audit_exact
+  FROM xfer2_x912_audit WHERE owner_tag='rr';
+--disable_query_log
+
+--connection xfer2_x912_gtid_owner
+--enable_query_log
+SELECT @@SESSION.sql_log_bin=1 AND @@SESSION.GTID_NEXT='AUTOMATIC'
+         AS gtid_owner_automatic_before_drain;
+SELECT COUNT(*)=16 AND SUM(balance)=16035 AND SUM(version)=3
+         AND SUM(state='gtid-owner')=3 AS gtid_owner_exact_before_drain
+  FROM xfer2_x912_accounts FORCE INDEX(k_workload_balance)
+ WHERE workload='gtid';
+SELECT COUNT(*)=3 AND SUM(delta)=35 AS gtid_owner_audit_exact
+  FROM xfer2_x912_audit WHERE owner_tag='gtid';
+--disable_query_log
+
+--connection xfer2_x912_nobin_owner
+--enable_query_log
+SELECT @@SESSION.sql_log_bin=0 AND @@SESSION.GTID_NEXT='AUTOMATIC'
+         AS nobin_owner_automatic_before_drain;
+SELECT COUNT(*)=16 AND SUM(balance)=16040 AND SUM(version)=3
+         AND SUM(state='nobin-owner')=3 AS nobin_owner_exact_before_drain
+  FROM xfer2_x912_accounts FORCE INDEX(k_workload_balance)
+ WHERE workload='nobin';
+SELECT COUNT(*)=3 AND SUM(delta)=40 AS nobin_owner_audit_exact
+  FROM xfer2_x912_audit WHERE owner_tag='nobin';
+--disable_query_log
+
+--connection xfer2_x912_outsider
+--enable_query_log
+SELECT COUNT(*)=16 AND SUM(balance)=16000 AND SUM(version)=0
+         AS outsider_hides_rc_owner
+  FROM xfer2_x912_accounts WHERE workload='rc';
+SELECT COUNT(*)=16 AND SUM(balance)=16001 AND SUM(version)=1
+         AND SUM(state='rr-background')=1 AS outsider_sees_only_rr_background
+  FROM xfer2_x912_accounts WHERE workload='rr';
+SELECT COUNT(*)=16 AND SUM(balance)=16000 AND SUM(version)=0
+         AS outsider_hides_gtid_owner
+  FROM xfer2_x912_accounts WHERE workload='gtid';
+SELECT COUNT(*)=16 AND SUM(balance)=16000 AND SUM(version)=0
+         AS outsider_hides_nobin_owner
+  FROM xfer2_x912_accounts WHERE workload='nobin';
+SELECT COUNT(*)=0 AS outsider_hides_all_owner_audit
+  FROM xfer2_x912_audit;
+SELECT balance=1001 AND version=1 AS source_native_background_committed
+  FROM xfer2_w01_accounts WHERE id=32;
+--disable_query_log
+
+--connect(xfer2_x912_receiver_native,127.0.0.1,xfer2_x912_receiver_app,,test,$SERVER_MYPORT_2,)
+--connect(xfer2_x912_drain,localhost,root,,test)
+SET DEBUG_SYNC=
+  'preserve_trx_transfer_before_commit_send_ownership_cas SIGNAL xfer2_x912_before_cas WAIT_FOR xfer2_x912_release';
+--send DRAIN TRANSACTIONS PRESERVE
+
+--connection xfer2_source_ha
+SET DEBUG_SYNC='now WAIT_FOR xfer2_x912_before_cas TIMEOUT 120';
+--enable_query_log
+SELECT COUNT(*)=@x912_preserved_before+4 AS four_x912_tokens_detached,
+       SUM(MOD_TABLES_COUNT=2)=4 AS every_x912_owner_modified_two_tables,
+       SUM(SAVEPOINT_COUNT=0)=4 AS no_x912_savepoint_state
+  FROM performance_schema.preserved_transactions;
+SELECT SUM(ISOLATION='READ-COMMITTED')=3 AS three_rc_tokens,
+       SUM(ISOLATION='REPEATABLE-READ')=1 AS one_rr_token,
+       SUM(HAS_READ_VIEW='YES')=1 AS one_valid_rr_read_view
+  FROM performance_schema.preserved_transactions;
+SELECT SUM(GLOBAL_LOG_BIN='ON')=4 AS every_token_records_global_binlog_on,
+       SUM(SESSION_SQL_LOG_BIN='OFF')=3 AS three_session_off_tokens,
+       SUM(SESSION_SQL_LOG_BIN='ON')=1 AS one_logged_token
+  FROM performance_schema.preserved_transactions;
+SELECT SUM(BINLOG_STATE='SESSION_OFF_NO_CACHE')=3
+         AS three_session_off_no_cache_tokens,
+       SUM(BINLOG_STATE='LOGGED_WITH_CACHE')=1
+         AS one_logged_cache_token,
+       SUM(WROTE_TO_CACHE='YES')=1 AS one_cache_writer,
+       SUM(BINLOG_CACHE_SIZE>0)=1 AS one_nonempty_binlog_cache
+  FROM performance_schema.preserved_transactions;
+SELECT SUM(GTID_NEXT='AUTOMATIC')=1 AS one_serialized_automatic_gtid,
+       SUM(GTID_NEXT IS NULL)=3 AS no_gtid_text_for_no_cache_tokens
+  FROM performance_schema.preserved_transactions;
+SELECT @@GLOBAL.GTID_EXECUTED='' AS gtid_still_unallocated_before_reset;
+--disable_query_log
+
+# Reaching the source hook proves all final-token payload ACKs.  Independently
+# require one real receiver epoch, four token reservations, and object seals.
+--connection xfer2_receiver
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_online_epochs')=@x912_online_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_admitted_frames')>@x912_admitted_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')=@x912_inflight_tokens_before+4 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_last_object_seal_monotonic_us')>@x912_last_seal_before
+--let $wait_timeout= 30
+--source include/wait_condition_or_abort.inc
+--enable_query_log
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_online_epochs')
+         =@x912_online_before+1 AS one_x912_precommit_epoch,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')
+         =@x912_active_before AS no_x912_terminal_epoch;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_admitted_frames')
+         >@x912_admitted_before AS x912_real_frames_admitted,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_admitted_bytes')
+         >@x912_admitted_bytes_before AS x912_real_bytes_admitted,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+          'Preserve_trx_transfer_receiver_last_object_seal_monotonic_us')
+         >@x912_last_seal_before AS x912_object_seal_observed;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')
+         =@x912_inflight_tokens_before+4 AS four_x912_receiver_tokens,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')
+         >@x912_inflight_bytes_before AS x912_receiver_bytes_reserved,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes')
+         >@x912_staged_before AS x912_receiver_staging_nonempty;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins')
+         =@x912_terminal_before AS no_x912_commit_cas_before_reset,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+          'Preserve_trx_transfer_receiver_terminal_status_tombstones')
+         =@x912_tombstones_before AS no_x912_tombstone_before_reset,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+          'Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens')
+         =@x912_ready_before AS no_x912_ready_before_reset;
+--disable_query_log
+
+# O09: unrelated receiver-native work commits while all transfer tokens are
+# staged and the source ownership CAS is still blocked.
+--connection xfer2_x912_receiver_native
+START TRANSACTION;
+UPDATE xfer2_x912_receiver_native SET v=v+3;
+DELETE FROM xfer2_x912_receiver_native WHERE id=24;
+INSERT INTO xfer2_x912_receiver_native VALUES(25,250);
+COMMIT;
+
+--connection xfer2_receiver
+--enable_query_log
+SELECT COUNT(*)=24 AND SUM(v)=1423
+         AS receiver_native_commit_during_x912_pause
+  FROM xfer2_x912_receiver_native;
+--disable_query_log
+
+--connect(xfer2_x912_reset,localhost,preserve_trx_ha_admin,xfer2-smoke-w01-secret,test)
+--send RESET DRAIN
+
+--connection xfer2_source_ha
+--let $wait_condition= SELECT COUNT(*)=1 FROM performance_schema.threads WHERE PROCESSLIST_INFO='RESET DRAIN'
+--let $wait_timeout= 10
+--source include/wait_condition_or_abort.inc
+SET DEBUG_SYNC='now SIGNAL xfer2_x912_release';
+
+--connection xfer2_x912_reset
+--reap
+
+--connection xfer2_x912_drain
+--error ER_PRESERVE_TRX_DRAIN_RESET
+--reap
+SET DEBUG_SYNC='RESET';
+
+--connection xfer2_source_ha
+--enable_query_log
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_reset_drain_wins')
+         =@x912_reset_wins_before+1 AS x912_reset_won_precommit,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_reset_drain_too_late')
+         =@x912_reset_too_late_before AS x912_reset_not_too_late;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+          'Preserve_trx_transfer_source_handoff_pending_epochs')
+         =@x912_handoff_before AS no_x912_handoff_pending,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+          'Preserve_trx_transfer_source_commit_unknown_epochs')
+         =@x912_unknown_before AS no_x912_commit_unknown,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_quarantine_epochs')
+         =@x912_quarantine_epochs_before AS no_x912_quarantine_epoch,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_quarantine_tokens')
+         =@x912_quarantine_tokens_before AS no_x912_quarantine_token;
+SELECT COUNT(*)=@x912_preserved_before AS no_detached_x912_token
+  FROM performance_schema.preserved_transactions;
+SELECT @@GLOBAL.GTID_EXECUTED='' AS reset_did_not_allocate_gtid;
+--disable_query_log
+
+--connection xfer2_receiver
+SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=OFF;
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')=@x912_inflight_tokens_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')=@x912_inflight_bytes_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes')=@x912_staged_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_worker_active')=0 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_queued_bytes')=0
+--let $wait_timeout= 30
+--source include/wait_condition_or_abort.inc
+--enable_query_log
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins')
+         =@x912_terminal_before+1 AS one_x912_terminal_cas,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+          'Preserve_trx_transfer_receiver_terminal_cas_duplicates')
+         =@x912_duplicates_before+1 AS one_x912_terminal_duplicate,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_conflicts')
+         =@x912_conflicts_before AS no_x912_terminal_conflict,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+          'Preserve_trx_transfer_receiver_terminal_status_tombstones')
+         =@x912_tombstones_before+1 AS one_x912_terminal_tombstone;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')
+         =@x912_active_before AS no_accepted_x912_epoch,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+          'Preserve_trx_transfer_receiver_saved_online_tokens')
+         =@x912_saved_before AS no_saved_x912_token,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+          'Preserve_trx_transfer_receiver_auto_prewarm_tokens')
+         =@x912_classified_before AS no_classified_x912_token,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+          'Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens')
+         =@x912_ready_before AS no_ready_x912_token,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+          'Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens')
+         =@x912_not_ready_before AS no_not_ready_x912_publication;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')
+         =@x912_prepared_before AS no_x912_prepared_registration,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+          'Preserve_trx_promotion_prepared_prewarm_pending_tokens')
+         =@x912_prepared_pending_before AS no_x912_prepared_pending,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_ready_tokens')
+         =@x912_prepared_ready_before AS no_x912_prepared_ready,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_promotion_ready_cache_bytes')
+         =@x912_ready_cache_before AS no_x912_ready_cache,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_memory_current_bytes')
+         =@x912_memory_before AS no_x912_preserve_memory;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+          'Preserve_trx_transfer_receiver_cleanup_debt_tokens')
+         =@x912_debt_tokens_before AS no_x912_cleanup_debt_token,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_bytes')
+         =@x912_debt_bytes_before AS no_x912_cleanup_debt_bytes,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_worker_active')=0
+         AS no_x912_receiver_worker,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_queued_bytes')=0
+         AS no_x912_receiver_queue;
+SELECT COUNT(*)=24 AND SUM(v)=1423 AS reset_kept_receiver_native_commit
+  FROM xfer2_x912_receiver_native;
+SELECT COUNT(*)=0 AS no_source_x912_table_published
+  FROM information_schema.tables
+ WHERE table_schema='test'
+   AND table_name IN ('xfer2_x912_accounts','xfer2_x912_audit');
+--disable_query_log
+
+--connection default
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+
+# W13 legal boundary: the restored owner still sees its writes while the RC
+# reader sees the baseline until COMMIT, then sees the committed version on its
+# next statement.
+--connection xfer2_x912_rc_reader
+--enable_query_log
+SELECT COUNT(*)=16 AND SUM(balance)=16000 AND SUM(version)=0
+         AS rc_reader_still_baseline_before_legal_commit
+  FROM xfer2_x912_accounts FORCE INDEX(k_workload_balance)
+ WHERE workload='rc';
+--disable_query_log
+
+--connection xfer2_x912_rc_owner
+--replace_result $x912_rc_owner_id X912_RC_OWNER_ID
+--enable_query_log
+--eval SELECT CONNECTION_ID()=$x912_rc_owner_id AS original_rc_owner_restored
+SELECT @@SESSION.transaction_isolation='READ-COMMITTED'
+         AND @@SESSION.sql_log_bin=0
+         AND @@SESSION.GTID_NEXT='AUTOMATIC'
+         AS rc_session_contract_restored;
+SELECT COUNT(*)=16 AND SUM(balance)=16025 AND SUM(version)=3
+         AND SUM(state='rc-owner')=3 AS restored_rc_owner_exact
+  FROM xfer2_x912_accounts FORCE INDEX(k_workload_balance)
+ WHERE workload='rc';
+SELECT COUNT(*)=3 AND SUM(delta)=25 AS restored_rc_audit_exact
+  FROM xfer2_x912_audit WHERE owner_tag='rc';
+--disable_query_log
+COMMIT;
+
+--connection xfer2_x912_rc_reader
+--enable_query_log
+SELECT COUNT(*)=16 AND SUM(balance)=16025 AND SUM(version)=3
+         AND SUM(state='rc-owner')=3
+         AS rc_reader_changes_only_after_legal_commit
+  FROM xfer2_x912_accounts FORCE INDEX(k_workload_balance)
+ WHERE workload='rc';
+SELECT COUNT(*)=3 AND SUM(delta)=25 AS rc_reader_sees_committed_audit
+  FROM xfer2_x912_audit WHERE owner_tag='rc';
+--disable_query_log
+
+# W14 keeps the same nonempty ReadView and old control row through RESET, then
+# commits its own three-row effect beside the independent committed update.
+--connection xfer2_x912_outsider
+--enable_query_log
+SELECT COUNT(*)=16 AND SUM(balance)=16001 AND SUM(version)=1
+         AS rr_outsider_before_owner_commit
+  FROM xfer2_x912_accounts WHERE workload='rr';
+--disable_query_log
+
+--connection xfer2_x912_rr_owner
+--replace_result $x912_rr_owner_id X912_RR_OWNER_ID
+--enable_query_log
+--eval SELECT CONNECTION_ID()=$x912_rr_owner_id AS original_rr_owner_restored
+SELECT @@SESSION.transaction_isolation='REPEATABLE-READ'
+         AND @@SESSION.sql_log_bin=0
+         AND @@SESSION.GTID_NEXT='AUTOMATIC'
+         AS rr_session_contract_restored;
+SELECT balance=1000 AND version=0 AS restored_rr_old_control
+  FROM xfer2_x912_accounts WHERE id=32;
+SELECT COUNT(*)=16 AND SUM(balance)=16035 AND SUM(version)=3
+         AND SUM(state='rr-owner')=3 AS restored_rr_owner_exact
+  FROM xfer2_x912_accounts FORCE INDEX(k_workload_balance)
+ WHERE workload='rr';
+SELECT COUNT(*)=3 AND SUM(delta)=35 AS restored_rr_audit_exact
+  FROM xfer2_x912_audit WHERE owner_tag='rr';
+--disable_query_log
+COMMIT;
+
+--connection xfer2_x912_outsider
+--enable_query_log
+SELECT COUNT(*)=16 AND SUM(balance)=16036 AND SUM(version)=4
+         AND SUM(state='rr-owner')=3
+         AND SUM(state='rr-background')=1
+         AS rr_owner_and_background_commit_once
+  FROM xfer2_x912_accounts WHERE workload='rr';
+--disable_query_log
+
+# The session-off comparison commits first and cannot consume a GTID.
+--connection xfer2_x912_nobin_owner
+--replace_result $x912_nobin_owner_id X912_NOBIN_OWNER_ID
+--enable_query_log
+--eval SELECT CONNECTION_ID()=$x912_nobin_owner_id AS original_nobin_owner_restored
+SELECT @@SESSION.sql_log_bin=0 AND @@SESSION.GTID_NEXT='AUTOMATIC'
+         AS restored_nobin_session_contract;
+SELECT COUNT(*)=16 AND SUM(balance)=16040 AND SUM(version)=3
+         AND SUM(state='nobin-owner')=3 AS restored_nobin_owner_exact
+  FROM xfer2_x912_accounts FORCE INDEX(k_workload_balance)
+ WHERE workload='nobin';
+SELECT COUNT(*)=3 AND SUM(delta)=40 AS restored_nobin_audit_exact
+  FROM xfer2_x912_audit WHERE owner_tag='nobin';
+--disable_query_log
+COMMIT;
+
+--connection xfer2_source_ha
+--enable_query_log
+SELECT @@GLOBAL.GTID_EXECUTED=''
+         AS session_off_commits_allocate_no_gtid;
+--disable_query_log
+
+# The logged owner must regain the original cache with AUTOMATIC GTID state;
+# its sole legal COMMIT allocates exactly source UUID GNO 1.
+--connection xfer2_x912_gtid_owner
+--replace_result $x912_gtid_owner_id X912_GTID_OWNER_ID
+--enable_query_log
+--eval SELECT CONNECTION_ID()=$x912_gtid_owner_id AS original_gtid_owner_restored
+SELECT @@SESSION.sql_log_bin=1 AND @@SESSION.GTID_NEXT='AUTOMATIC'
+         AS restored_gtid_session_contract;
+SELECT COUNT(*)=16 AND SUM(balance)=16035 AND SUM(version)=3
+         AND SUM(state='gtid-owner')=3 AS restored_gtid_owner_exact
+  FROM xfer2_x912_accounts FORCE INDEX(k_workload_balance)
+ WHERE workload='gtid';
+SELECT COUNT(*)=3 AND SUM(delta)=35 AS restored_gtid_audit_exact
+  FROM xfer2_x912_audit WHERE owner_tag='gtid';
+--disable_query_log
+COMMIT;
+--enable_query_log
+SELECT @@SESSION.GTID_NEXT='AUTOMATIC'
+         AS automatic_gtid_reset_after_commit;
+--disable_query_log
+
+--connection xfer2_source_ha
+--enable_query_log
+SELECT GTID_SUBSET(CONCAT(@@GLOBAL.SERVER_UUID,':1'),
+                   @@GLOBAL.GTID_EXECUTED)=1
+       AND GTID_SUBSET(@@GLOBAL.GTID_EXECUTED,
+                       CONCAT(@@GLOBAL.SERVER_UUID,':1'))=1
+         AS exactly_one_automatic_gtid_committed;
+--disable_query_log
+
+# Final source truth: every owner occurs once and every access path agrees.
+--connection xfer2_x912_outsider
+--enable_query_log
+SELECT COUNT(*)=64 AND SUM(balance)=64136 AND SUM(version)=13
+         AND SUM(state='seed')=51
+         AND SUM(state='rc-owner')=3
+         AND SUM(state='rr-owner')=3
+         AND SUM(state='rr-background')=1
+         AND SUM(state='gtid-owner')=3
+         AND SUM(state='nobin-owner')=3
+         AS committed_x912_full_scan_exact
+  FROM xfer2_x912_accounts;
+SELECT COUNT(*)=16 AND SUM(balance)=16025 AND SUM(version)=3
+         AS committed_rc_index_exact
+  FROM xfer2_x912_accounts FORCE INDEX(k_workload_balance)
+ WHERE workload='rc';
+SELECT COUNT(*)=16 AND SUM(balance)=16036 AND SUM(version)=4
+         AS committed_rr_index_exact
+  FROM xfer2_x912_accounts FORCE INDEX(k_workload_balance)
+ WHERE workload='rr';
+SELECT COUNT(*)=16 AND SUM(balance)=16035 AND SUM(version)=3
+         AS committed_gtid_index_exact
+  FROM xfer2_x912_accounts FORCE INDEX(k_workload_balance)
+ WHERE workload='gtid';
+SELECT COUNT(*)=16 AND SUM(balance)=16040 AND SUM(version)=3
+         AS committed_nobin_index_exact
+  FROM xfer2_x912_accounts FORCE INDEX(k_workload_balance)
+ WHERE workload='nobin';
+SELECT COUNT(*)=12 AND SUM(delta)=135
+         AND SUM(owner_tag='rc')=3
+         AND SUM(owner_tag='rr')=3
+         AND SUM(owner_tag='gtid')=3
+         AND SUM(owner_tag='nobin')=3
+         AS committed_x912_audit_exact
+  FROM xfer2_x912_audit;
+CHECK TABLE xfer2_x912_accounts,xfer2_x912_audit;
+--disable_query_log
+
+--disconnect xfer2_x912_rc_owner
+--disconnect xfer2_x912_rc_reader
+--disconnect xfer2_x912_rr_owner
+--disconnect xfer2_x912_gtid_owner
+--disconnect xfer2_x912_nobin_owner
+--disconnect xfer2_x912_outsider
+--disconnect xfer2_x912_receiver_native
+--disconnect xfer2_x912_drain
+--disconnect xfer2_x912_reset
+
+--connection xfer2_receiver
+DROP USER xfer2_x912_receiver_app@localhost;
+
+--source suite/preserve_trx_transfer_stby/include/w01_teardown.inc
+
+# Both server generations changed.  Source data and the unrelated receiver
+# commit remain exact; all transfer process state is gone.
+--connection xfer2_cleanup
+--enable_query_log
+SELECT COUNT(*)=64 AND SUM(balance)=64136 AND SUM(version)=13
+         AND SUM(state='seed')=51 AS restarted_x912_full_scan_exact
+  FROM xfer2_x912_accounts;
+SELECT COUNT(*)=16 AND SUM(balance)=16025 AND SUM(version)=3
+         AS restarted_rc_index_exact
+  FROM xfer2_x912_accounts FORCE INDEX(k_workload_balance)
+ WHERE workload='rc';
+SELECT COUNT(*)=16 AND SUM(balance)=16036 AND SUM(version)=4
+         AS restarted_rr_index_exact
+  FROM xfer2_x912_accounts FORCE INDEX(k_workload_balance)
+ WHERE workload='rr';
+SELECT COUNT(*)=16 AND SUM(balance)=16035 AND SUM(version)=3
+         AS restarted_gtid_index_exact
+  FROM xfer2_x912_accounts FORCE INDEX(k_workload_balance)
+ WHERE workload='gtid';
+SELECT COUNT(*)=16 AND SUM(balance)=16040 AND SUM(version)=3
+         AS restarted_nobin_index_exact
+  FROM xfer2_x912_accounts FORCE INDEX(k_workload_balance)
+ WHERE workload='nobin';
+SELECT COUNT(*)=12 AND SUM(delta)=135 AS restarted_x912_audit_exact
+  FROM xfer2_x912_audit;
+CHECK TABLE xfer2_x912_accounts,xfer2_x912_audit;
+DROP TABLE xfer2_x912_audit,xfer2_x912_accounts;
+--disable_query_log
+
+--connection xfer2_receiver
+--enable_query_log
+SELECT COUNT(*)=24 AND SUM(v)=1423
+         AS restarted_receiver_native_commit_exact
+  FROM xfer2_x912_receiver_native;
+CHECK TABLE xfer2_x912_receiver_native;
+DROP TABLE xfer2_x912_receiver_native;
+--disable_query_log
+
+--connection xfer2_cleanup
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+--enable_query_log

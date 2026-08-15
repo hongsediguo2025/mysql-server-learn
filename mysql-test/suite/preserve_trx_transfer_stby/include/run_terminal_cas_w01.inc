@@ -1,11 +1,13 @@
-# Private X6-02/X6-03/X6-12 W04/O01/O02/O10 terminal-CAS driver.  The legacy
-# filename and shared W01 table setup are retained; the executed business
-# transaction below is the W04 debit/credit/balanced-ledger workload.
+# Private X6-02/X6-03/X6-12/X11-04 W04/O01/O02/O09/O10 terminal-CAS driver.
+# The legacy filename and shared W01 table setup are retained; the executed
+# business transaction below is the W04 debit/credit/balanced-ledger workload.
 #
 # Required caller variable:
 #   $terminal_cas_case = 1 identical COMMIT retry
 #                      = 2 conflicting terminal fact digest retry
 #                      = 3 terminal tombstone expiry/status requery
+#                      = 4 process-local COMMITTED status keeps source fenced
+#                      = 5 receiver crash after process-local COMMITTED
 #
 # Debug-contract boundaries:
 # * mysqltest has no raw COM_PRESERVE_TRX_TRANSFER frame builder.  Each wrapper
@@ -22,10 +24,35 @@
 
 --source suite/preserve_trx_transfer_stby/include/w01_setup.inc
 
+--let $terminal_commit_unknown_case= 0
+--let $terminal_receiver_restart_case= 0
+--let $terminal_retained_receiver_case= 1
 if ($terminal_cas_case == 3)
+{
+  --let $terminal_commit_unknown_case= 1
+  --let $terminal_retained_receiver_case= 0
+}
+if ($terminal_cas_case == 4)
+{
+  --let $terminal_commit_unknown_case= 1
+}
+if ($terminal_cas_case == 5)
+{
+  --let $terminal_commit_unknown_case= 1
+  --let $terminal_receiver_restart_case= 1
+  --let $terminal_retained_receiver_case= 0
+}
+
+if ($terminal_commit_unknown_case == 1)
 {
   CALL mtr.add_suppression(
     "PRESERVE: standby transfer source entered COMMIT_UNKNOWN");
+}
+if ($terminal_receiver_restart_case == 1)
+{
+  CALL mtr.add_suppression(
+    "PRESERVE: standby transfer client send failed errno=.*");
+  CALL mtr.add_suppression(".*Got an error reading communication packets.*");
 }
 
 --disable_query_log
@@ -145,6 +172,24 @@ SET @terminal_handoff_before=(SELECT VARIABLE_VALUE+0
 SET @terminal_unknown_before=(SELECT VARIABLE_VALUE+0
   FROM performance_schema.global_status WHERE VARIABLE_NAME=
   'Preserve_trx_transfer_source_commit_unknown_epochs');
+if ($terminal_cas_case == 4)
+{
+  SET @terminal_reset_wins_before=(SELECT VARIABLE_VALUE+0
+    FROM performance_schema.global_status WHERE VARIABLE_NAME=
+    'Preserve_trx_reset_drain_wins');
+  SET @terminal_reset_too_late_before=(SELECT VARIABLE_VALUE+0
+    FROM performance_schema.global_status WHERE VARIABLE_NAME=
+    'Preserve_trx_reset_drain_too_late');
+}
+if ($terminal_cas_case == 5)
+{
+  SET @terminal_reset_wins_before=(SELECT VARIABLE_VALUE+0
+    FROM performance_schema.global_status WHERE VARIABLE_NAME=
+    'Preserve_trx_reset_drain_wins');
+  SET @terminal_reset_too_late_before=(SELECT VARIABLE_VALUE+0
+    FROM performance_schema.global_status WHERE VARIABLE_NAME=
+    'Preserve_trx_reset_drain_too_late');
+}
 
 # W04 owner: one nonempty RR ReadView, a balanced debit/credit pair, and two
 # opposite ledger rows.
@@ -250,6 +295,14 @@ if ($terminal_cas_case == 3)
   # first QUERY_EPOCH_STATUS returned the original COMMITTED terminal result.
   SET DEBUG_SYNC=
     'preserve_trx_transfer_after_committed_status_query SIGNAL xfer2_terminal_status_live WAIT_FOR xfer2_terminal_status_expired TIMEOUT 60';
+}
+if ($terminal_cas_case == 5)
+{
+  # Pause after one authenticated live-process COMMITTED status response.  The
+  # receiver is then crashed before the source can perform its debug-only
+  # second query, so the old process status cannot be reused after restart.
+  SET DEBUG_SYNC=
+    'preserve_trx_transfer_after_committed_status_query SIGNAL xfer2_x1104_status_live WAIT_FOR xfer2_x1104_receiver_restarted TIMEOUT 120';
 }
 --send DRAIN TRANSACTIONS PRESERVE
 
@@ -358,13 +411,112 @@ if ($terminal_cas_case == 3)
   --source include/wait_condition_or_abort.inc
 }
 
-if ($terminal_cas_case == 3)
+if ($terminal_cas_case == 4)
+{
+  # Both verified COMMIT ACKs are hidden.  One terminal winner plus one exact
+  # duplicate proves that the receiver completed the same operation before the
+  # source's authenticated process-local status recovery.  Unlike X6-12, this
+  # case neither advances retention time nor forces a second status lookup.
+  --connection xfer2_receiver
+  --let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins')=@terminal_wins_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_duplicates')=@terminal_duplicates_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_conflicts')=@terminal_conflicts_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_status_tombstones')=@terminal_tombstones_before+1
+  --let $wait_timeout= 20
+  --source include/wait_condition_or_abort.inc
+}
+
+if ($terminal_cas_case == 5)
+{
+  # Require a completed terminal CAS, its exact retry, and the fully classified
+  # READY/prepared publication before crashing the receiver.  A pre-COMMIT or
+  # pre-classification crash would exercise X11-01/X11-02 instead of X11-04.
+  --connection xfer2_receiver
+  --let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins')=@terminal_wins_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_duplicates')=@terminal_duplicates_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_conflicts')=@terminal_conflicts_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_status_tombstones')=@terminal_tombstones_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')=@terminal_active_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_tokens')=@terminal_classified_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens')=@terminal_ready_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens')=@terminal_not_ready_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')=@terminal_prepared_registered_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_ready_tokens')=@terminal_prepared_ready_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_ready_cache_bytes')>@terminal_ready_cache_before
+  --let $wait_timeout= 30
+  --source include/wait_condition_or_abort.inc
+
+  # The sticky signal proves that the normal source path authenticated one
+  # COMMITTED query against this exact live receiver generation.
+  --connection xfer2_source_ha
+  SET DEBUG_SYNC='now WAIT_FOR xfer2_x1104_status_live TIMEOUT 30';
+  --let $terminal_sync_warning_count= query_get_value("SELECT @@warning_count AS c",c,1)
+  if ($terminal_sync_warning_count != 0)
+  {
+    --let $terminal_sync_failed= 1
+  }
+
+  --connection xfer2_receiver
+  --let $terminal_receiver_generation_before= query_get_value(SELECT VARIABLE_VALUE AS value FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_process_generation',value,1)
+  --enable_query_log
+  SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+           WHERE VARIABLE_NAME=
+            'Preserve_trx_transfer_receiver_terminal_cas_wins')
+           =@terminal_wins_before+1 AS precrash_terminal_cas_once,
+         (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+           WHERE VARIABLE_NAME=
+            'Preserve_trx_transfer_receiver_terminal_status_tombstones')
+           =@terminal_tombstones_before+1 AS precrash_committed_status_live,
+         (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+           WHERE VARIABLE_NAME=
+            'Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens')
+           =@terminal_ready_before+1 AS precrash_ready_once,
+         (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+           WHERE VARIABLE_NAME=
+            'Preserve_trx_promotion_prepared_ready_tokens')
+           =@terminal_prepared_ready_before+1 AS precrash_prepared_ready_once;
+
+  # O09: independent receiver-native work commits while the terminal state is
+  # live and must survive the forced receiver process loss.
+  START TRANSACTION;
+  UPDATE xfer2_terminal_receiver_native SET v=v+id WHERE id=1;
+  INSERT INTO xfer2_terminal_receiver_native VALUES(2,20);
+  COMMIT;
+  SELECT COUNT(*)=2 AND SUM(v)=121 AS receiver_native_commit_before_crash
+    FROM xfer2_terminal_receiver_native;
+  --disable_query_log
+
+  --let $restart_parameters= restart
+  --source include/kill_mysqld.inc
+
+  --connection xfer2_receiver
+  --source include/start_mysqld.inc
+  --let $terminal_receiver_generation_after= query_get_value(SELECT VARIABLE_VALUE AS value FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_process_generation',value,1)
+  --source suite/preserve_trx_transfer_stby/include/assert_receiver_restart_clean.inc
+  # Do not expand the random generation fingerprints into the golden query.
+  --disable_query_log
+  --eval SELECT $terminal_receiver_generation_before<>0 AS old_generation_projected,$terminal_receiver_generation_after<>0 AS new_generation_projected,$terminal_receiver_generation_before<>$terminal_receiver_generation_after AS receiver_generation_changed
+  --enable_query_log
+  SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+           WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')=0
+           AS no_old_terminal_epoch_after_restart,
+         (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+           WHERE VARIABLE_NAME=
+            'Preserve_trx_transfer_receiver_terminal_status_tombstones')=0
+           AS no_old_committed_status_after_restart,
+         (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+           WHERE VARIABLE_NAME=
+            'Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens')=0
+           AS no_old_ready_after_restart,
+         (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+           WHERE VARIABLE_NAME=
+            'Preserve_trx_promotion_prepared_ready_tokens')=0
+           AS no_old_prepared_ready_after_restart;
+  SELECT COUNT(*)=2 AND SUM(v)=121 AS receiver_native_commit_survives_crash
+    FROM xfer2_terminal_receiver_native;
+  --disable_query_log
+
+  # Release the source only after the new receiver generation is clean.  The
+  # old connection/query cannot turn the vanished process-local COMMITTED state
+  # into authoritative ownership, so the source must preserve uncertainty.
+  --connection xfer2_source_ha
+  SET DEBUG_SYNC='now SIGNAL xfer2_x1104_receiver_restarted';
+}
+
+if ($terminal_commit_unknown_case == 1)
 {
   --connection xfer2_terminal_drain
   --error ER_PRESERVE_TRX_UNSUPPORTED
   --reap
 }
-if ($terminal_cas_case != 3)
+if ($terminal_commit_unknown_case == 0)
 {
   --connection xfer2_terminal_drain
   --replace_column 1 GENERATION 3 SOURCE_ID 6 CLOSING_STARTED_US 7 CLOSING_DEADLINE_US
@@ -378,7 +530,7 @@ if ($terminal_cas_case != 3)
 # terminal traffic must retain that original READY/prepared entry without a
 # second lease, publication, adoption, or cleanup effect.
 --connection xfer2_receiver
-if ($terminal_cas_case != 3)
+if ($terminal_retained_receiver_case == 1)
 {
   --let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')=@terminal_active_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_tokens')=@terminal_classified_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens')=@terminal_ready_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens')=@terminal_not_ready_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_failed_tokens')=@terminal_failed_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')=@terminal_inflight_tokens_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')=@terminal_inflight_bytes_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes')=@terminal_staged_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_saved_online_tokens')=@terminal_saved_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_tokens')=@terminal_cleanup_debt_tokens_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_bytes')=@terminal_cleanup_debt_bytes_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')=@terminal_prepared_registered_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_prewarm_pending_tokens')=@terminal_prepared_pending_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_ready_tokens')=@terminal_prepared_ready_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_adopting_tokens')=@terminal_prepared_adopting_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_adopted_tokens')=@terminal_prepared_adopted_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_ready_cache_bytes')>@terminal_ready_cache_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_gate_adopted_count')=@terminal_gate_adopted_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_memory_current_bytes')>@terminal_memory_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_worker_active')=0 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_queued_bytes')=0
   --let $wait_timeout= 30
@@ -449,6 +601,25 @@ if ($terminal_cas_case == 3)
            =@terminal_not_found_before+1
            AS authenticated_post_expiry_query_not_found;
 }
+if ($terminal_cas_case == 4)
+{
+  SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+           WHERE VARIABLE_NAME=
+            'Preserve_trx_transfer_receiver_terminal_cas_wins')
+           =@terminal_wins_before+1 AS one_process_local_commit,
+         (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+           WHERE VARIABLE_NAME=
+            'Preserve_trx_transfer_receiver_terminal_cas_duplicates')
+           =@terminal_duplicates_before+1 AS one_exact_commit_retry,
+         (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+           WHERE VARIABLE_NAME=
+            'Preserve_trx_transfer_receiver_terminal_cas_conflicts')
+           =@terminal_conflicts_before AS no_terminal_conflict,
+         (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+           WHERE VARIABLE_NAME=
+            'Preserve_trx_transfer_receiver_terminal_status_tombstones')
+           =@terminal_tombstones_before+1 AS process_status_retained;
+}
 if ($terminal_cas_case == 1)
 {
   SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
@@ -515,6 +686,33 @@ if ($terminal_cas_case == 2)
             'Preserve_trx_promotion_gate_adopted_count')
            =@terminal_gate_adopted_before AS no_conflict_gate_adoption;
 }
+if ($terminal_cas_case == 4)
+{
+  SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+           WHERE VARIABLE_NAME=
+            'Preserve_trx_transfer_receiver_active_epochs')
+           =@terminal_active_before+1 AS committed_epoch_retained,
+         (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+           WHERE VARIABLE_NAME=
+            'Preserve_trx_transfer_receiver_auto_prewarm_tokens')
+           =@terminal_classified_before+1 AS classified_once,
+         (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+           WHERE VARIABLE_NAME=
+            'Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens')
+           =@terminal_ready_before+1 AS ready_once,
+         (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+           WHERE VARIABLE_NAME=
+            'Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens')
+           =@terminal_not_ready_before AS no_not_ready_token,
+         (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+           WHERE VARIABLE_NAME=
+            'Preserve_trx_transfer_receiver_failed_tokens')
+           =@terminal_failed_before+1 AS one_excluded_waiter_record,
+         (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+           WHERE VARIABLE_NAME=
+            'Preserve_trx_transfer_receiver_saved_online_tokens')
+           =@terminal_saved_before+1 AS ready_record_retained_once;
+}
 if ($terminal_cas_case == 3)
 {
   # Classification counters are cumulative; the process-local READY resources
@@ -541,29 +739,34 @@ if ($terminal_cas_case == 3)
             'Preserve_trx_transfer_receiver_saved_online_tokens')
            =@terminal_saved_before AS no_saved_online_residue;
 }
-SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
-         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')
-         =@terminal_inflight_tokens_before AS no_receiver_token_lease,
-       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
-         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')
-         =@terminal_inflight_bytes_before AS no_receiver_byte_lease,
-       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
-         WHERE VARIABLE_NAME=
-          'Preserve_trx_transfer_receiver_staged_memory_bytes')
-         =@terminal_staged_before AS no_staging_residue;
-SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
-         WHERE VARIABLE_NAME=
-          'Preserve_trx_transfer_receiver_cleanup_debt_tokens')
-         =@terminal_cleanup_debt_tokens_before AS no_cleanup_debt_token,
-       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
-         WHERE VARIABLE_NAME=
-          'Preserve_trx_transfer_receiver_cleanup_debt_bytes')
-         =@terminal_cleanup_debt_bytes_before AS no_cleanup_debt_byte,
-       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
-         WHERE VARIABLE_NAME=
-          'Preserve_trx_transfer_receiver_cleanup_tainted_transitions')
-         =@terminal_cleanup_tainted_before AS no_cleanup_taint;
-if ($terminal_cas_case != 3)
+if ($terminal_receiver_restart_case == 0)
+{
+  SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+           WHERE VARIABLE_NAME=
+            'Preserve_trx_transfer_receiver_inflight_tokens')
+           =@terminal_inflight_tokens_before AS no_receiver_token_lease,
+         (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+           WHERE VARIABLE_NAME=
+            'Preserve_trx_transfer_receiver_inflight_bytes')
+           =@terminal_inflight_bytes_before AS no_receiver_byte_lease,
+         (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+           WHERE VARIABLE_NAME=
+            'Preserve_trx_transfer_receiver_staged_memory_bytes')
+           =@terminal_staged_before AS no_staging_residue;
+  SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+           WHERE VARIABLE_NAME=
+            'Preserve_trx_transfer_receiver_cleanup_debt_tokens')
+           =@terminal_cleanup_debt_tokens_before AS no_cleanup_debt_token,
+         (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+           WHERE VARIABLE_NAME=
+            'Preserve_trx_transfer_receiver_cleanup_debt_bytes')
+           =@terminal_cleanup_debt_bytes_before AS no_cleanup_debt_byte,
+         (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+           WHERE VARIABLE_NAME=
+            'Preserve_trx_transfer_receiver_cleanup_tainted_transitions')
+           =@terminal_cleanup_tainted_before AS no_cleanup_taint;
+}
+if ($terminal_retained_receiver_case == 1)
 {
   SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
            WHERE VARIABLE_NAME=
@@ -647,7 +850,7 @@ if ($terminal_cas_case == 3)
 }
 --disable_query_log
 
-if ($terminal_cas_case != 3)
+if ($terminal_commit_unknown_case == 0)
 {
   --connection xfer2_source_ha
   --enable_query_log
@@ -668,7 +871,7 @@ if ($terminal_cas_case != 3)
 --replace_result $terminal_waiter_id WAITER_ID
 --enable_query_log
 --eval SELECT COUNT(*)=1 AS waiter_still_blocked_after_terminal_case FROM performance_schema.data_lock_waits w JOIN performance_schema.threads t ON t.THREAD_ID=w.REQUESTING_THREAD_ID WHERE t.PROCESSLIST_ID=$terminal_waiter_id
-if ($terminal_cas_case == 3)
+if ($terminal_commit_unknown_case == 1)
 {
   SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
            WHERE VARIABLE_NAME=
@@ -680,6 +883,40 @@ if ($terminal_cas_case == 3)
            =@terminal_unknown_before+1 AS one_fenced_commit_unknown;
 }
 --disable_query_log
+
+if ($terminal_cas_case == 4)
+{
+  # A process-local COMMITTED status cannot restore source ownership either.
+  # Without a separate authoritative HA proof, RESET must remain TOO_LATE and
+  # leave both the source fence and receiver publication untouched.
+  --connection xfer2_source_ha
+  --enable_query_log
+  --error ER_PRESERVE_TRX_RESET_TOO_LATE
+  RESET DRAIN;
+  SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+           WHERE VARIABLE_NAME='Preserve_trx_reset_drain_wins')
+           =@terminal_reset_wins_before AS status_reset_did_not_win,
+         (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+           WHERE VARIABLE_NAME='Preserve_trx_reset_drain_too_late')
+           =@terminal_reset_too_late_before+1 AS status_reset_too_late_once;
+  --disable_query_log
+}
+if ($terminal_cas_case == 5)
+{
+  # Receiver restart removes the process-local result but cannot grant source
+  # ownership.  With no authoritative HA resolution, RESET remains TOO_LATE.
+  --connection xfer2_source_ha
+  --enable_query_log
+  --error ER_PRESERVE_TRX_RESET_TOO_LATE
+  RESET DRAIN;
+  SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+           WHERE VARIABLE_NAME='Preserve_trx_reset_drain_wins')
+           =@terminal_reset_wins_before AS restart_reset_did_not_win,
+         (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+           WHERE VARIABLE_NAME='Preserve_trx_reset_drain_too_late')
+           =@terminal_reset_too_late_before+1 AS restart_reset_too_late_once;
+  --disable_query_log
+}
 
 if ($terminal_cas_case != 3)
 {
@@ -698,13 +935,27 @@ SELECT COUNT(*)=0 AS no_source_sql_table_published
   FROM information_schema.tables
  WHERE table_schema='test'
    AND table_name IN ('xfer2_w01_accounts','xfer2_w01_audit');
-START TRANSACTION;
-UPDATE xfer2_terminal_receiver_native SET v=v+7 WHERE id=1;
-SELECT v=107 AS receiver_native_transaction_visible
-  FROM xfer2_terminal_receiver_native WHERE id=1;
-ROLLBACK;
-SELECT v=100 AS receiver_native_rollback_exact
-  FROM xfer2_terminal_receiver_native WHERE id=1;
+if ($terminal_receiver_restart_case == 0)
+{
+  START TRANSACTION;
+  UPDATE xfer2_terminal_receiver_native SET v=v+7 WHERE id=1;
+  SELECT v=107 AS receiver_native_transaction_visible
+    FROM xfer2_terminal_receiver_native WHERE id=1;
+  ROLLBACK;
+  SELECT v=100 AS receiver_native_rollback_exact
+    FROM xfer2_terminal_receiver_native WHERE id=1;
+}
+if ($terminal_receiver_restart_case == 1)
+{
+  START TRANSACTION;
+  UPDATE xfer2_terminal_receiver_native SET v=v+7 WHERE id=1;
+  SELECT v=108 AS receiver_native_transaction_visible_after_restart
+    FROM xfer2_terminal_receiver_native WHERE id=1;
+  ROLLBACK;
+  SELECT COUNT(*)=2 AND SUM(v)=121
+           AS receiver_native_rollback_exact_after_restart
+    FROM xfer2_terminal_receiver_native;
+}
 --disable_query_log
 
 # Keep O02 pending through source shutdown.  The shared teardown restarts that
@@ -730,7 +981,7 @@ DROP TABLE xfer2_terminal_receiver_native;
 --disconnect xfer2_terminal_waiter
 
 # The shared teardown restarted the source generation.  This also resolves an
-# X6-12 source-side unknown/quarantine, if the post-expiry query created one.
+# X6-12 or X6-08/X6-09(T1) source-side unknown/quarantine.
 --connection xfer2_cleanup
 --source suite/preserve_trx/include/assert_no_preserve_residue.inc
 

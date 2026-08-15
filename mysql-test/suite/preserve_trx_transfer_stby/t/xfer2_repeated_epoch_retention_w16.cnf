@@ -1,0 +1,26 @@
+!include ../my.cnf
+
+[mysqld.1]
+log-bin=xfer2-x1205-source-bin
+binlog-format=ROW
+gtid-mode=ON
+enforce-gtid-consistency=ON
+max_allowed_packet=67108864
+rds-preserve-trx-transfer-runtime-profile=PROMOTION_PREPARE
+rds-preserve-trx-transfer-max-inflight-bytes=67108864
+# Epoch A only: hide both terminal COMMIT ACK observations, authenticate the
+# process-local COMMITTED status, and pause before the identical second query.
+# The test disables both flags before the normal W16 epochs.
+debug=d,preserve_trx_transfer_drop_commit_ack_twice,preserve_trx_transfer_requery_commit_status_after_debug_sync
+
+[mysqld.2]
+log-bin=xfer2-x1205-receiver-bin
+binlog-format=ROW
+gtid-mode=ON
+enforce-gtid-consistency=ON
+max_allowed_packet=67108864
+rds-preserve-trx-transfer-runtime-profile=PROMOTION_PREPARE
+rds-preserve-trx-transfer-max-inflight-bytes=67108864
+# Epoch A only: advance the real reaper on the second authenticated query.
+# The test disables this flag immediately after the control epoch expires.
+debug=d,preserve_trx_receiver_expire_terminal_before_second_status_query

@@ -1,0 +1,11 @@
+!include ../my.cnf
+
+[mysqld.1]
+log-bin=xfer1-x509-bin
+binlog-format=ROW
+max_allowed_packet=67108864
+rds-preserve-trx-transfer-runtime-profile=BUSINESS_FIRST
+rds-preserve-trx-transfer-max-inflight-bytes=67108864
+
+[ENV]
+SERVER_MYPORT_1=@mysqld.1.port

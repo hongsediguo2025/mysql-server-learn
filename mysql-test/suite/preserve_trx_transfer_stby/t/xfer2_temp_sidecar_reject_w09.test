@@ -1,0 +1,513 @@
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+# X9-09 / W09 / O01 / O06 / O09 / T1 debug-contract / I02 / I05 / I10.
+#
+# Local Preserve/Resume supports a mixed persistent plus user-temporary-table
+# transaction through image and no-redo-undo sidecars.  Those sidecars are not
+# portable to another mysqld yet.  A real standby-transfer attempt must OPEN
+# and DECLARE the W09 token, then reject it before publishing any portable
+# object or terminal COMMIT.  The original owner must retain both halves of
+# the transaction, source/receiver native commits remain independent, and an
+# explicit owner rollback must restore both tables without sidecar residue.
+
+--source suite/preserve_trx_transfer_stby/include/w01_setup.inc
+
+--disable_query_log
+
+--connection default
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
+GRANT CREATE TEMPORARY TABLES ON test.* TO xfer2_w01_app@localhost;
+--disable_warnings
+DROP TABLE IF EXISTS xfer2_x909_permanent;
+DROP TABLE IF EXISTS xfer2_x909_source_native;
+--enable_warnings
+CREATE TABLE xfer2_x909_permanent(
+  id INT PRIMARY KEY,
+  seq_no INT NOT NULL,
+  v INT NOT NULL,
+  state VARCHAR(24) NOT NULL,
+  UNIQUE KEY uk_seq(seq_no),
+  KEY k_state(state)
+) ENGINE=InnoDB;
+INSERT INTO xfer2_x909_permanent
+WITH RECURSIVE seq(n) AS (
+  SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<24
+)
+SELECT n,n,n*10,'base' FROM seq;
+
+CREATE TABLE xfer2_x909_source_native(
+  id INT PRIMARY KEY,
+  v INT NOT NULL,
+  KEY(v)
+) ENGINE=InnoDB;
+INSERT INTO xfer2_x909_source_native
+WITH RECURSIVE seq(n) AS (
+  SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<32
+)
+SELECT n,n FROM seq;
+
+--connection xfer2_receiver
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
+--disable_warnings
+DROP USER IF EXISTS xfer2_x909_receiver_app@localhost;
+DROP TABLE IF EXISTS xfer2_x909_receiver_native;
+--enable_warnings
+CREATE USER xfer2_x909_receiver_app@localhost;
+CREATE TABLE xfer2_x909_receiver_native(
+  id INT PRIMARY KEY,
+  v INT NOT NULL,
+  KEY(v)
+) ENGINE=InnoDB;
+INSERT INTO xfer2_x909_receiver_native
+WITH RECURSIVE seq(n) AS (
+  SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<32
+)
+SELECT n,n*2 FROM seq;
+GRANT SELECT,INSERT,UPDATE,DELETE ON test.xfer2_x909_receiver_native
+  TO xfer2_x909_receiver_app@localhost;
+
+SET @x909_online_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_online_epochs');
+SET @x909_active_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_active_epochs');
+SET @x909_admitted_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_admitted_frames');
+SET @x909_inflight_tokens_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_inflight_tokens');
+SET @x909_inflight_bytes_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_inflight_bytes');
+SET @x909_staged_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_staged_memory_bytes');
+SET @x909_saved_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_saved_online_tokens');
+SET @x909_failed_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_failed_tokens');
+SET @x909_terminal_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_terminal_cas_wins');
+SET @x909_duplicates_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_terminal_cas_duplicates');
+SET @x909_conflicts_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_terminal_cas_conflicts');
+SET @x909_tombstones_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_terminal_status_tombstones');
+SET @x909_classified_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_auto_prewarm_tokens');
+SET @x909_ready_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens');
+SET @x909_not_ready_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens');
+SET @x909_prepared_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_promotion_prepared_registered_tokens');
+SET @x909_prepared_pending_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_promotion_prepared_prewarm_pending_tokens');
+SET @x909_prepared_ready_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_promotion_prepared_ready_tokens');
+SET @x909_ready_cache_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_promotion_ready_cache_bytes');
+SET @x909_memory_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_memory_current_bytes');
+SET @x909_debt_tokens_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_cleanup_debt_tokens');
+SET @x909_debt_bytes_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_cleanup_debt_bytes');
+
+--connection xfer2_source_ha
+SET @x909_preserved_before=(SELECT COUNT(*)
+  FROM performance_schema.preserved_transactions);
+SET @x909_handoff_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_source_handoff_pending_epochs');
+SET @x909_unknown_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_source_commit_unknown_epochs');
+SET @x909_quarantine_epochs_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_quarantine_epochs');
+SET @x909_quarantine_tokens_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_quarantine_tokens');
+
+# W09: seed the temporary table outside the target transaction, then mix
+# indexed INSERT/UPDATE/DELETE operations across temporary and permanent data.
+--connect(xfer2_x909_owner,localhost,xfer2_w01_app,,test)
+--let $x909_owner_id= query_get_value(SELECT CONNECTION_ID() AS id,id,1)
+CREATE TEMPORARY TABLE xfer2_x909_temp(
+  id INT PRIMARY KEY,
+  seq_no INT NOT NULL,
+  v INT NOT NULL,
+  state VARCHAR(24) NOT NULL,
+  UNIQUE KEY uk_seq(seq_no),
+  KEY k_state(state)
+) ENGINE=InnoDB;
+INSERT INTO xfer2_x909_temp
+WITH RECURSIVE seq(n) AS (
+  SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<24
+)
+SELECT n,n,n*100,'base' FROM seq;
+COMMIT;
+
+START TRANSACTION;
+UPDATE xfer2_x909_permanent
+   SET v=v+100,state='owner-update' WHERE id=1;
+UPDATE xfer2_x909_permanent
+   SET v=v+200,state='owner-update' WHERE id=2;
+DELETE FROM xfer2_x909_permanent WHERE id=3;
+INSERT INTO xfer2_x909_permanent VALUES(40,40,400,'owner-insert');
+
+UPDATE xfer2_x909_temp
+   SET v=v+4000,state='temp-update' WHERE id=4;
+UPDATE xfer2_x909_temp
+   SET v=v+5000,state='temp-update' WHERE id=5;
+DELETE FROM xfer2_x909_temp WHERE id=6;
+INSERT INTO xfer2_x909_temp VALUES(40,40,4000,'temp-insert');
+
+--enable_query_log
+SELECT COUNT(*)=24 AS owner_permanent_row_count,
+       SUM(v)=3670 AS owner_permanent_sum,
+       SUM(state='owner-update')=2 AS owner_two_permanent_updates,
+       SUM(id=3)=0 AS owner_permanent_delete_once,
+       SUM(id=40 AND state='owner-insert')=1
+         AS owner_permanent_insert_once
+  FROM xfer2_x909_permanent;
+SELECT COUNT(*)=24 AS owner_temp_row_count,
+       SUM(v)=42400 AS owner_temp_sum,
+       SUM(state='temp-update')=2 AS owner_two_temp_updates,
+       SUM(id=6)=0 AS owner_temp_delete_once,
+       SUM(id=40 AND state='temp-insert')=1 AS owner_temp_insert_once
+  FROM xfer2_x909_temp;
+--disable_query_log
+
+--connect(xfer2_x909_outsider,localhost,root,,test)
+--enable_query_log
+SELECT COUNT(*)=24 AS outsider_permanent_seed_count,
+       SUM(v)=3000 AS outsider_permanent_seed_sum,
+       SUM(state='base')=24 AS outsider_only_committed_seed,
+       SUM(id=40)=0 AS outsider_hides_owner_insert
+  FROM xfer2_x909_permanent;
+--disable_query_log
+
+# Native source and receiver sessions commit only while DRAIN is parked after
+# real receiver OPEN/DECLARE admission.
+--connect(xfer2_x909_source_native,localhost,xfer2_w01_app,,test)
+--connect(xfer2_x909_receiver_native,127.0.0.1,xfer2_x909_receiver_app,,test,$SERVER_MYPORT_2,)
+
+--connect(xfer2_x909_drain,localhost,root,,test)
+--let $x909_drain_id= query_get_value(SELECT CONNECTION_ID() AS id,id,1)
+SET DEBUG_SYNC=
+  'preserve_trx_warmcopy_after_phase1_open SIGNAL xfer2_x909_phase1_open WAIT_FOR xfer2_x909_phase1_release';
+--send DRAIN TRANSACTIONS PRESERVE
+
+# Wait for receiver admission before consuming the source DEBUG_SYNC signal so
+# the HA control session cannot be speculatively included in the frozen set.
+--connection xfer2_receiver
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_online_epochs')=@x909_online_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')=@x909_active_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_admitted_frames')=@x909_admitted_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')=@x909_inflight_tokens_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')>@x909_inflight_bytes_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes')=@x909_staged_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')=@x909_prepared_before
+--let $wait_timeout= 30
+--source include/wait_condition_or_abort.inc
+
+--connection xfer2_source_ha
+SET DEBUG_SYNC='now WAIT_FOR xfer2_x909_phase1_open TIMEOUT 60';
+
+--connection xfer2_receiver
+--enable_query_log
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_online_epochs')
+         =@x909_online_before+1 AS one_w09_epoch_open,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_admitted_frames')
+         =@x909_admitted_before+1 AS one_w09_token_declared,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')
+         =@x909_active_before AS no_terminal_epoch_while_paused,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes')
+         =@x909_staged_before AS no_portable_object_while_paused;
+--disable_query_log
+
+--connection xfer2_x909_source_native
+START TRANSACTION;
+UPDATE xfer2_x909_source_native SET v=v+10;
+DELETE FROM xfer2_x909_source_native WHERE id=32;
+INSERT INTO xfer2_x909_source_native VALUES(33,330);
+UPDATE xfer2_w01_accounts
+   SET balance=balance+1,version=version+1 WHERE id=32;
+COMMIT;
+
+--connection default
+--enable_query_log
+SELECT COUNT(*)=32 AND SUM(v)=1136 AS source_native_commit_during_w09_pause
+  FROM xfer2_x909_source_native;
+--disable_query_log
+
+--connection xfer2_x909_receiver_native
+START TRANSACTION;
+UPDATE xfer2_x909_receiver_native SET v=v+20;
+DELETE FROM xfer2_x909_receiver_native WHERE id=32;
+INSERT INTO xfer2_x909_receiver_native VALUES(33,660);
+COMMIT;
+
+--connection xfer2_receiver
+--enable_query_log
+SELECT COUNT(*)=32 AND SUM(v)=2272
+         AS receiver_native_commit_during_w09_pause
+  FROM xfer2_x909_receiver_native;
+--disable_query_log
+
+--connection default
+--replace_result $x909_drain_id DRAIN_ID
+--enable_query_log
+--eval SELECT COUNT(*)=1 AS drain_still_paused_after_native_commits FROM information_schema.processlist WHERE ID=$x909_drain_id AND STATE LIKE 'debug sync point:%'
+--disable_query_log
+
+--connection xfer2_source_ha
+SET DEBUG_SYNC='now SIGNAL xfer2_x909_phase1_release';
+
+--connection xfer2_x909_drain
+--error ER_PRESERVE_TRX_UNSUPPORTED
+--reap
+SET DEBUG_SYNC='RESET';
+
+# The unsupported portable engine shape is a source-local pre-final failure.
+# It may leave one bounded terminal status record, but no receiver token data,
+# prepared state, cleanup debt, or source ownership ambiguity may survive.
+--connection xfer2_receiver
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')=@x909_inflight_tokens_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')=@x909_inflight_bytes_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes')=@x909_staged_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_worker_active')=0 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_queued_bytes')=0
+--let $wait_timeout= 30
+--source include/wait_condition_or_abort.inc
+
+# The receiver sees only the bounded pre-final exchange: one OPEN epoch, six
+# admitted control/data frames, and one failed token.  No terminal decision is
+# published because strict engine-shape validation fails on the source.
+--enable_query_log
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_online_epochs')
+         =@x909_online_before+1 AS one_precommit_w09_epoch,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_admitted_frames')
+         =@x909_admitted_before+6 AS six_precommit_w09_frames,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_failed_tokens')
+         =@x909_failed_before+1 AS one_failed_w09_token;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins')
+         =@x909_terminal_before AS no_w09_terminal_cas,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+          'Preserve_trx_transfer_receiver_terminal_cas_duplicates')
+         =@x909_duplicates_before AS no_w09_terminal_duplicate,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_conflicts')
+         =@x909_conflicts_before AS no_w09_terminal_conflict,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+          'Preserve_trx_transfer_receiver_terminal_status_tombstones')
+         =@x909_tombstones_before AS no_w09_terminal_tombstone;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')
+         =@x909_active_before AS no_accepted_w09_epoch,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+          'Preserve_trx_transfer_receiver_saved_online_tokens')
+         =@x909_saved_before AS no_saved_w09_token,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+          'Preserve_trx_transfer_receiver_auto_prewarm_tokens')
+         =@x909_classified_before AS no_classified_w09_token,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+          'Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens')
+         =@x909_ready_before AS no_ready_w09_token,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+          'Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens')
+         =@x909_not_ready_before AS no_not_ready_w09_publication,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')
+         =@x909_prepared_before AS no_prepared_w09_token;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+          'Preserve_trx_promotion_prepared_prewarm_pending_tokens')
+         =@x909_prepared_pending_before AS no_prepared_pending_w09_token,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_ready_tokens')
+         =@x909_prepared_ready_before AS no_prepared_ready_w09_token,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_promotion_ready_cache_bytes')
+         =@x909_ready_cache_before AS no_w09_ready_cache,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_memory_current_bytes')
+         =@x909_memory_before AS no_w09_preserve_memory,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+          'Preserve_trx_transfer_receiver_cleanup_debt_tokens')
+         =@x909_debt_tokens_before AS no_w09_cleanup_debt_token,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_bytes')
+         =@x909_debt_bytes_before AS no_w09_cleanup_debt_bytes;
+--disable_query_log
+
+--connection xfer2_source_ha
+--enable_query_log
+SELECT COUNT(*)=@x909_preserved_before AS no_detached_w09_token
+  FROM performance_schema.preserved_transactions;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+          'Preserve_trx_transfer_source_handoff_pending_epochs')
+         =@x909_handoff_before AS no_w09_handoff_pending,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+          'Preserve_trx_transfer_source_commit_unknown_epochs')
+         =@x909_unknown_before AS no_w09_commit_unknown,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_quarantine_epochs')
+         =@x909_quarantine_epochs_before AS no_w09_quarantine_epoch,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_quarantine_tokens')
+         =@x909_quarantine_tokens_before AS no_w09_quarantine_token;
+--disable_query_log
+
+--connection default
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+
+--let $assert_text= W09 mixed temp sidecar is rejected by strict standby transfer semantics
+--let $assert_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--let $assert_select= PRESERVE: early target failed .*reason=standby_transfer_strict_semantics_unsupported
+--let $assert_count_condition= == 1
+--source include/assert_grep.inc
+--let $assert_count_condition=
+
+# The exact original owner and both halves of its uncommitted transaction are
+# still live.  Continue each table once, then explicitly roll back everything.
+--connection xfer2_x909_owner
+--replace_result $x909_owner_id W09_OWNER_ID
+--enable_query_log
+--eval SELECT CONNECTION_ID()=$x909_owner_id AS original_w09_owner_restored
+SELECT COUNT(*)=24 AND SUM(v)=3670
+         AS restored_permanent_state_exact,
+       SUM(id=3)=0 AND SUM(id=40)=1 AS restored_permanent_keyset_exact
+  FROM xfer2_x909_permanent;
+SELECT COUNT(*)=24 AND SUM(v)=42400 AS restored_temp_state_exact,
+       SUM(id=6)=0 AND SUM(id=40)=1 AS restored_temp_keyset_exact
+  FROM xfer2_x909_temp;
+--disable_query_log
+UPDATE xfer2_x909_permanent
+   SET v=v+400,state='owner-after-reject' WHERE id=4;
+UPDATE xfer2_x909_temp
+   SET v=v+7000,state='temp-after-reject' WHERE id=7;
+--enable_query_log
+SELECT COUNT(*)=24 AND SUM(v)=4070
+         AS continued_permanent_state_exact,
+       SUM(id=4 AND state='owner-after-reject')=1
+         AS continued_permanent_update_once
+  FROM xfer2_x909_permanent;
+SELECT COUNT(*)=24 AND SUM(v)=49400 AS continued_temp_state_exact,
+       SUM(id=7 AND state='temp-after-reject')=1
+         AS continued_temp_update_once
+  FROM xfer2_x909_temp;
+--disable_query_log
+
+--connection xfer2_x909_outsider
+--enable_query_log
+SELECT COUNT(*)=24 AS outsider_still_seed_count,
+       SUM(v)=3000 AS outsider_still_seed_sum,
+       SUM(state='base')=24 AS outsider_still_hides_owner,
+       SUM(id=40)=0 AS outsider_still_hides_insert
+  FROM xfer2_x909_permanent;
+--disable_query_log
+
+--connection xfer2_x909_owner
+ROLLBACK;
+--enable_query_log
+SELECT COUNT(*)=24 AS rolled_back_temp_seed_count,
+       SUM(v)=30000 AS rolled_back_temp_seed_sum,
+       SUM(state='base')=24 AS rolled_back_temp_only_seed,
+       SUM(id=40)=0 AS rolled_back_temp_insert_absent
+  FROM xfer2_x909_temp;
+DROP TEMPORARY TABLE xfer2_x909_temp;
+--disable_query_log
+
+--connection xfer2_x909_outsider
+--enable_query_log
+SELECT COUNT(*)=24 AS rolled_back_permanent_seed_count,
+       SUM(v)=3000 AS rolled_back_permanent_seed_sum,
+       SUM(state='base')=24 AS rolled_back_permanent_only_seed,
+       SUM(id=40)=0 AS rolled_back_permanent_insert_absent
+  FROM xfer2_x909_permanent;
+SELECT COUNT(*)=32 AND SUM(v)=1136 AS source_native_commit_survives_owner_rollback
+  FROM xfer2_x909_source_native;
+CHECK TABLE xfer2_x909_permanent,xfer2_x909_source_native;
+--disable_query_log
+
+--connection xfer2_receiver
+--enable_query_log
+SELECT COUNT(*)=32 AND SUM(v)=2272
+         AS receiver_native_commit_survives_w09_reject
+  FROM xfer2_x909_receiver_native;
+SELECT COUNT(*)=0 AS no_source_table_published_on_receiver
+  FROM information_schema.tables
+ WHERE table_schema='test'
+   AND table_name IN ('xfer2_x909_permanent','xfer2_x909_temp',
+                      'xfer2_x909_source_native');
+--disable_query_log
+
+--disconnect xfer2_x909_owner
+--disconnect xfer2_x909_outsider
+--disconnect xfer2_x909_source_native
+--disconnect xfer2_x909_receiver_native
+--disconnect xfer2_x909_drain
+
+--connection xfer2_receiver
+DROP USER xfer2_x909_receiver_app@localhost;
+
+--source suite/preserve_trx_transfer_stby/include/w01_teardown.inc
+
+# Both mysqld processes restarted in the shared teardown.  Only the two native
+# commits survive; the rejected W09 owner's persistent half remains baseline.
+--connection xfer2_cleanup
+--enable_query_log
+SELECT COUNT(*)=24 AS restarted_permanent_seed_count,
+       SUM(v)=3000 AS restarted_permanent_seed_sum,
+       SUM(state='base')=24 AS restarted_permanent_only_seed,
+       SUM(id=40)=0 AS restarted_permanent_insert_absent
+  FROM xfer2_x909_permanent;
+SELECT COUNT(*)=32 AND SUM(v)=1136 AS restarted_source_native_commit_exact
+  FROM xfer2_x909_source_native;
+CHECK TABLE xfer2_x909_permanent,xfer2_x909_source_native;
+DROP TABLE xfer2_x909_permanent,xfer2_x909_source_native;
+--disable_query_log
+
+--connection xfer2_receiver
+--enable_query_log
+SELECT COUNT(*)=32 AND SUM(v)=2272 AS restarted_receiver_native_commit_exact
+  FROM xfer2_x909_receiver_native;
+CHECK TABLE xfer2_x909_receiver_native;
+DROP TABLE xfer2_x909_receiver_native;
+--disable_query_log
+
+--connection xfer2_cleanup
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+--enable_query_log

@@ -12436,8 +12436,14 @@ static bool reattach_current_batch_preserve_failure_to_original_thd(
     Preserve_snapshot_delete_status delete_status =
         Preserve_snapshot_delete_status::OK;
     if (snapshot_files_may_exist) {
-      delete_status =
-          delete_snapshot_files_with_status(preserve_trx_default_dir(), token);
+      Preserve_snapshot_remove_options remove_options;
+      if (metadata != nullptr &&
+          !metadata->temp_table_manifest_payload.empty()) {
+        remove_options.preserve_committed_temp_sidecar_source_space_ids =
+            preserve_trx_temp_table_sidecar_source_space_ids(*metadata);
+      }
+      delete_status = delete_snapshot_files_with_status(
+          preserve_trx_default_dir(), token, remove_options);
     }
     if (delete_status ==
         Preserve_snapshot_delete_status::ERROR_BEFORE_SNAPSHOT_DELETE) {
@@ -15910,6 +15916,9 @@ bool preserve_trx_kernel_preserve_attached_transaction(
           token,
           "failed to fsync preserved transaction directory after unlink");
     }
+    const bool cleanup_artifacts_may_exist =
+        effective_snapshot_files_may_exist ||
+        !metadata.temp_table_manifest_payload.empty();
     Mysql_binlog_preserve_snapshot rollback_binlog_snapshot = binlog_snapshot;
     Preserve_memory_lease rollback_binlog_payload_lease;
     if (has_logged_binlog_cache && source_rollback_image != nullptr) {
@@ -15933,7 +15942,7 @@ bool preserve_trx_kernel_preserve_attached_transaction(
       }
     }
     if (!reattach_current_batch_preserve_failure_to_original_thd(
-            thd, trx, token, true, effective_snapshot_files_may_exist, false,
+            thd, trx, token, true, cleanup_artifacts_may_exist, false,
             &cleanup_failed, &left_preserved, &metadata,
             has_logged_binlog_cache, &rollback_binlog_snapshot,
             &blob_descriptors)) {
@@ -15973,9 +15982,6 @@ bool preserve_trx_kernel_preserve_attached_transaction(
     }
     preserved_trx_add_failed_observable_record(
         metadata, "batch cleanup detached transaction fallback");
-    const bool cleanup_artifacts_may_exist =
-        effective_snapshot_files_may_exist ||
-        !metadata.temp_table_manifest_payload.empty();
     if (cleanup_artifacts_may_exist) {
       const bool delete_failed =
           delete_preserved_snapshot_files_and_sidecars_or_log(

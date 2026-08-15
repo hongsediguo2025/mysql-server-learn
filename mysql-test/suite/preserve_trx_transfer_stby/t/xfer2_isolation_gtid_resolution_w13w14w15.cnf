@@ -1,0 +1,12 @@
+!include ../my.cnf
+
+[mysqld.1]
+log-bin=xfer2-x912-bin
+binlog-format=ROW
+gtid-mode=ON
+enforce-gtid-consistency=ON
+max_allowed_packet=67108864
+
+[mysqld.2]
+skip-log-bin
+max_allowed_packet=67108864

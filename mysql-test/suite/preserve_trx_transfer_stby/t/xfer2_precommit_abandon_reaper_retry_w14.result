@@ -55,6 +55,12 @@ FROM performance_schema.global_status WHERE VARIABLE_NAME=
 SET @terminal_wins_before=(SELECT VARIABLE_VALUE+0
 FROM performance_schema.global_status WHERE VARIABLE_NAME=
 'Preserve_trx_transfer_receiver_terminal_cas_wins');
+SET @terminal_duplicates_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_terminal_cas_duplicates');
+SET @terminal_conflicts_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_terminal_cas_conflicts');
 SET @terminal_tombstones_before=(SELECT VARIABLE_VALUE+0
 FROM performance_schema.global_status WHERE VARIABLE_NAME=
 'Preserve_trx_transfer_receiver_terminal_status_tombstones');
@@ -166,13 +172,22 @@ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins')
 = @terminal_wins_before+1 AS abandon_terminal_cas_won_once,
 (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_terminal_cas_duplicates')
+= @terminal_duplicates_before+2
+AS exact_sender_retry_and_reaper_reentry,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_terminal_cas_conflicts')
+= @terminal_conflicts_before AS duplicate_abandon_is_not_conflict,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
 'Preserve_trx_transfer_receiver_terminal_status_tombstones')
 = @terminal_tombstones_before+1 AS one_bounded_terminal_tombstone,
 (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')
 = @active_before AS no_committed_receiver_epoch;
-abandon_terminal_cas_won_once	one_bounded_terminal_tombstone	no_committed_receiver_epoch
-1	1	1
+abandon_terminal_cas_won_once	exact_sender_retry_and_reaper_reentry	duplicate_abandon_is_not_conflict	one_bounded_terminal_tombstone	no_committed_receiver_epoch
+1	1	1	1	1
 SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')
 = @inflight_tokens_before AS no_inflight_token,

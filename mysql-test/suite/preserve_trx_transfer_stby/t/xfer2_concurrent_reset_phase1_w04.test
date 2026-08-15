@@ -1,0 +1,351 @@
+# X7-06 / W04 / O01 / O02 / O09 / O10 / T1 debug-contract / I02 / I10
+#
+# Two independent HA sessions issue RESET DRAIN while a real standby-transfer
+# epoch is paused after Phase1 admission. Exactly one request owns cancellation;
+# the other joins the same release barrier. The receiver must observe one token
+# cleanup, while the original RR transaction, connection, view, and record lock
+# are restored once and remain usable until the application rolls them back.
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+--source suite/preserve_trx_transfer_stby/include/w01_setup.inc
+
+--connection xfer2_receiver
+SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=ON;
+--disable_warnings
+DROP TABLE IF EXISTS xfer2_x706_receiver_native;
+--enable_warnings
+CREATE TABLE xfer2_x706_receiver_native(
+  id INT PRIMARY KEY,
+  v INT NOT NULL,
+  KEY(v)
+) ENGINE=InnoDB;
+INSERT INTO xfer2_x706_receiver_native VALUES(1,10),(2,20);
+
+SET @online_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_online_epochs');
+SET @active_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_active_epochs');
+SET @admitted_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_admitted_frames');
+SET @admitted_bytes_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_admitted_bytes');
+SET @sequence_replays_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_sequence_already_applied');
+SET @inflight_tokens_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_inflight_tokens');
+SET @inflight_bytes_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_inflight_bytes');
+SET @staged_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_staged_memory_bytes');
+SET @terminal_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_terminal_cas_wins');
+SET @tombstones_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_terminal_status_tombstones');
+SET @cleanup_debt_tokens_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_cleanup_debt_tokens');
+SET @cleanup_debt_bytes_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_cleanup_debt_bytes');
+SET @prepared_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_promotion_prepared_registered_tokens');
+SET @ready_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_promotion_prepared_ready_tokens');
+SET @ready_cache_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_promotion_ready_cache_bytes');
+SET @memory_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_memory_current_bytes');
+
+--connection xfer2_source_ha
+SET @reset_wins_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_reset_drain_wins');
+SET @reset_too_late_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_reset_drain_too_late');
+SET @handoff_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_source_handoff_pending_epochs');
+SET @unknown_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_source_commit_unknown_epochs');
+SET @quarantine_epochs_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_quarantine_epochs');
+SET @quarantine_tokens_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_quarantine_tokens');
+SET @preserved_before=(SELECT COUNT(*)
+  FROM performance_schema.preserved_transactions);
+
+# W04 plus RR: the owner keeps an old view, moves value between two rows, and
+# writes a balanced ledger. O01 supplies a committed source-side foreground
+# change which must survive RESET independently of the restored owner.
+--connect(xfer2_x706_owner,localhost,xfer2_w01_app,,test)
+--let $owner_id= query_get_value(SELECT CONNECTION_ID() AS id,id,1)
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+SELECT balance=1000 AND version=0 AS owner_rr_initial
+  FROM xfer2_w01_accounts WHERE id=32;
+
+--connect(xfer2_x706_outsider,localhost,root,,test)
+UPDATE xfer2_w01_accounts
+   SET balance=balance+1,version=version+1 WHERE id=32;
+SELECT ROW_COUNT()=1 AS outsider_committed_once;
+
+--connection xfer2_x706_owner
+SELECT balance=1000 AND version=0 AS owner_rr_stays_old
+  FROM xfer2_w01_accounts WHERE id=32;
+UPDATE xfer2_w01_accounts
+   SET balance=balance-70,version=version+1 WHERE id=11;
+UPDATE xfer2_w01_accounts
+   SET balance=balance+70,version=version+1 WHERE id=12;
+INSERT INTO xfer2_w01_audit(account_id,delta)
+VALUES(11,-70),(12,70);
+SELECT COUNT(*)=2 AND SUM(balance)=2000 AND SUM(version)=2
+       AS owner_w04_balance_conserved
+  FROM xfer2_w01_accounts WHERE id IN (11,12);
+SELECT MAX(CASE WHEN id=11 THEN balance END)=930
+       AND MAX(CASE WHEN id=12 THEN balance END)=1070
+       AS owner_w04_exact_effects
+  FROM xfer2_w01_accounts WHERE id IN (11,12);
+SELECT COUNT(*)=2 AND SUM(delta)=0
+       AND SUM(account_id=11 AND delta=-70)=1
+       AND SUM(account_id=12 AND delta=70)=1
+       AS owner_w04_balanced_ledger
+  FROM xfer2_w01_audit;
+
+--connection xfer2_x706_outsider
+SELECT COUNT(*)=32 AND SUM(balance)=32001 AND SUM(version)=1
+       AS outsider_hides_owner_changes
+  FROM xfer2_w01_accounts;
+SELECT COUNT(*)=0 AS outsider_hides_owner_ledger
+  FROM xfer2_w01_audit;
+
+--connect(xfer2_x706_drain,localhost,root,,test)
+SET DEBUG_SYNC=
+  'preserve_trx_transfer_after_phase1_binlog_stream SIGNAL xfer2_x706_phase1 WAIT_FOR xfer2_x706_release';
+--send DRAIN TRANSACTIONS PRESERVE
+
+--connection xfer2_source_ha
+SET DEBUG_SYNC='now WAIT_FOR xfer2_x706_phase1 TIMEOUT 60';
+
+# Fail hard unless this is a real source-to-receiver epoch with admitted bytes
+# and one accounted transfer token. This excludes a pre-connect RESET smoke.
+--connection xfer2_receiver
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_online_epochs')=@online_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_admitted_frames')>@admitted_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')>@inflight_tokens_before
+--let $wait_timeout= 10
+--source include/wait_condition_or_abort.inc
+SET @admitted_at_pause=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_admitted_frames');
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_online_epochs')
+       =@online_before+1 AS one_live_phase1_epoch,
+       @admitted_at_pause>@admitted_before AS phase1_frames_admitted,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_admitted_bytes')
+       >@admitted_bytes_before AS phase1_bytes_admitted;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')
+       >@inflight_tokens_before AS phase1_token_accounted,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')
+       >@inflight_bytes_before AS phase1_bytes_accounted,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')
+       =@active_before AS no_terminal_epoch_before_reset;
+
+# O02 is introduced after Phase1 admission so the waiter tests restored source
+# lock ownership rather than preventing the target from reaching the hook.
+--connect(xfer2_x706_waiter,localhost,root,,test)
+SET SESSION innodb_lock_wait_timeout=3600;
+START TRANSACTION;
+--let $waiter_id= query_get_value(SELECT CONNECTION_ID() AS id,id,1)
+--send UPDATE xfer2_w01_accounts SET balance=balance+5,version=version+1 WHERE id=11
+
+--connection xfer2_source_ha
+--let $wait_condition= SELECT COUNT(*)=1 FROM performance_schema.data_lock_waits w JOIN performance_schema.threads t ON t.THREAD_ID=w.REQUESTING_THREAD_ID WHERE t.PROCESSLIST_ID=$waiter_id
+--let $wait_timeout= 10
+--source include/wait_condition_or_abort.inc
+--replace_result $waiter_id WAITER_ID
+--eval SELECT COUNT(*)=1 AS waiter_blocked_before_concurrent_reset FROM performance_schema.data_lock_waits w JOIN performance_schema.threads t ON t.THREAD_ID=w.REQUESTING_THREAD_ID WHERE t.PROCESSLIST_ID=$waiter_id
+
+# O09/O10: receiver-native work commits while both source and receiver carry
+# unrelated transfer state. Cleanup must not own or roll it back.
+--connection xfer2_receiver
+START TRANSACTION;
+UPDATE xfer2_x706_receiver_native SET v=v+id;
+INSERT INTO xfer2_x706_receiver_native VALUES(3,30);
+COMMIT;
+SELECT COUNT(*)=3 AND SUM(v)=63 AS receiver_native_commit_during_phase1
+  FROM xfer2_x706_receiver_native;
+
+# Both RESET commands enter before the drain owner is released. One publishes
+# RESET_CLEANUP; the other observes RESET_REQUESTED and joins the same barrier.
+--connect(xfer2_x706_reset_1,localhost,preserve_trx_ha_admin,xfer2-smoke-w01-secret,test)
+START TRANSACTION;
+SAVEPOINT x706_reset_session_guard;
+--send RESET DRAIN
+--connect(xfer2_x706_reset_2,localhost,preserve_trx_ha_admin,xfer2-smoke-w01-secret,test)
+--send RESET DRAIN
+
+--connection xfer2_source_ha
+--let $wait_condition= SELECT COUNT(*)=2 FROM performance_schema.threads WHERE PROCESSLIST_INFO='RESET DRAIN'
+--let $wait_timeout= 10
+--source include/wait_condition_or_abort.inc
+SET DEBUG_SYNC='now SIGNAL xfer2_x706_release';
+
+--connection xfer2_x706_reset_1
+--reap
+ROLLBACK TO SAVEPOINT x706_reset_session_guard;
+ROLLBACK;
+--connection xfer2_x706_reset_2
+--reap
+
+--connection xfer2_x706_drain
+--error ER_PRESERVE_TRX_DRAIN_RESET
+--reap
+SET DEBUG_SYNC='RESET';
+
+# Both SQL calls succeeded, but the attempt-level CAS records one winner only.
+--connection xfer2_source_ha
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_reset_drain_wins')
+       =@reset_wins_before+1 AS exactly_one_reset_winner,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_reset_drain_too_late')
+       =@reset_too_late_before AS neither_reset_too_late;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_source_handoff_pending_epochs')
+       =@handoff_before AS no_handoff_pending,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_source_commit_unknown_epochs')
+       =@unknown_before AS no_commit_unknown,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_quarantine_epochs')
+       =@quarantine_epochs_before AS no_quarantine_epoch,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_quarantine_tokens')
+       =@quarantine_tokens_before AS no_quarantine_token;
+SELECT COUNT(*)=@preserved_before AS no_detached_source_token
+  FROM performance_schema.preserved_transactions;
+
+# The drain owner can finish queued Phase1 manifest frames after the sync point
+# before it observes RESET, then sends the token ABORT. Do not mistake those
+# legitimate tail frames for duplicate cleanup. The joined RESET must create no
+# replayed sequence, terminal epoch CAS, or cleanup debt, and all payload,
+# prepared, and cache accounting must return to baseline.
+--connection xfer2_receiver
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')=@inflight_tokens_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')=@inflight_bytes_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes')=@staged_before
+--let $wait_timeout= 20
+--source include/wait_condition_or_abort.inc
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_admitted_frames')
+       >@admitted_at_pause AS reset_cleanup_tail_admitted,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+         'Preserve_trx_transfer_receiver_sequence_already_applied')
+       =@sequence_replays_before AS no_duplicate_sequence_replay,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins')
+       =@terminal_before AS no_terminal_cas,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_status_tombstones')
+       =@tombstones_before AS no_terminal_tombstone;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')
+       =@inflight_tokens_before AS token_accounting_released,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')
+       =@inflight_bytes_before AS byte_accounting_released,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes')
+       =@staged_before AS staged_payload_released,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_memory_current_bytes')
+       =@memory_before AS preserve_memory_released;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')
+       =@prepared_before AS no_prepared_registration,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_ready_tokens')
+       =@ready_before AS no_ready_token,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_promotion_ready_cache_bytes')
+       =@ready_cache_before AS no_ready_cache;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_tokens')
+       =@cleanup_debt_tokens_before AS no_cleanup_debt_token,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_bytes')
+       =@cleanup_debt_bytes_before AS no_cleanup_debt_bytes;
+
+SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=OFF;
+--let $receiver_connection= xfer2_receiver
+--source suite/preserve_trx_transfer_stby/include/assert_receiver_quiescent.inc
+SELECT COUNT(*)=3 AND SUM(v)=63 AS receiver_native_commit_survives_reset
+  FROM xfer2_x706_receiver_native;
+
+# Both RESET callers return only after the same source-runnable barrier. The
+# original owner still has its old RR view and lock; the waiter is still blocked
+# until the owner explicitly rolls back.
+--connection xfer2_x706_owner
+--replace_result $owner_id OWNER_ID
+--eval SELECT CONNECTION_ID()=$owner_id AS original_owner_connection_restored
+SELECT balance=1000 AND version=0 AS owner_rr_view_restored
+  FROM xfer2_w01_accounts WHERE id=32;
+SELECT COUNT(*)=2 AND SUM(balance)=2000 AND SUM(version)=2
+       AS owner_w04_changes_restored
+  FROM xfer2_w01_accounts WHERE id IN (11,12);
+SELECT COUNT(*)=2 AND SUM(delta)=0 AS owner_ledger_restored
+  FROM xfer2_w01_audit;
+UPDATE xfer2_w01_accounts
+   SET pad=CONCAT(pad,'-after-x706-reset') WHERE id=12;
+SELECT ROW_COUNT()=1 AS owner_can_continue_after_joined_reset;
+
+--connection xfer2_source_ha
+--replace_result $waiter_id WAITER_ID
+--eval SELECT COUNT(*)=1 AS waiter_still_blocked_after_both_resets FROM performance_schema.data_lock_waits w JOIN performance_schema.threads t ON t.THREAD_ID=w.REQUESTING_THREAD_ID WHERE t.PROCESSLIST_ID=$waiter_id
+
+--connection xfer2_x706_owner
+ROLLBACK;
+
+--connection xfer2_x706_waiter
+--reap
+ROLLBACK;
+
+--connection xfer2_x706_outsider
+--source suite/preserve_trx_transfer_stby/include/assert_w01_baseline.inc
+CHECK TABLE xfer2_w01_accounts,xfer2_w01_audit;
+
+--connection xfer2_receiver
+SELECT COUNT(*)=3 AND SUM(v)=63 AS receiver_native_final
+  FROM xfer2_x706_receiver_native;
+DROP TABLE xfer2_x706_receiver_native;
+
+--disconnect xfer2_x706_waiter
+--disconnect xfer2_x706_outsider
+--disconnect xfer2_x706_owner
+--disconnect xfer2_x706_drain
+--disconnect xfer2_x706_reset_1
+--disconnect xfer2_x706_reset_2
+
+--source suite/preserve_trx_transfer_stby/include/w01_teardown.inc

@@ -47,6 +47,33 @@ SET @horizon_rejects_before=(
 SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME=
 'Preserve_trx_transfer_receiver_read_view_horizon_rejects');
+SET @object_misses_before=(
+SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_object_prewarm_miss_count');
+SET @record_prewarm_before=(
+SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_record_object_prewarm_count');
+SET @strict_index_reads_before=(
+SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_strict_record_index_page_reads');
+SET @strict_ibuf_merges_before=(
+SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_strict_ibuf_merges');
+SET @strict_redo_bytes_before=(
+SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_strict_target_local_redo_bytes');
+SET @record_req_residency_before=(
+SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_record_lock_req_residency_bytes');
+SET @record_resv_residency_before=(
+SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_record_lock_resv_residency_bytes');
 SET @inflight_tokens_before=(
 SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens');
@@ -148,11 +175,45 @@ WHERE VARIABLE_NAME=
 no_final_fact_bind	no_prepared_ready_token	no_read_view_horizon_rejection
 1	1	1
 SELECT VARIABLE_VALUE='receiver_selection_failed:3'
-         AS prewarm_deadline_is_exact_reason
+         AS strict_record_plan_reaches_deadline
 FROM performance_schema.global_status
 WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_last_failed_reason';
-prewarm_deadline_is_exact_reason
+strict_record_plan_reaches_deadline
 1
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_object_prewarm_miss_count')
+> @object_misses_before AS object_prewarm_attempt_missed,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_record_object_prewarm_count')
+= @record_prewarm_before AS no_record_object_prewarm_completed;
+object_prewarm_attempt_missed	no_record_object_prewarm_completed
+1	1
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_strict_record_index_page_reads')
+= @strict_index_reads_before AS no_strict_index_page_read,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_strict_ibuf_merges')
+= @strict_ibuf_merges_before AS no_strict_ibuf_merge,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_strict_target_local_redo_bytes')
+= @strict_redo_bytes_before AS no_strict_target_local_redo;
+no_strict_index_page_read	no_strict_ibuf_merge	no_strict_target_local_redo
+1	1	1
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_record_lock_req_residency_bytes')
+= @record_req_residency_before AS no_record_required_residency,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_record_lock_resv_residency_bytes')
+= @record_resv_residency_before AS no_record_reserved_residency;
+no_record_required_residency	no_record_reserved_residency
+1	1
 SELECT 1;
 ERROR HY000: Preserve drain is active; this command was not executed
 SELECT VARIABLE_VALUE=0 AS no_active_receiver_worker

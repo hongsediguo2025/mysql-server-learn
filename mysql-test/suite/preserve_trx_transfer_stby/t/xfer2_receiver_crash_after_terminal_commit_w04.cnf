@@ -1,0 +1,13 @@
+!include ../my.cnf
+
+[mysqld.1]
+skip-log-bin
+rds-preserve-trx-transfer-runtime-profile=BUSINESS_FIRST
+max_allowed_packet=67108864
+# Lose both terminal ACK observations.  The requery hook pauses only after the
+# normal authenticated status path has observed process-local COMMITTED once.
+debug=d,preserve_trx_transfer_drop_commit_ack_twice,preserve_trx_transfer_requery_commit_status_after_debug_sync
+
+[mysqld.2]
+skip-log-bin
+max_allowed_packet=67108864

@@ -17,6 +17,10 @@ WITH RECURSIVE seq(n) AS (
 SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<32
 )
 SELECT n, 1000, 0, CONCAT('account-', n) FROM seq;
+SELECT @scale_rc_receiver_dict_identity_matches=1
+AS receiver_rc_shadow_dictionary_identity_matches;
+receiver_rc_shadow_dictionary_identity_matches
+1
 SELECT balance=1000 AND version=0 AS owner_rr_initial
 FROM xfer2_w01_accounts WHERE id=32;
 owner_rr_initial
@@ -44,20 +48,59 @@ observer_sees_background_only	observer_hides_owner_updates
 SELECT COUNT(*)=0 AS observer_hides_owner_audit FROM xfer2_w01_audit;
 observer_hides_owner_audit
 1
+SELECT COUNT(*)=64 AND SUM(id)=2169 AND SUM(k)=21740
+AND SUM(amount)=216924 AND SUM(version)=3
+AS rc_owner_w03_exact_aggregate
+FROM xfer2_x1003_rc;
+rc_owner_w03_exact_aggregate
+1
+SELECT COUNT(*)=2 AND SUM(id)=24 AND SUM(k)=290
+AS rc_owner_moved_secondary_keys
+FROM xfer2_x1003_rc FORCE INDEX(k_range) WHERE k IN (85,205);
+rc_owner_moved_secondary_keys
+1
+SELECT COUNT(*)=3 AS rc_owner_unique_keys_exact
+FROM xfer2_x1003_rc FORCE INDEX(uk_note)
+WHERE note IN ('moved-0006','moved-0018','owner-0102');
+rc_owner_unique_keys_exact
+1
+SELECT COUNT(*)=21 AND MIN(k)=300 AND MAX(k)=500
+AS rc_record_range_established
+FROM xfer2_x1003_rc FORCE INDEX(k_range)
+WHERE k BETWEEN 300 AND 500;
+rc_record_range_established
+1
+SELECT COUNT(*)>0 AS rc_range_record_locks_exist FROM performance_schema.data_locks l JOIN performance_schema.threads t ON t.THREAD_ID=l.THREAD_ID WHERE t.PROCESSLIST_ID=RC_OWNER_ID AND l.OBJECT_SCHEMA='test' AND l.OBJECT_NAME='xfer2_x1003_rc' AND l.INDEX_NAME='k_range' AND l.LOCK_TYPE='RECORD';
+rc_range_record_locks_exist
+1
 SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_online_epochs')
 =@scale_online_before+1 AS one_open_epoch_while_paused,
 (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_admitted_frames')
-=@scale_admitted_before+1 AS one_declared_token_while_paused,
+=@scale_admitted_before+2 AS two_declared_tokens_while_paused,
 (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')
 =@scale_active_before AS no_accepted_epoch_while_paused,
 (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')
 =@scale_prepared_registered_before AS no_prepared_state_while_paused;
-one_open_epoch_while_paused	one_declared_token_while_paused	no_accepted_epoch_while_paused	no_prepared_state_while_paused
+one_open_epoch_while_paused	two_declared_tokens_while_paused	no_accepted_epoch_while_paused	no_prepared_state_while_paused
 1	1	1	1
+SELECT ROW_COUNT()=1 AS rc_adjacent_committed_during_phase1;
+rc_adjacent_committed_during_phase1
+1
+SELECT COUNT(*)=65 AND SUM(id)=2231 AND SUM(k)=21155
+AND SUM(amount)=243500 AND SUM(version)=1
+AS rc_outsider_sees_only_committed_adjacent
+FROM xfer2_x1003_rc;
+rc_outsider_sees_only_committed_adjacent
+1
+SELECT COUNT(*)=1 AND MAX(id)=151 AND MAX(amount)=35500
+AS rc_adjacent_index_visible_during_phase1
+FROM xfer2_x1003_rc FORCE INDEX(k_range) WHERE k=355;
+rc_adjacent_index_visible_during_phase1
+1
 SELECT COUNT(*)=64 AND SUM(v)=4682 AS source_foreground_commit_visible
 FROM xfer2_scale_source_native;
 source_foreground_commit_visible
@@ -72,27 +115,35 @@ receiver_foreground_commit_visible
 CHECK TABLE xfer2_scale_receiver_native;
 Table	Op	Msg_type	Msg_text
 test.xfer2_scale_receiver_native	check	status	OK
-SELECT COUNT(*)=1 AS drain_still_paused_after_both_foreground_commits FROM information_schema.processlist WHERE ID=DRAIN_ID AND STATE LIKE 'debug sync point:%';
-drain_still_paused_after_both_foreground_commits
+SELECT COUNT(*)=1 AS drain_still_paused_after_all_foreground_commits FROM information_schema.processlist WHERE ID=DRAIN_ID AND STATE LIKE 'debug sync point:%';
+drain_still_paused_after_all_foreground_commits
 1
 generation	outcome	source_connection_id	token_role	reason	closing_started_us	closing_deadline_us
 GENERATION	SUCCESS	SOURCE_ID	SURVIVOR	NONE	CLOSING_STARTED_US	CLOSING_DEADLINE_US
+GENERATION	SUCCESS	SOURCE_ID	SURVIVOR	NONE	CLOSING_STARTED_US	CLOSING_DEADLINE_US
+SELECT COUNT(*)=@scale_preserved_before+2 AS two_source_tokens_detached,
+SUM(ISOLATION='READ-COMMITTED')=1 AS one_rc_token,
+SUM(ISOLATION='REPEATABLE-READ')=1 AS one_rr_token,
+SUM(MOD_TABLES_COUNT>=1)=2 AS both_tokens_have_data
+FROM performance_schema.preserved_transactions;
+two_source_tokens_detached	one_rc_token	one_rr_token	both_tokens_have_data
+1	1	1	1
 SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')
 =@scale_active_before+1 AS exactly_one_accepted_epoch,
 (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_tokens')
-=@scale_classified_before+1 AS exactly_one_classified_target,
+=@scale_classified_before+2 AS exactly_two_classified_targets,
 (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens')
-=@scale_ready_before+1 AS exactly_one_ready_target,
+=@scale_ready_before+2 AS exactly_two_ready_targets,
 (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens')
 =@scale_not_ready_before AS no_not_ready_target,
 (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins')
 =@scale_terminal_before+1 AS one_terminal_epoch;
-exactly_one_accepted_epoch	exactly_one_classified_target	exactly_one_ready_target	no_not_ready_target	one_terminal_epoch
+exactly_one_accepted_epoch	exactly_two_classified_targets	exactly_two_ready_targets	no_not_ready_target	one_terminal_epoch
 1	1	1	1	1
 SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')
@@ -102,23 +153,23 @@ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes')
 =@scale_staged_before AS no_staged_memory_residue,
 (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_saved_online_tokens')
-=@scale_saved_before+1 AS one_saved_online_token,
+=@scale_saved_before+2 AS two_saved_online_tokens,
 (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_failed_tokens')
 =@scale_failed_before AS no_failed_token,
 (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')
-=@scale_prepared_registered_before+1 AS one_prepared_entry,
+=@scale_prepared_registered_before+2 AS two_prepared_entries,
 (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_ready_tokens')
-=@scale_prepared_ready_before+1 AS one_prepared_ready_entry,
+=@scale_prepared_ready_before+2 AS two_prepared_ready_entries,
 (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME='Preserve_trx_promotion_ready_cache_bytes')
 >@scale_ready_cache_before AS ready_cache_retained,
 (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_tokens')
 =@scale_cleanup_debt_tokens_before AS no_cleanup_debt;
-no_inflight_token_residue	no_staged_memory_residue	one_saved_online_token	no_failed_token	one_prepared_entry	one_prepared_ready_entry	ready_cache_retained	no_cleanup_debt
+no_inflight_token_residue	no_staged_memory_residue	two_saved_online_tokens	no_failed_token	two_prepared_entries	two_prepared_ready_entries	ready_cache_retained	no_cleanup_debt
 1	1	1	1	1	1	1	1
 SELECT VARIABLE_VALUE+0=0 AS no_closing_command_completion
 FROM performance_schema.global_status WHERE VARIABLE_NAME=
@@ -140,9 +191,15 @@ no_handoff_pending	no_commit_unknown
 1	1
 SELECT 1;
 ERROR HY000: Preserve drain is active; this command was not executed
+SELECT 1;
+ERROR HY000: Preserve drain is active; this command was not executed
 SELECT COUNT(*)=64 AND SUM(v)=9364 AS receiver_foreground_still_exact
 FROM xfer2_scale_receiver_native;
 receiver_foreground_still_exact
+1
+SELECT COUNT(*)=0 AS receiver_rc_shadow_stays_dictionary_only
+FROM xfer2_x1003_rc;
+receiver_rc_shadow_stays_dictionary_only
 1
 source_ha_control_session
 1
@@ -206,6 +263,36 @@ source_foreground_survives_restart
 CHECK TABLE xfer2_scale_source_native;
 Table	Op	Msg_type	Msg_text
 test.xfer2_scale_source_native	check	status	OK
+SELECT COUNT(*)=65 AND SUM(id)=2231 AND SUM(k)=21155
+AND SUM(amount)=243500 AND SUM(version)=1
+AS restarted_rc_only_adjacent_committed
+FROM xfer2_x1003_rc;
+restarted_rc_only_adjacent_committed
+1
+SELECT COUNT(*)=22 AND SUM(id)=991 AND SUM(k)=8755
+AS restarted_rc_range_exact
+FROM xfer2_x1003_rc FORCE INDEX(k_range)
+WHERE k BETWEEN 300 AND 500;
+restarted_rc_range_exact
+1
+SELECT COUNT(*)=1 AND MAX(id)=151 AND MAX(amount)=35500
+AS restarted_rc_adjacent_once
+FROM xfer2_x1003_rc FORCE INDEX(k_range) WHERE k=355;
+restarted_rc_adjacent_once
+1
+SELECT COUNT(*)=0 AS restarted_rc_owner_unique_mutations_rolled_back
+FROM xfer2_x1003_rc FORCE INDEX(uk_note)
+WHERE note IN ('moved-0006','moved-0018','owner-0102');
+restarted_rc_owner_unique_mutations_rolled_back
+1
+SELECT COUNT(*)=1 AND MAX(k)=130 AND MAX(amount)=1300
+AS restarted_rc_deleted_row_restored
+FROM xfer2_x1003_rc WHERE id=13;
+restarted_rc_deleted_row_restored
+1
+CHECK TABLE xfer2_x1003_rc;
+Table	Op	Msg_type	Msg_text
+test.xfer2_x1003_rc	check	status	OK
 SELECT COUNT(*)=64 AND SUM(v)=9364 AS receiver_foreground_survives_restart
 FROM xfer2_scale_receiver_native;
 receiver_foreground_survives_restart
@@ -218,3 +305,7 @@ receiver_foreground_remains_writable
 CHECK TABLE xfer2_scale_receiver_native;
 Table	Op	Msg_type	Msg_text
 test.xfer2_scale_receiver_native	check	status	OK
+SELECT COUNT(*)=0 AS receiver_rc_shadow_survives_restart_empty
+FROM xfer2_x1003_rc;
+receiver_rc_shadow_survives_restart_empty
+1

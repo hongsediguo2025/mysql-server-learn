@@ -1328,10 +1328,10 @@ class Preserve_trx_transfer_source_epoch_session {
   Preserve_trx_transfer_status send_phase1_control_batches_locked(
       const std::vector<std::string> &encoded_frames,
       size_t *acknowledged_frame_count, size_t *consumed_frame_count);
-  Preserve_trx_transfer_status abort_token_locked(uint64_t transfer_token,
-                                                  const std::string &reason,
-                                                  bool allow_finalized,
-                                                  Pending_frame_cleanup cleanup);
+  Preserve_trx_transfer_status abort_token_locked(
+      uint64_t transfer_token, const std::string &reason,
+      bool allow_finalized, Pending_frame_cleanup cleanup,
+      std::string *encoded_abort);
   Preserve_trx_transfer_status abort_epoch_locked(const std::string &reason);
 
   std::string m_epoch_id;

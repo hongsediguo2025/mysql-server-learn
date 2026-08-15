@@ -1,0 +1,284 @@
+CALL mtr.add_suppression(
+"PRESERVE: rolled back prepared transaction without snapshot during recovery");
+CREATE TABLE xfer2_w01_accounts(
+id INT PRIMARY KEY,
+balance INT NOT NULL,
+version INT NOT NULL DEFAULT 0,
+pad VARCHAR(64) NOT NULL
+) ENGINE=InnoDB;
+CREATE TABLE xfer2_w01_audit(
+id BIGINT AUTO_INCREMENT PRIMARY KEY,
+account_id INT NOT NULL,
+delta INT NOT NULL,
+KEY(account_id)
+) ENGINE=InnoDB;
+INSERT INTO xfer2_w01_accounts
+WITH RECURSIVE seq(n) AS (
+SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<32
+)
+SELECT n, 1000, 0, CONCAT('account-', n) FROM seq;
+SELECT @x1004_receiver_dict_identity_matches=1
+AS receiver_w02_shadow_dictionary_identity_matches;
+receiver_w02_shadow_dictionary_identity_matches
+1
+SELECT ROW_COUNT()=2 AS owner_w02_allocated_two_inventory_rows;
+owner_w02_allocated_two_inventory_rows
+1
+SELECT ROW_COUNT()=1 AS owner_w02_deleted_one_pending_item;
+owner_w02_deleted_one_pending_item
+1
+SELECT COUNT(*)=1 AND SUM(total)=155 AND SUM(version)=1
+AND SUM(status='READY')=1 AS owner_w02_order_exact
+FROM xfer2_x1004_orders;
+owner_w02_order_exact
+1
+SELECT COUNT(*)=2 AND SUM(qty)=5 AND SUM(qty*unit_price)=155
+AND SUM(status='ALLOCATED')=2 AS owner_w02_items_exact
+FROM xfer2_x1004_order_items;
+owner_w02_items_exact
+1
+SELECT COUNT(*)=24 AND SUM(stock)=2395 AND SUM(allocated)=5
+AND SUM(version)=2 AS owner_w02_inventory_exact
+FROM xfer2_x1004_inventory;
+owner_w02_inventory_exact
+1
+SELECT SUM(sku_id=3 AND stock=98 AND allocated=2 AND version=1)=1
+AND SUM(sku_id=7 AND stock=97 AND allocated=3 AND version=1)=1
+AND SUM(sku_id=11 AND stock=100 AND allocated=0 AND version=0)=1
+AS owner_w02_inventory_rows_exact
+FROM xfer2_x1004_inventory;
+owner_w02_inventory_rows_exact
+1
+SELECT COUNT(*)=0 AS owner_w02_fk_integrity_exact
+FROM xfer2_x1004_order_items oi
+LEFT JOIN xfer2_x1004_orders o ON o.order_id=oi.order_id
+LEFT JOIN xfer2_x1004_inventory i ON i.sku_id=oi.sku_id
+WHERE o.order_id IS NULL OR i.sku_id IS NULL;
+owner_w02_fk_integrity_exact
+1
+SELECT (SELECT COUNT(*) FROM xfer2_x1004_orders)=0
+AND (SELECT COUNT(*) FROM xfer2_x1004_order_items)=0
+AS observer_hides_owner_w02_order;
+observer_hides_owner_w02_order
+1
+SELECT COUNT(*)=24 AND SUM(stock)=2400 AND SUM(allocated)=0
+AND SUM(version)=0 AS observer_hides_owner_w02_inventory
+FROM xfer2_x1004_inventory;
+observer_hides_owner_w02_inventory
+1
+SELECT ROW_COUNT()=1 AS source_native_commit_during_phase1;
+source_native_commit_during_phase1
+1
+SELECT @x1004_alter_pending=1 AS alter_waits_for_exclusive_mdl,
+@x1004_owner_mdl_granted=1 AS owner_keeps_granted_table_mdl;
+alter_waits_for_exclusive_mdl	owner_keeps_granted_table_mdl
+1	1
+SELECT COUNT(*)=32 AND SUM(v)=38106
+AS receiver_native_commit_during_mdl_wait
+FROM xfer2_x1004_receiver_native;
+receiver_native_commit_during_mdl_wait
+1
+SELECT COUNT(*)=1 AS drain_still_paused_with_alter_pending FROM information_schema.processlist WHERE ID=DRAIN_ID AND STATE LIKE 'debug sync point:%';
+drain_still_paused_with_alter_pending
+1
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SELECT TIMESTAMPDIFF(MICROSECOND,@x1004_release_started,NOW(6))<5000000
+AS active_ddl_rejection_is_bounded;
+active_ddl_rejection_is_bounded
+1
+SELECT COUNT(*)=@x1004_preserved_before AS no_w02_source_token_detached
+FROM performance_schema.preserved_transactions;
+no_w02_source_token_detached
+1
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_source_handoff_pending_epochs')
+=@x1004_handoff_before AS no_handoff_pending,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_source_commit_unknown_epochs')
+=@x1004_unknown_before AS no_commit_unknown;
+no_handoff_pending	no_commit_unknown
+1	1
+SELECT @x1004_rejected_alter_pending=1
+AS rejected_epoch_alter_still_waits_on_source_mdl;
+rejected_epoch_alter_still_waits_on_source_mdl
+1
+SELECT COUNT(*)=0 AS alter_column_not_published_before_owner_release
+FROM information_schema.columns
+WHERE table_schema='test' AND table_name='xfer2_x1004_orders'
+   AND column_name='ddl_marker';
+alter_column_not_published_before_owner_release
+1
+no_active_receiver_worker
+1
+no_receiver_queue
+1
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_admitted_frames')
+>@x1004_admitted_before AS phase1_reached_receiver_before_rejection,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_online_epochs')
+=@x1004_online_before+1 AS one_aborted_online_epoch_retained,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')
+=@x1004_active_before AS no_accepted_epoch;
+phase1_reached_receiver_before_rejection	one_aborted_online_epoch_retained	no_accepted_epoch
+1	1	1
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_failed_tokens')
+=@x1004_failed_before+2 AS only_owner_and_ddl_aborted,
+(SELECT VARIABLE_VALUE FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_last_failed_reason')
+='target_counter_rejected' AS exact_abort_reason,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins')
+=@x1004_terminal_before AS no_terminal_cas;
+only_owner_and_ddl_aborted	exact_abort_reason	no_terminal_cas
+1	1	1
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_tokens')
+=@x1004_classified_before AS no_classified_w02_token,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens')
+=@x1004_ready_before AS no_ready_w02_token,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens')
+=@x1004_not_ready_before AS no_not_ready_w02_token;
+no_classified_w02_token	no_ready_w02_token	no_not_ready_w02_token
+1	1	1
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_saved_online_tokens')
+=@x1004_saved_before AS no_saved_online_w02_token,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')
+=@x1004_prepared_before AS no_prepared_w02_token,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_ready_tokens')
+=@x1004_prepared_ready_before AS no_prepared_ready_w02_token;
+no_saved_online_w02_token	no_prepared_w02_token	no_prepared_ready_w02_token
+1	1	1
+SELECT (SELECT COUNT(*) FROM xfer2_x1004_orders)=0
+AND (SELECT COUNT(*) FROM xfer2_x1004_order_items)=0
+AND (SELECT COUNT(*) FROM xfer2_x1004_inventory)=0
+AS receiver_w02_shadows_stay_empty;
+receiver_w02_shadows_stay_empty
+1
+SELECT COUNT(*)=32 AND SUM(v)=38106
+AS receiver_native_commit_stays_exact_before_restart
+FROM xfer2_x1004_receiver_native;
+receiver_native_commit_stays_exact_before_restart
+1
+SELECT COUNT(*)=1 AND SUM(total)=155 AND SUM(version)=1
+AS original_owner_continues_after_rejected_drain
+FROM xfer2_x1004_orders WHERE order_id=10004;
+original_owner_continues_after_rejected_drain
+1
+SELECT COUNT(*)=2 AND SUM(qty*unit_price)=155
+AS original_owner_items_still_exact
+FROM xfer2_x1004_order_items WHERE order_id=10004;
+original_owner_items_still_exact
+1
+ROLLBACK;
+SELECT COUNT(*)=1 AS alter_published_exactly_one_column
+FROM information_schema.columns
+WHERE table_schema='test' AND table_name='xfer2_x1004_orders'
+   AND column_name='ddl_marker';
+alter_published_exactly_one_column
+1
+SELECT (SELECT COUNT(*) FROM xfer2_x1004_orders)=0
+AND (SELECT COUNT(*) FROM xfer2_x1004_order_items)=0
+AS owner_order_rolled_back_before_restart;
+owner_order_rolled_back_before_restart
+1
+SELECT COUNT(*)=24 AND SUM(stock)=2400 AND SUM(allocated)=0
+AND SUM(version)=0 AS owner_inventory_rolled_back_before_restart
+FROM xfer2_x1004_inventory;
+owner_inventory_rolled_back_before_restart
+1
+source_ha_control_session
+1
+SELECT COUNT(*)=32 AS thirty_two_accounts,
+SUM(balance)=32001 AS committed_background_balance,
+SUM(version)=1 AS one_committed_background_version,
+MAX(CASE WHEN id=32 THEN balance END)=1001 AS background_update_visible,
+MAX(CASE WHEN id=3 THEN version END)=0 AS owner_updates_hidden
+FROM xfer2_w01_accounts;
+thirty_two_accounts	committed_background_balance	one_committed_background_version	background_update_visible	owner_updates_hidden
+1	1	1	1	1
+SELECT COUNT(*)=0 AS no_committed_audit FROM xfer2_w01_audit;
+no_committed_audit
+1
+DROP TABLE xfer2_w01_audit;
+DROP TABLE xfer2_w01_accounts;
+DROP USER xfer2_w01_app@localhost;
+DROP USER preserve_trx_ha_admin@localhost;
+DROP USER preserve_trx_ha_admin@localhost;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')=0
+AS no_receiver_epoch_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')=0
+AS no_inflight_token_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')=0
+AS no_inflight_byte_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_staged_memory_bytes')=0
+AS no_staged_memory_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')=0
+AS no_prepared_entry_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_promotion_prepared_prewarm_pending_tokens')=0
+AS no_prewarm_pending_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_ready_tokens')=0
+AS no_prepared_ready_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_promotion_ready_cache_bytes')=0
+AS no_ready_cache_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_memory_current_bytes')=0
+AS no_preserve_memory_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_worker_active')=0
+AS no_active_worker_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_queued_bytes')=0
+AS no_queued_byte_after_restart;
+no_receiver_epoch_after_restart	no_inflight_token_after_restart	no_inflight_byte_after_restart	no_staged_memory_after_restart	no_prepared_entry_after_restart	no_prewarm_pending_after_restart	no_prepared_ready_after_restart	no_ready_cache_after_restart	no_preserve_memory_after_restart	no_active_worker_after_restart	no_queued_byte_after_restart
+1	1	1	1	1	1	1	1	1	1	1
+SELECT (SELECT COUNT(*) FROM xfer2_x1004_orders)=0
+AND (SELECT COUNT(*) FROM xfer2_x1004_order_items)=0
+AS source_owner_order_rolled_back_after_restart;
+source_owner_order_rolled_back_after_restart
+1
+SELECT COUNT(*)=24 AND SUM(stock)=2400 AND SUM(allocated)=0
+AND SUM(version)=0 AS source_owner_inventory_rolled_back_after_restart
+FROM xfer2_x1004_inventory;
+source_owner_inventory_rolled_back_after_restart
+1
+SELECT COUNT(*)=1 AS completed_alter_survives_restart_once
+FROM information_schema.columns
+WHERE table_schema='test' AND table_name='xfer2_x1004_orders'
+   AND column_name='ddl_marker';
+completed_alter_survives_restart_once
+1
+CHECK TABLE xfer2_x1004_inventory,xfer2_x1004_orders,
+xfer2_x1004_order_items;
+Table	Op	Msg_type	Msg_text
+test.xfer2_x1004_inventory	check	status	OK
+test.xfer2_x1004_orders	check	status	OK
+test.xfer2_x1004_order_items	check	status	OK
+SELECT COUNT(*)=32 AND SUM(v)=38106
+AS receiver_native_commit_survives_restart
+FROM xfer2_x1004_receiver_native;
+receiver_native_commit_survives_restart
+1
+SELECT (SELECT COUNT(*) FROM xfer2_x1004_orders)=0
+AND (SELECT COUNT(*) FROM xfer2_x1004_order_items)=0
+AND (SELECT COUNT(*) FROM xfer2_x1004_inventory)=0
+AS receiver_w02_shadows_survive_restart_empty;
+receiver_w02_shadows_survive_restart_empty
+1

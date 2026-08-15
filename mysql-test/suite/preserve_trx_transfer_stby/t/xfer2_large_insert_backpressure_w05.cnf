@@ -1,0 +1,15 @@
+!include ../my.cnf
+
+[mysqld.1]
+log-bin=xfer2-x1202-source-bin
+binlog-format=ROW
+max_allowed_packet=67108864
+rds-preserve-trx-transfer-runtime-profile=BUSINESS_FIRST
+rds-preserve-trx-transfer-max-inflight-bytes=67108864
+
+[mysqld.2]
+log-bin=xfer2-x1202-receiver-bin
+binlog-format=ROW
+max_allowed_packet=67108864
+rds-preserve-trx-transfer-runtime-profile=BUSINESS_FIRST
+rds-preserve-trx-transfer-max-inflight-bytes=67108864

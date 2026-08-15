@@ -1,0 +1,499 @@
+CALL mtr.add_suppression(
+"PRESERVE: rolled back prepared transaction without snapshot during recovery");
+CREATE TABLE xfer2_w01_accounts(
+id INT PRIMARY KEY,
+balance INT NOT NULL,
+version INT NOT NULL DEFAULT 0,
+pad VARCHAR(64) NOT NULL
+) ENGINE=InnoDB;
+CREATE TABLE xfer2_w01_audit(
+id BIGINT AUTO_INCREMENT PRIMARY KEY,
+account_id INT NOT NULL,
+delta INT NOT NULL,
+KEY(account_id)
+) ENGINE=InnoDB;
+INSERT INTO xfer2_w01_accounts
+WITH RECURSIVE seq(n) AS (
+SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<32
+)
+SELECT n, 1000, 0, CONCAT('account-', n) FROM seq;
+SELECT COUNT(*)=48 AS owner_partition_row_count,
+SUM(score)=36033 AS owner_partition_score_sum,
+SUM(tag='owner-update')=6 AS owner_six_partition_updates,
+SUM(tag='owner-insert')=2 AS owner_two_partition_inserts
+FROM xfer2_x911_partitioned;
+owner_partition_row_count	owner_partition_score_sum	owner_six_partition_updates	owner_two_partition_inserts
+1	1	1	1
+SELECT COUNT(*)=24 AND SUM(score)=6617 AS owner_low_partition_exact
+FROM xfer2_x911_partitioned PARTITION(p_low);
+owner_low_partition_exact
+1
+SELECT COUNT(*)=24 AND SUM(score)=29416 AS owner_high_partition_exact
+FROM xfer2_x911_partitioned PARTITION(p_high);
+owner_high_partition_exact
+1
+SELECT COUNT(*)=6 AND SUM(score)=11421
+AS owner_secondary_partition_exact
+FROM xfer2_x911_partitioned FORCE INDEX(k_group_score)
+WHERE group_name IN ('low-touched','high-touched');
+owner_secondary_partition_exact
+1
+SELECT COUNT(*)=12 AS owner_boundary_row_count,
+SUM(id)=88 AS owner_boundary_id_sum,
+SUM(nullable_key IS NULL)=5 AS owner_five_null_keys,
+SUM(state='base')=7 AS owner_seven_boundary_base_rows
+FROM xfer2_x911_boundary;
+owner_boundary_row_count	owner_boundary_id_sum	owner_five_null_keys	owner_seven_boundary_base_rows
+1	1	1	1
+SELECT COUNT(*)=1 AND MIN(id)=1 AND SUM(state='ci-update')=1
+AS owner_ci_index_casefold_exact
+FROM xfer2_x911_boundary FORCE INDEX(k_ci) WHERE ci_key='ALPHA';
+owner_ci_index_casefold_exact
+1
+SELECT COUNT(*)=1 AND MIN(id)=3
+AND MIN(signed_edge=9223372036854775807)=1
+AND MIN(unsigned_edge=18446744073709551615)=1
+AS owner_accent_and_max_edges_exact
+FROM xfer2_x911_boundary FORCE INDEX(k_ci) WHERE ci_key='cafe';
+owner_accent_and_max_edges_exact
+1
+SELECT COUNT(*)=1 AND MIN(id)=3 AS owner_binary_rekey_exact
+FROM xfer2_x911_boundary FORCE INDEX(uk_bin)
+WHERE bin_key=UNHEX('ABCD');
+owner_binary_rekey_exact
+1
+SELECT COUNT(*)=48 AND SUM(score)=19800 AND SUM(tag='seed')=48
+AS outsider_partition_baseline_exact
+FROM xfer2_x911_partitioned;
+outsider_partition_baseline_exact
+1
+SELECT COUNT(*)=24 AND SUM(score)=2700 AS outsider_low_partition_baseline
+FROM xfer2_x911_partitioned PARTITION(p_low);
+outsider_low_partition_baseline
+1
+SELECT COUNT(*)=24 AND SUM(score)=17100 AS outsider_high_partition_baseline
+FROM xfer2_x911_partitioned PARTITION(p_high);
+outsider_high_partition_baseline
+1
+SELECT COUNT(*)=12 AND SUM(id)=78
+AND SUM(nullable_key IS NULL)=6 AND SUM(state='base')=12
+AS outsider_boundary_baseline_exact
+FROM xfer2_x911_boundary;
+outsider_boundary_baseline_exact
+1
+SELECT COUNT(*)=1 AND MIN(id)=3 AS outsider_original_binary_key_visible
+FROM xfer2_x911_boundary FORCE INDEX(uk_bin)
+WHERE bin_key=UNHEX('00FF');
+outsider_original_binary_key_visible
+1
+SELECT COUNT(*)=0 AS outsider_hides_owner_boundary_insert
+FROM xfer2_x911_boundary WHERE id=20;
+outsider_hides_owner_boundary_insert
+1
+SELECT COUNT(*)=@x911_preserved_before+1 AS one_x911_token_detached,
+SUM(MOD_TABLES_COUNT>=2)=1 AS partition_and_boundary_tables_recorded,
+SUM(SAVEPOINT_COUNT=0)=1 AS no_unrelated_savepoint_state
+FROM performance_schema.preserved_transactions;
+one_x911_token_detached	partition_and_boundary_tables_recorded	no_unrelated_savepoint_state
+1	1	1
+SELECT SUM(MOD_TABLES_COUNT)=3 AS three_physical_tables_recorded
+FROM performance_schema.preserved_transactions;
+three_physical_tables_recorded
+1
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_online_epochs')
+=@x911_online_before+1 AS one_x911_precommit_epoch,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')
+=@x911_active_before AS no_x911_terminal_epoch;
+one_x911_precommit_epoch	no_x911_terminal_epoch
+1	1
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_admitted_frames')
+>@x911_admitted_before AS x911_real_frames_admitted,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_admitted_bytes')
+>@x911_admitted_bytes_before AS x911_real_bytes_admitted,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_last_object_seal_monotonic_us')
+>@x911_last_seal_before AS x911_object_seal_observed;
+x911_real_frames_admitted	x911_real_bytes_admitted	x911_object_seal_observed
+1	1	1
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins')
+=@x911_terminal_before AS no_commit_cas_before_reset,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_terminal_status_tombstones')
+=@x911_tombstones_before AS no_terminal_tombstone_before_reset,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens')
+=@x911_ready_before AS no_ready_before_reset;
+no_commit_cas_before_reset	no_terminal_tombstone_before_reset	no_ready_before_reset
+1	1	1
+SELECT COUNT(*)=16 AND SUM(v)=945
+AS receiver_native_commit_during_x911_pause
+FROM xfer2_x911_receiver_native;
+receiver_native_commit_during_x911_pause
+1
+ERROR HY000: DRAIN TRANSACTIONS PRESERVE was reset before ownership became irreversible
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_reset_drain_wins')
+=@x911_reset_wins_before+1 AS x911_reset_won_precommit,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_reset_drain_too_late')
+=@x911_reset_too_late_before AS x911_reset_not_too_late;
+x911_reset_won_precommit	x911_reset_not_too_late
+1	1
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_source_handoff_pending_epochs')
+=@x911_handoff_before AS no_x911_handoff_pending,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_source_commit_unknown_epochs')
+=@x911_unknown_before AS no_x911_commit_unknown,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_quarantine_epochs')
+=@x911_quarantine_epochs_before AS no_x911_quarantine_epoch,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_quarantine_tokens')
+=@x911_quarantine_tokens_before AS no_x911_quarantine_token;
+no_x911_handoff_pending	no_x911_commit_unknown	no_x911_quarantine_epoch	no_x911_quarantine_token
+1	1	1	1
+SELECT COUNT(*)=@x911_preserved_before AS no_detached_x911_token
+FROM performance_schema.preserved_transactions;
+no_detached_x911_token
+1
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins')
+=@x911_terminal_before+1 AS one_x911_terminal_cas,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_terminal_cas_duplicates')
+=@x911_duplicates_before+1 AS one_x911_terminal_duplicate,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_conflicts')
+=@x911_conflicts_before AS no_x911_terminal_conflict,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_terminal_status_tombstones')
+=@x911_tombstones_before+1 AS one_x911_terminal_tombstone;
+one_x911_terminal_cas	one_x911_terminal_duplicate	no_x911_terminal_conflict	one_x911_terminal_tombstone
+1	1	1	1
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')
+=@x911_active_before AS no_accepted_x911_epoch,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_saved_online_tokens')
+=@x911_saved_before AS no_saved_x911_token,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_auto_prewarm_tokens')
+=@x911_classified_before AS no_classified_x911_token,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens')
+=@x911_ready_before AS no_ready_x911_token,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens')
+=@x911_not_ready_before AS no_not_ready_x911_publication;
+no_accepted_x911_epoch	no_saved_x911_token	no_classified_x911_token	no_ready_x911_token	no_not_ready_x911_publication
+1	1	1	1	1
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')
+=@x911_prepared_before AS no_x911_prepared_registration,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_promotion_prepared_prewarm_pending_tokens')
+=@x911_prepared_pending_before AS no_x911_prepared_pending,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_ready_tokens')
+=@x911_prepared_ready_before AS no_x911_prepared_ready,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_promotion_ready_cache_bytes')
+=@x911_ready_cache_before AS no_x911_ready_cache,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_memory_current_bytes')
+=@x911_memory_before AS no_x911_preserve_memory;
+no_x911_prepared_registration	no_x911_prepared_pending	no_x911_prepared_ready	no_x911_ready_cache	no_x911_preserve_memory
+1	1	1	1	1
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_cleanup_debt_tokens')
+=@x911_debt_tokens_before AS no_x911_cleanup_debt_token,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_bytes')
+=@x911_debt_bytes_before AS no_x911_cleanup_debt_bytes,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_worker_active')=0
+AS no_x911_receiver_worker,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_queued_bytes')=0
+AS no_x911_receiver_queue;
+no_x911_cleanup_debt_token	no_x911_cleanup_debt_bytes	no_x911_receiver_worker	no_x911_receiver_queue
+1	1	1	1
+SELECT COUNT(*)=16 AND SUM(v)=945 AS reset_kept_receiver_native_commit
+FROM xfer2_x911_receiver_native;
+reset_kept_receiver_native_commit
+1
+SELECT COUNT(*)=0 AS no_source_x911_table_published
+FROM information_schema.tables
+WHERE table_schema='test'
+   AND table_name IN ('xfer2_x911_partitioned','xfer2_x911_boundary');
+no_source_x911_table_published
+1
+SELECT CONNECTION_ID()=X911_OWNER_ID AS original_x911_owner_restored;
+original_x911_owner_restored
+1
+SELECT COUNT(*)=48 AND SUM(score)=36033
+AS restored_partition_full_scan_exact
+FROM xfer2_x911_partitioned;
+restored_partition_full_scan_exact
+1
+SELECT COUNT(*)=24 AND SUM(score)=6617 AS restored_low_partition_exact
+FROM xfer2_x911_partitioned PARTITION(p_low);
+restored_low_partition_exact
+1
+SELECT COUNT(*)=24 AND SUM(score)=29416 AS restored_high_partition_exact
+FROM xfer2_x911_partitioned PARTITION(p_high);
+restored_high_partition_exact
+1
+SELECT COUNT(*)=6 AND SUM(score)=11421
+AS restored_partition_secondary_exact
+FROM xfer2_x911_partitioned FORCE INDEX(k_group_score)
+WHERE group_name IN ('low-touched','high-touched');
+restored_partition_secondary_exact
+1
+SELECT COUNT(*)=12 AND SUM(id)=88
+AND SUM(nullable_key IS NULL)=5 AS restored_boundary_full_scan_exact
+FROM xfer2_x911_boundary;
+restored_boundary_full_scan_exact
+1
+SELECT COUNT(*)=1 AND MIN(id)=1 AS restored_ci_casefold_exact
+FROM xfer2_x911_boundary FORCE INDEX(k_ci) WHERE ci_key='ALPHA';
+restored_ci_casefold_exact
+1
+SELECT COUNT(*)=1 AND MIN(id)=3 AS restored_ci_accent_exact
+FROM xfer2_x911_boundary FORCE INDEX(k_ci) WHERE ci_key='cafe';
+restored_ci_accent_exact
+1
+SELECT COUNT(*)=1 AND MIN(id)=3 AS restored_binary_key_exact
+FROM xfer2_x911_boundary FORCE INDEX(uk_bin)
+WHERE bin_key=UNHEX('ABCD');
+restored_binary_key_exact
+1
+SELECT COUNT(*)=5 AS restored_null_index_exact
+FROM xfer2_x911_boundary FORCE INDEX(k_nullable)
+WHERE nullable_key IS NULL;
+restored_null_index_exact
+1
+SELECT ROW_COUNT()=1 AS boundary_continued_once_after_reset;
+boundary_continued_once_after_reset
+1
+SELECT COUNT(*)=48 AND SUM(score)=43033
+AND SUM(tag='after-reset')=2
+AS continued_partition_full_scan_exact
+FROM xfer2_x911_partitioned;
+continued_partition_full_scan_exact
+1
+SELECT COUNT(*)=24 AND SUM(score)=9617 AS continued_low_partition_exact
+FROM xfer2_x911_partitioned PARTITION(p_low);
+continued_low_partition_exact
+1
+SELECT COUNT(*)=24 AND SUM(score)=33416 AS continued_high_partition_exact
+FROM xfer2_x911_partitioned PARTITION(p_high);
+continued_high_partition_exact
+1
+SELECT COUNT(*)=1
+AND MIN(decimal_edge=-9999999999999999.9998)=1
+AND MIN(signed_edge=-9223372036854775808)=1
+AS continued_min_boundary_exact
+FROM xfer2_x911_boundary WHERE id=4;
+continued_min_boundary_exact
+1
+SELECT COUNT(*)=48 AND SUM(score)=43033
+AND SUM(tag='seed')=38
+AND SUM(tag='owner-update')=6
+AND SUM(tag='owner-insert')=2
+AND SUM(tag='after-reset')=2
+AS committed_partition_full_scan_exact
+FROM xfer2_x911_partitioned;
+committed_partition_full_scan_exact
+1
+SELECT COUNT(*)=24 AND SUM(score)=9617 AS committed_low_partition_exact
+FROM xfer2_x911_partitioned PARTITION(p_low);
+committed_low_partition_exact
+1
+SELECT COUNT(*)=24 AND SUM(score)=33416 AS committed_high_partition_exact
+FROM xfer2_x911_partitioned PARTITION(p_high);
+committed_high_partition_exact
+1
+SELECT COUNT(*)=6 AND SUM(score)=11421
+AS committed_partition_secondary_exact
+FROM xfer2_x911_partitioned FORCE INDEX(k_group_score)
+WHERE group_name IN ('low-touched','high-touched');
+committed_partition_secondary_exact
+1
+SELECT COUNT(*)=12 AND SUM(id)=88
+AND SUM(nullable_key IS NULL)=5
+AND SUM(state='base')=6
+AND SUM(state='null-update')=2
+AND SUM(state IN ('ci-update','binary-update',
+'owner-insert','after-reset'))=4
+AS committed_boundary_full_scan_exact
+FROM xfer2_x911_boundary;
+committed_boundary_full_scan_exact
+1
+SELECT COUNT(*)=1 AND MIN(id)=1 AS committed_ci_casefold_exact
+FROM xfer2_x911_boundary FORCE INDEX(k_ci) WHERE ci_key='ALPHA';
+committed_ci_casefold_exact
+1
+SELECT COUNT(*)=1 AND MIN(id)=3
+AND MIN(signed_edge=9223372036854775807)=1
+AND MIN(unsigned_edge=18446744073709551615)=1
+AS committed_max_boundary_exact
+FROM xfer2_x911_boundary FORCE INDEX(k_ci) WHERE ci_key='cafe';
+committed_max_boundary_exact
+1
+SELECT COUNT(*)=1 AND MIN(id)=20
+AND MIN(signed_edge=-9223372036854775808)=1
+AND MIN(unsigned_edge=18446744073709551615)=1
+AND MIN(decimal_edge=9999999999999999.9999)=1
+AS committed_inserted_boundary_exact
+FROM xfer2_x911_boundary FORCE INDEX(uk_bin)
+WHERE bin_key=UNHEX('00000000000000FE');
+committed_inserted_boundary_exact
+1
+SELECT COUNT(*)=5 AS committed_null_index_exact
+FROM xfer2_x911_boundary FORCE INDEX(k_nullable)
+WHERE nullable_key IS NULL;
+committed_null_index_exact
+1
+CHECK TABLE xfer2_x911_partitioned,xfer2_x911_boundary;
+Table	Op	Msg_type	Msg_text
+test.xfer2_x911_partitioned	check	status	OK
+test.xfer2_x911_boundary	check	status	OK
+source_ha_control_session
+1
+SELECT COUNT(*)=32 AS thirty_two_accounts,
+SUM(balance)=32001 AS committed_background_balance,
+SUM(version)=1 AS one_committed_background_version,
+MAX(CASE WHEN id=32 THEN balance END)=1001 AS background_update_visible,
+MAX(CASE WHEN id=3 THEN version END)=0 AS owner_updates_hidden
+FROM xfer2_w01_accounts;
+thirty_two_accounts	committed_background_balance	one_committed_background_version	background_update_visible	owner_updates_hidden
+1	1	1	1	1
+SELECT COUNT(*)=0 AS no_committed_audit FROM xfer2_w01_audit;
+no_committed_audit
+1
+DROP TABLE xfer2_w01_audit;
+DROP TABLE xfer2_w01_accounts;
+DROP USER xfer2_w01_app@localhost;
+DROP USER preserve_trx_ha_admin@localhost;
+DROP USER preserve_trx_ha_admin@localhost;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')=0
+AS no_receiver_epoch_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')=0
+AS no_inflight_token_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')=0
+AS no_inflight_byte_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_staged_memory_bytes')=0
+AS no_staged_memory_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')=0
+AS no_prepared_entry_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_promotion_prepared_prewarm_pending_tokens')=0
+AS no_prewarm_pending_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_ready_tokens')=0
+AS no_prepared_ready_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_promotion_ready_cache_bytes')=0
+AS no_ready_cache_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_memory_current_bytes')=0
+AS no_preserve_memory_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_worker_active')=0
+AS no_active_worker_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_queued_bytes')=0
+AS no_queued_byte_after_restart;
+no_receiver_epoch_after_restart	no_inflight_token_after_restart	no_inflight_byte_after_restart	no_staged_memory_after_restart	no_prepared_entry_after_restart	no_prewarm_pending_after_restart	no_prepared_ready_after_restart	no_ready_cache_after_restart	no_preserve_memory_after_restart	no_active_worker_after_restart	no_queued_byte_after_restart
+1	1	1	1	1	1	1	1	1	1	1
+SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+SELECT COUNT(*)=48 AND SUM(score)=43033
+AND SUM(tag='seed')=38
+AND SUM(tag='owner-update')=6
+AND SUM(tag='owner-insert')=2
+AND SUM(tag='after-reset')=2
+AS restarted_partition_full_scan_exact
+FROM xfer2_x911_partitioned;
+restarted_partition_full_scan_exact
+1
+SELECT COUNT(*)=24 AND SUM(score)=9617 AS restarted_low_partition_exact
+FROM xfer2_x911_partitioned PARTITION(p_low);
+restarted_low_partition_exact
+1
+SELECT COUNT(*)=24 AND SUM(score)=33416 AS restarted_high_partition_exact
+FROM xfer2_x911_partitioned PARTITION(p_high);
+restarted_high_partition_exact
+1
+SELECT COUNT(*)=6 AND SUM(score)=11421
+AS restarted_partition_secondary_exact
+FROM xfer2_x911_partitioned FORCE INDEX(k_group_score)
+WHERE group_name IN ('low-touched','high-touched');
+restarted_partition_secondary_exact
+1
+SELECT COUNT(*)=12 AND SUM(id)=88
+AND SUM(nullable_key IS NULL)=5
+AND SUM(state='base')=6 AS restarted_boundary_full_scan_exact
+FROM xfer2_x911_boundary;
+restarted_boundary_full_scan_exact
+1
+SELECT COUNT(*)=1 AND MIN(id)=1 AS restarted_ci_casefold_exact
+FROM xfer2_x911_boundary FORCE INDEX(k_ci) WHERE ci_key='ALPHA';
+restarted_ci_casefold_exact
+1
+SELECT COUNT(*)=1 AND MIN(id)=3 AS restarted_ci_accent_exact
+FROM xfer2_x911_boundary FORCE INDEX(k_ci) WHERE ci_key='cafe';
+restarted_ci_accent_exact
+1
+SELECT COUNT(*)=1 AND MIN(id)=20
+AND MIN(unsigned_edge=18446744073709551615)=1
+AS restarted_binary_and_unsigned_edge_exact
+FROM xfer2_x911_boundary FORCE INDEX(uk_bin)
+WHERE bin_key=UNHEX('00000000000000FE');
+restarted_binary_and_unsigned_edge_exact
+1
+SELECT COUNT(*)=5 AS restarted_null_index_exact
+FROM xfer2_x911_boundary FORCE INDEX(k_nullable)
+WHERE nullable_key IS NULL;
+restarted_null_index_exact
+1
+CHECK TABLE xfer2_x911_partitioned,xfer2_x911_boundary;
+Table	Op	Msg_type	Msg_text
+test.xfer2_x911_partitioned	check	status	OK
+test.xfer2_x911_boundary	check	status	OK
+DROP TABLE xfer2_x911_partitioned,xfer2_x911_boundary;
+SELECT COUNT(*)=16 AND SUM(v)=945
+AS restarted_receiver_native_commit_exact
+FROM xfer2_x911_receiver_native;
+restarted_receiver_native_commit_exact
+1
+CHECK TABLE xfer2_x911_receiver_native;
+Table	Op	Msg_type	Msg_text
+test.xfer2_x911_receiver_native	check	status	OK
+DROP TABLE xfer2_x911_receiver_native;

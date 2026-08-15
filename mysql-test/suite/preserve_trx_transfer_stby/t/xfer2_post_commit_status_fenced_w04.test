@@ -1,0 +1,22 @@
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+# X6-08 / X6-09(T1) / W04 / O01 / O02 / O10 / T1 debug-contract / I03 / I04
+#
+# The receiver completes one terminal COMMIT, but both verified COMMIT ACKs are
+# hidden from the source.  The normal sender then performs its authenticated
+# QUERY_EPOCH_STATUS recovery.  A matching process-local COMMITTED result is
+# evidence about the live receiver process only: it is not authoritative HA
+# ownership proof and must not advance the source to COMMITTED_HANDOFF.
+#
+# Expected contract: DRAIN returns uncertain, the source publishes
+# COMMIT_UNKNOWN and remains fenced, RESET is too late, the original waiter is
+# still blocked, and the receiver retains exactly one READY/prepared/cache
+# publication without promotion or adoption.  Eventual ownership resolution is
+# intentionally outside this T1 case and remains blocked on an authoritative HA
+# provider/caller.
+
+--let $terminal_cas_case= 4
+--source suite/preserve_trx_transfer_stby/include/run_terminal_cas_w01.inc

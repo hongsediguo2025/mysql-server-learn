@@ -1,0 +1,559 @@
+# X3-01 / X9-03 / W03 / O01 / O09 / O10 / T1 debug-contract /
+# I02 / I05 / I06 / I10
+#
+# A real two-mysqld STANDBY_TRANSFER_SAVE drain carries a large logged W03
+# transaction with a primary key, a nonunique secondary index, and a unique
+# business key. The receiver first applies a non-final OBJECT_CHUNK and loses
+# its ACK; the source reconnects and the receiver must classify the replayed
+# sequences ALREADY_APPLIED. The first verified COMMIT_EPOCH ACK is then hidden,
+# forcing one byte-identical terminal retry and one duplicate terminal CAS.
+# After the Phase1 object prefix and its exact retry have both completed, the
+# same owner rewrites 512 indexed rows.  The quiesced Phase2 final-HWM path must
+# carry that late 768 KiB change before terminal metadata can be accepted.
+#
+# T1 does not physically apply source SQL rows on the independent receiver.
+# Therefore the exact mutated index model is proved inside the source owner
+# before transfer, outsider isolation is proved concurrently, and source
+# restart must restore all three indexes to the committed baseline without a
+# stale unique or secondary entry.
+--source include/have_debug.inc
+--source include/have_log_bin.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+--source suite/preserve_trx_transfer_stby/include/w01_setup.inc
+CALL mtr.add_suppression(".*Got an error reading communication packets.*");
+
+# X3-01 attaches a target-local DEBUG_SYNC action to the application THD.  The
+# case-owned account is dropped by the shared teardown.
+--connection default
+--disable_query_log
+GRANT SESSION_VARIABLES_ADMIN ON *.* TO xfer2_w01_app@localhost;
+--enable_query_log
+
+--connection xfer2_source_ha
+--let $x903_old_phase1_timeout= query_get_value(SELECT @@GLOBAL.rds_preserve_trx_drain_phase1_timeout_ms AS v,v,1)
+--let $x903_old_phase2_timeout= query_get_value(SELECT @@GLOBAL.rds_preserve_trx_drain_phase2_timeout_ms AS v,v,1)
+--let $x903_old_retention= query_get_value(SELECT @@GLOBAL.rds_preserve_trx_token_retention_timeout_ms AS v,v,1)
+SET GLOBAL rds_preserve_trx_drain_phase1_timeout_ms=120000;
+SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms=120000;
+SET GLOBAL rds_preserve_trx_token_retention_timeout_ms=120000;
+SELECT @@GLOBAL.rds_preserve_trx_transfer_runtime_profile='BUSINESS_FIRST'
+         AS source_business_first_profile,
+       @@GLOBAL.rds_preserve_trx_transfer_max_inflight_bytes=64*1024*1024
+         AS source_inflight_budget;
+
+--connection default
+SET SESSION cte_max_recursion_depth=3000;
+--disable_warnings
+DROP TABLE IF EXISTS xfer2_x903_indexed;
+DROP TABLE IF EXISTS xfer2_x903_source_native;
+--enable_warnings
+CREATE TABLE xfer2_x903_indexed(
+  id INT PRIMARY KEY,
+  business_key VARCHAR(32) NOT NULL,
+  bucket INT NOT NULL,
+  score BIGINT NOT NULL,
+  payload VARBINARY(1536) NOT NULL,
+  UNIQUE KEY uk_business(business_key),
+  KEY idx_bucket_score(bucket,score,id)
+) ENGINE=InnoDB;
+INSERT INTO xfer2_x903_indexed
+WITH RECURSIVE seq(n) AS (
+  SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<2048
+)
+SELECT n,CONCAT('biz-',LPAD(n,5,'0')),MOD(n,17),n*10,
+       REPEAT(CHAR(65+MOD(n,26)),512)
+  FROM seq;
+CREATE TABLE xfer2_x903_source_native(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO xfer2_x903_source_native VALUES(1,100),(2,200);
+START TRANSACTION;
+UPDATE xfer2_x903_source_native SET v=v+id;
+INSERT INTO xfer2_x903_source_native VALUES(3,300);
+COMMIT;
+SELECT COUNT(*)=3 AND SUM(v)=603 AS source_native_commit_before_retry
+  FROM xfer2_x903_source_native;
+
+--connection xfer2_receiver
+SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=OFF;
+SELECT @@GLOBAL.rds_preserve_trx_transfer_runtime_profile='BUSINESS_FIRST'
+         AS receiver_business_first_profile,
+       @@GLOBAL.rds_preserve_trx_transfer_max_inflight_bytes=64*1024*1024
+         AS receiver_inflight_budget;
+--disable_warnings
+DROP TABLE IF EXISTS xfer2_x903_receiver_native;
+--enable_warnings
+CREATE TABLE xfer2_x903_receiver_native(
+  id INT PRIMARY KEY,
+  v INT NOT NULL,
+  KEY(v)
+) ENGINE=InnoDB;
+INSERT INTO xfer2_x903_receiver_native VALUES(1,10),(2,20);
+
+--let $x903_projection_count= query_get_value("SELECT COUNT(*) AS c FROM performance_schema.global_status WHERE VARIABLE_NAME IN ('Preserve_trx_transfer_receiver_after_apply_before_ack_faults','Preserve_trx_transfer_receiver_sequence_already_applied','Preserve_trx_transfer_receiver_terminal_cas_duplicates')",c,1)
+if ($x903_projection_count != 3)
+{
+  --die RED: missing object-replay or terminal-duplicate projection
+}
+SET @active_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_active_epochs');
+SET @admitted_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_admitted_frames');
+SET @admitted_bytes_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_admitted_bytes');
+SET @after_apply_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_after_apply_before_ack_faults');
+SET @already_applied_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_sequence_already_applied');
+SET @terminal_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_terminal_cas_wins');
+SET @duplicates_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_terminal_cas_duplicates');
+SET @conflicts_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_terminal_cas_conflicts');
+SET @tombstones_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_terminal_status_tombstones');
+SET @classified_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_auto_prewarm_tokens');
+SET @ready_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens');
+SET @not_ready_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens');
+SET @inflight_tokens_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_inflight_tokens');
+SET @inflight_bytes_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_inflight_bytes');
+SET @staged_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_staged_memory_bytes');
+SET @saved_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_saved_online_tokens');
+SET @failed_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_failed_tokens');
+SET @prepared_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_promotion_prepared_registered_tokens');
+SET @prepared_pending_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_promotion_prepared_prewarm_pending_tokens');
+SET @prepared_ready_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_promotion_prepared_ready_tokens');
+SET @ready_cache_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_promotion_ready_cache_bytes');
+SET @memory_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_memory_current_bytes');
+SET @debt_tokens_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_cleanup_debt_tokens');
+SET @debt_bytes_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_cleanup_debt_bytes');
+SET @tainted_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_cleanup_tainted_transitions');
+
+--connection xfer2_source_ha
+SET @phase1_frames_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_phase1_frame_count');
+SET @phase1_sends_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_phase1_network_send_count');
+SET @phase1_batches_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_phase1_batch_count');
+SET @phase1_oversize_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_phase1_oversize_token_count');
+SET @handoff_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_source_handoff_pending_epochs');
+SET @unknown_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_source_commit_unknown_epochs');
+SET @quarantine_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_quarantine_epochs');
+
+# O01 and W03. The owner keeps the old RR view across an independent commit,
+# then mutates every unique and secondary key across many index pages.
+--connect(xfer2_x903_owner,localhost,xfer2_w01_app,,test)
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+SELECT balance=1000 AND version=0 AS owner_rr_initial
+  FROM xfer2_w01_accounts WHERE id=32;
+SELECT COUNT(*)=2048 AND SUM(id)=2098176 AND SUM(score)=20981760
+         AND SUM(OCTET_LENGTH(payload))=1048576
+         AS owner_w03_primary_baseline
+  FROM xfer2_x903_indexed FORCE INDEX(PRIMARY);
+
+--connect(xfer2_x903_outsider,localhost,root,,test)
+UPDATE xfer2_w01_accounts
+   SET balance=balance+1,version=version+1 WHERE id=32;
+SELECT ROW_COUNT()=1 AS outsider_background_commit;
+
+--connection xfer2_x903_owner
+SELECT balance=1000 AND version=0 AS owner_rr_stays_old
+  FROM xfer2_w01_accounts WHERE id=32;
+UPDATE xfer2_x903_indexed
+   SET business_key=CONCAT('mut-',LPAD(id,5,'0')),
+       bucket=100+MOD(id,7),
+       score=score+100000,
+       payload=REPEAT(CHAR(97+MOD(id,26)),1536);
+SELECT ROW_COUNT()=2048 AS all_index_pages_updated_once;
+INSERT INTO xfer2_x903_indexed
+  VALUES(3001,'mut-03001',108,300100,REPEAT('I',1536));
+SELECT ROW_COUNT()=1 AS one_unique_key_inserted;
+DELETE FROM xfer2_x903_indexed WHERE id=1537;
+SELECT ROW_COUNT()=1 AS one_old_key_deleted;
+
+SELECT COUNT(*)=2048 AND SUM(id)=2099640 AND SUM(score)=225966490
+         AND SUM(OCTET_LENGTH(payload))=3145728
+         AS owner_primary_final_model_exact
+  FROM xfer2_x903_indexed FORCE INDEX(PRIMARY);
+SELECT COUNT(*)=2048 AND SUM(id)=2099640 AND SUM(score)=225966490
+         AS owner_secondary_final_model_exact
+  FROM xfer2_x903_indexed FORCE INDEX(idx_bucket_score)
+ WHERE bucket BETWEEN 100 AND 108;
+SELECT COUNT(*)=2048 AND SUM(id)=2099640 AND SUM(score)=225966490
+         AS owner_unique_final_model_exact
+  FROM xfer2_x903_indexed FORCE INDEX(uk_business)
+ WHERE business_key>='mut-' AND business_key<'muu-';
+SELECT GROUP_CONCAT(CONCAT(bucket,':',cnt) ORDER BY bucket)=
+         '100:292,101:293,102:293,103:293,104:292,105:292,106:292,108:1'
+         AS owner_secondary_distribution_exact
+  FROM (
+    SELECT bucket,COUNT(*) AS cnt
+      FROM xfer2_x903_indexed FORCE INDEX(idx_bucket_score)
+     WHERE bucket BETWEEN 100 AND 108 GROUP BY bucket
+  ) AS d;
+SELECT id=1 AND bucket=101 AND score=100010 AS owner_unique_lookup_updated
+  FROM xfer2_x903_indexed FORCE INDEX(uk_business)
+ WHERE business_key='mut-00001';
+SELECT id=3001 AND bucket=108 AND score=300100 AS owner_unique_lookup_inserted
+  FROM xfer2_x903_indexed FORCE INDEX(uk_business)
+ WHERE business_key='mut-03001';
+SELECT COUNT(*)=0 AS owner_deleted_key_absent
+  FROM xfer2_x903_indexed FORCE INDEX(uk_business)
+ WHERE business_key IN ('biz-01537','mut-01537');
+
+# The signal is attached to the target THD.  It can fire only after Phase2 has
+# built and queued this owner's final binlog high-watermark descriptor.
+--disable_query_log
+SET DEBUG_SYNC=
+  'preserve_trx_phase2_final_hwm_enqueued_before_local_preserve SIGNAL xfer2_x301_final_hwm_enqueued';
+--enable_query_log
+
+--connection xfer2_x903_outsider
+SELECT COUNT(*)=2048 AND SUM(id)=2098176 AND SUM(score)=20981760
+         AND SUM(OCTET_LENGTH(payload))=1048576
+         AS outsider_primary_remains_baseline
+  FROM xfer2_x903_indexed FORCE INDEX(PRIMARY);
+SELECT COUNT(*)=0 AS outsider_sees_no_mutated_unique_keys
+  FROM xfer2_x903_indexed FORCE INDEX(uk_business)
+ WHERE business_key>='mut-' AND business_key<'muu-';
+SELECT id=1537 AND business_key='biz-01537' AND score=15370
+         AS outsider_still_sees_deleted_row
+  FROM xfer2_x903_indexed WHERE id=1537;
+
+--connect(xfer2_x903_drain,localhost,root,,test)
+--disable_query_log
+SET DEBUG_SYNC=
+  'preserve_trx_transfer_after_phase1_binlog_stream SIGNAL xfer2_x301_phase1_streamed WAIT_FOR xfer2_x301_late_dml_done';
+--enable_query_log
+--send DRAIN TRANSACTIONS PRESERVE
+
+# Prove that the selected non-final object payload was applied and its exact
+# replay reused stable sequence results before the terminal phase begins.
+--connection xfer2_receiver
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_after_apply_before_ack_faults')=@after_apply_before+1
+--let $wait_timeout= 60
+--source include/wait_condition_or_abort.inc
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_sequence_already_applied')>@already_applied_before
+--let $wait_timeout= 60
+--source include/wait_condition_or_abort.inc
+
+# X3-01: the first Phase1 object image is now fully ACKed (including the exact
+# replay), but the source has not entered WARMCOPY_CLOSING.  Mutate the same
+# owner after that boundary so only the real quiesced final-HWM catch-up can
+# bind the terminal object digest to these latest bytes.
+--connection xfer2_source_ha
+--disable_query_log
+SET DEBUG_SYNC='now WAIT_FOR xfer2_x301_phase1_streamed TIMEOUT 60';
+--let $x301_phase1_sync_warnings= query_get_value(SELECT @@warning_count AS c,c,1)
+--enable_query_log
+if ($x301_phase1_sync_warnings != 0)
+{
+  --die X3-01 Phase1 object-stream synchronization timed out
+}
+
+--connection xfer2_x903_owner
+UPDATE xfer2_x903_indexed
+   SET business_key=CONCAT('late-',LPAD(id,5,'0')),
+       bucket=200+MOD(id,5),
+       score=score+777,
+       payload=REPEAT('L',1536)
+ WHERE id BETWEEN 1 AND 512;
+SELECT ROW_COUNT()=512 AS x301_late_rows_updated;
+SELECT COUNT(*)=2048 AND SUM(id)=2099640 AND SUM(score)=226364314
+         AND SUM(OCTET_LENGTH(payload))=3145728
+         AS x301_owner_final_model_exact
+  FROM xfer2_x903_indexed FORCE INDEX(PRIMARY);
+SELECT COUNT(*)=512 AND SUM(id)=131328 AND SUM(score)=52911104
+         AND SUM(OCTET_LENGTH(payload))=786432
+         AS x301_late_unique_range_exact
+  FROM xfer2_x903_indexed FORCE INDEX(uk_business)
+ WHERE business_key>='late-' AND business_key<'latf-';
+SELECT GROUP_CONCAT(CONCAT(bucket,':',cnt) ORDER BY bucket)=
+         '200:102,201:103,202:103,203:102,204:102'
+         AS x301_late_secondary_distribution_exact
+  FROM (
+    SELECT bucket,COUNT(*) AS cnt
+      FROM xfer2_x903_indexed FORCE INDEX(idx_bucket_score)
+     WHERE bucket BETWEEN 200 AND 204 GROUP BY bucket
+  ) AS d;
+SELECT id=1 AND bucket=201 AND score=100787
+         AND OCTET_LENGTH(payload)=1536
+         AND SHA2(payload,256)=SHA2(REPEAT('L',1536),256)
+         AS x301_first_late_row_exact
+  FROM xfer2_x903_indexed FORCE INDEX(uk_business)
+ WHERE business_key='late-00001';
+SELECT id=512 AND bucket=202 AND score=105897
+         AND OCTET_LENGTH(payload)=1536
+         AND SHA2(payload,256)=SHA2(REPEAT('L',1536),256)
+         AS x301_last_late_row_exact
+  FROM xfer2_x903_indexed FORCE INDEX(uk_business)
+ WHERE business_key='late-00512';
+
+--connection xfer2_x903_outsider
+SELECT COUNT(*)=2048 AND SUM(id)=2098176 AND SUM(score)=20981760
+         AND SUM(OCTET_LENGTH(payload))=1048576
+         AS x301_outsider_still_sees_committed_baseline
+  FROM xfer2_x903_indexed FORCE INDEX(PRIMARY);
+SELECT COUNT(*)=0 AS x301_outsider_hides_late_unique_keys
+  FROM xfer2_x903_indexed FORCE INDEX(uk_business)
+ WHERE business_key>='late-' AND business_key<'latf-';
+
+--connection xfer2_source_ha
+--disable_query_log
+SET DEBUG_SYNC='now SIGNAL xfer2_x301_late_dml_done';
+SET DEBUG_SYNC='now WAIT_FOR xfer2_x301_final_hwm_enqueued TIMEOUT 60';
+--let $x301_final_hwm_sync_warnings= query_get_value(SELECT @@warning_count AS c,c,1)
+--enable_query_log
+if ($x301_final_hwm_sync_warnings != 0)
+{
+  --die X3-01 quiesced final-HWM path did not run
+}
+
+--connection xfer2_x903_drain
+--replace_column 1 GENERATION 3 SOURCE_ID 6 CLOSING_STARTED_US 7 CLOSING_DEADLINE_US
+--reap
+
+# One source token produces one terminal failed receiver record. The dropped
+# COMMIT ACK must add exactly one duplicate CAS, never a second winner.
+--connection xfer2_receiver
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')=@active_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins')=@terminal_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_duplicates')=@duplicates_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_conflicts')=@conflicts_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_status_tombstones')=@tombstones_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_tokens')=@classified_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens')=@ready_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens')=@not_ready_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_failed_tokens')=@failed_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')=@inflight_tokens_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')=@inflight_bytes_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes')=@staged_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')=@prepared_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_prewarm_pending_tokens')=@prepared_pending_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_ready_tokens')=@prepared_ready_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_ready_cache_bytes')=@ready_cache_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_memory_current_bytes')=@memory_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_tokens')=@debt_tokens_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_bytes')=@debt_bytes_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_worker_active')=0 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_queued_bytes')=0
+--let $wait_timeout= 60
+--source include/wait_condition_or_abort.inc
+
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_after_apply_before_ack_faults')
+       =@after_apply_before+1 AS exactly_one_object_ack_lost_after_apply,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_sequence_already_applied')
+       >@already_applied_before AS object_replay_used_already_applied;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins')
+       =@terminal_before+1 AS one_original_terminal_cas,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_duplicates')
+       =@duplicates_before+1 AS one_identical_terminal_retry,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_conflicts')
+       =@conflicts_before AS terminal_retry_not_conflict,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_status_tombstones')
+       =@tombstones_before+1 AS one_terminal_tombstone;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_admitted_frames')
+       >@admitted_before+8 AS many_unique_frames_admitted,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_admitted_bytes')
+       >@admitted_bytes_before+2*1024*1024 AS multi_mib_unique_bytes_admitted;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_tokens')
+       =@classified_before+1 AS one_classified_token,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens')
+       =@ready_before AS no_ready_token,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens')
+       =@not_ready_before+1 AS one_deadline_token;
+SELECT VARIABLE_VALUE='receiver_selection_failed:3'
+       AS w03_prewarm_deadline_is_exact_reason
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_last_failed_reason';
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_saved_online_tokens')
+       =@saved_before AS no_saved_online_token,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_failed_tokens')
+       =@failed_before+1 AS one_not_ready_record,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_tainted_transitions')
+       =@tainted_before AS no_cleanup_taint;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')
+       =@inflight_tokens_before AS inflight_token_released,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')
+       =@inflight_bytes_before AS inflight_bytes_released,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes')
+       =@staged_before AS staged_memory_released;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')
+       =@prepared_before AS no_prepared_token,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_prewarm_pending_tokens')
+       =@prepared_pending_before AS no_prepared_pending_token,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_ready_tokens')
+       =@prepared_ready_before AS no_prepared_ready_token,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_promotion_ready_cache_bytes')
+       =@ready_cache_before AS no_ready_cache_residue,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_memory_current_bytes')
+       =@memory_before AS no_preserve_memory_residue;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_tokens')
+       =@debt_tokens_before AS no_cleanup_debt_token,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_bytes')
+       =@debt_bytes_before AS no_cleanup_debt_bytes;
+
+START TRANSACTION;
+UPDATE xfer2_x903_receiver_native SET v=v+id;
+INSERT INTO xfer2_x903_receiver_native VALUES(3,30);
+COMMIT;
+SELECT COUNT(*)=3 AND SUM(v)=63 AS receiver_native_commit_after_retries
+  FROM xfer2_x903_receiver_native;
+SELECT COUNT(*)=0 AS no_source_sql_table_published
+  FROM information_schema.tables
+ WHERE table_schema='test' AND table_name='xfer2_x903_indexed';
+
+--connection xfer2_source_ha
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_phase1_frame_count')
+       >@phase1_frames_before AS phase1_frames_sent,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_phase1_network_send_count')
+       >@phase1_sends_before AS phase1_network_sends,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_phase1_batch_count')
+       >@phase1_batches_before AS phase1_batches_sent,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_phase1_oversize_token_count')
+       =@phase1_oversize_before+1 AS one_chunked_oversize_object;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_source_handoff_pending_epochs')
+       =@handoff_before AS no_handoff_pending,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_source_commit_unknown_epochs')
+       =@unknown_before AS no_commit_unknown,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_quarantine_epochs')
+       =@quarantine_before AS no_quarantine;
+
+--connection xfer2_x903_owner
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT COUNT(*) FROM xfer2_x903_indexed;
+
+--connection xfer2_source_ha
+--eval SET GLOBAL rds_preserve_trx_drain_phase1_timeout_ms=$x903_old_phase1_timeout
+--eval SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms=$x903_old_phase2_timeout
+--eval SET GLOBAL rds_preserve_trx_token_retention_timeout_ms=$x903_old_retention
+
+--disconnect xfer2_x903_owner
+--disconnect xfer2_x903_outsider
+--disconnect xfer2_x903_drain
+
+--source suite/preserve_trx_transfer_stby/include/w01_teardown.inc
+
+# Source restart resolves the T1-only owner by rollback. All three access paths
+# must return to the exact seed model, including restored/deleted unique keys.
+--connection xfer2_cleanup
+SELECT COUNT(*)=2048 AND SUM(id)=2098176 AND SUM(score)=20981760
+         AND SUM(OCTET_LENGTH(payload))=1048576
+         AS source_primary_baseline_after_restart
+  FROM xfer2_x903_indexed FORCE INDEX(PRIMARY);
+SELECT COUNT(*)=120 AND SUM(id)=123420 AND SUM(score)=1234200
+         AS source_secondary_baseline_after_restart
+  FROM xfer2_x903_indexed FORCE INDEX(idx_bucket_score) WHERE bucket=0;
+SELECT id=1 AND bucket=1 AND score=10 AS source_unique_baseline_after_restart
+  FROM xfer2_x903_indexed FORCE INDEX(uk_business)
+ WHERE business_key='biz-00001';
+SELECT id=1537 AND business_key='biz-01537' AND score=15370
+         AS source_deleted_row_restored
+  FROM xfer2_x903_indexed WHERE id=1537;
+SELECT COUNT(*)=0 AS source_mutated_unique_keys_rolled_back
+  FROM xfer2_x903_indexed FORCE INDEX(uk_business)
+ WHERE business_key>='mut-' AND business_key<'muu-';
+SELECT COUNT(*)=0 AS source_late_unique_keys_rolled_back
+  FROM xfer2_x903_indexed FORCE INDEX(uk_business)
+ WHERE business_key>='late-' AND business_key<'latf-';
+SELECT COUNT(*)=0 AS source_inserted_pk_rolled_back
+  FROM xfer2_x903_indexed WHERE id=3001;
+--error ER_DUP_ENTRY
+INSERT INTO xfer2_x903_indexed
+  VALUES(4000,'biz-00001',0,1,REPEAT('D',512));
+SELECT COUNT(*)=2048 AS duplicate_unique_rejection_changed_no_rows
+  FROM xfer2_x903_indexed;
+SELECT COUNT(*)=3 AND SUM(v)=603 AS source_native_commit_survives_restart
+  FROM xfer2_x903_source_native;
+CHECK TABLE xfer2_x903_indexed,xfer2_x903_source_native;
+
+--connection xfer2_receiver
+SELECT COUNT(*)=3 AND SUM(v)=63 AS receiver_native_commit_survives_restart
+  FROM xfer2_x903_receiver_native;
+SELECT VARIABLE_VALUE=0 AS object_ack_fault_counter_reset
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_after_apply_before_ack_faults';
+SELECT VARIABLE_VALUE=0 AS already_applied_counter_reset
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_sequence_already_applied';
+SELECT VARIABLE_VALUE=0 AS terminal_duplicate_counter_reset
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_terminal_cas_duplicates';
+CHECK TABLE xfer2_x903_receiver_native;
+DROP TABLE xfer2_x903_receiver_native;
+
+--connection xfer2_cleanup
+DROP TABLE xfer2_x903_indexed;
+DROP TABLE xfer2_x903_source_native;

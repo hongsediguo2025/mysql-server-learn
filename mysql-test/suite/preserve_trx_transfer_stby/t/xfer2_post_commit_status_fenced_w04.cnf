@@ -1,0 +1,14 @@
+!include ../my.cnf
+
+[mysqld.1]
+skip-log-bin
+rds-preserve-trx-transfer-runtime-profile=BUSINESS_FIRST
+max_allowed_packet=67108864
+# Hide both successful COMMIT_EPOCH ACKs.  The normal sender must recover with
+# an authenticated process-local status query without treating that status as
+# authoritative HA ownership proof.
+debug=d,preserve_trx_transfer_drop_commit_ack_twice
+
+[mysqld.2]
+skip-log-bin
+max_allowed_packet=67108864

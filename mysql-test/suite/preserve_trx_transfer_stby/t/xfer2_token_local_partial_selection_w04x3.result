@@ -1,0 +1,443 @@
+CALL mtr.add_suppression(
+"PRESERVE: rolled back prepared transaction without snapshot during recovery");
+CREATE TABLE xfer2_w01_accounts(
+id INT PRIMARY KEY,
+balance INT NOT NULL,
+version INT NOT NULL DEFAULT 0,
+pad VARCHAR(64) NOT NULL
+) ENGINE=InnoDB;
+CREATE TABLE xfer2_w01_audit(
+id BIGINT AUTO_INCREMENT PRIMARY KEY,
+account_id INT NOT NULL,
+delta INT NOT NULL,
+KEY(account_id)
+) ENGINE=InnoDB;
+INSERT INTO xfer2_w01_accounts
+WITH RECURSIVE seq(n) AS (
+SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<32
+)
+SELECT n, 1000, 0, CONCAT('account-', n) FROM seq;
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO xfer2_w01_app@localhost;
+SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=ON;
+SET GLOBAL rds_preserve_trx_token_retention_timeout_ms=120000;
+SET GLOBAL debug='+d,preserve_trx_receiver_fail_one_token_prewarm';
+DROP TABLE IF EXISTS xfer2_x502_receiver_native;
+CREATE TABLE xfer2_x502_receiver_native(
+id INT PRIMARY KEY,
+v INT NOT NULL,
+KEY(v)
+) ENGINE=InnoDB;
+INSERT INTO xfer2_x502_receiver_native VALUES(1,10),(2,20);
+SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms=5000;
+SET @x502_online_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_online_epochs');
+SET @x502_active_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_active_epochs');
+SET @x502_terminal_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_terminal_cas_wins');
+SET @x502_tombstones_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_terminal_status_tombstones');
+SET @x502_classified_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_auto_prewarm_tokens');
+SET @x502_ready_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens');
+SET @x502_not_ready_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens');
+SET @x502_failed_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_failed_tokens');
+SET @x502_saved_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_saved_online_tokens');
+SET @x502_seal_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_seal_prewarm_tokens');
+SET @x502_seal_success_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_seal_prewarm_success_tokens');
+SET @x502_seal_not_ready_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_seal_prewarm_not_ready_tokens');
+SET @x502_inflight_tokens_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_inflight_tokens');
+SET @x502_inflight_bytes_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_inflight_bytes');
+SET @x502_staged_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_staged_memory_bytes');
+SET @x502_debt_tokens_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_cleanup_debt_tokens');
+SET @x502_debt_bytes_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_cleanup_debt_bytes');
+SET @x502_prepared_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status WHERE VARIABLE_NAME=
+'Preserve_trx_promotion_prepared_registered_tokens');
+SET @x502_prepared_pending_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status WHERE VARIABLE_NAME=
+'Preserve_trx_promotion_prepared_prewarm_pending_tokens');
+SET @x502_prepared_ready_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status WHERE VARIABLE_NAME=
+'Preserve_trx_promotion_prepared_ready_tokens');
+SET @x502_ready_cache_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status WHERE VARIABLE_NAME=
+'Preserve_trx_promotion_ready_cache_bytes');
+SET @x502_memory_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status WHERE VARIABLE_NAME=
+'Preserve_trx_memory_current_bytes');
+UPDATE xfer2_w01_accounts
+SET balance=balance+1,version=version+1 WHERE id=32;
+CREATE TABLE xfer2_x906_rows(
+owner_id INT NOT NULL,
+id INT NOT NULL,
+bucket INT NOT NULL,
+value_sum INT NOT NULL,
+version INT NOT NULL DEFAULT 0,
+state VARCHAR(16) NOT NULL DEFAULT 'base',
+PRIMARY KEY(owner_id,id),
+KEY k_bucket(owner_id,bucket,id),
+KEY k_value(owner_id,value_sum)
+) ENGINE=InnoDB;
+INSERT INTO xfer2_x906_rows
+WITH RECURSIVE row_seq(id) AS (
+SELECT 1 UNION ALL SELECT id+1 FROM row_seq WHERE id<64
+)
+SELECT 4,id,MOD(id,8),id*10,0,'base'
+  FROM row_seq;
+SELECT COUNT(*)=64 AS w06_seed_rows,
+SUM(value_sum)=20800 AS w06_seed_aggregate,
+SUM(version)=0 AS w06_seed_versions,
+SUM(state='base')=64 AS w06_seed_state
+FROM xfer2_x906_rows;
+w06_seed_rows	w06_seed_aggregate	w06_seed_versions	w06_seed_state
+1	1	1	1
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+SELECT balance=1001 AND version=1 AS owner1_rr_background_visible
+FROM xfer2_w01_accounts WHERE id=32;
+owner1_rr_background_visible
+1
+UPDATE xfer2_w01_accounts
+SET balance=balance-17,version=version+1 WHERE id=1;
+UPDATE xfer2_w01_accounts
+SET balance=balance+17,version=version+1 WHERE id=2;
+INSERT INTO xfer2_w01_audit(account_id,delta)
+VALUES(1,-17),(2,17);
+SELECT COUNT(*)=2 AND SUM(balance)=2000 AND SUM(version)=2
+AS owner1_w04_balance_conserved
+FROM xfer2_w01_accounts WHERE id IN (1,2);
+owner1_w04_balance_conserved
+1
+SELECT COUNT(*)=2 AND SUM(delta)=0
+AND SUM(account_id=1 AND delta=-17)=1
+AND SUM(account_id=2 AND delta=17)=1
+AS owner1_w04_ledger_exact
+FROM xfer2_w01_audit;
+owner1_w04_ledger_exact
+1
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+SELECT balance=1001 AND version=1 AS owner2_rr_background_visible
+FROM xfer2_w01_accounts WHERE id=32;
+owner2_rr_background_visible
+1
+UPDATE xfer2_w01_accounts
+SET balance=balance-23,version=version+1 WHERE id=3;
+UPDATE xfer2_w01_accounts
+SET balance=balance+23,version=version+1 WHERE id=4;
+INSERT INTO xfer2_w01_audit(account_id,delta)
+VALUES(3,-23),(4,23);
+SELECT COUNT(*)=2 AND SUM(balance)=2000 AND SUM(version)=2
+AS owner2_w04_balance_conserved
+FROM xfer2_w01_accounts WHERE id IN (3,4);
+owner2_w04_balance_conserved
+1
+SELECT COUNT(*)=2 AND SUM(delta)=0
+AND SUM(account_id=3 AND delta=-23)=1
+AND SUM(account_id=4 AND delta=23)=1
+AS owner2_w04_ledger_exact
+FROM xfer2_w01_audit;
+owner2_w04_ledger_exact
+1
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+SELECT balance=1001 AND version=1 AS owner3_rr_background_visible
+FROM xfer2_w01_accounts WHERE id=32;
+owner3_rr_background_visible
+1
+UPDATE xfer2_w01_accounts
+SET balance=balance-31,version=version+1 WHERE id=5;
+UPDATE xfer2_w01_accounts
+SET balance=balance+31,version=version+1 WHERE id=6;
+INSERT INTO xfer2_w01_audit(account_id,delta)
+VALUES(5,-31),(6,31);
+SELECT COUNT(*)=2 AND SUM(balance)=2000 AND SUM(version)=2
+AS owner3_w04_balance_conserved
+FROM xfer2_w01_accounts WHERE id IN (5,6);
+owner3_w04_balance_conserved
+1
+SELECT COUNT(*)=2 AND SUM(delta)=0
+AND SUM(account_id=5 AND delta=-31)=1
+AND SUM(account_id=6 AND delta=31)=1
+AS owner3_w04_ledger_exact
+FROM xfer2_w01_audit;
+owner3_w04_ledger_exact
+1
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+SELECT balance=1001 AND version=1 AS excluded_rr_background_visible
+FROM xfer2_w01_accounts WHERE id=32;
+excluded_rr_background_visible
+1
+UPDATE xfer2_x906_rows
+SET value_sum=value_sum+1000,version=version+1,state='range'
+ WHERE owner_id=4 AND id BETWEEN 9 AND 24;
+UPDATE xfer2_x906_rows FORCE INDEX(k_bucket)
+SET value_sum=value_sum+2000,version=version+1,state='secondary'
+ WHERE owner_id=4 AND bucket=3 AND id>24;
+DELETE FROM xfer2_x906_rows
+WHERE owner_id=4 AND bucket=6 AND id<=32;
+SELECT COUNT(*)=60 AS excluded_w06_row_count,
+SUM(value_sum)=44080 AS excluded_w06_aggregate,
+SUM(version)=19 AS excluded_w06_versions,
+SUM(state='range')=14 AS excluded_w06_range_rows,
+SUM(state='secondary')=5 AS excluded_w06_secondary_rows,
+SUM(state='base')=41 AS excluded_w06_base_rows
+FROM xfer2_x906_rows WHERE owner_id=4;
+excluded_w06_row_count	excluded_w06_aggregate	excluded_w06_versions	excluded_w06_range_rows	excluded_w06_secondary_rows	excluded_w06_base_rows
+1	1	1	1	1	1
+SELECT COUNT(*)=0 AS excluded_w06_deleted_set_absent
+FROM xfer2_x906_rows
+WHERE owner_id=4 AND id IN (6,14,22,30);
+excluded_w06_deleted_set_absent
+1
+SET DEBUG_SYNC=
+'before_execute_sql_command SIGNAL x906_excluded_command_running WAIT_FOR x906_excluded_command_continue';
+UPDATE xfer2_x906_rows SET value_sum=value_sum+7,version=version+1,state='continued' WHERE owner_id=4 AND id=64;
+SET DEBUG_SYNC='now WAIT_FOR x906_excluded_command_running TIMEOUT 10';
+SELECT COUNT(*)=32 AS observer_row_count,
+SUM(balance)=32001 AS observer_only_background,
+SUM(version)=1 AS all_owner_updates_hidden
+FROM xfer2_w01_accounts;
+observer_row_count	observer_only_background	all_owner_updates_hidden
+1	1	1
+SELECT COUNT(*)=0 AS all_owner_ledgers_hidden
+FROM xfer2_w01_audit;
+all_owner_ledgers_hidden
+1
+SELECT COUNT(*)=64 AS observer_w06_baseline_rows,
+SUM(value_sum)=20800 AS observer_w06_baseline_aggregate,
+SUM(version)=0 AS observer_hides_all_w06_versions,
+SUM(state='base')=64 AS observer_hides_all_w06_states
+FROM xfer2_x906_rows;
+observer_w06_baseline_rows	observer_w06_baseline_aggregate	observer_hides_all_w06_versions	observer_hides_all_w06_states
+1	1	1	1
+DRAIN TRANSACTIONS PRESERVE;
+generation	outcome	source_connection_id	token_role	reason	closing_started_us	closing_deadline_us
+GENERATION	SUCCESS_WITH_EXCLUSIONS	OWNER1_ID	SURVIVOR	NONE	CLOSING_STARTED_US	CLOSING_DEADLINE_US
+GENERATION	SUCCESS_WITH_EXCLUSIONS	OWNER2_ID	SURVIVOR	NONE	CLOSING_STARTED_US	CLOSING_DEADLINE_US
+GENERATION	SUCCESS_WITH_EXCLUSIONS	OWNER3_ID	SURVIVOR	NONE	CLOSING_STARTED_US	CLOSING_DEADLINE_US
+GENERATION	SUCCESS_WITH_EXCLUSIONS	EXCLUDED_ID	EXCLUDED	CLOSING_COMMAND_TIMEOUT	CLOSING_STARTED_US	CLOSING_DEADLINE_US
+SELECT VARIABLE_VALUE+0=1 AS exactly_one_prefinal_exclusion
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_closing_excluded_tokens';
+exactly_one_prefinal_exclusion
+1
+SELECT VARIABLE_VALUE+0=EXCLUDED_ID AS excluded_owner_identity_exact FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_closing_last_excluded_token';
+excluded_owner_identity_exact
+1
+SET DEBUG_SYNC='now SIGNAL x906_excluded_command_continue';
+SELECT 1;
+ERROR HY000: Preserve drain is active; this command was not executed
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_tokens')
+=@x502_classified_before AS no_premature_classification,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_queued_bytes')>0
+AS three_payloads_reach_real_queue;
+no_premature_classification	three_payloads_reach_real_queue
+1	1
+START TRANSACTION;
+UPDATE xfer2_x502_receiver_native SET v=v+id;
+INSERT INTO xfer2_x502_receiver_native VALUES(3,30);
+COMMIT;
+SELECT COUNT(*)=3 AND SUM(v)=63 AS receiver_native_commit_while_queued
+FROM xfer2_x502_receiver_native;
+receiver_native_commit_while_queued
+1
+SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=OFF;
+SET GLOBAL debug='-d,preserve_trx_receiver_fail_one_token_prewarm';
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_tokens')
+=@x502_classified_before+3 AS exactly_three_classified,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens')
+=@x502_ready_before+2 AS exactly_two_ready_siblings,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens')
+=@x502_not_ready_before+1 AS exactly_one_failed_token;
+exactly_three_classified	exactly_two_ready_siblings	exactly_one_failed_token
+1	1	1
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_failed_tokens')
+=@x502_failed_before+2
+AS excluded_abort_and_selection_failure_accounted;
+excluded_abort_and_selection_failure_accounted
+1
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_seal_prewarm_tokens')
+=@x502_seal_before+3 AS all_three_reached_strict_prewarm,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_seal_prewarm_success_tokens')
+=@x502_seal_success_before+2 AS only_siblings_report_prewarm_success,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_seal_prewarm_not_ready_tokens')
+=@x502_seal_not_ready_before+1 AS injected_token_is_not_ready;
+all_three_reached_strict_prewarm	only_siblings_report_prewarm_success	injected_token_is_not_ready
+1	1	1
+SELECT VARIABLE_VALUE='receiver_selection_failed:1'
+         AS permanent_failure_reason_is_exact
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_last_failed_reason';
+permanent_failure_reason_is_exact
+1
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_saved_online_tokens')
+=@x502_saved_before+2 AS only_ready_siblings_saved,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')
+=@x502_prepared_before+2 AS only_ready_siblings_prepared,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_ready_tokens')
+=@x502_prepared_ready_before+2 AS only_ready_siblings_prepared_ready;
+only_ready_siblings_saved	only_ready_siblings_prepared	only_ready_siblings_prepared_ready
+1	1	1
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_promotion_ready_cache_bytes')
+>@x502_ready_cache_before AS ready_subset_keeps_cache,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_memory_current_bytes')
+>@x502_memory_before AS ready_subset_keeps_owned_memory;
+ready_subset_keeps_cache	ready_subset_keeps_owned_memory
+1	1
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')
+=@x502_inflight_tokens_before AS failed_token_inflight_released,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')
+=@x502_inflight_bytes_before AS failed_token_bytes_released,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes')
+=@x502_staged_before AS failed_token_staging_released;
+failed_token_inflight_released	failed_token_bytes_released	failed_token_staging_released
+1	1	1
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_tokens')
+=@x502_debt_tokens_before AS no_cleanup_debt_token,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_bytes')
+=@x502_debt_bytes_before AS no_cleanup_debt_bytes,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_worker_active')=0
+AS no_active_worker,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_worker_idle')=0
+AS worker_pool_auto_stopped;
+no_cleanup_debt_token	no_cleanup_debt_bytes	no_active_worker	worker_pool_auto_stopped
+1	1	1	1
+SELECT COUNT(*)=3 AND SUM(v)=63 AS receiver_native_commit_still_exact
+FROM xfer2_x502_receiver_native;
+receiver_native_commit_still_exact
+1
+SELECT COUNT(*)=3 AS exactly_three_preserved_owners,
+SUM(MOD_TABLES_COUNT=2)=3 AS every_survivor_has_w04_double_entry,
+SUM(HAS_READ_VIEW='YES')=3 AS every_owner_keeps_rr_view
+FROM performance_schema.preserved_transactions;
+exactly_three_preserved_owners	every_survivor_has_w04_double_entry	every_owner_keeps_rr_view
+1	1	1
+SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms=30000;
+SELECT 1;
+ERROR HY000: Preserve drain is active; this command was not executed
+SELECT 1;
+ERROR HY000: Preserve drain is active; this command was not executed
+SELECT 1;
+ERROR HY000: Preserve drain is active; this command was not executed
+source_ha_control_session
+1
+SELECT COUNT(*)=32 AS thirty_two_accounts,
+SUM(balance)=32001 AS committed_background_balance,
+SUM(version)=1 AS one_committed_background_version,
+MAX(CASE WHEN id=32 THEN balance END)=1001 AS background_update_visible,
+MAX(CASE WHEN id=3 THEN version END)=0 AS owner_updates_hidden
+FROM xfer2_w01_accounts;
+thirty_two_accounts	committed_background_balance	one_committed_background_version	background_update_visible	owner_updates_hidden
+1	1	1	1	1
+SELECT COUNT(*)=0 AS no_committed_audit FROM xfer2_w01_audit;
+no_committed_audit
+1
+DROP TABLE xfer2_w01_audit;
+DROP TABLE xfer2_w01_accounts;
+DROP USER xfer2_w01_app@localhost;
+DROP USER preserve_trx_ha_admin@localhost;
+DROP USER preserve_trx_ha_admin@localhost;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')=0
+AS no_receiver_epoch_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')=0
+AS no_inflight_token_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')=0
+AS no_inflight_byte_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_staged_memory_bytes')=0
+AS no_staged_memory_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')=0
+AS no_prepared_entry_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_promotion_prepared_prewarm_pending_tokens')=0
+AS no_prewarm_pending_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_ready_tokens')=0
+AS no_prepared_ready_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_promotion_ready_cache_bytes')=0
+AS no_ready_cache_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_memory_current_bytes')=0
+AS no_preserve_memory_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_worker_active')=0
+AS no_active_worker_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_queued_bytes')=0
+AS no_queued_byte_after_restart;
+no_receiver_epoch_after_restart	no_inflight_token_after_restart	no_inflight_byte_after_restart	no_staged_memory_after_restart	no_prepared_entry_after_restart	no_prewarm_pending_after_restart	no_prepared_ready_after_restart	no_ready_cache_after_restart	no_preserve_memory_after_restart	no_active_worker_after_restart	no_queued_byte_after_restart
+1	1	1	1	1	1	1	1	1	1	1
+SELECT COUNT(*)=64 AS all_w06_rows_after_source_restart,
+SUM(value_sum)=20800 AS all_w06_aggregate_after_source_restart,
+SUM(version)=0 AS all_w06_versions_after_source_restart,
+SUM(state='base')=64 AS all_w06_states_after_source_restart
+FROM xfer2_x906_rows;
+all_w06_rows_after_source_restart	all_w06_aggregate_after_source_restart	all_w06_versions_after_source_restart	all_w06_states_after_source_restart
+1	1	1	1
+DROP TABLE xfer2_x906_rows;
+SELECT COUNT(*)=3 AND SUM(v)=63
+AS receiver_native_commit_survives_restart
+FROM xfer2_x502_receiver_native;
+receiver_native_commit_survives_restart
+1
+DROP TABLE xfer2_x502_receiver_native;

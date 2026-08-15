@@ -6246,6 +6246,65 @@ class Capturing_transfer_frame_sink final
   std::vector<std::string> m_frames;
 };
 
+class Abort_ack_uncertain_transfer_frame_sink final
+    : public Preserve_trx_transfer_encoded_frame_sink {
+ public:
+  explicit Abort_ack_uncertain_transfer_frame_sink(
+      bool abandon_ack_uncertain = false)
+      : m_abandon_ack_uncertain(abandon_ack_uncertain) {}
+
+  Preserve_trx_transfer_status open_epoch_transport(
+      const std::string &, uint64_t requested_terminal_status_retention_us,
+      uint64_t, std::string *receiver_process_nonce,
+      uint64_t *accepted_terminal_status_retention_us) override {
+    *receiver_process_nonce = m_receiver_process_nonce;
+    *accepted_terminal_status_retention_us =
+        requested_terminal_status_retention_us;
+    return Preserve_trx_transfer_status::OK;
+  }
+
+  Preserve_trx_transfer_status send_encoded_frame(
+      const std::string &encoded_frame) override {
+    Preserve_trx_transfer_frame frame;
+    if (preserve_trx_transfer_decode_frame(encoded_frame, &frame) !=
+        Preserve_trx_transfer_status::OK) {
+      return Preserve_trx_transfer_status::CORRUPT;
+    }
+    m_frames.push_back(encoded_frame);
+    if (frame.type == Preserve_trx_transfer_frame_type::ABORT &&
+        !m_abort_ack_uncertain) {
+      m_abort_ack_uncertain = true;
+      return Preserve_trx_transfer_status::ACK_UNCERTAIN;
+    }
+    if (frame.type ==
+        Preserve_trx_transfer_frame_type::ABANDON_EPOCH_IF_NOT_COMMITTED) {
+      ++m_abandon_send_count;
+      if (m_abandon_ack_uncertain && m_abandon_send_count == 1) {
+        return Preserve_trx_transfer_status::ACK_UNCERTAIN;
+      }
+      return Preserve_trx_transfer_status::NOT_COMMITTED_CLEAN;
+    }
+    return Preserve_trx_transfer_status::OK;
+  }
+
+  Preserve_trx_transfer_status prepare_cancelled_epoch_cleanup() override {
+    ++m_cleanup_prepare_count;
+    return Preserve_trx_transfer_status::OK;
+  }
+
+  const std::vector<std::string> &frames() const { return m_frames; }
+  size_t cleanup_prepare_count() const { return m_cleanup_prepare_count; }
+
+ private:
+  const std::string m_receiver_process_nonce{
+      "00112233445566778899aabbccddeeff"};
+  bool m_abandon_ack_uncertain{false};
+  bool m_abort_ack_uncertain{false};
+  size_t m_abandon_send_count{0};
+  size_t m_cleanup_prepare_count{0};
+  std::vector<std::string> m_frames;
+};
+
 Preserve_trx_transfer_status apply_receiver_wire_payloads(
     const std::string &root_dir, const std::vector<std::string> &payloads,
     Preserved_trx_store *store,
@@ -15001,6 +15060,29 @@ TEST(PreservedTrxTransfer, ProtocolV2TerminalControlFramesRoundTrip) {
   }
 }
 
+TEST(PreservedTrxTransfer, ProtocolV2OpenOnlyAbandonAllowsZeroToken) {
+  Preserve_trx_transfer_frame abandon;
+  abandon.type =
+      Preserve_trx_transfer_frame_type::ABANDON_EPOCH_IF_NOT_COMMITTED;
+  abandon.sequence = 1;
+  abandon.epoch_id = "epoch-product-v1-open-only-abandon";
+  abandon.receiver_process_nonce = "00112233445566778899aabbccddeeff";
+  abandon.terminal_fact_digest[0] = 0x5d;
+
+  std::string encoded;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_encode_frame(abandon, &encoded));
+  Preserve_trx_transfer_frame decoded;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_decode_frame(encoded, &decoded));
+  EXPECT_EQ(abandon.type, decoded.type);
+  EXPECT_EQ(0U, decoded.token);
+  EXPECT_EQ(abandon.epoch_id, decoded.epoch_id);
+  EXPECT_EQ(abandon.receiver_process_nonce,
+            decoded.receiver_process_nonce);
+  EXPECT_EQ(abandon.terminal_fact_digest, decoded.terminal_fact_digest);
+}
+
 TEST_F(PreserveSnapshotTest,
        ExternalObjectDescriptorUsesOnlyProductV1Domain) {
   Preserve_trx_transfer_object_descriptor descriptor;
@@ -16269,6 +16351,47 @@ TEST_F(PreserveSnapshotTest,
             registry.query_epoch_terminal(m_dir, abandon.epoch_id));
   EXPECT_EQ(Preserve_trx_transfer_epoch_terminal_outcome::EPOCH_NOT_FOUND,
             registry.try_begin_epoch_abandon(abandon));
+}
+
+TEST_F(PreserveSnapshotTest,
+       ReceiverOpenOnlyEpochAbandonIsCleanAndRetentionBounded) {
+  Preserve_trx_transfer_receiver_registry registry;
+  const std::string epoch_id = "epoch-terminal-open-only-abandon";
+  const std::string principal = "17:preserve_transfer|1:%";
+  const std::string nonce = "00112233445566778899aabbccddeeff";
+  uint64_t accepted_retention_us = 0;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.open_online_epoch(epoch_id, principal, 60000000, nonce,
+                                       &accepted_retention_us));
+  ASSERT_EQ(1U, registry.online_epoch_count());
+  ASSERT_EQ(0U, registry.size());
+
+  Preserve_trx_transfer_epoch_terminal_request abandon;
+  abandon.root_dir = m_dir;
+  abandon.epoch_id = epoch_id;
+  abandon.receiver_process_generation = nonce;
+  abandon.authenticated_principal = principal;
+  abandon.operation_id = "abandon-v1";
+  abandon.fact_digest = test_sha256("open-only-abandon");
+  abandon.now_us = 1000;
+  abandon.retention_us = accepted_retention_us;
+
+  EXPECT_EQ(Preserve_trx_transfer_epoch_terminal_outcome::NOT_COMMITTED_CLEAN,
+            preserve_trx_transfer_abandon_receiver_epoch_if_not_committed(
+                abandon, &registry));
+  EXPECT_EQ(1U, registry.online_epoch_count());
+  EXPECT_EQ(0U, registry.size());
+
+  Preserve_trx_transfer_epoch_terminal_status terminal;
+  EXPECT_EQ(Preserve_trx_transfer_status::OK,
+            registry.query_epoch_terminal_authenticated(
+                m_dir, epoch_id, principal, nonce, abandon.fact_digest,
+                &terminal));
+  EXPECT_EQ(Preserve_trx_transfer_epoch_terminal_outcome::NOT_COMMITTED_CLEAN,
+            terminal.outcome);
+  EXPECT_EQ(1U, registry.retire_acknowledged_epochs_once(
+                    abandon.now_us + accepted_retention_us + 1));
+  EXPECT_EQ(0U, registry.online_epoch_count());
 }
 
 TEST_F(PreserveSnapshotTest,
@@ -24832,6 +24955,114 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_EQ(Preserve_trx_transfer_frame_type::ABANDON_EPOCH_IF_NOT_COMMITTED,
             abandon.type);
   EXPECT_EQ(session.epoch_id(), abandon.epoch_id);
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferResetCleanupAbandonsOpenEpochBeforeFirstFrame) {
+  Transfer_codec_context_guard codec_guard;
+  Online_context_transfer_frame_sink sink;
+  Preserve_trx_transfer_source_epoch_session session(
+      "epoch-reset-open-only-abandon", 1024, &sink);
+  const uint64_t deadline_us = std::numeric_limits<uint64_t>::max();
+
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.open_epoch(75000000, deadline_us));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.cleanup_cancelled_epoch("reset_before_first_frame"));
+  ASSERT_EQ(1U, sink.frames().size());
+
+  Preserve_trx_transfer_frame abandon;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_decode_frame(sink.frames().front(),
+                                               &abandon));
+  EXPECT_EQ(Preserve_trx_transfer_frame_type::ABANDON_EPOCH_IF_NOT_COMMITTED,
+            abandon.type);
+  EXPECT_EQ(1U, abandon.sequence);
+  EXPECT_EQ(0U, abandon.token);
+  EXPECT_EQ(session.epoch_id(), abandon.epoch_id);
+  EXPECT_EQ(session.receiver_process_nonce(),
+            abandon.receiver_process_nonce);
+  EXPECT_TRUE(std::any_of(abandon.terminal_fact_digest.begin(),
+                          abandon.terminal_fact_digest.end(),
+                          [](unsigned char byte) { return byte != 0; }));
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferResetCleanupEscalatesUncertainAbortToEpochAbandon) {
+  Transfer_codec_context_guard codec_guard;
+  Abort_ack_uncertain_transfer_frame_sink sink;
+  Preserve_trx_transfer_source_epoch_session session(
+      "epoch-reset-uncertain-abort", 17, &sink);
+  const uint64_t now_us = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.open_epoch(75000000, now_us + 2000000));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK, session.declare_token(7105));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK, session.declare_token(7106));
+
+  EXPECT_EQ(Preserve_trx_transfer_status::OK,
+            session.cleanup_cancelled_epoch("reset_during_phase1"));
+  EXPECT_EQ(2U, sink.cleanup_prepare_count());
+  ASSERT_EQ(4U, sink.frames().size());
+
+  Preserve_trx_transfer_frame uncertain_abort;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_decode_frame(sink.frames()[2],
+                                               &uncertain_abort));
+  EXPECT_EQ(Preserve_trx_transfer_frame_type::ABORT,
+            uncertain_abort.type);
+  EXPECT_EQ(7105U, uncertain_abort.token);
+
+  Preserve_trx_transfer_frame abandon;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_decode_frame(sink.frames()[3], &abandon));
+  EXPECT_EQ(Preserve_trx_transfer_frame_type::ABANDON_EPOCH_IF_NOT_COMMITTED,
+            abandon.type);
+  EXPECT_EQ(uncertain_abort.epoch_id, abandon.epoch_id);
+  EXPECT_EQ(uncertain_abort.receiver_process_nonce,
+            abandon.receiver_process_nonce);
+  EXPECT_EQ(uncertain_abort.sequence, abandon.sequence);
+  EXPECT_EQ(uncertain_abort.token, abandon.token);
+  EXPECT_EQ(test_sha256(sink.frames()[2]), abandon.terminal_fact_digest);
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferResetCleanupRetriesExactAbandonAfterUncertainAck) {
+  Transfer_codec_context_guard codec_guard;
+  Abort_ack_uncertain_transfer_frame_sink sink(true);
+  Preserve_trx_transfer_source_epoch_session session(
+      "epoch-reset-uncertain-abandon", 17, &sink);
+  const uint64_t now_us = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.open_epoch(75000000, now_us + 2000000));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK, session.declare_token(7107));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK, session.declare_token(7108));
+
+  EXPECT_EQ(Preserve_trx_transfer_status::ACK_UNCERTAIN,
+            session.cleanup_cancelled_epoch("reset_during_phase1"));
+  EXPECT_EQ(Preserve_trx_transfer_status::OK,
+            session.cleanup_cancelled_epoch("reset_during_phase1"));
+  EXPECT_EQ(3U, sink.cleanup_prepare_count());
+  ASSERT_EQ(5U, sink.frames().size());
+  EXPECT_EQ(sink.frames()[3], sink.frames()[4]);
+
+  Preserve_trx_transfer_frame uncertain_abort;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_decode_frame(sink.frames()[2],
+                                               &uncertain_abort));
+  EXPECT_EQ(Preserve_trx_transfer_frame_type::ABORT,
+            uncertain_abort.type);
+  Preserve_trx_transfer_frame abandon;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_decode_frame(sink.frames()[4], &abandon));
+  EXPECT_EQ(Preserve_trx_transfer_frame_type::ABANDON_EPOCH_IF_NOT_COMMITTED,
+            abandon.type);
+  EXPECT_EQ(test_sha256(sink.frames()[2]), abandon.terminal_fact_digest);
 }
 
 TEST_F(PreserveSnapshotTest,

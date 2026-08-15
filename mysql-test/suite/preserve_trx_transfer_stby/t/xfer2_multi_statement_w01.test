@@ -4,7 +4,9 @@
 # X5-11a / W14 RR ReadView plus multi-statement updates / O01 / T1
 # Coverage delta: unlike standby_transfer_drain_no_shutdown, this case verifies
 # three successive DML statements, a nonempty owner MVCC ReadView, and outsider
-# visibility before transfer.
+# visibility before transfer. It also verifies that an independent receiver
+# which cannot complete the strict record-lock plan stays NOT_READY, performs no
+# strict target-page work, and reclaims record-lock residency.
 
 --source suite/preserve_trx_transfer_stby/include/w01_setup.inc
 
@@ -37,6 +39,33 @@ SET @horizon_rejects_before=(
   SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
    WHERE VARIABLE_NAME=
      'Preserve_trx_transfer_receiver_read_view_horizon_rejects');
+SET @object_misses_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME=
+     'Preserve_trx_transfer_receiver_object_prewarm_miss_count');
+SET @record_prewarm_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME=
+     'Preserve_trx_transfer_receiver_record_object_prewarm_count');
+SET @strict_index_reads_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME=
+     'Preserve_trx_transfer_receiver_strict_record_index_page_reads');
+SET @strict_ibuf_merges_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_strict_ibuf_merges');
+SET @strict_redo_bytes_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME=
+     'Preserve_trx_transfer_receiver_strict_target_local_redo_bytes');
+SET @record_req_residency_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME=
+     'Preserve_trx_transfer_receiver_record_lock_req_residency_bytes');
+SET @record_resv_residency_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME=
+     'Preserve_trx_transfer_receiver_record_lock_resv_residency_bytes');
 SET @inflight_tokens_before=(
   SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
    WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens');
@@ -123,9 +152,37 @@ SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
            'Preserve_trx_transfer_receiver_read_view_horizon_rejects')
          = @horizon_rejects_before AS no_read_view_horizon_rejection;
 SELECT VARIABLE_VALUE='receiver_selection_failed:3'
-         AS prewarm_deadline_is_exact_reason
+         AS strict_record_plan_reaches_deadline
   FROM performance_schema.global_status
  WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_last_failed_reason';
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+           'Preserve_trx_transfer_receiver_object_prewarm_miss_count')
+         > @object_misses_before AS object_prewarm_attempt_missed,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+           'Preserve_trx_transfer_receiver_record_object_prewarm_count')
+         = @record_prewarm_before AS no_record_object_prewarm_completed;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+           'Preserve_trx_transfer_receiver_strict_record_index_page_reads')
+         = @strict_index_reads_before AS no_strict_index_page_read,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+           'Preserve_trx_transfer_receiver_strict_ibuf_merges')
+         = @strict_ibuf_merges_before AS no_strict_ibuf_merge,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+           'Preserve_trx_transfer_receiver_strict_target_local_redo_bytes')
+         = @strict_redo_bytes_before AS no_strict_target_local_redo;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+           'Preserve_trx_transfer_receiver_record_lock_req_residency_bytes')
+         = @record_req_residency_before AS no_record_required_residency,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+           'Preserve_trx_transfer_receiver_record_lock_resv_residency_bytes')
+         = @record_resv_residency_before AS no_record_reserved_residency;
 
 --connection xfer2_smoke_owner
 --error ER_PRESERVE_TRX_SESSION_DRAINED

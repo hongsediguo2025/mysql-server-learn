@@ -1,0 +1,194 @@
+DROP USER IF EXISTS xfer2_x008_source_app@localhost;
+DROP TABLE IF EXISTS xfer2_x008_native_source;
+CREATE USER xfer2_x008_source_app@localhost;
+GRANT SELECT, INSERT, UPDATE, DELETE ON test.*
+TO xfer2_x008_source_app@localhost;
+CREATE TABLE xfer2_x008_native_source(
+id INT PRIMARY KEY,
+balance INT NOT NULL,
+version INT NOT NULL DEFAULT 0,
+pad VARCHAR(64) NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO xfer2_x008_native_source
+WITH RECURSIVE seq(n) AS (
+SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<64
+)
+SELECT n,1000,0,CONCAT('source-native-',n) FROM seq;
+DROP USER IF EXISTS xfer2_x008_receiver_app@localhost;
+DROP TABLE IF EXISTS xfer2_x008_native_receiver;
+CREATE USER xfer2_x008_receiver_app@localhost;
+GRANT SELECT, INSERT, UPDATE, DELETE ON test.*
+TO xfer2_x008_receiver_app@localhost;
+CREATE TABLE xfer2_x008_native_receiver(
+id INT PRIMARY KEY,
+balance INT NOT NULL,
+version INT NOT NULL DEFAULT 0,
+pad VARCHAR(64) NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO xfer2_x008_native_receiver
+WITH RECURSIVE seq(n) AS (
+SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<64
+)
+SELECT n,1000,0,CONCAT('receiver-native-',n) FROM seq;
+SET @x008_admitted_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_admitted_frames');
+SET @x008_active_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs');
+SET @x008_inflight_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens');
+SET @x008_staged_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes');
+SET @x008_prepared_before=(SELECT VARIABLE_VALUE+0
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens');
+START TRANSACTION;
+UPDATE xfer2_x008_native_source
+SET balance=balance+IF(id<=32,10,-10),version=version+1;
+SELECT ROW_COUNT()=64 AS source_native_rows_updated;
+source_native_rows_updated
+1
+COMMIT;
+START TRANSACTION;
+UPDATE xfer2_x008_native_receiver
+SET balance=balance+IF(id<=32,10,-10),version=version+1;
+SELECT ROW_COUNT()=64 AS receiver_native_rows_updated;
+receiver_native_rows_updated
+1
+COMMIT;
+CREATE USER xfer2_x008_case_user@localhost;
+GRANT SELECT, INSERT, UPDATE, DELETE ON test.*
+TO xfer2_x008_case_user@localhost;
+CREATE TABLE xfer2_x008_case_source(
+id INT PRIMARY KEY,
+v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO xfer2_x008_case_source
+WITH RECURSIVE seq(n) AS (
+SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<16
+)
+SELECT n,n*10 FROM seq;
+CREATE USER xfer2_x008_case_user@localhost;
+GRANT SELECT, INSERT, UPDATE, DELETE ON test.*
+TO xfer2_x008_case_user@localhost;
+CREATE TABLE xfer2_x008_case_receiver(
+id INT PRIMARY KEY,
+v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO xfer2_x008_case_receiver
+WITH RECURSIVE seq(n) AS (
+SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<16
+)
+SELECT n,n*20 FROM seq;
+CREATE TABLE xfer2_x008_case_source(id INT PRIMARY KEY) ENGINE=InnoDB;
+ERROR 42S01: Table 'xfer2_x008_case_source' already exists
+SELECT 1 AS expected_partial_setup_failure_observed;
+expected_partial_setup_failure_observed
+1
+SELECT COUNT(*)=16 AND SUM(v)=1360 AS source_case_state_present
+FROM xfer2_x008_case_source;
+source_case_state_present
+1
+SELECT COUNT(*)=1 AS source_case_user_present
+FROM mysql.user
+WHERE User='xfer2_x008_case_user' AND Host='localhost';
+source_case_user_present
+1
+SELECT COUNT(*)=16 AND SUM(v)=2720 AS receiver_case_state_present
+FROM xfer2_x008_case_receiver;
+receiver_case_state_present
+1
+SELECT COUNT(*)=1 AS receiver_case_user_present
+FROM mysql.user
+WHERE User='xfer2_x008_case_user' AND Host='localhost';
+receiver_case_user_present
+1
+SELECT 1 AS credential_file_present_after_partial_setup;
+credential_file_present_after_partial_setup
+1
+SELECT COUNT(*)=0 AS no_source_case_table
+FROM information_schema.tables
+WHERE table_schema='test' AND table_name='xfer2_x008_case_source';
+no_source_case_table
+1
+SELECT COUNT(*)=0 AS no_source_case_user
+FROM mysql.user
+WHERE User='xfer2_x008_case_user' AND Host='localhost';
+no_source_case_user
+1
+SELECT COUNT(*)=0 AS no_receiver_case_table
+FROM information_schema.tables
+WHERE table_schema='test' AND table_name='xfer2_x008_case_receiver';
+no_receiver_case_table
+1
+SELECT COUNT(*)=0 AS no_receiver_case_user
+FROM mysql.user
+WHERE User='xfer2_x008_case_user' AND Host='localhost';
+no_receiver_case_user
+1
+SELECT 1 AS first_partial_teardown_clean;
+first_partial_teardown_clean
+1
+UPDATE xfer2_x008_native_source
+SET balance=balance+7,version=version+1 WHERE id=1;
+SELECT ROW_COUNT()=1 AS source_native_survives_first_teardown;
+source_native_survives_first_teardown
+1
+UPDATE xfer2_x008_native_receiver
+SET balance=balance-7,version=version+1 WHERE id=64;
+SELECT ROW_COUNT()=1 AS receiver_native_survives_first_teardown;
+receiver_native_survives_first_teardown
+1
+SELECT COUNT(*)=0 AS no_source_case_resource_after_second_teardown
+FROM information_schema.tables
+WHERE table_schema='test' AND table_name='xfer2_x008_case_source';
+no_source_case_resource_after_second_teardown
+1
+SELECT COUNT(*)=0 AS no_receiver_case_resource_after_second_teardown
+FROM information_schema.tables
+WHERE table_schema='test' AND table_name='xfer2_x008_case_receiver';
+no_receiver_case_resource_after_second_teardown
+1
+SELECT 1 AS second_partial_teardown_idempotent;
+second_partial_teardown_idempotent
+1
+UPDATE xfer2_x008_native_source
+SET balance=balance+3,version=version+1 WHERE id=2;
+SELECT COUNT(*)=64 AS source_native_row_count,
+SUM(balance)=64010 AS source_native_exact_balance,
+SUM(version)=66 AS source_native_exact_version
+FROM xfer2_x008_native_source;
+source_native_row_count	source_native_exact_balance	source_native_exact_version
+1	1	1
+UPDATE xfer2_x008_native_receiver
+SET balance=balance-3,version=version+1 WHERE id=63;
+SELECT COUNT(*)=64 AS receiver_native_row_count,
+SUM(balance)=63990 AS receiver_native_exact_balance,
+SUM(version)=66 AS receiver_native_exact_version
+FROM xfer2_x008_native_receiver;
+receiver_native_row_count	receiver_native_exact_balance	receiver_native_exact_version
+1	1	1
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_admitted_frames')
+=@x008_admitted_before AS no_transfer_frame_admitted,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')
+=@x008_active_before AS no_transfer_epoch,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')
+=@x008_inflight_before AS no_transfer_inflight_token,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes')
+=@x008_staged_before AS no_transfer_staged_memory,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')
+=@x008_prepared_before AS no_transfer_prepared_token;
+no_transfer_frame_admitted	no_transfer_epoch	no_transfer_inflight_token	no_transfer_staged_memory	no_transfer_prepared_token
+1	1	1	1	1
+DROP TABLE xfer2_x008_native_source;
+DROP USER xfer2_x008_source_app@localhost;
+DROP TABLE xfer2_x008_native_receiver;
+DROP USER xfer2_x008_receiver_app@localhost;

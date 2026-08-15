@@ -1,0 +1,20 @@
+!include ../my.cnf
+
+[mysqld.1]
+log-bin=xfer2-x903-source-bin
+binlog-format=ROW
+max_allowed_packet=67108864
+rds-preserve-trx-transfer-runtime-profile=BUSINESS_FIRST
+rds-preserve-trx-transfer-max-inflight-bytes=67108864
+# Hide only the first verified COMMIT_EPOCH ACK. The ordinary source sender
+# must reconnect and submit the byte-identical terminal frame once more.
+debug=d,preserve_trx_transfer_drop_commit_ack_once
+
+[mysqld.2]
+skip-log-bin
+max_allowed_packet=67108864
+rds-preserve-trx-transfer-runtime-profile=BUSINESS_FIRST
+rds-preserve-trx-transfer-max-inflight-bytes=67108864
+# Drop one ACK only after a payload containing a non-final OBJECT_CHUNK has
+# been applied. Control-only and final object payloads cannot consume it.
+debug=d,preserve_trx_transfer_receiver_after_frame_apply_before_ack,preserve_trx_transfer_receiver_drop_nonfinal_object_batch_ack_once

@@ -1,0 +1,10 @@
+!include ../my.cnf
+
+[mysqld.1]
+skip-log-bin
+rds-preserve-trx-transfer-runtime-profile=BUSINESS_FIRST
+rds-preserve-trx-temp-table-enable=ON
+
+[mysqld.2]
+skip-log-bin
+rds-preserve-trx-temp-table-enable=ON

@@ -1,0 +1,20 @@
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+# X11-04 / W04 / O01 / O02 / O09 / O10 / T1 debug-contract / I03 / I04 / I09
+#
+# Both verified COMMIT ACKs are hidden, so the normal source path authenticates
+# one process-local COMMITTED status query and then pauses.  Crash and restart
+# the independent receiver before the debug-only second query.  The old process
+# generation, terminal result, READY/prepared/cache publication, and transfer
+# memory must disappear, while unrelated receiver-native committed data lives.
+#
+# A new clean receiver process is not authoritative ownership proof.  Releasing
+# the source must therefore leave the original W04 owner fenced in
+# COMMIT_UNKNOWN, keep its real record-lock waiter blocked, and make RESET DRAIN
+# return TOO_LATE.  Eventual ownership resolution remains a T3 capability gap.
+
+--let $terminal_cas_case= 5
+--source suite/preserve_trx_transfer_stby/include/run_terminal_cas_w01.inc

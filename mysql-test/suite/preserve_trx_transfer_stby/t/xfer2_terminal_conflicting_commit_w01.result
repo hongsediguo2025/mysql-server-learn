@@ -126,10 +126,12 @@ WHERE VARIABLE_NAME=
 original_accepted_epoch_retained	conflict_did_not_reclassify	original_ready_retained	conflict_created_no_not_ready	conflict_created_no_extra_failed_record	original_ready_record_retained	no_conflict_adopting	no_conflict_adoption	no_conflict_gate_adoption
 1	1	1	1	1	1	1	1	1
 SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
-WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')
+WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_inflight_tokens')
 =@terminal_inflight_tokens_before AS no_receiver_token_lease,
 (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
-WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')
+WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_inflight_bytes')
 =@terminal_inflight_bytes_before AS no_receiver_byte_lease,
 (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME=

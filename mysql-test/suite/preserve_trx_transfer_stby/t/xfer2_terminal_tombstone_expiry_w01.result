@@ -149,10 +149,12 @@ WHERE VARIABLE_NAME=
 expired_epoch_classified_once	expired_epoch_was_ready	expiry_created_no_not_ready	no_failed_record_residue	no_saved_online_residue
 1	1	1	1	1
 SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
-WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')
+WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_inflight_tokens')
 =@terminal_inflight_tokens_before AS no_receiver_token_lease,
 (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
-WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')
+WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_inflight_bytes')
 =@terminal_inflight_bytes_before AS no_receiver_byte_lease,
 (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME=

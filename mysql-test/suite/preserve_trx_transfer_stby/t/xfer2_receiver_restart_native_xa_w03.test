@@ -1,0 +1,364 @@
+# X4-12 / X11-08 / W03 / O09 / T1
+# Preserve a real source transaction with PK, nonunique-secondary, and unique
+# key mutations while the receiver owns an unrelated prepared native XA.  A
+# successful transfer must not disturb that XA; receiver restart must clear only
+# process-local transfer/classification state, recover the native XA exactly once, and
+# permit ordinary receiver DML after recovery.  T1 makes no receiver SQL-apply
+# or physical-promotion claim.
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+--source suite/preserve_trx_transfer_stby/include/w01_setup.inc
+
+# W03: 192 padded rows span multiple leaf pages and expose all three index paths.
+--connection default
+--disable_warnings
+DROP TABLE IF EXISTS xfer2_x11_indexed;
+--enable_warnings
+CREATE TABLE xfer2_x11_indexed(
+  id INT PRIMARY KEY,
+  business_key VARCHAR(32) NOT NULL,
+  bucket INT NOT NULL,
+  score INT NOT NULL,
+  pad VARCHAR(512) NOT NULL,
+  UNIQUE KEY uk_business(business_key),
+  KEY idx_bucket(bucket,id)
+) ENGINE=InnoDB;
+INSERT INTO xfer2_x11_indexed
+WITH RECURSIVE seq(n) AS (
+  SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<192
+)
+SELECT n, CONCAT('biz-',LPAD(n,4,'0')), MOD(n,8), n*10,
+       REPEAT(CHAR(65+MOD(n,26)),400)
+  FROM seq;
+
+--connect(xfer2_x11_owner,localhost,xfer2_w01_app,,test)
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+--enable_query_log
+SELECT COUNT(*)=192 AND SUM(score)=185280
+         AS owner_w03_baseline_by_primary
+  FROM xfer2_x11_indexed FORCE INDEX(PRIMARY);
+--disable_query_log
+START TRANSACTION;
+UPDATE xfer2_x11_indexed
+   SET business_key='biz-1008',bucket=80,score=score+80
+ WHERE id=8;
+--enable_query_log
+SELECT ROW_COUNT()=1 AS first_cross_index_update_applied;
+--disable_query_log
+UPDATE xfer2_x11_indexed
+   SET business_key='biz-1096',bucket=81,score=score+96
+ WHERE id=96;
+--enable_query_log
+SELECT ROW_COUNT()=1 AS second_cross_index_update_applied;
+--disable_query_log
+UPDATE xfer2_x11_indexed
+   SET business_key='biz-1184',bucket=82,score=score+184
+ WHERE id=184;
+--enable_query_log
+SELECT ROW_COUNT()=1 AS third_cross_index_update_applied;
+--disable_query_log
+INSERT INTO xfer2_x11_indexed
+  VALUES(257,'biz-0257',83,2570,REPEAT('Z',400));
+--enable_query_log
+SELECT ROW_COUNT()=1 AS new_unique_key_inserted;
+--disable_query_log
+DELETE FROM xfer2_x11_indexed WHERE id=33;
+--enable_query_log
+SELECT ROW_COUNT()=1 AS old_unique_key_deleted;
+--disable_query_log
+
+--connect(xfer2_x11_outsider,localhost,root,,test)
+--enable_query_log
+SELECT COUNT(*)=192 AND SUM(score)=185280
+         AS outsider_sees_w03_baseline_by_primary
+  FROM xfer2_x11_indexed FORCE INDEX(PRIMARY);
+SELECT COUNT(*)=0 AS outsider_sees_no_new_secondary_keys
+  FROM xfer2_x11_indexed FORCE INDEX(idx_bucket)
+ WHERE bucket IN (80,81,82,83);
+SELECT COUNT(*)=0 AS outsider_sees_no_new_unique_keys
+  FROM xfer2_x11_indexed FORCE INDEX(uk_business)
+ WHERE business_key IN ('biz-1008','biz-1096','biz-1184','biz-0257');
+SELECT COUNT(*)=1 AS outsider_still_sees_deleted_row
+  FROM xfer2_x11_indexed WHERE id=33;
+--disable_query_log
+
+# A non-target source transaction commits independently and supplies the shared
+# teardown's durable native baseline.  It is not part of the W03 transfer token.
+UPDATE xfer2_w01_accounts
+   SET balance=balance+1,version=version+1 WHERE id=32;
+
+# O09: an ordinary receiver table and a detached native XA are unrelated to the
+# preserve transfer registry.  Both are established before transfer control
+# traffic reaches mysqld.2.
+--connection xfer2_receiver
+--disable_warnings
+DROP TABLE IF EXISTS xfer2_x11_receiver_native;
+--enable_warnings
+CREATE TABLE xfer2_x11_receiver_native(
+  id INT PRIMARY KEY,
+  business_key VARCHAR(32) NOT NULL,
+  state INT NOT NULL,
+  amount INT NOT NULL,
+  UNIQUE KEY uk_business(business_key),
+  KEY idx_state(state,id)
+) ENGINE=InnoDB;
+INSERT INTO xfer2_x11_receiver_native
+WITH RECURSIVE seq(n) AS (
+  SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<64
+)
+SELECT n,CONCAT('native-',LPAD(n,3,'0')),MOD(n,4),n*10 FROM seq;
+CALL mtr.add_suppression("Found .* prepared XA transactions");
+CALL mtr.add_suppression(
+  "PRESERVE: rolled back prepared transaction without snapshot during recovery");
+--let $receiver_uuid_before= query_get_value(SELECT @@GLOBAL.server_uuid AS value,value,1)
+--let $receiver_generation_before= query_get_value(SELECT VARIABLE_VALUE AS value FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_process_generation',value,1)
+SET @active_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_active_epochs');
+SET @terminal_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_terminal_cas_wins');
+SET @tombstones_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_terminal_status_tombstones');
+SET @classified_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_auto_prewarm_tokens');
+SET @ready_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens');
+SET @not_ready_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens');
+SET @prepared_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_promotion_prepared_registered_tokens');
+SET @pending_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_promotion_prepared_prewarm_pending_tokens');
+SET @prepared_ready_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_promotion_prepared_ready_tokens');
+SET @ready_cache_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_promotion_ready_cache_bytes');
+SET @failed_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_failed_tokens');
+SET @inflight_tokens_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_inflight_tokens');
+SET @inflight_bytes_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_inflight_bytes');
+SET @staged_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_staged_memory_bytes');
+SET @memory_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_memory_current_bytes');
+
+--connect(xfer2_x11_receiver_xa,127.0.0.1,root,,test,$SERVER_MYPORT_2,)
+XA START 'xfer2_x11_native';
+UPDATE xfer2_x11_receiver_native
+   SET state=9,
+       amount=amount+CASE id WHEN 4 THEN 7 WHEN 32 THEN 11 ELSE 13 END
+ WHERE id IN (4,32,60);
+INSERT INTO xfer2_x11_receiver_native
+  VALUES(101,'native-101',9,1010);
+DELETE FROM xfer2_x11_receiver_native WHERE id=17;
+XA END 'xfer2_x11_native';
+XA PREPARE 'xfer2_x11_native';
+--disconnect xfer2_x11_receiver_xa
+
+--connection xfer2_receiver
+--enable_query_log
+XA RECOVER CONVERT XID;
+SELECT COUNT(*)=64 AND SUM(amount)=20800
+         AS native_xa_changes_hidden_before_commit
+  FROM xfer2_x11_receiver_native;
+--disable_query_log
+
+# Execute one ordinary receiver transaction while the prepared XA remains
+# detached.  This proves the unrelated native path remains writable before the
+# preserve transfer starts and establishes durable O09 data for restart checks.
+START TRANSACTION;
+UPDATE xfer2_x11_receiver_native
+   SET state=8,amount=amount+2 WHERE id=2;
+INSERT INTO xfer2_x11_receiver_native
+  VALUES(100,'native-100',8,1000);
+COMMIT;
+--enable_query_log
+SELECT COUNT(*)=65 AND SUM(amount)=21802
+         AS receiver_ordinary_commit_visible_with_prepared_xa
+  FROM xfer2_x11_receiver_native;
+--disable_query_log
+
+# Transfer the independent W03 owner.  Receiver native XA and O09 data must not
+# participate in the epoch.  The current T1 receiver cannot complete this W03
+# secondary-index prewarm, so the token must classify fail-closed at the exact
+# PREWARM_DEADLINE boundary without contaminating native recovery state.
+--connection default
+--replace_column 1 GENERATION 3 SOURCE_ID 6 CLOSING_STARTED_US 7 CLOSING_DEADLINE_US
+DRAIN TRANSACTIONS PRESERVE;
+
+--connection xfer2_receiver
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')=@active_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins')=@terminal_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_status_tombstones')=@tombstones_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_tokens')=@classified_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens')=@ready_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens')=@not_ready_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_failed_tokens')=@failed_before+1
+--let $wait_timeout= 30
+--source include/wait_condition_or_abort.inc
+--let $receiver_connection= xfer2_receiver
+--source suite/preserve_trx_transfer_stby/include/assert_receiver_quiescent.inc
+--enable_query_log
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')
+         =@active_before+1 AS w03_epoch_retained_before_restart,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins')
+         =@terminal_before+1 AS w03_terminal_committed_once,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+          'Preserve_trx_transfer_receiver_terminal_status_tombstones')
+         =@tombstones_before+1 AS w03_terminal_tombstone_retained;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_tokens')
+         =@classified_before+1 AS w03_token_classified_once,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens')
+         =@ready_before AS w03_token_not_marked_ready,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens')
+         =@not_ready_before+1 AS w03_token_classified_not_ready;
+SELECT VARIABLE_VALUE='receiver_selection_failed:3'
+         AS w03_prewarm_deadline_is_exact_reason
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_last_failed_reason';
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')
+         =@prepared_before AS no_transfer_prepared_residue,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+          'Preserve_trx_promotion_prepared_prewarm_pending_tokens')
+         =@pending_before AS no_transfer_prewarm_pending_residue,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_ready_tokens')
+         =@prepared_ready_before AS no_transfer_prepared_ready_residue,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_promotion_ready_cache_bytes')
+         =@ready_cache_before AS no_transfer_ready_cache_residue;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')
+         =@inflight_tokens_before AS no_transfer_inflight_token,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')
+         =@inflight_bytes_before AS no_transfer_inflight_byte,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes')
+         =@staged_before AS no_transfer_staged_memory,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_memory_current_bytes')
+         =@memory_before AS no_transfer_preserve_memory;
+XA RECOVER CONVERT XID;
+SELECT COUNT(*)=65 AND SUM(amount)=21802
+         AS native_state_unchanged_by_transfer
+  FROM xfer2_x11_receiver_native;
+--disable_query_log
+
+--connection xfer2_x11_owner
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT 1;
+
+# Restart the receiver with both process-local transfer state and the unrelated
+# prepared native XA present.  Only transfer state may disappear.
+--connection xfer2_receiver
+--exec echo "restart:" > $MYSQLTEST_VARDIR/tmp/mysqld.2.expect
+--shutdown_server
+--source include/wait_until_disconnected.inc
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+--let $receiver_generation_after= query_get_value(SELECT VARIABLE_VALUE AS value FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_process_generation',value,1)
+--source suite/preserve_trx_transfer_stby/include/assert_receiver_restart_clean.inc
+--disable_query_log
+--eval SELECT @@GLOBAL.server_uuid='$receiver_uuid_before' AS receiver_datadir_identity_stable
+--eval SELECT $receiver_generation_before<>0 AND $receiver_generation_after<>0 AND $receiver_generation_before<>$receiver_generation_after AS receiver_process_generation_changed
+--enable_query_log
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins')=0
+         AS old_terminal_cas_cleared,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME=
+          'Preserve_trx_transfer_receiver_terminal_status_tombstones')=0
+         AS old_terminal_tombstone_cleared,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_failed_tokens')=0
+         AS old_failed_token_record_cleared;
+SELECT VARIABLE_VALUE='' AS old_failed_reason_cleared
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_last_failed_reason';
+XA RECOVER CONVERT XID;
+SELECT COUNT(*)=65 AND SUM(amount)=21802
+         AS prepared_xa_still_hidden_after_restart
+  FROM xfer2_x11_receiver_native;
+XA COMMIT 'xfer2_x11_native';
+SELECT COUNT(*)=65 AND SUM(amount)=22673
+         AS recovered_native_xa_committed_exactly_once
+  FROM xfer2_x11_receiver_native;
+SELECT COUNT(*)=4 AND SUM(amount)=2001
+         AS recovered_xa_secondary_index_exact
+  FROM xfer2_x11_receiver_native FORCE INDEX(idx_state) WHERE state=9;
+SELECT id=101 AND state=9 AND amount=1010
+         AS recovered_xa_unique_index_exact
+  FROM xfer2_x11_receiver_native FORCE INDEX(uk_business)
+ WHERE business_key='native-101';
+--disable_query_log
+
+# The fresh receiver generation remains an ordinary writable MySQL server.
+START TRANSACTION;
+UPDATE xfer2_x11_receiver_native
+   SET state=7,amount=amount+3 WHERE id=3;
+INSERT INTO xfer2_x11_receiver_native
+  VALUES(102,'native-102',7,1020);
+COMMIT;
+--enable_query_log
+SELECT COUNT(*)=66 AND SUM(amount)=23696
+         AS receiver_native_dml_works_after_recovery
+  FROM xfer2_x11_receiver_native;
+SELECT GROUP_CONCAT(CONCAT(state,':',cnt) ORDER BY state)=
+         '0:13,1:15,2:15,3:15,7:2,8:2,9:4'
+         AS receiver_secondary_index_distribution_exact
+  FROM (
+    SELECT state,COUNT(*) AS cnt
+      FROM xfer2_x11_receiver_native FORCE INDEX(idx_state)
+     GROUP BY state
+  ) AS s;
+CHECK TABLE xfer2_x11_receiver_native;
+--disable_query_log
+DROP TABLE xfer2_x11_receiver_native;
+
+--disconnect xfer2_x11_outsider
+--disconnect xfer2_x11_owner
+
+# Shared teardown restarts the source, rolling back its T1-only W03 owner.  The
+# final checks prove all three source indexes returned to the deterministic
+# baseline; no receiver SQL-apply claim is inferred from the transfer artifacts.
+--source suite/preserve_trx_transfer_stby/include/w01_teardown.inc
+
+--connection xfer2_cleanup
+--enable_query_log
+SELECT COUNT(*)=192 AND SUM(score)=185280
+         AS source_w03_primary_baseline_after_restart
+  FROM xfer2_x11_indexed FORCE INDEX(PRIMARY);
+SELECT COUNT(*)=24 AND SUM(score)=24000
+         AS source_w03_secondary_baseline_after_restart
+  FROM xfer2_x11_indexed FORCE INDEX(idx_bucket) WHERE bucket=0;
+SELECT id=8 AND bucket=0 AND score=80
+         AS source_w03_unique_baseline_after_restart
+  FROM xfer2_x11_indexed FORCE INDEX(uk_business)
+ WHERE business_key='biz-0008';
+SELECT COUNT(*)=0 AS source_w03_new_keys_rolled_back
+  FROM xfer2_x11_indexed FORCE INDEX(uk_business)
+ WHERE business_key IN ('biz-1008','biz-1096','biz-1184','biz-0257');
+CHECK TABLE xfer2_x11_indexed;
+DROP TABLE xfer2_x11_indexed;
+--disable_query_log

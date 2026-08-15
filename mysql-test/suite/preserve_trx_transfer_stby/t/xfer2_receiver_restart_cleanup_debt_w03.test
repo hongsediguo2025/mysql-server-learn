@@ -1,0 +1,341 @@
+--source include/have_debug.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+# X4-11 / W03 / O01 / O09 / O10 / T1 / I09 / I10 / I14 / I15.
+# A W03 token that misses receiver prewarm owns a real staging-cleanup debt.
+# Restart mysqld.2 only after the debt reaches CLEANUP_TAINTED.  The fresh
+# receiver generation must discard all process-local transfer state, must never
+# publish the failed token READY, and must preserve unrelated native InnoDB
+# commits.  Receiver restart does not restore or un-fence the source owner.
+
+--source suite/preserve_trx_transfer_stby/include/w01_setup.inc
+
+# W03: enough padded rows for primary, nonunique-secondary, and unique-key
+# mutations.  The source owner also carries an old repeatable-read view (O01).
+--connection default
+--disable_query_log
+--disable_warnings
+DROP TABLE IF EXISTS xfer2_x411_items;
+--enable_warnings
+CREATE TABLE xfer2_x411_items(
+  id INT PRIMARY KEY,
+  business_key VARCHAR(32) NOT NULL,
+  bucket INT NOT NULL,
+  score INT NOT NULL,
+  version INT NOT NULL DEFAULT 0,
+  pad VARCHAR(512) NOT NULL,
+  UNIQUE KEY uk_business(business_key),
+  KEY idx_bucket(bucket,id)
+) ENGINE=InnoDB;
+INSERT INTO xfer2_x411_items
+WITH RECURSIVE seq(n) AS (
+  SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<192
+)
+SELECT n,CONCAT('biz-',LPAD(n,4,'0')),MOD(n,8),n*10,0,
+       REPEAT(CHAR(65+MOD(n,26)),400)
+  FROM seq;
+--enable_query_log
+
+--connect(xfer2_x411_owner,localhost,xfer2_w01_app,,test)
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+SELECT id=192 AND score=1920 AND version=0
+         AS owner_old_view_established
+  FROM xfer2_x411_items FORCE INDEX(PRIMARY) WHERE id=192;
+
+--connect(xfer2_x411_outsider,localhost,root,,test)
+UPDATE xfer2_x411_items
+   SET score=score+100,version=version+1 WHERE id=192;
+SELECT ROW_COUNT()=1 AS outsider_commit_applied;
+
+--connection xfer2_x411_owner
+SELECT id=192 AND score=1920 AND version=0
+         AS owner_retains_old_view
+  FROM xfer2_x411_items FORCE INDEX(PRIMARY) WHERE id=192;
+UPDATE xfer2_x411_items
+   SET business_key='biz-1008',bucket=80,score=score+8,version=version+1
+ WHERE id=8;
+SELECT ROW_COUNT()=1 AS first_cross_index_update_applied;
+UPDATE xfer2_x411_items
+   SET business_key='biz-1096',bucket=81,score=score+96,version=version+1
+ WHERE id=96;
+SELECT ROW_COUNT()=1 AS second_cross_index_update_applied;
+INSERT INTO xfer2_x411_items
+  VALUES(257,'biz-0257',82,2570,1,REPEAT('Z',400));
+SELECT ROW_COUNT()=1 AS new_unique_key_inserted;
+DELETE FROM xfer2_x411_items WHERE id=33;
+SELECT ROW_COUNT()=1 AS old_unique_key_deleted;
+SELECT COUNT(*)=192 AND SUM(score)=187624 AND SUM(version)=3
+         AS owner_w03_view_and_writes_exact
+  FROM xfer2_x411_items FORCE INDEX(PRIMARY);
+SELECT GROUP_CONCAT(id ORDER BY id)='8,96,257'
+         AS owner_secondary_keys_exact
+  FROM xfer2_x411_items FORCE INDEX(idx_bucket)
+ WHERE bucket IN (80,81,82);
+SELECT COUNT(*)=3 AS owner_unique_keys_exact
+  FROM xfer2_x411_items FORCE INDEX(uk_business)
+ WHERE business_key IN ('biz-1008','biz-1096','biz-0257');
+
+--connection xfer2_x411_outsider
+SELECT COUNT(*)=192 AND SUM(score)=185380 AND SUM(version)=1
+         AS outsider_sees_only_committed_w03_state
+  FROM xfer2_x411_items FORCE INDEX(PRIMARY);
+SELECT id=192 AND score=2020 AND version=1
+         AS outsider_commit_visible_exactly
+  FROM xfer2_x411_items FORCE INDEX(PRIMARY) WHERE id=192;
+SELECT COUNT(*)=0 AS owner_new_unique_keys_hidden
+  FROM xfer2_x411_items FORCE INDEX(uk_business)
+ WHERE business_key IN ('biz-1008','biz-1096','biz-0257');
+SELECT COUNT(*)=1 AS owner_deleted_row_still_visible
+  FROM xfer2_x411_items FORCE INDEX(PRIMARY) WHERE id=33;
+
+# Durable native source work supplies the shared teardown baseline and is not
+# part of the W03 preserve token.
+UPDATE xfer2_w01_accounts
+   SET balance=balance+1,version=version+1 WHERE id=32;
+
+# O09: establish receiver-native data before transfer.  Its later transaction
+# commits while the failed transfer token remains CLEANUP_TAINTED.
+--connection xfer2_receiver
+--disable_query_log
+--disable_warnings
+DROP TABLE IF EXISTS xfer2_x411_receiver_native;
+--enable_warnings
+CREATE TABLE xfer2_x411_receiver_native(
+  id INT PRIMARY KEY,
+  v INT NOT NULL,
+  pad VARCHAR(128) NOT NULL,
+  KEY idx_v(v,id)
+) ENGINE=InnoDB;
+INSERT INTO xfer2_x411_receiver_native VALUES
+  (1,10,REPEAT('A',96)),(2,20,REPEAT('B',96));
+--let $receiver_uuid_before= query_get_value(SELECT @@GLOBAL.server_uuid AS value,value,1)
+--let $receiver_generation_before= query_get_value(SELECT VARIABLE_VALUE AS value FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_process_generation',value,1)
+SET @x411_active_before=(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs');
+SET @x411_terminal_before=(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins');
+SET @x411_tombstones_before=(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_status_tombstones');
+SET @x411_classified_before=(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_tokens');
+SET @x411_ready_before=(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens');
+SET @x411_not_ready_before=(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens');
+SET @x411_failed_before=(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_failed_tokens');
+SET @x411_inflight_tokens_before=(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens');
+SET @x411_inflight_bytes_before=(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes');
+SET @x411_staged_before=(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes');
+SET @x411_prepared_before=(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens');
+SET @x411_pending_before=(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_prewarm_pending_tokens');
+SET @x411_prepared_ready_before=(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_ready_tokens');
+SET @x411_ready_cache_before=(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_promotion_ready_cache_bytes');
+SET @x411_memory_before=(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_memory_current_bytes');
+SET @x411_debt_tokens_before=(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_tokens');
+SET @x411_debt_bytes_before=(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_bytes');
+SET @x411_tainted_before=(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_tainted_transitions');
+SET @x411_cleanup_completed_before=(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_retry_completions');
+SET GLOBAL debug=
+  '+d,preserve_trx_receiver_fail_cleanup_until_tainted,preserve_trx_receiver_cleanup_retry_fast';
+--enable_query_log
+
+# The independent W03 transfer classifies not-ready at PREWARM_DEADLINE.  Its
+# selected-token staging cleanup then fails until the debt becomes tainted.
+--connection default
+--replace_column 1 GENERATION 3 SOURCE_ID 6 CLOSING_STARTED_US 7 CLOSING_DEADLINE_US
+DRAIN TRANSACTIONS PRESERVE;
+
+--connection xfer2_receiver
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')=@x411_active_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins')=@x411_terminal_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_status_tombstones')=@x411_tombstones_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_tokens')=@x411_classified_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens')=@x411_ready_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens')=@x411_not_ready_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_tainted_transitions')=@x411_tainted_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_tokens')=@x411_debt_tokens_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_max_attempts')>=5 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_failed_tokens')=@x411_failed_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_worker_active')=0 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_queued_bytes')=0
+--let $wait_timeout= 30
+--source include/wait_condition_or_abort.inc
+SET GLOBAL debug=
+  '-d,preserve_trx_receiver_fail_cleanup_until_tainted,preserve_trx_receiver_cleanup_retry_fast';
+--let $receiver_connection= xfer2_receiver
+--source suite/preserve_trx_transfer_stby/include/assert_receiver_quiescent.inc
+
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')
+         =@x411_active_before+1 AS tainted_epoch_retained,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins')
+         =@x411_terminal_before+1 AS terminal_fact_committed_once,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_status_tombstones')
+         =@x411_tombstones_before+1 AS terminal_tombstone_retained;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_tokens')
+         =@x411_classified_before+1 AS w03_token_classified_once,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens')
+         =@x411_ready_before AS tainted_token_never_ready,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens')
+         =@x411_not_ready_before+1 AS w03_token_not_ready_once;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_tainted_transitions')
+         =@x411_tainted_before+1 AS cleanup_reached_tainted_once,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_tokens')
+         =@x411_debt_tokens_before+1 AS one_cleanup_debt_retained,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_bytes')
+         >@x411_debt_bytes_before AS cleanup_debt_retains_budget,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_oldest_age_us')
+         >0 AS cleanup_debt_has_age,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_max_attempts')
+         >=5 AS five_cleanup_attempts_recorded;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')
+         =@x411_inflight_tokens_before+1 AS debt_owns_inflight_token_budget,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')
+         >@x411_inflight_bytes_before AS debt_owns_inflight_byte_budget,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes')
+         =@x411_staged_before AS failed_token_releases_staged_memory,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_retry_completions')
+         =@x411_cleanup_completed_before AS tainted_debt_not_completed_online;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')
+         =@x411_prepared_before AS no_prepared_token_residue,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_prewarm_pending_tokens')
+         =@x411_pending_before AS no_prewarm_pending_residue,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_ready_tokens')
+         =@x411_prepared_ready_before AS no_prepared_ready_residue,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_promotion_ready_cache_bytes')
+         =@x411_ready_cache_before AS no_ready_cache_residue,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_memory_current_bytes')
+         =@x411_memory_before AS no_preserve_memory_residue;
+SELECT VARIABLE_VALUE='staging_cleanup_retry_failed:IO_ERROR'
+         AS tainted_cleanup_reason_is_exact
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_last_failed_reason';
+
+# Native receiver work commits while cleanup debt is still tainted and retains
+# the transfer byte budget.  It must survive both receiver restarts below.
+START TRANSACTION;
+UPDATE xfer2_x411_receiver_native SET v=v+id WHERE id IN (1,2);
+INSERT INTO xfer2_x411_receiver_native VALUES(3,30,REPEAT('C',96));
+COMMIT;
+SELECT COUNT(*)=3 AND SUM(v)=63 AS native_commit_visible_during_tainted_debt
+  FROM xfer2_x411_receiver_native;
+SELECT GROUP_CONCAT(CONCAT(id,':',v) ORDER BY id)='1:11,2:22,3:30'
+         AS native_rows_exact_during_tainted_debt
+  FROM xfer2_x411_receiver_native FORCE INDEX(PRIMARY);
+
+--connection xfer2_x411_owner
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT 1;
+
+# Restart only mysqld.2 before the 60-second tainted retry becomes due.
+--connection xfer2_receiver
+--exec echo "restart:" > $MYSQLTEST_VARDIR/tmp/mysqld.2.expect
+--shutdown_server
+--source include/wait_until_disconnected.inc
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+--let $receiver_generation_after= query_get_value(SELECT VARIABLE_VALUE AS value FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_process_generation',value,1)
+--source suite/preserve_trx_transfer_stby/include/assert_receiver_restart_clean.inc
+--disable_query_log
+--eval SELECT @@GLOBAL.server_uuid='$receiver_uuid_before' AS receiver_datadir_identity_stable
+--eval SELECT $receiver_generation_before<>0 AND $receiver_generation_after<>0 AND $receiver_generation_before<>$receiver_generation_after AS receiver_process_generation_changed
+--enable_query_log
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins')=0
+         AS old_terminal_fact_cleared,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_status_tombstones')=0
+         AS old_terminal_tombstone_cleared,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_failed_tokens')=0
+         AS old_failed_token_cleared;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_tokens')=0
+         AS old_cleanup_debt_cleared,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_bytes')=0
+         AS old_cleanup_budget_cleared,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_max_attempts')=0
+         AS old_cleanup_attempts_cleared,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_tainted_transitions')=0
+         AS old_tainted_transition_cleared,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_retry_completions')=0
+         AS no_false_cleanup_completion;
+SELECT VARIABLE_VALUE='' AS old_failed_reason_cleared
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_last_failed_reason';
+SELECT COUNT(*)=3 AND SUM(v)=63 AS native_commit_survives_receiver_restart
+  FROM xfer2_x411_receiver_native;
+SELECT GROUP_CONCAT(CONCAT(id,':',v) ORDER BY id)='1:11,2:22,3:30'
+         AS native_rows_exact_after_receiver_restart
+  FROM xfer2_x411_receiver_native FORCE INDEX(idx_v);
+CHECK TABLE xfer2_x411_receiver_native;
+
+# Receiver restart retires process-local cleanup debt only.  It cannot restore
+# ownership to the old source process.
+--connection xfer2_x411_owner
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT 1;
+
+--disconnect xfer2_x411_outsider
+--disconnect xfer2_x411_owner
+
+# Shared teardown restarts both servers.  The source W03 owner rolls back; the
+# outsider commit and receiver-native commit remain durable.
+--source suite/preserve_trx_transfer_stby/include/w01_teardown.inc
+
+--connection xfer2_cleanup
+SELECT COUNT(*)=192 AND SUM(score)=185380 AND SUM(version)=1
+         AS source_w03_final_committed_state_exact
+  FROM xfer2_x411_items FORCE INDEX(PRIMARY);
+SELECT COUNT(*)=24 AND SUM(score)=24100 AND SUM(version)=1
+         AS source_w03_secondary_state_exact
+  FROM xfer2_x411_items FORCE INDEX(idx_bucket) WHERE bucket=0;
+SELECT id=8 AND bucket=0 AND score=80 AND version=0
+         AS source_w03_unique_state_restored
+  FROM xfer2_x411_items FORCE INDEX(uk_business)
+ WHERE business_key='biz-0008';
+SELECT COUNT(*)=0 AS source_owner_new_keys_rolled_back
+  FROM xfer2_x411_items FORCE INDEX(uk_business)
+ WHERE business_key IN ('biz-1008','biz-1096','biz-0257');
+SELECT (SELECT COUNT(*) FROM xfer2_x411_items WHERE id=33)=1
+         AND (SELECT COUNT(*) FROM xfer2_x411_items WHERE id=257)=0
+         AS source_delete_and_insert_rolled_back;
+CHECK TABLE xfer2_x411_items;
+DROP TABLE xfer2_x411_items;
+
+--connection xfer2_receiver
+SELECT COUNT(*)=3 AND SUM(v)=63 AS native_commit_survives_full_teardown_restart
+  FROM xfer2_x411_receiver_native;
+SELECT GROUP_CONCAT(CONCAT(id,':',v) ORDER BY id)='1:11,2:22,3:30'
+         AS native_rows_exact_after_full_teardown
+  FROM xfer2_x411_receiver_native FORCE INDEX(PRIMARY);
+CHECK TABLE xfer2_x411_receiver_native;
+DROP TABLE xfer2_x411_receiver_native;

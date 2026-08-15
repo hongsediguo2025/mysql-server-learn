@@ -114,10 +114,12 @@ WHERE VARIABLE_NAME=
 exactly_one_accepted_epoch	exactly_one_classified_token	exactly_one_ready_token	no_not_ready_token	one_excluded_waiter_record	ready_record_retained_once
 1	1	1	1	1	1
 SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
-WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')
+WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_inflight_tokens')
 =@terminal_inflight_tokens_before AS no_receiver_token_lease,
 (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
-WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')
+WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_inflight_bytes')
 =@terminal_inflight_bytes_before AS no_receiver_byte_lease,
 (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME=

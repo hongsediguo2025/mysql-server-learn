@@ -141,6 +141,7 @@ static std::atomic<uint64_t> g_receiver_sequence_already_applied{0};
 static std::atomic<uint64_t> g_receiver_after_apply_before_ack_faults{0};
 #ifndef DBUG_OFF
 static std::atomic<bool> g_source_drop_commit_ack_consumed{false};
+static std::atomic<bool> g_source_drop_abandon_ack_consumed{false};
 struct Source_drop_commit_ack_twice_debug_state {
   std::mutex mutex;
   std::string encoded_commit;
@@ -1978,6 +1979,20 @@ Preserve_trx_transfer_status default_transfer_client_send(
       return Preserve_trx_transfer_status::ACK_UNCERTAIN;
     }
 #ifndef DBUG_OFF
+    DBUG_EXECUTE_IF("preserve_trx_transfer_drop_abandon_ack_once", {
+      Preserve_trx_transfer_frame injected_frame;
+      if (preserve_trx_transfer_decode_frame(encoded_frame, &injected_frame) ==
+              Preserve_trx_transfer_status::OK &&
+          injected_frame.type == Preserve_trx_transfer_frame_type::
+                                     ABANDON_EPOCH_IF_NOT_COMMITTED &&
+          ack.status == Preserve_trx_transfer_status::NOT_COMMITTED_CLEAN) {
+        bool expected = false;
+        if (g_source_drop_abandon_ack_consumed.compare_exchange_strong(
+                expected, true)) {
+          return Preserve_trx_transfer_status::ACK_UNCERTAIN;
+        }
+      }
+    });
     DBUG_EXECUTE_IF("preserve_trx_transfer_drop_commit_ack_once", {
       if (transfer_status_is_committed_outcome(ack.status) &&
           debug_payload_contains_commit(encoded_frame)) {
@@ -2361,6 +2376,66 @@ bool build_precommit_abandon_payload(const std::string &encoded_rejection,
   abandon.receiver_process_nonce = rejected.receiver_process_nonce;
   abandon.token = rejected.token;
   abandon.terminal_fact_digest = sha256_digest(encoded_rejection);
+  return preserve_trx_transfer_encode_frame(abandon, encoded_abandon) ==
+         Preserve_trx_transfer_status::OK;
+}
+
+bool build_open_epoch_abandon_payload(
+    const std::string &epoch_id, const std::string &receiver_process_nonce,
+    uint64_t requested_terminal_status_retention_us,
+    std::string *encoded_abandon) {
+  if (encoded_abandon == nullptr || !transfer_component_safe(epoch_id) ||
+      receiver_process_nonce.length() != 32 ||
+      !transfer_component_safe(receiver_process_nonce) ||
+      requested_terminal_status_retention_us == 0) {
+    return false;
+  }
+
+  Preserve_trx_transfer_frame open;
+  open.type = Preserve_trx_transfer_frame_type::OPEN_EPOCH;
+  open.epoch_id = epoch_id;
+  open.requested_terminal_status_retention_us =
+      requested_terminal_status_retention_us;
+  std::string encoded_open;
+  if (preserve_trx_transfer_encode_frame(open, &encoded_open) !=
+      Preserve_trx_transfer_status::OK) {
+    return false;
+  }
+
+  Preserve_trx_transfer_frame abandon;
+  abandon.type =
+      Preserve_trx_transfer_frame_type::ABANDON_EPOCH_IF_NOT_COMMITTED;
+  abandon.protocol_version = kPreserveTrxTransferProtocolVersion;
+  abandon.sequence = 1;
+  abandon.epoch_id = epoch_id;
+  abandon.receiver_process_nonce = receiver_process_nonce;
+  abandon.token = 0;
+  abandon.terminal_fact_digest = sha256_digest(encoded_open);
+  return preserve_trx_transfer_encode_frame(abandon, encoded_abandon) ==
+         Preserve_trx_transfer_status::OK;
+}
+
+bool build_uncertain_abort_abandon_payload(
+    const std::string &encoded_abort, std::string *encoded_abandon) {
+  if (encoded_abandon == nullptr) return false;
+  Preserve_trx_transfer_frame abort;
+  if (preserve_trx_transfer_decode_frame(encoded_abort, &abort) !=
+          Preserve_trx_transfer_status::OK ||
+      abort.type != Preserve_trx_transfer_frame_type::ABORT ||
+      abort.sequence == 0 || abort.token == 0 ||
+      abort.receiver_process_nonce.length() != 32) {
+    return false;
+  }
+
+  Preserve_trx_transfer_frame abandon;
+  abandon.type =
+      Preserve_trx_transfer_frame_type::ABANDON_EPOCH_IF_NOT_COMMITTED;
+  abandon.protocol_version = kPreserveTrxTransferProtocolVersion;
+  abandon.sequence = abort.sequence;
+  abandon.epoch_id = abort.epoch_id;
+  abandon.receiver_process_nonce = abort.receiver_process_nonce;
+  abandon.token = abort.token;
+  abandon.terminal_fact_digest = sha256_digest(encoded_abort);
   return preserve_trx_transfer_encode_frame(abandon, encoded_abandon) ==
          Preserve_trx_transfer_status::OK;
 }
@@ -2867,9 +2942,7 @@ class Preserve_trx_transfer_client_frame_sink final
               disconnect_owned_connection(connection_index);
               return Preserve_trx_transfer_status::CORRUPT;
             }
-            if (transfer_status_is_committed_outcome(query_status) ||
-                query_status ==
-                    Preserve_trx_transfer_status::NOT_COMMITTED_CLEAN) {
+            if (transfer_status_is_committed_outcome(query_status)) {
 #ifndef DBUG_OFF
               bool requery_commit_status = false;
               DBUG_EXECUTE_IF(
@@ -2899,6 +2972,15 @@ class Preserve_trx_transfer_client_frame_sink final
                 return preserve_uncertain_result();
               }
 #endif
+              /*
+                QUERY_EPOCH_STATUS reports receiver-process state, not an
+                authoritative HA ownership handoff.  Keep the original COMMIT
+                uncertain until a separate ownership proof resolves it.
+              */
+              return preserve_uncertain_result();
+            }
+            if (query_status ==
+                Preserve_trx_transfer_status::NOT_COMMITTED_CLEAN) {
               if (out_ack != nullptr) *out_ack = ack;
               uncertain_payload.clear();
               return query_status;
@@ -4255,7 +4337,9 @@ Preserve_trx_transfer_status validate_frame_components(
 
   const bool token_optional =
       frame.type == Preserve_trx_transfer_frame_type::OPEN_EPOCH ||
-      frame.type == Preserve_trx_transfer_frame_type::PROMOTION_GATE_EPOCH;
+      frame.type == Preserve_trx_transfer_frame_type::PROMOTION_GATE_EPOCH ||
+      frame.type == Preserve_trx_transfer_frame_type::
+                        ABANDON_EPOCH_IF_NOT_COMMITTED;
   if (!transfer_protocol_version_is_decodable(frame.protocol_version) ||
       !transfer_component_safe(frame.epoch_id) ||
       (!token_optional && frame.token == 0)) {
@@ -4408,6 +4492,11 @@ Preserve_trx_transfer_status validate_frame_components(
           !frame.object_id.empty() || frame.chunk_offset != 0 ||
           !frame.manifest_payload.empty() || !frame.chunk_payload.empty() ||
           !frame.reason.empty()) {
+        return frame_error();
+      }
+      if (frame.type == Preserve_trx_transfer_frame_type::
+                            ABANDON_EPOCH_IF_NOT_COMMITTED &&
+          frame.token == 0 && frame.sequence != 1) {
         return frame_error();
       }
       break;
@@ -9347,10 +9436,14 @@ Preserve_trx_transfer_receiver_registry::try_begin_epoch_abandon(
         return item.first.first == request.epoch_id;
       });
   const auto online = m_online_epochs.find(request.epoch_id);
-  const bool rejected_before_first_token =
-      online != m_online_epochs.end() &&
-      online->second.precommit_poisoned;
-  if (!receiving && !rejected_before_first_token) {
+  if (online != m_online_epochs.end() &&
+      (online->second.receiver_process_nonce !=
+           request.receiver_process_generation ||
+       online->second.authenticated_principal !=
+           request.authenticated_principal)) {
+    return Preserve_trx_transfer_epoch_terminal_outcome::CORRUPT;
+  }
+  if (!receiving && online == m_online_epochs.end()) {
     return Preserve_trx_transfer_epoch_terminal_outcome::EPOCH_NOT_FOUND;
   }
 
@@ -14095,7 +14188,7 @@ Preserve_trx_transfer_status preserve_trx_transfer_finalize_deferred_candidate(
 Preserve_trx_transfer_status
 Preserve_trx_transfer_source_epoch_session::abort_token_locked(
     uint64_t transfer_token, const std::string &reason, bool allow_finalized,
-    Pending_frame_cleanup cleanup) {
+    Pending_frame_cleanup cleanup, std::string *encoded_abort) {
   if (m_sink == nullptr || !transfer_component_safe(m_epoch_id) ||
       transfer_token == 0) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
@@ -14158,8 +14251,12 @@ Preserve_trx_transfer_source_epoch_session::abort_token_locked(
   abort.token = transfer_token;
   abort.reason = reason;
   stamp_online_epoch_context_locked(&abort);
+  std::string encoded_frame;
   Preserve_trx_transfer_status status =
-      send_encoded_transfer_frame(m_sink, abort);
+      preserve_trx_transfer_encode_frame(abort, &encoded_frame);
+  if (status != Preserve_trx_transfer_status::OK) return status;
+  if (encoded_abort != nullptr) *encoded_abort = encoded_frame;
+  status = m_sink->send_encoded_frame(encoded_frame);
   if (status != Preserve_trx_transfer_status::OK) return status;
   ++m_next_sequence;
   if (finalized) {
@@ -14199,7 +14296,7 @@ Preserve_trx_transfer_source_epoch_session::abort_token(
     uint64_t transfer_token, const std::string &reason) {
   std::lock_guard<std::mutex> guard(m_mutex);
   return abort_token_locked(transfer_token, reason, false,
-                            Pending_frame_cleanup::REQUIRED);
+                            Pending_frame_cleanup::REQUIRED, nullptr);
 }
 
 Preserve_trx_transfer_status
@@ -14210,6 +14307,17 @@ Preserve_trx_transfer_source_epoch_session::abort_epoch_locked(
   }
   if (m_final_metadata_ack_uncertain)
     return Preserve_trx_transfer_status::ACK_UNCERTAIN;
+  if (m_declared_tokens.empty() && m_epoch_transport_open &&
+      !m_ack_uncertain && !m_epoch_poisoned &&
+      m_pending_precommit_payload_for_abandon.empty()) {
+    if (!build_open_epoch_abandon_payload(
+            m_epoch_id, m_receiver_process_nonce,
+            m_requested_terminal_status_retention_us,
+            &m_pending_precommit_payload_for_abandon)) {
+      return Preserve_trx_transfer_status::CORRUPT;
+    }
+    m_epoch_poisoned = true;
+  }
   if (m_epoch_committed || m_commit_in_progress ||
       (m_declared_tokens.empty() && !m_ack_uncertain &&
        !m_epoch_poisoned)) {
@@ -14230,10 +14338,10 @@ Preserve_trx_transfer_source_epoch_session::abort_epoch_locked(
   }
 
   /*
-    A process-bound metadata rejection supplies an epoch-wide clean-abandon
-    anchor. Send it before any best-effort token ABORT: losing an ABORT ACK
-    would otherwise pin that connection to a different uncertain payload and
-    prevent the terminal ABANDON from reaching the receiver.
+    A process-bound metadata rejection or an uncertain token ABORT supplies an
+    epoch-wide clean-abandon anchor. Send it before any further best-effort
+    token ABORT: the uncertain payload pins that connection and would prevent
+    the terminal ABANDON from reaching the receiver.
   */
   if (!m_pending_precommit_payload_for_abandon.empty()) {
     const Preserve_trx_transfer_status abandon_status =
@@ -14250,9 +14358,40 @@ Preserve_trx_transfer_source_epoch_session::abort_epoch_locked(
   Preserve_trx_transfer_status first_error = Preserve_trx_transfer_status::OK;
   for (uint64_t transfer_token : m_declared_tokens) {
     if (m_aborted_tokens.count(transfer_token) != 0) continue;
+    std::string encoded_abort;
     const Preserve_trx_transfer_status status =
         abort_token_locked(transfer_token, reason, true,
-                           Pending_frame_cleanup::ALREADY_CLEARED);
+                           Pending_frame_cleanup::ALREADY_CLEARED,
+                           &encoded_abort);
+    if (status == Preserve_trx_transfer_status::ACK_UNCERTAIN &&
+        m_epoch_transport_open) {
+      /*
+        RESET cannot send a different token ABORT on a connection pinned to
+        this payload. Bind an epoch-wide ABANDON to the exact uncertain ABORT,
+        then rebuild the cleanup transport before sending it.
+      */
+      std::string encoded_abandon;
+      if (!build_uncertain_abort_abandon_payload(encoded_abort,
+                                                 &encoded_abandon)) {
+        return Preserve_trx_transfer_status::CORRUPT;
+      }
+      m_epoch_poisoned = true;
+      m_pending_precommit_payload_for_abandon = std::move(encoded_abandon);
+      const Preserve_trx_transfer_status prepare_status =
+          m_sink->prepare_cancelled_epoch_cleanup();
+      if (prepare_status != Preserve_trx_transfer_status::OK) {
+        return prepare_status;
+      }
+      const Preserve_trx_transfer_status abandon_status =
+          m_sink->send_encoded_frame(m_pending_precommit_payload_for_abandon);
+      if (abandon_status == Preserve_trx_transfer_status::OK ||
+          abandon_status ==
+              Preserve_trx_transfer_status::NOT_COMMITTED_CLEAN) {
+        m_pending_precommit_payload_for_abandon.clear();
+        return Preserve_trx_transfer_status::OK;
+      }
+      return abandon_status;
+    }
     if (status != Preserve_trx_transfer_status::OK &&
         first_error == Preserve_trx_transfer_status::OK) {
       first_error = status;
@@ -16974,6 +17113,12 @@ static bool run_receiver_object_prewarm_job(
       receiver_object_prewarm_delay_ms_for_unit_test().load();
   if (delay_ms != 0) my_sleep(delay_ms * 1000ULL);
   if (receiver_epoch_expired_or_removed(root_dir, registry, manifest)) {
+    /* The enqueue path owns this key even if terminal state obsoletes work. */
+    Receiver_object_prewarm_key inflight_key;
+    if (receiver_object_prewarm_key(root_dir, manifest, object_id,
+                                    &inflight_key)) {
+      (void)finish_receiver_object_prewarm_job(inflight_key, nullptr);
+    }
     return false;
   }
   Preserve_trx_transfer_manifest effective_manifest = manifest;
@@ -17341,6 +17486,7 @@ void receiver_prewarm_worker_main() {
                                            [job.manifest.token];
     }
 
+    bool request_idle_stop_after_job = false;
     auto finish_registry_job = create_scope_guard([&] {
       const bool accepted_epoch_live =
           job.registry != nullptr &&
@@ -17402,9 +17548,7 @@ void receiver_prewarm_worker_main() {
         }
       }
       g_receiver_prewarm_cv.notify_all();
-      if (accepted_epoch_live) {
-        request_receiver_prewarm_idle_stop();
-      }
+      request_idle_stop_after_job = accepted_epoch_live;
     });
     g_receiver_worker_active.fetch_add(1);
     auto finish_worker_active = create_scope_guard(
@@ -17461,6 +17605,7 @@ void receiver_prewarm_worker_main() {
     finish_registry_job.rollback();
     g_receiver_worker_active.fetch_sub(1);
     finish_worker_active.commit();
+    if (request_idle_stop_after_job) request_receiver_prewarm_idle_stop();
     const uint64_t job_finished_us = transfer_monotonic_us();
     const uint64_t job_elapsed_us = std::max<uint64_t>(
         1, job_finished_us >= job_started_us

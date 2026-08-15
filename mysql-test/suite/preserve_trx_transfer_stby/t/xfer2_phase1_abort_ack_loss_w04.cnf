@@ -1,0 +1,8 @@
+!include ../my.cnf
+
+[mysqld.1]
+skip-log-bin
+debug=d,preserve_trx_transfer_drop_abort_ack,preserve_trx_transfer_drop_abandon_ack_once
+
+[mysqld.2]
+skip-log-bin

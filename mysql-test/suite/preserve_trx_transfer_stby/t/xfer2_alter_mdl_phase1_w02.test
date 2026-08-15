@@ -1,0 +1,525 @@
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+# X10-04 / W02 / O04 / O06 / O09 / T1 debug-contract / I02 / I14 / I15
+#
+# A real W02 owner holds transaction-duration MDL on the orders table while an
+# ALTER starts after Phase1 OPEN.  The ALTER must remain PENDING on the owner's
+# MDL.  Because the waiting DDL itself owns an unsupported active transaction,
+# closing classification must reject the entire transfer before detach or
+# terminal publication; it must never bypass MDL or silently exclude an active
+# DDL transaction.  The original owner then continues and rolls back, after
+# which ALTER succeeds exactly once.  Independent source and receiver commits
+# survive their respective server restarts.
+
+--source suite/preserve_trx_transfer_stby/include/w01_setup.inc
+
+--disable_query_log
+
+# W02 source schema and deterministic inventory seed.  The DDL order is
+# replayed on mysqld.2 below so the T1 lock metadata has matching dictionary
+# table/index/space identities; the receiver shadows intentionally stay empty.
+--connection default
+--disable_warnings
+DROP TABLE IF EXISTS xfer2_x1004_order_items,xfer2_x1004_orders,
+                     xfer2_x1004_inventory;
+--enable_warnings
+CREATE TABLE xfer2_x1004_inventory(
+  sku_id INT PRIMARY KEY,
+  stock INT NOT NULL,
+  allocated INT NOT NULL DEFAULT 0,
+  version INT NOT NULL DEFAULT 0,
+  KEY k_stock(stock)
+) ENGINE=InnoDB;
+CREATE TABLE xfer2_x1004_orders(
+  order_id BIGINT PRIMARY KEY,
+  customer_id INT NOT NULL,
+  status VARCHAR(16) NOT NULL,
+  total INT NOT NULL,
+  version INT NOT NULL DEFAULT 0,
+  KEY k_status(status,order_id)
+) ENGINE=InnoDB;
+CREATE TABLE xfer2_x1004_order_items(
+  order_id BIGINT NOT NULL,
+  line_no INT NOT NULL,
+  sku_id INT NOT NULL,
+  qty INT NOT NULL,
+  unit_price INT NOT NULL,
+  status VARCHAR(16) NOT NULL,
+  PRIMARY KEY(order_id,line_no),
+  KEY k_status(status,order_id),
+  KEY k_sku(sku_id),
+  CONSTRAINT fk_x1004_item_order FOREIGN KEY(order_id)
+    REFERENCES xfer2_x1004_orders(order_id),
+  CONSTRAINT fk_x1004_item_inventory FOREIGN KEY(sku_id)
+    REFERENCES xfer2_x1004_inventory(sku_id)
+) ENGINE=InnoDB;
+INSERT INTO xfer2_x1004_inventory(sku_id,stock,allocated,version)
+WITH RECURSIVE seq(n) AS (
+  SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<24
+)
+SELECT n,100,0,0 FROM seq;
+SET @x1004_source_dict_fingerprint=(
+  SELECT GROUP_CONCAT(CONCAT_WS(':',t.NAME,t.TABLE_ID,i.NAME,i.INDEX_ID,
+                                i.SPACE)
+                      ORDER BY t.NAME,i.NAME)
+    FROM information_schema.innodb_tables t
+    JOIN information_schema.innodb_indexes i ON i.TABLE_ID=t.TABLE_ID
+   WHERE t.NAME IN ('test/xfer2_x1004_inventory',
+                    'test/xfer2_x1004_orders',
+                    'test/xfer2_x1004_order_items'));
+--let $x1004_source_dict_fingerprint= query_get_value(SELECT @x1004_source_dict_fingerprint AS v,v,1)
+
+--connection xfer2_receiver
+--disable_warnings
+DROP USER IF EXISTS xfer2_x1004_receiver_app@localhost;
+DROP TABLE IF EXISTS xfer2_x1004_receiver_native;
+DROP TABLE IF EXISTS xfer2_x1004_order_items,xfer2_x1004_orders,
+                     xfer2_x1004_inventory;
+DROP TABLE IF EXISTS xfer2_w01_audit,xfer2_w01_accounts;
+--enable_warnings
+CREATE USER xfer2_x1004_receiver_app@localhost;
+CREATE TABLE xfer2_w01_accounts(
+  id INT PRIMARY KEY,
+  balance INT NOT NULL,
+  version INT NOT NULL DEFAULT 0,
+  pad VARCHAR(64) NOT NULL
+) ENGINE=InnoDB;
+CREATE TABLE xfer2_w01_audit(
+  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  account_id INT NOT NULL,
+  delta INT NOT NULL,
+  KEY(account_id)
+) ENGINE=InnoDB;
+CREATE TABLE xfer2_x1004_inventory(
+  sku_id INT PRIMARY KEY,
+  stock INT NOT NULL,
+  allocated INT NOT NULL DEFAULT 0,
+  version INT NOT NULL DEFAULT 0,
+  KEY k_stock(stock)
+) ENGINE=InnoDB;
+CREATE TABLE xfer2_x1004_orders(
+  order_id BIGINT PRIMARY KEY,
+  customer_id INT NOT NULL,
+  status VARCHAR(16) NOT NULL,
+  total INT NOT NULL,
+  version INT NOT NULL DEFAULT 0,
+  KEY k_status(status,order_id)
+) ENGINE=InnoDB;
+CREATE TABLE xfer2_x1004_order_items(
+  order_id BIGINT NOT NULL,
+  line_no INT NOT NULL,
+  sku_id INT NOT NULL,
+  qty INT NOT NULL,
+  unit_price INT NOT NULL,
+  status VARCHAR(16) NOT NULL,
+  PRIMARY KEY(order_id,line_no),
+  KEY k_status(status,order_id),
+  KEY k_sku(sku_id),
+  CONSTRAINT fk_x1004_item_order FOREIGN KEY(order_id)
+    REFERENCES xfer2_x1004_orders(order_id),
+  CONSTRAINT fk_x1004_item_inventory FOREIGN KEY(sku_id)
+    REFERENCES xfer2_x1004_inventory(sku_id)
+) ENGINE=InnoDB;
+--eval SET @x1004_receiver_dict_identity_matches=(SELECT GROUP_CONCAT(CONCAT_WS(':',t.NAME,t.TABLE_ID,i.NAME,i.INDEX_ID,i.SPACE) ORDER BY t.NAME,i.NAME) FROM information_schema.innodb_tables t JOIN information_schema.innodb_indexes i ON i.TABLE_ID=t.TABLE_ID WHERE t.NAME IN ('test/xfer2_x1004_inventory','test/xfer2_x1004_orders','test/xfer2_x1004_order_items'))='$x1004_source_dict_fingerprint'
+--let $x1004_receiver_dict_identity_matches= query_get_value(SELECT @x1004_receiver_dict_identity_matches AS ok,ok,1)
+if ($x1004_receiver_dict_identity_matches != 1)
+{
+  --die X10-04 receiver shadow dictionary identity does not match source
+}
+--enable_query_log
+SELECT @x1004_receiver_dict_identity_matches=1
+         AS receiver_w02_shadow_dictionary_identity_matches;
+--disable_query_log
+CREATE TABLE xfer2_x1004_receiver_native(
+  id INT PRIMARY KEY,
+  v INT NOT NULL,
+  UNIQUE KEY uk_v(v)
+) ENGINE=InnoDB;
+INSERT INTO xfer2_x1004_receiver_native
+WITH RECURSIVE seq(n) AS (
+  SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<32
+)
+SELECT n,n*10 FROM seq;
+GRANT SELECT,INSERT,UPDATE,DELETE
+  ON test.xfer2_x1004_receiver_native TO xfer2_x1004_receiver_app@localhost;
+SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=OFF;
+
+SET @x1004_active_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_active_epochs');
+SET @x1004_online_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_online_epochs');
+SET @x1004_admitted_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_admitted_frames');
+SET @x1004_inflight_tokens_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_inflight_tokens');
+SET @x1004_inflight_bytes_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_inflight_bytes');
+SET @x1004_staged_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_staged_memory_bytes');
+SET @x1004_classified_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_auto_prewarm_tokens');
+SET @x1004_ready_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens');
+SET @x1004_not_ready_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens');
+SET @x1004_saved_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_saved_online_tokens');
+SET @x1004_failed_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_failed_tokens');
+SET @x1004_terminal_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_terminal_cas_wins');
+SET @x1004_prepared_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_promotion_prepared_registered_tokens');
+SET @x1004_prepared_ready_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_promotion_prepared_ready_tokens');
+
+--connection xfer2_source_ha
+--let $x1004_old_phase2_timeout= query_get_value(SELECT @@GLOBAL.rds_preserve_trx_drain_phase2_timeout_ms AS v,v,1)
+SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms=5000;
+SET @x1004_handoff_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_source_handoff_pending_epochs');
+SET @x1004_unknown_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_source_commit_unknown_epochs');
+SET @x1004_preserved_before=(SELECT COUNT(*)
+  FROM performance_schema.preserved_transactions);
+
+# W02 owner: one order, three initial lines, one deleted PENDING line, two
+# inventory allocations, and an exact derived total.  All writes stay private.
+--connect(xfer2_x1004_owner,localhost,xfer2_w01_app,,test)
+--let $x1004_owner_id= query_get_value(SELECT CONNECTION_ID() AS id,id,1)
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+INSERT INTO xfer2_x1004_orders(order_id,customer_id,status,total,version)
+VALUES(10004,77,'BUILDING',0,0);
+INSERT INTO xfer2_x1004_order_items
+  (order_id,line_no,sku_id,qty,unit_price,status)
+VALUES(10004,1,3,2,40,'ALLOCATED'),
+      (10004,2,7,3,25,'ALLOCATED'),
+      (10004,3,11,1,60,'PENDING');
+UPDATE xfer2_x1004_inventory i
+  JOIN xfer2_x1004_order_items oi ON oi.sku_id=i.sku_id
+   SET i.stock=i.stock-oi.qty,
+       i.allocated=i.allocated+oi.qty,
+       i.version=i.version+1
+ WHERE oi.order_id=10004 AND oi.status='ALLOCATED';
+--enable_query_log
+SELECT ROW_COUNT()=2 AS owner_w02_allocated_two_inventory_rows;
+--disable_query_log
+DELETE FROM xfer2_x1004_order_items
+ WHERE order_id=10004 AND status='PENDING';
+--enable_query_log
+SELECT ROW_COUNT()=1 AS owner_w02_deleted_one_pending_item;
+--disable_query_log
+UPDATE xfer2_x1004_orders
+   SET status='READY',
+       total=(SELECT SUM(qty*unit_price)
+                FROM xfer2_x1004_order_items WHERE order_id=10004),
+       version=version+1
+ WHERE order_id=10004;
+--enable_query_log
+SELECT COUNT(*)=1 AND SUM(total)=155 AND SUM(version)=1
+         AND SUM(status='READY')=1 AS owner_w02_order_exact
+  FROM xfer2_x1004_orders;
+SELECT COUNT(*)=2 AND SUM(qty)=5 AND SUM(qty*unit_price)=155
+         AND SUM(status='ALLOCATED')=2 AS owner_w02_items_exact
+  FROM xfer2_x1004_order_items;
+SELECT COUNT(*)=24 AND SUM(stock)=2395 AND SUM(allocated)=5
+         AND SUM(version)=2 AS owner_w02_inventory_exact
+  FROM xfer2_x1004_inventory;
+SELECT SUM(sku_id=3 AND stock=98 AND allocated=2 AND version=1)=1
+         AND SUM(sku_id=7 AND stock=97 AND allocated=3 AND version=1)=1
+         AND SUM(sku_id=11 AND stock=100 AND allocated=0 AND version=0)=1
+         AS owner_w02_inventory_rows_exact
+  FROM xfer2_x1004_inventory;
+SELECT COUNT(*)=0 AS owner_w02_fk_integrity_exact
+  FROM xfer2_x1004_order_items oi
+  LEFT JOIN xfer2_x1004_orders o ON o.order_id=oi.order_id
+  LEFT JOIN xfer2_x1004_inventory i ON i.sku_id=oi.sku_id
+ WHERE o.order_id IS NULL OR i.sku_id IS NULL;
+--disable_query_log
+
+--connect(xfer2_x1004_observer,localhost,root,,test)
+--enable_query_log
+SELECT (SELECT COUNT(*) FROM xfer2_x1004_orders)=0
+         AND (SELECT COUNT(*) FROM xfer2_x1004_order_items)=0
+         AS observer_hides_owner_w02_order;
+SELECT COUNT(*)=24 AND SUM(stock)=2400 AND SUM(allocated)=0
+         AND SUM(version)=0 AS observer_hides_owner_w02_inventory
+  FROM xfer2_x1004_inventory;
+--disable_query_log
+
+# Idle ordinary sessions exist before the initial scan; their work begins only
+# after the Phase1 OPEN hook, so neither can become a frozen transfer target.
+--connect(xfer2_x1004_source_native,localhost,xfer2_w01_app,,test)
+--connect(xfer2_x1004_alter,localhost,root,,test)
+--let $x1004_alter_id= query_get_value(SELECT CONNECTION_ID() AS id,id,1)
+SET SESSION lock_wait_timeout=3600;
+--connect(xfer2_x1004_receiver_native,127.0.0.1,xfer2_x1004_receiver_app,,test,$SERVER_MYPORT_2,)
+
+--connect(xfer2_x1004_drain,localhost,root,,test)
+--let $x1004_drain_id= query_get_value(SELECT CONNECTION_ID() AS id,id,1)
+SET DEBUG_SYNC=
+  'preserve_trx_warmcopy_after_phase1_open SIGNAL xfer2_x1004_phase1_open WAIT_FOR xfer2_x1004_phase1_release';
+--send DRAIN TRANSACTIONS PRESERVE
+
+--connection xfer2_receiver
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_online_epochs')=@x1004_online_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_admitted_frames')=@x1004_admitted_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')=@x1004_inflight_tokens_before+1
+--let $wait_timeout= 30
+--source include/wait_condition_or_abort.inc
+
+--connection xfer2_source_ha
+SET DEBUG_SYNC='now WAIT_FOR xfer2_x1004_phase1_open TIMEOUT 60';
+--let $x1004_sync_warning_count= query_get_value("SELECT @@warning_count AS c",c,1)
+--let $x1004_sync_failed= 0
+if ($x1004_sync_warning_count != 0)
+{
+  --let $x1004_sync_failed= 1
+}
+
+# O06: a non-target source commit completes while DRAIN is still parked.  It
+# also supplies the exact committed W01 baseline used by the shared teardown.
+--connection xfer2_x1004_source_native
+UPDATE xfer2_w01_accounts
+   SET balance=balance+1,version=version+1 WHERE id=32;
+--enable_query_log
+SELECT ROW_COUNT()=1 AS source_native_commit_during_phase1;
+--disable_query_log
+
+# O04: ALTER reaches the server after the frozen target set.  The W02 owner's
+# transaction-duration SHARED_WRITE MDL must make its EXCLUSIVE request wait.
+--connection xfer2_x1004_alter
+--send ALTER TABLE xfer2_x1004_orders ADD COLUMN ddl_marker INT NOT NULL DEFAULT 0
+
+--connection xfer2_source_ha
+--let $wait_condition= SELECT COUNT(*)=1 FROM information_schema.processlist WHERE ID=$x1004_alter_id AND STATE='Waiting for table metadata lock'
+--let $wait_timeout= 10
+--source include/wait_condition_or_abort.inc
+--eval SET @x1004_alter_pending=(SELECT COUNT(*)=1 FROM performance_schema.metadata_locks ml JOIN performance_schema.threads t ON t.THREAD_ID=ml.OWNER_THREAD_ID WHERE t.PROCESSLIST_ID=$x1004_alter_id AND ml.OBJECT_SCHEMA='test' AND ml.OBJECT_NAME='xfer2_x1004_orders' AND ml.LOCK_TYPE='EXCLUSIVE' AND ml.LOCK_STATUS='PENDING')
+--eval SET @x1004_owner_mdl_granted=(SELECT COUNT(*)>=1 FROM performance_schema.metadata_locks ml JOIN performance_schema.threads t ON t.THREAD_ID=ml.OWNER_THREAD_ID WHERE t.PROCESSLIST_ID=$x1004_owner_id AND ml.OBJECT_SCHEMA='test' AND ml.OBJECT_NAME='xfer2_x1004_orders' AND ml.LOCK_STATUS='GRANTED')
+--enable_query_log
+SELECT @x1004_alter_pending=1 AS alter_waits_for_exclusive_mdl,
+       @x1004_owner_mdl_granted=1 AS owner_keeps_granted_table_mdl;
+--disable_query_log
+
+# O09: unrelated receiver-native DML commits while the source DDL is blocked.
+--connection xfer2_x1004_receiver_native
+START TRANSACTION;
+UPDATE xfer2_x1004_receiver_native SET v=v+1000+id;
+DELETE FROM xfer2_x1004_receiver_native WHERE id=32;
+INSERT INTO xfer2_x1004_receiver_native VALUES(33,1650);
+COMMIT;
+--connection xfer2_receiver
+--enable_query_log
+SELECT COUNT(*)=32 AND SUM(v)=38106
+         AS receiver_native_commit_during_mdl_wait
+  FROM xfer2_x1004_receiver_native;
+--disable_query_log
+
+# Remove every now-idle ordinary source connection from the late Phase1 scan.
+# The only source THDs eligible when the late scan runs are the W02 owner and
+# the waiting ALTER.  DRAIN is excluded by identity, and the established sticky
+# DEBUG_SYNC ordering lets the HA signal command finish before this scan.
+# Exactly those two business/DDL token declarations must therefore abort.
+--disconnect xfer2_x1004_source_native
+--disconnect xfer2_x1004_observer
+
+--connection xfer2_source_ha
+--replace_result $x1004_drain_id DRAIN_ID
+--enable_query_log
+--eval SELECT COUNT(*)=1 AS drain_still_paused_with_alter_pending FROM information_schema.processlist WHERE ID=$x1004_drain_id AND STATE LIKE 'debug sync point:%'
+--disable_query_log
+SET @x1004_release_started=NOW(6);
+SET DEBUG_SYNC='now SIGNAL xfer2_x1004_phase1_release';
+
+--connection xfer2_x1004_drain
+--error ER_PRESERVE_TRX_UNSUPPORTED
+--reap
+
+--connection xfer2_source_ha
+SET DEBUG_SYNC='RESET';
+--eval SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms=$x1004_old_phase2_timeout
+--enable_query_log
+SELECT TIMESTAMPDIFF(MICROSECOND,@x1004_release_started,NOW(6))<5000000
+         AS active_ddl_rejection_is_bounded;
+SELECT COUNT(*)=@x1004_preserved_before AS no_w02_source_token_detached
+  FROM performance_schema.preserved_transactions;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_source_handoff_pending_epochs')
+         =@x1004_handoff_before AS no_handoff_pending,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_source_commit_unknown_epochs')
+         =@x1004_unknown_before AS no_commit_unknown;
+--disable_query_log
+--eval SET @x1004_rejected_alter_pending=(SELECT COUNT(*)=1 FROM performance_schema.metadata_locks ml JOIN performance_schema.threads t ON t.THREAD_ID=ml.OWNER_THREAD_ID WHERE t.PROCESSLIST_ID=$x1004_alter_id AND ml.OBJECT_SCHEMA='test' AND ml.OBJECT_NAME='xfer2_x1004_orders' AND ml.LOCK_TYPE='EXCLUSIVE' AND ml.LOCK_STATUS='PENDING')
+--enable_query_log
+SELECT @x1004_rejected_alter_pending=1
+         AS rejected_epoch_alter_still_waits_on_source_mdl;
+SELECT COUNT(*)=0 AS alter_column_not_published_before_owner_release
+  FROM information_schema.columns
+ WHERE table_schema='test' AND table_name='xfer2_x1004_orders'
+   AND column_name='ddl_marker';
+--disable_query_log
+
+# Phase1 had reached mysqld.2.  Token ABORT must release payload accounting and
+# every prepared ledger, while retaining exactly one process-local ABORTED
+# diagnostic record/online epoch until receiver restart.
+--connection xfer2_receiver
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_online_epochs')=@x1004_online_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')=@x1004_active_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')=@x1004_inflight_tokens_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')=@x1004_inflight_bytes_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes')=@x1004_staged_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')=@x1004_prepared_before
+--let $wait_timeout= 30
+--source include/wait_condition_or_abort.inc
+--let $x1004_failed_delta= query_get_value(SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_failed_tokens')-@x1004_failed_before AS value,value,1)
+if ($x1004_failed_delta != 2)
+{
+  --die X10-04 late Phase1 scan declared an unexpected extra source connection
+}
+--let $receiver_connection= xfer2_receiver
+--source suite/preserve_trx_transfer_stby/include/assert_receiver_quiescent.inc
+--enable_query_log
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_admitted_frames')
+         >@x1004_admitted_before AS phase1_reached_receiver_before_rejection,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_online_epochs')
+         =@x1004_online_before+1 AS one_aborted_online_epoch_retained,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')
+         =@x1004_active_before AS no_accepted_epoch;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_failed_tokens')
+         =@x1004_failed_before+2 AS only_owner_and_ddl_aborted,
+       (SELECT VARIABLE_VALUE FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_last_failed_reason')
+         ='target_counter_rejected' AS exact_abort_reason,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins')
+         =@x1004_terminal_before AS no_terminal_cas;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_tokens')
+         =@x1004_classified_before AS no_classified_w02_token,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens')
+         =@x1004_ready_before AS no_ready_w02_token,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens')
+         =@x1004_not_ready_before AS no_not_ready_w02_token;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_saved_online_tokens')
+         =@x1004_saved_before AS no_saved_online_w02_token,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')
+         =@x1004_prepared_before AS no_prepared_w02_token,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_ready_tokens')
+         =@x1004_prepared_ready_before AS no_prepared_ready_w02_token;
+SELECT (SELECT COUNT(*) FROM xfer2_x1004_orders)=0
+         AND (SELECT COUNT(*) FROM xfer2_x1004_order_items)=0
+         AND (SELECT COUNT(*) FROM xfer2_x1004_inventory)=0
+         AS receiver_w02_shadows_stay_empty;
+SELECT COUNT(*)=32 AND SUM(v)=38106
+         AS receiver_native_commit_stays_exact_before_restart
+  FROM xfer2_x1004_receiver_native;
+--disable_query_log
+
+# Target-counter rejection is before detach: the same owner still has its W02
+# data, locks and command authority.  ROLLBACK releases the MDL exactly once.
+--connection xfer2_x1004_owner
+--enable_query_log
+SELECT COUNT(*)=1 AND SUM(total)=155 AND SUM(version)=1
+         AS original_owner_continues_after_rejected_drain
+  FROM xfer2_x1004_orders WHERE order_id=10004;
+SELECT COUNT(*)=2 AND SUM(qty*unit_price)=155
+         AS original_owner_items_still_exact
+  FROM xfer2_x1004_order_items WHERE order_id=10004;
+ROLLBACK;
+--disable_query_log
+
+--connection xfer2_x1004_alter
+--reap
+
+--connect(xfer2_x1004_post_observer,localhost,root,,test)
+--enable_query_log
+SELECT COUNT(*)=1 AS alter_published_exactly_one_column
+  FROM information_schema.columns
+ WHERE table_schema='test' AND table_name='xfer2_x1004_orders'
+   AND column_name='ddl_marker';
+SELECT (SELECT COUNT(*) FROM xfer2_x1004_orders)=0
+         AND (SELECT COUNT(*) FROM xfer2_x1004_order_items)=0
+         AS owner_order_rolled_back_before_restart;
+SELECT COUNT(*)=24 AND SUM(stock)=2400 AND SUM(allocated)=0
+         AND SUM(version)=0 AS owner_inventory_rolled_back_before_restart
+  FROM xfer2_x1004_inventory;
+--disable_query_log
+
+--connection xfer2_source_ha
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+
+--disconnect xfer2_x1004_owner
+--disconnect xfer2_x1004_alter
+--disconnect xfer2_x1004_post_observer
+--disconnect xfer2_x1004_receiver_native
+--disconnect xfer2_x1004_drain
+
+# Restart both servers to prove native commits, the one completed ALTER, and
+# the fully rolled-back W02 transaction are durable while transfer state is not.
+--source suite/preserve_trx_transfer_stby/include/w01_teardown.inc
+
+--connection xfer2_cleanup
+--enable_query_log
+SELECT (SELECT COUNT(*) FROM xfer2_x1004_orders)=0
+         AND (SELECT COUNT(*) FROM xfer2_x1004_order_items)=0
+         AS source_owner_order_rolled_back_after_restart;
+SELECT COUNT(*)=24 AND SUM(stock)=2400 AND SUM(allocated)=0
+         AND SUM(version)=0 AS source_owner_inventory_rolled_back_after_restart
+  FROM xfer2_x1004_inventory;
+SELECT COUNT(*)=1 AS completed_alter_survives_restart_once
+  FROM information_schema.columns
+ WHERE table_schema='test' AND table_name='xfer2_x1004_orders'
+   AND column_name='ddl_marker';
+CHECK TABLE xfer2_x1004_inventory,xfer2_x1004_orders,
+            xfer2_x1004_order_items;
+--disable_query_log
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+DROP TABLE xfer2_x1004_order_items,xfer2_x1004_orders,
+           xfer2_x1004_inventory;
+
+--connection xfer2_receiver
+--enable_query_log
+SELECT COUNT(*)=32 AND SUM(v)=38106
+         AS receiver_native_commit_survives_restart
+  FROM xfer2_x1004_receiver_native;
+SELECT (SELECT COUNT(*) FROM xfer2_x1004_orders)=0
+         AND (SELECT COUNT(*) FROM xfer2_x1004_order_items)=0
+         AND (SELECT COUNT(*) FROM xfer2_x1004_inventory)=0
+         AS receiver_w02_shadows_survive_restart_empty;
+--disable_query_log
+DROP TABLE xfer2_x1004_receiver_native;
+DROP TABLE xfer2_x1004_order_items,xfer2_x1004_orders,
+           xfer2_x1004_inventory;
+DROP TABLE xfer2_w01_audit,xfer2_w01_accounts;
+DROP USER xfer2_x1004_receiver_app@localhost;
+
+if ($x1004_sync_failed)
+{
+  --die X10-04 Phase1 OPEN synchronization timed out
+}
+
+--enable_query_log

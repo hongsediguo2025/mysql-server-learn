@@ -3,14 +3,17 @@
 --source include/not_windows.inc
 --source include/force_restart.inc
 
-# X12-06 / W01 / O06 / O09 / T1 debug-contract / I02 / I14 / I15
+# X10-03 / X12-06 / W01 + W03(RC) / O03 / O06 / O09 /
+# T1 debug-contract / I02 / I14 / I15
 #
-# Pause a real two-mysqld transfer after OPEN and the first token declaration.
-# While DRAIN is parked, an ordinary non-target source transaction and an
-# unrelated receiver-native transaction must both commit and become visible.
-# Releasing DRAIN may classify only the original W01 target.  Source restart
-# rolls that target back while both foreground commits survive their respective
-# server restarts.
+# Pause a real two-mysqld transfer after OPEN and both token declarations.  One
+# target is the original W01 owner; the other is a READ COMMITTED W03 owner
+# holding matching records in a nonunique-index range without a search gap
+# lock.  While DRAIN is parked, a non-target adjacent insert, an ordinary
+# source transaction, and an unrelated receiver-native transaction must all
+# commit and become visible.  Releasing DRAIN may classify only the two frozen
+# targets. Source restart rolls both targets back while all foreground commits
+# survive their respective server restarts and every RC index remains exact.
 
 --source suite/preserve_trx_transfer_stby/include/w01_setup.inc
 
@@ -22,6 +25,7 @@
 --connection default
 --disable_warnings
 DROP TABLE IF EXISTS xfer2_scale_source_native;
+DROP TABLE IF EXISTS xfer2_x1003_rc;
 --enable_warnings
 CREATE TABLE xfer2_scale_source_native(
   id INT PRIMARY KEY,
@@ -32,13 +36,76 @@ WITH RECURSIVE seq(n) AS (
   SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<64
 )
 SELECT n,n FROM seq;
+CREATE TABLE xfer2_x1003_rc(
+  id INT PRIMARY KEY,
+  k INT NOT NULL,
+  amount INT NOT NULL,
+  version INT NOT NULL DEFAULT 0,
+  note VARCHAR(32) NOT NULL,
+  UNIQUE KEY uk_note(note),
+  KEY k_range(k,id)
+) ENGINE=InnoDB;
+INSERT INTO xfer2_x1003_rc
+WITH RECURSIVE seq(n) AS (
+  SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<64
+)
+SELECT n,n*10,n*100,0,CONCAT('note-',LPAD(n,4,'0')) FROM seq;
+SET @scale_rc_source_dict_fingerprint=(
+  SELECT GROUP_CONCAT(CONCAT_WS(':',t.TABLE_ID,i.INDEX_ID,i.SPACE)
+                      ORDER BY i.NAME)
+    FROM information_schema.innodb_tables t
+    JOIN information_schema.innodb_indexes i ON i.TABLE_ID=t.TABLE_ID
+   WHERE t.NAME='test/xfer2_x1003_rc');
+--let $scale_rc_source_dict_fingerprint= query_get_value(SELECT @scale_rc_source_dict_fingerprint AS v,v,1)
 
 --connection xfer2_receiver
 --disable_warnings
 DROP USER IF EXISTS xfer2_scale_receiver_app@localhost;
 DROP TABLE IF EXISTS xfer2_scale_receiver_native;
+DROP TABLE IF EXISTS xfer2_x1003_rc;
+DROP TABLE IF EXISTS xfer2_scale_source_native;
+DROP TABLE IF EXISTS xfer2_w01_audit;
+DROP TABLE IF EXISTS xfer2_w01_accounts;
 --enable_warnings
 CREATE USER xfer2_scale_receiver_app@localhost;
+# Replay the source table DDL order on the receiver. These empty tables provide
+# only the T1 dictionary identity needed to prewarm record-lock metadata; they
+# do not claim T2 physical data identity or receive the source's SQL rows.
+CREATE TABLE xfer2_w01_accounts(
+  id INT PRIMARY KEY,
+  balance INT NOT NULL,
+  version INT NOT NULL DEFAULT 0,
+  pad VARCHAR(64) NOT NULL
+) ENGINE=InnoDB;
+CREATE TABLE xfer2_w01_audit(
+  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  account_id INT NOT NULL,
+  delta INT NOT NULL,
+  KEY(account_id)
+) ENGINE=InnoDB;
+CREATE TABLE xfer2_scale_source_native(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+CREATE TABLE xfer2_x1003_rc(
+  id INT PRIMARY KEY,
+  k INT NOT NULL,
+  amount INT NOT NULL,
+  version INT NOT NULL DEFAULT 0,
+  note VARCHAR(32) NOT NULL,
+  UNIQUE KEY uk_note(note),
+  KEY k_range(k,id)
+) ENGINE=InnoDB;
+--eval SET @scale_rc_receiver_dict_identity_matches=(SELECT GROUP_CONCAT(CONCAT_WS(':',t.TABLE_ID,i.INDEX_ID,i.SPACE) ORDER BY i.NAME) FROM information_schema.innodb_tables t JOIN information_schema.innodb_indexes i ON i.TABLE_ID=t.TABLE_ID WHERE t.NAME='test/xfer2_x1003_rc')='$scale_rc_source_dict_fingerprint'
+--let $scale_rc_receiver_dict_identity_matches= query_get_value(SELECT @scale_rc_receiver_dict_identity_matches AS ok,ok,1)
+if ($scale_rc_receiver_dict_identity_matches != 1)
+{
+  --die X10-03 receiver shadow dictionary identity does not match source
+}
+--enable_query_log
+SELECT @scale_rc_receiver_dict_identity_matches=1
+         AS receiver_rc_shadow_dictionary_identity_matches;
+--disable_query_log
 CREATE TABLE xfer2_scale_receiver_native(
   id INT PRIMARY KEY,
   v INT NOT NULL
@@ -119,6 +186,8 @@ SET @scale_handoff_before=(SELECT VARIABLE_VALUE+0
 SET @scale_unknown_before=(SELECT VARIABLE_VALUE+0
   FROM performance_schema.global_status WHERE VARIABLE_NAME=
   'Preserve_trx_transfer_source_commit_unknown_epochs');
+SET @scale_preserved_before=(SELECT COUNT(*)
+  FROM performance_schema.preserved_transactions);
 
 # W01 target and O01 visibility boundary.
 --connect(xfer2_scale_owner,localhost,xfer2_w01_app,,test)
@@ -166,9 +235,56 @@ SELECT COUNT(*)=0 AS observer_hides_owner_audit FROM xfer2_w01_audit;
 --disable_query_log
 COMMIT;
 
-# Both foreground connections exist but are idle when the first Phase1 target
-# scan runs.  Their transactions begin only after DRAIN is parked.
+# X10-03 / W03 / O03: READ COMMITTED retains matching record locks for the
+# target's updates and locking read, but its nonunique-index range search must
+# not acquire the RR-style search gap lock.  The exact cross-index state is
+# frozen as a real transfer target before an adjacent insert races Phase1.
+--connect(xfer2_scale_rc_owner,localhost,xfer2_w01_app,,test)
+--let $scale_rc_owner_id= query_get_value(SELECT CONNECTION_ID() AS id,id,1)
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+START TRANSACTION;
+UPDATE xfer2_x1003_rc
+   SET k=85,amount=amount+6,version=version+1,note='moved-0006'
+ WHERE id=6;
+UPDATE xfer2_x1003_rc
+   SET k=205,amount=amount+18,version=version+1,note='moved-0018'
+ WHERE id=18;
+INSERT INTO xfer2_x1003_rc
+VALUES(102,1020,10200,1,'owner-0102');
+DELETE FROM xfer2_x1003_rc WHERE id=13;
+--enable_query_log
+SELECT COUNT(*)=64 AND SUM(id)=2169 AND SUM(k)=21740
+         AND SUM(amount)=216924 AND SUM(version)=3
+         AS rc_owner_w03_exact_aggregate
+  FROM xfer2_x1003_rc;
+SELECT COUNT(*)=2 AND SUM(id)=24 AND SUM(k)=290
+         AS rc_owner_moved_secondary_keys
+  FROM xfer2_x1003_rc FORCE INDEX(k_range) WHERE k IN (85,205);
+SELECT COUNT(*)=3 AS rc_owner_unique_keys_exact
+  FROM xfer2_x1003_rc FORCE INDEX(uk_note)
+ WHERE note IN ('moved-0006','moved-0018','owner-0102');
+--disable_query_log
+--disable_result_log
+SELECT id,k FROM xfer2_x1003_rc FORCE INDEX(k_range)
+ WHERE k BETWEEN 300 AND 500 ORDER BY k,id FOR UPDATE;
+--enable_result_log
+--enable_query_log
+SELECT COUNT(*)=21 AND MIN(k)=300 AND MAX(k)=500
+         AS rc_record_range_established
+  FROM xfer2_x1003_rc FORCE INDEX(k_range)
+ WHERE k BETWEEN 300 AND 500;
+--disable_query_log
+
+--connection xfer2_source_ha
+--replace_result $scale_rc_owner_id RC_OWNER_ID
+--enable_query_log
+--eval SELECT COUNT(*)>0 AS rc_range_record_locks_exist FROM performance_schema.data_locks l JOIN performance_schema.threads t ON t.THREAD_ID=l.THREAD_ID WHERE t.PROCESSLIST_ID=$scale_rc_owner_id AND l.OBJECT_SCHEMA='test' AND l.OBJECT_NAME='xfer2_x1003_rc' AND l.INDEX_NAME='k_range' AND l.LOCK_TYPE='RECORD'
+--disable_query_log
+
+# Both non-target foreground connections exist but are idle when the first
+# Phase1 target scan runs. Their transactions begin only after DRAIN is parked.
 --connect(xfer2_scale_source_native,localhost,xfer2_w01_app,,test)
+SET SESSION innodb_lock_wait_timeout=5;
 --connect(xfer2_scale_receiver_native,127.0.0.1,xfer2_scale_receiver_app,,test,$SERVER_MYPORT_2,)
 
 --connect(xfer2_scale_drain,localhost,root,,test)
@@ -177,12 +293,12 @@ SET DEBUG_SYNC=
   'preserve_trx_warmcopy_after_phase1_open SIGNAL xfer2_scale_phase1_open WAIT_FOR xfer2_scale_phase1_release';
 --send DRAIN TRANSACTIONS PRESERVE
 
-# The receiver has admitted exactly the W01 token declaration, but final
+# The receiver has admitted exactly the W01 and RC token declarations, but final
 # accepted/prepared state does not exist while the source hook is parked.  Wait
 # here before consuming the sticky DEBUG_SYNC signal so the HA control command
 # cannot be speculatively declared by the initial Phase1 scan.
 --connection xfer2_receiver
---let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_online_epochs')=@scale_online_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')=@scale_active_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_admitted_frames')=@scale_admitted_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')=@scale_inflight_tokens_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')>@scale_inflight_bytes_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes')=@scale_staged_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')=@scale_prepared_registered_before
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_online_epochs')=@scale_online_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')=@scale_active_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_admitted_frames')=@scale_admitted_before+2 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')=@scale_inflight_tokens_before+2 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')>@scale_inflight_bytes_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes')=@scale_staged_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')=@scale_prepared_registered_before
 --let $wait_timeout= 30
 --source include/wait_condition_or_abort.inc
 
@@ -202,13 +318,33 @@ SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
          =@scale_online_before+1 AS one_open_epoch_while_paused,
        (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
          WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_admitted_frames')
-         =@scale_admitted_before+1 AS one_declared_token_while_paused,
+         =@scale_admitted_before+2 AS two_declared_tokens_while_paused,
        (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
          WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')
          =@scale_active_before AS no_accepted_epoch_while_paused,
        (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
          WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')
          =@scale_prepared_registered_before AS no_prepared_state_while_paused;
+--disable_query_log
+
+# X10-03: this key lies inside the RC owner's searched range but matches no
+# existing record.  Completion under a five-second lock timeout proves Phase1
+# did not turn native RC semantics into an RR-style gap lock.
+--connection xfer2_scale_source_native
+INSERT INTO xfer2_x1003_rc VALUES(151,355,35500,1,'rc-adjacent');
+--enable_query_log
+SELECT ROW_COUNT()=1 AS rc_adjacent_committed_during_phase1;
+--disable_query_log
+
+--connection default
+--enable_query_log
+SELECT COUNT(*)=65 AND SUM(id)=2231 AND SUM(k)=21155
+         AND SUM(amount)=243500 AND SUM(version)=1
+         AS rc_outsider_sees_only_committed_adjacent
+  FROM xfer2_x1003_rc;
+SELECT COUNT(*)=1 AND MAX(id)=151 AND MAX(amount)=35500
+         AS rc_adjacent_index_visible_during_phase1
+  FROM xfer2_x1003_rc FORCE INDEX(k_range) WHERE k=355;
 --disable_query_log
 
 # O06: a source transaction that was not in the frozen target set commits and
@@ -243,12 +379,13 @@ SELECT COUNT(*)=64 AND SUM(v)=9364 AS receiver_foreground_commit_visible
 CHECK TABLE xfer2_scale_receiver_native;
 --disable_query_log
 
-# Prove both commits completed while the DRAIN THD was still parked, rather
-# than racing after release.  The dynamic process id never reaches the result.
+# Prove all three foreground commits completed while the DRAIN THD was still
+# parked, rather than racing after release. The dynamic process id never
+# reaches the result.
 --connection default
 --replace_result $scale_drain_id DRAIN_ID
 --enable_query_log
---eval SELECT COUNT(*)=1 AS drain_still_paused_after_both_foreground_commits FROM information_schema.processlist WHERE ID=$scale_drain_id AND STATE LIKE 'debug sync point:%'
+--eval SELECT COUNT(*)=1 AS drain_still_paused_after_all_foreground_commits FROM information_schema.processlist WHERE ID=$scale_drain_id AND STATE LIKE 'debug sync point:%'
 --disable_query_log
 
 --connection xfer2_source_ha
@@ -261,11 +398,18 @@ SET DEBUG_SYNC='now SIGNAL xfer2_scale_phase1_release';
 --connection xfer2_source_ha
 SET DEBUG_SYNC='RESET';
 --eval SET GLOBAL rds_preserve_trx_token_retention_timeout_ms=$scale_old_retention
+--enable_query_log
+SELECT COUNT(*)=@scale_preserved_before+2 AS two_source_tokens_detached,
+       SUM(ISOLATION='READ-COMMITTED')=1 AS one_rc_token,
+       SUM(ISOLATION='REPEATABLE-READ')=1 AS one_rr_token,
+       SUM(MOD_TABLES_COUNT>=1)=2 AS both_tokens_have_data
+  FROM performance_schema.preserved_transactions;
+--disable_query_log
 
-# Exactly one W01 target reaches terminal classification.  The committed O06
-# source transaction and O09 receiver transaction are not transfer tokens.
+# Exactly the W01 and RC targets reach terminal classification.  The committed
+# adjacent insert plus O06 source and O09 receiver transactions are not tokens.
 --connection xfer2_receiver
---let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')=@scale_active_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins')=@scale_terminal_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_tokens')=@scale_classified_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens')=@scale_ready_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens')=@scale_not_ready_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_saved_online_tokens')=@scale_saved_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_failed_tokens')=@scale_failed_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')=@scale_inflight_tokens_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')=@scale_inflight_bytes_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes')=@scale_staged_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')=@scale_prepared_registered_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_prewarm_pending_tokens')=@scale_prepared_pending_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_ready_tokens')=@scale_prepared_ready_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_ready_cache_bytes')>@scale_ready_cache_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_memory_current_bytes')>@scale_memory_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_tokens')=@scale_cleanup_debt_tokens_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_bytes')=@scale_cleanup_debt_bytes_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_worker_active')=0 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_queued_bytes')=0
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')=@scale_active_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins')=@scale_terminal_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_tokens')=@scale_classified_before+2 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens')=@scale_ready_before+2 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens')=@scale_not_ready_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_saved_online_tokens')=@scale_saved_before+2 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_failed_tokens')=@scale_failed_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')=@scale_inflight_tokens_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')=@scale_inflight_bytes_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes')=@scale_staged_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')=@scale_prepared_registered_before+2 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_prewarm_pending_tokens')=@scale_prepared_pending_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_ready_tokens')=@scale_prepared_ready_before+2 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_ready_cache_bytes')>@scale_ready_cache_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_memory_current_bytes')>@scale_memory_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_tokens')=@scale_cleanup_debt_tokens_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_bytes')=@scale_cleanup_debt_bytes_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_worker_active')=0 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_queued_bytes')=0
 --let $wait_timeout= 30
 --source include/wait_condition_or_abort.inc
 --enable_query_log
@@ -274,10 +418,10 @@ SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
          =@scale_active_before+1 AS exactly_one_accepted_epoch,
        (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
          WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_tokens')
-         =@scale_classified_before+1 AS exactly_one_classified_target,
+         =@scale_classified_before+2 AS exactly_two_classified_targets,
        (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
          WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens')
-         =@scale_ready_before+1 AS exactly_one_ready_target,
+         =@scale_ready_before+2 AS exactly_two_ready_targets,
        (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
          WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens')
          =@scale_not_ready_before AS no_not_ready_target,
@@ -292,16 +436,16 @@ SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
          =@scale_staged_before AS no_staged_memory_residue,
        (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
          WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_saved_online_tokens')
-         =@scale_saved_before+1 AS one_saved_online_token,
+         =@scale_saved_before+2 AS two_saved_online_tokens,
        (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
          WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_failed_tokens')
          =@scale_failed_before AS no_failed_token,
        (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
          WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')
-         =@scale_prepared_registered_before+1 AS one_prepared_entry,
+         =@scale_prepared_registered_before+2 AS two_prepared_entries,
        (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
          WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_ready_tokens')
-         =@scale_prepared_ready_before+1 AS one_prepared_ready_entry,
+         =@scale_prepared_ready_before+2 AS two_prepared_ready_entries,
        (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
          WHERE VARIABLE_NAME='Preserve_trx_promotion_ready_cache_bytes')
          >@scale_ready_cache_before AS ready_cache_retained,
@@ -332,6 +476,12 @@ SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 SELECT 1;
 --disable_query_log
 
+--connection xfer2_scale_rc_owner
+--enable_query_log
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT 1;
+--disable_query_log
+
 # The source fence intentionally blocks every ordinary source session after
 # handoff.  Receiver-native data remains independently readable here; the
 # source-native commit is checked again after the source restart below.
@@ -339,9 +489,12 @@ SELECT 1;
 --enable_query_log
 SELECT COUNT(*)=64 AND SUM(v)=9364 AS receiver_foreground_still_exact
   FROM xfer2_scale_receiver_native;
+SELECT COUNT(*)=0 AS receiver_rc_shadow_stays_dictionary_only
+  FROM xfer2_x1003_rc;
 --disable_query_log
 
 --disconnect xfer2_scale_owner
+--disconnect xfer2_scale_rc_owner
 --disconnect xfer2_scale_outsider
 --disconnect xfer2_scale_source_native
 --disconnect xfer2_scale_receiver_native
@@ -356,6 +509,24 @@ SELECT COUNT(*)=64 AND SUM(v)=9364 AS receiver_foreground_still_exact
 SELECT COUNT(*)=64 AND SUM(v)=4682 AS source_foreground_survives_restart
   FROM xfer2_scale_source_native;
 CHECK TABLE xfer2_scale_source_native;
+SELECT COUNT(*)=65 AND SUM(id)=2231 AND SUM(k)=21155
+         AND SUM(amount)=243500 AND SUM(version)=1
+         AS restarted_rc_only_adjacent_committed
+  FROM xfer2_x1003_rc;
+SELECT COUNT(*)=22 AND SUM(id)=991 AND SUM(k)=8755
+         AS restarted_rc_range_exact
+  FROM xfer2_x1003_rc FORCE INDEX(k_range)
+ WHERE k BETWEEN 300 AND 500;
+SELECT COUNT(*)=1 AND MAX(id)=151 AND MAX(amount)=35500
+         AS restarted_rc_adjacent_once
+  FROM xfer2_x1003_rc FORCE INDEX(k_range) WHERE k=355;
+SELECT COUNT(*)=0 AS restarted_rc_owner_unique_mutations_rolled_back
+  FROM xfer2_x1003_rc FORCE INDEX(uk_note)
+ WHERE note IN ('moved-0006','moved-0018','owner-0102');
+SELECT COUNT(*)=1 AND MAX(k)=130 AND MAX(amount)=1300
+         AS restarted_rc_deleted_row_restored
+  FROM xfer2_x1003_rc WHERE id=13;
+CHECK TABLE xfer2_x1003_rc;
 --disable_query_log
 
 --connection xfer2_receiver
@@ -366,13 +537,20 @@ UPDATE xfer2_scale_receiver_native SET v=v+7 WHERE id=1;
 SELECT COUNT(*)=64 AND SUM(v)=9371 AS receiver_foreground_remains_writable
   FROM xfer2_scale_receiver_native;
 CHECK TABLE xfer2_scale_receiver_native;
+SELECT COUNT(*)=0 AS receiver_rc_shadow_survives_restart_empty
+  FROM xfer2_x1003_rc;
 --disable_query_log
 
 DROP TABLE xfer2_scale_receiver_native;
+DROP TABLE xfer2_x1003_rc;
+DROP TABLE xfer2_scale_source_native;
+DROP TABLE xfer2_w01_audit;
+DROP TABLE xfer2_w01_accounts;
 DROP USER xfer2_scale_receiver_app@localhost;
 
 --connection xfer2_cleanup
 DROP TABLE xfer2_scale_source_native;
+DROP TABLE xfer2_x1003_rc;
 
 if ($scale_sync_failed)
 {

@@ -1,0 +1,227 @@
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+# X0-08 / W01 native committed background / O09 / T1 / I14 / I15.
+# Build case-owned setup state on both mysqld processes, fail after that state is
+# usable, then invoke the exact teardown twice. Unrelated users and committed
+# InnoDB data must remain usable, and no transfer lifecycle may be entered.
+
+--disable_query_log
+--let $x008_credential_file= $MYSQL_TMP_DIR/xfer2-partial-setup.secret
+--connect(xfer2_x008_receiver,127.0.0.1,root,,test,$SERVER_MYPORT_2,)
+--source suite/preserve_trx_transfer_stby/include/cleanup_x008_partial_setup.inc
+
+--disable_query_log
+--write_file $x008_credential_file
+xfer2-partial-setup-secret
+EOF
+--exec chmod 600 $x008_credential_file
+--enable_query_log
+
+--connection default
+--disable_warnings
+DROP USER IF EXISTS xfer2_x008_source_app@localhost;
+DROP TABLE IF EXISTS xfer2_x008_native_source;
+--enable_warnings
+CREATE USER xfer2_x008_source_app@localhost;
+GRANT SELECT, INSERT, UPDATE, DELETE ON test.*
+  TO xfer2_x008_source_app@localhost;
+CREATE TABLE xfer2_x008_native_source(
+  id INT PRIMARY KEY,
+  balance INT NOT NULL,
+  version INT NOT NULL DEFAULT 0,
+  pad VARCHAR(64) NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO xfer2_x008_native_source
+WITH RECURSIVE seq(n) AS (
+  SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<64
+)
+SELECT n,1000,0,CONCAT('source-native-',n) FROM seq;
+
+--connection xfer2_x008_receiver
+--disable_warnings
+DROP USER IF EXISTS xfer2_x008_receiver_app@localhost;
+DROP TABLE IF EXISTS xfer2_x008_native_receiver;
+--enable_warnings
+CREATE USER xfer2_x008_receiver_app@localhost;
+GRANT SELECT, INSERT, UPDATE, DELETE ON test.*
+  TO xfer2_x008_receiver_app@localhost;
+CREATE TABLE xfer2_x008_native_receiver(
+  id INT PRIMARY KEY,
+  balance INT NOT NULL,
+  version INT NOT NULL DEFAULT 0,
+  pad VARCHAR(64) NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO xfer2_x008_native_receiver
+WITH RECURSIVE seq(n) AS (
+  SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<64
+)
+SELECT n,1000,0,CONCAT('receiver-native-',n) FROM seq;
+SET @x008_admitted_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_admitted_frames');
+SET @x008_active_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs');
+SET @x008_inflight_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens');
+SET @x008_staged_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes');
+SET @x008_prepared_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens');
+
+--connect(xfer2_x008_source_native,localhost,xfer2_x008_source_app,,test)
+START TRANSACTION;
+UPDATE xfer2_x008_native_source
+   SET balance=balance+IF(id<=32,10,-10),version=version+1;
+SELECT ROW_COUNT()=64 AS source_native_rows_updated;
+COMMIT;
+
+--connect(xfer2_x008_receiver_native,127.0.0.1,xfer2_x008_receiver_app,,test,$SERVER_MYPORT_2,)
+START TRANSACTION;
+UPDATE xfer2_x008_native_receiver
+   SET balance=balance+IF(id<=32,10,-10),version=version+1;
+SELECT ROW_COUNT()=64 AS receiver_native_rows_updated;
+COMMIT;
+
+# Create every case-owned resource before the expected setup failure.
+--connection default
+CREATE USER xfer2_x008_case_user@localhost;
+GRANT SELECT, INSERT, UPDATE, DELETE ON test.*
+  TO xfer2_x008_case_user@localhost;
+CREATE TABLE xfer2_x008_case_source(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+--connect(xfer2_x008_source_case,localhost,xfer2_x008_case_user,,test)
+INSERT INTO xfer2_x008_case_source
+WITH RECURSIVE seq(n) AS (
+  SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<16
+)
+SELECT n,n*10 FROM seq;
+
+--connection xfer2_x008_receiver
+CREATE USER xfer2_x008_case_user@localhost;
+GRANT SELECT, INSERT, UPDATE, DELETE ON test.*
+  TO xfer2_x008_case_user@localhost;
+CREATE TABLE xfer2_x008_case_receiver(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+--connect(xfer2_x008_receiver_case,127.0.0.1,xfer2_x008_case_user,,test,$SERVER_MYPORT_2,)
+INSERT INTO xfer2_x008_case_receiver
+WITH RECURSIVE seq(n) AS (
+  SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<16
+)
+SELECT n,n*20 FROM seq;
+
+--connection default
+--error ER_TABLE_EXISTS_ERROR
+CREATE TABLE xfer2_x008_case_source(id INT PRIMARY KEY) ENGINE=InnoDB;
+SELECT 1 AS expected_partial_setup_failure_observed;
+SELECT COUNT(*)=16 AND SUM(v)=1360 AS source_case_state_present
+  FROM xfer2_x008_case_source;
+SELECT COUNT(*)=1 AS source_case_user_present
+  FROM mysql.user
+ WHERE User='xfer2_x008_case_user' AND Host='localhost';
+--connection xfer2_x008_receiver
+SELECT COUNT(*)=16 AND SUM(v)=2720 AS receiver_case_state_present
+  FROM xfer2_x008_case_receiver;
+SELECT COUNT(*)=1 AS receiver_case_user_present
+  FROM mysql.user
+ WHERE User='xfer2_x008_case_user' AND Host='localhost';
+--connection default
+--file_exists $x008_credential_file
+SELECT 1 AS credential_file_present_after_partial_setup;
+
+--disconnect xfer2_x008_source_case
+--disconnect xfer2_x008_receiver_case
+--source suite/preserve_trx_transfer_stby/include/cleanup_x008_partial_setup.inc
+
+--connection default
+SELECT COUNT(*)=0 AS no_source_case_table
+  FROM information_schema.tables
+ WHERE table_schema='test' AND table_name='xfer2_x008_case_source';
+SELECT COUNT(*)=0 AS no_source_case_user
+  FROM mysql.user
+ WHERE User='xfer2_x008_case_user' AND Host='localhost';
+--connection xfer2_x008_receiver
+SELECT COUNT(*)=0 AS no_receiver_case_table
+  FROM information_schema.tables
+ WHERE table_schema='test' AND table_name='xfer2_x008_case_receiver';
+SELECT COUNT(*)=0 AS no_receiver_case_user
+  FROM mysql.user
+ WHERE User='xfer2_x008_case_user' AND Host='localhost';
+--connection default
+--error 1
+--file_exists $x008_credential_file
+SELECT 1 AS first_partial_teardown_clean;
+
+# The unrelated sessions must still be authorized and writable.
+--connection xfer2_x008_source_native
+UPDATE xfer2_x008_native_source
+   SET balance=balance+7,version=version+1 WHERE id=1;
+SELECT ROW_COUNT()=1 AS source_native_survives_first_teardown;
+--connection xfer2_x008_receiver_native
+UPDATE xfer2_x008_native_receiver
+   SET balance=balance-7,version=version+1 WHERE id=64;
+SELECT ROW_COUNT()=1 AS receiver_native_survives_first_teardown;
+
+# A second call must be a clean no-op over already absent case resources.
+--source suite/preserve_trx_transfer_stby/include/cleanup_x008_partial_setup.inc
+--connection default
+SELECT COUNT(*)=0 AS no_source_case_resource_after_second_teardown
+  FROM information_schema.tables
+ WHERE table_schema='test' AND table_name='xfer2_x008_case_source';
+--connection xfer2_x008_receiver
+SELECT COUNT(*)=0 AS no_receiver_case_resource_after_second_teardown
+  FROM information_schema.tables
+ WHERE table_schema='test' AND table_name='xfer2_x008_case_receiver';
+--connection default
+--error 1
+--file_exists $x008_credential_file
+SELECT 1 AS second_partial_teardown_idempotent;
+
+--connection xfer2_x008_source_native
+UPDATE xfer2_x008_native_source
+   SET balance=balance+3,version=version+1 WHERE id=2;
+SELECT COUNT(*)=64 AS source_native_row_count,
+       SUM(balance)=64010 AS source_native_exact_balance,
+       SUM(version)=66 AS source_native_exact_version
+  FROM xfer2_x008_native_source;
+--connection xfer2_x008_receiver_native
+UPDATE xfer2_x008_native_receiver
+   SET balance=balance-3,version=version+1 WHERE id=63;
+SELECT COUNT(*)=64 AS receiver_native_row_count,
+       SUM(balance)=63990 AS receiver_native_exact_balance,
+       SUM(version)=66 AS receiver_native_exact_version
+  FROM xfer2_x008_native_receiver;
+
+--connection xfer2_x008_receiver
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_admitted_frames')
+         =@x008_admitted_before AS no_transfer_frame_admitted,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')
+         =@x008_active_before AS no_transfer_epoch,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')
+         =@x008_inflight_before AS no_transfer_inflight_token,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes')
+         =@x008_staged_before AS no_transfer_staged_memory,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')
+         =@x008_prepared_before AS no_transfer_prepared_token;
+
+--disconnect xfer2_x008_source_native
+--disconnect xfer2_x008_receiver_native
+--connection default
+DROP TABLE xfer2_x008_native_source;
+DROP USER xfer2_x008_source_app@localhost;
+--connection xfer2_x008_receiver
+DROP TABLE xfer2_x008_native_receiver;
+DROP USER xfer2_x008_receiver_app@localhost;
