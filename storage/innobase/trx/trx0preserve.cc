@@ -32,6 +32,10 @@ this program; if not, write to the Free Software Foundation, Inc.,
 
 #include <algorithm>
 #include <atomic>
+#ifdef UNIV_DEBUG
+#include <chrono>
+#include <condition_variable>
+#endif /* UNIV_DEBUG */
 #include <cstring>
 #include <limits>
 #include <map>
@@ -830,6 +834,35 @@ static dberr_t trx_preserve_make_temp_only_claimable(trx_t *trx) {
 	  transaction. Any failure rolls the partially allocated trx back to NOT_STARTED
 	  before freeing it.
 */
+#ifdef UNIV_DEBUG
+namespace {
+std::mutex g_trx_preserve_rw_trx_add_rendezvous_mutex;
+std::condition_variable g_trx_preserve_rw_trx_add_rendezvous_cv;
+uint32_t g_trx_preserve_rw_trx_add_rendezvous_arrived{0};
+}  // namespace
+
+/*
+  Debug-only RR-H9 reproduction harness. The selected recovery workers meet
+  before entering trx_sys so they contend on the production mutex without
+  waiting while holding it. A timeout is a harness failure, never a successful
+  release. Armed with
+  --debug=+d,preserve_trx_recovery_rw_trx_add_rendezvous.
+*/
+static bool trx_preserve_debug_rw_trx_add_rendezvous() {
+  std::unique_lock<std::mutex> lock(
+      g_trx_preserve_rw_trx_add_rendezvous_mutex);
+  ++g_trx_preserve_rw_trx_add_rendezvous_arrived;
+  if (g_trx_preserve_rw_trx_add_rendezvous_arrived >= 2) {
+    g_trx_preserve_rw_trx_add_rendezvous_cv.notify_all();
+    return true;
+  }
+  return g_trx_preserve_rw_trx_add_rendezvous_cv.wait_for(
+      lock, std::chrono::seconds(30), [] {
+        return g_trx_preserve_rw_trx_add_rendezvous_arrived >= 2;
+      });
+}
+#endif /* UNIV_DEBUG */
+
 trx_t *trx_preserve_create_temp_only_claimed(const XID &xid, uint64_t trx_id) {
   if (!xid_is_preserve_magic(xid) || trx_id == 0 || trx_id >= TRX_ID_MAX) {
     return nullptr;
@@ -869,6 +902,16 @@ trx_t *trx_preserve_create_temp_only_claimed(const XID &xid, uint64_t trx_id) {
     return nullptr;
   }
 
+#ifdef UNIV_DEBUG
+  DBUG_EXECUTE_IF("preserve_trx_recovery_rw_trx_add_rendezvous", {
+    if (!trx_preserve_debug_rw_trx_add_rendezvous()) {
+      ib::fatal(ER_IB_MSG_1212)
+          << "PRESERVE: recovery rw_trx_add rendezvous timed out"
+          << " recovered_trx_id=" << recovered_trx_id;
+    }
+  });
+#endif /* UNIV_DEBUG */
+
   trx_sys_mutex_enter();
   if (trx_sys->max_trx_id <= recovered_trx_id) {
     trx_sys->max_trx_id = recovered_trx_id + 1;
@@ -891,9 +934,17 @@ trx_t *trx_preserve_create_temp_only_claimed(const XID &xid, uint64_t trx_id) {
   }
   trx_sys->rw_trx_ids.insert(pos, recovered_trx_id);
   trx_preserve_add_to_rw_trx_list_ordered(trx);
-  trx_sys_mutex_exit();
-
+#ifdef UNIV_DEBUG
+  DBUG_EXECUTE_IF("preserve_trx_recovery_rw_trx_add_rendezvous", {
+    if (!trx_sys_mutex_own()) {
+      ib::fatal(ER_IB_MSG_1212)
+          << "PRESERVE: trx_sys_rw_trx_add_without_trx_sys_mutex"
+          << " recovered_trx_id=" << recovered_trx_id;
+    }
+  });
+#endif /* UNIV_DEBUG */
   trx_sys_rw_trx_add(trx);
+  trx_sys_mutex_exit();
   return trx;
 }
 

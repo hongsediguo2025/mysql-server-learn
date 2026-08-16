@@ -169,6 +169,7 @@ def render_my_cnf(paths: Nfr2Paths, options: ServerOptions) -> str:
         "performance-schema-consumer-events-transactions-current=ON",
         "performance-schema-consumer-events-waits-current=ON",
         "rds-preserve-trx-enable=ON",
+        "rds-preserve-trx-transfer-artifact-mode=LOCAL_CARRIER",
     ]
     lines.extend(options.extra_mysqld_options)
     lines.extend(

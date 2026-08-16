@@ -70,9 +70,6 @@ SET @admitted_before=(SELECT VARIABLE_VALUE+0
 SET @admitted_bytes_before=(SELECT VARIABLE_VALUE+0
   FROM performance_schema.global_status WHERE VARIABLE_NAME=
   'Preserve_trx_transfer_receiver_admitted_bytes');
-SET @faults_before=(SELECT VARIABLE_VALUE+0
-  FROM performance_schema.global_status WHERE VARIABLE_NAME=
-  'Preserve_trx_transfer_receiver_after_apply_before_ack_faults');
 SET @inflight_tokens_before=(SELECT VARIABLE_VALUE+0
   FROM performance_schema.global_status WHERE VARIABLE_NAME=
   'Preserve_trx_transfer_receiver_inflight_tokens');
@@ -182,14 +179,9 @@ SELECT COUNT(*)=0 AS outsider_hides_large_insert
 --send DRAIN TRANSACTIONS PRESERVE
 
 --connection xfer2_receiver
---let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_after_apply_before_ack_faults')=@faults_before+1
---let $wait_timeout= 30
---source include/wait_condition_or_abort.inc
+SET DEBUG_SYNC='now WAIT_FOR reached_xfer2_nonfinal_apply_before_ack_fault TIMEOUT 30';
+SET DEBUG_SYNC='now SIGNAL continue_xfer2_nonfinal_apply_before_ack_fault';
 SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
-         WHERE VARIABLE_NAME=
-          'Preserve_trx_transfer_receiver_after_apply_before_ack_faults')
-       =@faults_before+1 AS one_partial_object_fault_after_apply,
-       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
          WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_online_epochs')
        =@online_before+1 AS one_receiving_epoch;
 SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import dataclasses
 import inspect
 import subprocess
 import sys
@@ -186,6 +187,75 @@ class ContinuousTieredFullPressureContractTest(unittest.TestCase):
                 evidence="continuous-tiered-transfer",
             )
 
+    def test_smoke_keeps_tier_samples_but_skips_statistical_slos(self):
+        profile = CONTINUOUS_TIERED_SMOKE_PROFILE
+        report = self._valid_report()
+        report.update(
+            workload_sessions=profile.sessions,
+            workload_table_count=profile.tables,
+            workload_statements_per_tx=profile.statements_per_tx,
+            workload_seed_rows_per_table_per_session=(
+                profile.seed_rows_per_table_per_session
+            ),
+            workload_lockset_batch_size=profile.lockset_batch_size,
+            standby_tokens=profile.sessions,
+            receiver_ready_tokens=profile.sessions,
+            receiver_seal_prewarm_tokens=profile.sessions,
+            receiver_seal_prewarm_success_tokens=profile.sessions,
+            receiver_record_object_prewarm_count=profile.sessions,
+            phase2_record_lock_count_samples=[
+                profile.sessions * profile.lockset_batch_size
+            ],
+            source_early_staged_tokens_samples=[profile.sessions],
+            completed_stmt_total=profile.sessions,
+            receiver_read_load_threads=profile.receiver_read_load_threads,
+            receiver_read_load_performance_gate_enforced=False,
+            receiver_ready_after_final_spool_ack_us=9_000_000,
+            receiver_all_prewarm_after_final_ack_us=9_000_000,
+            source_phase1_transfer_network_send_count=12,
+            source_phase1_transfer_frame_count=38,
+            source_tiered_load_threads_per_tier=(
+                profile.source_tiered_load_threads_per_tier
+            ),
+            source_tiered_load_thread_count=profile.source_tiered_load_threads,
+            source_tiered_load_started_workers=profile.source_tiered_load_threads,
+            source_tiered_load_workers_with_samples=profile.source_tiered_load_threads,
+            source_tiered_load_completed_workers=profile.source_tiered_load_threads,
+            source_tiered_load_natural_drain_stop_workers=(
+                profile.source_tiered_load_threads
+            ),
+            source_tiered_load_cutoff_4020_count=profile.source_tiered_load_threads,
+            source_tiered_load_disconnect_count=0,
+        )
+        for label, work_units in zip(
+            ("10ms", "100ms", "200ms"), profile.source_tiered_load_work_units
+        ):
+            prefix = f"source_tiered_{label}"
+            report[f"{prefix}_work_units"] = work_units
+            report[f"{prefix}_sample_count"] = (
+                profile.source_tiered_load_min_samples_per_tier
+            )
+            report[f"{prefix}_p50_us"] = 1
+
+        metrics = validate_e2e_report(
+            profile, report, evidence="continuous-tiered-transfer"
+        )
+
+        self.assertEqual(1, metrics["source_tiered_10ms_p50_us"])
+
+        strict_profile = dataclasses.replace(
+            profile, statistical_slo_enforced=True
+        )
+        report["receiver_read_load_performance_gate_enforced"] = True
+        with self.assertRaisesRegex(
+            RuntimeError, "phase1 network-send reduction"
+        ):
+            validate_e2e_report(
+                strict_profile,
+                report,
+                evidence="continuous-tiered-transfer",
+            )
+
     @staticmethod
     def _valid_report():
         report = {
@@ -255,6 +325,7 @@ class ContinuousTieredFullPressureContractTest(unittest.TestCase):
             "receiver_read_load_transfer_p99_us": 1090,
             "receiver_read_load_p99_increase_pct": 9.0,
             "receiver_read_load_error_count": 0,
+            "receiver_read_load_performance_gate_enforced": True,
             "source_continuous_tiered_load": True,
             "source_tiered_load_threads_per_tier": 10,
             "source_tiered_load_thread_count": 30,

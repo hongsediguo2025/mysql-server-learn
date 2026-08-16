@@ -7,16 +7,13 @@
 #
 # The receiver completes one terminal COMMIT, but both verified COMMIT ACKs are
 # hidden from the source.  The normal sender then performs its authenticated
-# QUERY_EPOCH_STATUS recovery.  A matching process-local COMMITTED result is
-# evidence about the live receiver process only: it is not authoritative HA
-# ownership proof and must not advance the source to COMMITTED_HANDOFF.
+# QUERY_EPOCH_STATUS recovery.  A matching same-process COMMITTED result is
+# now sufficient for the live source/receiver protocol to complete the handoff.
 #
-# Expected contract: DRAIN returns uncertain, the source publishes
-# COMMIT_UNKNOWN and remains fenced, RESET is too late, the original waiter is
-# still blocked, and the receiver retains exactly one READY/prepared/cache
-# publication without promotion or adoption.  Eventual ownership resolution is
-# intentionally outside this T1 case and remains blocked on an authoritative HA
-# provider/caller.
+# Expected contract: DRAIN succeeds, the source publishes no COMMIT_UNKNOWN,
+# RESET is still too late after the handoff barrier, the original source-side
+# waiter remains blocked until source shutdown, and the receiver retains
+# exactly one READY/prepared/cache publication without promotion or adoption.
 
 --let $terminal_cas_case= 4
 --source suite/preserve_trx_transfer_stby/include/run_terminal_cas_w01.inc

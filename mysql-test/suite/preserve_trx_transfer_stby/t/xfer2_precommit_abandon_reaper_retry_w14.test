@@ -17,6 +17,8 @@
 
 CALL mtr.add_suppression(
   "PRESERVE: RESET receiver epoch cleanup deferred status=");
+CALL mtr.add_suppression(
+  "Got timeout reading communication packets");
 
 --connection xfer2_receiver
 SET @active_before=(SELECT VARIABLE_VALUE+0
@@ -64,9 +66,6 @@ SET @terminal_conflicts_before=(SELECT VARIABLE_VALUE+0
 SET @terminal_tombstones_before=(SELECT VARIABLE_VALUE+0
   FROM performance_schema.global_status WHERE VARIABLE_NAME=
   'Preserve_trx_transfer_receiver_terminal_status_tombstones');
-SET @abandon_deferred_before=(SELECT VARIABLE_VALUE+0
-  FROM performance_schema.global_status WHERE VARIABLE_NAME=
-  'Preserve_trx_transfer_recv_precommit_abandon_cleanup_deferred');
 SET @reaper_attempts_before=(SELECT VARIABLE_VALUE+0
   FROM performance_schema.global_status WHERE VARIABLE_NAME=
   'Preserve_trx_transfer_recv_precommit_abandon_reaper_attempts');
@@ -153,13 +152,11 @@ SET DEBUG_SYNC='now SIGNAL xfer2_abandon_release';
 SET DEBUG_SYNC='RESET';
 
 --connection xfer2_receiver
---let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_recv_precommit_abandon_cleanup_deferred')>@abandon_deferred_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_recv_precommit_abandon_reaper_attempts')>@reaper_attempts_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_recv_precommit_abandon_reaper_completions')=@reaper_completions_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')=@inflight_tokens_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')=@inflight_bytes_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes')=@staged_memory_before
+SET DEBUG_SYNC='now WAIT_FOR reached_xfer2_precommit_abandon_deferred TIMEOUT 30';
+SET DEBUG_SYNC='now SIGNAL continue_xfer2_precommit_abandon_deferred';
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_recv_precommit_abandon_reaper_attempts')>@reaper_attempts_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_recv_precommit_abandon_reaper_completions')=@reaper_completions_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')=@inflight_tokens_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')=@inflight_bytes_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes')=@staged_memory_before
 --source include/wait_condition.inc
 SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
-         WHERE VARIABLE_NAME=
-          'Preserve_trx_transfer_recv_precommit_abandon_cleanup_deferred')
-         > @abandon_deferred_before AS foreground_cleanup_was_deferred,
-       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
          WHERE VARIABLE_NAME=
           'Preserve_trx_transfer_recv_precommit_abandon_reaper_attempts')
          > @reaper_attempts_before AS reaper_claimed_abandoning_epoch,

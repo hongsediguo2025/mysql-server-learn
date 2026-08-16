@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 
+import dataclasses
 import json
+import signal
 import socket
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scripts.preserve_trx_full_pressure_runner import (
     DEFAULT_MIXED_FULL_REQUIRED_FREE_BYTES,
@@ -21,10 +24,12 @@ from scripts.preserve_trx_full_pressure_runner import (
     build_release_command,
     create_owned_work_dir,
     detect_server_shutdown_failures,
+    main,
     parse_args,
     redact_command,
     remove_owned_work_dir,
     run_with_finalization,
+    stop_owned_servers,
     validate_e2e_report,
     validate_preflight,
 )
@@ -64,6 +69,10 @@ class FullPressureProfileTest(unittest.TestCase):
         self.assertEqual(8, FULL_PROFILE.promotion_prewarm_workers)
         self.assertEqual(1024**2, SMOKE_PROFILE.phase1_batch_bytes)
         self.assertTrue(FULL_PROFILE.warmcopy_required)
+        self.assertTrue(FULL_PROFILE.statistical_slo_enforced)
+        self.assertFalse(SMOKE_PROFILE.statistical_slo_enforced)
+        self.assertTrue(FULL_PROFILE.receiver_read_load_performance_gate_enforced)
+        self.assertFalse(SMOKE_PROFILE.receiver_read_load_performance_gate_enforced)
 
     def test_reset_profile_is_large_repeated_write_without_lockset_replacement(self):
         self.assertEqual(1000, RESET_FULL_PROFILE.sessions)
@@ -75,10 +84,14 @@ class FullPressureProfileTest(unittest.TestCase):
         self.assertEqual(2 * 1024**3, RESET_FULL_PROFILE.source_buffer_pool_bytes)
         self.assertEqual(2 * 1024**3, RESET_FULL_PROFILE.receiver_buffer_pool_bytes)
         self.assertEqual(3, RESET_SMOKE_PROFILE.sessions)
+        self.assertFalse(RESET_SMOKE_PROFILE.statistical_slo_enforced)
 
     def test_mixed_full_uses_only_public_resource_controls(self):
         self.assertEqual(
             2 * 1024**3, MIXED_FULL_PROFILE.preserve_memory_budget_bytes
+        )
+        self.assertEqual(
+            2 * 1024**3, MIXED_FULL_PROFILE.transfer_max_inflight_bytes
         )
         self.assertEqual(600_000_000, MIXED_FULL_PROFILE.source_phase2_limit_us)
 
@@ -113,6 +126,11 @@ class FullPressureProfileTest(unittest.TestCase):
         self.assertIn(
             "--rds-preserve-trx-memory-budget-bytes=2147483648", source
         )
+        for command_line in (source, receiver):
+            self.assertIn(
+                "--rds-preserve-trx-transfer-max-inflight-bytes=2147483648",
+                command_line,
+            )
         self.assertFalse(
             any(item.startswith("--preserve-trx-warmcopy-max-total-bytes=")
                 for item in source)
@@ -186,6 +204,7 @@ class FullPressureProfileTest(unittest.TestCase):
         self.assertIn("--receiver-read-load-threads 8", joined)
         self.assertIn("--receiver-read-load-max-qps-drop-pct 5.0", joined)
         self.assertIn("--receiver-read-load-max-p99-increase-pct 10.0", joined)
+        self.assertNotIn("--receiver-read-load-observe-only", command)
         self.assertIn(str(paths.receiver_datadir / "preserve"), command)
         self.assertIn(
             "--standby-transfer-password=-do-not-record-this", command
@@ -206,6 +225,29 @@ class FullPressureProfileTest(unittest.TestCase):
         self.assertFalse(any("transfer-io-bytes-per-sec" in item for item in source + receiver))
         self.assertFalse(any("promotion-prewarm" in item for item in receiver))
         self.assertIn("--warmcopy-required", command)
+        self.assertIn("--keep-schema", command)
+
+    def test_smoke_command_observes_receiver_read_load_without_nfr_gate(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            paths = FullPressurePaths.resolve(
+                repo_root=root / "repo",
+                build_dir=Path("build-release"),
+                work_root=root / "work",
+                history_root=root / "history",
+                run_id="run-smoke-observe-only",
+            )
+            command = build_e2e_command(
+                SMOKE_PROFILE,
+                paths,
+                source_command=["mysqld", "--source"],
+                receiver_command=["mysqld", "--receiver"],
+                source_port=3511,
+                receiver_port=3512,
+                credential_secret="secret",
+            )
+
+        self.assertIn("--receiver-read-load-observe-only", command)
 
     def test_transfer_phase2_checklist_requires_process_local_epoch_ready(self):
         acceptance = build_acceptance_contract(
@@ -441,6 +483,7 @@ class FullPressureProfileTest(unittest.TestCase):
             "receiver_read_load_transfer_p99_us": 1090,
             "receiver_read_load_p99_increase_pct": 9.0,
             "receiver_read_load_error_count": 0,
+            "receiver_read_load_performance_gate_enforced": True,
         }
         metrics = validate_e2e_report(FULL_PROFILE, report)
         self.assertEqual(100_000_000, metrics["phase2_record_lock_count"])
@@ -471,6 +514,71 @@ class FullPressureProfileTest(unittest.TestCase):
                 del report[field]
                 with self.assertRaisesRegex(RuntimeError, field):
                     validate_e2e_report(FULL_PROFILE, report)
+
+    def test_smoke_report_keeps_read_load_evidence_but_skips_nfr_thresholds(self):
+        report = self._valid_ready_report()
+        report.update(
+            workload_sessions=SMOKE_PROFILE.sessions,
+            workload_table_count=SMOKE_PROFILE.tables,
+            workload_statements_per_tx=SMOKE_PROFILE.statements_per_tx,
+            workload_seed_rows_per_table_per_session=(
+                SMOKE_PROFILE.seed_rows_per_table_per_session
+            ),
+            workload_lockset_batch_size=SMOKE_PROFILE.lockset_batch_size,
+            standby_tokens=SMOKE_PROFILE.sessions,
+            receiver_ready_tokens=SMOKE_PROFILE.sessions,
+            receiver_seal_prewarm_tokens=SMOKE_PROFILE.sessions,
+            receiver_seal_prewarm_success_tokens=SMOKE_PROFILE.sessions,
+            receiver_record_object_prewarm_count=SMOKE_PROFILE.sessions,
+            phase2_record_lock_count_samples=[
+                SMOKE_PROFILE.sessions * SMOKE_PROFILE.lockset_batch_size
+            ],
+            source_early_staged_tokens_samples=[SMOKE_PROFILE.sessions],
+            completed_stmt_total=SMOKE_PROFILE.sessions,
+            receiver_read_load_threads=SMOKE_PROFILE.receiver_read_load_threads,
+            receiver_read_load_qps_drop_pct=80.0,
+            receiver_read_load_p99_increase_pct=500.0,
+            receiver_read_load_performance_gate_enforced=False,
+            receiver_ready_after_final_spool_ack_us=9_000_000,
+            source_phase1_transfer_network_send_count=12,
+            source_phase1_transfer_frame_count=38,
+        )
+
+        metrics = validate_e2e_report(SMOKE_PROFILE, report)
+
+        self.assertEqual(80.0, metrics["receiver_read_load_qps_drop_pct"])
+        self.assertEqual(500.0, metrics["receiver_read_load_p99_increase_pct"])
+        self.assertEqual(12, metrics["source_phase1_transfer_network_send_count"])
+
+        strict_profile = dataclasses.replace(
+            SMOKE_PROFILE, statistical_slo_enforced=True
+        )
+        report["receiver_read_load_performance_gate_enforced"] = True
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "receiver_ready_after_final_spool_ack_us.*"
+            "phase1 network-send reduction.*receiver_read_load_qps_drop_pct",
+        ):
+            validate_e2e_report(strict_profile, report)
+
+    def test_reset_contract_is_not_a_transfer_ready_contract(self):
+        acceptance = build_acceptance_contract(
+            RESET_FULL_PROFILE, "reset-drain"
+        )
+
+        self.assertEqual(
+            "STANDALONE_TRANSFER_RESET_E2E", acceptance["evidence_kind"]
+        )
+        self.assertEqual(300_000, acceptance["reset_response_p99_us_max"])
+        self.assertEqual(500_000, acceptance["reset_response_max_us_max"])
+        self.assertNotIn("receiver_readiness_contract", acceptance)
+        self.assertNotIn("record_lock_count_min", acceptance)
+
+    def test_release_reset_smoke_is_rejected_before_runner_setup(self):
+        with self.assertRaisesRegex(
+            RuntimeError, "NO_DETERMINISTIC_PRECOMMIT_BARRIER"
+        ):
+            main(["--profile", "smoke", "--evidence", "reset-drain"])
 
     def test_full_report_gate_rejects_strict_side_effects_and_missing_ready(self):
         report = self._valid_ready_report()
@@ -616,6 +724,7 @@ class FullPressureProfileTest(unittest.TestCase):
             "receiver_read_load_transfer_p99_us": 1090,
             "receiver_read_load_p99_increase_pct": 9.0,
             "receiver_read_load_error_count": 0,
+            "receiver_read_load_performance_gate_enforced": True,
         }
 
 
@@ -721,7 +830,41 @@ class FullPressureEnvironmentTest(unittest.TestCase):
 
             remove_owned_work_dir(work_dir)
 
-            self.assertFalse(work_dir.exists())
+        self.assertFalse(work_dir.exists())
+
+    def test_server_cleanup_reports_forced_sigkill_as_failure(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            paths = FullPressurePaths.resolve(
+                repo_root=root / "repo",
+                build_dir=Path("build-release"),
+                work_root=root / "work",
+                history_root=root / "history",
+                run_id="run-forced-kill",
+            )
+            paths.source_pid_file.parent.mkdir(parents=True)
+            paths.source_pid_file.write_text("123\n", encoding="utf-8")
+            command = f"mysqld --datadir={paths.source_datadir}"
+
+            with mock.patch(
+                "scripts.preserve_trx_full_pressure_runner._pid_is_alive",
+                side_effect=[True, True, True, False, False],
+            ), mock.patch(
+                "scripts.preserve_trx_full_pressure_runner._pid_command",
+                return_value=command,
+            ), mock.patch(
+                "scripts.preserve_trx_full_pressure_runner.matching_run_processes",
+                return_value=[],
+            ), mock.patch(
+                "scripts.preserve_trx_full_pressure_runner.os.kill"
+            ) as kill:
+                with self.assertRaisesRegex(RuntimeError, "SIGKILL"):
+                    stop_owned_servers(paths, timeout_s=0)
+
+            self.assertEqual(
+                [call.args for call in kill.call_args_list],
+                [(123, signal.SIGTERM), (123, signal.SIGKILL)],
+            )
 
     def test_archive_redacts_secret_and_preserves_failure_metadata(self):
         with tempfile.TemporaryDirectory() as tmpdir:

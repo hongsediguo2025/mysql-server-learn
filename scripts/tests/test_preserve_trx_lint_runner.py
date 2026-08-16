@@ -241,18 +241,18 @@ class PreserveTrxLintRunnerTest(unittest.TestCase):
         (root / "storage/innobase/trx").mkdir(parents=True)
         (root / "sql/preserve_trx_temp_table.cc").write_text(
             "bool preserve_trx_temp_table_row_hooks_enabled() {\n"
-            "  return rds_preserve_trx_temp_table_enable;\n"
+            "  return preserve_trx_temp_table_enable;\n"
             "}\n"
             "Temp_table_warmcopy_participant *"
             "preserve_trx_temp_table_ensure_participant(THD *thd) {\n"
-            "  if (!rds_preserve_trx_temp_table_enable || thd == nullptr)\n"
+            "  if (!preserve_trx_temp_table_enable || thd == nullptr)\n"
             "    return nullptr;\n"
             "}\n"
         )
         (root / "storage/innobase/include/trx0temp_preserve.h").write_text(
             "static inline bool "
             "trx_preserve_temp_space_image_dirty_page_hook_enabled() {\n"
-            "  return rds_preserve_trx_temp_table_enable;\n"
+            "  return preserve_trx_temp_table_enable;\n"
             "}\n"
         )
         (root / "storage/innobase/trx/trx0temp_preserve.cc").write_text(
@@ -273,6 +273,54 @@ class PreserveTrxLintRunnerTest(unittest.TestCase):
 
         self.assertEqual("fail", summary["status"])
         self.assertTrue(any(
+            item["rule"] == "preserve_trx_off_path_invasive_surface_lint"
+            for item in summary["findings"]
+        ))
+
+    def test_off_path_invasive_surface_accepts_top_level_gates(self):
+        tmp = self.make_repo()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        (root / "sql").mkdir()
+        (root / "storage/innobase/include").mkdir(parents=True)
+        (root / "storage/innobase/trx").mkdir(parents=True)
+        (root / "sql/preserve_trx_temp_table.cc").write_text(
+            "bool preserve_trx_temp_table_row_hooks_enabled() {\n"
+            "  return preserve_trx_is_enabled();\n"
+            "}\n"
+            "Temp_table_warmcopy_participant *"
+            "preserve_trx_temp_table_ensure_participant(THD *thd) {\n"
+            "  if (!preserve_trx_is_enabled() || "
+            "!preserve_trx_temp_table_enable || thd == nullptr)\n"
+            "    return nullptr;\n"
+            "}\n"
+        )
+        (root / "storage/innobase/include/trx0temp_preserve.h").write_text(
+            "static inline bool "
+            "trx_preserve_temp_space_image_dirty_page_hook_enabled() {\n"
+            "  return preserve_trx_is_enabled() && "
+            "preserve_trx_temp_table_enable;\n"
+            "}\n"
+        )
+        (root / "storage/innobase/trx/trx0temp_preserve.cc").write_text(
+            "dberr_t trx_preserve_temp_space_image_stage_dirty_page() {\n"
+            "  if (!trx_preserve_temp_space_image_dirty_page_hook_enabled())\n"
+            "    return DB_SUCCESS;\n"
+            "  validate_after_gate();\n"
+            "}\n"
+        )
+        (root / "sql/handler.cc").write_text(
+            "void handler::ha_write_row() {\n"
+            "  if (preserve_trx_temp_table_row_hooks_enabled() &&\n"
+            "      preserve_trx_temp_table_row_capture_candidate(table))\n"
+            "    preserve_trx_temp_table_note_row_write(ha_thd(), table, "
+            "nullptr, 0);\n"
+            "}\n"
+        )
+
+        summary = run_lint_checks(root)
+
+        self.assertFalse(any(
             item["rule"] == "preserve_trx_off_path_invasive_surface_lint"
             for item in summary["findings"]
         ))

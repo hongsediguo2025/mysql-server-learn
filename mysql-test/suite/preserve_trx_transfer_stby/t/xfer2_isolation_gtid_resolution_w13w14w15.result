@@ -247,18 +247,14 @@ SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins')
 =@x912_terminal_before+1 AS one_x912_terminal_cas,
 (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
-WHERE VARIABLE_NAME=
-'Preserve_trx_transfer_receiver_terminal_cas_duplicates')
-=@x912_duplicates_before+1 AS one_x912_terminal_duplicate,
-(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_conflicts')
 =@x912_conflicts_before AS no_x912_terminal_conflict,
 (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME=
 'Preserve_trx_transfer_receiver_terminal_status_tombstones')
 =@x912_tombstones_before+1 AS one_x912_terminal_tombstone;
-one_x912_terminal_cas	one_x912_terminal_duplicate	no_x912_terminal_conflict	one_x912_terminal_tombstone
-1	1	1	1
+one_x912_terminal_cas	no_x912_terminal_conflict	one_x912_terminal_tombstone
+1	1	1
 SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')
 =@x912_active_before AS no_accepted_x912_epoch,

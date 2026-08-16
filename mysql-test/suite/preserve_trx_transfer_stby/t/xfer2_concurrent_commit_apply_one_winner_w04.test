@@ -1,0 +1,130 @@
+# Review-IDs: RR-M3
+# Workload: W04 + O09
+# Actors: T1=source owner; T2=source DRAIN; S1/S2=source COMMIT senders
+# created by the Debug-only replay harness; R1/R2=receiver handlers.
+
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+--source suite/preserve_trx_transfer_stby/include/w01_setup.inc
+
+--connection default
+UPDATE xfer2_w01_accounts
+   SET balance=balance+1, version=version+1 WHERE id=32;
+
+--connection xfer2_receiver
+SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=OFF;
+SET GLOBAL debug='+d,syncpoint_xfer2_commit_gate_a,syncpoint_xfer2_commit_second_apply_position';
+CREATE TABLE xfer2_commit_native(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO xfer2_commit_native VALUES (1,10),(2,20);
+--let $failed_before= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_failed_tokens', v, 1)
+--let $wins_before= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins', v, 1)
+--let $duplicates_before= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_duplicates', v, 1)
+--let $conflicts_before= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_conflicts', v, 1)
+--let $prepared_before= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens', v, 1)
+--let $ready_cache_before= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_ready_cache_bytes', v, 1)
+--let $active_epochs_before= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs', v, 1)
+--let $online_before= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_online_epochs', v, 1)
+--let $cleanup_debt_before= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_tokens', v, 1)
+
+--connection default
+--connect(xfer2_commit_owner,localhost,xfer2_w01_app,,test)
+--let $owner_id= query_get_value(SELECT CONNECTION_ID() AS id, id, 1)
+START TRANSACTION;
+UPDATE xfer2_w01_accounts
+   SET balance=balance-25, version=version+1 WHERE id=1;
+UPDATE xfer2_w01_accounts
+   SET balance=balance+25, version=version+1 WHERE id=2;
+INSERT INTO xfer2_w01_audit(account_id,delta) VALUES (1,-25),(2,25);
+
+--connect(xfer2_commit_drain,localhost,root,,test)
+SET SESSION debug='+d,preserve_trx_transfer_debug_replay_commit_frame';
+--send DRAIN TRANSACTIONS PRESERVE
+
+--connection xfer2_receiver
+SET DEBUG_SYNC='now WAIT_FOR reached_xfer2_commit_gate_a TIMEOUT 60';
+SET DEBUG_SYNC='now WAIT_FOR reached_xfer2_commit_second_apply_position TIMEOUT 60';
+SET GLOBAL debug='+d,syncpoint_release_xfer2_commit_second_apply_position,syncpoint_release_xfer2_commit_gate_a';
+SET DEBUG_SYNC='now SIGNAL continue_xfer2_commit_gate_a';
+
+# R1 must publish the sole winner while R2 remains parked at the common
+# old/new second-apply position. This makes the loser-side state comparison
+# independent of source scheduling or receiver worker completion order.
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins')=$wins_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_duplicates')=$duplicates_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')=$prepared_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_ready_cache_bytes')>$ready_cache_before
+--let $wait_timeout= 60
+--source include/wait_condition.inc
+
+# O09: ordinary receiver-native InnoDB DML stays live while the duplicate
+# COMMIT handler is parked; it is independent of transfer state.
+START TRANSACTION;
+UPDATE xfer2_commit_native SET v=v+3 WHERE id=1;
+INSERT INTO xfer2_commit_native VALUES (3,30);
+COMMIT;
+
+--let $failed_at_winner= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_failed_tokens', v, 1)
+--let $wins_at_winner= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins', v, 1)
+--let $duplicates_at_winner= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_duplicates', v, 1)
+--let $conflicts_at_winner= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_conflicts', v, 1)
+--let $prepared_at_winner= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens', v, 1)
+--let $ready_cache_at_winner= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_ready_cache_bytes', v, 1)
+--let $active_epochs_at_winner= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs', v, 1)
+--let $online_at_winner= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_online_epochs', v, 1)
+--let $cleanup_debt_at_winner= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_tokens', v, 1)
+
+--disable_query_log
+--eval SELECT $wins_at_winner=$wins_before+1 AS winner_published_once
+--eval SELECT $duplicates_at_winner=$duplicates_before+1 AS duplicate_admitted_once
+--eval SELECT $conflicts_at_winner=$conflicts_before AS no_conflict_before_loser
+--eval SELECT $failed_at_winner=$failed_before AS no_failure_before_loser
+--eval SELECT $prepared_at_winner=$prepared_before+1 AS winner_prepared_exactly_once
+--eval SELECT $ready_cache_at_winner>$ready_cache_before AS winner_ready_cache_present
+--eval SELECT $active_epochs_at_winner=$active_epochs_before+1 AS winner_epoch_active
+--eval SELECT $online_at_winner=$online_before+1 AS winner_epoch_online
+--eval SELECT $cleanup_debt_at_winner=$cleanup_debt_before AS no_cleanup_debt_before_loser
+--enable_query_log
+
+SET DEBUG_SYNC='now SIGNAL continue_xfer2_commit_second_apply_position';
+
+--connection xfer2_commit_drain
+--replace_result $owner_id OWNER_ID
+--replace_column 1 GENERATION 6 CLOSING_STARTED_US 7 CLOSING_DEADLINE_US
+--reap
+
+--connection xfer2_receiver
+--disable_query_log
+--eval SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins')=$wins_at_winner AS loser_did_not_add_winner
+--eval SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_duplicates')=$duplicates_at_winner AS loser_did_not_add_duplicate
+--eval SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_conflicts')=$conflicts_at_winner AS loser_did_not_add_conflict
+--eval SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_failed_tokens')=$failed_at_winner AS loser_did_not_mark_failure
+--eval SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')=$prepared_at_winner AS loser_preserved_prepared_state
+--eval SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_ready_cache_bytes')=$ready_cache_at_winner AS loser_preserved_ready_cache
+--eval SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')=$active_epochs_at_winner AS loser_preserved_active_epoch
+--eval SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_online_epochs')=$online_at_winner AS loser_preserved_online_epoch
+--eval SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_tokens')=$cleanup_debt_at_winner AS loser_added_no_cleanup_debt
+--enable_query_log
+SELECT * FROM xfer2_commit_native ORDER BY id;
+
+SET GLOBAL debug='-d,syncpoint_xfer2_commit_gate_a,syncpoint_xfer2_commit_second_apply_position,syncpoint_release_xfer2_commit_second_apply_position,syncpoint_release_xfer2_commit_gate_a';
+SET DEBUG_SYNC='RESET';
+
+--connection xfer2_commit_owner
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT 1;
+--disconnect xfer2_commit_owner
+
+--connection xfer2_receiver
+--let $assert_file= $MYSQLTEST_VARDIR/log/mysqld.2.err
+--let $assert_text= no loser destructive cleanup ran (no commit_epoch_finalize:CORRUPT)
+--let $assert_select= PRESERVE: standby transfer receiver commit epoch finalize failed
+--let $assert_count= 0
+--source include/assert_grep.inc
+--let $assert_text= no uncontrolled second core apply entered
+--let $assert_select= xfer2_commit_apply_overlap
+--let $assert_count= 0
+--source include/assert_grep.inc
+
+--source suite/preserve_trx_transfer_stby/include/w01_teardown.inc
+
+--connection xfer2_receiver
+DROP TABLE xfer2_commit_native;

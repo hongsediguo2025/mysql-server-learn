@@ -1,0 +1,102 @@
+# Review-IDs: RR-M1
+# Workload: W14 + O09
+# Actors: T1=source owner; T2=source DRAIN; W1=receiver staged-token
+# prewarm worker; R1=receiver reaper; T3=receiver observer/releaser.
+
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+--source suite/preserve_trx_transfer_stby/include/w01_setup.inc
+
+--connection default
+UPDATE xfer2_w01_accounts
+   SET balance=balance+1, version=version+1 WHERE id=32;
+
+--connection xfer2_receiver
+SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=OFF;
+--let $retention_before= query_get_value(SELECT @@GLOBAL.rds_preserve_trx_token_retention_timeout_ms AS v, v, 1)
+SET GLOBAL rds_preserve_trx_token_retention_timeout_ms=1000;
+SET GLOBAL debug='+d,syncpoint_xfer2_prewarm_expiry_gate';
+CREATE TABLE xfer2_expiry_native(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO xfer2_expiry_native VALUES (1,10),(2,20);
+--let $online_before= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_online_epochs', v, 1)
+--let $expired_before= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_expired_epochs', v, 1)
+--let $active_before= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_token_active', v, 1)
+--let $prepared_before= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens', v, 1)
+--let $ready_cache_before= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_ready_cache_bytes', v, 1)
+--let $inflight_before= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens', v, 1)
+--let $inflight_bytes_before= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes', v, 1)
+--let $staged_memory_before= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes', v, 1)
+--let $queued_bytes_before= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_queued_bytes', v, 1)
+--let $cleanup_debt_before= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_tokens', v, 1)
+
+--connection default
+--connect(xfer2_expiry_owner,localhost,xfer2_w01_app,,test)
+--let $owner_id= query_get_value(SELECT CONNECTION_ID() AS id, id, 1)
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+SELECT balance=1000 AS owner_snapshot
+  FROM xfer2_w01_accounts WHERE id=29;
+UPDATE xfer2_w01_accounts
+   SET balance=balance-11, version=version+1 WHERE id=1;
+UPDATE xfer2_w01_accounts
+   SET balance=balance+11, version=version+1 WHERE id=2;
+INSERT INTO xfer2_w01_audit(account_id,delta) VALUES(1,-11),(2,11);
+
+--connection default
+--replace_result $owner_id OWNER_ID
+--replace_column 1 GENERATION 6 CLOSING_STARTED_US 7 CLOSING_DEADLINE_US
+DRAIN TRANSACTIONS PRESERVE;
+
+--connection xfer2_receiver
+SET DEBUG_SYNC='now WAIT_FOR reached_xfer2_prewarm_expiry_gate TIMEOUT 60';
+
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_expired_epochs')=$expired_before+1
+--source include/wait_condition.inc
+
+--eval SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_token_active')=$active_before+1 AS worker_still_active_at_expiry
+--eval SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_online_epochs')=$online_before+1 AS online_epoch_kept_while_worker_active
+
+--let $success_at_expiry= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_seal_prewarm_success_tokens', v, 1)
+--let $not_ready_at_expiry= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_seal_prewarm_not_ready_tokens', v, 1)
+--let $last_status_at_expiry= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_seal_prewarm_last_status', v, 1)
+
+# O09: native receiver work remains independent while the expired transfer
+# worker is still pinned and the reaper must defer destruction.
+START TRANSACTION;
+UPDATE xfer2_expiry_native SET v=v+4 WHERE id=1;
+INSERT INTO xfer2_expiry_native VALUES (3,30);
+COMMIT;
+
+SET GLOBAL debug='+d,syncpoint_release_xfer2_prewarm_expiry_gate';
+SET DEBUG_SYNC='now SIGNAL continue_xfer2_prewarm_expiry_gate';
+
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_token_active')=$active_before
+--source include/wait_condition.inc
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_online_epochs')=$online_before
+--source include/wait_condition.inc
+
+--eval SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_seal_prewarm_success_tokens')=$success_at_expiry AS expired_worker_published_no_success
+--eval SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_seal_prewarm_not_ready_tokens')=$not_ready_at_expiry AS expired_worker_published_no_failure
+--eval SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_seal_prewarm_last_status')=$last_status_at_expiry AS expired_worker_changed_no_terminal_status
+--eval SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')=$prepared_before AS no_prepared_residue
+--eval SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_promotion_ready_cache_bytes')=$ready_cache_before AS no_ready_cache_residue
+--eval SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')=$inflight_before AS no_inflight_token_residue
+--eval SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')=$inflight_bytes_before AS no_inflight_byte_residue
+--eval SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes')=$staged_memory_before AS no_staged_memory_residue
+--eval SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_queued_bytes')=$queued_bytes_before AS no_queued_byte_residue
+--eval SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_tokens')=$cleanup_debt_before AS no_cleanup_debt_residue
+SELECT * FROM xfer2_expiry_native ORDER BY id;
+DROP TABLE xfer2_expiry_native;
+
+SET GLOBAL debug='-d,syncpoint_xfer2_prewarm_expiry_gate,syncpoint_release_xfer2_prewarm_expiry_gate';
+--eval SET GLOBAL rds_preserve_trx_token_retention_timeout_ms=$retention_before
+SET DEBUG_SYNC='RESET';
+
+--connection xfer2_expiry_owner
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT 1;
+--disconnect xfer2_expiry_owner
+
+--source suite/preserve_trx_transfer_stby/include/w01_teardown.inc

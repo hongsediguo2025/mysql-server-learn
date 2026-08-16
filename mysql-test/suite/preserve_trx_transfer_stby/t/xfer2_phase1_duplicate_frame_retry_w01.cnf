@@ -14,4 +14,4 @@ max_allowed_packet=67108864
 # Debug ABI.  The first flag names the exact receiver control point;
 # the second makes it epoch-local/one-shot for a payload containing an applied
 # OBJECT_CHUNK but no matching SEAL, then suppresses the already-resolved ACK.
-debug=d,preserve_trx_transfer_receiver_after_frame_apply_before_ack,preserve_trx_transfer_receiver_drop_nonfinal_object_batch_ack_once
+debug=d,preserve_trx_transfer_receiver_after_frame_apply_before_ack,preserve_trx_transfer_receiver_drop_nonfinal_object_batch_ack_once,syncpoint_xfer2_nonfinal_apply_before_ack_fault

@@ -1,0 +1,45 @@
+CALL mtr.add_suppression("Attempting backtrace");
+CALL mtr.add_suppression("You can use the following information to find out");
+CALL mtr.add_suppression("PRESERVE: RESET DRAIN invariant failure");
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=ON;
+SET GLOBAL rds_preserve_trx_token_retention_timeout_ms=1000;
+CREATE TABLE reset_packet_accounts(
+id INT PRIMARY KEY,
+balance INT NOT NULL,
+version INT NOT NULL,
+pad CHAR(32) NOT NULL DEFAULT ''
+) ENGINE=InnoDB;
+CREATE TABLE reset_packet_audit(
+id INT AUTO_INCREMENT PRIMARY KEY,
+account_id INT NOT NULL,
+note CHAR(16) NOT NULL
+) ENGINE=InnoDB;
+SELECT COUNT(*) AS t4_accounts_before_race FROM reset_packet_accounts;
+t4_accounts_before_race
+32
+SELECT COUNT(*) AS t4_audit_before_race FROM reset_packet_audit;
+t4_audit_before_race
+0
+ERROR HY000: Preserve drain is active; this command was not executed
+ERROR HY000: DRAIN TRANSACTIONS PRESERVE was reset before ownership became irreversible
+SELECT 1 AS server_survived_packet_claim_race;
+server_survived_packet_claim_race
+1
+SELECT COUNT(*) AS t4_accounts_after_race FROM reset_packet_accounts;
+t4_accounts_after_race
+32
+SELECT COUNT(*) AS t4_audit_after_race FROM reset_packet_audit;
+t4_audit_after_race
+0
+SELECT GROUP_CONCAT(CONCAT(id,':',balance,':',version) ORDER BY id)
+AS sampled_accounts FROM reset_packet_accounts WHERE id IN (3,11,27);
+sampled_accounts
+3:990:1,11:1004:1,27:1006:1
+SELECT COUNT(*) AS audit_rows_after_commit FROM reset_packet_audit;
+audit_rows_after_commit
+1
+SELECT COUNT(*) AS preserved_records_after_race
+FROM performance_schema.preserved_transactions;
+preserved_records_after_race
+0

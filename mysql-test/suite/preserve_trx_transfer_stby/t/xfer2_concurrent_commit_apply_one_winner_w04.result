@@ -1,0 +1,147 @@
+CALL mtr.add_suppression(
+"PRESERVE: rolled back prepared transaction without snapshot during recovery");
+CREATE TABLE xfer2_w01_accounts(
+id INT PRIMARY KEY,
+balance INT NOT NULL,
+version INT NOT NULL DEFAULT 0,
+pad VARCHAR(64) NOT NULL
+) ENGINE=InnoDB;
+CREATE TABLE xfer2_w01_audit(
+id BIGINT AUTO_INCREMENT PRIMARY KEY,
+account_id INT NOT NULL,
+delta INT NOT NULL,
+KEY(account_id)
+) ENGINE=InnoDB;
+INSERT INTO xfer2_w01_accounts
+WITH RECURSIVE seq(n) AS (
+SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<32
+)
+SELECT n, 1000, 0, CONCAT('account-', n) FROM seq;
+UPDATE xfer2_w01_accounts
+SET balance=balance+1, version=version+1 WHERE id=32;
+SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=OFF;
+SET GLOBAL debug='+d,syncpoint_xfer2_commit_gate_a,syncpoint_xfer2_commit_second_apply_position';
+CREATE TABLE xfer2_commit_native(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO xfer2_commit_native VALUES (1,10),(2,20);
+START TRANSACTION;
+UPDATE xfer2_w01_accounts
+SET balance=balance-25, version=version+1 WHERE id=1;
+UPDATE xfer2_w01_accounts
+SET balance=balance+25, version=version+1 WHERE id=2;
+INSERT INTO xfer2_w01_audit(account_id,delta) VALUES (1,-25),(2,25);
+SET SESSION debug='+d,preserve_trx_transfer_debug_replay_commit_frame';
+DRAIN TRANSACTIONS PRESERVE;
+SET DEBUG_SYNC='now WAIT_FOR reached_xfer2_commit_gate_a TIMEOUT 60';
+SET DEBUG_SYNC='now WAIT_FOR reached_xfer2_commit_second_apply_position TIMEOUT 60';
+SET GLOBAL debug='+d,syncpoint_release_xfer2_commit_second_apply_position,syncpoint_release_xfer2_commit_gate_a';
+SET DEBUG_SYNC='now SIGNAL continue_xfer2_commit_gate_a';
+START TRANSACTION;
+UPDATE xfer2_commit_native SET v=v+3 WHERE id=1;
+INSERT INTO xfer2_commit_native VALUES (3,30);
+COMMIT;
+winner_published_once
+1
+duplicate_admitted_once
+1
+no_conflict_before_loser
+1
+no_failure_before_loser
+1
+winner_prepared_exactly_once
+1
+winner_ready_cache_present
+1
+winner_epoch_active
+1
+winner_epoch_online
+1
+no_cleanup_debt_before_loser
+1
+SET DEBUG_SYNC='now SIGNAL continue_xfer2_commit_second_apply_position';
+generation	outcome	source_connection_id	token_role	reason	closing_started_us	closing_deadline_us
+GENERATION	SUCCESS	OWNER_ID	SURVIVOR	NONE	CLOSING_STARTED_US	CLOSING_DEADLINE_US
+loser_did_not_add_winner
+1
+loser_did_not_add_duplicate
+1
+loser_did_not_add_conflict
+1
+loser_did_not_mark_failure
+1
+loser_preserved_prepared_state
+1
+loser_preserved_ready_cache
+1
+loser_preserved_active_epoch
+1
+loser_preserved_online_epoch
+1
+loser_added_no_cleanup_debt
+1
+SELECT * FROM xfer2_commit_native ORDER BY id;
+id	v
+1	13
+2	20
+3	30
+SET GLOBAL debug='-d,syncpoint_xfer2_commit_gate_a,syncpoint_xfer2_commit_second_apply_position,syncpoint_release_xfer2_commit_second_apply_position,syncpoint_release_xfer2_commit_gate_a';
+SET DEBUG_SYNC='RESET';
+SELECT 1;
+ERROR HY000: Preserve drain is active; this command was not executed
+include/assert_grep.inc [no loser destructive cleanup ran (no commit_epoch_finalize:CORRUPT)]
+include/assert_grep.inc [no uncontrolled second core apply entered]
+source_ha_control_session
+1
+SELECT COUNT(*)=32 AS thirty_two_accounts,
+SUM(balance)=32001 AS committed_background_balance,
+SUM(version)=1 AS one_committed_background_version,
+MAX(CASE WHEN id=32 THEN balance END)=1001 AS background_update_visible,
+MAX(CASE WHEN id=3 THEN version END)=0 AS owner_updates_hidden
+FROM xfer2_w01_accounts;
+thirty_two_accounts	committed_background_balance	one_committed_background_version	background_update_visible	owner_updates_hidden
+1	1	1	1	1
+SELECT COUNT(*)=0 AS no_committed_audit FROM xfer2_w01_audit;
+no_committed_audit
+1
+DROP TABLE xfer2_w01_audit;
+DROP TABLE xfer2_w01_accounts;
+DROP USER xfer2_w01_app@localhost;
+DROP USER preserve_trx_ha_admin@localhost;
+DROP USER preserve_trx_ha_admin@localhost;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')=0
+AS no_receiver_epoch_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')=0
+AS no_inflight_token_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')=0
+AS no_inflight_byte_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_transfer_receiver_staged_memory_bytes')=0
+AS no_staged_memory_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_registered_tokens')=0
+AS no_prepared_entry_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_promotion_prepared_prewarm_pending_tokens')=0
+AS no_prewarm_pending_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_ready_tokens')=0
+AS no_prepared_ready_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_promotion_ready_cache_bytes')=0
+AS no_ready_cache_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_memory_current_bytes')=0
+AS no_preserve_memory_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_worker_active')=0
+AS no_active_worker_after_restart,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_queued_bytes')=0
+AS no_queued_byte_after_restart;
+no_receiver_epoch_after_restart	no_inflight_token_after_restart	no_inflight_byte_after_restart	no_staged_memory_after_restart	no_prepared_entry_after_restart	no_prewarm_pending_after_restart	no_prepared_ready_after_restart	no_ready_cache_after_restart	no_preserve_memory_after_restart	no_active_worker_after_restart	no_queued_byte_after_restart
+1	1	1	1	1	1	1	1	1	1	1
+DROP TABLE xfer2_commit_native;

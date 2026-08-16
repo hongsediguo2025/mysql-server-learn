@@ -37,6 +37,9 @@ class LockWarmcopyNfr2RunnerTest(unittest.TestCase):
         self.assertIn("loose-mysqlx=0", rendered)
         self.assertIn(f"loose-mysqlx-socket={paths.mysqlx_socket}", rendered)
         self.assertIn("rds-preserve-trx-enable=ON", rendered)
+        self.assertIn(
+            "rds-preserve-trx-transfer-artifact-mode=LOCAL_CARRIER", rendered
+        )
         self.assertIn("max-connections=17", rendered)
         self.assertNotIn("preserve-trx-max-scan-pages", rendered)
         self.assertNotIn("preserve-trx-materialize-timeout-ms", rendered)

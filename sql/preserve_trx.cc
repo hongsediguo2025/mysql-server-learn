@@ -933,6 +933,12 @@ bool preserve_trx_publish_reset_cleanup(
       case Preserve_trx_manager_state::SHUTDOWN_REQUESTED:
         if (snapshot.owner_thread_id != attempt.owner_thread_id) return false;
         break;
+      case Preserve_trx_manager_state::DRAIN_CLEANUP_FAILED:
+        if (snapshot.owner_thread_id != 0 &&
+            snapshot.owner_thread_id != attempt.owner_thread_id)
+          return false;
+        desired_owner = 0;
+        break;
       case Preserve_trx_manager_state::TRANSFER_HANDOFF_COMPLETE:
         if (snapshot.owner_thread_id != 0) return false;
         desired_owner = 0;
@@ -1023,6 +1029,8 @@ Preserve_trx_reset_drain_result preserve_trx_request_active_drain_reset_impl(
   switch (request) {
     case Preserve_trx_drain_reset_request::WON:
       result = Preserve_trx_reset_drain_result::RESET_WON;
+      DEBUG_SYNC(current_thd,
+                 "preserve_trx_reset_after_ownership_before_manager_publish");
       if (!preserve_trx_publish_reset_cleanup(*attempt)) {
         preserve_trx_reset_invariant_failure(
             "reset_manager_publication_failed", attempt);
@@ -11687,7 +11695,25 @@ static bool cleanup_reset_batch_record_artifacts(
 static void preserve_trx_kill_connection(THD *thd) {
   if (thd == nullptr) return;
   mysql_mutex_lock(&thd->LOCK_thd_data);
+#ifndef DBUG_OFF
+  bool assert_active_vio_shutdown = false;
+  DBUG_EXECUTE_IF("preserve_trx_reset_assert_double_detach_kill_woke_connection",
+                  assert_active_vio_shutdown = true;);
+  if (assert_active_vio_shutdown && thd->killed == THD::KILL_CONNECTION &&
+      thd->active_vio != nullptr) {
+    mysql_mutex_unlock(&thd->LOCK_thd_data);
+    preserve_trx_reset_invariant_failure(
+        "reset_double_detach_kill_left_active_vio");
+  }
+#endif
   if (thd->killed != THD::KILL_CONNECTION) thd->awake(THD::KILL_CONNECTION);
+#ifndef DBUG_OFF
+  if (assert_active_vio_shutdown && thd->active_vio != nullptr) {
+    mysql_mutex_unlock(&thd->LOCK_thd_data);
+    preserve_trx_reset_invariant_failure(
+        "reset_double_detach_kill_left_active_vio");
+  }
+#endif
   mysql_mutex_unlock(&thd->LOCK_thd_data);
 }
 
@@ -11695,6 +11721,26 @@ static bool restore_batch_record_semantics_to_original_thd(
     THD *thd, const Preserve_trx_batch_item &item,
     Preserve_trx_batch_reset_cleanup *deferred_cleanup) {
   if (thd == nullptr || item.token.empty()) return true;
+
+#ifndef DBUG_OFF
+  /*
+    Debug-only RR-M18 overlap detector: RESET restore must not mutate a
+    target THD that is still inside its drained-packet rejection window.
+    Armed via "+d,preserve_trx_reset_check_drained_packet_overlap".
+  */
+  DBUG_EXECUTE_IF("preserve_trx_reset_check_drained_packet_overlap", {
+    mysql_mutex_lock(&thd->LOCK_thd_data);
+    const bool overlaps_drained_packet =
+        thd->preserve_trx_batch_state ==
+            Preserve_trx_batch_thd_state::PRESERVED_DRAINED &&
+        !thd->m_server_idle;
+    mysql_mutex_unlock(&thd->LOCK_thd_data);
+    if (overlaps_drained_packet) {
+      preserve_trx_reset_invariant_failure(
+          "reset_overlapped_drained_packet_without_execution_claim");
+    }
+  });
+#endif
 
   Preserved_trx_record record;
   if (!preserved_trx_take_record(item.token, &record)) return true;
@@ -11728,7 +11774,9 @@ static bool restore_batch_record_semantics_to_original_thd(
           LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG, kill_message.c_str());
           preserved_trx_add_resume_detach_failure_observable_record(record,
                                                                     reason);
-          thd->killed = THD::KILL_CONNECTION;
+          preserve_trx_kill_connection(thd);
+          DEBUG_SYNC(current_thd,
+                     "preserve_trx_reset_detach_failure_after_kill");
           thd_state_guard.dismiss();
           return true;
         }
@@ -11986,6 +12034,63 @@ class Preserve_batch_restore_target_collector final : public Do_THD_Impl {
   bool m_error{false};
 };
 
+static bool preserve_trx_external_thd_teardown_started(THD *thd) {
+  std::lock_guard<std::mutex> lock(g_preserved_trx_thd_pin_mutex);
+  return thd == nullptr || g_preserved_trx_thd_teardown.count(thd) != 0;
+}
+
+/*
+  Claim a drained target only at an idle packet boundary. The packet-header
+  callback changes m_server_idle under the same LOCK_thd_data mutex, so either
+  the packet owns its complete 4020 response path or RESET owns the THD; they
+  cannot mutate session state concurrently. ATTACHING also makes a later
+  packet-header callback wait until restore publishes NONE.
+*/
+static bool preserve_trx_claim_batch_target_for_restore(
+    THD *thd, ulonglong generation) {
+  if (thd == nullptr) return false;
+  uint wait_loops = 0;
+  for (;;) {
+    mysql_mutex_lock(&thd->LOCK_thd_data);
+    const bool same_generation =
+        thd->preserve_trx_batch_generation == generation;
+    const Preserve_trx_batch_thd_state state =
+        thd->preserve_trx_batch_state;
+    if (!same_generation ||
+        state != Preserve_trx_batch_thd_state::PRESERVED_DRAINED ||
+        thd->killed == THD::KILL_CONNECTION ||
+        thd->release_resources_done()) {
+      mysql_mutex_unlock(&thd->LOCK_thd_data);
+      return false;
+    }
+    if (thd->m_server_idle) {
+      thd->preserve_trx_batch_state =
+          Preserve_trx_batch_thd_state::ATTACHING;
+      mysql_mutex_unlock(&thd->LOCK_thd_data);
+      return true;
+    }
+    mysql_mutex_unlock(&thd->LOCK_thd_data);
+
+    DEBUG_SYNC(current_thd,
+               "preserve_trx_reset_restore_waiting_for_drained_packet");
+    if (preserve_trx_external_thd_teardown_started(thd)) return false;
+    preserve_trx_wait_for_drain_owner(&wait_loops);
+  }
+}
+
+static void preserve_trx_release_batch_target_restore_claim(
+    THD *thd, ulonglong generation) {
+  if (thd == nullptr) return;
+  mysql_mutex_lock(&thd->LOCK_thd_data);
+  if (thd->preserve_trx_batch_generation == generation &&
+      thd->preserve_trx_batch_state ==
+          Preserve_trx_batch_thd_state::ATTACHING) {
+    thd->preserve_trx_batch_state =
+        Preserve_trx_batch_thd_state::PRESERVED_DRAINED;
+  }
+  mysql_mutex_unlock(&thd->LOCK_thd_data);
+}
+
 static bool restore_preserved_batch_items_to_original_thds(
     ulonglong generation, const std::vector<Preserve_trx_batch_item> &items,
     const std::shared_ptr<Preserve_trx_drain_attempt> &active_drain_attempt,
@@ -12017,6 +12122,14 @@ static bool restore_preserved_batch_items_to_original_thds(
 
   std::vector<Preserve_trx_pinned_thd> &targets = collector.targets();
   for (size_t i = items.size(); i != 0; --i) {
+    if (!preserve_trx_claim_batch_target_for_restore(targets[i - 1].thd,
+                                                     generation)) {
+      return true;
+    }
+    auto restore_claim = create_scope_guard([&] {
+      preserve_trx_release_batch_target_restore_claim(targets[i - 1].thd,
+                                                      generation);
+    });
     Preserve_trx_batch_reset_cleanup cleanup;
     if (restore_batch_record_semantics_to_original_thd(
             targets[i - 1].thd, items[i - 1],
@@ -12086,6 +12199,15 @@ static void restore_preserved_batch_items_for_reset(
           Preserve_trx_reset_disposition::CONNECTION_TEARDOWN_PENDING;
       continue;
     }
+
+    if (!preserve_trx_claim_batch_target_for_restore(target.thd, generation)) {
+      item.reset_disposition =
+          Preserve_trx_reset_disposition::CONNECTION_TEARDOWN_PENDING;
+      continue;
+    }
+    auto restore_claim = create_scope_guard([&] {
+      preserve_trx_release_batch_target_restore_claim(target.thd, generation);
+    });
 
     Preserve_trx_batch_reset_cleanup cleanup;
     if (!restore_batch_record_semantics_to_original_thd(target.thd, item,
@@ -16772,6 +16894,8 @@ bool Preserve_trx_drain_service::execute(
           phase1_readiness_started_us,
           phase1_timeout_ms);
   auto active_drain_attempt_cleanup = create_scope_guard([&] {
+    std::lock_guard<std::mutex> lock(g_active_drain_attempt_mutex);
+    if (g_active_drain_attempt != active_drain_attempt) return;
     if (preserve_trx_active_drain_reset_requested(active_drain_attempt) &&
         !active_drain_attempt->reset_release_barrier_complete.load(
             std::memory_order_acquire)) {
@@ -16779,7 +16903,7 @@ bool Preserve_trx_drain_service::execute(
           "drain_scope_exited_before_reset_release_barrier",
           active_drain_attempt);
     }
-    preserve_trx_clear_active_drain_attempt(active_drain_attempt);
+    g_active_drain_attempt.reset();
   });
   Preserve_batch_clear_temp_table_unsupported_boundaries clear_temp_boundaries;
   Global_THD_manager::get_instance()->do_for_all_thd_copy(
@@ -16943,6 +17067,49 @@ bool Preserve_trx_drain_service::execute(
     */
     if (thd->is_error()) thd->clear_error();
     return preserve_trx_reject_drain_reset();
+  };
+  auto finish_reset_after_local_terminal = [&](const char *stage) {
+    if (active_drain_attempt == nullptr) return false;
+#ifndef DBUG_OFF
+    (void)reset_requested();
+    DEBUG_SYNC(thd, "preserve_trx_local_terminal_after_reset_check");
+#endif
+    {
+      std::lock_guard<std::mutex> lock(g_active_drain_attempt_mutex);
+      if (g_active_drain_attempt != active_drain_attempt) {
+        preserve_trx_reset_invariant_failure(
+            "local_terminal_active_attempt_mismatch", active_drain_attempt);
+      }
+      if (!reset_requested()) {
+        g_active_drain_attempt.reset();
+        active_drain_attempt_cleanup.commit();
+        return false;
+      }
+    }
+    if (!preserve_trx_publish_reset_cleanup(*active_drain_attempt)) {
+      preserve_trx_reset_invariant_failure(
+          "local_terminal_reset_manager_publication_failed",
+          active_drain_attempt);
+    }
+    if (!active_drain_attempt->reset_release_barrier_complete.load(
+            std::memory_order_acquire)) {
+      if (!active_drain_attempt->ownership.begin_source_restore()) {
+        preserve_trx_reset_invariant_failure(
+            "local_terminal_reset_source_restore_transition_failed",
+            active_drain_attempt);
+      }
+      preserve_trx_publish_active_drain_reset_barrier(active_drain_attempt);
+    }
+    cleanup_cancelled_batch_transfer_epoch(stage);
+    release_reset_source_resources();
+    draining->dismiss();
+    active_drain_attempt_cleanup.commit();
+    active_drain_attempt->drain_scope_released.store(
+        true, std::memory_order_release);
+    preserved_trx_reset_attempt_reaper_scan_once();
+    preserved_trx_request_expired_reaper_scan();
+    if (thd->is_error()) thd->clear_error();
+    return true;
   };
   auto finish_phase1_reset = [&](const char *stage) {
     if (batch_transfer_phase1_sender != nullptr)
@@ -17839,6 +18006,9 @@ bool Preserve_trx_drain_service::execute(
     abort_drain_participants(stage);
     draining->transition_to(Preserve_trx_manager_state::DRAIN_CLEANUP_FAILED,
                             0);
+    DEBUG_SYNC(thd, "preserve_trx_cleanup_failure_terminal_published");
+    if (finish_reset_after_local_terminal(stage))
+      return preserve_trx_reject_batch_cleanup_failed();
     draining->dismiss();
     return preserve_trx_reject_batch_cleanup_failed();
   };
@@ -20204,9 +20374,15 @@ bool Preserve_trx_drain_service::execute(
         return finish_cleanup_failure_without_shutdown(
             "early_final_lock_fence_cleanup_failed");
       }
+      DEBUG_SYNC(thd,
+                 "preserve_trx_cleanup_failure_direct_return_before_exit");
+      if (finish_reset_after_local_terminal(
+              "reset_after_local_restore_direct_return"))
+        return preserve_trx_reject_drain_reset();
       return preserve_trx_reject_unsupported();
     }
   }
+  DEBUG_SYNC(thd, "preserve_trx_drain_before_transfer_commit_reset_check");
   if (reset_requested())
     return finish_phase2_reset(&preserved_batch_items,
                                         "reset_before_transfer_commit");

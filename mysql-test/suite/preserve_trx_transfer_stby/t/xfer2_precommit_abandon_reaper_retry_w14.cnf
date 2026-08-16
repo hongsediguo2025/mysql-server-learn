@@ -3,4 +3,4 @@
 [mysqld.2]
 # Foreground ABANDON handlers retain the authenticated ABANDONING tombstone;
 # the receiver reaper has no THD and performs the real online cleanup.
-debug=d,preserve_trx_receiver_defer_precommit_abandon_cleanup_to_reaper
+debug=d,preserve_trx_receiver_defer_precommit_abandon_cleanup_to_reaper,syncpoint_xfer2_precommit_abandon_deferred

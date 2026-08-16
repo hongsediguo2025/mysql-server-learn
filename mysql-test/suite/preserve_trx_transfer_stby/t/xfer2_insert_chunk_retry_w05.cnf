@@ -15,4 +15,4 @@ rds-preserve-trx-transfer-runtime-profile=BUSINESS_FIRST
 rds-preserve-trx-transfer-max-inflight-bytes=67108864
 # Arm the exact one-shot X9-05 fault before any transfer worker starts.  The
 # selector ignores control-only and final object payloads.
-debug=d,preserve_trx_transfer_receiver_after_frame_apply_before_ack,preserve_trx_transfer_receiver_drop_nonfinal_object_batch_ack_once
+debug=d,preserve_trx_transfer_receiver_after_frame_apply_before_ack,preserve_trx_transfer_receiver_drop_nonfinal_object_batch_ack_once,syncpoint_xfer2_nonfinal_apply_before_ack_fault

@@ -615,8 +615,6 @@ int show_preserve_trx_transfer_receiver_admitted_bytes(THD *thd,
                                                        char *buf);
 int show_preserve_trx_transfer_receiver_sequence_already_applied(
     THD *thd, SHOW_VAR *var, char *buf);
-int show_preserve_trx_transfer_receiver_after_apply_before_ack_faults(
-    THD *thd, SHOW_VAR *var, char *buf);
 int show_preserve_trx_transfer_source_handoff_pending_epochs(THD *thd,
                                                              SHOW_VAR *var,
                                                              char *buf);
@@ -638,8 +636,6 @@ int show_preserve_trx_transfer_receiver_terminal_status_tombstones(
 int show_preserve_trx_transfer_receiver_terminal_status_tombstone_expiries(
     THD *thd, SHOW_VAR *var, char *buf);
 int show_preserve_trx_transfer_receiver_terminal_status_not_found(
-    THD *thd, SHOW_VAR *var, char *buf);
-int show_preserve_trx_transfer_receiver_precommit_abandon_cleanup_deferred(
     THD *thd, SHOW_VAR *var, char *buf);
 int show_preserve_trx_transfer_receiver_precommit_abandon_reaper_attempts(
     THD *thd, SHOW_VAR *var, char *buf);

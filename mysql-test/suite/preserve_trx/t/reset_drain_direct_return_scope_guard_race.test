@@ -1,0 +1,180 @@
+# Review-IDs: CR-A1/RR-H1
+# Workload: W04 + O06/O10 | FX: direct-return scope-guard race
+# Overlays: O06,O10
+# Actors: T1A/T1B=owner transactions, T2=async DRAIN owner, T3=async
+#         RESET DRAIN, T4=observer/release + native DML
+# RED invariant (unfixed code): RESET DRAIN wins and publishes RESET_CLEANUP
+#   while the DRAIN owner is parked on a cleanup-failure direct-return
+#   branch; the owner then returns without any reset funnel and its scope
+#   guard aborts the server on the named invariant
+#   drain_scope_exited_before_reset_release_barrier.
+# GREEN invariant (this .result is the hand-written GREEN contract per plan
+#   section 7.2): every non-reset terminal return re-arbitrates RESET through
+#   a single funnel; exactly one source restore and release barrier executes;
+#   RESET DRAIN returns in bounded time; T1A/T1B are restored to their
+#   original sessions and commit their W04 changes exactly once; the manager
+#   is IDLE afterwards; the O06 native commit is preserved.
+#
+# This runtime race test requires a Debug server with Debug Sync enabled.
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_query_log
+
+--let $credential_file= $MYSQL_TMP_DIR/reset_direct_return.secret
+--write_file $credential_file
+reset-direct-return-secret
+EOF
+--exec chmod 600 $credential_file
+
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+DROP USER IF EXISTS reset_direct_app@localhost;
+DROP TABLE IF EXISTS reset_direct_native;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'reset-direct-return-secret';
+GRANT SHUTDOWN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.*
+  TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+CREATE USER reset_direct_app@localhost;
+GRANT SELECT, INSERT, UPDATE, DELETE ON test.* TO reset_direct_app@localhost;
+GRANT SESSION_VARIABLES_ADMIN ON *.* TO reset_direct_app@localhost;
+
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$MASTER_MYPORT --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=reset_direct_mtr --rds-preserve-trx-transfer-credential-secret-file=$credential_file
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--let $restart_parameters=
+
+CALL mtr.add_suppression("Attempting backtrace");
+CALL mtr.add_suppression("You can use the following information to find out");
+CALL mtr.add_suppression("PRESERVE: RESET DRAIN invariant failure");
+
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=ON;
+SET GLOBAL rds_preserve_trx_token_retention_timeout_ms=1000;
+
+--enable_query_log
+# W04: two tables updated in opposite logical directions.
+CREATE TABLE reset_direct_accounts(
+  id INT PRIMARY KEY,
+  balance INT NOT NULL,
+  version INT NOT NULL
+) ENGINE=InnoDB;
+CREATE TABLE reset_direct_ledger(
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  account_id INT NOT NULL,
+  delta INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO reset_direct_accounts VALUES
+  (1,1000,0),(2,1000,0),(3,1000,0),(4,1000,0);
+--disable_query_log
+
+# O06: committed native background owned by a non-target.
+CREATE TABLE reset_direct_native(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO reset_direct_native VALUES (1,10),(2,20);
+
+# T1A: W04 debit 1 / credit 2 + ledger rows.
+--connect(reset_direct_app_a,localhost,reset_direct_app,,test)
+START TRANSACTION;
+UPDATE reset_direct_accounts SET balance=balance-50, version=version+1
+  WHERE id=1;
+UPDATE reset_direct_accounts SET balance=balance+50, version=version+1
+  WHERE id=2;
+INSERT INTO reset_direct_ledger(account_id,delta) VALUES (1,-50),(2,50);
+
+# T1B: W04 debit 3 / credit 4 + ledger rows (disjoint rows from T1A).
+--connect(reset_direct_app_b,localhost,reset_direct_app,,test)
+START TRANSACTION;
+UPDATE reset_direct_accounts SET balance=balance-30, version=version+1
+  WHERE id=3;
+UPDATE reset_direct_accounts SET balance=balance+30, version=version+1
+  WHERE id=4;
+INSERT INTO reset_direct_ledger(account_id,delta) VALUES (3,-30),(4,30);
+
+# T2: async DRAIN owner. The fault selector forces the phase-2 final
+# lock-fence change branch whose restore succeeds, so no reset funnel runs.
+# Park T2 after its last RESET snapshot but before the active attempt is
+# retired; this is the post-check TOCTOU boundary.
+--connect(reset_direct_owner,localhost,root,,test)
+SET SESSION debug='+d,preserve_trx_early_force_final_fence_change';
+SET DEBUG_SYNC=
+  'preserve_trx_local_terminal_after_reset_check SIGNAL t2_direct_return WAIT_FOR t2_direct_return_release';
+--send DRAIN TRANSACTIONS PRESERVE
+
+# T4/HA observer: wait until T2 is parked on the direct-return boundary.
+--connect(reset_direct_ha,localhost,preserve_trx_ha_admin,reset-direct-return-secret,test)
+SET DEBUG_SYNC='now WAIT_FOR t2_direct_return TIMEOUT 60';
+--let $reset_wins_before= query_get_value(SELECT VARIABLE_VALUE+0 AS value FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_reset_drain_wins',value,1)
+
+# T3: async RESET DRAIN. On unfixed code it wins reset ownership and
+# publishes RESET_CLEANUP while T2 is parked.
+--connect(reset_direct_reset,localhost,preserve_trx_ha_admin,reset-direct-return-secret,test)
+--send RESET DRAIN
+
+--connection reset_direct_ha
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_reset_drain_wins') > $reset_wins_before
+--source include/wait_condition.inc
+
+# T4 confirms T3 won RESET ownership and published RESET_CLEANUP, then
+# releases T2.
+SET DEBUG_SYNC='now SIGNAL t2_direct_return_release';
+
+# On unfixed code T2 exits its scope without the reset funnel and the scope
+# guard aborts the server on drain_scope_exited_before_reset_release_barrier;
+# both reaps then see CR_SERVER_LOST.
+--connection reset_direct_reset
+--reap
+
+--connection reset_direct_owner
+--error ER_PRESERVE_TRX_DRAIN_RESET
+--reap
+
+--connection reset_direct_ha
+--enable_query_log
+# GREEN-only step: on unfixed code the server is dead here, so the red run
+# stops with the named invariant abort in the crash log.
+SELECT 1 AS server_survived_scope_guard_race;
+--disable_query_log
+
+# GREEN verification: the unified funnel restored T1A/T1B to their original
+# sessions; they commit their W04 changes exactly once.
+--connection reset_direct_app_a
+COMMIT;
+--connection reset_direct_app_b
+COMMIT;
+
+--connect(reset_direct_idle_probe,localhost,preserve_trx_ha_admin,reset-direct-return-secret,test)
+RESET DRAIN;
+--disconnect reset_direct_idle_probe
+
+--connection reset_direct_ha
+--enable_query_log
+SELECT GROUP_CONCAT(CONCAT(id,':',balance,':',version) ORDER BY id)
+       AS accounts_after_race
+  FROM reset_direct_accounts;
+SELECT COUNT(*) AS ledger_rows_after_race FROM reset_direct_ledger;
+SELECT COUNT(*) AS preserved_records_after_race
+  FROM performance_schema.preserved_transactions;
+SELECT * FROM reset_direct_native ORDER BY id;
+--disable_query_log
+
+--connection default
+DROP TABLE reset_direct_accounts;
+DROP TABLE reset_direct_ledger;
+DROP TABLE reset_direct_native;
+DROP USER preserve_trx_ha_admin@localhost;
+DROP USER reset_direct_app@localhost;
+SET DEBUG_SYNC='RESET';
+--remove_file $credential_file
+--disconnect reset_direct_ha
+--disconnect reset_direct_app_a
+--disconnect reset_direct_app_b
+
+--enable_query_log

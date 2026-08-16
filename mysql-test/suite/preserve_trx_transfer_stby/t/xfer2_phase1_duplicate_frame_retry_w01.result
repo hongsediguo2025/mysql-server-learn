@@ -180,13 +180,6 @@ GENERATION	SUCCESS_WITH_EXCLUSIONS	SOURCE_ID	SURVIVOR	NONE	CLOSING_STARTED_US	CL
 GENERATION	SUCCESS_WITH_EXCLUSIONS	SOURCE_ID	EXCLUDED	CLOSING_COMMAND_TIMEOUT	CLOSING_STARTED_US	CLOSING_DEADLINE_US
 SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME=
-'Preserve_trx_transfer_receiver_after_apply_before_ack_faults')
-=@after_apply_faults_before+1
-AS exactly_one_after_apply_before_ack_fault;
-exactly_one_after_apply_before_ack_fault
-1
-SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
-WHERE VARIABLE_NAME=
 'Preserve_trx_transfer_receiver_sequence_already_applied')
 >@already_applied_before AS object_payload_sequences_reused;
 object_payload_sequences_reused
@@ -378,12 +371,6 @@ SELECT COUNT(*)=3 AND SUM(v)=607 AS receiver_native_survives_restart
 FROM xfer2_phase1_receiver_native;
 receiver_native_survives_restart
 1
-SELECT VARIABLE_VALUE=0 AS after_apply_fault_counter_reset
-FROM performance_schema.global_status
-WHERE VARIABLE_NAME=
-'Preserve_trx_transfer_receiver_after_apply_before_ack_faults';
-after_apply_fault_counter_reset
-1
 SELECT VARIABLE_VALUE=0 AS already_applied_counter_reset
 FROM performance_schema.global_status
 WHERE VARIABLE_NAME=
@@ -391,7 +378,7 @@ WHERE VARIABLE_NAME=
 already_applied_counter_reset
 1
 SET GLOBAL debug=
-'-d,preserve_trx_transfer_receiver_after_frame_apply_before_ack,preserve_trx_transfer_receiver_drop_nonfinal_object_batch_ack_once';
+'-d,preserve_trx_transfer_receiver_after_frame_apply_before_ack,preserve_trx_transfer_receiver_drop_nonfinal_object_batch_ack_once,syncpoint_xfer2_nonfinal_apply_before_ack_fault';
 Got one of the listed errors
 SELECT COUNT(*)=32 AS thirty_two_accounts,
 SUM(balance)=32001 AS committed_background_balance,

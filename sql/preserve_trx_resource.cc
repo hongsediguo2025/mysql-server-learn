@@ -921,9 +921,6 @@ DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_transfer_receiver_sequence_already_applied,
     preserve_trx_transfer_receiver_sequence_already_applied_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
-    show_preserve_trx_transfer_receiver_after_apply_before_ack_faults,
-    preserve_trx_transfer_receiver_after_apply_before_ack_faults_status())
-DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_transfer_source_handoff_pending_epochs,
     preserve_trx_transfer_source_handoff_pending_epochs_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
@@ -950,9 +947,6 @@ DEFINE_PRESERVE_TRX_SHOW_FUNC(
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_transfer_receiver_terminal_status_not_found,
     preserve_trx_transfer_receiver_terminal_status_not_found_status())
-DEFINE_PRESERVE_TRX_SHOW_FUNC(
-    show_preserve_trx_transfer_receiver_precommit_abandon_cleanup_deferred,
-    preserve_trx_transfer_receiver_precommit_abandon_cleanup_deferred_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_transfer_receiver_precommit_abandon_reaper_attempts,
     preserve_trx_transfer_receiver_precommit_abandon_reaper_attempts_status())

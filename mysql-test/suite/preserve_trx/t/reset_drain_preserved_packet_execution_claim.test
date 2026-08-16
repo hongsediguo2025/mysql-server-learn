@@ -1,0 +1,213 @@
+# Review-IDs: RR-M18
+# Workload: W01 + O01/O10 | FX: drained packet vs reset restore overlap
+# Overlays: O01,O10
+# Actors: T0=async DRAIN owner & restore executor, T1=PRESERVED_DRAINED
+#         client, T2=async RESET DRAIN requester/waiter, T3=observer/release,
+#         T4=O01 consistent reader
+# RED invariant (unfixed code): T0 reaches the restore mutation boundary for
+#   T1's THD while T1 is still inside its drained-packet rejection window
+#   (packet read, 4020 not yet sent) and no execution claim serializes them;
+#   the named invariant
+#   reset_overlapped_drained_packet_without_execution_claim aborts the
+#   server.
+# GREEN invariant (this .result is the hand-written GREEN contract per plan
+#   section 7.2): T1 acquires the execution claim after header arrival and
+#   holds it through the deterministic 4020 status send and statement
+#   cleanup; T0 blocks as a claim waiter; exactly one RESET completes; T1's
+#   command never executes; T1 then commits its restored W01 transaction
+#   exactly once; T4's two projections show no dirty read.
+#
+# This runtime race test requires a Debug server with Debug Sync enabled.
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_query_log
+
+--let $credential_file= $MYSQL_TMP_DIR/reset_packet_claim.secret
+--write_file $credential_file
+reset-packet-claim-secret
+EOF
+--exec chmod 600 $credential_file
+
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+DROP USER IF EXISTS reset_packet_app@localhost;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'reset-packet-claim-secret';
+GRANT SHUTDOWN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.*
+  TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+CREATE USER reset_packet_app@localhost;
+GRANT SELECT, INSERT, UPDATE, DELETE ON test.* TO reset_packet_app@localhost;
+GRANT SESSION_VARIABLES_ADMIN ON *.* TO reset_packet_app@localhost;
+
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$MASTER_MYPORT --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=reset_packet_mtr --rds-preserve-trx-transfer-credential-secret-file=$credential_file
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--let $restart_parameters=
+
+CALL mtr.add_suppression("Attempting backtrace");
+CALL mtr.add_suppression("You can use the following information to find out");
+CALL mtr.add_suppression("PRESERVE: RESET DRAIN invariant failure");
+
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=ON;
+SET GLOBAL rds_preserve_trx_token_retention_timeout_ms=1000;
+
+--enable_query_log
+# W01: accounts seeded with 32 rows + one audit table.
+CREATE TABLE reset_packet_accounts(
+  id INT PRIMARY KEY,
+  balance INT NOT NULL,
+  version INT NOT NULL,
+  pad CHAR(32) NOT NULL DEFAULT ''
+) ENGINE=InnoDB;
+CREATE TABLE reset_packet_audit(
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  account_id INT NOT NULL,
+  note CHAR(16) NOT NULL
+) ENGINE=InnoDB;
+--disable_query_log
+INSERT INTO reset_packet_accounts(id,balance,version,pad) VALUES
+  (1,1000,0,'p01'),(2,1000,0,'p02'),(3,1000,0,'p03'),(4,1000,0,'p04'),
+  (5,1000,0,'p05'),(6,1000,0,'p06'),(7,1000,0,'p07'),(8,1000,0,'p08'),
+  (9,1000,0,'p09'),(10,1000,0,'p10'),(11,1000,0,'p11'),(12,1000,0,'p12'),
+  (13,1000,0,'p13'),(14,1000,0,'p14'),(15,1000,0,'p15'),(16,1000,0,'p16'),
+  (17,1000,0,'p17'),(18,1000,0,'p18'),(19,1000,0,'p19'),(20,1000,0,'p20'),
+  (21,1000,0,'p21'),(22,1000,0,'p22'),(23,1000,0,'p23'),(24,1000,0,'p24'),
+  (25,1000,0,'p25'),(26,1000,0,'p26'),(27,1000,0,'p27'),(28,1000,0,'p28'),
+  (29,1000,0,'p29'),(30,1000,0,'p30'),(31,1000,0,'p31'),(32,1000,0,'p32');
+
+# T4: O01 consistent reader, first projection before the race.
+--connect(reset_packet_reader,localhost,reset_packet_app,,test)
+--enable_query_log
+SELECT COUNT(*) AS t4_accounts_before_race FROM reset_packet_accounts;
+SELECT COUNT(*) AS t4_audit_before_race FROM reset_packet_audit;
+--disable_query_log
+
+# T1: W01 owner transaction; stays idle after three nonadjacent updates and
+# one audit insert. The packet gate is armed now, before the session becomes
+# PRESERVED_DRAINED (a drained session rejects every command including SET
+# DEBUG_SYNC); it fires on the first packet of the post-drain command.
+--connect(reset_packet_app,localhost,reset_packet_app,,test)
+START TRANSACTION;
+UPDATE reset_packet_accounts SET balance=balance-10, version=version+1
+  WHERE id=3;
+UPDATE reset_packet_accounts SET balance=balance+4, version=version+1
+  WHERE id=11;
+UPDATE reset_packet_accounts SET balance=balance+6, version=version+1
+  WHERE id=27;
+INSERT INTO reset_packet_audit(account_id,note) VALUES (3,'w01-debit');
+SET DEBUG_SYNC=
+  'preserve_trx_after_command_read_before_packet_marker SIGNAL t1_packet_parked WAIT_FOR t1_packet_release';
+
+# T0: async DRAIN owner, parked at the pre-commit reset check with the
+# overlap detector armed.
+--connect(reset_packet_owner,localhost,root,,test)
+SET SESSION debug='+d,preserve_trx_reset_check_drained_packet_overlap';
+SET DEBUG_SYNC=
+  'preserve_trx_drain_before_transfer_commit_reset_check SIGNAL t0_at_precommit WAIT_FOR t0_precommit_release';
+SET DEBUG_SYNC=
+  'preserve_trx_reset_restore_waiting_for_drained_packet SIGNAL t0_waiting_for_packet';
+--send DRAIN TRANSACTIONS PRESERVE
+
+# T3: observer/release.
+--connect(reset_packet_ha,localhost,preserve_trx_ha_admin,reset-packet-claim-secret,test)
+SET DEBUG_SYNC='now WAIT_FOR t0_at_precommit TIMEOUT 60';
+--let $reset_wins_before= query_get_value(SELECT VARIABLE_VALUE+0 AS value FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_reset_drain_wins', value, 1)
+
+# T1 is PRESERVED_DRAINED now. Its next packet is parked after the packet was
+# read (inside the rejection window) and before the 4020 status is sent.
+--connection reset_packet_app
+--send SELECT 1
+
+--connection reset_packet_ha
+SET DEBUG_SYNC='now WAIT_FOR t1_packet_parked TIMEOUT 30';
+
+# T2: async RESET DRAIN requester/waiter; wins RESET_REQUESTED and waits for
+# the reset release barrier.
+--connect(reset_packet_reset,localhost,preserve_trx_ha_admin,reset-packet-claim-secret,test)
+--send RESET DRAIN
+
+--connection reset_packet_ha
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_reset_drain_wins')>$reset_wins_before
+--source include/wait_condition.inc
+
+# Release T0. On unfixed code it reaches the restore mutation boundary for
+# T1's THD while T1 is still inside the rejection window and the named
+# overlap invariant aborts the server. On fixed code T0 blocks as a claim
+# waiter until T1's rejection completes.
+SET DEBUG_SYNC='now SIGNAL t0_precommit_release';
+
+# The production restore actor has observed T1's non-idle packet boundary and
+# is waiting to claim the THD. This is the GREEN linearization witness; it does
+# not rely on a timeout or a test-only status counter.
+SET DEBUG_SYNC='now WAIT_FOR t0_waiting_for_packet TIMEOUT 30';
+
+# Release T1: it finishes the deterministic 4020 rejection and statement
+# cleanup, then releases the execution claim.
+SET DEBUG_SYNC='now SIGNAL t1_packet_release';
+
+--connection reset_packet_app
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+--reap
+
+--connection reset_packet_reset
+--reap
+
+--connection reset_packet_owner
+--error ER_PRESERVE_TRX_DRAIN_RESET
+--reap
+
+--connection reset_packet_ha
+--enable_query_log
+# GREEN-only step: on unfixed code the server is dead here, so the red run
+# stops with the named invariant abort in the crash log.
+SELECT 1 AS server_survived_packet_claim_race;
+--disable_query_log
+
+# T4 second projection: the race produced no dirty read; T1's changes are
+# still invisible because T1 has not committed yet.
+--connection reset_packet_reader
+--enable_query_log
+SELECT COUNT(*) AS t4_accounts_after_race FROM reset_packet_accounts;
+SELECT COUNT(*) AS t4_audit_after_race FROM reset_packet_audit;
+--disable_query_log
+
+# GREEN: T1's transaction was restored to its own session by the RESET; T1
+# commits it exactly once.
+--connection reset_packet_app
+COMMIT;
+
+--connect(reset_packet_idle_probe,localhost,preserve_trx_ha_admin,reset-packet-claim-secret,test)
+RESET DRAIN;
+--disconnect reset_packet_idle_probe
+
+--connection reset_packet_ha
+--enable_query_log
+SELECT GROUP_CONCAT(CONCAT(id,':',balance,':',version) ORDER BY id)
+       AS sampled_accounts FROM reset_packet_accounts WHERE id IN (3,11,27);
+SELECT COUNT(*) AS audit_rows_after_commit FROM reset_packet_audit;
+SELECT COUNT(*) AS preserved_records_after_race
+  FROM performance_schema.preserved_transactions;
+--disable_query_log
+
+--connection default
+DROP TABLE reset_packet_accounts;
+DROP TABLE reset_packet_audit;
+DROP USER preserve_trx_ha_admin@localhost;
+DROP USER reset_packet_app@localhost;
+SET DEBUG_SYNC='RESET';
+--remove_file $credential_file
+--disconnect reset_packet_reader
+--disconnect reset_packet_app
+--disconnect reset_packet_ha
+
+--enable_query_log

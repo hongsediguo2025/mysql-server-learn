@@ -28,6 +28,7 @@ LEGACY_LINT_RULE_IDS: Sequence[str] = (
     "batch_drain_context_switch_guard_lint",
     "batch_drain_drained_session_command_matrix_lint",
     "batch_drain_nonidle_autocommit_no_token_lint",
+    "batch_drain_phase2_final_hwm_overlap_lint",
     "batch_drain_unknown_query_quiesce_boundary_lint",
     "batch_drain_lock_warmcopy_hook_coverage_lint",
     "batch_drain_lock_warmcopy_no_partial_fallback_lint",
@@ -565,7 +566,7 @@ def _check_off_path_invasive_surface(repo_root: Path,
             r"Temp_table_warmcopy_participant\s*\*"
             r"preserve_trx_temp_table_ensure_participant\s*\([^)]*\)\s*\{"
             r"[\s\S]{0,260}if\s*\(\s*!preserve_trx_is_enabled\s*\(\s*\)"
-            r"\s*\|\|\s*!rds_preserve_trx_temp_table_enable",
+            r"\s*\|\|\s*!preserve_trx_temp_table_enable",
             re.S,
         ),
         message="temporary-table participant allocation must be gated by both "
@@ -579,7 +580,7 @@ def _check_off_path_invasive_surface(repo_root: Path,
         pattern=re.compile(
             r"trx_preserve_temp_space_image_dirty_page_hook_enabled\s*\(\s*\)"
             r"\s*\{[\s\S]{0,180}return\s+preserve_trx_is_enabled\s*\(\s*\)"
-            r"\s*&&\s*rds_preserve_trx_temp_table_enable\s*;",
+            r"\s*&&\s*preserve_trx_temp_table_enable\s*;",
             re.S,
         ),
         message="InnoDB temporary dirty-page hook must be inert unless both "

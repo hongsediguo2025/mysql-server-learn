@@ -9,6 +9,7 @@ come from running scripts/resumable_trx_business_e2e.py against a real server.
 import unittest
 import contextlib
 import hashlib
+import inspect
 import io
 import json
 import queue
@@ -4528,6 +4529,61 @@ class WorkloadPlanTest(unittest.TestCase):
 
         self.assertEqual(runner.coordinator.published, [])
 
+    def test_mixed_resume_proof_failure_closes_all_unpublished_connections(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            scenario="hundred_session_semantic_matrix",
+            sessions=2,
+            cycles=1,
+            strict_token_count=True,
+            mixed_pressure_workload=True,
+            mixed_seed_rows_per_table=10,
+            mixed_transaction_sizes=[10],
+            mixed_transaction_weights=[1],
+            mixed_min_started_sessions=2,
+            mixed_min_completed_statements=2,
+            business_run_before_drain_s=1.0,
+        )
+        runner.plan = WorkloadPlan(runner.config)
+        runner.runtime = _ResumeMappingRuntime([(1, 10), (2, 10)])
+        connections = []
+
+        def connect(database=False, autocommit=True):
+            conn = _FakeConnection()
+            conn.transactional = database and not autocommit
+            connections.append(conn)
+            return conn
+
+        runner.runtime.connect = connect
+        runner.coordinator = _ReadyCoordinator()
+        runner.stop_event = threading.Event()
+        runner.phase2_pause_samples = []
+        runner.resume_token_elapsed_samples_us = []
+        runner.mixed_resumed_survivor_details = []
+        runner.restart_server = lambda: None
+        runner.configure_preserve_globals = lambda: None
+        runner.read_preserved_tokens = lambda: ["tok-a", "tok-b"]
+        runner._execute_drain_preserve = lambda: None
+
+        def proof(conn, sid, tx_id):
+            if sid == 2:
+                raise RuntimeError("proof failed")
+            return {
+                "stored_procedure_completed": True,
+                "stored_procedure_last_tx_id": tx_id,
+                "stored_procedure_last_stmt_no": 8,
+            }
+
+        runner._mixed_resumed_stored_procedure_proof = proof
+
+        with self.assertRaisesRegex(RuntimeError, "proof failed"):
+            runner.drain_restart_resume(cycle=1)
+
+        transactional = [conn for conn in connections if conn.transactional]
+        self.assertEqual(len(transactional), 2)
+        self.assertTrue(all(conn.closed for conn in transactional))
+        self.assertEqual(runner.coordinator.published, [])
+
     def test_drain_restart_resume_publishes_all_resumed_connections_atomically(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
         runner.config = HarnessConfig(sessions=2)
@@ -4612,6 +4668,44 @@ class WorkloadPlanTest(unittest.TestCase):
             sql_text,
         )
         self.assertFalse(conn.closed)
+
+    def test_resume_token_closes_connection_when_resume_fails(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(sessions=1)
+        runner.runtime = _FakeRuntime()
+        connection = _FakeConnection()
+        runner.runtime.connect = lambda database=False, autocommit=True: connection
+
+        def fail_resume(conn, sql, fetch=False):
+            raise RuntimeError("resume failed")
+
+        runner.runtime.execute = fail_resume
+
+        with self.assertRaisesRegex(RuntimeError, "resume failed"):
+            runner.resume_token("tok-fail")
+
+        self.assertTrue(connection.closed)
+
+    def test_fresh_restart_connection_is_closed_when_session_setup_fails(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            sessions=2,
+            strict_token_count=False,
+            mixed_pressure_workload=True,
+        )
+        runner.runtime = _FakeRuntime()
+        connection = _FakeConnection()
+        runner.runtime.connect = lambda database=False, autocommit=True: connection
+        runner.runtime.execute = mock.Mock(
+            side_effect=RuntimeError("session setup failed")
+        )
+        resumed = {1: _FakeConnection()}
+
+        with self.assertRaisesRegex(RuntimeError, "session setup failed"):
+            runner._add_mixed_pressure_fresh_restart_connections(resumed)
+
+        self.assertTrue(connection.closed)
+        self.assertEqual(sorted(resumed), [1])
 
     def test_resume_token_rejects_corrupt_temp_table_rows_when_enabled(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
@@ -5282,6 +5376,7 @@ class WorkloadPlanTest(unittest.TestCase):
                 "5",
                 "--receiver-read-load-max-p99-increase-pct",
                 "10",
+                "--receiver-read-load-observe-only",
             ]
         )
 
@@ -5296,6 +5391,7 @@ class WorkloadPlanTest(unittest.TestCase):
         self.assertEqual(cfg.receiver_read_load_baseline_s, 5.0)
         self.assertEqual(cfg.receiver_read_load_max_qps_drop_pct, 5.0)
         self.assertEqual(cfg.receiver_read_load_max_p99_increase_pct, 10.0)
+        self.assertFalse(cfg.receiver_read_load_performance_gate_enforced)
 
     def test_receiver_read_load_report_accepts_business_first_budget(self):
         report = build_receiver_read_load_report(
@@ -9681,13 +9777,13 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
             self.assertEqual(runner.phase2_pause_samples[0].bucket_mb, 64)
             self.assertEqual(runner.phase2_pause_samples[0].phase2_pause_ms, 123.456)
 
-    def test_final_mixed_cycle_stops_after_sql_resume_without_worker_handoff(self):
+    def test_final_mixed_cycle_commits_survivor_before_cleanup_without_worker_handoff(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
         runner.config = HarnessConfig(
             scenario="hundred_session_semantic_matrix",
             sessions=2,
             cycles=1,
-            strict_token_count=True,
+            strict_token_count=False,
             mixed_pressure_workload=True,
             mixed_seed_rows_per_table=10,
             mixed_transaction_sizes=[10],
@@ -9697,7 +9793,25 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
             business_run_before_drain_s=1.0,
         )
         runner.plan = WorkloadPlan(runner.config)
-        runner.runtime = _ResumeMappingRuntime([(1, 10, 0), (2, 10, 0)])
+        runner.runtime = _ResumeMappingRuntime([(1, 10, 0)])
+        connections = []
+
+        def connect(database=False, autocommit=True):
+            conn = _FakeConnection()
+            conn.transactional = database and not autocommit
+            conn.resumed = False
+            connections.append(conn)
+            return conn
+
+        runner.runtime.connect = connect
+        execute = runner.runtime.execute
+
+        def execute_and_mark_resume(conn, sql, fetch=False):
+            if sql.startswith("RESUME PRESERVED TRANSACTION"):
+                conn.resumed = True
+            return execute(conn, sql, fetch=fetch)
+
+        runner.runtime.execute = execute_and_mark_resume
         runner.coordinator = _ReadyCoordinator()
         runner.stop_event = threading.Event()
         runner.phase2_pause_samples = []
@@ -9705,7 +9819,7 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
         runner.mixed_resumed_survivor_details = []
         runner.restart_server = lambda: None
         runner.configure_preserve_globals = lambda: None
-        runner.read_preserved_tokens = lambda: ["tok-a", "tok-b"]
+        runner.read_preserved_tokens = lambda: ["tok-a"]
         runner._execute_drain_preserve = lambda: None
         runner._mixed_resumed_stored_procedure_proof = (
             lambda conn, sid, tx_id: {
@@ -9721,6 +9835,14 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
         self.assertTrue(runner.mixed_resume_validation_completed)
         self.assertEqual(runner.coordinator.cancelled, [1])
         self.assertEqual(runner.coordinator.published, [])
+        transactional = [conn for conn in connections if conn.transactional]
+        self.assertEqual(
+            [conn.commit_count for conn in transactional if conn.resumed], [1]
+        )
+        self.assertEqual(
+            [conn.commit_count for conn in transactional if not conn.resumed], [0]
+        )
+        self.assertTrue(all(conn.closed for conn in connections))
 
     def test_drain_restart_resume_rejects_phase2_total_over_gate(self):
         with tempfile.NamedTemporaryFile("w+", encoding="utf-8") as error_log:
@@ -10714,7 +10836,7 @@ class ResetDrainHarnessTest(unittest.TestCase):
         )
         self.assertTrue(connection.closed)
 
-    def test_debug_reset_scenario_pauses_receiver_prewarm_for_orphan_ttl(self):
+    def test_reset_scenario_only_shortens_receiver_retention(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
         runner.runtime = mock.Mock()
         runner.reset_debug_sync_used = True
@@ -10730,31 +10852,22 @@ class ResetDrainHarnessTest(unittest.TestCase):
                     connection,
                     "SET GLOBAL "
                     "rds_preserve_trx_token_retention_timeout_ms=1000",
-                ),
-                mock.call(
-                    connection,
-                    "SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=ON",
-                ),
+                )
             ],
         )
-        self.assertTrue(runner.reset_receiver_prewarm_paused)
         self.assertTrue(connection.closed)
 
-    def test_reset_scenario_restores_receiver_prewarm_after_debug_evidence(self):
-        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
-        runner.runtime = mock.Mock()
-        runner.reset_receiver_prewarm_paused = True
-        connection = _FakeConnection()
-        runner._receiver_admin_connection = mock.Mock(return_value=connection)
+    def test_debug_phase2_reset_uses_precommit_cas_without_orphan_flow(self):
+        source = inspect.getsource(BusinessE2ERunner._run_reset_drain_phase2)
 
-        runner._reset_receiver_prewarm_pause()
-
-        runner.runtime.execute.assert_called_once_with(
-            connection,
-            "SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=OFF",
+        self.assertIn(
+            "preserve_trx_transfer_before_commit_send_ownership_cas", source
         )
-        self.assertFalse(runner.reset_receiver_prewarm_paused)
-        self.assertTrue(connection.closed)
+        self.assertNotIn(
+            "preserve_trx_transfer_after_commit_ack_before_final_ack", source
+        )
+        self.assertNotIn("reset_receiver_accepted", source)
+        self.assertNotIn("_wait_receiver_epoch_expired", source)
 
     def test_direct_command_probe_does_not_create_cursor_or_ping(self):
         class DirectConnection:
@@ -10871,43 +10984,22 @@ class ResetDrainHarnessTest(unittest.TestCase):
         )
         self.assertTrue(connection.closed)
 
-    def test_reset_thread_waits_for_live_closing_control_counter(self):
+    def test_reset_thread_has_no_false_closing_status_barrier(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
-        runner.config = HarnessConfig(
-            scenario="standby_transfer_reset_drain",
-            repeated_row_write_workload=True,
-            receiver_unix_socket="/tmp/reset-receiver.sock",
-            receiver_preserve_dir="/tmp/reset-receiver/preserve",
-            resume_timeout_s=2.0,
-        ).validate()
         connection = _FakeConnection()
         runner.runtime = mock.Mock()
-        status_values = iter((10, 11))
-
-        def execute(_connection, sql, fetch=False):
-            self.assertIs(_connection, connection)
-            if sql.startswith("SELECT VARIABLE_VALUE"):
-                self.assertTrue(fetch)
-                self.assertIn(
-                    "Preserve_trx_closing_control_connection_commands", sql
-                )
-                return [(next(status_values),)]
-            self.assertEqual(sql, "RESET DRAIN")
-            self.assertFalse(fetch)
-            return ()
-
-        runner.runtime.execute.side_effect = execute
 
         thread, state = runner._start_reset_thread(
             label="phase2",
             connection=connection,
-            wait_for_closing_control_commands_after=10,
         )
         thread.join(1.0)
 
         self.assertFalse(thread.is_alive())
         self.assertIsNone(state["error"])
-        self.assertEqual(runner.runtime.execute.call_count, 3)
+        runner.runtime.execute.assert_called_once_with(
+            connection, "RESET DRAIN"
+        )
         self.assertTrue(connection.closed)
 
     def test_reset_cancelled_drain_accepts_4013_only_after_confirmed_win(self):
@@ -11137,13 +11229,13 @@ class ResetDrainHarnessTest(unittest.TestCase):
                     "owner_cleanup_done_us": 1_150,
                     "first_original_connection_replay_us": 1_130,
                     "all_original_connections_replayed_us": 1_140,
-                    "phase2_trigger": "FINAL_ACK_DEBUG_SYNC",
+                    "phase2_trigger": "PRECOMMIT_CAS_DEBUG_SYNC",
                     "phase2_observer_rejected": False,
                     "draining_rejected_session_count": 0,
                 }
             ]
-            runner.reset_receiver_orphan_accepted = True
-            runner.reset_receiver_orphan_expired = True
+            runner.reset_receiver_orphan_accepted = False
+            runner.reset_receiver_orphan_expired = False
             runner.reset_debug_sync_used = True
             runner.receiver_read_load_report = None
 
@@ -11161,8 +11253,8 @@ class ResetDrainHarnessTest(unittest.TestCase):
         self.assertEqual(report["reset_response_receiver_wait_us"], 0)
         self.assertEqual(report["reset_response_artifact_payload_read_bytes"], 0)
         self.assertTrue(report["original_connections_continued"])
-        self.assertTrue(report["receiver_orphan_expired"])
-        self.assertEqual(report["phase2_trigger"], "FINAL_ACK_DEBUG_SYNC")
+        self.assertFalse(report["receiver_orphan_expired"])
+        self.assertEqual(report["phase2_trigger"], "PRECOMMIT_CAS_DEBUG_SYNC")
 
 
 if __name__ == "__main__":

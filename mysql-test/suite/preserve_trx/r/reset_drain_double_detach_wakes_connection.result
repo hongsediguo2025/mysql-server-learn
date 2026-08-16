@@ -1,0 +1,43 @@
+CALL mtr.add_suppression("Preserved transaction batch cleanup failed to detach reattached transaction");
+CALL mtr.add_suppression("PRESERVE: RESET DRAIN invariant failure");
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=ON;
+SET GLOBAL rds_preserve_trx_token_retention_timeout_ms=1000;
+CREATE TABLE reset_wakeup_accounts(
+id INT PRIMARY KEY,
+balance INT NOT NULL,
+version INT NOT NULL,
+pad CHAR(32) NOT NULL DEFAULT ''
+) ENGINE=InnoDB;
+CREATE TABLE reset_wakeup_audit(
+id INT AUTO_INCREMENT PRIMARY KEY,
+account_id INT NOT NULL,
+note CHAR(16) NOT NULL
+) ENGINE=InnoDB;
+SELECT COUNT(*) AS failed_observable_rows
+FROM performance_schema.preserved_transactions
+WHERE STATE='FAILED';
+failed_observable_rows
+1
+SELECT COUNT(*) AS t1_thread_retained_by_restore_pin_after_kill
+FROM performance_schema.threads
+WHERE PROCESSLIST_USER='reset_wakeup_app' AND PROCESSLIST_COMMAND='Sleep';
+t1_thread_retained_by_restore_pin_after_kill
+1
+SELECT COUNT(*) AS t1_thread_present_after_reset_barrier
+FROM performance_schema.threads
+WHERE PROCESSLIST_USER='reset_wakeup_app' AND PROCESSLIST_COMMAND='Sleep';
+t1_thread_present_after_reset_barrier
+0
+SELECT GROUP_CONCAT(CONCAT(id,':',balance,':',version) ORDER BY id)
+AS sampled_accounts FROM reset_wakeup_accounts WHERE id IN (3,11,27);
+sampled_accounts
+3:1000:0,11:1000:0,27:1000:0
+SELECT COUNT(*) AS audit_rows FROM reset_wakeup_audit;
+audit_rows
+0
+SELECT TOKEN, STATE, LAST_ERROR IS NOT NULL AS has_last_error
+FROM performance_schema.preserved_transactions
+ORDER BY TOKEN;
+TOKEN	STATE	has_last_error
+TOKEN	FAILED	1

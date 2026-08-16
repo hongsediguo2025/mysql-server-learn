@@ -667,6 +667,7 @@ class HarnessConfig:
     receiver_read_load_baseline_s: float = 0.0
     receiver_read_load_max_qps_drop_pct: float = 5.0
     receiver_read_load_max_p99_increase_pct: float = 10.0
+    receiver_read_load_performance_gate_enforced: bool = True
     source_continuous_tiered_load: bool = False
     source_tiered_load_threads_per_tier: int = 0
     source_tiered_load_work_units: List[int] = dataclasses.field(
@@ -5830,6 +5831,9 @@ class BusinessE2ERunner:
                     max_p99_increase_pct=(
                         self.config.receiver_read_load_max_p99_increase_pct
                     ),
+                    enforce_performance_budget=(
+                        self.config.receiver_read_load_performance_gate_enforced
+                    ),
                 )
             completed_stmt_total = sum(
                 worker.statements_completed for worker in self.workers
@@ -5889,7 +5893,6 @@ class BusinessE2ERunner:
         self.reset_receiver_orphan_accepted = False
         self.reset_receiver_orphan_expired = False
         self.reset_debug_sync_used = self._source_debug_sync_supported()
-        self.reset_receiver_prewarm_paused = False
         self.reset_phase1_skipped_reason: Optional[str] = None
         self.reset_workers: List[ResetDrainWorker] = []
         try:
@@ -5933,7 +5936,6 @@ class BusinessE2ERunner:
                     worker.coordinator.cancel()
             for worker in self.reset_workers:
                 worker.join(min(5.0, self.config.worker_join_timeout_s))
-            self._reset_receiver_prewarm_pause()
             self._reset_source_debug_sync()
             if self.config.keep_schema is False and completed_successfully:
                 self.drop_schema()
@@ -5946,31 +5948,8 @@ class BusinessE2ERunner:
                 "SET GLOBAL "
                 "rds_preserve_trx_token_retention_timeout_ms=1000",
             )
-            if self.reset_debug_sync_used:
-                self.runtime.execute(
-                    conn,
-                    "SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=ON",
-                )
-                self.reset_receiver_prewarm_paused = True
         finally:
             conn.close()
-
-    def _reset_receiver_prewarm_pause(self) -> None:
-        if not getattr(self, "reset_receiver_prewarm_paused", False):
-            return
-        conn = None
-        try:
-            conn = self._receiver_admin_connection()
-            self.runtime.execute(
-                conn,
-                "SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=OFF",
-            )
-            self.reset_receiver_prewarm_paused = False
-        except BaseException:
-            pass
-        finally:
-            if conn is not None:
-                conn.close()
 
     def _source_debug_sync_supported(self) -> bool:
         conn = None
@@ -6209,34 +6188,6 @@ class BusinessE2ERunner:
                 )
             time.sleep(min(0.02, remaining))
 
-    def _wait_receiver_epoch_expired(
-        self,
-        *,
-        active_before: int,
-        expired_before: int,
-        timeout_s: float,
-    ) -> Tuple[int, int]:
-        deadline = time.monotonic() + timeout_s
-        while True:
-            active = self._read_status_int(
-                "Preserve_trx_transfer_receiver_active_epochs",
-                connection_factory=self._receiver_admin_connection,
-            )
-            expired = self._read_status_int(
-                "Preserve_trx_transfer_receiver_expired_epochs",
-                connection_factory=self._receiver_admin_connection,
-            )
-            if active <= active_before and expired > expired_before:
-                return active, expired
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(
-                    "receiver accepted epoch did not expire: "
-                    f"active_before={active_before} active={active} "
-                    f"expired_before={expired_before} expired={expired}"
-                )
-            time.sleep(min(0.1, remaining))
-
     def _run_reset_drain_phase1(self) -> Dict[str, object]:
         conn = self.runtime.connect(database=True, autocommit=False)
         drain_thread: Optional[threading.Thread] = None
@@ -6335,16 +6286,8 @@ class BusinessE2ERunner:
         debug_control_conn = None
         reset_control_conn = None
         phase2_released = False
-        final_ack_released = False
+        precommit_cas_released = False
         reset_win_confirmed = False
-        active_before = self._read_status_int(
-            "Preserve_trx_transfer_receiver_active_epochs",
-            connection_factory=self._receiver_admin_connection,
-        )
-        expired_before = self._read_status_int(
-            "Preserve_trx_transfer_receiver_expired_epochs",
-            connection_factory=self._receiver_admin_connection,
-        )
         try:
             if deterministic_ack_window:
                 debug_control_conn = self._source_ha_control_connection()
@@ -6389,9 +6332,9 @@ class BusinessE2ERunner:
                     "preserve_trx_warmcopy_after_closing_state_before_targets "
                     "SIGNAL reset_phase2_entered "
                     "WAIT_FOR reset_phase2_release",
-                    "preserve_trx_transfer_after_commit_ack_before_final_ack "
-                    "SIGNAL reset_receiver_accepted "
-                    "WAIT_FOR reset_final_ack_release",
+                    "preserve_trx_transfer_before_commit_send_ownership_cas "
+                    "SIGNAL reset_precommit_cas_reached "
+                    "WAIT_FOR reset_precommit_cas_release",
                 ]
             if read_load_probe is not None:
                 read_load_probe.begin_transfer()
@@ -6418,16 +6361,9 @@ class BusinessE2ERunner:
                 )
                 phase2_released = True
                 self._debug_sync_now(
-                    "now WAIT_FOR reset_receiver_accepted TIMEOUT 120",
+                    "now WAIT_FOR reset_precommit_cas_reached TIMEOUT 120",
                     connection=debug_control_conn,
                 )
-                self._wait_status_at_least(
-                    "Preserve_trx_transfer_receiver_active_epochs",
-                    active_before + 1,
-                    timeout_s=self.config.resume_timeout_s,
-                    connection_factory=self._receiver_admin_connection,
-                )
-                self.reset_receiver_orphan_accepted = True
                 coordinator.allow_drain_probe()
                 if not coordinator.wait_all_probes_started(
                     self.config.resume_timeout_s
@@ -6443,7 +6379,7 @@ class BusinessE2ERunner:
                     raise TimeoutError(
                         "not every original connection observed error 4020"
                     )
-                phase2_trigger = "FINAL_ACK_DEBUG_SYNC"
+                phase2_trigger = "PRECOMMIT_CAS_DEBUG_SYNC"
                 phase2_observer_rejected = False
                 reset_thread, reset_state = self._start_reset_thread(
                     label="phase2", connection=reset_control_conn
@@ -6457,10 +6393,10 @@ class BusinessE2ERunner:
                 )
                 reset_win_confirmed = True
                 self._debug_sync_now(
-                    "now SIGNAL reset_final_ack_release",
+                    "now SIGNAL reset_precommit_cas_release",
                     connection=debug_control_conn,
                 )
-                final_ack_released = True
+                precommit_cas_released = True
                 self._join_reset_thread(reset_thread, reset_state)
             else:
                 self._join_reset_thread(reset_thread, reset_state)
@@ -6507,18 +6443,6 @@ class BusinessE2ERunner:
 
             probe = self.runtime.connect(database=False)
             probe.close()
-            if self.reset_receiver_orphan_accepted:
-                self.reset_receiver_active_epochs_after_expiry, \
-                    self.reset_receiver_expired_epochs_after_expiry = (
-                        self._wait_receiver_epoch_expired(
-                            active_before=active_before,
-                            expired_before=expired_before,
-                            timeout_s=max(
-                                8.0, self.config.receiver_read_load_baseline_s + 4.0
-                            ),
-                        )
-                    )
-                self.reset_receiver_orphan_expired = True
             replay_timestamps = coordinator.replay_timestamps_us()
             if not replay_timestamps:
                 raise AssertionError("RESET replay timestamps are empty")
@@ -6554,10 +6478,10 @@ class BusinessE2ERunner:
                     )
                 except Exception:
                     pass
-            if deterministic_ack_window and not final_ack_released:
+            if deterministic_ack_window and not precommit_cas_released:
                 try:
                     self._debug_sync_now(
-                        "now SIGNAL reset_final_ack_release",
+                        "now SIGNAL reset_precommit_cas_release",
                         connection=debug_control_conn,
                     )
                 except Exception:
@@ -7732,6 +7656,9 @@ class BusinessE2ERunner:
                 self.config.lockset_select_for_update
             ),
             "workload_lockset_minimal_table": self.config.lockset_minimal_table,
+            "receiver_read_load_performance_gate_enforced": (
+                self.config.receiver_read_load_performance_gate_enforced
+            ),
             "completed_stmt_total": completed_stmt_total,
             "phase2_pause_samples_ms": [
                 metric.phase2_pause_ms for metric in metrics
@@ -9497,11 +9424,11 @@ END
         try:
             for sid in missing_sids:
                 conn = self.runtime.connect(database=True, autocommit=False)
+                added[sid] = conn
                 self.runtime.execute(
                     conn,
                     "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED",
                 )
-                added[sid] = conn
         except BaseException:
             for conn in added.values():
                 try:
@@ -9533,6 +9460,8 @@ END
         )
         startup_recovery_log_offset = self.warmcopy_error_log_offset()
         generation = self.coordinator.request_drain_checkpoint()
+        resumed_connections: Dict[int, object] = {}
+        resumed_connections_published = False
         try:
             if self.config.inflight_drain_probe:
                 if not self.coordinator.wait_all_drainable_for_drain(
@@ -9662,7 +9591,6 @@ END
             if self.config.strict_token_count and len(tokens) != self.config.sessions:
                 raise AssertionError(f"expected {self.config.sessions} preserved tokens, got {len(tokens)}")
             LOG.info("cycle %s resuming %s preserved transactions", cycle, len(tokens))
-            resumed_connections: Dict[int, object] = {}
             resumed_large_buckets: Dict[int, int] = {}
             resumed_tx_ids: Dict[int, int] = {}
             resumed_completed_stmt: Dict[int, int] = {}
@@ -9778,18 +9706,23 @@ END
             ):
                 self.purge_old_binary_logs_after_resume()
             if mixed_resume_validation_is_terminal:
-                self.mixed_resume_validation_completed = True
                 self.stop_event.set()
-                for conn in resumed_connections.values():
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
-                resumed_connections.clear()
-                self.coordinator.cancel_drain_checkpoint(generation)
+                try:
+                    for sid in sorted(resumed_tx_ids):
+                        resumed_connections[sid].commit()
+                    self.mixed_resume_validation_completed = True
+                finally:
+                    for conn in resumed_connections.values():
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                    resumed_connections.clear()
+                    self.coordinator.cancel_drain_checkpoint(generation)
                 LOG.info(
                     "cycle %s completed mixed startup/RESUME validation; "
-                    "post-resume business SQL is outside this E2E contract",
+                    "survivor transactions committed; post-resume business SQL "
+                    "is outside this E2E contract",
                     cycle,
                 )
                 return
@@ -9803,6 +9736,7 @@ END
                     and cycle < self.config.cycles
                 ),
             )
+            resumed_connections_published = True
             if self.config.shutdown_gap_replay_probe:
                 if not self.coordinator.wait_for_shutdown_gap_replay_completed(
                     sid=1,
@@ -9840,6 +9774,13 @@ END
                     )
                 self.shutdown_gap_replay_samples.append(sample)
         except BaseException:
+            if not resumed_connections_published:
+                for conn in resumed_connections.values():
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                resumed_connections.clear()
             self.coordinator.cancel_drain_checkpoint(generation)
             raise
 
@@ -11894,45 +11835,50 @@ END
 
     def resume_token(self, token: str) -> Tuple[int, object, int, int, int]:
         conn = self.runtime.connect(database=True, autocommit=False)
-        quoted = quote_sql_string(token)
-        started_ns = time.monotonic_ns()
-        self.runtime.execute(conn, f"RESUME PRESERVED TRANSACTION {quoted}")
-        elapsed_us = max(1, (time.monotonic_ns() - started_ns) // 1000)
-        if not hasattr(self, "resume_token_elapsed_samples_us"):
-            self.resume_token_elapsed_samples_us = []
-        self.resume_token_elapsed_samples_us.append(int(elapsed_us))
-        rows = self.runtime.execute(
-            conn,
-            "SELECT @rtx_e2e_sid, @rtx_e2e_tx, @rtx_e2e_large_bucket_mb, "
-            "@rtx_e2e_stmt_completed",
-            fetch=True,
-        )
-        if len(rows) != 1 or rows[0][0] is None or rows[0][1] is None:
-            conn.close()
-            raise AssertionError(f"resumed token {token} did not expose restored sid/tx user vars")
-        sid = int(rows[0][0])
-        tx_id = int(rows[0][1])
-        bucket_mb = int(rows[0][2] or 0)
-        completed_stmt_no = -1 if rows[0][3] is None else int(rows[0][3])
-        LOG.debug(
-            "resumed token maps to sid=%s tx=%s bucket_mb=%s completed_stmt=%s",
-            sid,
-            tx_id,
-            bucket_mb,
-            completed_stmt_no,
-        )
-        if sid < 1 or sid > self.config.sessions:
-            conn.close()
-            raise AssertionError(f"resumed token {token} has invalid sid {sid}")
-        if tx_id <= 0:
-            conn.close()
-            raise AssertionError(f"resumed token {token} has invalid tx id {tx_id}")
-        if self.config.temp_table_workload and completed_stmt_no < 0:
-            conn.close()
-            raise AssertionError(
-                f"resumed token {token} did not expose restored completed statement user var"
+        try:
+            quoted = quote_sql_string(token)
+            started_ns = time.monotonic_ns()
+            self.runtime.execute(conn, f"RESUME PRESERVED TRANSACTION {quoted}")
+            elapsed_us = max(1, (time.monotonic_ns() - started_ns) // 1000)
+            if not hasattr(self, "resume_token_elapsed_samples_us"):
+                self.resume_token_elapsed_samples_us = []
+            self.resume_token_elapsed_samples_us.append(int(elapsed_us))
+            rows = self.runtime.execute(
+                conn,
+                "SELECT @rtx_e2e_sid, @rtx_e2e_tx, @rtx_e2e_large_bucket_mb, "
+                "@rtx_e2e_stmt_completed",
+                fetch=True,
             )
-        return sid, conn, bucket_mb, tx_id, completed_stmt_no
+            if len(rows) != 1 or rows[0][0] is None or rows[0][1] is None:
+                raise AssertionError(
+                    f"resumed token {token} did not expose restored sid/tx user vars"
+                )
+            sid = int(rows[0][0])
+            tx_id = int(rows[0][1])
+            bucket_mb = int(rows[0][2] or 0)
+            completed_stmt_no = -1 if rows[0][3] is None else int(rows[0][3])
+            LOG.debug(
+                "resumed token maps to sid=%s tx=%s bucket_mb=%s completed_stmt=%s",
+                sid,
+                tx_id,
+                bucket_mb,
+                completed_stmt_no,
+            )
+            if sid < 1 or sid > self.config.sessions:
+                raise AssertionError(f"resumed token {token} has invalid sid {sid}")
+            if tx_id <= 0:
+                raise AssertionError(f"resumed token {token} has invalid tx id {tx_id}")
+            if self.config.temp_table_workload and completed_stmt_no < 0:
+                raise AssertionError(
+                    f"resumed token {token} did not expose restored completed statement user var"
+                )
+            return sid, conn, bucket_mb, tx_id, completed_stmt_no
+        except BaseException:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            raise
 
     def _validate_resumed_temp_table(
         self, conn, token: str, sid: int, tx_id: int, completed_stmt_no: int
@@ -13388,6 +13334,15 @@ command is used after each DRAIN command shuts that server down.
     parser.add_argument("--receiver-read-load-baseline-seconds", dest="receiver_read_load_baseline_s", type=float, default=0.0, help="receiver point-read baseline duration before source transfer starts")
     parser.add_argument("--receiver-read-load-max-qps-drop-pct", type=float, default=5.0, help="maximum allowed receiver point-read QPS drop during transfer")
     parser.add_argument("--receiver-read-load-max-p99-increase-pct", type=float, default=10.0, help="maximum allowed receiver point-read P99 latency increase during transfer")
+    parser.add_argument(
+        "--receiver-read-load-observe-only",
+        dest="receiver_read_load_performance_gate_enforced",
+        action="store_false",
+        help=(
+            "collect receiver read-load samples and require nonempty, "
+            "error-free evidence without applying QPS/P99 performance budgets"
+        ),
+    )
     parser.add_argument("--source-continuous-tiered-load", action="store_true", help="run independent continuous source SQL in measured 10ms/100ms/200ms tiers until CLOSING cuts every connection off")
     parser.add_argument("--source-tiered-load-threads-per-tier", type=int, default=0, help="ordinary source business connections in each continuous SQL duration tier")
     parser.add_argument("--source-tiered-load-work-units", type=_parse_positive_int_list, default=[], help="three comma-separated real scan work-unit counts for the 10ms/100ms/200ms tiers")
@@ -13528,6 +13483,9 @@ command is used after each DRAIN command shuts that server down.
         ),
         receiver_read_load_max_p99_increase_pct=(
             args.receiver_read_load_max_p99_increase_pct
+        ),
+        receiver_read_load_performance_gate_enforced=(
+            args.receiver_read_load_performance_gate_enforced
         ),
         source_continuous_tiered_load=(
             args.source_continuous_tiered_load

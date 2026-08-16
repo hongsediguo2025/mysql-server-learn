@@ -1,0 +1,4 @@
+!include ../my.cnf
+
+[mysqld.2]
+rds-preserve-trx-transfer-runtime-profile=BUSINESS_FIRST

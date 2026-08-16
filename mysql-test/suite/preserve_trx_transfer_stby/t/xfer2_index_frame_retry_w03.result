@@ -82,9 +82,6 @@ FROM performance_schema.global_status WHERE VARIABLE_NAME=
 SET @admitted_bytes_before=(SELECT VARIABLE_VALUE+0
 FROM performance_schema.global_status WHERE VARIABLE_NAME=
 'Preserve_trx_transfer_receiver_admitted_bytes');
-SET @after_apply_before=(SELECT VARIABLE_VALUE+0
-FROM performance_schema.global_status WHERE VARIABLE_NAME=
-'Preserve_trx_transfer_receiver_after_apply_before_ack_faults');
 SET @already_applied_before=(SELECT VARIABLE_VALUE+0
 FROM performance_schema.global_status WHERE VARIABLE_NAME=
 'Preserve_trx_transfer_receiver_sequence_already_applied');
@@ -267,6 +264,8 @@ FROM xfer2_x903_indexed WHERE id=1537;
 outsider_still_sees_deleted_row
 1
 DRAIN TRANSACTIONS PRESERVE;
+SET DEBUG_SYNC='now WAIT_FOR reached_xfer2_nonfinal_apply_before_ack_fault TIMEOUT 60';
+SET DEBUG_SYNC='now SIGNAL continue_xfer2_nonfinal_apply_before_ack_fault';
 UPDATE xfer2_x903_indexed
 SET business_key=CONCAT('late-',LPAD(id,5,'0')),
 bucket=200+MOD(id,5),
@@ -329,13 +328,10 @@ x301_outsider_hides_late_unique_keys
 generation	outcome	source_connection_id	token_role	reason	closing_started_us	closing_deadline_us
 GENERATION	SUCCESS	SOURCE_ID	SURVIVOR	NONE	CLOSING_STARTED_US	CLOSING_DEADLINE_US
 SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
-WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_after_apply_before_ack_faults')
-=@after_apply_before+1 AS exactly_one_object_ack_lost_after_apply,
-(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_sequence_already_applied')
 >@already_applied_before AS object_replay_used_already_applied;
-exactly_one_object_ack_lost_after_apply	object_replay_used_already_applied
-1	1
+object_replay_used_already_applied
+1
 SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins')
 =@terminal_before+1 AS one_original_terminal_cas,
@@ -573,12 +569,6 @@ test.xfer2_x903_source_native	check	status	OK
 SELECT COUNT(*)=3 AND SUM(v)=63 AS receiver_native_commit_survives_restart
 FROM xfer2_x903_receiver_native;
 receiver_native_commit_survives_restart
-1
-SELECT VARIABLE_VALUE=0 AS object_ack_fault_counter_reset
-FROM performance_schema.global_status
-WHERE VARIABLE_NAME=
-'Preserve_trx_transfer_receiver_after_apply_before_ack_faults';
-object_ack_fault_counter_reset
 1
 SELECT VARIABLE_VALUE=0 AS already_applied_counter_reset
 FROM performance_schema.global_status

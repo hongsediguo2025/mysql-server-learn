@@ -6,7 +6,7 @@
 #   $terminal_cas_case = 1 identical COMMIT retry
 #                      = 2 conflicting terminal fact digest retry
 #                      = 3 terminal tombstone expiry/status requery
-#                      = 4 process-local COMMITTED status keeps source fenced
+#                      = 4 same-process COMMITTED status completes handoff
 #                      = 5 receiver crash after process-local COMMITTED
 #
 # Debug-contract boundaries:
@@ -31,10 +31,6 @@ if ($terminal_cas_case == 3)
 {
   --let $terminal_commit_unknown_case= 1
   --let $terminal_retained_receiver_case= 0
-}
-if ($terminal_cas_case == 4)
-{
-  --let $terminal_commit_unknown_case= 1
 }
 if ($terminal_cas_case == 5)
 {
@@ -886,9 +882,9 @@ if ($terminal_commit_unknown_case == 1)
 
 if ($terminal_cas_case == 4)
 {
-  # A process-local COMMITTED status cannot restore source ownership either.
-  # Without a separate authoritative HA proof, RESET must remain TOO_LATE and
-  # leave both the source fence and receiver publication untouched.
+  # Once the same-process COMMITTED status completed the handoff, RESET is
+  # still too late and must leave the source fence and receiver publication
+  # untouched.
   --connection xfer2_source_ha
   --enable_query_log
   --error ER_PRESERVE_TRX_RESET_TOO_LATE

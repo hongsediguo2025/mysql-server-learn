@@ -1,0 +1,201 @@
+# Review-IDs: RR-M12
+# Workload: W01 + O10 | FX: reset double-detach failure wakeup race
+# Overlays: O10
+# Actors: T0=async DRAIN owner & restore executor, T1=preserved idle client,
+#         T2=async RESET DRAIN requester/waiter, T3=P_S/manager observer and
+#         gate controller
+# RED invariant (unfixed code): the failed double-detach branch raw-writes
+#   thd->killed=KILL_CONNECTION without LOCK_thd_data/awake(); the later
+#   helper observes KILL_CONNECTION with a live active_vio and aborts on the
+#   named reset_double_detach_kill_left_active_vio invariant.
+# GREEN invariant (this .result is the hand-written GREEN contract per plan
+#   section 7.2): the unified kill/awake helper holds LOCK_thd_data and
+#   awake()s T1. While T0 still pins the target THD for restore, P_S may keep
+#   the thread row visible; after RESET completes, the same thread exits
+#   without an external disconnect. The FAILED observable row is kept by the
+#   existing GC contract; T1's W01 transaction never commits.
+#
+# This runtime race test requires a Debug server with Debug Sync enabled.
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_query_log
+
+--let $credential_file= $MYSQL_TMP_DIR/reset_wakeup.secret
+--write_file $credential_file
+reset-wakeup-secret
+EOF
+--exec chmod 600 $credential_file
+
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+DROP USER IF EXISTS reset_wakeup_app@localhost;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'reset-wakeup-secret';
+GRANT SHUTDOWN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.*
+  TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+CREATE USER reset_wakeup_app@localhost;
+GRANT SELECT, INSERT, UPDATE, DELETE ON test.* TO reset_wakeup_app@localhost;
+GRANT SESSION_VARIABLES_ADMIN ON *.* TO reset_wakeup_app@localhost;
+
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$MASTER_MYPORT --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=reset_wakeup_mtr --rds-preserve-trx-transfer-credential-secret-file=$credential_file
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--let $restart_parameters=
+
+CALL mtr.add_suppression("Preserved transaction batch cleanup failed to detach reattached transaction");
+CALL mtr.add_suppression("PRESERVE: RESET DRAIN invariant failure");
+
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=ON;
+SET GLOBAL rds_preserve_trx_token_retention_timeout_ms=1000;
+
+--enable_query_log
+# W01: accounts seeded with 32 rows + one audit table.
+CREATE TABLE reset_wakeup_accounts(
+  id INT PRIMARY KEY,
+  balance INT NOT NULL,
+  version INT NOT NULL,
+  pad CHAR(32) NOT NULL DEFAULT ''
+) ENGINE=InnoDB;
+CREATE TABLE reset_wakeup_audit(
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  account_id INT NOT NULL,
+  note CHAR(16) NOT NULL
+) ENGINE=InnoDB;
+--disable_query_log
+INSERT INTO reset_wakeup_accounts(id,balance,version,pad) VALUES
+  (1,1000,0,'p01'),(2,1000,0,'p02'),(3,1000,0,'p03'),(4,1000,0,'p04'),
+  (5,1000,0,'p05'),(6,1000,0,'p06'),(7,1000,0,'p07'),(8,1000,0,'p08'),
+  (9,1000,0,'p09'),(10,1000,0,'p10'),(11,1000,0,'p11'),(12,1000,0,'p12'),
+  (13,1000,0,'p13'),(14,1000,0,'p14'),(15,1000,0,'p15'),(16,1000,0,'p16'),
+  (17,1000,0,'p17'),(18,1000,0,'p18'),(19,1000,0,'p19'),(20,1000,0,'p20'),
+  (21,1000,0,'p21'),(22,1000,0,'p22'),(23,1000,0,'p23'),(24,1000,0,'p24'),
+  (25,1000,0,'p25'),(26,1000,0,'p26'),(27,1000,0,'p27'),(28,1000,0,'p28'),
+  (29,1000,0,'p29'),(30,1000,0,'p30'),(31,1000,0,'p31'),(32,1000,0,'p32');
+
+# T1: W01 owner transaction; updates three nonadjacent accounts and inserts
+# one audit row, then stays idle in the network read.
+--connect(reset_wakeup_app,localhost,reset_wakeup_app,,test)
+--let $t1_connection_id= query_get_value(SELECT CONNECTION_ID() AS id, id, 1)
+START TRANSACTION;
+UPDATE reset_wakeup_accounts SET balance=balance-10, version=version+1
+  WHERE id=3;
+UPDATE reset_wakeup_accounts SET balance=balance+4, version=version+1
+  WHERE id=11;
+UPDATE reset_wakeup_accounts SET balance=balance+6, version=version+1
+  WHERE id=27;
+INSERT INTO reset_wakeup_audit(account_id,note) VALUES (3,'w01-debit');
+
+# T0: async DRAIN owner. Fault selectors send the RESET restore into the
+# double-detach failure branch; gates pin T0 pre-commit and post-kill.
+--connect(reset_wakeup_owner,localhost,root,,test)
+SET SESSION debug='+d,preserve_trx_fail_activate_reattached_original,preserve_trx_fail_detach_resumed_from_thd,preserve_trx_fail_detach_resumed_from_thd_for_cleanup,preserve_trx_reset_assert_double_detach_kill_woke_connection';
+SET DEBUG_SYNC=
+  'preserve_trx_drain_before_transfer_commit_reset_check SIGNAL t0_at_precommit WAIT_FOR t0_precommit_release';
+SET DEBUG_SYNC=
+  'preserve_trx_reset_detach_failure_after_kill SIGNAL t0_after_kill WAIT_FOR t0_after_kill_release';
+--send DRAIN TRANSACTIONS PRESERVE
+
+# T3: observer/gate controller.
+--connect(reset_wakeup_ha,localhost,preserve_trx_ha_admin,reset-wakeup-secret,test)
+SET DEBUG_SYNC='now WAIT_FOR t0_at_precommit TIMEOUT 60';
+--let $reset_wins_before= query_get_value(SELECT VARIABLE_VALUE+0 AS value FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_reset_drain_wins', value, 1)
+
+# Root observer for PFS rows owned by the app account and for assert_grep
+# (LOAD_FILE requires the FILE privilege).
+--connect(reset_wakeup_mon,localhost,root,,test)
+
+# T2: async RESET DRAIN requester/waiter; wins RESET_REQUESTED and then waits
+# for the reset release barrier.
+--connect(reset_wakeup_reset,localhost,preserve_trx_ha_admin,reset-wakeup-secret,test)
+--send RESET DRAIN
+
+--connection reset_wakeup_ha
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_reset_drain_wins')>$reset_wins_before
+--source include/wait_condition.inc
+SET DEBUG_SYNC='now SIGNAL t0_precommit_release';
+
+# T0 restores T1; activation fails (injected), both detaches fail (injected),
+# and the old code raw-writes KILL_CONNECTION without awake(). T0 parks right
+# after the raw write.
+SET DEBUG_SYNC='now WAIT_FOR t0_after_kill TIMEOUT 60';
+
+--enable_query_log
+# First terminal observation: the failed branch left a FAILED observable row.
+# The fixed code has woken T1, but T0 still owns a restore pin at this gate,
+# so the P_S row is expected to remain until T0 releases the pin.
+--connection reset_wakeup_mon
+SELECT COUNT(*) AS failed_observable_rows
+  FROM performance_schema.preserved_transactions
+  WHERE STATE='FAILED';
+SELECT COUNT(*) AS t1_thread_retained_by_restore_pin_after_kill
+  FROM performance_schema.threads
+  WHERE PROCESSLIST_USER='reset_wakeup_app' AND PROCESSLIST_COMMAND='Sleep';
+--disable_query_log
+--connection reset_wakeup_ha
+
+SET DEBUG_SYNC='now SIGNAL t0_after_kill_release';
+
+--connection reset_wakeup_reset
+--reap
+
+--connection reset_wakeup_owner
+--disable_result_log
+--error 4021
+--reap
+--enable_result_log
+
+--connection reset_wakeup_ha
+--enable_query_log
+--connection reset_wakeup_mon
+# Second terminal observation: the reset release barrier has been published
+# and RESET DRAIN returned. The named Debug invariant above is the formal RED
+# oracle; this bounded wait remains the GREEN teardown/liveness assertion.
+--disable_query_log
+--let $wait_condition= SELECT COUNT(*)=0 FROM performance_schema.threads WHERE PROCESSLIST_ID=$t1_connection_id
+--source include/wait_condition.inc
+--enable_query_log
+SELECT COUNT(*) AS t1_thread_present_after_reset_barrier
+  FROM performance_schema.threads
+  WHERE PROCESSLIST_USER='reset_wakeup_app' AND PROCESSLIST_COMMAND='Sleep';
+--disable_query_log
+
+# Teardown: close T1's client socket after the server side has already exited.
+--disconnect reset_wakeup_app
+
+# Consistency: T1's W01 transaction never committed; native data intact.
+--connection reset_wakeup_mon
+--enable_query_log
+SELECT GROUP_CONCAT(CONCAT(id,':',balance,':',version) ORDER BY id)
+       AS sampled_accounts FROM reset_wakeup_accounts WHERE id IN (3,11,27);
+SELECT COUNT(*) AS audit_rows FROM reset_wakeup_audit;
+# The double-detach failure branch leaves exactly one FAILED observable row
+# (kept by the existing GC contract; it is evidence, not residue to clear).
+--replace_column 1 TOKEN
+SELECT TOKEN, STATE, LAST_ERROR IS NOT NULL AS has_last_error
+  FROM performance_schema.preserved_transactions
+  ORDER BY TOKEN;
+--disable_query_log
+
+--connection reset_wakeup_mon
+DROP TABLE reset_wakeup_accounts;
+DROP TABLE reset_wakeup_audit;
+DROP USER preserve_trx_ha_admin@localhost;
+DROP USER reset_wakeup_app@localhost;
+SET DEBUG_SYNC='RESET';
+--remove_file $credential_file
+--disconnect reset_wakeup_owner
+--disconnect reset_wakeup_reset
+--disconnect reset_wakeup_ha
+--disconnect reset_wakeup_mon
+
+--enable_query_log

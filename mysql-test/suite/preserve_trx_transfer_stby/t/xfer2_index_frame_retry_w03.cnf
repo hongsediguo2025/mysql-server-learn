@@ -17,4 +17,4 @@ rds-preserve-trx-transfer-runtime-profile=BUSINESS_FIRST
 rds-preserve-trx-transfer-max-inflight-bytes=67108864
 # Drop one ACK only after a payload containing a non-final OBJECT_CHUNK has
 # been applied. Control-only and final object payloads cannot consume it.
-debug=d,preserve_trx_transfer_receiver_after_frame_apply_before_ack,preserve_trx_transfer_receiver_drop_nonfinal_object_batch_ack_once
+debug=d,preserve_trx_transfer_receiver_after_frame_apply_before_ack,preserve_trx_transfer_receiver_drop_nonfinal_object_batch_ack_once,syncpoint_xfer2_nonfinal_apply_before_ack_fault

@@ -9551,10 +9551,6 @@ SHOW_VAR status_vars[] = {
     {"Preserve_trx_transfer_receiver_sequence_already_applied",
      (char *)&show_preserve_trx_transfer_receiver_sequence_already_applied,
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},
-    {"Preserve_trx_transfer_receiver_after_apply_before_ack_faults",
-     (char *)
-         &show_preserve_trx_transfer_receiver_after_apply_before_ack_faults,
-     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"Preserve_trx_transfer_source_handoff_pending_epochs",
      (char *)&show_preserve_trx_transfer_source_handoff_pending_epochs,
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},
@@ -9582,10 +9578,6 @@ SHOW_VAR status_vars[] = {
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"Preserve_trx_transfer_recv_terminal_status_not_found",
      (char *)&show_preserve_trx_transfer_receiver_terminal_status_not_found,
-     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
-    {"Preserve_trx_transfer_recv_precommit_abandon_cleanup_deferred",
-     (char *)
-         &show_preserve_trx_transfer_receiver_precommit_abandon_cleanup_deferred,
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"Preserve_trx_transfer_recv_precommit_abandon_reaper_attempts",
      (char *)

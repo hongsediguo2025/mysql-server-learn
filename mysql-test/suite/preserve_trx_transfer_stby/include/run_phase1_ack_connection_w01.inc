@@ -218,20 +218,16 @@ SET SESSION innodb_lock_wait_timeout=3600;
 --eval SELECT COUNT(*)=1 AS real_waiter_blocked_before_transfer FROM performance_schema.data_lock_waits w JOIN performance_schema.threads t ON t.THREAD_ID=w.REQUESTING_THREAD_ID WHERE t.PROCESSLIST_ID=$phase1_waiter_id
 --disable_query_log
 
-# Fail-hard projection preflight.  These counters are required because the wire
-# returns OK for an ALREADY_APPLIED replay; ACK_UNCERTAIN alone cannot prove
-# receiver idempotency.  For case 2, the one-shot DBUG selector itself must
-# reject every payload that lacks OBJECT_CHUNK or contains that object's SEAL;
-# one generic fault count therefore proves that its strict predicate matched.
+# Fail-hard projection preflight.  The wire returns OK for an ALREADY_APPLIED
+# replay; ACK_UNCERTAIN alone cannot prove receiver idempotency.  The non-final
+# object selector is observed through a Debug Sync reached signal instead of a
+# production SHOW counter.
 --connection xfer2_receiver
---let $phase1_common_projection_count= query_get_value("SELECT COUNT(*) AS c FROM performance_schema.global_status WHERE VARIABLE_NAME IN ('Preserve_trx_transfer_receiver_after_apply_before_ack_faults','Preserve_trx_transfer_receiver_sequence_already_applied')",c,1)
-if ($phase1_common_projection_count != 2)
+--let $phase1_common_projection_count= query_get_value("SELECT COUNT(*) AS c FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_sequence_already_applied'",c,1)
+if ($phase1_common_projection_count != 1)
 {
-  --die RED: missing apply-before-ACK drop or ALREADY_APPLIED projection
+  --die RED: missing ALREADY_APPLIED projection
 }
-SET @after_apply_faults_before=(SELECT VARIABLE_VALUE+0
-  FROM performance_schema.global_status WHERE VARIABLE_NAME=
-  'Preserve_trx_transfer_receiver_after_apply_before_ack_faults');
 SET @already_applied_before=(SELECT VARIABLE_VALUE+0
   FROM performance_schema.global_status WHERE VARIABLE_NAME=
   'Preserve_trx_transfer_receiver_sequence_already_applied');
@@ -239,17 +235,13 @@ SET @already_applied_before=(SELECT VARIABLE_VALUE+0
 --connect(xfer2_phase1_drain,localhost,root,,test)
 --send DRAIN TRANSACTIONS PRESERVE
 
-# Missing hook with implemented projections fails here via the bounded,
-# fail-hard wait.  No sleep and no error-log grep can satisfy this branch.
+# Missing hook with implemented projections fails here via bounded, fail-hard
+# Debug Sync and ALREADY_APPLIED waits.  No sleep and no error-log grep can
+# satisfy this branch.
 --connection xfer2_receiver
-if ($phase1_ack_case == 1)
-{
-  --let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_after_apply_before_ack_faults')=@after_apply_faults_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_sequence_already_applied')>@already_applied_before
-}
-if ($phase1_ack_case == 2)
-{
-  --let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_after_apply_before_ack_faults')=@after_apply_faults_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_sequence_already_applied')>@already_applied_before
-}
+SET DEBUG_SYNC='now WAIT_FOR reached_xfer2_nonfinal_apply_before_ack_fault TIMEOUT 30';
+SET DEBUG_SYNC='now SIGNAL continue_xfer2_nonfinal_apply_before_ack_fault';
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_sequence_already_applied')>@already_applied_before
 --let $wait_timeout= 30
 --source include/wait_condition_or_abort.inc
 
@@ -267,11 +259,6 @@ if ($phase1_ack_case == 2)
 --source include/wait_condition_or_abort.inc
 
 --enable_query_log
-SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
-         WHERE VARIABLE_NAME=
-          'Preserve_trx_transfer_receiver_after_apply_before_ack_faults')
-         =@after_apply_faults_before+1
-         AS exactly_one_after_apply_before_ack_fault;
 if ($phase1_ack_case == 1)
 {
   # The receiver ACK covers one encoded payload.  The selected payload contains
@@ -467,10 +454,6 @@ DROP USER preserve_trx_ha_admin@localhost;
 --enable_query_log
 SELECT COUNT(*)=3 AND SUM(v)=607 AS receiver_native_survives_restart
   FROM xfer2_phase1_receiver_native;
-SELECT VARIABLE_VALUE=0 AS after_apply_fault_counter_reset
-  FROM performance_schema.global_status
- WHERE VARIABLE_NAME=
-  'Preserve_trx_transfer_receiver_after_apply_before_ack_faults';
 SELECT VARIABLE_VALUE=0 AS already_applied_counter_reset
   FROM performance_schema.global_status
  WHERE VARIABLE_NAME=
@@ -481,12 +464,12 @@ SELECT VARIABLE_VALUE=0 AS already_applied_counter_reset
 if ($phase1_ack_case == 1)
 {
   SET GLOBAL debug=
-    '-d,preserve_trx_transfer_receiver_after_frame_apply_before_ack,preserve_trx_transfer_receiver_drop_nonfinal_object_batch_ack_once';
+    '-d,preserve_trx_transfer_receiver_after_frame_apply_before_ack,preserve_trx_transfer_receiver_drop_nonfinal_object_batch_ack_once,syncpoint_xfer2_nonfinal_apply_before_ack_fault';
 }
 if ($phase1_ack_case == 2)
 {
   SET GLOBAL debug=
-    '-d,preserve_trx_transfer_receiver_after_frame_apply_before_ack,preserve_trx_transfer_receiver_disconnect_nonfinal_object_batch_once';
+    '-d,preserve_trx_transfer_receiver_after_frame_apply_before_ack,preserve_trx_transfer_receiver_disconnect_nonfinal_object_batch_once,syncpoint_xfer2_nonfinal_apply_before_ack_fault';
 }
 --disable_query_log
 DROP TABLE xfer2_phase1_receiver_native;

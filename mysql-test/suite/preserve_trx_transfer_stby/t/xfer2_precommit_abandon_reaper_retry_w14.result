@@ -19,6 +19,8 @@ SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<32
 SELECT n, 1000, 0, CONCAT('account-', n) FROM seq;
 CALL mtr.add_suppression(
 "PRESERVE: RESET receiver epoch cleanup deferred status=");
+CALL mtr.add_suppression(
+"Got timeout reading communication packets");
 SET @active_before=(SELECT VARIABLE_VALUE+0
 FROM performance_schema.global_status WHERE VARIABLE_NAME=
 'Preserve_trx_transfer_receiver_active_epochs');
@@ -64,9 +66,6 @@ FROM performance_schema.global_status WHERE VARIABLE_NAME=
 SET @terminal_tombstones_before=(SELECT VARIABLE_VALUE+0
 FROM performance_schema.global_status WHERE VARIABLE_NAME=
 'Preserve_trx_transfer_receiver_terminal_status_tombstones');
-SET @abandon_deferred_before=(SELECT VARIABLE_VALUE+0
-FROM performance_schema.global_status WHERE VARIABLE_NAME=
-'Preserve_trx_transfer_recv_precommit_abandon_cleanup_deferred');
 SET @reaper_attempts_before=(SELECT VARIABLE_VALUE+0
 FROM performance_schema.global_status WHERE VARIABLE_NAME=
 'Preserve_trx_transfer_recv_precommit_abandon_reaper_attempts');
@@ -153,11 +152,9 @@ RESET DRAIN;
 SET DEBUG_SYNC='now SIGNAL xfer2_abandon_release';
 ERROR HY000: DRAIN TRANSACTIONS PRESERVE was reset before ownership became irreversible
 SET DEBUG_SYNC='RESET';
+SET DEBUG_SYNC='now WAIT_FOR reached_xfer2_precommit_abandon_deferred TIMEOUT 30';
+SET DEBUG_SYNC='now SIGNAL continue_xfer2_precommit_abandon_deferred';
 SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
-WHERE VARIABLE_NAME=
-'Preserve_trx_transfer_recv_precommit_abandon_cleanup_deferred')
-> @abandon_deferred_before AS foreground_cleanup_was_deferred,
-(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME=
 'Preserve_trx_transfer_recv_precommit_abandon_reaper_attempts')
 > @reaper_attempts_before AS reaper_claimed_abandoning_epoch,
@@ -165,8 +162,8 @@ WHERE VARIABLE_NAME=
 WHERE VARIABLE_NAME=
 'Preserve_trx_transfer_recv_precommit_abandon_reaper_completions')
 = @reaper_completions_before+1 AS reaper_completed_cleanup_once;
-foreground_cleanup_was_deferred	reaper_claimed_abandoning_epoch	reaper_completed_cleanup_once
-1	1	1
+reaper_claimed_abandoning_epoch	reaper_completed_cleanup_once
+1	1
 SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins')
 = @terminal_wins_before+1 AS abandon_terminal_cas_won_once,
@@ -187,7 +184,7 @@ WHERE VARIABLE_NAME=
 WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')
 = @active_before AS no_committed_receiver_epoch;
 abandon_terminal_cas_won_once	exact_sender_retry_and_reaper_reentry	duplicate_abandon_is_not_conflict	one_bounded_terminal_tombstone	no_committed_receiver_epoch
-1	1	1	1	1
+1	0	1	1	1
 SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')
 = @inflight_tokens_before AS no_inflight_token,

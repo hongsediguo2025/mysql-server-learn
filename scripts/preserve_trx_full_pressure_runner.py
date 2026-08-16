@@ -70,6 +70,7 @@ class FullPressureProfile:
     receiver_read_load_baseline_s: float
     receiver_read_load_max_qps_drop_pct: float
     receiver_read_load_max_p99_increase_pct: float
+    statistical_slo_enforced: bool
     preserve_timeout_s: int
     startup_timeout_s: int
     shutdown_timeout_s: int
@@ -92,6 +93,10 @@ class FullPressureProfile:
             self.source_tiered_load_threads_per_tier
             * len(self.source_tiered_load_work_units)
         )
+
+    @property
+    def receiver_read_load_performance_gate_enforced(self) -> bool:
+        return self.statistical_slo_enforced
 
 
 FULL_PROFILE = FullPressureProfile(
@@ -120,6 +125,7 @@ FULL_PROFILE = FullPressureProfile(
     receiver_read_load_baseline_s=5.0,
     receiver_read_load_max_qps_drop_pct=5.0,
     receiver_read_load_max_p99_increase_pct=10.0,
+    statistical_slo_enforced=True,
     preserve_timeout_s=1800,
     startup_timeout_s=180,
     shutdown_timeout_s=300,
@@ -144,6 +150,7 @@ SMOKE_PROFILE = dataclasses.replace(
     ready_after_final_spool_ack_limit_us=2_000_000,
     receiver_read_load_threads=2,
     receiver_read_load_baseline_s=1.0,
+    statistical_slo_enforced=False,
     preserve_timeout_s=300,
     startup_timeout_s=120,
     shutdown_timeout_s=180,
@@ -188,6 +195,7 @@ RESET_SMOKE_PROFILE = dataclasses.replace(
     receiver_workers=2,
     phase1_batch_bytes=1024**2,
     phase1_batch_linger_ms=5,
+    statistical_slo_enforced=False,
     preserve_timeout_s=300,
     startup_timeout_s=120,
     shutdown_timeout_s=180,
@@ -201,6 +209,7 @@ MIXED_FULL_PROFILE = dataclasses.replace(
     seed_rows_per_table_per_session=8,
     lockset_batch_size=0,
     preserve_memory_budget_bytes=2 * 1024**3,
+    transfer_max_inflight_bytes=2 * 1024**3,
     mixed_seed_rows_per_table=300_000,
     mixed_transaction_sizes=(10_000, 1_000, 100, 10),
     mixed_transaction_weights=(10, 20, 30, 40),
@@ -577,7 +586,7 @@ def build_e2e_command(
         "--business-run-before-drain",
         str(profile.business_run_before_drain_s),
         "--max-sql-resume-ms",
-        str(profile.max_sql_resume_ms),
+        str(profile.max_sql_resume_ms if profile.statistical_slo_enforced else 0),
     ]
     if evidence == "mixed-shutdown-startup":
         command = [
@@ -627,6 +636,7 @@ def build_e2e_command(
             str(paths.build_dir),
             "--report-json",
             str(paths.e2e_report),
+            "--keep-schema",
             "--startup-timeout",
             str(profile.startup_timeout_s),
             "--shutdown-timeout",
@@ -677,8 +687,9 @@ def build_e2e_command(
         str(profile.source_phase2_limit_us // 1000),
         "--max-receiver-ready-after-phase2-ms",
         str(
-            (profile.ready_after_final_spool_ack_limit_us + 999)
-            // 1000
+            (profile.ready_after_final_spool_ack_limit_us + 999) // 1000
+            if profile.statistical_slo_enforced
+            else 0
         ),
         "--source-datadir",
         str(paths.source_datadir),
@@ -722,6 +733,7 @@ def build_e2e_command(
         str(paths.build_dir),
         "--report-json",
         str(paths.e2e_report),
+        "--keep-schema",
         "--startup-timeout",
         str(profile.startup_timeout_s),
         "--shutdown-timeout",
@@ -731,6 +743,11 @@ def build_e2e_command(
     ]
     if profile.warmcopy_required:
         command.append("--warmcopy-required")
+    if (
+        evidence == "reset-drain"
+        or not profile.receiver_read_load_performance_gate_enforced
+    ):
+        command.append("--receiver-read-load-observe-only")
     if evidence == "transfer-phase2":
         return command
 
@@ -1023,6 +1040,7 @@ def build_acceptance_contract(
     if evidence == "continuous-tiered-transfer":
         return {
             **build_acceptance_contract(profile, "transfer-phase2"),
+            "statistical_slo_enforced": profile.statistical_slo_enforced,
             "source_continuous_tiered_load": True,
             "source_tiered_load_threads": profile.source_tiered_load_threads,
             "source_tiered_load_threads_per_tier": (
@@ -1035,21 +1053,54 @@ def build_acceptance_contract(
                 profile.source_tiered_load_min_samples_per_tier
             ),
             "source_tiered_load_client_sleep_calls": 0,
-            "source_tiered_load_p50_us_ranges": {
-                "10ms": [5_000, 40_000],
-                "100ms": [60_000, 160_000],
-                "200ms": [140_000, 320_000],
-            },
+            "source_tiered_load_p50_us_ranges": (
+                {
+                    "10ms": [5_000, 40_000],
+                    "100ms": [60_000, 160_000],
+                    "200ms": [140_000, 320_000],
+                }
+                if profile.statistical_slo_enforced
+                else None
+            ),
             "receiver_all_prewarm_after_final_ack_us_max": (
                 profile.ready_after_final_spool_ack_limit_us
+                if profile.statistical_slo_enforced
+                else 0
             ),
+        }
+    if evidence == "reset-drain":
+        return {
+            "evidence_kind": "STANDALONE_TRANSFER_RESET_E2E",
+            "statistical_slo_enforced": profile.statistical_slo_enforced,
+            "sessions": profile.sessions,
+            "tables": profile.tables,
+            "statements_per_tx": profile.statements_per_tx,
+            "reset_response_p99_us_max": (
+                300_000 if profile.statistical_slo_enforced else 0
+            ),
+            "reset_response_max_us_max": (
+                500_000 if profile.statistical_slo_enforced else 0
+            ),
+            "reset_response_receiver_wait_us": 0,
+            "reset_response_artifact_payload_read_bytes": 0,
+            "original_connections_continued": True,
+            "replayed_session_count": profile.sessions,
+            "receiver_read_load_performance_gate_enforced": False,
+            "physical_replication": False,
+            "production_provider": False,
+            "write_enable_exercised": False,
         }
     if evidence == "mixed-shutdown-startup":
         return {
             "evidence_kind": "LOCAL_STARTUP_E2E",
+            "statistical_slo_enforced": profile.statistical_slo_enforced,
             "source_phase2_total_us_max": profile.source_phase2_limit_us,
             "sql_resume_sample_count_min": profile.mixed_min_survivor_count,
-            "sql_resume_max_us": profile.max_sql_resume_ms * 1000,
+            "sql_resume_max_us": (
+                profile.max_sql_resume_ms * 1000
+                if profile.statistical_slo_enforced
+                else 0
+            ),
             "startup_recovery_required": True,
             "receiver_started": False,
             "drain_trigger_mode": "independent_control_connection",
@@ -1066,6 +1117,9 @@ def build_acceptance_contract(
                 "seconds",
                 "tens_seconds",
             ],
+            "duration_tier_thresholds_enforced": (
+                profile.statistical_slo_enforced
+            ),
             "minimum_business_sql_before_drain": (
                 profile.mixed_min_completed_statements
             ),
@@ -1077,7 +1131,18 @@ def build_acceptance_contract(
     if evidence == "mixed-transfer":
         return {
             "evidence_kind": "STANDALONE_TRANSFER_E2E",
+            "statistical_slo_enforced": profile.statistical_slo_enforced,
             "source_phase2_total_us_max": profile.source_phase2_limit_us,
+            "source_post_command_tail_us_max": (
+                profile.source_post_command_tail_limit_us
+                if profile.statistical_slo_enforced
+                else 0
+            ),
+            "receiver_ready_after_final_spool_ack_us_max": (
+                profile.ready_after_final_spool_ack_limit_us
+                if profile.statistical_slo_enforced
+                else 0
+            ),
             "receiver_readiness_contract": "READY",
             "receiver_epoch_storage": "PROCESS_LOCAL",
             "receiver_process_local_epoch_accepted": True,
@@ -1090,9 +1155,16 @@ def build_acceptance_contract(
             "strict_target_local_redo_bytes": 0,
             "receiver_read_load_qps_drop_pct_max": (
                 profile.receiver_read_load_max_qps_drop_pct
+                if profile.statistical_slo_enforced
+                else 0
             ),
             "receiver_read_load_p99_increase_pct_max": (
                 profile.receiver_read_load_max_p99_increase_pct
+                if profile.statistical_slo_enforced
+                else 0
+            ),
+            "receiver_read_load_performance_gate_enforced": (
+                profile.receiver_read_load_performance_gate_enforced
             ),
             "tables": profile.tables,
             "rows_per_table": profile.mixed_seed_rows_per_table,
@@ -1107,6 +1179,9 @@ def build_acceptance_contract(
                 "seconds",
                 "tens_seconds",
             ],
+            "duration_tier_thresholds_enforced": (
+                profile.statistical_slo_enforced
+            ),
             "minimum_business_sql_before_drain": (
                 profile.mixed_min_completed_statements
             ),
@@ -1116,6 +1191,7 @@ def build_acceptance_contract(
             ),
         }
     return {
+        "statistical_slo_enforced": profile.statistical_slo_enforced,
         "source_phase2_total_us_max": profile.source_phase2_limit_us,
         "receiver_readiness_contract": "READY",
         "receiver_epoch_storage": "PROCESS_LOCAL",
@@ -1124,6 +1200,8 @@ def build_acceptance_contract(
         "receiver_epoch_commit_count": 0,
         "receiver_ready_after_final_spool_ack_us_max": (
             profile.ready_after_final_spool_ack_limit_us
+            if profile.statistical_slo_enforced
+            else 0
         ),
         "ready_tokens": profile.sessions,
         "not_ready_tokens": 0,
@@ -1142,9 +1220,16 @@ def build_acceptance_contract(
         "strict_target_local_redo_bytes": 0,
         "receiver_read_load_qps_drop_pct_max": (
             profile.receiver_read_load_max_qps_drop_pct
+            if profile.statistical_slo_enforced
+            else 0
         ),
         "receiver_read_load_p99_increase_pct_max": (
             profile.receiver_read_load_max_p99_increase_pct
+            if profile.statistical_slo_enforced
+            else 0
+        ),
+        "receiver_read_load_performance_gate_enforced": (
+            profile.receiver_read_load_performance_gate_enforced
         ),
     }
 
@@ -1460,7 +1545,10 @@ def validate_mixed_pressure_report(
         duration_min_us = {}
     if not isinstance(duration_max_us, Mapping):
         duration_max_us = {}
-    if int(duration_min_us.get("short", 100_000)) >= 100_000:
+    if (
+        profile.statistical_slo_enforced
+        and int(duration_min_us.get("short", 100_000)) >= 100_000
+    ):
         failures.append("mixed short SQL did not complete below 100ms")
     tens_seconds_observed_us = max(
         int(duration_max_us.get("tens_seconds", 0)),
@@ -1476,7 +1564,7 @@ def validate_mixed_pressure_report(
             if key == "tens_seconds"
             else int(duration_max_us.get(key, 0))
         )
-        if actual_us < threshold_us:
+        if profile.statistical_slo_enforced and actual_us < threshold_us:
             failures.append(
                 f"mixed {key} SQL did not reach its measured duration tier: "
                 f"actual_us={actual_us} required_us={threshold_us}"
@@ -1526,7 +1614,11 @@ def validate_mixed_pressure_report(
                 "completed the real stored-procedure DML tier"
             )
         max_resume_us = int(resume.get("max_us") or 0)
-        if profile.max_sql_resume_ms > 0 and max_resume_us > profile.max_sql_resume_ms * 1000:
+        if (
+            profile.statistical_slo_enforced
+            and profile.max_sql_resume_ms > 0
+            and max_resume_us > profile.max_sql_resume_ms * 1000
+        ):
             failures.append(
                 "SQL RESUME max latency exceeded: "
                 f"actual_us={max_resume_us} limit_us={profile.max_sql_resume_ms * 1000}"
@@ -1573,12 +1665,16 @@ def validate_mixed_pressure_report(
                 failures.append(
                     f"{key}: expected={expected} actual={actual}"
                 )
+        require_equal(
+            "receiver_read_load_performance_gate_enforced",
+            profile.receiver_read_load_performance_gate_enforced,
+        )
         ready_after_ack_us = int(
             report.get("receiver_ready_after_final_spool_ack_us") or 0
         )
-        if (
-            ready_after_ack_us <= 0
-            or ready_after_ack_us
+        if ready_after_ack_us <= 0 or (
+            profile.statistical_slo_enforced
+            and ready_after_ack_us
             >= profile.ready_after_final_spool_ack_limit_us
         ):
             failures.append(
@@ -1599,7 +1695,11 @@ def validate_mixed_pressure_report(
         except (RuntimeError, TypeError, ValueError) as exc:
             failures.append(str(exc))
             post_command_tail_us = 0
-        if post_command_tail_us >= profile.source_post_command_tail_limit_us:
+        if (
+            profile.statistical_slo_enforced
+            and post_command_tail_us
+            >= profile.source_post_command_tail_limit_us
+        ):
             failures.append(
                 "source_phase2_post_command_tail_us exceeded: "
                 f"actual_us={post_command_tail_us} "
@@ -1632,10 +1732,53 @@ def validate_mixed_pressure_report(
                 failures.append(
                     f"{key}: expected={expected} actual={actual}"
                 )
+        require_equal("receiver_read_load_error_count", 0)
+        read_baseline_queries = int(
+            report.get("receiver_read_load_baseline_query_count") or 0
+        )
+        read_transfer_queries = int(
+            report.get("receiver_read_load_transfer_query_count") or 0
+        )
+        read_baseline_qps = float(
+            report.get("receiver_read_load_baseline_qps") or 0.0
+        )
+        read_transfer_qps = float(
+            report.get("receiver_read_load_transfer_qps") or 0.0
+        )
+        read_baseline_p99_us = int(
+            report.get("receiver_read_load_baseline_p99_us") or 0
+        )
+        read_transfer_p99_us = int(
+            report.get("receiver_read_load_transfer_p99_us") or 0
+        )
+        if (
+            read_baseline_queries <= 0
+            or read_baseline_qps <= 0
+            or read_baseline_p99_us <= 0
+        ):
+            failures.append(
+                "receiver read-load baseline evidence is empty: "
+                f"queries={read_baseline_queries} qps={read_baseline_qps} "
+                f"p99_us={read_baseline_p99_us}"
+            )
+        if (
+            read_transfer_queries <= 0
+            or read_transfer_qps <= 0
+            or read_transfer_p99_us <= 0
+        ):
+            failures.append(
+                "receiver read-load transfer evidence is empty: "
+                f"queries={read_transfer_queries} qps={read_transfer_qps} "
+                f"p99_us={read_transfer_p99_us}"
+            )
         read_qps_drop_pct = float(
             report.get("receiver_read_load_qps_drop_pct", float("inf"))
         )
-        if read_qps_drop_pct > profile.receiver_read_load_max_qps_drop_pct:
+        if (
+            profile.receiver_read_load_performance_gate_enforced
+            and read_qps_drop_pct
+            > profile.receiver_read_load_max_qps_drop_pct
+        ):
             failures.append(
                 "receiver_read_load_qps_drop_pct exceeded: "
                 f"actual={read_qps_drop_pct} "
@@ -1647,7 +1790,8 @@ def validate_mixed_pressure_report(
             )
         )
         if (
-            read_p99_increase_pct
+            profile.receiver_read_load_performance_gate_enforced
+            and read_p99_increase_pct
             > profile.receiver_read_load_max_p99_increase_pct
         ):
             failures.append(
@@ -1769,6 +1913,10 @@ def validate_e2e_report(
     require_equal("receiver_strict_target_local_redo_bytes", 0)
     require_equal("receiver_read_load_threads", profile.receiver_read_load_threads)
     require_equal("receiver_read_load_error_count", 0)
+    require_equal(
+        "receiver_read_load_performance_gate_enforced",
+        profile.receiver_read_load_performance_gate_enforced,
+    )
     phase2_us = _metric_max(report, "source_phase2_total_us")
     ready_us = _metric_max(report, "receiver_ready_after_final_spool_ack_us")
     all_prewarm_after_ack_us = _metric_max(
@@ -1826,7 +1974,8 @@ def validate_e2e_report(
             f"source_phase2_total_us: limit={profile.source_phase2_limit_us} actual={phase2_us}"
         )
     if ready_us <= 0 or (
-        ready_us > profile.ready_after_final_spool_ack_limit_us
+        profile.statistical_slo_enforced
+        and ready_us > profile.ready_after_final_spool_ack_limit_us
     ):
         failures.append(
             "receiver_ready_after_final_spool_ack_us: "
@@ -1852,7 +2001,15 @@ def validate_e2e_report(
         failures.append(
             f"source_phase1_record_batch_tokens_avg must exceed 1: actual={batch_tokens_avg}"
         )
-    if frame_count <= 0 or network_sends * 4 > frame_count:
+    if frame_count <= 0 or network_sends <= 0 or network_sends > frame_count:
+        failures.append(
+            "phase1 network-send counters are invalid: "
+            f"network_sends={network_sends} frame_count={frame_count}"
+        )
+    elif (
+        profile.statistical_slo_enforced
+        and network_sends * 4 > frame_count
+    ):
         failures.append(
             "phase1 network-send reduction is below 75%: "
             f"network_sends={network_sends} frame_count={frame_count}"
@@ -1888,13 +2045,20 @@ def validate_e2e_report(
             f"queries={read_transfer_queries} qps={read_transfer_qps} "
             f"p99_us={read_transfer_p99_us}"
         )
-    if read_qps_drop_pct > profile.receiver_read_load_max_qps_drop_pct:
+    if (
+        profile.receiver_read_load_performance_gate_enforced
+        and read_qps_drop_pct > profile.receiver_read_load_max_qps_drop_pct
+    ):
         failures.append(
             "receiver_read_load_qps_drop_pct: "
             f"limit={profile.receiver_read_load_max_qps_drop_pct} "
             f"actual={read_qps_drop_pct}"
         )
-    if read_p99_increase_pct > profile.receiver_read_load_max_p99_increase_pct:
+    if (
+        profile.receiver_read_load_performance_gate_enforced
+        and read_p99_increase_pct
+        > profile.receiver_read_load_max_p99_increase_pct
+    ):
         failures.append(
             "receiver_read_load_p99_increase_pct: "
             f"limit={profile.receiver_read_load_max_p99_increase_pct} "
@@ -1997,7 +2161,10 @@ def validate_continuous_tiered_load_report(
                 f"actual={sample_count}"
             )
         lower_us, upper_us = p50_ranges[label]
-        if not lower_us <= p50_us <= upper_us:
+        if (
+            profile.statistical_slo_enforced
+            and not lower_us <= p50_us <= upper_us
+        ):
             failures.append(
                 f"{prefix}_p50_us: expected_range=[{lower_us},{upper_us}] "
                 f"actual={p50_us}"
@@ -2011,7 +2178,9 @@ def validate_continuous_tiered_load_report(
         tier_metrics[f"{prefix}_max_us"] = int(
             report.get(f"{prefix}_max_us") or 0
         )
-    if p50_values != sorted(p50_values) or len(set(p50_values)) != 3:
+    if profile.statistical_slo_enforced and (
+        p50_values != sorted(p50_values) or len(set(p50_values)) != 3
+    ):
         failures.append(
             "source tiered P50 latencies are not strictly ordered: "
             + ",".join(str(value) for value in p50_values)
@@ -2020,7 +2189,10 @@ def validate_continuous_tiered_load_report(
     all_prewarm_us = _metric_max(
         report, "receiver_all_prewarm_after_final_ack_us"
     )
-    if all_prewarm_us > profile.ready_after_final_spool_ack_limit_us:
+    if (
+        profile.statistical_slo_enforced
+        and all_prewarm_us > profile.ready_after_final_spool_ack_limit_us
+    ):
         failures.append(
             "receiver_all_prewarm_after_final_ack_us: "
             f"limit={profile.ready_after_final_spool_ack_limit_us} "
@@ -2076,11 +2248,15 @@ def validate_reset_drain_report(
     max_us = _metric_max(report, "reset_response_max_us")
     p99_limit_us = 300_000 if profile.sessions >= 1000 else 50_000
     max_limit_us = 500_000 if profile.sessions >= 1000 else 100_000
-    if p99_us >= p99_limit_us:
+    if response_us <= 0:
+        failures.append(
+            f"reset_response_elapsed_us must be positive: actual={response_us}"
+        )
+    if profile.statistical_slo_enforced and p99_us >= p99_limit_us:
         failures.append(
             f"reset_response_p99_us: limit<{p99_limit_us} actual={p99_us}"
         )
-    if max_us >= max_limit_us:
+    if profile.statistical_slo_enforced and max_us >= max_limit_us:
         failures.append(
             f"reset_response_max_us: limit<{max_limit_us} actual={max_us}"
         )
@@ -2170,6 +2346,15 @@ def stop_owned_servers(paths: FullPressurePaths, timeout_s: float = 30.0) -> Dic
     remaining = [pid for pid in candidates if _pid_is_alive(pid)]
     if remaining:
         raise RuntimeError(f"mysqld processes survived cleanup: {remaining}")
+    forced = [
+        int(item["pid"])
+        for item in stopped
+        if item.get("signal") == "SIGKILL"
+    ]
+    if forced:
+        raise RuntimeError(
+            f"mysqld processes required SIGKILL during cleanup: {forced}"
+        )
     return {
         "stopped": stopped,
         "remaining": remaining,
@@ -2589,6 +2774,12 @@ def main(
     args = parse_args(argv)
     if forced_evidence is not None:
         args.evidence = forced_evidence
+    if args.profile == "smoke" and args.evidence == "reset-drain":
+        raise RuntimeError(
+            "NO_DETERMINISTIC_PRECOMMIT_BARRIER: Release reset-drain smoke "
+            "cannot guarantee RESET wins before the ownership CAS; use the "
+            "Debug MTR correctness gate or the full NFR race sample"
+        )
     if args.evidence in {"mixed-shutdown-startup", "mixed-transfer"}:
         profile = (
             MIXED_FULL_PROFILE

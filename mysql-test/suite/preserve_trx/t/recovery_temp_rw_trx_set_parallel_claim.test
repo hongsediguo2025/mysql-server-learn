@@ -1,0 +1,122 @@
+# Review-IDs: RR-H9
+# Workload: FX:TEMP_ONLY_RECOVERY + O06/O10 (not W09: no permanent-table DML
+#           inside the target transactions)
+# Overlays: O06,O10
+# Actors: T1/T2=two temp-only Preserve startup recovery workers (internal,
+#         not mysqltest connections), T4=server-ready observer/native DML
+# RED invariant (unfixed code): trx_sys_rw_trx_add() inserts into the
+#   non-thread-safe rw_trx_set after trx_sys_mutex_exit(); two parallel
+#   Preserve recovery workers reach it concurrently and the selected
+#   mutex-owner assertion
+#   "PRESERVE: trx_sys_rw_trx_add_without_trx_sys_mutex" aborts the server
+#   during startup (see mysqld error log of the red run).
+# GREEN invariant (this .result is the hand-written GREEN contract per plan
+#   section 7.2): the Preserve temp-only synthesis call site performs the
+#   insertion inside the existing trx_sys mutex critical section, so the
+#   assertion never fires; the server becomes ready; both temp-only tokens
+#   recover; resuming each returns the identical temp-table row
+#   set/aggregate; the O06 permanent data is intact.
+#
+# This startup race test requires a Debug server.
+--source include/have_debug.inc
+--source include/not_windows.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_rw_set_o06;
+--enable_warnings
+
+SET GLOBAL rds_preserve_trx_enable=ON;
+
+--disable_query_log
+CALL mtr.add_suppression("PRESERVE: trx_sys_rw_trx_add_without_trx_sys_mutex");
+CALL mtr.add_suppression("Assertion failure: trx0preserve.cc:.*ib::fatal triggered");
+CALL mtr.add_suppression("Assertion failure: ut0ut.cc:.*");
+CALL mtr.add_suppression("Attempting backtrace");
+CALL mtr.add_suppression("You can use the following information to find out");
+CALL mtr.add_suppression("\\[FATAL\\]");
+--enable_query_log
+
+# O06: committed native permanent-table background owned by a non-target.
+CREATE TABLE t_rw_set_o06(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO t_rw_set_o06 VALUES (1,10),(2,20);
+
+# T1 target: temp-only transaction (user temp table, 4 deterministic DML
+# operations, no permanent table DML, no binlog).
+--connect(rw_set_app_a,localhost,root,,test)
+CREATE TEMPORARY TABLE tmp_rw_set(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+START TRANSACTION;
+INSERT INTO tmp_rw_set VALUES (1,10),(2,20),(3,30);
+UPDATE tmp_rw_set SET v=21 WHERE id=2;
+DELETE FROM tmp_rw_set WHERE id=3;
+INSERT INTO tmp_rw_set VALUES (4,40);
+
+# T2 target: identical temp-only shape so recovery order is irrelevant.
+--connect(rw_set_app_b,localhost,root,,test)
+CREATE TEMPORARY TABLE tmp_rw_set(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+START TRANSACTION;
+INSERT INTO tmp_rw_set VALUES (1,10),(2,20),(3,30);
+UPDATE tmp_rw_set SET v=21 WHERE id=2;
+DELETE FROM tmp_rw_set WHERE id=3;
+INSERT INTO tmp_rw_set VALUES (4,40);
+
+# Normal DRAIN shutdown writes both artifacts.
+--connection default
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--let $preserve_trx_drain_clause=
+--source suite/preserve_trx/include/drain_transaction_from_control.inc
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+
+# Restart with the self-releasing rendezvous armed: both Preserve recovery
+# workers park before trx_sys_mutex_enter() so they contend on the production
+# mutex. On unfixed code the selected mutex-owner assertion aborts the server
+# at the rw_trx_set insertion; on fixed code the insertion runs inside the
+# trx_sys mutex and recovery completes.
+--let $_server_id= 1
+--let $_expect_file_name= $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --debug=d,preserve_trx_recovery_rw_trx_add_rendezvous
+--source include/start_mysqld.inc
+--let $wait_counter=
+
+--enable_query_log
+SELECT COUNT(*) AS recovered_temp_only_tokens
+  FROM performance_schema.preserved_transactions;
+--disable_query_log
+
+# Resume the first token and verify the temp-only row set/aggregate.
+--let $preserved_token= `SELECT TOKEN FROM performance_schema.preserved_transactions ORDER BY TOKEN LIMIT 1`
+--connect(rw_set_resume_1,localhost,root,,test)
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+--enable_query_log
+SELECT COUNT(*) AS temp_rows_token_1, SUM(v) AS temp_sum_token_1
+  FROM tmp_rw_set;
+--disable_query_log
+ROLLBACK;
+--disconnect rw_set_resume_1
+
+--connection default
+--let $preserved_token= `SELECT TOKEN FROM performance_schema.preserved_transactions ORDER BY TOKEN LIMIT 1`
+--connect(rw_set_resume_2,localhost,root,,test)
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+--enable_query_log
+SELECT COUNT(*) AS temp_rows_token_2, SUM(v) AS temp_sum_token_2
+  FROM tmp_rw_set;
+--disable_query_log
+ROLLBACK;
+--disconnect rw_set_resume_2
+
+--connection default
+--enable_query_log
+# O06 permanent data survived both restarts.
+SELECT * FROM t_rw_set_o06 ORDER BY id;
+--disable_query_log
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+
+DROP TABLE t_rw_set_o06;
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET DEBUG_SYNC='RESET';
+
+--enable_query_log

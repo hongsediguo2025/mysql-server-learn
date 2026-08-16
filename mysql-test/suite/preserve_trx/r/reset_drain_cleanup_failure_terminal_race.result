@@ -1,0 +1,42 @@
+CALL mtr.add_suppression("Attempting backtrace");
+CALL mtr.add_suppression("You can use the following information to find out");
+CALL mtr.add_suppression("PRESERVE: RESET DRAIN invariant failure");
+CALL mtr.add_suppression("Preserved transaction batch cleanup failed after debug injected target error");
+CALL mtr.add_suppression("Preserved transaction .* recovery cleanup failed: failed to delete snapshot files");
+CALL mtr.add_suppression("Preserved transaction '.*' expired-token reaper forced rollback: recovery timeout expired");
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=ON;
+SET GLOBAL rds_preserve_trx_token_retention_timeout_ms=1000;
+CREATE TABLE reset_terminal_accounts(
+id INT PRIMARY KEY,
+balance INT NOT NULL,
+version INT NOT NULL
+) ENGINE=InnoDB;
+CREATE TABLE reset_terminal_ledger(
+id INT AUTO_INCREMENT PRIMARY KEY,
+account_id INT NOT NULL,
+delta INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO reset_terminal_accounts VALUES
+(1,1000,0),(2,1000,0),(3,1000,0),(4,1000,0);
+ERROR HY000: DRAIN TRANSACTIONS PRESERVE batch cleanup failed; inspect preserved_transactions and target sessions before retry
+SELECT 1 AS server_survived_terminal_race;
+server_survived_terminal_race
+1
+RESET DRAIN;
+SELECT GROUP_CONCAT(CONCAT(id,':',balance,':',version) ORDER BY id)
+AS accounts_after_race
+FROM reset_terminal_accounts;
+accounts_after_race
+1:1000:0,2:1000:0,3:1000:0,4:1000:0
+SELECT COUNT(*) AS ledger_rows_after_race FROM reset_terminal_ledger;
+ledger_rows_after_race
+0
+SELECT COUNT(*) AS preserved_records_after_race
+FROM performance_schema.preserved_transactions;
+preserved_records_after_race
+0
+SELECT * FROM reset_terminal_native ORDER BY id;
+id	v
+1	10
+2	20

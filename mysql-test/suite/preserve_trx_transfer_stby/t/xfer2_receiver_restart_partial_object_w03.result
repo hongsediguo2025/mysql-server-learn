@@ -62,9 +62,6 @@ FROM performance_schema.global_status WHERE VARIABLE_NAME=
 SET @admitted_bytes_before=(SELECT VARIABLE_VALUE+0
 FROM performance_schema.global_status WHERE VARIABLE_NAME=
 'Preserve_trx_transfer_receiver_admitted_bytes');
-SET @faults_before=(SELECT VARIABLE_VALUE+0
-FROM performance_schema.global_status WHERE VARIABLE_NAME=
-'Preserve_trx_transfer_receiver_after_apply_before_ack_faults');
 SET @inflight_tokens_before=(SELECT VARIABLE_VALUE+0
 FROM performance_schema.global_status WHERE VARIABLE_NAME=
 'Preserve_trx_transfer_receiver_inflight_tokens');
@@ -172,15 +169,13 @@ FROM xfer2_x409_items WHERE id=101;
 outsider_hides_large_insert
 1
 DRAIN TRANSACTIONS PRESERVE;
+SET DEBUG_SYNC='now WAIT_FOR reached_xfer2_nonfinal_apply_before_ack_fault TIMEOUT 30';
+SET DEBUG_SYNC='now SIGNAL continue_xfer2_nonfinal_apply_before_ack_fault';
 SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
-WHERE VARIABLE_NAME=
-'Preserve_trx_transfer_receiver_after_apply_before_ack_faults')
-=@faults_before+1 AS one_partial_object_fault_after_apply,
-(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_online_epochs')
 =@online_before+1 AS one_receiving_epoch;
-one_partial_object_fault_after_apply	one_receiving_epoch
-1	1
+one_receiving_epoch
+1
 SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_admitted_frames')
 >@admitted_before AS real_partial_frames_admitted,

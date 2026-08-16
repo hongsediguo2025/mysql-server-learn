@@ -165,8 +165,6 @@ preserve_trx_transfer_receiver_ready_after_terminal_commit_admitted_us_status();
 uint64_t preserve_trx_transfer_receiver_admitted_frames_status();
 uint64_t preserve_trx_transfer_receiver_admitted_bytes_status();
 uint64_t preserve_trx_transfer_receiver_sequence_already_applied_status();
-uint64_t
-preserve_trx_transfer_receiver_after_apply_before_ack_faults_status();
 uint64_t preserve_trx_transfer_source_handoff_pending_epochs_status();
 uint64_t preserve_trx_transfer_source_commit_unknown_epochs_status();
 uint64_t preserve_trx_transfer_source_restore_guard_rejects_status();
@@ -182,8 +180,6 @@ uint64_t preserve_trx_transfer_receiver_terminal_status_tombstones_status();
 uint64_t
 preserve_trx_transfer_receiver_terminal_status_tombstone_expiries_status();
 uint64_t preserve_trx_transfer_receiver_terminal_status_not_found_status();
-uint64_t
-preserve_trx_transfer_receiver_precommit_abandon_cleanup_deferred_status();
 uint64_t
 preserve_trx_transfer_receiver_precommit_abandon_reaper_attempts_status();
 uint64_t
@@ -680,6 +676,7 @@ struct Preserve_trx_transfer_accepted_epoch {
   std::string root_dir;
   std::string epoch_id;
   std::string receiver_process_generation;
+  uint64_t prewarm_generation{0};
   uint64_t source_fence_lsn{0};
   std::vector<uint64_t> tokens;
   std::array<unsigned char, kPreservedTrxSha256Length> fact_digest{};
@@ -734,6 +731,13 @@ struct Preserve_trx_transfer_epoch_terminal_status {
   uint64_t retire_after_us{0};
 };
 
+struct Preserve_trx_transfer_acknowledged_epoch_retirement {
+  std::string root_dir;
+  std::string epoch_id;
+  uint64_t prewarm_generation{0};
+  bool accepted_owner_present{false};
+};
+
 struct Preserve_trx_transfer_payload_apply_reservation {
   std::string epoch_id;
   uint64_t first_sequence{0};
@@ -748,7 +752,8 @@ class Preserve_trx_transfer_receiver_registry {
       const std::string &epoch_id, const std::string &authenticated_principal,
       uint64_t requested_terminal_status_retention_us,
       const std::string &receiver_process_nonce,
-      uint64_t *accepted_terminal_status_retention_us);
+      uint64_t *accepted_terminal_status_retention_us,
+      uint64_t *prewarm_generation = nullptr);
   Preserve_trx_transfer_status validate_online_epoch(
       const std::string &epoch_id, const std::string &authenticated_principal,
       const std::string &receiver_process_nonce,
@@ -757,6 +762,8 @@ class Preserve_trx_transfer_receiver_registry {
       const std::string &epoch_id,
       Preserve_trx_transfer_runtime_policy *runtime_policy,
       uint64_t *max_inflight_bytes) const;
+  bool epoch_prewarm_generation(const std::string &epoch_id,
+                                uint64_t *prewarm_generation) const;
 
   Preserve_trx_transfer_status declare_token(const std::string &epoch_id,
                                              uint64_t token);
@@ -801,8 +808,8 @@ class Preserve_trx_transfer_receiver_registry {
   Preserve_trx_transfer_status publish_accepted_epoch(
       const std::string &root_dir,
       std::shared_ptr<const Preserve_trx_transfer_epoch_fact> fact,
-      const std::string &receiver_process_generation, uint64_t now_us,
-      uint64_t prewarm_timeout_ms, bool flat_projection_published);
+      uint64_t now_us, uint64_t prewarm_timeout_ms,
+      bool flat_projection_published);
   Preserve_trx_transfer_status query_accepted_epoch(
       const std::string &root_dir, const std::string &epoch_id,
       Preserve_trx_transfer_accepted_epoch *accepted = nullptr) const;
@@ -859,7 +866,13 @@ class Preserve_trx_transfer_receiver_registry {
       const std::string &root_dir, const std::string &epoch_id);
   Preserve_trx_transfer_status erase_abandoning_epoch(
       const std::string &root_dir, const std::string &epoch_id);
-  size_t retire_acknowledged_epochs_once(uint64_t now_us);
+  Preserve_trx_transfer_status claim_acknowledged_epochs_due_for_retirement(
+      uint64_t now_us,
+      std::vector<Preserve_trx_transfer_acknowledged_epoch_retirement>
+          *retirements);
+  bool retire_acknowledged_epoch_if_due(
+      uint64_t now_us,
+      const Preserve_trx_transfer_acknowledged_epoch_retirement &retirement);
   Preserve_trx_transfer_status mark_corrupt(const std::string &epoch_id,
                                             uint64_t token,
                                             const std::string &reason);
@@ -897,6 +910,16 @@ class Preserve_trx_transfer_receiver_registry {
       const std::string &epoch_id, uint64_t sequence,
       const std::array<unsigned char, kPreservedTrxSha256Length> &frame_digest,
       std::vector<Preserve_trx_transfer_receiver_record> *records);
+  Preserve_trx_transfer_status claim_epoch_commit_apply(
+      const std::string &epoch_id, uint64_t sequence,
+      const std::array<unsigned char, kPreservedTrxSha256Length> &frame_digest,
+      uint64_t timeout_ms,
+      std::vector<Preserve_trx_transfer_receiver_record> *records,
+      uint64_t *claim_generation);
+  void release_epoch_commit_apply(
+      const std::string &epoch_id, uint64_t sequence,
+      const std::array<unsigned char, kPreservedTrxSha256Length> &frame_digest,
+      uint64_t claim_generation);
   void mark_epoch_commit_admission_corrupt(
       const std::string &epoch_id, uint64_t sequence,
       const std::array<unsigned char, kPreservedTrxSha256Length> &frame_digest);
@@ -1018,17 +1041,20 @@ class Preserve_trx_transfer_receiver_registry {
     uint64_t accepted_terminal_status_retention_us{0};
     Preserve_trx_transfer_runtime_policy runtime_policy;
     uint64_t max_inflight_bytes{0};
+    uint64_t prewarm_generation{0};
     bool precommit_poisoned{false};
     uint64_t metadata_rejected_token{0};
   };
   std::map<std::string, Online_epoch> m_online_epochs;
+  uint64_t m_next_prewarm_generation{0};
   enum class Terminal_phase : uint8_t {
     OPEN,
     COMMIT_ADMITTED,
     ABANDONING,
     COMMITTED,
     NOT_COMMITTED_CLEAN,
-    CORRUPT
+    CORRUPT,
+    RETIRING
   };
   struct Acknowledged_epoch {
     std::string root_dir;
@@ -1045,6 +1071,8 @@ class Preserve_trx_transfer_receiver_registry {
     std::array<unsigned char, kPreservedTrxSha256Length>
         admitted_commit_frame_digest{};
     bool commit_snapshot_verified{false};
+    bool commit_apply_in_progress{false};
+    uint64_t commit_apply_generation{0};
     std::array<unsigned char, kPreservedTrxSha256Length> fact_digest{};
     bool abandon_cleanup_in_progress{false};
     uint64_t terminal_cas_monotonic_us{0};
@@ -1460,8 +1488,10 @@ preserve_trx_transfer_complete_receiver_promotion_lease_process_local(
 Preserve_trx_transfer_status
 preserve_trx_transfer_destroy_abandoning_receiver_epoch_process_local(
     const Preserve_trx_transfer_accepted_epoch &accepted);
+#if !defined(DBUG_OFF)
 void preserve_trx_transfer_receiver_reaper_scan_for_unit_test(
     uint64_t now_us, Preserve_trx_transfer_receiver_registry *registry);
+#endif
 Preserve_trx_transfer_status
 preserve_trx_transfer_destroy_receiver_epoch_process_local(
     const Preserve_trx_transfer_accepted_epoch &accepted,
@@ -1538,6 +1568,13 @@ void preserve_trx_transfer_set_receiver_worker_init_pause_for_unit_test(
     bool pause);
 void preserve_trx_transfer_set_prewarm_paused_for_unit_test(bool paused);
 bool preserve_trx_transfer_receiver_workers_starting_for_unit_test();
+#ifndef DBUG_OFF
+std::string preserve_trx_transfer_receiver_process_nonce_for_unit_test();
+void preserve_trx_transfer_set_receiver_staged_prewarm_active_pause_for_unit_test(
+    bool paused);
+bool preserve_trx_transfer_wait_receiver_staged_prewarm_active_pause_for_unit_test(
+    uint timeout_ms);
+#endif
 /* Receiver transfer state is valid only for the current mysqld process. */
 Preserve_trx_transfer_status preserve_trx_transfer_cleanup_startup_root();
 Preserve_trx_transfer_status

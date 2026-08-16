@@ -1,0 +1,38 @@
+CALL mtr.add_suppression("Attempting backtrace");
+CALL mtr.add_suppression("You can use the following information to find out");
+CALL mtr.add_suppression("PRESERVE: RESET DRAIN invariant failure");
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=ON;
+SET GLOBAL rds_preserve_trx_token_retention_timeout_ms=1000;
+CREATE TABLE reset_direct_accounts(
+id INT PRIMARY KEY,
+balance INT NOT NULL,
+version INT NOT NULL
+) ENGINE=InnoDB;
+CREATE TABLE reset_direct_ledger(
+id INT AUTO_INCREMENT PRIMARY KEY,
+account_id INT NOT NULL,
+delta INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO reset_direct_accounts VALUES
+(1,1000,0),(2,1000,0),(3,1000,0),(4,1000,0);
+ERROR HY000: DRAIN TRANSACTIONS PRESERVE was reset before ownership became irreversible
+SELECT 1 AS server_survived_scope_guard_race;
+server_survived_scope_guard_race
+1
+SELECT GROUP_CONCAT(CONCAT(id,':',balance,':',version) ORDER BY id)
+AS accounts_after_race
+FROM reset_direct_accounts;
+accounts_after_race
+1:950:1,2:1050:1,3:970:1,4:1030:1
+SELECT COUNT(*) AS ledger_rows_after_race FROM reset_direct_ledger;
+ledger_rows_after_race
+4
+SELECT COUNT(*) AS preserved_records_after_race
+FROM performance_schema.preserved_transactions;
+preserved_records_after_race
+0
+SELECT * FROM reset_direct_native ORDER BY id;
+id	v
+1	10
+2	20

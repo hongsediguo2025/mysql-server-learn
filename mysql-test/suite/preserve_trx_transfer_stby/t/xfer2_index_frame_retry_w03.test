@@ -93,8 +93,8 @@ CREATE TABLE xfer2_x903_receiver_native(
 ) ENGINE=InnoDB;
 INSERT INTO xfer2_x903_receiver_native VALUES(1,10),(2,20);
 
---let $x903_projection_count= query_get_value("SELECT COUNT(*) AS c FROM performance_schema.global_status WHERE VARIABLE_NAME IN ('Preserve_trx_transfer_receiver_after_apply_before_ack_faults','Preserve_trx_transfer_receiver_sequence_already_applied','Preserve_trx_transfer_receiver_terminal_cas_duplicates')",c,1)
-if ($x903_projection_count != 3)
+--let $x903_projection_count= query_get_value("SELECT COUNT(*) AS c FROM performance_schema.global_status WHERE VARIABLE_NAME IN ('Preserve_trx_transfer_receiver_sequence_already_applied','Preserve_trx_transfer_receiver_terminal_cas_duplicates')",c,1)
+if ($x903_projection_count != 2)
 {
   --die RED: missing object-replay or terminal-duplicate projection
 }
@@ -107,9 +107,6 @@ SET @admitted_before=(SELECT VARIABLE_VALUE+0
 SET @admitted_bytes_before=(SELECT VARIABLE_VALUE+0
   FROM performance_schema.global_status WHERE VARIABLE_NAME=
   'Preserve_trx_transfer_receiver_admitted_bytes');
-SET @after_apply_before=(SELECT VARIABLE_VALUE+0
-  FROM performance_schema.global_status WHERE VARIABLE_NAME=
-  'Preserve_trx_transfer_receiver_after_apply_before_ack_faults');
 SET @already_applied_before=(SELECT VARIABLE_VALUE+0
   FROM performance_schema.global_status WHERE VARIABLE_NAME=
   'Preserve_trx_transfer_receiver_sequence_already_applied');
@@ -288,9 +285,8 @@ SET DEBUG_SYNC=
 # Prove that the selected non-final object payload was applied and its exact
 # replay reused stable sequence results before the terminal phase begins.
 --connection xfer2_receiver
---let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_after_apply_before_ack_faults')=@after_apply_before+1
---let $wait_timeout= 60
---source include/wait_condition_or_abort.inc
+SET DEBUG_SYNC='now WAIT_FOR reached_xfer2_nonfinal_apply_before_ack_fault TIMEOUT 60';
+SET DEBUG_SYNC='now SIGNAL continue_xfer2_nonfinal_apply_before_ack_fault';
 --let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_sequence_already_applied')>@already_applied_before
 --let $wait_timeout= 60
 --source include/wait_condition_or_abort.inc
@@ -379,9 +375,6 @@ if ($x301_final_hwm_sync_warnings != 0)
 --source include/wait_condition_or_abort.inc
 
 SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
-         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_after_apply_before_ack_faults')
-       =@after_apply_before+1 AS exactly_one_object_ack_lost_after_apply,
-       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
          WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_sequence_already_applied')
        >@already_applied_before AS object_replay_used_already_applied;
 SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
@@ -539,10 +532,6 @@ CHECK TABLE xfer2_x903_indexed,xfer2_x903_source_native;
 --connection xfer2_receiver
 SELECT COUNT(*)=3 AND SUM(v)=63 AS receiver_native_commit_survives_restart
   FROM xfer2_x903_receiver_native;
-SELECT VARIABLE_VALUE=0 AS object_ack_fault_counter_reset
-  FROM performance_schema.global_status
- WHERE VARIABLE_NAME=
-  'Preserve_trx_transfer_receiver_after_apply_before_ack_faults';
 SELECT VARIABLE_VALUE=0 AS already_applied_counter_reset
   FROM performance_schema.global_status
  WHERE VARIABLE_NAME=

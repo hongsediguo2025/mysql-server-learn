@@ -74,9 +74,6 @@ FROM performance_schema.global_status WHERE VARIABLE_NAME=
 SET @admitted_bytes_before=(SELECT VARIABLE_VALUE+0
 FROM performance_schema.global_status WHERE VARIABLE_NAME=
 'Preserve_trx_transfer_receiver_admitted_bytes');
-SET @after_apply_before=(SELECT VARIABLE_VALUE+0
-FROM performance_schema.global_status WHERE VARIABLE_NAME=
-'Preserve_trx_transfer_receiver_after_apply_before_ack_faults');
 SET @already_applied_before=(SELECT VARIABLE_VALUE+0
 FROM performance_schema.global_status WHERE VARIABLE_NAME=
 'Preserve_trx_transfer_receiver_sequence_already_applied');
@@ -225,16 +222,15 @@ FROM xfer2_w01_accounts;
 outsider_sees_only_background_commit
 1
 DRAIN TRANSACTIONS PRESERVE;
+SET DEBUG_SYNC='now WAIT_FOR reached_xfer2_nonfinal_apply_before_ack_fault TIMEOUT 60';
+SET DEBUG_SYNC='now SIGNAL continue_xfer2_nonfinal_apply_before_ack_fault';
 generation	outcome	source_connection_id	token_role	reason	closing_started_us	closing_deadline_us
 GENERATION	SUCCESS	SOURCE_ID	SURVIVOR	NONE	CLOSING_STARTED_US	CLOSING_DEADLINE_US
 SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
-WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_after_apply_before_ack_faults')
-=@after_apply_before+1 AS exactly_one_ack_lost_after_apply,
-(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_sequence_already_applied')
 >@already_applied_before AS replay_used_already_applied;
-exactly_one_ack_lost_after_apply	replay_used_already_applied
-1	1
+replay_used_already_applied
+1
 SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_admitted_frames')
 >@admitted_before+5 AS multiple_unique_frames_admitted,
@@ -314,7 +310,7 @@ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_conflicts')
 no_cleanup_debt_token	no_cleanup_debt_bytes	no_terminal_duplicate	no_terminal_conflict
 1	1	1	1
 SET GLOBAL debug=
-'-d,preserve_trx_transfer_receiver_after_frame_apply_before_ack,preserve_trx_transfer_receiver_drop_nonfinal_object_batch_ack_once';
+'-d,preserve_trx_transfer_receiver_after_frame_apply_before_ack,preserve_trx_transfer_receiver_drop_nonfinal_object_batch_ack_once,syncpoint_xfer2_nonfinal_apply_before_ack_fault';
 SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=OFF;
 START TRANSACTION;
 UPDATE xfer2_x905_receiver_native SET v=v+id;
@@ -429,12 +425,6 @@ test.xfer2_x905_source_native	check	status	OK
 SELECT COUNT(*)=3 AND SUM(v)=63 AS receiver_native_commit_survives_restart
 FROM xfer2_x905_receiver_native;
 receiver_native_commit_survives_restart
-1
-SELECT VARIABLE_VALUE=0 AS ack_fault_counter_reset
-FROM performance_schema.global_status
-WHERE VARIABLE_NAME=
-'Preserve_trx_transfer_receiver_after_apply_before_ack_faults';
-ack_fault_counter_reset
 1
 SELECT VARIABLE_VALUE=0 AS already_applied_counter_reset
 FROM performance_schema.global_status

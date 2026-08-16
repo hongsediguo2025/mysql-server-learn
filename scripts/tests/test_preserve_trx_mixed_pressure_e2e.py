@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import dataclasses
 import tempfile
 import threading
 import unittest
@@ -690,6 +691,14 @@ class MixedPressureCommandTest(unittest.TestCase):
             "receiver_worker_active": 0,
             "receiver_read_load_qps_drop_pct": 4.0,
             "receiver_read_load_p99_increase_pct": 9.0,
+            "receiver_read_load_baseline_query_count": 100,
+            "receiver_read_load_transfer_query_count": 100,
+            "receiver_read_load_baseline_qps": 100.0,
+            "receiver_read_load_transfer_qps": 100.0,
+            "receiver_read_load_baseline_p99_us": 100,
+            "receiver_read_load_transfer_p99_us": 100,
+            "receiver_read_load_error_count": 0,
+            "receiver_read_load_performance_gate_enforced": False,
             "physical_replication": False,
             "production_provider": False,
             "write_enable_exercised": False,
@@ -737,8 +746,12 @@ class MixedPressureCommandTest(unittest.TestCase):
         self.assertIn("--business-run-before-drain", command)
         self.assertIn("--mixed-min-started-sessions", command)
         self.assertIn("--max-sql-resume-ms", command)
+        self.assertEqual(
+            "0", command[command.index("--max-sql-resume-ms") + 1]
+        )
         self.assertIn("--allow-partial-tokens", command)
         self.assertIn("--warmcopy-required", command)
+        self.assertIn("--keep-schema", command)
         self.assertIn("--source-start-command", command)
         self.assertIn("--restart-command", command)
         self.assertNotIn("--receiver-start-command", command)
@@ -760,9 +773,12 @@ class MixedPressureCommandTest(unittest.TestCase):
             MIXED_SMOKE_PROFILE, "mixed-transfer"
         )
         self.assertEqual("LOCAL_STARTUP_E2E", local["evidence_kind"])
-        self.assertEqual(100_000, local["sql_resume_max_us"])
+        self.assertEqual(0, local["sql_resume_max_us"])
+        self.assertFalse(local["statistical_slo_enforced"])
         self.assertNotIn("receiver_readiness_contract", local)
         self.assertEqual("READY", transfer["receiver_readiness_contract"])
+        self.assertEqual(0, transfer["receiver_ready_after_final_spool_ack_us_max"])
+        self.assertFalse(transfer["statistical_slo_enforced"])
         self.assertNotIn("sql_resume_max_us", transfer)
 
     def test_transfer_command_uses_same_workload_over_tcp(self):
@@ -806,6 +822,14 @@ class MixedPressureCommandTest(unittest.TestCase):
         self.assertIn("--enforce-gtid-consistency=ON", receiver)
         self.assertNotIn("--receiver-unix-socket", command)
         self.assertIn("--warmcopy-required", command)
+        self.assertIn("--keep-schema", command)
+        self.assertEqual(
+            "0",
+            command[
+                command.index("--max-receiver-ready-after-phase2-ms") + 1
+            ],
+        )
+        self.assertIn("--receiver-read-load-observe-only", command)
         self.assertIn(
             "--rds-preserve-trx-transfer-runtime-profile=PROMOTION_PREPARE",
             source,
@@ -849,32 +873,70 @@ class MixedPressureCommandTest(unittest.TestCase):
                     MIXED_SMOKE_PROFILE, invalid, "mixed-transfer"
                 )
 
-        too_slow = dict(report)
-        too_slow["source_phase2_post_command_tail_us"] = [500_001]
+        slow_but_functionally_complete = dict(report)
+        slow_but_functionally_complete["source_phase2_post_command_tail_us"] = [
+            2_500_000
+        ]
+        slow_but_functionally_complete[
+            "receiver_ready_after_final_spool_ack_us"
+        ] = 2_500_000
+        metrics = validate_mixed_pressure_report(
+            MIXED_SMOKE_PROFILE,
+            slow_but_functionally_complete,
+            "mixed-transfer",
+        )
+        self.assertEqual(2_500_000, metrics["source_post_command_tail_us"])
+
+        strict_profile = dataclasses.replace(
+            MIXED_SMOKE_PROFILE, statistical_slo_enforced=True
+        )
+        slow_but_functionally_complete[
+            "receiver_read_load_performance_gate_enforced"
+        ] = True
         with self.assertRaisesRegex(
-            RuntimeError, "source_phase2_post_command_tail_us"
+            RuntimeError,
+            "receiver_ready_after_final_spool_ack_us.*"
+            "source_phase2_post_command_tail_us",
         ):
             validate_mixed_pressure_report(
-                MIXED_SMOKE_PROFILE, too_slow, "mixed-transfer"
+                strict_profile,
+                slow_but_functionally_complete,
+                "mixed-transfer",
             )
 
-        at_limit = dict(report)
-        at_limit["source_phase2_post_command_tail_us"] = [500_000]
-        with self.assertRaisesRegex(
-            RuntimeError, "source_phase2_post_command_tail_us"
-        ):
-            validate_mixed_pressure_report(
-                MIXED_SMOKE_PROFILE, at_limit, "mixed-transfer"
-            )
+    def test_mixed_smoke_keeps_semantic_duration_and_resume_evidence_only(self):
+        profile = MIXED_SMOKE_PROFILE
+        report = self._valid_transfer_report()
+        report.update(
+            evidence_kind="LOCAL_STARTUP_E2E",
+            mixed_restart_fresh_connection_count=0,
+            sql_resume_latency={
+                "sample_count": profile.sessions,
+                "max_us": 250_000,
+            },
+            mixed_resumed_survivor_details=[
+                {
+                    "stored_procedure_completed": True,
+                    "stored_procedure_work_units": 100_000,
+                }
+                for _ in range(profile.sessions)
+            ],
+            mixed_final_table_row_count_min=profile.mixed_seed_rows_per_table,
+            phase2_total_samples_ms=[1_000],
+            startup_recovery_elapsed_samples_ms=[1_000],
+            mixed_duration_class_min_us={"short": 250_000},
+            mixed_duration_class_max_us={
+                "hundreds_ms": 50_000,
+                "seconds": 500_000,
+                "tens_seconds": 5_000_000,
+            },
+        )
 
-        ready_too_slow = dict(report)
-        ready_too_slow["receiver_ready_after_final_spool_ack_us"] = 500_000
-        with self.assertRaisesRegex(
-            RuntimeError, "receiver_ready_after_final_spool_ack_us"
-        ):
-            validate_mixed_pressure_report(
-                MIXED_SMOKE_PROFILE, ready_too_slow, "mixed-transfer"
-            )
+        metrics = validate_mixed_pressure_report(
+            profile, report, "mixed-shutdown-startup"
+        )
+
+        self.assertEqual(250_000, metrics["sql_resume_max_us"])
 
     def test_mixed_transfer_accepts_measured_inflight_long_command_duration(self):
         report = self._valid_transfer_report()
@@ -918,6 +980,19 @@ class MixedPressureCommandTest(unittest.TestCase):
         ] - 1
 
         with self.assertRaisesRegex(RuntimeError, "receiver_ready_tokens"):
+            validate_mixed_pressure_report(
+                MIXED_SMOKE_PROFILE, report, "mixed-transfer"
+            )
+
+    def test_mixed_transfer_observe_only_still_requires_healthy_read_probe(self):
+        report = self._valid_transfer_report()
+        report["receiver_read_load_error_count"] = 1
+        report["receiver_read_load_baseline_query_count"] = 0
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "receiver_read_load_error_count.*receiver read-load baseline evidence",
+        ):
             validate_mixed_pressure_report(
                 MIXED_SMOKE_PROFILE, report, "mixed-transfer"
             )

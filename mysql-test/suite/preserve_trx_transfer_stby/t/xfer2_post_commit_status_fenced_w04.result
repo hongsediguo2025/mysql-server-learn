@@ -17,8 +17,6 @@ WITH RECURSIVE seq(n) AS (
 SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<32
 )
 SELECT n, 1000, 0, CONCAT('account-', n) FROM seq;
-CALL mtr.add_suppression(
-"PRESERVE: standby transfer source entered COMMIT_UNKNOWN");
 SELECT balance=1000 AND version=0 AS owner_rr_initial
 FROM xfer2_w01_accounts WHERE id=32;
 owner_rr_initial
@@ -68,7 +66,9 @@ SELECT v=100 AS receiver_native_initial
 FROM xfer2_terminal_receiver_native WHERE id=1;
 receiver_native_initial
 1
-ERROR HY000: Resumable transactions across shutdown do not support this operation
+generation	outcome	source_connection_id	token_role	reason	closing_started_us	closing_deadline_us
+GENERATION	SUCCESS_WITH_EXCLUSIONS	SOURCE_ID	SURVIVOR	NONE	CLOSING_STARTED_US	CLOSING_DEADLINE_US
+GENERATION	SUCCESS_WITH_EXCLUSIONS	SOURCE_ID	EXCLUDED	CLOSING_COMMAND_TIMEOUT	CLOSING_STARTED_US	CLOSING_DEADLINE_US
 SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME=
 'Preserve_trx_transfer_receiver_terminal_cas_wins')
@@ -182,19 +182,19 @@ WHERE VARIABLE_NAME=
 AS no_receiver_queue;
 ready_cache_retained	no_promotion_adoption	ready_memory_retained	no_receiver_worker	no_receiver_queue
 1	1	1	1	1
-SELECT COUNT(*)=1 AS waiter_still_blocked_after_terminal_case FROM performance_schema.data_lock_waits w JOIN performance_schema.threads t ON t.THREAD_ID=w.REQUESTING_THREAD_ID WHERE t.PROCESSLIST_ID=WAITER_ID;
-waiter_still_blocked_after_terminal_case
-1
 SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME=
 'Preserve_trx_transfer_source_handoff_pending_epochs')
-=@terminal_handoff_before AS no_handoff_pending_after_status_case,
+=@terminal_handoff_before AS no_handoff_pending,
 (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME=
 'Preserve_trx_transfer_source_commit_unknown_epochs')
-=@terminal_unknown_before+1 AS one_fenced_commit_unknown;
-no_handoff_pending_after_status_case	one_fenced_commit_unknown
+=@terminal_unknown_before AS no_commit_unknown;
+no_handoff_pending	no_commit_unknown
 1	1
+SELECT COUNT(*)=1 AS waiter_still_blocked_after_terminal_case FROM performance_schema.data_lock_waits w JOIN performance_schema.threads t ON t.THREAD_ID=w.REQUESTING_THREAD_ID WHERE t.PROCESSLIST_ID=WAITER_ID;
+waiter_still_blocked_after_terminal_case
+1
 RESET DRAIN;
 ERROR HY000: RESET DRAIN arrived after ownership became irreversible
 SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
