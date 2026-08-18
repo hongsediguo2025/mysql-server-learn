@@ -1,0 +1,440 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Preserve/Resume：Session-only 一次性连接集合设计</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f2f5f7;
+      --paper: #fff;
+      --ink: #18232d;
+      --muted: #5d6975;
+      --line: #d7dfe5;
+      --soft: #edf4f4;
+      --accent: #087b83;
+      --good: #246b49;
+      --warn: #8b5b00;
+      --bad: #a33a3a;
+      --code: #17212b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei",
+        "PingFang SC", Arial, sans-serif;
+      line-height: 1.68;
+    }
+    main {
+      width: min(1080px, calc(100% - 32px));
+      margin: 24px auto;
+      padding: 42px 52px 64px;
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+    }
+    h1 { margin: 0 0 12px; font-size: 32px; line-height: 1.25; letter-spacing: 0; }
+    h2 { margin: 38px 0 14px; font-size: 23px; letter-spacing: 0; }
+    h3 { margin: 24px 0 8px; font-size: 17px; letter-spacing: 0; }
+    p, li { font-size: 15px; }
+    .meta { color: var(--muted); }
+    .decision {
+      margin: 24px 0;
+      padding: 18px 20px;
+      background: var(--soft);
+      border-left: 5px solid var(--accent);
+      font-size: 18px;
+      font-weight: 650;
+    }
+    .note, .warning {
+      margin: 16px 0;
+      padding: 12px 15px;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+    }
+    .note { border-left: 4px solid var(--good); }
+    .warning { border-left: 4px solid var(--warn); }
+    table { width: 100%; border-collapse: collapse; margin: 14px 0 22px; }
+    th, td {
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+    th { background: #f5f8f9; }
+    code { font-family: Consolas, "Cascadia Mono", monospace; font-size: 0.92em; }
+    p code, li code, td code { padding: 1px 4px; background: #edf1f3; border-radius: 3px; }
+    pre {
+      margin: 12px 0 20px;
+      padding: 16px;
+      overflow: auto;
+      color: #edf4f7;
+      background: var(--code);
+      border-radius: 5px;
+      line-height: 1.52;
+    }
+    pre code { font-size: 13px; }
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(110px, 1fr));
+      gap: 10px;
+      margin: 18px 0 24px;
+    }
+    .flow div {
+      position: relative;
+      min-height: 88px;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-top: 4px solid var(--accent);
+      border-radius: 4px;
+      background: #fafcfc;
+      font-size: 14px;
+    }
+    .flow div:not(:last-child)::after {
+      content: "→";
+      position: absolute;
+      top: 28px;
+      right: -13px;
+      z-index: 1;
+      color: var(--accent);
+      font-size: 19px;
+      font-weight: 700;
+    }
+    .yes { color: var(--good); font-weight: 700; }
+    .no { color: var(--bad); font-weight: 700; }
+    footer {
+      margin-top: 40px;
+      padding-top: 18px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+    }
+    @media (max-width: 820px) {
+      main { width: 100%; margin: 0; padding: 28px 18px 44px; border: 0; }
+      h1 { font-size: 27px; }
+      .flow { grid-template-columns: 1fr; }
+      .flow div:not(:last-child)::after { content: "↓"; top: auto; right: 50%; bottom: -18px; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Preserve/Resume：Session-only 一次性连接集合设计</h1>
+    <p class="meta">适用代码：MySQL 8.0.22 Preserve/Resume 当前工作树；范围：receiver 当前进程内最近一次成功 DRAIN handoff；源码状态同步：2026-08-18</p>
+  </header>
+
+  <div class="decision">
+    Receiver 只维护一个 session-only 白名单 <code>S</code>。<code>S</code> 只包含“属于本轮 source session，
+    且在 DRAIN 最终边界已确认没有未提交事务”的 source connection ID。<code>RESUME</code> 命中后必须在专用锁下
+    原子 <code>erase</code>，确保一个 source connection ID 最多配对一个 target connection。
+  </div>
+
+  <h2>1. 最终语义</h2>
+  <pre><code>S = eligible_idle_session_ids
+    + authoritatively_drained_no_transaction_ids
+
+T = successfully_finalized_transaction_token_ids
+
+S intersect T must be empty</code></pre>
+  <table>
+    <thead><tr><th>Source session 的最终情况</th><th>在 S 中</th><th>RESUME 行为</th></tr></thead>
+    <tbody>
+      <tr><td>DRAIN 分类时就是 eligible idle/no-trx 的普通 classic session</td><td class="yes">是</td><td>消费成员，确认无需绑定事务</td></tr>
+      <tr><td>Phase 2 命令边界为 eligible <code>DRAINED_NO_TRANSACTION</code></td><td class="yes">是</td><td>消费成员，不绑定事务</td></tr>
+      <tr><td>事务成功转移</td><td class="no">否</td><td>绑定当前 active epoch 的 promotion record</td></tr>
+      <tr><td>事务仍存在，但 source token-local 失败</td><td class="no">否</td><td>无 record 时返回 handoff 专用错误</td></tr>
+      <tr><td>receiver 接收、导入或 prewarm 失败</td><td class="no">否</td><td>无可绑定 record 时失败关闭</td></tr>
+      <tr><td>超时、结果未知或伪造 connection ID</td><td class="no">否</td><td>不得降级为 session-only</td></tr>
+    </tbody>
+  </table>
+
+  <div class="warning">
+    <strong>集合缺失不能解释为 session-only。</strong>存在 active handoff 时，只有原子命中 <code>S</code>，或命中当前 epoch
+    promotion record 的 ID 才能成功。其余 ID 一律失败，从而阻止代理误传/伪造 ID 获得无事务成功响应。
+  </div>
+
+  <h2>2. Source 形成集合</h2>
+  <p><code>Preserve_batch_target_counter</code> 已在持有 <code>THD::LOCK_thd_data</code> 时读取 idle、活动事务、在途
+    statement 和 closing 前 packet。统一谓词 <code>preserve_trx_session_only_candidate_is_eligible_locked()</code> 还要求：
+    THD 存活、非 system、未 killed、classic protocol、逻辑 idle、没有 SESSION/STMT engine participant，并且
+    <code>preserve_trx_is_unsupported_common_context()</code> 为 false，并且不持有任何临时表。即便某类临时表可由事务 bundle/sidecar
+    保存，session-only ID 本身也没有这些 payload；持有 XA、<code>LOCK TABLES</code>、user lock、server cursor、临时表等服务端上下文时，
+    整轮 DRAIN fail-closed，不能把该 ID 静默放入 <code>S</code>。</p>
+  <p>这里的“逻辑 idle”不能只看 <code>THD::m_server_idle</code>。CLOSING 后 packet header 已到达、但命令字节尚未解码时，
+    <code>m_server_idle</code> 已为 false，server 仍不知道它最终是应返回 4020 的普通命令，还是没有响应并将断开连接的
+    <code>COM_QUIT</code>。源码使用两个 THD-local atomic 字段表达这个三态窗口：</p>
+  <pre><code>preserve_trx_post_closing_command_classified = false; // 尚未解码
+preserve_trx_post_closing_cleanup_packet = false;
+
+// get_command() 成功后，先发布 COM_QUIT 分类，再发布 classified=true。
+preserve_trx_post_closing_cleanup_packet = (command == COM_QUIT);
+preserve_trx_post_closing_command_classified = true;</code></pre>
+  <table>
+    <thead><tr><th>最终扫描时的 command 状态</th><th>候选处理</th><th>理由</th></tr></thead>
+    <tbody>
+      <tr><td><code>m_server_idle=true</code></td><td class="yes">按其余 eligibility 保留</td><td>已经处于稳定命令边界</td></tr>
+      <tr><td>CLOSING 后普通命令已经分类、等待 4020</td><td class="yes">按其余 eligibility 保留</td><td>命令不会执行，连接仍属于 source session</td></tr>
+      <tr><td>CLOSING 后 packet 尚未分类或读包失败</td><td class="no">最终集合排除</td><td>无法证明它不是 COM_QUIT，必须 fail-closed</td></tr>
+      <tr><td>已经分类为 <code>COM_QUIT</code></td><td class="no">排除，但不使整轮 DRAIN 失败</td><td>连接已经不可逆地进入 teardown，即使 THD 尚存活</td></tr>
+      <tr><td><code>COM_STMT_CLOSE</code></td><td class="yes">视为仍存活 session</td><td>只释放 prepared statement，不关闭 THD/连接</td></tr>
+    </tbody>
+  </table>
+  <p>初始 counter 可以把“CLOSING 后尚未分类”的既有连接 ID 暂时加入候选集，但仍校验事务、临时表和 unsupported context；
+    这是为了避免普通命令在极短解码窗口中被永久漏掉。该 provisional ID 只有在最终快照已经分类为普通命令，或重新回到
+    <code>m_server_idle</code> 时才能留下。初始扫描若已经看见 <code>COM_QUIT</code>，只忽略该连接，不设置
+    <code>m_has_unsupported_transaction</code>。</p>
+  <p><code>preserve_trx_publish_pending_quiesce_at_idle_boundary()</code> 已提供后续权威二分：</p>
+  <pre><code>if (preserve_trx_has_active_multi_stmt_transaction(thd)) {
+  state = Preserve_trx_batch_thd_state::QUIESCED;
+} else {
+  state = Preserve_trx_batch_thd_state::DRAINED_NO_TRANSACTION;
+}</code></pre>
+  <div class="flow">
+    <div><strong>CLOSING</strong><br />阻止新普通命令</div>
+    <div><strong>初始候选 S</strong><br />收集 idle/no-trx 与 provisional ID</div>
+    <div><strong>边界判定</strong><br />DNT 时插入</div>
+    <div><strong>事务处理</strong><br />成功/失败均不插入</div>
+    <div><strong>最终交集复核</strong><br />删除退出、未分类、COM_QUIT 或失格 THD</div>
+    <div><strong>COMMIT_EPOCH</strong><br />一次发送有序 S</div>
+  </div>
+  <pre><code>std::set&lt;my_thread_id&gt; session_only_thread_ids(
+    counter.session_only_thread_ids().begin(),
+    counter.session_only_thread_ids().end());
+
+// 初始规划允许尚未解码的 post-CLOSING packet 暂时成为候选；
+// 最终快照调用同一谓词时不允许 unclassified。
+planning_eligible =
+    preserve_trx_session_only_candidate_is_eligible_locked(
+        candidate, true, true);
+final_eligible =
+    preserve_trx_session_only_candidate_is_eligible_locked(
+        candidate, true);
+
+if (target.state == DRAINED_NO_TRANSACTION &amp;&amp;
+    session_only_eligible_locked(target.thd)) {
+  session_only_thread_ids.insert(target.thread_id);
+} else if (target.state == DRAINED_NO_TRANSACTION) {
+  abort_drain_fail_closed();
+}
+
+Preserve_batch_session_only_final_snapshot final_snapshot(
+    session_only_thread_ids);
+Global_THD_manager::get_instance()-&gt;do_for_all_thd_copy(&amp;final_snapshot);
+session_only_thread_ids = final_snapshot.take_eligible_thread_ids();
+
+std::vector&lt;uint64_t&gt; commit_ids(
+    session_only_thread_ids.begin(), session_only_thread_ids.end());
+batch_transfer_source_session-&gt;commit_epoch(commit_ids);</code></pre>
+  <p><code>m_declared_tokens</code>、<code>m_finalized_tokens</code>、<code>m_aborted_tokens</code> 继续只作为传输协议账本；
+    不改变其含义。Phase 2 最终提交前会遍历当前 THD，但只对已有候选集合做交集复核：仍存活且仍满足统一 eligibility 的 ID 被保留，
+    未分类 packet、已解码 <code>COM_QUIT</code>、被 killed 或已经失格的 ID 被删除；<code>COM_STMT_CLOSE</code> 不等价于断连。
+    该扫描绝不把 closing 后新建的连接加入 <code>S</code>。
+    control-only 与包含事务的两条 COMMIT 路径都使用同一复核函数，扫描完成点就是 <code>S</code> 的 source 端线性化边界。</p>
+
+  <h2>3. COMMIT_EPOCH 与 Receiver 数据</h2>
+  <p><code>S</code> 以非零、升序、唯一的 vector 编入 <code>COMMIT_EPOCH.manifest_payload</code>，使用独立 magic
+    <code>PTRX_SSET_V1</code>。12-byte magic、4-byte count 和每 ID 8 bytes 必须限制在 1 MiB，因此最多 131070 个 ID。
+    现有 authenticated transfer principal、payload digest、完整 frame digest、sequence 和 commit admission 共同保护它，
+    不增加逐 ID 签名或 durable fact。</p>
+  <pre><code>// Process-local; no persistence and no history map.
+mutable std::mutex m_session_only_mutex;
+bool m_active_session_only_set_valid{false};
+std::unordered_set&lt;uint64_t&gt; m_active_session_only_tokens;
+std::string m_active_session_only_epoch_id;
+uint64_t m_active_session_only_generation{0};</code></pre>
+  <p>Source 与 receiver 都校验 <code>S ∩ T = ∅</code>。只有 COMMIT admission 成功后，receiver 才在
+    <code>m_session_only_mutex</code> 下整体 <code>swap</code> 新 set、epoch，并递增 generation。合法空 set 也必须覆盖旧 set。</p>
+  <pre><code>// Only in-flight transaction RESUME claims; also process-local.
+std::set&lt;std::pair&lt;uint64_t, uint64_t&gt;&gt; m_transaction_handoff_claims;
+
+// Source freezes the complete encoded COMMIT, not a second copy of vector S.
+bool m_final_metadata_accepted{false};
+std::string m_frozen_commit_payload;
+std::array&lt;unsigned char, kPreservedTrxSha256Length&gt;
+    m_terminal_fact_digest{};</code></pre>
+  <p>短 claim 的 key 是 <code>(handoff_generation, connection_id)</code>。它不保存事务，不形成历史 epoch map，只阻止旧、新 epoch
+    对同一个数值 connection ID 并发进入恢复。第一次 COMMIT 发送尝试前，source 把 canonical S、epoch、fence、trx-id-store proof
+    和 terminal digest 一次编码进 <code>m_frozen_commit_payload</code>。后续重试必须解码并核对同一 S，然后原样复用整帧，
+    防止 ACK 不确定时改写 terminal payload 的授权集合。</p>
+  <p>事务 epoch 同时保留两个摘要域：既有 <code>fact_digest</code> 只描述 finalized transaction manifests；
+    <code>terminal_fact_digest</code> 使用独立 domain 把该基础摘要与 canonical S、epoch 和 durable fence proof 绑定。
+    Control-only COMMIT 没有 transaction fact，因此使用另一个独立 domain 直接绑定 epoch、fence proof 与 S。Receiver 在
+    <code>Preserve_trx_transfer_accepted_epoch</code> 中分别保存两者，terminal CAS、QUERY/ABANDON 和 fallback resolution
+    一律比较 S-bound terminal digest，不能跨摘要域比较。</p>
+  <div class="note">
+    若 final metadata 已全部确认、但 COMMIT ACK 不确定，<code>m_final_metadata_accepted</code> 使重试跳过 metadata，直接重发冻结的
+    COMMIT；否则不同 payload 会被 uncertain-connection 保护拒绝。若 metadata 本身 ACK 不确定，仍沿用 fail-closed 的
+    precommit uncertainty 处理。本设计没有增加新的 wire command，只修正既有 COMMIT/QUERY/ABANDON 重试状态。
+  </div>
+  <div class="note">
+    Frame layout 仍是 product protocol v2，<code>manifest_payload</code> 是已有扩展槽位。新 source 的所有 COMMIT 都编码 S，
+    包括规范空集合；新 receiver 将旧 source 的无 payload transaction COMMIT 映射为“active + 空 S”，避免错误降级到本地 RESUME。
+    滚动升级必须 receiver-first；新 source 对旧 receiver 会被旧端拒绝并保留 source ownership，属于 fail-closed。
+  </div>
+
+  <h3>3.1 为什么不是多个 shard set</h3>
+  <p>当前只需要一个专用 set 和一把专用锁。session-only 路径按固定顺序短暂持有既有
+    <code>g_preserved_trx_mutex -&gt; m_session_only_mutex</code>，在同一线性化点完成“没有 transaction record”与
+    <code>find/erase</code>；事务路径只在 <code>m_session_only_mutex</code> 下登记/释放一个短 claim。权限检查、session 恢复、
+    InnoDB attach 和网络返回都不在 <code>m_session_only_mutex</code> 临界区内，因此 RESUME 主体不会被串行化。</p>
+  <div class="note">
+    不复用 receiver registry 的大 <code>m_mutex</code>，避免和 transfer/reaper/commit 状态竞争。现在做多 shard 会引入跨 shard 的
+    epoch 原子切换、锁序和旧 generation 清理，违反“最小正确实现”。只有压测证明这个短临界区成为瓶颈后才考虑固定分片。
+  </div>
+
+  <h3>3.2 Control-only COMMIT</h3>
+  <p>当本轮没有 finalized transaction 时，仍需发布 <code>S</code>（包括空 <code>S</code>）以覆盖旧 handoff。沿用窄
+    control-only COMMIT 分支：只跳过 transaction fact 构造，继续携带 trx-id-store/fence proof，并使用
+    <code>session_only_control_fact_digest()</code>、frame sequence、admission 与 ACK。Receiver 只允许 token=0、空 transaction
+    snapshot 且 canonical S payload 完整的 control-only COMMIT。</p>
+
+  <h2>4. RESUME 原子消费</h2>
+  <pre><code>handoff = snapshot_active_handoff(canonical_source_connection_id);
+record = preserved_trx_find_record(token);
+
+if (!handoff.available) {
+  return existing_local_preserve_resume_path();
+}
+
+if (handoff.session_only) {
+  require(RESUME_ANY privilege);
+  require(target has no active transaction or engine participant);
+  status = consume_under_record_then_session_lock(handoff);
+  if (status == RECORD_CONFLICT) {
+    return ER_PRESERVE_TRX_INVALID_STATE;  // S is not consumed
+  }
+  if (status != CONSUMED) {
+    return ER_PRESERVE_TRX_HANDOFF_UNAVAILABLE;
+  }
+  return OK;                              // S erased; no transaction attach
+}
+
+if (!record exists || !record.has_promotion_key ||
+    record.promotion_key.epoch_id != handoff.epoch_id) {
+  return ER_PRESERVE_TRX_HANDOFF_UNAVAILABLE;
+}
+
+claim_current_handoff_generation(handoff); // short, one ID at a time
+return existing_promotion_record_resume_path(record);</code></pre>
+  <p>Snapshot 返回当前 token 是否在 <code>S</code>、epoch 和 generation。真正授权在专用锁下发生。两个 target connections
+    并发使用同一个 source ID 时，最多一个线程 erase 成功；另一个线程看到成员已消失或 epoch/generation 改变并失败。
+    record 冲突检查与 erase 不再是两次可穿插的查询。事务路径在写 attach intent 前 claim 当前 handoff generation，旧 snapshot
+    在新 epoch 已发布后不能开始 attach；已先 claim 的恢复可继续，但同一数值 ID 在 claim 释放前不能由新 epoch 再次消费。
+    事务路径仍由既有 record claim/take 保证单所有者，并保留“原 owner 或 RESUME_ANY”鉴权；只有没有 record 元数据可核验的
+    session-only 路径强制要求 <code>RESUME_ANY_PRESERVED_TRANSACTION</code>。</p>
+  <div class="warning">
+    <strong>S 只负责 connection ID 授权和“一次配对”。</strong>它不包含 session payload，也不调用
+    <code>restore_preserved_session_variables()</code>。代理必须先通过既有链路完成认证和 session context 反序列化，再调用 RESUME；
+    本补丁成功返回只表示该 source ID 属于本轮 handoff 且无需 attach transaction。
+  </div>
+
+  <div class="warning">
+    <strong>一次性消费不是 SQL 级幂等接口。</strong>若 server 已消费 ID 并执行 <code>my_ok()</code>，但代理未收到 OK，盲目重试会失败。
+    代理必须保留成功返回的 target socket，并禁止同一 source ID 并发配对。ACK 丢失若需要可重试语义，必须另行引入 request nonce
+    或查询接口；本次实现不增加该复杂度。
+  </div>
+
+  <h2>5. 错误合同</h2>
+  <pre><code>ER_PRESERVE_TRX_HANDOFF_UNAVAILABLE
+  eng "No resumable transaction or session-only handoff entry exists for this connection"</code></pre>
+  <table>
+    <thead><tr><th>条件</th><th>SQL 结果</th><th>状态变化</th></tr></thead>
+    <tbody>
+      <tr><td>无 active handoff</td><td>沿用既有本地 Preserve/Resume</td><td>无</td></tr>
+      <tr><td>ID 在 S、无 record、消费成功</td><td>OK</td><td>erase；以后同 ID 失败</td></tr>
+      <tr><td>ID 在 S 但存在 record</td><td><code>ER_PRESERVE_TRX_INVALID_STATE</code></td><td>不消费</td></tr>
+      <tr><td>ID 在 S，但 target 已有活动事务/engine participant</td><td><code>ER_PRESERVE_TRX_INVALID_STATE</code></td><td>不消费</td></tr>
+      <tr><td>ID 不在 S、有当前 epoch promotion record</td><td>既有事务恢复结果</td><td>record claim/take</td></tr>
+      <tr><td>ID 不在 S、无当前 epoch record</td><td><code>ER_PRESERVE_TRX_HANDOFF_UNAVAILABLE</code></td><td>无</td></tr>
+      <tr><td>并发重复、已消费或 stale generation</td><td><code>ER_PRESERVE_TRX_HANDOFF_UNAVAILABLE</code></td><td>不触碰新集合</td></tr>
+    </tbody>
+  </table>
+  <p>代理读取 MySQL 数值错误码，不匹配 <code>HY000</code> 或错误文本。权限不足继续使用现有 access denied，并且不得消费成员。</p>
+
+  <h2>6. 状态机</h2>
+  <pre><code>NO_ACTIVE_HANDOFF
+  -- accepted COMMIT_EPOCH(S, epoch) --> ACTIVE(epoch, generation, S)
+
+ACTIVE(epoch, generation, S)
+  -- accepted newer COMMIT ----------> ACTIVE(new_epoch, generation + 1, new_S)
+  -- RESUME(id in S), erase succeeds -> ACTIVE(epoch, generation, S - {id}) + OK
+  -- RESUME(id absent), no current record
+                                     -> unchanged + HANDOFF_UNAVAILABLE
+  -- RESUME(current promotion record) -> handoff claim -> record claim/attach
+  -- RESUME(stale handoff generation) -> unchanged + HANDOFF_UNAVAILABLE
+  -- receiver restart ---------------> NO_ACTIVE_HANDOFF</code></pre>
+  <p>成员消费不改变 generation；generation 只标识一次完整 set 替换。Receiver 只保存最近一轮 handoff，新成功 epoch 覆盖旧 epoch。</p>
+
+  <h2>7. 最小代码范围</h2>
+  <table>
+    <thead><tr><th>文件</th><th>最小改动</th></tr></thead>
+    <tbody>
+      <tr><td><code>sql/preserve_trx.cc</code></td><td>counter 收集 idle IDs；两个 DNT 分支插入 S；最终候选交集复核；原子 record/S 消费；事务 handoff claim</td></tr>
+      <tr><td><code>sql/preserve_trx.h</code>、<code>sql/sql_class.h</code>、<code>sql/sql_parse.cc</code></td><td>声明 command 分类入口；保存 classified/COM_QUIT 原子状态；在 <code>get_command()</code> 后、packet marker 前发布分类</td></tr>
+      <tr><td><code>sql/preserve_trx_transfer.h/.cc</code></td><td>session-only codec；独立 set/epoch/generation/mutex；snapshot/consume/短 claim；S/T 冲突校验；COMMIT 的 S 冻结</td></tr>
+      <tr><td><code>share/messages_to_clients.txt</code></td><td>增加 handoff 专用错误码</td></tr>
+      <tr><td><code>mysql-test/suite/preserve_trx/</code></td><td>新增 7 组行为 MTR 与 1 组 source-shape lint；修改 1 组既有 MTR。覆盖 idle、最终扫描、Phase 2 COMMIT、失败 token、错误 ID、重复 RESUME、record/S 冲突和 epoch 覆盖</td></tr>
+    </tbody>
+  </table>
+  <div class="note">
+    <strong>当前工作树静态代码量：</strong>7 个生产文件（<code>share/messages_to_clients.txt</code>、
+    <code>sql/preserve_trx.cc/.h</code>、<code>sql/preserve_trx_transfer.cc/.h</code>、<code>sql/sql_class.h</code>、
+    <code>sql/sql_parse.cc</code>）合计 <code>+1097/-94</code>；修改的既有 MTR pair 为 <code>+19/-15</code>；
+    新增 7 组行为 MTR 和 1 组 source-shape lint，共 22 个文件、1158 个物理行。<code>unittest/gunit/preserve_trx-t.cc</code>
+    当前内容与 index 一致，不属于提交。统计不含本文档，也不代表已编译或已执行测试。
+  </div>
+  <p>明确不修改 durable epoch fact、启动 recovery、bundle/carrier、temp-table sidecar、SQL 语法和既有 proxy session payload；
+    不增加 per-ID 对象、历史 epoch map、多 shard、持久化表或新的 ACK wire protocol。</p>
+
+  <h2>8. 不变量与必测场景</h2>
+  <ol>
+    <li>只有通过统一 eligibility 的 idle/no-trx、provisional post-CLOSING packet 或权威 <code>DRAINED_NO_TRANSACTION</code> 才成为候选；最终复核只删除，不新增。</li>
+    <li>provisional packet 在最终快照前必须已经分类为普通命令或回到 idle；未分类/read-error 一律不能进入 S。</li>
+    <li><code>COM_QUIT</code> 一经分类即排除且不能使整轮 DRAIN 失败；<code>COM_STMT_CLOSE</code> 仍代表存活 session。</li>
+    <li>source/receiver failure、ABORT、artifact 缺失、timeout 和未知状态均不得进入 <code>S</code>。</li>
+    <li><code>S ∩ T = ∅</code>；双端校验冲突并 fail-closed。</li>
+    <li>第一次 session-only RESUME 成功且不 attach；第二次及并发竞争者返回专用错误。</li>
+    <li>Phase 2 COMMIT 后 DNT 的 ID 进入 <code>S</code>，已发送 staging 按既有流程清理。</li>
+    <li>成功事务不在 <code>S</code>，只能通过当前 epoch record 恢复一次。</li>
+    <li>source/receiver 失败 ID、随机数字 ID、旧 epoch ID 均不能 session-only 成功。</li>
+    <li>record 与 session-only ID 冲突时返回 INVALID_STATE，不消费成员。</li>
+    <li>target 已有活动事务或 engine participant 时返回 INVALID_STATE，不消费成员。</li>
+    <li>旧 snapshot 遇到新 epoch 覆盖时 consume 失败，不删除新 set 中的同值成员。</li>
+    <li>事务 RESUME 必须 claim 当前 handoff generation；同一个数值 ID 不能跨 epoch 并发恢复。</li>
+    <li>第一次 COMMIT 发送尝试后，同一 source epoch 不能改用另一份 <code>S</code>。</li>
+    <li>事务 terminal digest 必须绑定基础 transaction fact 与 S；control-only 使用独立摘要 domain；fallback 不得比较错误摘要域。</li>
+    <li>final metadata 已确认后的 COMMIT 重试不得重发 metadata，且必须逐字节复用冻结 COMMIT。</li>
+    <li>连续 epoch（包括空 set）整体覆盖；失败 COMMIT 不修改旧 active handoff。</li>
+    <li>receiver 重启后集合消失；本设计不承诺跨重启 session-only RESUME。</li>
+  </ol>
+
+  <h3>8.1 当前 MTR 证据矩阵</h3>
+  <table>
+    <thead><tr><th>MTR</th><th>覆盖合同</th></tr></thead>
+    <tbody>
+      <tr><td><code>standby_transfer_resume_required_lifecycle</code></td><td>无 active handoff、unsupported idle、source-finalize 失败、权限/target pristine、一次性消费、空集合覆盖与 COMMIT ACK 丢失</td></tr>
+      <tr><td><code>standby_transfer_resume_required_phase2_commit</code></td><td>事务在 Phase 2 命令边界完成 COMMIT 后转为 DNT，并以 session-only 成功一次</td></tr>
+      <tr><td><code>standby_transfer_resume_required_mixed</code></td><td>source failure、receiver NOT_READY、idle 成功、事务 ID/伪造 ID/非 canonical ID fail-closed</td></tr>
+      <tr><td><code>standby_transfer_resume_required_final_snapshot</code></td><td>事务型 epoch 在最终快照前已退出的 idle THD 不进入 S</td></tr>
+      <tr><td><code>standby_transfer_resume_required_control_only_final_snapshot</code></td><td>同一次 control-only DRAIN 同时验证已退出 THD、等待 4020 的存活 THD，以及快照时仍存活的 COM_QUIT THD</td></tr>
+      <tr><td><code>standby_transfer_resume_required_record_conflict</code></td><td>record/S 冲突不消费成员，故障解除后仍可成功一次</td></tr>
+      <tr><td><code>batch_drain_local_ignores_unrelated_idle_context</code></td><td>LOCAL_CARRIER 不执行 session-only eligibility，不受无关 idle unsupported context 污染</td></tr>
+      <tr><td><code>resume_required_token_set_lint</code></td><td>codec、摘要域、冻结重试、命令分类、锁序、双端 S/T 校验和错误合同的 source-shape 守卫</td></tr>
+      <tr><td><code>batch_drain_source_all_token_local_failure_reset</code></td><td>既有用例更新：control-only terminal handoff 后 RESET 必须返回 too-late</td></tr>
+    </tbody>
+  </table>
+  <div class="warning">
+    <strong>证据边界：</strong>上述是已编写的 MTR 合同与静态源码校验，不是已执行通过记录。按本轮约束没有编译，也没有运行 MTR/GUnit。
+    本次没有新增“physical promotion 后事务成功 RESUME”的 MTR，不应从该矩阵推导此路径已被运行时验证。
+  </div>
+
+  <footer>
+    集合 <code>S</code> 是一次性 session-only 授权，不是事务必需列表。命中并原子删除才允许跳过事务绑定；非成员必须匹配
+    当前 epoch 的 preserved transaction record，否则失败。一个专用 set 加短临界区已经满足正确性和并发性要求，无需预先分片。
+  </footer>
+</main>
+</body>
+</html>

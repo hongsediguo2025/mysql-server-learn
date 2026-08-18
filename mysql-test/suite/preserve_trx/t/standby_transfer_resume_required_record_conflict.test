@@ -1,0 +1,93 @@
+--source include/have_debug.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+--disable_query_log
+--disable_result_log
+
+--let $credential_file= $MYSQL_TMP_DIR/resume-required-conflict.secret
+--write_file $credential_file
+resume-required-conflict-secret
+EOF
+--exec chmod 600 $credential_file
+
+--connect(conflict_receiver_root,127.0.0.1,root,,test,$SERVER_MYPORT_2,)
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'resume-required-conflict-secret';
+GRANT PRESERVE_TRX_TRANSFER_ADMIN,
+      RESUME_ANY_PRESERVED_TRANSACTION,
+      PROCESS ON *.* TO preserve_trx_ha_admin@localhost;
+--connect(conflict_receiver_resume,127.0.0.1,preserve_trx_ha_admin,resume-required-conflict-secret,test,$SERVER_MYPORT_2,)
+
+--connection default
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+DROP USER IF EXISTS resume_required_conflict_app@localhost;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'resume-required-conflict-secret';
+GRANT SHUTDOWN, SYSTEM_VARIABLES_ADMIN,
+      PRESERVE_TRX_TRANSFER_ADMIN, PROCESS ON *.*
+  TO preserve_trx_ha_admin@localhost;
+CREATE USER resume_required_conflict_app@localhost;
+GRANT SELECT ON test.* TO resume_required_conflict_app@localhost;
+
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$SERVER_MYPORT_2 --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=resume_required_conflict --rds-preserve-trx-transfer-credential-secret-file=$credential_file
+--source include/restart_mysqld.inc
+--let $restart_parameters=
+--disable_query_log
+--disable_result_log
+
+--connect(conflict_source_ha,localhost,preserve_trx_ha_admin,resume-required-conflict-secret,test)
+--connect(conflict_source_idle,localhost,resume_required_conflict_app,,test)
+--let $source_idle_id= query_get_value(SELECT CONNECTION_ID() AS id, id, 1)
+
+--connection default
+DRAIN TRANSACTIONS PRESERVE;
+
+# Force the real record-conflict branch around the registry lookup. The two
+# rejected attempts must not consume the active S member.
+--connection conflict_receiver_root
+SET GLOBAL debug='+d,preserve_trx_force_session_only_record_conflict';
+--connection conflict_receiver_resume
+--error ER_PRESERVE_TRX_INVALID_STATE
+--eval RESUME PRESERVED TRANSACTION '$source_idle_id'
+--error ER_PRESERVE_TRX_INVALID_STATE
+--eval RESUME PRESERVED TRANSACTION '$source_idle_id'
+
+# Removing only the fault proves that the same S member was retained. Success
+# consumes it exactly once.
+--connection conflict_receiver_root
+SET GLOBAL debug='-d,preserve_trx_force_session_only_record_conflict';
+--connection conflict_receiver_resume
+--eval RESUME PRESERVED TRANSACTION '$source_idle_id'
+--error ER_PRESERVE_TRX_HANDOFF_UNAVAILABLE
+--eval RESUME PRESERVED TRANSACTION '$source_idle_id'
+
+--connection conflict_source_ha
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+SHUTDOWN;
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+--disable_query_log
+--disable_result_log
+
+--connect(conflict_source_cleanup,localhost,root,,test)
+DROP USER resume_required_conflict_app@localhost;
+DROP USER preserve_trx_ha_admin@localhost;
+
+--connection conflict_receiver_root
+DROP USER preserve_trx_ha_admin@localhost;
+
+--connection conflict_source_cleanup
+--remove_file $credential_file
+--enable_result_log
+SELECT 'ok' AS resume_required_record_conflict;
+--enable_query_log

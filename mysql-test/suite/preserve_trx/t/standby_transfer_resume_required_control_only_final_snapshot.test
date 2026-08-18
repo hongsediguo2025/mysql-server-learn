@@ -1,0 +1,146 @@
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+--disable_query_log
+--disable_result_log
+
+--let $credential_file= $MYSQL_TMP_DIR/resume-required-control-final.secret
+--write_file $credential_file
+resume-required-control-final-secret
+EOF
+--exec chmod 600 $credential_file
+
+--connect(control_final_receiver_admin,127.0.0.1,root,,test,$SERVER_MYPORT_2,)
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'resume-required-control-final-secret';
+GRANT PRESERVE_TRX_TRANSFER_ADMIN,
+      RESUME_ANY_PRESERVED_TRANSACTION,
+      PROCESS ON *.* TO preserve_trx_ha_admin@localhost;
+--connect(control_final_receiver_resume,127.0.0.1,preserve_trx_ha_admin,resume-required-control-final-secret,test,$SERVER_MYPORT_2,)
+
+--connection default
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+DROP USER IF EXISTS rr_ctrlfinal_app@localhost;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'resume-required-control-final-secret';
+GRANT SHUTDOWN, SYSTEM_VARIABLES_ADMIN,
+      PRESERVE_TRX_TRANSFER_ADMIN, PROCESS ON *.*
+  TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+CREATE USER rr_ctrlfinal_app@localhost;
+GRANT SELECT ON test.* TO rr_ctrlfinal_app@localhost;
+GRANT SYSTEM_VARIABLES_ADMIN ON *.*
+  TO rr_ctrlfinal_app@localhost;
+
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$SERVER_MYPORT_2 --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=resume_required_control_final --rds-preserve-trx-transfer-credential-secret-file=$credential_file
+--source include/restart_mysqld.inc
+--let $restart_parameters=
+--disable_query_log
+--disable_result_log
+
+--connect(control_final_source_ha,localhost,preserve_trx_ha_admin,resume-required-control-final-secret,test)
+--connect(control_final_source_idle,localhost,rr_ctrlfinal_app,,test)
+--let $departed_idle_id= query_get_value(SELECT CONNECTION_ID() AS id, id, 1)
+
+# A packet read after CLOSING is rejected before execution. While its 4020
+# response is parked, m_server_idle is false, but the source session is still a
+# valid session-only handoff and must survive the final S snapshot.
+--connection control_final_source_ha
+--connect(control_final_source_late,localhost,rr_ctrlfinal_app,,test)
+--let $late_idle_id= query_get_value(SELECT CONNECTION_ID() AS id, id, 1)
+SET DEBUG_SYNC=
+  'preserve_trx_closing_command_blocked_before_response SIGNAL control_late_packet_parked WAIT_FOR control_late_packet_release';
+
+# A decoded COM_QUIT is an admitted no-response cleanup command, not a command
+# that will receive ER_PRESERVE_TRX_SESSION_DRAINED. Keep its THD alive across
+# the final snapshot and verify that the receiver does not publish its id.
+--connection control_final_source_ha
+--connect(control_final_source_quit,localhost,rr_ctrlfinal_app,,test)
+--let $quit_idle_id= query_get_value(SELECT CONNECTION_ID() AS id, id, 1)
+SET DEBUG_SYNC=
+  'preserve_trx_after_command_read_before_packet_marker SIGNAL control_quit_packet_classified WAIT_FOR control_quit_packet_release';
+
+--connect(control_final_drain_owner,localhost,root,,test)
+--connection control_final_drain_owner
+SET DEBUG_SYNC=
+  'preserve_trx_drain_before_control_only_transfer_commit SIGNAL control_final_closing WAIT_FOR control_final_packets_ready';
+SET DEBUG_SYNC=
+  'preserve_trx_drain_after_session_only_final_snapshot SIGNAL control_final_snapshot_done WAIT_FOR control_final_snapshot_release';
+--send DRAIN TRANSACTIONS PRESERVE
+
+--connection control_final_source_ha
+SET DEBUG_SYNC='now WAIT_FOR control_final_closing TIMEOUT 30';
+
+# All three terminal facts are established before one authoritative snapshot.
+--disconnect control_final_source_idle
+--let $wait_condition= SELECT COUNT(*)=0 FROM performance_schema.threads WHERE PROCESSLIST_ID=$departed_idle_id
+--source include/wait_condition.inc
+--let $assert_text= departed control-only source THD is gone before the final snapshot
+--let $assert_cond= `SELECT COUNT(*) = 0 FROM performance_schema.threads WHERE PROCESSLIST_ID=$departed_idle_id`
+--source include/assert.inc
+
+--connection control_final_source_late
+--send SELECT 1
+--connection control_final_source_ha
+SET DEBUG_SYNC='now WAIT_FOR control_late_packet_parked TIMEOUT 30';
+send_quit control_final_source_quit;
+SET DEBUG_SYNC='now WAIT_FOR control_quit_packet_classified TIMEOUT 30';
+SET DEBUG_SYNC='now SIGNAL control_final_packets_ready';
+SET DEBUG_SYNC='now WAIT_FOR control_final_snapshot_done TIMEOUT 30';
+--let $assert_text= COM_QUIT source THD is still alive at the final snapshot
+--let $assert_cond= `SELECT COUNT(*) = 1 FROM performance_schema.threads WHERE PROCESSLIST_ID=$quit_idle_id`
+--source include/assert.inc
+--let $assert_text= rejected-command source THD is still alive at the final snapshot
+--let $assert_cond= `SELECT COUNT(*) = 1 FROM performance_schema.threads WHERE PROCESSLIST_ID=$late_idle_id`
+--source include/assert.inc
+SET DEBUG_SYNC='now SIGNAL control_late_packet_release';
+SET DEBUG_SYNC='now SIGNAL control_quit_packet_release';
+SET DEBUG_SYNC='now SIGNAL control_final_snapshot_release';
+
+--connection control_final_source_late
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+--reap
+
+--connection control_final_drain_owner
+--reap
+
+--connection control_final_receiver_resume
+--error ER_PRESERVE_TRX_HANDOFF_UNAVAILABLE
+--eval RESUME PRESERVED TRANSACTION '$departed_idle_id'
+--eval RESUME PRESERVED TRANSACTION '$late_idle_id'
+--error ER_PRESERVE_TRX_HANDOFF_UNAVAILABLE
+--eval RESUME PRESERVED TRANSACTION '$late_idle_id'
+--error ER_PRESERVE_TRX_HANDOFF_UNAVAILABLE
+--eval RESUME PRESERVED TRANSACTION '$quit_idle_id'
+
+--connection control_final_source_ha
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+SHUTDOWN;
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+--disable_query_log
+--disable_result_log
+
+--connect(control_final_source_cleanup,localhost,root,,test)
+DROP USER rr_ctrlfinal_app@localhost;
+DROP USER preserve_trx_ha_admin@localhost;
+SET DEBUG_SYNC='RESET';
+
+--connection control_final_receiver_admin
+DROP USER preserve_trx_ha_admin@localhost;
+
+--connection control_final_source_cleanup
+--remove_file $credential_file
+--enable_result_log
+SELECT 'ok' AS resume_required_control_only_final_snapshot;
+--enable_query_log

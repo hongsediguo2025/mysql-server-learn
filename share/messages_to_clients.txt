@@ -9481,6 +9481,9 @@ ER_PRESERVE_TRX_DRAIN_RESET
 ER_PRESERVE_TRX_RESET_TOO_LATE
   eng "RESET DRAIN arrived after shutdown handoff"
 
+ER_PRESERVE_TRX_HANDOFF_UNAVAILABLE
+  eng "No resumable transaction or session-only handoff entry exists for this connection"
+
 #
 #  End of 8.0 error messages (server-to-client).
 #  Do NOT add messages intended for the error log above!

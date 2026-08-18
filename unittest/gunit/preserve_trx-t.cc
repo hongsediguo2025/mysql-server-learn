@@ -24396,7 +24396,12 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_EQ(Preserve_trx_transfer_status::OK, session.commit_epoch());
   EXPECT_EQ(2U, arbiter.calls);
   EXPECT_EQ(sequence_before_commit + 1, session.next_sequence());
-  EXPECT_EQ(frame_count_before_commit + 2 * frames_per_commit_attempt,
+  /*
+    The first attempt already delivered and acknowledged the final metadata,
+    so the frozen-commit retry contract sends only the byte-identical COMMIT
+    frame instead of replaying the metadata frames.
+  */
+  EXPECT_EQ(frame_count_before_commit + frames_per_commit_attempt + 1U,
             sink.frames().size());
   EXPECT_EQ(1U, sink.release_count());
 
@@ -24413,6 +24418,9 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_EQ(Preserve_trx_transfer_frame_type::COMMIT_EPOCH,
             first_commit.type);
   EXPECT_EQ(first_commit.sequence, second_commit.sequence);
+  EXPECT_EQ(sink.frames()[frame_count_before_commit +
+                          frames_per_commit_attempt - 1],
+            sink.frames().back());
 }
 
 TEST(PreservedTrxDrainHandoff,
@@ -24439,7 +24447,7 @@ TEST(PreservedTrxDrainResetApi, PublicHeaderExposesStableSignature) {
 }
 
 TEST(PreservedTrxDrainHandoff,
-     ResetSelectsCoordinatorOrSourceRestoreByHandoffStage) {
+     ResetIsTooLateAfterCommitOwnershipBarrier) {
   Preserve_trx_drain_ownership_state reset_wins;
   EXPECT_EQ(Preserve_trx_drain_reset_request::WON,
             reset_wins.request_reset());
@@ -24450,11 +24458,27 @@ TEST(PreservedTrxDrainHandoff,
 
   Preserve_trx_drain_ownership_state commit_wins;
   EXPECT_TRUE(commit_wins.begin_commit_send());
-  EXPECT_EQ(Preserve_trx_drain_reset_request::WON,
+  EXPECT_EQ(Preserve_trx_drain_reset_request::TOO_LATE,
             commit_wins.request_reset());
-  EXPECT_EQ(Preserve_trx_drain_terminal::SOURCE_RESTORE_PENDING,
+  EXPECT_EQ(Preserve_trx_drain_terminal::HANDOFF_PENDING,
             commit_wins.state());
-  EXPECT_TRUE(commit_wins.restore_allowed());
+  EXPECT_FALSE(commit_wins.restore_allowed());
+
+  ASSERT_TRUE(commit_wins.acknowledge_commit());
+  EXPECT_EQ(Preserve_trx_drain_terminal::COMMITTED_HANDOFF,
+            commit_wins.state());
+  EXPECT_EQ(Preserve_trx_drain_reset_request::TOO_LATE,
+            commit_wins.request_reset());
+
+  Preserve_trx_drain_ownership_state local_shutdown;
+  ASSERT_TRUE(local_shutdown.shutdown_without_commit());
+  EXPECT_FALSE(local_shutdown.restore_allowed());
+  EXPECT_FALSE(local_shutdown.acknowledge_commit());
+  EXPECT_EQ(Preserve_trx_drain_reset_request::WON,
+            local_shutdown.request_reset());
+  EXPECT_EQ(Preserve_trx_drain_terminal::SOURCE_RESTORE_PENDING,
+            local_shutdown.state());
+  EXPECT_TRUE(local_shutdown.restore_allowed());
 }
 
 TEST(PreservedTrxDrainHandoff,

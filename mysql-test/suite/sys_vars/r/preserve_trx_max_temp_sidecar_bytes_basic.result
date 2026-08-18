@@ -1,6 +1,0 @@
-SET GLOBAL preserve_trx_max_temp_sidecar_bytes=4294967296;
-SELECT @@GLOBAL.preserve_trx_max_temp_sidecar_bytes;
-@@GLOBAL.preserve_trx_max_temp_sidecar_bytes
-4294967296
-SET GLOBAL preserve_trx_max_temp_sidecar_bytes=DEFAULT;
-ok

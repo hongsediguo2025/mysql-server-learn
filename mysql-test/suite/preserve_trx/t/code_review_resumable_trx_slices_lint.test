@@ -2699,7 +2699,9 @@ die "standby transfer multi-session receiver must serialize process-local sequen
              /preserve_trx_transfer_handle_receiver_payload_batch[\s\S]*begin_payload_sequence[\s\S]*end_payload_sequence[\s\S]*pre_admit_receiver_batch_sequence[\s\S]*preserve_trx_transfer_apply_receiver_frame_batch_with_workers/s;
 die "standby transfer receiver must register same-token apply order before releasing sequence admission and wait only after ACK\n"
   unless $receiver_payload_batch =~
-         /pre_admit_receiver_batch_sequence[\s\S]*reserve_payload_apply[\s\S]*payload_sequence_guard\.rollback[\s\S]*after_admission[\s\S]*wait_for_payload_apply_turn[\s\S]*preserve_trx_transfer_apply_receiver_frame_batch_with_workers/s;
+             /end_payload_sequence[\s\S]*payload_sequence_guard/s &&
+         $receiver_payload_batch =~
+             /after_admission[\s\S]*pre_admit_receiver_batch_sequence[\s\S]*reserve_payload_apply[\s\S]*wait_for_payload_apply_turn[\s\S]*preserve_trx_transfer_apply_receiver_frame_batch_with_workers/s;
 die "standby transfer wire compatibility must retain the legacy promotion frame identifiers\n"
   unless $transfer_header =~ /PROMOTION_PREWARM_TOKEN/s &&
          $transfer_header =~ /PROMOTION_GATE_EPOCH/s;
@@ -3274,11 +3276,20 @@ die "receiver frame admission must enforce the COMMIT sequence cutoff\n"
          $transfer =~
            /frame_sequence_exceeds_commit_cutoff_locked\s*\([\s\S]{0,500}sequence\s*>\s*terminal\.admitted_commit_sequence/s;
 $transfer =~
-  /case\s+Preserve_trx_transfer_frame_type::COMMIT_EPOCH\s*:\s*\{([\s\S]*?)case\s+Preserve_trx_transfer_frame_type::OPEN_EPOCH\s*:/s
+  /(preserve_trx_transfer_apply_receiver_frame_internal\s*\([\s\S]*?^})/m
+  or die "could not isolate receiver semantic apply function\n";
+my $receiver_semantic_apply = $1;
+$receiver_semantic_apply =~
+  /case\s+Preserve_trx_transfer_frame_type::COMMIT_EPOCH\s*:\s*\{([\s\S]*?)^\s*case\s+Preserve_trx_transfer_frame_type::OPEN_EPOCH\s*:/m
   or die "could not isolate receiver COMMIT semantic apply path\n";
 my $receiver_commit_apply = $1;
-die "receiver COMMIT must consume one authoritative registry snapshot\n"
-  unless $receiver_commit_apply =~ /snapshot_epoch_for_commit/s &&
+my $commit_claim = index($receiver_semantic_apply,
+                         'snapshot_epoch_for_commit(');
+my $commit_snapshot_lookup = index($receiver_semantic_apply,
+                                   '&commit_records');
+die "receiver COMMIT must claim one authoritative registry snapshot\n"
+  unless $commit_claim >= 0 &&
+         $commit_snapshot_lookup > $commit_claim &&
          $receiver_commit_apply =~ /publish_accepted_epoch/s;
 die "receiver COMMIT must not restore non-atomic sealed-record rescans\n"
   if $receiver_commit_apply =~ /all_receiving_tokens_sealed/s ||
@@ -3294,8 +3305,7 @@ die "online NOT_COMMITTED_CLEAN restore must publish SOURCE_RESTORED only after 
   unless $preserve =~
          /standby_transfer_not_committed_clean_restore_failed[\s\S]{0,500}complete_source_restore\(\)[\s\S]{0,300}standby_transfer_not_committed_clean_state_failed/s;
 $preserve =~
-  /finalize_drain_participants_for_terminal_handoff\s*\(
-     \s*"standby_transfer_commit_unknown"\s*\)/sx
+  /finalize_drain_participants_for_terminal_handoff\s*\([\s\S]{0,240}"standby_transfer_commit_unknown"[\s\S]{0,160}\)/s
   or die "COMMIT_UNKNOWN must use terminal-handoff participant finalization\n";
 my $unknown_finalize = index($preserve, $&);
 my $resolution_ready_publish =
@@ -3340,7 +3350,7 @@ die "DRAIN must not restore a source token-local failure\n"
      /restore_preserved_batch_items_to_original_thds|restore_current_items_to_original_thds/s;
 die "all source token-local failures must keep source ownership fenced for RESET\n"
   unless $source_token_local_classification =~
-         /source_all_token_local_failed[\s\S]*finish_with_shutdown\(\)/s;
+         /source_all_token_local_failed[\s\S]*commit_transfer_without_finalized_tokens\(\)/s;
 die "terminal source context must retain source token-local failures\n"
   unless $preserve =~
          /retain_source_failed_items_in_source_context\(\)\s*;\s*

@@ -69,26 +69,44 @@ SET GLOBAL debug='-d,preserve_trx_early_fail_candidate_finalize';
 SELECT 1;
 
 --connection closing_early_failure_ha
+--error ER_PRESERVE_TRX_RESET_TOO_LATE
 RESET DRAIN;
 
 --connection closing_early_failure_app
+--error ER_PRESERVE_TRX_SESSION_DRAINED
 UPDATE t_closing_early_failure SET v=v+10 WHERE id=1;
-COMMIT;
 
---connection default
+# The source stays fenced after the ownership boundary; verify the failed
+# transaction was not applied twice only after a clean restart.
+--disconnect closing_early_failure_app
+--disconnect closing_early_failure_owner
+--connection closing_early_failure_ha
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+SHUTDOWN;
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+--exec echo "restart: --rds-preserve-trx-enable=ON --skip-log-bin --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$MASTER_MYPORT --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=closing_early_failure --rds-preserve-trx-transfer-credential-secret-file=$credential_file" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+--connect(closing_early_failure_check1,localhost,root,,test)
 --enable_query_log
 SELECT v AS value_after_finalize_failure FROM t_closing_early_failure;
 --disable_query_log
 
 # A record-lock candidate has already been replaced when this injection stops
 # its retransmission. Epoch ABORT and source restoration remain all-or-nothing.
---connection closing_early_failure_app
+--disconnect closing_early_failure_ha
+--connect(closing_early_failure_ha,localhost,preserve_trx_ha_admin,closing-early-failure-secret,test)
+--connect(closing_early_failure_app,localhost,closing_early_failure_app,,test)
 START TRANSACTION;
 UPDATE t_closing_early_failure SET v=v+1 WHERE id=1;
 
 --connection closing_early_failure_ha
 SET GLOBAL debug='+d,preserve_trx_early_force_one_coordinate_drift,preserve_trx_early_fail_replacement_stage';
+--connect(closing_early_failure_owner,localhost,root,,test)
 
+--connection closing_early_failure_app
+--let $app_id= query_get_value(SELECT CONNECTION_ID() AS id, id, 1)
 --connection closing_early_failure_owner
 --replace_result $app_id APP_ID
 --replace_column 1 GENERATION 6 CLOSING_STARTED_US 7 CLOSING_DEADLINE_US
@@ -102,23 +120,34 @@ SET GLOBAL debug='-d,preserve_trx_early_force_one_coordinate_drift,preserve_trx_
 SELECT 1;
 
 --connection closing_early_failure_ha
+--error ER_PRESERVE_TRX_RESET_TOO_LATE
 RESET DRAIN;
 
 --connection closing_early_failure_app
+--error ER_PRESERVE_TRX_SESSION_DRAINED
 UPDATE t_closing_early_failure SET v=v+100 WHERE id=1;
-COMMIT;
 
---connection default
+--disconnect closing_early_failure_app
+--disconnect closing_early_failure_owner
+--connection closing_early_failure_ha
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+SHUTDOWN;
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+--exec echo "restart: --rds-preserve-trx-enable=ON --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+--connect(closing_early_failure_check2,localhost,root,,test)
 --enable_query_log
 SELECT v AS value_after_replacement_failure FROM t_closing_early_failure;
 --disable_query_log
 
---disconnect closing_early_failure_app
---disconnect closing_early_failure_owner
---disconnect closing_early_failure_ha
-
---connection default
+--connection closing_early_failure_check2
+--disable_query_log
+--disable_result_log
 DROP TABLE t_closing_early_failure;
 DROP USER closing_early_failure_app@localhost;
 DROP USER preserve_trx_ha_admin@localhost;
 --remove_file $credential_file
+--enable_result_log
+--enable_query_log

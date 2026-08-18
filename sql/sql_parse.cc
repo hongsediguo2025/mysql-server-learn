@@ -1269,6 +1269,7 @@ bool do_command(THD *thd) {
   DEBUG_SYNC(thd, "preserve_trx_after_begin_before_command_read");
   if (!rc) {
     rc = thd->get_protocol()->get_command(&com_data, &command);
+    if (!rc) preserved_trx_classify_protocol_command(thd, command);
     DEBUG_SYNC(thd, "preserve_trx_after_command_read_before_packet_marker");
     if (!rc) preserved_trx_mark_inflight_command_packet(thd, command);
     if (!preserved_trx_end_command_read(thd)) rc = 1;

@@ -6,13 +6,7 @@ one_accepted_epoch
 1
 two_source_survivors
 1
-app1_same_connection
+post_commit_reset_too_late
 1
-app2_same_connection
-1
-app3_same_connection
-1
-v
-111
-121
-131
+source_rows_after_restart
+1:10,2:20,3:30

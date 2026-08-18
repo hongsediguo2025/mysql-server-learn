@@ -1,0 +1,4 @@
+# Source-shape guard for the process-local session-only token set.
+SELECT 'ok' AS resume_required_token_set_lint;
+resume_required_token_set_lint
+ok

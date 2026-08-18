@@ -284,13 +284,15 @@ enum class Preserve_trx_drain_terminal : uint8_t {
   SOURCE_RESTORE_PENDING,
   SOURCE_RESTORED,
   RESET_REQUESTED,
-  SHUTDOWN_HANDOFF
+  SHUTDOWN_HANDOFF,
+  COMMITTED_HANDOFF
 };
 
 enum class Preserve_trx_drain_reset_request : uint8_t {
   WON,
   JOINED,
   ALREADY_RESTORED,
+  TOO_LATE,
   INVALID
 };
 
@@ -570,6 +572,8 @@ bool preserved_trx_end_idle_for_command_packet(THD *thd);
 bool preserved_trx_end_command_read(THD *thd);
 bool preserved_trx_wait_if_batch_session_quiesced(THD *thd);
 bool preserved_trx_reject_if_batch_session_drained(THD *thd);
+void preserved_trx_classify_protocol_command(
+    THD *thd, enum enum_server_command command);
 Preserve_trx_command_block_result preserved_trx_command_block_result(
     THD *thd, enum_sql_command sql_command);
 Preserve_trx_command_block_result preserved_trx_protocol_command_block_result(

@@ -12,8 +12,7 @@ DROP TABLE IF EXISTS t_preserve_rpl_apply;
 CREATE TABLE t_preserve_rpl_apply(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_preserve_rpl_apply VALUES(1, 10), (2, 20);
 include/sync_slave_sql_with_master.inc
-SET GLOBAL preserve_trx_enable=ON;
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 RESUME PRESERVED TRANSACTION 'invalid-token';
 ERROR HY000: Resumable transactions across shutdown do not support this operation

@@ -1,0 +1,3 @@
+include/assert.inc [departed source THD is gone before the final snapshot]
+resume_required_final_snapshot
+ok

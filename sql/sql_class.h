@@ -1336,7 +1336,11 @@ class THD : public MDL_context_owner,
     command_packet_before_closing is atomic because the packet-header callback
     publishes it before taking LOCK_thd_data; it records whether the current
     classic-protocol packet reached the server before the drain closing gate
-    became visible.
+    became visible. post_closing_command_classified distinguishes an ordinary
+    rejected command from a packet whose command byte is not decoded yet.
+    post_closing_cleanup_packet then marks COM_QUIT so a final session-only
+    snapshot does not retain a connection committed to teardown.
+    COM_STMT_CLOSE remains a live session and therefore is not marked here.
     quiesce_boundary_monotonic_us freezes the completion boundary of the old
     command selected by one drain generation. batch_generation ties this THD to
     one drain attempt so stale quiesce/drained state is not reused by a later
@@ -1347,6 +1351,8 @@ class THD : public MDL_context_owner,
   uint64 preserve_trx_command_sequence{0};
   ulonglong preserve_trx_command_started_monotonic_us{0};
   std::atomic<bool> preserve_trx_command_packet_before_closing{false};
+  std::atomic<bool> preserve_trx_post_closing_command_classified{false};
+  std::atomic<bool> preserve_trx_post_closing_cleanup_packet{false};
   ulonglong preserve_trx_quiesce_boundary_monotonic_us{0};
   ulonglong preserve_trx_batch_generation{0};
   Preserve_trx_batch_thd_state preserve_trx_batch_state{

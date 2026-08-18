@@ -1,0 +1,193 @@
+--echo # Source-shape guard for the process-local session-only token set.
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $source_root = File::Spec->rel2abs(
+  File::Spec->catdir($mysql_test_dir, '..'));
+
+sub read_source {
+  my ($relative) = @_;
+  my $path = File::Spec->catfile($source_root, split('/', $relative));
+  open(my $fh, '<', $path) or die "cannot open $path: $!";
+  my $src = do { local $/; <$fh> };
+  close($fh);
+  return $src;
+}
+
+my $drain = read_source('sql/preserve_trx.cc');
+my $preserve_h = read_source('sql/preserve_trx.h');
+my $sql_class = read_source('sql/sql_class.h');
+my $sql_parse = read_source('sql/sql_parse.cc');
+my $transfer_h = read_source('sql/preserve_trx_transfer.h');
+my $transfer = read_source('sql/preserve_trx_transfer.cc');
+my $messages = read_source('share/messages_to_clients.txt');
+
+die "CLOSING classification must collect eligible idle classic sessions\n"
+  unless $drain =~ /candidate->is_classic_protocol\(\)[\s\S]{0,240}m_session_only_thread_ids\.push_back\(candidate->thread_id\(\)\)/s;
+die "session-only eligibility must reject engine and unsupported session context\n"
+  unless $drain =~ /preserve_trx_session_only_candidate_is_eligible_locked[\s\S]{0,1300}!preserve_trx_has_transaction_participant\(candidate\)[\s\S]{0,260}!preserve_trx_is_unsupported_common_context\(candidate\)/s;
+my ($source_eligibility_body) =
+  $drain =~ /static bool preserve_trx_session_only_candidate_is_eligible_locked\([^)]*\)\s*\{([\s\S]*?)\n\}/s;
+die "session-only source eligibility helper is missing\n"
+  unless defined $source_eligibility_body;
+die "session-only source eligibility must not allocate or inspect another THD's InnoDB trx\n"
+  if $source_eligibility_body =~ /trx_preserve_thd_can_accept_preserved_trx/;
+die "final S eligibility must retain only a classified post-CLOSING command\n"
+  unless $source_eligibility_body =~ /candidate->m_server_idle\s*\|\|[\s\S]{0,360}!candidate->preserve_trx_command_packet_before_closing\.load[\s\S]{0,180}command_classified/s;
+die "final S eligibility must exclude a decoded no-response cleanup packet\n"
+  unless $source_eligibility_body =~ /candidate->preserve_trx_post_closing_cleanup_packet\.load[\s\S]{0,400}!disconnecting/s;
+die "post-CLOSING command state must use classified and cleanup atomics\n"
+  unless $sql_class =~ /std::atomic<bool>\s+preserve_trx_post_closing_command_classified\{false\}/s &&
+         $sql_class =~ /std::atomic<bool>\s+preserve_trx_post_closing_cleanup_packet\{false\}/s &&
+         $preserve_h =~ /void\s+preserved_trx_classify_protocol_command/s;
+die "protocol classification must exclude only a disconnecting COM_QUIT\n"
+  unless $drain =~ /void preserved_trx_classify_protocol_command[\s\S]{0,500}command\s*==\s*COM_QUIT/s &&
+         $drain !~ /preserved_trx_classify_protocol_command[\s\S]{0,500}command\s*==\s*COM_STMT_CLOSE/s &&
+         $drain =~ /preserved_trx_classify_protocol_command[\s\S]{0,500}preserve_trx_post_closing_command_classified\.store\(\s*true/s &&
+         $drain =~ /preserved_trx_begin_command_read[\s\S]{0,900}preserve_trx_post_closing_command_classified\.store\(\s*false/s &&
+         $drain =~ /preserved_trx_begin_command_read[\s\S]{0,900}preserve_trx_post_closing_cleanup_packet\.store\(\s*false/s;
+die "initial planning may retain an unclassified post-CLOSING packet but must ignore a classified COM_QUIT\n"
+  unless $drain =~ /preserve_trx_session_only_candidate_is_eligible_locked\(\s*candidate,\s*true,\s*true\)[\s\S]{0,900}command_unclassified[\s\S]{0,600}context_unsupported/s;
+my $get_command_pos =
+  index($sql_parse, 'thd->get_protocol()->get_command(&com_data, &command)');
+my $classify_command_pos =
+  index($sql_parse, 'preserved_trx_classify_protocol_command(thd, command)');
+my $after_read_sync_pos =
+  index($sql_parse, 'preserve_trx_after_command_read_before_packet_marker');
+die "protocol command must be classified before the post-read race hook\n"
+  unless $get_command_pos >= 0 && $classify_command_pos > $get_command_pos &&
+         $after_read_sync_pos > $classify_command_pos;
+die "session-only eligibility must reject temp tables without a bundle/sidecar\n"
+  unless $drain =~ /preserve_trx_session_only_candidate_is_eligible_locked[\s\S]{0,1300}candidate->temporary_tables\s*==\s*nullptr/s;
+my $eligibility_use_count = () =
+  $drain =~ /preserve_trx_session_only_candidate_is_eligible_locked\(/g;
+die "idle classification and both DNT observation paths must use one eligibility predicate\n"
+  unless $eligibility_use_count >= 4;
+die "DRAIN must initialize S from the counter's idle session IDs\n"
+  unless $drain =~ /session_only_thread_ids\s*\(\s*counter\.session_only_thread_ids\(\)\.begin\(\)[\s\S]{0,180}counter\.session_only_thread_ids\(\)\.end\(\)/s;
+die "idle session-only collection must be gated by an active transfer source\n"
+  unless $drain =~ /Preserve_batch_target_counter\s+counter\([\s\S]{0,220}batch_transfer_source_session\s*!=\s*nullptr/s &&
+         $drain =~ /m_collect_session_only[\s\S]{0,2600}preserve_trx_session_only_candidate_is_eligible_locked/s;
+my $insert_count = () = $drain =~ /session_only_thread_ids\.insert\(/g;
+die "only the two authoritative DRAINED_NO_TRANSACTION paths may add target IDs\n"
+  unless $insert_count == 2;
+die "early DRAINED_NO_TRANSACTION must add the connection ID to S\n"
+  unless $drain =~ /DRAINED_NO_TRANSACTION[\s\S]{0,900}session_only_thread_ids\.insert\(ready\.thread_id\)/s;
+die "legacy DRAINED_NO_TRANSACTION must add the connection ID to S\n"
+  unless $drain =~ /DRAINED_NO_TRANSACTION[\s\S]{0,350}session_only_thread_ids\.insert\(target_thread_id\)/s;
+my $dnt_transfer_gate_count = () =
+  $drain =~ /batch_transfer_source_session\s*!=\s*nullptr\s*&&\s*!\w*(?:\.)?session_only_eligible/g;
+die "DRAINED_NO_TRANSACTION session-only validation must be transfer-only\n"
+  unless $dnt_transfer_gate_count == 2;
+die "LOCAL_CARRIER target readers must not execute session-only eligibility\n"
+  unless $drain =~ /Preserve_batch_target_state_reader\([\s\S]{0,260}bool collect_session_only[\s\S]{0,1700}m_collect_session_only\s*&&[\s\S]{0,260}preserve_trx_session_only_candidate_is_eligible_locked/s &&
+         $drain =~ /Preserve_batch_pending_target_observer\([\s\S]{0,360}bool collect_session_only[\s\S]{0,2300}m_collect_session_only\s*&&[\s\S]{0,260}preserve_trx_session_only_candidate_is_eligible_locked/s &&
+         $drain =~ /Preserve_batch_timeout_target_decision\([\s\S]{0,260}bool collect_session_only[\s\S]{0,1700}m_collect_session_only\s*&&[\s\S]{0,260}preserve_trx_session_only_candidate_is_eligible_locked/s;
+die "COMMIT_EPOCH must receive the final ordered session-only vector\n"
+  unless $drain =~ /session_only_tokens\s*\(\s*session_only_thread_ids\.begin\(\)[\s\S]{0,800}commit_epoch\(session_only_tokens\)/s;
+my $final_snapshot_call_count = () =
+  $drain =~ /revalidate_session_only_thread_ids\(\)/g;
+die "both control-only and transaction COMMIT paths must revalidate S at the final boundary\n"
+  unless $final_snapshot_call_count == 2;
+die "final S revalidation must intersect the planned IDs with live eligible THDs\n"
+  unless $drain =~ /Preserve_batch_session_only_final_snapshot[\s\S]{0,1600}m_planned_thread_ids\.count\(thread_id\)[\s\S]{0,900}preserve_trx_session_only_candidate_is_eligible_locked\(candidate,\s*true\)/s;
+
+die "receiver handoff snapshot must carry availability, membership, epoch, and generation\n"
+  unless $transfer_h =~ /struct Preserve_trx_transfer_resume_handoff[\s\S]{0,500}available[\s\S]{0,120}session_only[\s\S]{0,160}epoch_id[\s\S]{0,160}generation/s;
+die "receiver must use a dedicated lock for one process-local active set\n"
+  unless $transfer_h =~ /m_session_only_mutex/ &&
+         $transfer_h =~ /m_active_session_only_set_valid/ &&
+         $transfer_h =~ /m_active_session_only_tokens/ &&
+         $transfer_h =~ /m_active_session_only_epoch_id/ &&
+         $transfer_h =~ /m_active_session_only_generation/;
+die "receiver must replace the complete active set only after COMMIT acceptance\n"
+  unless $transfer =~ /publish_active_session_only_set[\s\S]{0,900}m_active_session_only_tokens\.swap\([^)]+\)[\s\S]{0,300}m_active_session_only_set_valid\s*=\s*true/s;
+die "source COMMIT must reject transaction/session-only overlap\n"
+  unless $transfer =~ /for \(uint64_t finalized_token : m_finalized_tokens\)[\s\S]{0,500}binary_search\(commit_session_only_tokens\.begin\(\)[\s\S]{0,300}Preserve_trx_transfer_status::CORRUPT/s;
+die "receiver COMMIT must reject transaction/session-only overlap\n"
+  unless $transfer =~ /accepted\.tokens\.begin\(\)[\s\S]{0,700}next_session_only_tokens\.count\(token\)\s*!=\s*0[\s\S]{0,160}Preserve_trx_transfer_status::CORRUPT/s;
+die "COMMIT payload codec must reject non-canonical token vectors\n"
+  unless $transfer =~ /preserve_trx_transfer_encode_session_only_tokens[\s\S]{0,1800}previous_token/s &&
+         $transfer =~ /preserve_trx_transfer_decode_session_only_tokens[\s\S]{0,2200}reader\.eof\(\)/s;
+die "the source epoch COMMIT must carry a canonical empty or nonempty S payload\n"
+  unless $transfer =~ /empty_session_only_tokens[\s\S]{0,500}preserve_trx_transfer_encode_session_only_tokens\s*\(\s*commit_session_only_tokens/s;
+my $commit_emitter_count = () =
+  $transfer =~ /commit\.type\s*=\s*Preserve_trx_transfer_frame_type::COMMIT_EPOCH/g;
+my $commit_payload_encode_count = () =
+  $transfer =~ /preserve_trx_transfer_encode_session_only_tokens\s*\([\s\S]{0,120}&commit\.manifest_payload\s*\)/g;
+my $commit_payload_frozen_assignment_count = () =
+  $transfer =~ /commit\.manifest_payload\s*=\s*canonical_session_only_payload/g;
+die "only the source epoch COMMIT emitter may attach S; legacy helpers stay no-payload\n"
+  unless $commit_emitter_count == 4 &&
+         $commit_payload_encode_count == 0 &&
+         $commit_payload_frozen_assignment_count == 1;
+die "legacy no-payload transaction COMMIT must still install a fail-closed empty active set\n"
+  unless $transfer =~ /publish_accepted_epoch\s*\([\s\S]{0,320}!strict_online_epoch\s*,\s*&session_only_tokens\s*,[\s\S]{0,180}&frame\.terminal_fact_digest/s;
+die "atomic consume must validate epoch and generation before erase\n"
+  unless $transfer =~ /consume_session_only_token[\s\S]{0,900}epoch_id\s*!=\s*m_active_session_only_epoch_id[\s\S]{0,300}generation\s*!=\s*m_active_session_only_generation[\s\S]{0,500}m_active_session_only_tokens\.erase\(/s;
+die "transaction RESUME must claim the current handoff generation once\n"
+  unless $transfer_h =~ /claim_transaction_handoff[\s\S]{0,220}release_transaction_handoff/s &&
+         $transfer =~ /claim_transaction_handoff[\s\S]{0,1200}generation\s*!=\s*m_active_session_only_generation[\s\S]{0,700}m_transaction_handoff_claims\.insert/s;
+die "a sent COMMIT attempt must freeze its canonical session-only set\n"
+  unless $transfer_h =~ /m_frozen_commit_payload/s &&
+         $transfer =~ /commit\.manifest_payload\s*!=\s*canonical_session_only_payload[\s\S]{0,180}Preserve_trx_transfer_status::CORRUPT/s;
+die "COMMIT retry must reuse the complete encoded terminal frame\n"
+  unless $transfer_h =~ /m_frozen_commit_payload/s &&
+         $transfer =~ /m_frozen_commit_payload\.empty\(\)[\s\S]{0,900}preserve_trx_transfer_decode_frame\(m_frozen_commit_payload[\s\S]{0,1800}encoded_commit\s*=\s*m_frozen_commit_payload/s;
+die "COMMIT retry must not resend already accepted final metadata\n"
+  unless $transfer_h =~ /m_final_metadata_accepted/s &&
+         $transfer =~ /!m_final_metadata_accepted[\s\S]{0,2600}m_pending_final_metadata_frames/s &&
+         $transfer =~ /final_metadata_accepted_this_attempt[\s\S]{0,3600}m_final_metadata_accepted\s*=\s*true/s;
+die "transaction terminal digest must bind both the durable fact and canonical S\n"
+  unless $transfer =~ /session_only_transaction_fact_digest[\s\S]{0,1400}transaction_fact_digest[\s\S]{0,900}commit\.manifest_payload/s &&
+         $transfer =~ /commit\.terminal_fact_digest\s*=\s*session_only_transaction_fact_digest\(source_fact\.fact_digest,\s*commit\)/s &&
+         $transfer =~ /expected_terminal_fact_digest\s*=\s*has_session_only_tokens[\s\S]{0,500}session_only_transaction_fact_digest\(\s*built_fact\.fact_digest,\s*frame\)/s;
+die "receiver terminal CAS must publish the S-bound terminal digest\n"
+  unless $transfer =~ /publish_accepted_epoch\([\s\S]{0,500}&session_only_tokens[\s\S]{0,300}&frame\.terminal_fact_digest/s &&
+         $transfer_h =~ /publish_accepted_epoch[\s\S]{0,500}terminal_fact_digest/s;
+die "accepted epochs must retain the separate terminal digest for fallback CAS\n"
+  unless $transfer_h =~ /struct Preserve_trx_transfer_accepted_epoch[\s\S]{0,500}fact_digest[\s\S]{0,180}terminal_fact_digest/s &&
+         $transfer =~ /accepted\.terminal_fact_digest\s*=\s*terminal_digest/s &&
+         $transfer =~ /accepted->second\.terminal_fact_digest\s*!=\s*request\.fact_digest/s;
+
+die "session-only record validation and one-shot consumption must share one linearization lock\n"
+  unless $drain =~ /preserved_trx_consume_session_only_handoff[\s\S]{0,500}lock\(g_preserved_trx_mutex\)[\s\S]{0,500}preserved_trx_record_exists_locked[\s\S]{0,500}preserve_trx_transfer_consume_session_only_token/s;
+die "session-only RESUME must require RESUME_ANY privilege\n"
+  unless $drain =~ /handoff\.available\s*&&\s*handoff\.session_only[\s\S]{0,500}!has_resume_any_privilege[\s\S]{0,180}ER_PRESERVE_TRX_ACCESS_DENIED/s;
+die "session-only RESUME must reject an active target transaction before consuming S\n"
+  unless $drain =~ /preserve_trx_session_only_resume_target_is_pristine[\s\S]{0,1200}!preserve_trx_has_explicit_active_transaction\(thd\)[\s\S]{0,500}!preserve_trx_has_transaction_participant\(thd\)/s &&
+         $drain =~ /handoff\.available\s*&&\s*handoff\.session_only[\s\S]{0,900}!preserve_trx_session_only_resume_target_is_pristine\(thd\)[\s\S]{0,500}preserved_trx_consume_session_only_handoff/s;
+die "session-only RESUME must validate the complete target before consuming S\n"
+  unless $drain =~ /preserve_trx_session_only_resume_target_is_pristine[\s\S]{0,1000}temporary_tables\s*==\s*nullptr[\s\S]{0,700}trx_preserve_thd_can_accept_preserved_trx\(thd\)/s &&
+         $drain =~ /handoff\.available\s*&&\s*handoff\.session_only[\s\S]{0,900}!preserve_trx_session_only_resume_target_is_pristine\(thd\)[\s\S]{0,500}preserved_trx_consume_session_only_handoff/s;
+die "active-handoff transaction owner authorization must remain record based\n"
+  unless $drain =~ /record\.promotion_key\.epoch_id\s*!=\s*handoff\.epoch_id[\s\S]{0,900}preserved_trx_resume_allowed_for_account\(owns_token,\s*has_resume_any_privilege\)/s;
+die "session-only success must happen only after one-shot consume\n"
+  unless $drain =~ /preserved_trx_consume_session_only_handoff[\s\S]{0,900}audit_preserved_trx_event[\s\S]{0,250}my_ok\(thd\)[\s\S]{0,120}return false/s;
+die "active handoff transaction records must match the current epoch\n"
+  unless $drain =~ /record\.promotion_key\.epoch_id\s*!=\s*handoff\.epoch_id/s;
+die "transaction attach must claim the current handoff before begin_attach\n"
+  unless $drain =~ /preserve_trx_transfer_claim_transaction_handoff[\s\S]{0,1200}registry\.begin_attach/s;
+die "unavailable handoff IDs must use one dedicated SQL error\n"
+  unless $drain =~ /ER_PRESERVE_TRX_HANDOFF_UNAVAILABLE/ &&
+         $messages =~ /ER_PRESERVE_TRX_HANDOFF_UNAVAILABLE/;
+my $transfer_tail_assignment_count = () =
+  $drain =~ /phase2_metrics\.phase2_transfer_tail_us\s*=/g;
+my $closing_to_ack_assignment_count = () =
+  $drain =~ /phase2_metrics\.closing_to_final_ack_us\s*=/g;
+die "control-only and transaction drains must close both transfer-tail timing intervals\n"
+  unless $transfer_tail_assignment_count == 2 &&
+         $closing_to_ack_assignment_count == 2;
+my $handoff_error_count = () =
+  $messages =~ /^ER_PRESERVE_TRX_HANDOFF_UNAVAILABLE$/mg;
+die "handoff-unavailable must have one unique SQL error declaration\n"
+  unless $handoff_error_count == 1;
+
+EOF
+
+SELECT 'ok' AS resume_required_token_set_lint;

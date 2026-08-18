@@ -1,0 +1,23 @@
+--disable_query_log
+--disable_result_log
+SELECT @@GLOBAL.rds_preserve_trx_transfer_target_host;
+SELECT @@GLOBAL.rds_preserve_trx_transfer_target_port;
+SELECT @@GLOBAL.rds_preserve_trx_transfer_target_user;
+SELECT @@GLOBAL.rds_preserve_trx_transfer_credential_name;
+SELECT @@GLOBAL.rds_preserve_trx_transfer_artifact_mode;
+SELECT @@GLOBAL.rds_preserve_trx_transfer_max_inflight_bytes;
+--error ER_INCORRECT_GLOBAL_LOCAL_VAR
+SET @@GLOBAL.rds_preserve_trx_transfer_target_host='127.0.0.1';
+--error ER_INCORRECT_GLOBAL_LOCAL_VAR
+SET @@GLOBAL.rds_preserve_trx_transfer_target_port=3307;
+--error ER_INCORRECT_GLOBAL_LOCAL_VAR
+SET @@GLOBAL.rds_preserve_trx_transfer_target_user='transfer_user';
+--error ER_INCORRECT_GLOBAL_LOCAL_VAR
+SET @@GLOBAL.rds_preserve_trx_transfer_credential_name='transfer_credential';
+--error ER_WRONG_ARGUMENTS
+SET @@GLOBAL.rds_preserve_trx_transfer_artifact_mode=LOCAL_CARRIER;
+SET @@GLOBAL.rds_preserve_trx_transfer_artifact_mode=DEFAULT;
+SET @@GLOBAL.rds_preserve_trx_transfer_max_inflight_bytes=DEFAULT;
+--enable_result_log
+--enable_query_log
+--echo ok

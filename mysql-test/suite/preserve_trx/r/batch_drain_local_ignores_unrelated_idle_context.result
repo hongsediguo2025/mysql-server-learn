@@ -1,0 +1,28 @@
+DROP TABLE IF EXISTS t_batch_local_idle_context;
+SET GLOBAL rds_preserve_trx_enable=ON;
+CREATE TABLE t_batch_local_idle_context(
+id INT PRIMARY KEY,
+v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_batch_local_idle_context VALUES(1,10);
+START TRANSACTION;
+UPDATE t_batch_local_idle_context SET v=11 WHERE id=1;
+SELECT GET_LOCK('batch_local_idle_context_lock', 0);
+GET_LOCK('batch_local_idle_context_lock', 0)
+1
+DRAIN TRANSACTIONS PRESERVE;
+SELECT COUNT(*) AS preserved_count
+FROM performance_schema.preserved_transactions;
+preserved_count
+1
+RESUME PRESERVED TRANSACTION 'TOKEN';
+ROLLBACK;
+SELECT COUNT(*) AS preserved_count_after_resume
+FROM performance_schema.preserved_transactions;
+preserved_count_after_resume
+0
+SELECT v FROM t_batch_local_idle_context;
+v
+10
+DROP TABLE t_batch_local_idle_context;
+SET GLOBAL rds_preserve_trx_enable=ON;

@@ -1,5 +1,5 @@
-# A disconnected source THD is a token-local RESET outcome. Its transaction
-# rolls back independently while other preserved source sessions resume.
+# A disconnected source THD is a token-local pre-COMMIT RESET outcome. Its
+# transaction rolls back independently while other source sessions resume.
 --source include/have_debug.inc
 --source include/have_debug_sync.inc
 --source include/not_windows.inc
@@ -66,9 +66,14 @@ START TRANSACTION;
 UPDATE t_reset_drain_token_local SET v=v+1 WHERE id=2;
 
 --connect(reset_token_owner,localhost,root,,test)
+SET DEBUG_SYNC=
+  'preserve_trx_after_final_metadata_accepted_local SIGNAL reset_token_final_metadata_local WAIT_FOR reset_token_final_metadata_release';
 --disable_result_log
-DRAIN TRANSACTIONS PRESERVE WITH USER VARS;
+--send DRAIN TRANSACTIONS PRESERVE WITH USER VARS
 --enable_result_log
+
+--connection reset_token_ha
+SET DEBUG_SYNC='now WAIT_FOR reset_token_final_metadata_local TIMEOUT 60';
 
 --connection reset_token_keep
 --disable_result_log
@@ -81,7 +86,21 @@ UPDATE t_reset_drain_token_local SET v=v WHERE id=1;
 --let $wait_timeout= 30
 --let $wait_condition= SELECT COUNT(*)=0 FROM performance_schema.threads WHERE PROCESSLIST_ID=$drop_connection_id
 --source include/wait_condition.inc
-RESET DRAIN;
+
+--connect(reset_token_reset,localhost,preserve_trx_ha_admin,reset-drain-token-local-secret,test)
+--send RESET DRAIN
+--connection reset_token_ha
+--let $wait_condition= SELECT COUNT(*)=1 FROM performance_schema.threads WHERE PROCESSLIST_INFO='RESET DRAIN'
+--source include/wait_condition.inc
+SET DEBUG_SYNC='now SIGNAL reset_token_final_metadata_release';
+--connection reset_token_reset
+--reap
+
+--connection reset_token_owner
+--disable_result_log
+--error ER_PRESERVE_TRX_DRAIN_RESET
+--reap
+--enable_result_log
 
 --connection reset_token_keep
 UPDATE t_reset_drain_token_local SET v=v+10 WHERE id=1;
@@ -91,7 +110,6 @@ SELECT CONNECTION_ID()=@keep_connection_id AS surviving_connection_resumed;
 --disable_query_log
 
 --connection reset_token_ha
---let $wait_timeout= 30
 --let $wait_condition= SELECT v=20 FROM t_reset_drain_token_local WHERE id=2
 --source include/wait_condition.inc
 --let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')=@receiver_active_before
@@ -109,6 +127,7 @@ SELECT id,v FROM t_reset_drain_token_local ORDER BY id;
 
 --disconnect reset_token_keep
 --disconnect reset_token_owner
+--disconnect reset_token_reset
 --disconnect reset_token_ha
 DROP TABLE t_reset_drain_token_local;
 DROP USER reset_drain_token_app@localhost;

@@ -210,7 +210,7 @@ die "early transfer pipeline must be controlled by the transfer pipeline policy\
 die "early transfer pipeline must not retain a product selection sysvar\n"
   if $sys_vars =~ /transfer_pipeline_enable/s;
 my $second_scan = index($preserve, 'early_final_lock_fence_changed');
-my $commit_epoch = index($preserve, 'batch_transfer_source_session->commit_epoch()',
+my $commit_epoch = index($preserve, 'batch_transfer_source_session->commit_epoch(',
                          $second_scan);
 die "early final lock-fence scan must remain immediately before transfer commit\n"
   if $second_scan < 0 || $commit_epoch < $second_scan;

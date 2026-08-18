@@ -1,0 +1,192 @@
+--source include/have_debug.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+--disable_query_log
+--disable_result_log
+
+--let $credential_file= $MYSQL_TMP_DIR/resume-required-lifecycle.secret
+--write_file $credential_file
+resume-required-lifecycle-secret
+EOF
+--exec chmod 600 $credential_file
+
+--connect(required_receiver_admin,127.0.0.1,root,,test,$SERVER_MYPORT_2,)
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+DROP USER IF EXISTS resume_required_no_priv@localhost;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'resume-required-lifecycle-secret';
+GRANT PRESERVE_TRX_TRANSFER_ADMIN,
+      RESUME_ANY_PRESERVED_TRANSACTION,
+      PROCESS ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+GRANT CREATE TEMPORARY TABLES ON test.*
+  TO preserve_trx_ha_admin@localhost;
+CREATE USER resume_required_no_priv@localhost;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
+--connect(required_receiver_resume,127.0.0.1,preserve_trx_ha_admin,resume-required-lifecycle-secret,test,$SERVER_MYPORT_2,)
+--connect(required_receiver_replay,127.0.0.1,preserve_trx_ha_admin,resume-required-lifecycle-secret,test,$SERVER_MYPORT_2,)
+
+--connection default
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+DROP USER IF EXISTS resume_required_app@localhost;
+DROP TABLE IF EXISTS t_resume_required_lifecycle;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'resume-required-lifecycle-secret';
+GRANT SHUTDOWN, SYSTEM_VARIABLES_ADMIN,
+      PRESERVE_TRX_TRANSFER_ADMIN, PROCESS ON *.*
+  TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+CREATE USER resume_required_app@localhost;
+GRANT SELECT, UPDATE ON test.* TO resume_required_app@localhost;
+
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$SERVER_MYPORT_2 --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=resume_required_lifecycle --rds-preserve-trx-transfer-credential-secret-file=$credential_file
+--source include/restart_mysqld.inc
+--let $restart_parameters=
+--disable_query_log
+--disable_result_log
+
+CALL mtr.add_suppression(
+  "PRESERVE: rolled back prepared transaction without snapshot during recovery");
+
+CREATE TABLE t_resume_required_lifecycle(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_resume_required_lifecycle VALUES(1,10);
+
+--connect(required_source_ha,localhost,preserve_trx_ha_admin,resume-required-lifecycle-secret,test)
+--connect(required_source_txn,localhost,resume_required_app,,test)
+--let $txn_id= query_get_value(SELECT CONNECTION_ID() AS id, id, 1)
+START TRANSACTION;
+UPDATE t_resume_required_lifecycle SET v=11 WHERE id=1;
+
+--connect(required_source_idle,localhost,resume_required_app,,test)
+--let $idle_id= query_get_value(SELECT CONNECTION_ID() AS id, id, 1)
+--connect(required_source_idle_spare,localhost,resume_required_app,,test)
+--let $idle_spare_id= query_get_value(SELECT CONNECTION_ID() AS id, id, 1)
+
+# A session-only ID is valid only when no unsupported server-side context is
+# present. An idle user-lock owner must fail the whole DRAIN, not enter S.
+--connection required_source_idle
+SELECT GET_LOCK('resume_required_unsupported_idle', 0);
+--connection default
+--error ER_PRESERVE_TRX_UNSUPPORTED
+DRAIN TRANSACTIONS PRESERVE;
+--connection required_source_idle
+SELECT RELEASE_LOCK('resume_required_unsupported_idle');
+
+# Before the first set-bearing COMMIT, a numeric miss is ordinary NOT_FOUND.
+--connection required_receiver_resume
+--error ER_PRESERVE_TRX_NOT_FOUND
+--eval RESUME PRESERVED TRANSACTION '$txn_id'
+
+# Force the only transaction to fail source finalization. Its connection ID
+# must not enter S because the transaction did not disappear.
+--connection required_source_ha
+SET GLOBAL debug='+d,preserve_trx_early_fail_candidate_finalize';
+--connection default
+DRAIN TRANSACTIONS PRESERVE;
+--connection required_source_ha
+SET GLOBAL debug='-d,preserve_trx_early_fail_candidate_finalize';
+
+--connection required_receiver_resume
+--error ER_PRESERVE_TRX_HANDOFF_UNAVAILABLE
+--eval RESUME PRESERVED TRANSACTION '$txn_id'
+--error ER_PRESERVE_TRX_HANDOFF_UNAVAILABLE
+--eval RESUME PRESERVED TRANSACTION '$txn_id'
+
+# The idle source connection is explicitly present in S. The first RESUME
+# requires the HA privilege. A denied attempt must not consume the member.
+--connect(required_receiver_no_priv,127.0.0.1,resume_required_no_priv,,test,$SERVER_MYPORT_2,)
+--error ER_PRESERVE_TRX_ACCESS_DENIED
+--eval RESUME PRESERVED TRANSACTION '$idle_id'
+
+# The privileged attempt consumes it; a second target connection cannot reuse
+# the same source ID.
+--connection required_receiver_resume
+START TRANSACTION;
+--error ER_PRESERVE_TRX_INVALID_STATE
+--eval RESUME PRESERVED TRANSACTION '$idle_id'
+ROLLBACK;
+CREATE TEMPORARY TABLE t_resume_required_target_dirty(id INT PRIMARY KEY);
+--error ER_PRESERVE_TRX_INVALID_STATE
+--eval RESUME PRESERVED TRANSACTION '$idle_id'
+DROP TEMPORARY TABLE t_resume_required_target_dirty;
+--eval RESUME PRESERVED TRANSACTION '$idle_id'
+--let $assert_text= session-only resume leaves no SQL transaction active
+--let $assert_cond= `SELECT COUNT(*) = 0 FROM information_schema.innodb_trx WHERE trx_mysql_thread_id = CONNECTION_ID()`
+--source include/assert.inc
+--let $receiver_resume_id= query_get_value(SELECT CONNECTION_ID() AS id, id, 1)
+--let $assert_text= session-only resume leaves no native InnoDB transaction
+--let $assert_cond= `SELECT COUNT(*) = 0 FROM information_schema.innodb_trx WHERE trx_mysql_thread_id=$receiver_resume_id`
+--source include/assert.inc
+--connection required_receiver_replay
+--error ER_PRESERVE_TRX_HANDOFF_UNAVAILABLE
+--eval RESUME PRESERVED TRANSACTION '$idle_id'
+
+# The control-only COMMIT is the ownership boundary, so RESET is too late.
+--connection required_source_ha
+--error ER_PRESERVE_TRX_RESET_TOO_LATE
+RESET DRAIN;
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+SHUTDOWN;
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+
+# A later successful DRAIN replaces the process-local set. An old source ID is
+# neither in the new S nor backed by a current-epoch promotion record.
+--exec echo "restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$SERVER_MYPORT_2 --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=resume_required_lifecycle --rds-preserve-trx-transfer-credential-secret-file=$credential_file" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+--disable_query_log
+--disable_result_log
+
+--connect(required_source_ha_second,localhost,preserve_trx_ha_admin,resume-required-lifecycle-secret,test)
+--connect(required_source_drain_second,localhost,root,,test)
+# Lose the first control-only COMMIT ACK. Status-query resolution must observe
+# the committed receiver state without applying the replacement twice.
+--connection required_source_ha_second
+SET GLOBAL debug='+d,preserve_trx_transfer_drop_commit_ack_once';
+--connection required_source_drain_second
+DRAIN TRANSACTIONS PRESERVE;
+--connection required_source_ha_second
+SET GLOBAL debug='-d,preserve_trx_transfer_drop_commit_ack_once';
+
+--connection required_receiver_resume
+--error ER_PRESERVE_TRX_HANDOFF_UNAVAILABLE
+--eval RESUME PRESERVED TRANSACTION '$txn_id'
+--error ER_PRESERVE_TRX_HANDOFF_UNAVAILABLE
+--eval RESUME PRESERVED TRANSACTION '$idle_spare_id'
+
+--connection required_source_ha_second
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+SHUTDOWN;
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+--disable_query_log
+--disable_result_log
+
+--connect(required_source_cleanup,localhost,root,,test)
+DROP TABLE t_resume_required_lifecycle;
+DROP USER resume_required_app@localhost;
+DROP USER preserve_trx_ha_admin@localhost;
+
+--connection required_receiver_admin
+SET GLOBAL rds_preserve_trx_temp_table_enable=OFF;
+DROP USER resume_required_no_priv@localhost;
+DROP USER preserve_trx_ha_admin@localhost;
+
+--connection required_source_cleanup
+--remove_file $credential_file
+--enable_result_log
+SELECT 'ok' AS resume_required_lifecycle;
+--enable_query_log

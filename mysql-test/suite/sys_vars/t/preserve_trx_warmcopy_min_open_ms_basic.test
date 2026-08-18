@@ -1,6 +1,0 @@
---disable_query_log
---disable_result_log
-SELECT @@GLOBAL.preserve_trx_warmcopy_min_open_ms;
---enable_result_log
---enable_query_log
---echo ok

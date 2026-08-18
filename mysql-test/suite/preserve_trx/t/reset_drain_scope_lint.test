@@ -106,7 +106,7 @@ die "RESET DRAIN must not add a transfer wire status\n"
 
 my ($commit_body) =
   $transfer =~
-    /(Preserve_trx_transfer_source_epoch_session::commit_epoch\([\s\S]*?^})/m
+    /(Preserve_trx_transfer_source_epoch_session::commit_epoch_impl\([\s\S]*?^})/m
   or die "could not isolate source commit_epoch\n";
 my $ack_pos = index($commit_body, 'const bool commit_acknowledged');
 my $arbiter_pos = index($commit_body, 'm_final_ack_arbiter(');
@@ -258,9 +258,21 @@ die "phase-2 RESET must stop participant admission, classify every token, publis
 
 die "RESET must not retain the obsolete all-runnable/reset-failed binary contract\n"
   if $preserve =~ /all_transactions_runnable|reset_failed/;
-die "RESET request must accept post-COMMIT ownership and converge on source restore\n"
+die "RESET request must reject post-COMMIT ownership as too late\n"
   unless $preserve =~
-         /request_reset\s*\(\)[\s\S]*HANDOFF_PENDING[\s\S]*COMMIT_UNKNOWN[\s\S]*SHUTDOWN_HANDOFF[\s\S]*SOURCE_RESTORE_PENDING/s;
+         /request_reset\s*\(\)[\s\S]*HANDOFF_PENDING[\s\S]*COMMIT_UNKNOWN[\s\S]*COMMITTED_HANDOFF[\s\S]*TOO_LATE/s;
+die "RESET request must retain source-only shutdown handoff restoration\n"
+  unless $preserve =~
+         /request_reset\s*\(\)[\s\S]*SHUTDOWN_HANDOFF[\s\S]*SOURCE_RESTORE_PENDING[\s\S]*WON/s;
+die "receiver-owns handoff resolution must publish the live-source transfer fence\n"
+  unless $preserve =~
+         /preserved_trx_resolve_handoff_unknown[\s\S]*?acknowledge_commit[\s\S]*?Preserve_trx_manager_state::TRANSFER_HANDOFF_COMPLETE\s*,\s*0/s;
+die "source-owns handoff resolution must fail-stop if guarded restore exits incomplete\n"
+  unless $preserve =~
+         /begin_source_restore\(\)\)[\s\S]{0,350}preserve_trx_reset_invariant_failure\([\s\S]*?"quarantined_reset_source_restore_transition_failed"[\s\S]*?preserve_trx_publish_active_drain_reset_barrier\(attempt\);/s;
+die "receiver-owned resolution must retain the active attempt; only source-owned resolution may archive it\n"
+  unless $preserve =~
+         /RECEIVER_FENCED_SOURCE_OWNS[\s\S]*?g_active_drain_attempt\.reset\(\);[\s\S]*?g_last_resolved_drain_attempt\s*=\s*std::move\(attempt\);/s;
 die "RESET must not send receiver ABORT after source restore ownership wins\n"
   unless $preserve =~
          /auto abort_batch_transfer_epoch[\s\S]{0,800}preserve_trx_active_drain_reset_requested\(active_drain_attempt\)[\s\S]{0,120}return;/s;

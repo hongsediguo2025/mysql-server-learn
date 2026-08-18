@@ -32,19 +32,19 @@ app_2_same_connection
 SELECT CONNECTION_ID()=@original_connection_id AS app_3_same_connection;
 app_3_same_connection
 1
-SELECT CONNECTION_ID()=@original_connection_id AS handoff_same_connection;
-handoff_same_connection
+SELECT 1 AS handoff_source_remains_fenced;
+handoff_source_remains_fenced
 1
 SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME='Preserve_trx_reset_drain_wins')
 - @reset_wins_before_handoff AS handoff_reset_winner_delta;
 handoff_reset_winner_delta
-1
+0
 SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 WHERE VARIABLE_NAME='Preserve_trx_reset_drain_too_late')
 - @reset_too_late_before_handoff AS handoff_too_late_delta;
 handoff_too_late_delta
-0
+3
 SELECT 1 AS local_carrier_server_alive;
 local_carrier_server_alive
 1

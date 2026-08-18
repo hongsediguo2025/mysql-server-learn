@@ -34,6 +34,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -48,6 +49,11 @@ struct MYSQL;
 struct lock_preserve_record_lock_metadata_facts_t;
 struct Preserve_trx_prepared_token_key;
 
+/*
+  The session-only COMMIT payload is a receiver-first v2 extension. Legacy v2
+  no-payload COMMIT frames remain accepted, but a new source requires a receiver
+  that understands the canonical session-only payload before switchover.
+*/
 static constexpr uint16_t kPreserveTrxTransferProtocolVersion = 2;
 static constexpr uint32_t kPreserveTrxTransferOperationTimeoutMs = 30000;
 static constexpr uint16_t kPreserveTrxTransferLockPlanContractVersion =
@@ -268,6 +274,14 @@ enum class Preserve_trx_transfer_status {
   LOCK_PLAN_STALE = 10,
   NOT_COMMITTED = 11,
   NOT_COMMITTED_CLEAN = 12
+};
+
+struct Preserve_trx_transfer_resume_handoff {
+  bool available{false};
+  bool session_only{false};
+  uint64_t token{0};
+  std::string epoch_id;
+  uint64_t generation{0};
 };
 
 enum class Preserve_trx_transfer_password_status {
@@ -544,11 +558,12 @@ struct Preserve_trx_transfer_epoch_fact {
 struct Preserve_trx_transfer_frame {
   /*
     One classic-protocol transfer frame. BEGIN carries a complete encoded
-    manifest, OBJECT_CHUNK carries a byte range for one manifest object, and the
-    remaining frame types advance receiver-side state without interpreting the
-    existing snapshot bundle format. Promotion control frames are intentionally
-    small: PREWARM targets one token and GATE targets the whole epoch so the
-    promotion gate can stay free of cold snapshot reads.
+    manifest, OBJECT_CHUNK carries a byte range for one manifest object, and
+    COMMIT_EPOCH may carry the canonical process-local session-only token set.
+    The remaining frame types advance receiver-side state without
+    interpreting the existing snapshot bundle format. Promotion control frames
+    are intentionally small: PREWARM targets one token and GATE targets the
+    whole epoch so the promotion gate can stay free of cold snapshot reads.
   */
   Preserve_trx_transfer_frame_type type{Preserve_trx_transfer_frame_type::BEGIN};
   uint16_t protocol_version{kPreserveTrxTransferProtocolVersion};
@@ -574,6 +589,24 @@ struct Preserve_trx_transfer_frame_ack {
   Preserve_trx_transfer_status status{Preserve_trx_transfer_status::OK};
   uint64_t accepted_terminal_status_retention_us{0};
 };
+
+Preserve_trx_transfer_status
+preserve_trx_transfer_encode_session_only_tokens(
+    const std::vector<uint64_t> &tokens, std::string *encoded);
+
+Preserve_trx_transfer_status
+preserve_trx_transfer_decode_session_only_tokens(
+    const std::string &encoded, std::vector<uint64_t> *tokens);
+
+Preserve_trx_transfer_resume_handoff
+preserve_trx_transfer_resume_handoff_for_token(const std::string &token);
+
+bool preserve_trx_transfer_consume_session_only_token(
+    const Preserve_trx_transfer_resume_handoff &handoff);
+bool preserve_trx_transfer_claim_transaction_handoff(
+    const Preserve_trx_transfer_resume_handoff &handoff);
+void preserve_trx_transfer_release_transaction_handoff(
+    const Preserve_trx_transfer_resume_handoff &handoff);
 
 enum class Preserve_trx_transfer_receiver_state {
   DECLARED,
@@ -650,6 +683,7 @@ struct Preserve_trx_transfer_accepted_epoch {
   uint64_t source_fence_lsn{0};
   std::vector<uint64_t> tokens;
   std::array<unsigned char, kPreservedTrxSha256Length> fact_digest{};
+  std::array<unsigned char, kPreservedTrxSha256Length> terminal_fact_digest{};
   std::shared_ptr<const Preserve_trx_transfer_epoch_fact> fact;
   Preserve_trx_transfer_epoch_lifecycle lifecycle{
       Preserve_trx_transfer_epoch_lifecycle::PREWARMING};
@@ -765,7 +799,26 @@ class Preserve_trx_transfer_receiver_registry {
       const std::string &root_dir,
       std::shared_ptr<const Preserve_trx_transfer_epoch_fact> fact,
       const std::string &receiver_process_generation, uint64_t now_us,
-      uint64_t prewarm_timeout_ms, bool flat_projection_published);
+      uint64_t prewarm_timeout_ms,
+      bool flat_projection_published,
+      const std::vector<uint64_t> *session_only_tokens = nullptr,
+      const std::array<unsigned char, kPreservedTrxSha256Length>
+          *terminal_fact_digest = nullptr);
+  Preserve_trx_transfer_status publish_control_only_epoch(
+      const std::string &root_dir, const std::string &epoch_id,
+      uint64_t sequence,
+      const std::array<unsigned char, kPreservedTrxSha256Length>
+          &frame_digest,
+      const std::array<unsigned char, kPreservedTrxSha256Length>
+          &fact_digest,
+      uint64_t now_us,
+      const std::vector<uint64_t> &session_only_tokens);
+  Preserve_trx_transfer_resume_handoff resume_handoff(uint64_t token) const;
+  bool consume_session_only_token(uint64_t token, const std::string &epoch_id,
+                                  uint64_t generation);
+  bool claim_transaction_handoff(uint64_t token, const std::string &epoch_id,
+                                 uint64_t generation);
+  void release_transaction_handoff(uint64_t token, uint64_t generation);
   Preserve_trx_transfer_status query_accepted_epoch(
       const std::string &root_dir, const std::string &epoch_id,
       Preserve_trx_transfer_accepted_epoch *accepted = nullptr) const;
@@ -849,7 +902,8 @@ class Preserve_trx_transfer_receiver_registry {
   Preserve_trx_transfer_status snapshot_epoch_for_commit(
       const std::string &epoch_id, uint64_t sequence,
       const std::array<unsigned char, kPreservedTrxSha256Length> &frame_digest,
-      std::vector<Preserve_trx_transfer_receiver_record> *records);
+      std::vector<Preserve_trx_transfer_receiver_record> *records,
+      bool allow_empty_snapshot = false);
   void mark_epoch_commit_admission_corrupt(
       const std::string &epoch_id, uint64_t sequence,
       const std::array<unsigned char, kPreservedTrxSha256Length> &frame_digest);
@@ -998,9 +1052,20 @@ class Preserve_trx_transfer_receiver_registry {
   void mark_epoch_commit_admission_corrupt_locked(
       const std::string &epoch_id, uint64_t sequence,
       const std::array<unsigned char, kPreservedTrxSha256Length> &frame_digest);
+  void publish_active_session_only_set(
+      std::string *epoch_id,
+      std::unordered_set<uint64_t> *session_only_tokens);
   std::map<std::string, Acknowledged_epoch> m_acknowledged_epochs;
   std::map<std::string, Preserve_trx_transfer_accepted_epoch>
       m_accepted_epochs;
+  /* Last accepted handoff only; isolated from the transfer registry lock. */
+  mutable std::mutex m_session_only_mutex;
+  bool m_active_session_only_set_valid{false};
+  std::unordered_set<uint64_t> m_active_session_only_tokens;
+  std::string m_active_session_only_epoch_id;
+  uint64_t m_active_session_only_generation{0};
+  /* Short-lived claims prevent one numeric ID from resuming concurrently. */
+  std::set<std::pair<uint64_t, uint64_t>> m_transaction_handoff_claims;
   uint64_t m_expired_epoch_count{0};
 };
 
@@ -1202,6 +1267,8 @@ class Preserve_trx_transfer_source_epoch_session {
   Preserve_trx_transfer_status cleanup_cancelled_epoch(
       const std::string &reason);
   Preserve_trx_transfer_status commit_epoch();
+  Preserve_trx_transfer_status commit_epoch(
+      const std::vector<uint64_t> &session_only_tokens);
   std::string epoch_id() const { return m_epoch_id; }
   uint32_t chunk_bytes() const { return m_chunk_bytes; }
   uint64_t max_inflight_bytes() const { return m_max_inflight_bytes; }
@@ -1259,6 +1326,8 @@ class Preserve_trx_transfer_source_epoch_session {
                                                   bool allow_finalized,
                                                   Pending_frame_cleanup cleanup);
   Preserve_trx_transfer_status abort_epoch_locked(const std::string &reason);
+  Preserve_trx_transfer_status commit_epoch_impl(
+      const std::vector<uint64_t> *session_only_tokens);
 
   std::string m_epoch_id;
   Preserve_trx_transfer_runtime_policy m_runtime_policy;
@@ -1277,6 +1346,7 @@ class Preserve_trx_transfer_source_epoch_session {
   bool m_commit_in_progress{false};
   bool m_phase1_metrics_enabled{false};
   bool m_ack_uncertain{false};
+  bool m_final_metadata_accepted{false};
   bool m_epoch_transport_open{false};
   uint64_t m_requested_terminal_status_retention_us{0};
   uint64_t m_absolute_monotonic_deadline_us{0};
@@ -1299,7 +1369,7 @@ class Preserve_trx_transfer_source_epoch_session {
   std::map<uint64_t, std::set<std::string>> m_streaming_sealed_objects;
   std::set<uint64_t> m_final_metadata_tokens;
   std::vector<Preserve_trx_transfer_frame> m_pending_final_metadata_frames;
-  std::string m_pending_commit_payload_for_abandon;
+  std::string m_frozen_commit_payload;
   std::vector<Preserve_trx_transfer_manifest> m_finalized_manifests;
 #ifndef NDEBUG
   size_t m_pending_frame_cleanup_invocations{0};

@@ -1,0 +1,3 @@
+include/assert.inc [mixed receiver prewarm has exactly two not-ready tokens]
+resume_required_mixed
+ok

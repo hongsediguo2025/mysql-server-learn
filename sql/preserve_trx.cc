@@ -256,6 +256,8 @@ Preserve_trx_drain_ownership_state::request_reset() {
         break;
       case Preserve_trx_drain_terminal::HANDOFF_PENDING:
       case Preserve_trx_drain_terminal::COMMIT_UNKNOWN:
+      case Preserve_trx_drain_terminal::COMMITTED_HANDOFF:
+        return Preserve_trx_drain_reset_request::TOO_LATE;
       case Preserve_trx_drain_terminal::SHUTDOWN_HANDOFF:
         desired = Preserve_trx_drain_terminal::SOURCE_RESTORE_PENDING;
         result = Preserve_trx_drain_reset_request::WON;
@@ -338,15 +340,15 @@ bool Preserve_trx_drain_ownership_state::acknowledge_commit() {
   Preserve_trx_drain_terminal expected =
       Preserve_trx_drain_terminal::HANDOFF_PENDING;
   if (m_state.compare_exchange_strong(
-          expected, Preserve_trx_drain_terminal::SHUTDOWN_HANDOFF)) {
+          expected, Preserve_trx_drain_terminal::COMMITTED_HANDOFF)) {
     return true;
   }
   if (expected == Preserve_trx_drain_terminal::COMMIT_UNKNOWN) {
     return m_state.compare_exchange_strong(
-               expected, Preserve_trx_drain_terminal::SHUTDOWN_HANDOFF) ||
-           expected == Preserve_trx_drain_terminal::SHUTDOWN_HANDOFF;
+               expected, Preserve_trx_drain_terminal::COMMITTED_HANDOFF) ||
+           expected == Preserve_trx_drain_terminal::COMMITTED_HANDOFF;
   }
-  return expected == Preserve_trx_drain_terminal::SHUTDOWN_HANDOFF;
+  return expected == Preserve_trx_drain_terminal::COMMITTED_HANDOFF;
 }
 
 bool Preserve_trx_drain_ownership_state::shutdown_without_commit() {
@@ -368,6 +370,7 @@ bool Preserve_trx_drain_ownership_state::restore_allowed() const {
     case Preserve_trx_drain_terminal::COMMIT_UNKNOWN:
     case Preserve_trx_drain_terminal::SOURCE_RESTORED:
     case Preserve_trx_drain_terminal::SHUTDOWN_HANDOFF:
+    case Preserve_trx_drain_terminal::COMMITTED_HANDOFF:
       return false;
   }
   return false;
@@ -1029,6 +1032,9 @@ Preserve_trx_reset_drain_result preserve_trx_request_active_drain_reset_impl(
     case Preserve_trx_drain_reset_request::JOINED:
     case Preserve_trx_drain_reset_request::ALREADY_RESTORED:
       break;
+    case Preserve_trx_drain_reset_request::TOO_LATE:
+      g_reset_drain_too_late.fetch_add(1);
+      return Preserve_trx_reset_drain_result::TOO_LATE;
     case Preserve_trx_drain_reset_request::INVALID:
       preserve_trx_reset_invariant_failure("invalid_reset_ownership", attempt);
   }
@@ -1542,6 +1548,33 @@ bool preserved_trx_record_exists_locked(const std::string &token) {
     if (!record.observable_only && record.metadata.token == token) return true;
   }
   return false;
+}
+
+enum class Preserve_trx_session_only_consume_status : uint8_t {
+  CONSUMED,
+  HANDOFF_UNAVAILABLE,
+  RECORD_CONFLICT
+};
+
+static Preserve_trx_session_only_consume_status
+preserved_trx_consume_session_only_handoff(
+    const std::string &token,
+    const Preserve_trx_transfer_resume_handoff &handoff) {
+  /* Keep record -> handoff lock order for the conflict/erase linearization. */
+  std::lock_guard<std::mutex> lock(g_preserved_trx_mutex);
+  bool record_conflict = preserved_trx_record_exists_locked(token);
+#ifndef DBUG_OFF
+  DBUG_EXECUTE_IF("preserve_trx_force_session_only_record_conflict", {
+    record_conflict = true;
+  });
+#endif
+  if (record_conflict) {
+    return Preserve_trx_session_only_consume_status::RECORD_CONFLICT;
+  }
+  if (!preserve_trx_transfer_consume_session_only_token(handoff)) {
+    return Preserve_trx_session_only_consume_status::HANDOFF_UNAVAILABLE;
+  }
+  return Preserve_trx_session_only_consume_status::CONSUMED;
 }
 
 bool preserved_trx_find_record(const std::string &token,
@@ -4842,6 +4875,14 @@ bool preserve_trx_has_rw_transaction_participant(THD *thd) {
   return false;
 }
 
+static bool preserve_trx_has_transaction_participant(THD *thd) {
+  if (thd == nullptr) return false;
+  return thd->get_transaction()->ha_trx_info(Transaction_ctx::SESSION) !=
+             nullptr ||
+         thd->get_transaction()->ha_trx_info(Transaction_ctx::STMT) !=
+             nullptr;
+}
+
 static bool preserve_trx_has_lock_warmcopy_phase1_candidate_transaction(
     THD *thd) {
   if (thd == nullptr) return false;
@@ -4929,6 +4970,51 @@ bool preserve_trx_is_unsupported_common_context(
   }
 
   return false;
+}
+
+static bool preserve_trx_session_only_candidate_is_eligible_locked(
+    THD *candidate, bool closing_gate_active,
+    bool allow_unclassified_post_closing = false) {
+  const bool command_classified =
+      candidate != nullptr &&
+      candidate->preserve_trx_post_closing_command_classified.load(
+          std::memory_order_acquire);
+  const bool disconnecting =
+      command_classified &&
+      candidate->preserve_trx_post_closing_cleanup_packet.load(
+          std::memory_order_acquire);
+  const bool logically_idle =
+      candidate != nullptr && !disconnecting &&
+      (candidate->m_server_idle ||
+       (closing_gate_active &&
+        !candidate->preserve_trx_command_packet_before_closing.load(
+            std::memory_order_acquire) &&
+        (command_classified || allow_unclassified_post_closing)));
+  return candidate != nullptr && !candidate->release_resources_done() &&
+         !candidate->is_system_thread() &&
+         candidate->killed == THD::NOT_KILLED && logically_idle &&
+         candidate->is_classic_protocol() &&
+         !preserve_trx_has_explicit_active_transaction(candidate) &&
+         !preserve_trx_has_transaction_participant(candidate) &&
+         candidate->temporary_tables == nullptr &&
+         !preserve_trx_is_unsupported_common_context(candidate);
+}
+
+static bool preserve_trx_session_only_resume_target_is_pristine(THD *thd) {
+  if (thd == nullptr) return false;
+
+  mysql_mutex_lock(&thd->LOCK_thd_data);
+  const bool thd_state_pristine =
+      !thd->release_resources_done() && !thd->is_system_thread() &&
+      thd->killed == THD::NOT_KILLED &&
+      thd->preserve_trx_batch_state == Preserve_trx_batch_thd_state::NONE &&
+      thd->temporary_tables == nullptr;
+  mysql_mutex_unlock(&thd->LOCK_thd_data);
+
+  return thd_state_pristine &&
+         !preserve_trx_has_explicit_active_transaction(thd) &&
+         !preserve_trx_has_transaction_participant(thd) &&
+         trx_preserve_thd_can_accept_preserved_trx(thd);
 }
 
 bool preserve_trx_has_unsupported_transaction_contents(
@@ -5322,10 +5408,12 @@ bool preserve_trx_batch_candidate_is_idle_target(THD *owner, THD *candidate) {
 class Preserve_batch_target_counter final : public Do_THD_Impl {
  public:
   Preserve_batch_target_counter(THD *owner, ulonglong generation,
-                                ulonglong closing_started_us)
+                                ulonglong closing_started_us,
+                                bool collect_session_only)
       : m_owner(owner),
         m_generation(generation),
-        m_closing_started_us(closing_started_us) {}
+        m_closing_started_us(closing_started_us),
+        m_collect_session_only(collect_session_only) {}
 
   void operator()(THD *candidate) override {
     if (candidate == nullptr) return;
@@ -5342,9 +5430,20 @@ class Preserve_batch_target_counter final : public Do_THD_Impl {
                          candidate->killed == THD::KILL_CONNECTION;
     if (!ignored) {
       if (candidate->is_system_thread()) {
-        if (preserve_trx_has_rw_transaction_participant(candidate) ||
-            preserve_trx_thd_has_batch_inflight_statement(candidate)) {
+        /*
+          System threads (purge, page cleaner, I/O) are never drain targets.
+          They do not run user statements, so a live batch inflight statement
+          is the only durable unsupported signal; rw participants they
+          transiently hold while scanning must not poison the batch.
+        */
+        if (preserve_trx_thd_has_batch_inflight_statement(candidate)) {
           m_has_unsupported_transaction = true;
+          LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
+                 ("PRESERVE: target counter unsupported detail thread_id=" +
+                  std::to_string(static_cast<unsigned long long>(
+                      candidate->thread_id())) +
+                  " reason=system_thread_inflight")
+                     .c_str());
         }
         mysql_mutex_unlock(&candidate->LOCK_thd_data);
         return;
@@ -5360,10 +5459,12 @@ class Preserve_batch_target_counter final : public Do_THD_Impl {
           (candidate->preserve_trx_inflight_unknown_query_depth > 0 &&
            command_packet_before_closing);
       if (preserve_trx_is_ha_control_connection(candidate)) {
-        if (active_explicit_transaction ||
-            preserve_trx_has_rw_transaction_participant(candidate)) {
-          m_has_unsupported_transaction = true;
-        }
+        /*
+          HA control connections are the control plane, never drain targets:
+          they legitimately run control statements (RESET DRAIN, DEBUG_SYNC
+          choreography, SET GLOBAL) concurrently with the drain, and their
+          transient transaction/participant state is not batch-relevant.
+        */
         mysql_mutex_unlock(&candidate->LOCK_thd_data);
         return;
       }
@@ -5373,6 +5474,39 @@ class Preserve_batch_target_counter final : public Do_THD_Impl {
           command_packet_before_closing && candidate->is_classic_protocol();
       if (!active_explicit_transaction && !batch_inflight_statement &&
           !nonidle_unclassified_command_packet) {
+        if (m_collect_session_only &&
+            candidate->killed == THD::NOT_KILLED &&
+            candidate->is_classic_protocol()) {
+          if (preserve_trx_session_only_candidate_is_eligible_locked(
+                  candidate, true, true)) {
+            m_session_only_thread_ids.push_back(candidate->thread_id());
+          } else {
+            /*
+              Design §2: a transiently unclassified post-CLOSING packet is a
+              provisional candidate, not an unsupported session.  Only a
+              genuinely unsupported server-side context fails the batch; the
+              final session-only snapshot removes still-unclassified members.
+              A lingering autocommit participant registration on an idle
+              session is a scan-time artifact, not an open transaction: the
+              eligibility check above already keeps such sessions out of S.
+            */
+            const bool command_unclassified =
+                !candidate->preserve_trx_post_closing_command_classified.load(
+                    std::memory_order_acquire);
+            const bool context_unsupported =
+                preserve_trx_is_unsupported_common_context(candidate) ||
+                candidate->temporary_tables != nullptr;
+            if (command_unclassified && context_unsupported) {
+              m_has_unsupported_transaction = true;
+              LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
+                     ("PRESERVE: target counter unsupported detail thread_id=" +
+                      std::to_string(static_cast<unsigned long long>(
+                          candidate->thread_id())) +
+                      " reason=provisional_session_only_context")
+                         .c_str());
+            }
+          }
+        }
         mysql_mutex_unlock(&candidate->LOCK_thd_data);
         return;
       }
@@ -5386,9 +5520,12 @@ class Preserve_batch_target_counter final : public Do_THD_Impl {
         silently skipped.
       */
       if (active_explicit_transaction) ++m_transaction_count;
-      const bool unstable_unsupported =
+      const bool stale_batch_state =
           candidate->preserve_trx_batch_state !=
-              Preserve_trx_batch_thd_state::NONE ||
+              Preserve_trx_batch_thd_state::NONE &&
+          candidate->preserve_trx_batch_generation == m_generation;
+      const bool unstable_unsupported =
+          stale_batch_state ||
           candidate->killed != THD::NOT_KILLED;
       const bool idle_unsupported =
           active_explicit_transaction && !batch_inflight_statement &&
@@ -5404,6 +5541,17 @@ class Preserve_batch_target_counter final : public Do_THD_Impl {
 
       if (unsupported) {
         m_has_unsupported_transaction = true;
+        LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
+               ("PRESERVE: target counter unsupported detail thread_id=" +
+                std::to_string(static_cast<unsigned long long>(
+                    candidate->thread_id())) +
+                " unstable=" + std::to_string(unstable_unsupported ? 1 : 0) +
+                " idle=" + std::to_string(idle_unsupported ? 1 : 0) +
+                " stale=" + std::to_string(stale_batch_state ? 1 : 0) +
+                " killed=" + std::to_string(candidate->killed != THD::NOT_KILLED
+                                                ? 1
+                                                : 0))
+                   .c_str());
       } else if (idle_target) {
         ++m_target_count;
         m_target_thread_ids.push_back(candidate->thread_id());
@@ -5448,10 +5596,15 @@ class Preserve_batch_target_counter final : public Do_THD_Impl {
   const std::vector<my_thread_id> &transaction_target_thread_ids() const {
     return m_transaction_target_thread_ids;
   }
+  const std::vector<my_thread_id> &session_only_thread_ids() const {
+    return m_session_only_thread_ids;
+  }
+
  private:
   THD *m_owner;
   ulonglong m_generation;
   ulonglong m_closing_started_us;
+  bool m_collect_session_only;
   uint m_transaction_count{0};
   uint m_target_count{0};
   uint m_pending_target_count{0};
@@ -5459,6 +5612,37 @@ class Preserve_batch_target_counter final : public Do_THD_Impl {
   bool m_has_unsupported_transaction{false};
   std::vector<my_thread_id> m_target_thread_ids;
   std::vector<my_thread_id> m_transaction_target_thread_ids;
+  std::vector<my_thread_id> m_session_only_thread_ids;
+};
+
+class Preserve_batch_session_only_final_snapshot final : public Do_THD_Impl {
+ public:
+  explicit Preserve_batch_session_only_final_snapshot(
+      const std::set<my_thread_id> &planned_thread_ids)
+      : m_planned_thread_ids(planned_thread_ids) {}
+
+  void operator()(THD *candidate) override {
+    if (candidate == nullptr) return;
+    const my_thread_id thread_id = candidate->thread_id();
+    if (m_planned_thread_ids.count(thread_id) == 0) {
+      return;
+    }
+
+    mysql_mutex_lock(&candidate->LOCK_thd_data);
+    const bool eligible =
+        preserve_trx_session_only_candidate_is_eligible_locked(candidate,
+                                                                true);
+    mysql_mutex_unlock(&candidate->LOCK_thd_data);
+    if (eligible) m_eligible_thread_ids.insert(thread_id);
+  }
+
+  std::set<my_thread_id> take_eligible_thread_ids() {
+    return std::move(m_eligible_thread_ids);
+  }
+
+ private:
+  const std::set<my_thread_id> &m_planned_thread_ids;
+  std::set<my_thread_id> m_eligible_thread_ids;
 };
 
 class Preserve_batch_phase1_transfer_target_scanner final : public Do_THD_Impl {
@@ -5598,8 +5782,11 @@ static void preserve_trx_note_quiesced_wait(uint *loops) {
 class Preserve_batch_target_state_reader final : public Do_THD_Impl {
  public:
   Preserve_batch_target_state_reader(ulonglong generation,
-                                     my_thread_id target_thread_id)
-      : m_generation(generation), m_target_thread_id(target_thread_id) {}
+                                     my_thread_id target_thread_id,
+                                     bool collect_session_only)
+      : m_generation(generation),
+        m_target_thread_id(target_thread_id),
+        m_collect_session_only(collect_session_only) {}
 
   void operator()(THD *candidate) override {
     if (m_seen || candidate == nullptr) return;
@@ -5617,6 +5804,11 @@ class Preserve_batch_target_state_reader final : public Do_THD_Impl {
       m_temp_unsupported_boundary_seen =
           preserve_trx_temp_table_has_untracked_change(candidate) ||
           preserve_trx_temp_table_has_batch_unsupported_boundary(candidate);
+      m_session_only_eligible =
+          m_collect_session_only &&
+          m_state == Preserve_trx_batch_thd_state::DRAINED_NO_TRANSACTION &&
+          preserve_trx_session_only_candidate_is_eligible_locked(candidate,
+                                                                  true);
     }
     mysql_mutex_unlock(&candidate->LOCK_thd_data);
   }
@@ -5626,13 +5818,16 @@ class Preserve_batch_target_state_reader final : public Do_THD_Impl {
   bool temp_unsupported_boundary_seen() const {
     return m_temp_unsupported_boundary_seen;
   }
+  bool session_only_eligible() const { return m_session_only_eligible; }
 
  private:
   ulonglong m_generation;
   my_thread_id m_target_thread_id;
+  bool m_collect_session_only{false};
   bool m_seen{false};
   Preserve_trx_batch_thd_state m_state{Preserve_trx_batch_thd_state::NONE};
   bool m_temp_unsupported_boundary_seen{false};
+  bool m_session_only_eligible{false};
 };
 
 bool preserve_trx_quiesced_batch_target_is_eligible_locked(
@@ -5642,6 +5837,7 @@ struct Preserve_batch_ready_target {
   my_thread_id thread_id{0};
   Preserve_trx_batch_thd_state state{Preserve_trx_batch_thd_state::NONE};
   bool temp_unsupported{false};
+  bool session_only_eligible{false};
   ulonglong boundary_observed_us{0};
 };
 
@@ -5651,10 +5847,12 @@ class Preserve_batch_pending_target_observer final : public Do_THD_Impl {
       ulonglong generation,
       const std::set<my_thread_id> &pending_thread_ids,
       bool closing_gate_active,
+      bool collect_session_only,
       std::vector<Preserve_batch_ready_target> *ready_targets)
       : m_generation(generation),
         m_pending_thread_ids(pending_thread_ids),
         m_closing_gate_active(closing_gate_active),
+        m_collect_session_only(collect_session_only),
         m_ready_targets(ready_targets) {}
 
   void operator()(THD *candidate) override {
@@ -5693,8 +5891,16 @@ class Preserve_batch_pending_target_observer final : public Do_THD_Impl {
         mysql_mutex_unlock(&candidate->LOCK_thd_data);
         return;
       }
-    } else if (state !=
+    } else if (state ==
                Preserve_trx_batch_thd_state::DRAINED_NO_TRANSACTION) {
+      if (m_collect_session_only &&
+          !preserve_trx_session_only_candidate_is_eligible_locked(
+              candidate, m_closing_gate_active)) {
+        m_invalid = true;
+        mysql_mutex_unlock(&candidate->LOCK_thd_data);
+        return;
+      }
+    } else {
       m_invalid = true;
       mysql_mutex_unlock(&candidate->LOCK_thd_data);
       return;
@@ -5703,6 +5909,8 @@ class Preserve_batch_pending_target_observer final : public Do_THD_Impl {
     if (m_ready_targets != nullptr) {
       m_ready_targets->push_back(
           {thread_id, state, temp_unsupported_boundary_seen,
+           m_collect_session_only &&
+               state == Preserve_trx_batch_thd_state::DRAINED_NO_TRANSACTION,
            candidate->preserve_trx_quiesce_boundary_monotonic_us});
     }
     mysql_mutex_unlock(&candidate->LOCK_thd_data);
@@ -5715,6 +5923,7 @@ class Preserve_batch_pending_target_observer final : public Do_THD_Impl {
   ulonglong m_generation;
   const std::set<my_thread_id> &m_pending_thread_ids;
   bool m_closing_gate_active{false};
+  bool m_collect_session_only{false};
   bool m_invalid{false};
   size_t m_seen_count{0};
   std::vector<Preserve_batch_ready_target> *m_ready_targets;
@@ -5933,16 +6142,27 @@ class Preserve_batch_quiesced_target_counter final : public Do_THD_Impl {
         preserve_trx_batch_thread_id_in_targets(candidate->thread_id(),
                                                 m_target_thread_ids);
     if (target) {
+      /*
+        Under high concurrency (1000+ sessions), the re-check can observe
+        transient states: a target still converging to QUIESCED, or a
+        command that has not yet reached its idle boundary.  Only flag
+        genuinely broken states; convergence is handled by the wait loop.
+      */
+      const bool still_converging =
+          candidate->preserve_trx_batch_state ==
+              Preserve_trx_batch_thd_state::PENDING_QUIESCE ||
+          !candidate->m_server_idle;
       const bool unsupported =
-          candidate->release_resources_done() || candidate->is_system_thread() ||
-          candidate->killed != THD::NOT_KILLED ||
-          candidate->preserve_trx_batch_state !=
-              Preserve_trx_batch_thd_state::QUIESCED ||
-          !candidate->m_server_idle ||
-          !preserve_trx_has_explicit_active_transaction(candidate) ||
-          !preserved_trx_binlog_format_is_supported(
-              candidate->variables.binlog_format) ||
-          preserve_trx_is_unsupported_common_context(candidate);
+          !still_converging &&
+          (candidate->release_resources_done() ||
+           candidate->is_system_thread() ||
+           candidate->killed != THD::NOT_KILLED ||
+           candidate->preserve_trx_batch_state !=
+               Preserve_trx_batch_thd_state::QUIESCED ||
+           !preserve_trx_has_explicit_active_transaction(candidate) ||
+           !preserved_trx_binlog_format_is_supported(
+               candidate->variables.binlog_format) ||
+           preserve_trx_is_unsupported_common_context(candidate));
       if (unsupported) {
         m_has_unsupported_transaction = true;
       } else {
@@ -5997,8 +6217,11 @@ class Preserve_batch_clear_target_generation final : public Do_THD_Impl {
 class Preserve_batch_timeout_target_decision final : public Do_THD_Impl {
  public:
   Preserve_batch_timeout_target_decision(ulonglong generation,
-                                         my_thread_id target_thread_id)
-      : m_generation(generation), m_target_thread_id(target_thread_id) {}
+                                         my_thread_id target_thread_id,
+                                         bool collect_session_only)
+      : m_generation(generation),
+        m_target_thread_id(target_thread_id),
+        m_collect_session_only(collect_session_only) {}
 
   void operator()(THD *candidate) override {
     if (m_seen || candidate == nullptr) return;
@@ -6012,6 +6235,11 @@ class Preserve_batch_timeout_target_decision final : public Do_THD_Impl {
       m_temp_unsupported_boundary_seen =
           preserve_trx_temp_table_has_untracked_change(candidate) ||
           preserve_trx_temp_table_has_batch_unsupported_boundary(candidate);
+      m_session_only_eligible =
+          m_collect_session_only &&
+          m_state == Preserve_trx_batch_thd_state::DRAINED_NO_TRANSACTION &&
+          preserve_trx_session_only_candidate_is_eligible_locked(candidate,
+                                                                  true);
       m_boundary_observed_us =
           candidate->preserve_trx_quiesce_boundary_monotonic_us;
       if (m_state == Preserve_trx_batch_thd_state::PENDING_QUIESCE) {
@@ -6033,15 +6261,18 @@ class Preserve_batch_timeout_target_decision final : public Do_THD_Impl {
   bool temp_unsupported_boundary_seen() const {
     return m_temp_unsupported_boundary_seen;
   }
+  bool session_only_eligible() const { return m_session_only_eligible; }
   ulonglong boundary_observed_us() const { return m_boundary_observed_us; }
 
  private:
   ulonglong m_generation;
   my_thread_id m_target_thread_id;
+  bool m_collect_session_only{false};
   bool m_seen{false};
   bool m_timed_out{false};
   Preserve_trx_batch_thd_state m_state{Preserve_trx_batch_thd_state::NONE};
   bool m_temp_unsupported_boundary_seen{false};
+  bool m_session_only_eligible{false};
   ulonglong m_boundary_observed_us{0};
 };
 
@@ -6056,6 +6287,7 @@ enum class Preserve_trx_batch_wait_result {
 Preserve_trx_batch_wait_result preserve_trx_batch_wait_target_ready(
     THD *owner, ulonglong generation, my_thread_id target_thread_id,
     Preserve_trx_batch_thd_state *state, bool *temp_unsupported_boundary_seen,
+    bool *session_only_eligible, bool collect_session_only,
     ulonglong close_deadline_us,
     const std::shared_ptr<Preserve_trx_drain_attempt> &drain_attempt,
     const std::function<bool()> &background_progress) {
@@ -6070,7 +6302,8 @@ Preserve_trx_batch_wait_result preserve_trx_batch_wait_target_ready(
     if (background_progress && background_progress())
       return Preserve_trx_batch_wait_result::TARGET_NOT_FOUND;
 
-    Preserve_batch_target_state_reader reader(generation, target_thread_id);
+    Preserve_batch_target_state_reader reader(generation, target_thread_id,
+                                               collect_session_only);
     Global_THD_manager::get_instance()->do_for_all_thd_copy(&reader);
     if (!reader.seen())
       return Preserve_trx_batch_wait_result::TARGET_NOT_FOUND;
@@ -6082,6 +6315,9 @@ Preserve_trx_batch_wait_result preserve_trx_batch_wait_target_ready(
         *temp_unsupported_boundary_seen =
             reader.temp_unsupported_boundary_seen();
       }
+      if (session_only_eligible != nullptr) {
+        *session_only_eligible = reader.session_only_eligible();
+      }
       return Preserve_trx_batch_wait_result::READY;
     }
     my_sleep(10000);
@@ -6092,7 +6328,7 @@ Preserve_trx_batch_wait_result preserve_trx_batch_observe_targets_ready_joint(
     THD *owner, ulonglong generation,
     std::set<my_thread_id> *pending,
     std::vector<Preserve_batch_ready_target> *ready_targets,
-    ulonglong close_deadline_us,
+    bool collect_session_only, ulonglong close_deadline_us,
     const std::shared_ptr<Preserve_trx_drain_attempt> &drain_attempt) {
   if (pending == nullptr || ready_targets == nullptr) {
     return Preserve_trx_batch_wait_result::TARGET_NOT_FOUND;
@@ -6113,7 +6349,8 @@ Preserve_trx_batch_wait_result preserve_trx_batch_observe_targets_ready_joint(
   const bool closing_gate_active = preserve_trx_closing_command_gate_active(
       preserve_trx_manager_state_owner_snapshot().state);
   Preserve_batch_pending_target_observer observer(
-      generation, *pending, closing_gate_active, ready_targets);
+      generation, *pending, closing_gate_active, collect_session_only,
+      ready_targets);
   Global_THD_manager::get_instance()->do_for_all_thd_copy(&observer);
   if (observer.invalid()) {
     return Preserve_trx_batch_wait_result::TARGET_NOT_FOUND;
@@ -9913,6 +10150,10 @@ bool preserved_trx_begin_command_read(THD *thd) {
     thd->preserve_trx_command_started_monotonic_us = 0;
     thd->preserve_trx_command_packet_before_closing.store(
         false, std::memory_order_release);
+    thd->preserve_trx_post_closing_command_classified.store(
+        false, std::memory_order_release);
+    thd->preserve_trx_post_closing_cleanup_packet.store(
+        false, std::memory_order_release);
     assert(thd->preserve_trx_inflight_risky_statement_depth == 0);
     assert(thd->preserve_trx_inflight_unknown_query_depth == 0);
     if (thd->preserve_trx_batch_state ==
@@ -10005,6 +10246,17 @@ bool preserved_trx_end_idle_for_command_packet(THD *thd) {
     preserve_trx_wait_for_drain_owner(&quiesced_wait_loops);
   }
 }
+
+void preserved_trx_classify_protocol_command(
+    THD *thd, enum enum_server_command command) {
+  if (thd == nullptr || !preserve_trx_is_enabled()) return;
+
+  thd->preserve_trx_post_closing_cleanup_packet.store(
+      command == COM_QUIT, std::memory_order_relaxed);
+  thd->preserve_trx_post_closing_command_classified.store(
+      true, std::memory_order_release);
+}
+
 
 bool preserved_trx_end_command_read(THD *thd) {
   if (thd == nullptr) return false;
@@ -17490,9 +17742,13 @@ bool Preserve_trx_drain_service::execute(
   }
   const ulonglong target_wait_deadline_us = closing_command_deadline_us;
 
-  Preserve_batch_target_counter counter(thd, generation,
-                                        phase2_metrics.closing_started_us);
+  Preserve_batch_target_counter counter(
+      thd, generation, phase2_metrics.closing_started_us,
+      batch_transfer_source_session != nullptr);
   Global_THD_manager::get_instance()->do_for_all_thd_copy(&counter);
+  std::set<my_thread_id> session_only_thread_ids(
+      counter.session_only_thread_ids().begin(),
+      counter.session_only_thread_ids().end());
   if (closing_target_classification_guard.owns_lock())
     closing_target_classification_guard.unlock();
   DEBUG_SYNC(thd, "preserve_trx_warmcopy_after_targets_classified");
@@ -17680,8 +17936,10 @@ bool Preserve_trx_drain_service::execute(
     publish_phase2_metrics();
 #if defined(ENABLED_DEBUG_SYNC)
     if (active_drain_attempt != nullptr &&
-        active_drain_attempt->ownership.state() ==
-            Preserve_trx_drain_terminal::SHUTDOWN_HANDOFF) {
+        (active_drain_attempt->ownership.state() ==
+             Preserve_trx_drain_terminal::SHUTDOWN_HANDOFF ||
+         active_drain_attempt->ownership.state() ==
+             Preserve_trx_drain_terminal::COMMITTED_HANDOFF)) {
       DEBUG_SYNC(thd, "preserve_trx_drain_after_shutdown_handoff");
     }
 #endif
@@ -17821,6 +18079,224 @@ bool Preserve_trx_drain_service::execute(
     return false;
   };
 
+  auto quarantine_retained_bytes = [&]() {
+    uint64_t retained_bytes = 0;
+    for (const Preserve_trx_batch_item &item : preserved_batch_items) {
+      if (item.source_rollback_image == nullptr) continue;
+      const uint64_t item_bytes =
+          !item.source_rollback_image->binlog_snapshot.cache_payload.empty()
+              ? item.source_rollback_image->binlog_snapshot.cache_payload
+                    .size()
+              : item.source_rollback_image->has_prebuilt_binlog_blob
+                    ? item.source_rollback_image->prebuilt_binlog_blob.size
+                    : 0;
+      retained_bytes =
+          item_bytes > std::numeric_limits<uint64_t>::max() - retained_bytes
+              ? std::numeric_limits<uint64_t>::max()
+              : retained_bytes + item_bytes;
+    }
+    return retained_bytes;
+  };
+  auto enter_commit_unknown = [&](Preserve_trx_transfer_status status) {
+    if (active_drain_attempt == nullptr) {
+      LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+             "PRESERVE: standby transfer has no active attempt for "
+             "COMMIT_UNKNOWN");
+      return finish_cleanup_failure_without_shutdown(
+          "standby_transfer_commit_unknown_state_failed");
+    }
+
+    const Preserve_trx_handoff_resolution_context handoff_context =
+        batch_transfer_source_session->handoff_resolution_context();
+    const uint64_t retained_bytes = quarantine_retained_bytes();
+    const uint64_t retained_token_count = preserved_batch_items.size();
+    std::set<std::string> retained_warmcopy_ids;
+    if (batch_transfer_binlog_blob_provider != nullptr) {
+      retained_warmcopy_ids =
+          batch_transfer_binlog_blob_provider
+              ->release_phase1_blobs_for_deferred_cleanup();
+    }
+    {
+      std::lock_guard<std::mutex> lock(
+          active_drain_attempt->quarantine_mutex);
+      active_drain_attempt->quarantine_started_monotonic_us =
+          preserve_trx_monotonic_us();
+      active_drain_attempt->quarantined_items =
+          std::move(preserved_batch_items);
+      active_drain_attempt->quarantined_source_warmcopy_ids =
+          std::move(retained_warmcopy_ids);
+    }
+    const bool resolution_armed =
+        active_drain_attempt->handoff_resolution.arm(handoff_context);
+    if (!resolution_armed) {
+      LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+             "PRESERVE: standby transfer could not arm HA handoff "
+             "resolution context");
+    }
+    const bool commit_unknown_published =
+        active_drain_attempt->ownership.mark_commit_unknown();
+    if (!commit_unknown_published) {
+      LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+             "PRESERVE: standby transfer could not publish COMMIT_UNKNOWN");
+    }
+    preserve_trx_transfer_note_source_commit_unknown(
+        retained_token_count, retained_bytes);
+
+    batch_transfer_phase1_flush_context.session = nullptr;
+    batch_transfer_source_session.reset();
+    release_batch_transfer_frame_sink();
+    batch_transfer_binlog_blob_provider.reset();
+    batch_transfer_phase1_declared_tokens.clear();
+    finalize_drain_participants_for_terminal_handoff(
+        "standby_transfer_commit_unknown");
+
+    active_drain_attempt->source_restore_context_ready.store(
+        true, std::memory_order_release);
+    if (reset_requested()) {
+      (void)preserve_trx_try_restore_quarantined_reset(
+          active_drain_attempt);
+      return finish_phase2_reset(nullptr,
+                                 "reset_during_commit_unknown_publication");
+    }
+    active_drain_attempt_cleanup.commit();
+    draining->dismiss();
+    active_drain_attempt->drain_scope_released.store(
+        true, std::memory_order_release);
+    active_drain_attempt->handoff_resolution_ready.store(
+        resolution_armed && commit_unknown_published,
+        std::memory_order_release);
+    LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+           ("PRESERVE: standby transfer source entered COMMIT_UNKNOWN "
+            "status=" +
+            std::to_string(static_cast<int>(status)) + " token_count=" +
+            std::to_string(retained_token_count) +
+            " retained_bytes=" + std::to_string(retained_bytes))
+               .c_str());
+    return preserve_trx_reject_unsupported();
+  };
+
+
+  auto revalidate_session_only_thread_ids = [&]() {
+    Preserve_batch_session_only_final_snapshot final_snapshot(
+        session_only_thread_ids);
+    Global_THD_manager::get_instance()->do_for_all_thd_copy(&final_snapshot);
+    session_only_thread_ids = final_snapshot.take_eligible_thread_ids();
+    DEBUG_SYNC(thd, "preserve_trx_drain_after_session_only_final_snapshot");
+  };
+
+  auto commit_transfer_without_finalized_tokens = [&]() {
+    if (batch_transfer_source_session == nullptr) {
+      return preserve_trx_reject_unsupported();
+    }
+    if (batch_transfer_phase1_sender != nullptr) {
+      if (batch_transfer_phase1_sender->flush() !=
+          Preserve_trx_transfer_status::OK) {
+        abort_batch_transfer_epoch("control_only_phase1_flush_failed");
+        const bool cleanup_error = restore_current_items_to_original_thds();
+        abort_drain_participants("control_only_phase1_flush_failed");
+        return cleanup_error
+                   ? finish_cleanup_failure_without_shutdown(
+                         "control_only_phase1_flush_cleanup_failed")
+                   : preserve_trx_reject_unsupported();
+      }
+      batch_transfer_phase1_sender.reset();
+    }
+    retain_source_failed_items_in_source_context();
+    preserved_token_count = preserved_batch_items.size();
+    DEBUG_SYNC(thd,
+               "preserve_trx_drain_before_control_only_transfer_commit");
+    revalidate_session_only_thread_ids();
+    const std::vector<uint64_t> session_only_tokens(
+        session_only_thread_ids.begin(), session_only_thread_ids.end());
+    const ulonglong commit_epoch_started_us = preserve_trx_monotonic_us();
+    const Preserve_trx_transfer_status commit_status =
+        batch_transfer_source_session->commit_epoch(session_only_tokens);
+    phase2_metrics.transfer_commit_epoch_us +=
+        elapsed_since(commit_epoch_started_us);
+    if (commit_status == Preserve_trx_transfer_status::ACK_UNCERTAIN &&
+        active_drain_attempt != nullptr &&
+        active_drain_attempt->ownership.state() ==
+            Preserve_trx_drain_terminal::RUNNING) {
+      return enter_commit_unknown(commit_status);
+    }
+    const bool receiver_committed =
+        commit_status == Preserve_trx_transfer_status::COMMITTED_READY ||
+        commit_status == Preserve_trx_transfer_status::COMMITTED_NOT_READY;
+    const bool receiver_commit_succeeded =
+        commit_status == Preserve_trx_transfer_status::OK ||
+        receiver_committed;
+    if (!receiver_commit_succeeded) {
+      if (reset_requested()) {
+        return finish_phase2_reset(
+            &preserved_batch_items, "reset_during_control_only_commit");
+      }
+      if (commit_status ==
+          Preserve_trx_transfer_status::NOT_COMMITTED_CLEAN) {
+        if (active_drain_attempt == nullptr ||
+            !active_drain_attempt->ownership.resolve_not_committed_clean()) {
+          return enter_commit_unknown(commit_status);
+        }
+        preserve_trx_transfer_note_source_handoff_committed();
+        const bool cleanup_error = restore_current_items_to_original_thds();
+        if (cleanup_error) {
+          return finish_cleanup_failure_without_shutdown(
+              "control_only_not_committed_clean_restore_failed");
+        }
+        if (!active_drain_attempt->ownership.complete_source_restore()) {
+          return finish_cleanup_failure_without_shutdown(
+              "control_only_not_committed_clean_state_failed");
+        }
+        preserve_trx_publish_active_drain_reset_barrier(active_drain_attempt);
+        abort_drain_participants("control_only_receiver_not_committed_clean");
+        return preserve_trx_reject_unsupported();
+      }
+      if (active_drain_attempt != nullptr &&
+          (active_drain_attempt->ownership.state() ==
+               Preserve_trx_drain_terminal::HANDOFF_PENDING ||
+           active_drain_attempt->ownership.state() ==
+               Preserve_trx_drain_terminal::COMMIT_UNKNOWN)) {
+        return enter_commit_unknown(commit_status);
+      }
+      if (!receiver_committed) {
+        abort_batch_transfer_epoch("control_only_commit_failed");
+      }
+      const bool cleanup_error = restore_current_items_to_original_thds();
+      abort_drain_participants("control_only_commit_failed");
+      return cleanup_error
+                 ? finish_cleanup_failure_without_shutdown(
+                       "control_only_commit_cleanup_failed")
+                 : preserve_trx_reject_unsupported();
+    }
+
+    transfer_final_ack_accepted =
+        active_drain_attempt != nullptr &&
+        active_drain_attempt->ownership.state() ==
+            Preserve_trx_drain_terminal::COMMITTED_HANDOFF;
+    if (!transfer_final_ack_accepted) {
+      LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+             "PRESERVE: receiver accepted control-only transfer without "
+             "terminal source ownership; source shutdown will continue");
+    }
+    const ulonglong final_ack_us = preserve_trx_monotonic_us();
+    phase2_metrics.phase2_transfer_tail_us =
+        phase2_transfer_tail_started_us != 0 &&
+                final_ack_us >= phase2_transfer_tail_started_us
+            ? final_ack_us - phase2_transfer_tail_started_us
+            : 0;
+    phase2_metrics.closing_to_final_ack_us =
+        phase2_metrics.closing_started_us != 0 &&
+                final_ack_us >= phase2_metrics.closing_started_us
+            ? final_ack_us - phase2_metrics.closing_started_us
+            : 0;
+    batch_transfer_phase1_flush_context.session = nullptr;
+    batch_transfer_source_session.reset();
+    release_batch_transfer_frame_sink();
+    retain_reset_source_warmcopy_ids();
+    batch_transfer_binlog_blob_provider.reset();
+    batch_transfer_phase1_declared_tokens.clear();
+    return finish_with_shutdown();
+  };
+
   auto select_batch_tokens =
       [&](const std::vector<my_thread_id> &target_thread_ids) {
         if (batch_tokens_selected) return false;
@@ -17893,7 +18369,8 @@ bool Preserve_trx_drain_service::execute(
     return preserve_trx_reject_unsupported();
   }
 
-  if (counter.target_count() == 0) {
+  if (counter.target_count() == 0 &&
+      batch_transfer_source_session == nullptr) {
     if (close_warmcopy_participants_for_shutdown("no_targets_close_failed")) {
       if (reset_requested())
         return finish_reset_from_current_items(
@@ -18310,7 +18787,8 @@ bool Preserve_trx_drain_service::execute(
     while (!pending.empty() &&
            !worker_abort.load(std::memory_order_acquire)) {
       early_wait_result = preserve_trx_batch_observe_targets_ready_joint(
-          thd, generation, &pending, &ready_targets, target_wait_deadline_us,
+          thd, generation, &pending, &ready_targets,
+          batch_transfer_source_session != nullptr, target_wait_deadline_us,
           active_drain_attempt);
       if (early_wait_result == Preserve_trx_batch_wait_result::DEADLINE &&
           timeout_exclusion_enabled) {
@@ -18332,8 +18810,9 @@ bool Preserve_trx_drain_service::execute(
             reset_during_exclusion = true;
             break;
           }
-          Preserve_batch_timeout_target_decision decision(generation,
-                                                          target_thread_id);
+          Preserve_batch_timeout_target_decision decision(
+              generation, target_thread_id,
+              batch_transfer_source_session != nullptr);
           Global_THD_manager::get_instance()->do_for_all_thd_copy(&decision);
           if (!decision.seen()) {
             exclusion_failed = true;
@@ -18344,6 +18823,7 @@ bool Preserve_trx_drain_service::execute(
             ready_targets.push_back(
                 {target_thread_id, decision.state(),
                  decision.temp_unsupported_boundary_seen(),
+                 decision.session_only_eligible(),
                  decision.boundary_observed_us()});
             pending.erase(target_thread_id);
             continue;
@@ -18421,6 +18901,10 @@ bool Preserve_trx_drain_service::execute(
           const auto execution_it =
               execution_by_thread_id.find(ready.thread_id);
           if (ready.temp_unsupported ||
+              (ready.state ==
+                   Preserve_trx_batch_thd_state::DRAINED_NO_TRANSACTION &&
+               batch_transfer_source_session != nullptr &&
+               !ready.session_only_eligible) ||
               (ready.state !=
                    Preserve_trx_batch_thd_state::DRAINED_NO_TRANSACTION &&
                ready.state != Preserve_trx_batch_thd_state::QUIESCED)) {
@@ -18429,6 +18913,9 @@ bool Preserve_trx_drain_service::execute(
           }
           if (ready.state ==
               Preserve_trx_batch_thd_state::DRAINED_NO_TRANSACTION) {
+            if (batch_transfer_source_session != nullptr) {
+              session_only_thread_ids.insert(ready.thread_id);
+            }
             if (ready.boundary_observed_us == 0) {
               command_boundary_sample_missing = true;
             } else {
@@ -18777,17 +19264,21 @@ bool Preserve_trx_drain_service::execute(
       Preserve_trx_batch_thd_state target_state{
           Preserve_trx_batch_thd_state::NONE};
       bool temp_unsupported_boundary_seen = false;
+      bool session_only_eligible = false;
       Preserve_trx_batch_wait_result target_wait_result =
           preserve_trx_batch_wait_target_ready(
               thd, generation, target_thread_id, &target_state,
-              &temp_unsupported_boundary_seen, target_wait_deadline_us,
-              active_drain_attempt, active_binlog_progress);
+              &temp_unsupported_boundary_seen, &session_only_eligible,
+              batch_transfer_source_session != nullptr,
+              target_wait_deadline_us, active_drain_attempt,
+              active_binlog_progress);
       if (reset_requested())
         return finish_reset_from_current_items("reset_during_target_wait");
       if (target_wait_result == Preserve_trx_batch_wait_result::DEADLINE &&
           timeout_exclusion_enabled) {
-        Preserve_batch_timeout_target_decision decision(generation,
-                                                        target_thread_id);
+        Preserve_batch_timeout_target_decision decision(
+            generation, target_thread_id,
+            batch_transfer_source_session != nullptr);
         Global_THD_manager::get_instance()->do_for_all_thd_copy(&decision);
         if (!decision.seen()) {
           target_wait_result =
@@ -18828,6 +19319,7 @@ bool Preserve_trx_drain_service::execute(
           target_state = decision.state();
           temp_unsupported_boundary_seen =
               decision.temp_unsupported_boundary_seen();
+          session_only_eligible = decision.session_only_eligible();
         }
       }
       if (target_wait_result != Preserve_trx_batch_wait_result::READY ||
@@ -18847,7 +19339,11 @@ bool Preserve_trx_drain_service::execute(
                                 : preserve_trx_reject_unsupported();
       }
 
-      if (temp_unsupported_boundary_seen) {
+      if (temp_unsupported_boundary_seen ||
+          (target_state ==
+               Preserve_trx_batch_thd_state::DRAINED_NO_TRANSACTION &&
+           batch_transfer_source_session != nullptr &&
+           !session_only_eligible)) {
         if (reset_requested())
           return finish_reset_from_current_items(
               "reset_during_temp_boundary_validation");
@@ -18860,6 +19356,9 @@ bool Preserve_trx_drain_service::execute(
 
       if (target_state ==
           Preserve_trx_batch_thd_state::DRAINED_NO_TRANSACTION) {
+        if (batch_transfer_source_session != nullptr) {
+          session_only_thread_ids.insert(target_thread_id);
+        }
         Preserve_batch_clear_target_generation clear_target(generation,
                                                             target_thread_id);
         Global_THD_manager::get_instance()->do_for_all_thd_copy(&clear_target);
@@ -18891,6 +19390,21 @@ bool Preserve_trx_drain_service::execute(
         return finish_reset_from_current_items(
             "reset_during_no_quiesced_phase1_close");
       return preserve_trx_reject_unsupported();
+    }
+    if (batch_transfer_source_session != nullptr) {
+      if (abort_phase1_transfer_targets_not_quiesced(
+              quiesced_target_thread_ids)) {
+        return preserve_trx_reject_unsupported();
+      }
+      /*
+        A control-only COMMIT moves ownership only when the epoch carries the
+        session-only set or closes a clean empty epoch.  Timeout exclusions
+        make the epoch dirty: keep ownership local so RESET can still win.
+      */
+      if (!session_only_thread_ids.empty() ||
+          excluded_timeout_thread_ids.empty()) {
+        return commit_transfer_without_finalized_tokens();
+      }
     }
     abort_batch_transfer_epoch("no_quiesced_targets");
     return finish_with_shutdown();
@@ -19650,9 +20164,18 @@ bool Preserve_trx_drain_service::execute(
               "reset_during_source_all_token_local_failed_close");
         return preserve_trx_reject_unsupported();
       }
-      abort_batch_transfer_epoch("source_all_token_local_failed");
-      retain_source_failed_items_in_source_context();
-      return finish_with_shutdown();
+      /*
+        Ownership moves with a control-only COMMIT only when the session-only
+        set is non-empty or the epoch is clean.  A dirty epoch (timeout
+        exclusions) with an empty set keeps ownership local so RESET wins.
+      */
+      if (session_only_thread_ids.empty() &&
+          !excluded_timeout_thread_ids.empty()) {
+        retain_source_failed_items_in_source_context();
+        abort_batch_transfer_epoch("source_all_token_local_failed_dirty_epoch");
+        return finish_with_shutdown();
+      }
+      return commit_transfer_without_finalized_tokens();
     }
   }
 
@@ -20044,110 +20567,18 @@ bool Preserve_trx_drain_service::execute(
       return preserve_trx_reject_unsupported();
     }
   }
+  DEBUG_SYNC(thd, "preserve_trx_drain_before_transfer_commit_reset_check");
   if (reset_requested())
     return finish_phase2_reset(&preserved_batch_items,
                                         "reset_before_transfer_commit");
   retain_source_failed_items_in_source_context();
   if (batch_transfer_source_session != nullptr) {
-    auto quarantine_retained_bytes = [&]() {
-      uint64_t retained_bytes = 0;
-      for (const Preserve_trx_batch_item &item : preserved_batch_items) {
-        if (item.source_rollback_image == nullptr) continue;
-        const uint64_t item_bytes =
-            !item.source_rollback_image->binlog_snapshot.cache_payload.empty()
-                ? item.source_rollback_image->binlog_snapshot.cache_payload
-                      .size()
-                : item.source_rollback_image->has_prebuilt_binlog_blob
-                      ? item.source_rollback_image->prebuilt_binlog_blob.size
-                      : 0;
-        retained_bytes =
-            item_bytes > std::numeric_limits<uint64_t>::max() - retained_bytes
-                ? std::numeric_limits<uint64_t>::max()
-                : retained_bytes + item_bytes;
-      }
-      return retained_bytes;
-    };
-    auto enter_commit_unknown = [&](Preserve_trx_transfer_status status) {
-      if (active_drain_attempt == nullptr) {
-        LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
-               "PRESERVE: standby transfer has no active attempt for "
-               "COMMIT_UNKNOWN");
-        return finish_cleanup_failure_without_shutdown(
-            "standby_transfer_commit_unknown_state_failed");
-      }
-
-      const Preserve_trx_handoff_resolution_context handoff_context =
-          batch_transfer_source_session->handoff_resolution_context();
-      const uint64_t retained_bytes = quarantine_retained_bytes();
-      const uint64_t retained_token_count = preserved_batch_items.size();
-      std::set<std::string> retained_warmcopy_ids;
-      if (batch_transfer_binlog_blob_provider != nullptr) {
-        retained_warmcopy_ids =
-            batch_transfer_binlog_blob_provider
-                ->release_phase1_blobs_for_deferred_cleanup();
-      }
-      {
-        std::lock_guard<std::mutex> lock(
-            active_drain_attempt->quarantine_mutex);
-        active_drain_attempt->quarantine_started_monotonic_us =
-            preserve_trx_monotonic_us();
-        active_drain_attempt->quarantined_items =
-            std::move(preserved_batch_items);
-        active_drain_attempt->quarantined_source_warmcopy_ids =
-            std::move(retained_warmcopy_ids);
-      }
-      const bool resolution_armed =
-          active_drain_attempt->handoff_resolution.arm(handoff_context);
-      if (!resolution_armed) {
-        LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
-               "PRESERVE: standby transfer could not arm HA handoff "
-               "resolution context");
-      }
-      const bool commit_unknown_published =
-          active_drain_attempt->ownership.mark_commit_unknown();
-      if (!commit_unknown_published) {
-        LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
-               "PRESERVE: standby transfer could not publish COMMIT_UNKNOWN");
-      }
-      preserve_trx_transfer_note_source_commit_unknown(
-          retained_token_count, retained_bytes);
-
-      batch_transfer_phase1_flush_context.session = nullptr;
-      batch_transfer_source_session.reset();
-      release_batch_transfer_frame_sink();
-      batch_transfer_binlog_blob_provider.reset();
-      batch_transfer_phase1_declared_tokens.clear();
-      finalize_drain_participants_for_terminal_handoff(
-          "standby_transfer_commit_unknown");
-
-      active_drain_attempt->source_restore_context_ready.store(
-          true, std::memory_order_release);
-      if (reset_requested()) {
-        (void)preserve_trx_try_restore_quarantined_reset(
-            active_drain_attempt);
-        return finish_phase2_reset(nullptr,
-                                   "reset_during_commit_unknown_publication");
-      }
-      active_drain_attempt_cleanup.commit();
-      draining->dismiss();
-      active_drain_attempt->drain_scope_released.store(
-          true, std::memory_order_release);
-      active_drain_attempt->handoff_resolution_ready.store(
-          resolution_armed && commit_unknown_published,
-          std::memory_order_release);
-      LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
-             ("PRESERVE: standby transfer source entered COMMIT_UNKNOWN "
-              "status=" +
-              std::to_string(static_cast<int>(status)) + " token_count=" +
-              std::to_string(retained_token_count) +
-              " retained_bytes=" + std::to_string(retained_bytes))
-                 .c_str());
-      return preserve_trx_reject_unsupported();
-    };
-
+    revalidate_session_only_thread_ids();
+    const std::vector<uint64_t> session_only_tokens(
+        session_only_thread_ids.begin(), session_only_thread_ids.end());
     const ulonglong commit_epoch_started_us = preserve_trx_monotonic_us();
     const Preserve_trx_transfer_status commit_status =
-        batch_transfer_source_session->commit_epoch();
+        batch_transfer_source_session->commit_epoch(session_only_tokens);
     phase2_metrics.transfer_commit_epoch_us +=
         elapsed_since(commit_epoch_started_us);
     const bool receiver_committed =
@@ -20210,7 +20641,7 @@ bool Preserve_trx_drain_service::execute(
     transfer_final_ack_accepted =
         active_drain_attempt != nullptr &&
         active_drain_attempt->ownership.state() ==
-            Preserve_trx_drain_terminal::SHUTDOWN_HANDOFF;
+            Preserve_trx_drain_terminal::COMMITTED_HANDOFF;
     if (!transfer_final_ack_accepted) {
       LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
              "PRESERVE: receiver accepted transfer without terminal source "
@@ -20935,7 +21366,8 @@ static dberr_t activate_resumed_trx_shared(Preserved_trx_record *record) {
 static Preserved_trx_promotion_resume_status
 preserved_trx_resume_adopted_for_promotion_on_current_thd(
     THD *target, const Preserve_trx_prepared_token_key &key,
-    uint64_t requested_deadline_us);
+    uint64_t requested_deadline_us,
+    const Preserve_trx_transfer_resume_handoff &handoff);
 
 static bool preserved_trx_resume_record_on_current_thd(
     THD *thd, const LEX_CSTRING &resume_token) {
@@ -20982,12 +21414,54 @@ static bool preserved_trx_resume_record_on_current_thd(
   const bool has_resume_any_privilege =
       preserve_trx_has_resume_any_privilege(thd);
   preserved_trx_wait_recovery_complete();
+  const Preserve_trx_transfer_resume_handoff handoff =
+      preserve_trx_transfer_resume_handoff_for_token(token);
+  auto reject_unavailable_record = [&]() {
+    if (handoff.available) {
+      log_redacted_resume_failure(token, "handoff entry is unavailable");
+      my_error(ER_PRESERVE_TRX_HANDOFF_UNAVAILABLE, MYF(0));
+    } else {
+      my_error(ER_PRESERVE_TRX_NOT_FOUND, MYF(0));
+    }
+    return true;
+  };
   Preserved_trx_record record;
-  if (!preserved_trx_find_record(token, &record)) {
+  const bool record_found = preserved_trx_find_record(token, &record);
+  if (handoff.available && handoff.session_only) {
+    /*
+      Membership is a one-shot authorization to omit transaction attachment.
+      The HA proxy must already have restored the authenticated session state.
+    */
     if (!has_resume_any_privilege) {
       my_error(ER_PRESERVE_TRX_ACCESS_DENIED, MYF(0));
       return true;
     }
+    if (!preserve_trx_session_only_resume_target_is_pristine(thd)) {
+      my_error(ER_PRESERVE_TRX_INVALID_STATE, MYF(0));
+      return true;
+    }
+    const Preserve_trx_session_only_consume_status consume_status =
+        preserved_trx_consume_session_only_handoff(token, handoff);
+    if (consume_status ==
+        Preserve_trx_session_only_consume_status::RECORD_CONFLICT) {
+      log_redacted_resume_failure(
+          token, "session-only token conflicts with preserved transaction");
+      my_error(ER_PRESERVE_TRX_INVALID_STATE, MYF(0));
+      return true;
+    }
+    if (consume_status != Preserve_trx_session_only_consume_status::CONSUMED) {
+      return reject_unavailable_record();
+    }
+    audit_preserved_trx_event(thd, token, "resume", "session-only");
+    my_ok(thd);
+    return false;
+  }
+  if (!record_found) {
+    if (!has_resume_any_privilege) {
+      my_error(ER_PRESERVE_TRX_ACCESS_DENIED, MYF(0));
+      return true;
+    }
+    if (handoff.available) return reject_unavailable_record();
 
     auto store = create_preserved_trx_default_store(preserve_trx_default_dir());
     Preserved_trx_bundle bundle;
@@ -21010,6 +21484,16 @@ static bool preserved_trx_resume_record_on_current_thd(
       my_error(ER_PRESERVE_TRX_UNSUPPORTED, MYF(0));
     }
     return true;
+  }
+  if (handoff.available &&
+      (record.state !=
+           Preserved_trx_lifecycle_state::ADOPTED_FOR_PROMOTION ||
+       record.resumable || !record.has_promotion_key ||
+       record.promotion_key.token != token ||
+       record.promotion_key.epoch_id != handoff.epoch_id)) {
+    log_redacted_resume_failure(
+        token, "preserved transaction does not belong to active handoff");
+    return reject_unavailable_record();
   }
   Security_context *sctx = thd->security_context();
   const bool owns_token =
@@ -21044,7 +21528,8 @@ static bool preserved_trx_resume_record_on_current_thd(
     }
     const auto status =
         preserved_trx_resume_adopted_for_promotion_on_current_thd(
-            thd, record.promotion_key, std::numeric_limits<uint64_t>::max());
+            thd, record.promotion_key, std::numeric_limits<uint64_t>::max(),
+            handoff);
     if (status == Preserved_trx_promotion_resume_status::OK) {
       my_ok(thd);
       return false;
@@ -21052,16 +21537,14 @@ static bool preserved_trx_resume_record_on_current_thd(
     if (status ==
             Preserved_trx_promotion_resume_status::PROMOTION_RECORD_NOT_FOUND ||
         status == Preserved_trx_promotion_resume_status::REGISTRY_NOT_ADOPTED) {
-      my_error(ER_PRESERVE_TRX_NOT_FOUND, MYF(0));
-      return true;
+      return reject_unavailable_record();
     }
     return preserve_trx_reject_unsupported();
   }
 
   if (preserved_trx_record_resume_deadline_expired(record)) {
     if (!preserved_trx_take_record(token, &record)) {
-      my_error(ER_PRESERVE_TRX_NOT_FOUND, MYF(0));
-      return true;
+      return reject_unavailable_record();
     }
     preserve_trx_set_record_error(&record, "recovery timeout expired");
     (void)rollback_resumable_record_after_resume_timeout(record);
@@ -21177,8 +21660,7 @@ static bool preserved_trx_resume_record_on_current_thd(
                     &durable_bundle);
     if (durable_status == Preserve_snapshot_status::CORRUPT) {
       if (!preserved_trx_take_resumable_record(token, &record)) {
-        my_error(ER_PRESERVE_TRX_NOT_FOUND, MYF(0));
-        return true;
+        return reject_unavailable_record();
       }
       (void)rollback_resumable_record_after_corrupt_snapshot(record);
       my_error(ER_PRESERVE_TRX_CORRUPT_SNAPSHOT, MYF(0));
@@ -21192,8 +21674,7 @@ static bool preserved_trx_resume_record_on_current_thd(
   }
 
   if (!preserved_trx_take_resumable_record(token, &record)) {
-    my_error(ER_PRESERVE_TRX_NOT_FOUND, MYF(0));
-    return true;
+    return reject_unavailable_record();
   }
   if (preserved_trx_record_resume_deadline_expired(record)) {
     preserve_trx_set_record_error(&record, "recovery timeout expired");
@@ -21500,7 +21981,8 @@ static Preserved_trx_promotion_resume_status
 preserved_trx_resume_adopted_for_promotion_on_current_thd(
     THD *target,
     const Preserve_trx_prepared_token_key &key,
-    uint64_t requested_deadline_us) {
+    uint64_t requested_deadline_us,
+    const Preserve_trx_transfer_resume_handoff &handoff) {
   const uint64_t started_us = preserve_trx_monotonic_us();
   auto finish = [&](Preserved_trx_promotion_resume_status status) {
     const uint64_t elapsed_us = preserve_trx_monotonic_us() - started_us;
@@ -21566,6 +22048,19 @@ preserved_trx_resume_adopted_for_promotion_on_current_thd(
   if (metadata_has_binlog_cache != snapshot.facts.binlog_cache_present) {
     return finish(Preserved_trx_promotion_resume_status::STAGING_FAILED);
   }
+
+  bool handoff_claimed = false;
+  if (handoff.available) {
+    if (!preserve_trx_transfer_claim_transaction_handoff(handoff)) {
+      return finish(Preserved_trx_promotion_resume_status::REGISTRY_NOT_ADOPTED);
+    }
+    handoff_claimed = true;
+  }
+  const auto handoff_claim_guard = create_scope_guard([&] {
+    if (handoff_claimed) {
+      preserve_trx_transfer_release_transaction_handoff(handoff);
+    }
+  });
 
   Preserve_strict_attach_intent_write_context intent_context;
   intent_context.state = Preserve_trx_strict_attach_intent_state::ATTACHING;

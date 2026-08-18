@@ -117,7 +117,7 @@ my $flush_pos = index($src, 'batch_transfer_phase1_sender->flush()', $join_pos);
 my $preseal_pos = index($src, 'object_presealed_for_token', $flush_pos);
 my $publish_pos = index($src,
   'publish_acked_transfer_binlog_cache_progress', $preseal_pos);
-my $commit_pos = index($src, 'batch_transfer_source_session->commit_epoch()',
+my $commit_pos = index($src, 'batch_transfer_source_session->commit_epoch(',
                        $flush_pos);
 die "terminal final-HWM barrier must flush, verify exact preseal, then commit\n"
   if $flush_pos < 0 || $preseal_pos < $flush_pos ||

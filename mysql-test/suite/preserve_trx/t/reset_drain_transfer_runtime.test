@@ -313,23 +313,32 @@ UPDATE t_reset_drain_transfer_runtime SET v=v WHERE id=1;
 
 --disable_result_log
 --connect(reset_runtime_handoff_reset,localhost,preserve_trx_ha_admin,reset-drain-mtr-secret,test)
+--error ER_PRESERVE_TRX_RESET_TOO_LATE
 RESET DRAIN;
+--error ER_PRESERVE_TRX_RESET_TOO_LATE
 RESET DRAIN;
 --enable_result_log
 
 --connection reset_runtime_handoff_app
+--disable_result_log
+--error ER_PRESERVE_TRX_SESSION_DRAINED
 UPDATE t_reset_drain_transfer_runtime SET v=v+10 WHERE id=1;
-COMMIT;
+--enable_result_log
 
 --disable_result_log
 --connection reset_runtime_handoff_reset
+--error ER_PRESERVE_TRX_RESET_TOO_LATE
 RESET DRAIN;
 --enable_result_log
 
---enable_query_log
 --connection reset_runtime_handoff_app
-SELECT CONNECTION_ID()=@original_connection_id AS handoff_same_connection;
+--disable_result_log
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT CONNECTION_ID()=@original_connection_id;
+--enable_result_log
 --connection reset_runtime_ha
+--enable_query_log
+SELECT 1 AS handoff_source_remains_fenced;
 SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
         WHERE VARIABLE_NAME='Preserve_trx_reset_drain_wins')
        - @reset_wins_before_handoff AS handoff_reset_winner_delta;
@@ -342,12 +351,14 @@ SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 --disconnect reset_runtime_handoff_owner
 --disconnect reset_runtime_handoff_reset
 
---connection default
---let $restart_parameters= restart: --rds-preserve-trx-enable=ON
---disable_result_log
---source include/restart_mysqld.inc
---enable_result_log
---let $restart_parameters=
+--connection reset_runtime_ha
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+SHUTDOWN;
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+--exec echo "restart: --rds-preserve-trx-enable=ON --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
 --disable_query_log
 
 --connect(reset_runtime_local_ha,localhost,preserve_trx_ha_admin,reset-drain-mtr-secret,test)
@@ -378,11 +389,12 @@ SELECT 1 AS local_carrier_server_alive;
 --disconnect reset_runtime_local_owner
 --disconnect reset_runtime_local_ha
 
---connection default
+--connect(reset_runtime_cleanup,localhost,root,,test)
 DROP TABLE t_reset_drain_transfer_runtime;
 DROP USER preserve_trx_ha_admin@localhost;
 DROP USER reset_drain_app@localhost;
 SET DEBUG_SYNC='RESET';
 --remove_file $credential_file
+--disconnect reset_runtime_cleanup
 
 --enable_query_log

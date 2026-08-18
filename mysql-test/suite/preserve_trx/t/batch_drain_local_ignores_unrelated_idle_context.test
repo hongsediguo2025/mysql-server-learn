@@ -1,0 +1,45 @@
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_batch_local_idle_context;
+--enable_warnings
+SET GLOBAL rds_preserve_trx_enable=ON;
+
+CREATE TABLE t_batch_local_idle_context(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_batch_local_idle_context VALUES(1,10);
+
+--connect(batch_local_idle_txn,localhost,root,,test)
+START TRANSACTION;
+UPDATE t_batch_local_idle_context SET v=11 WHERE id=1;
+
+# This idle connection owns unsupported session state, but LOCAL_CARRIER does
+# not publish a session-only set and must preserve the unrelated transaction.
+--connect(batch_local_idle_lock,localhost,root,,test)
+SELECT GET_LOCK('batch_local_idle_context_lock', 0);
+
+--connection default
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+DRAIN TRANSACTIONS PRESERVE;
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+
+--exec echo "restart: --rds-preserve-trx-enable=ON --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+--let $token= query_get_value(SELECT TOKEN FROM performance_schema.preserved_transactions, TOKEN, 1)
+--replace_result $token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$token'
+ROLLBACK;
+SELECT COUNT(*) AS preserved_count_after_resume
+  FROM performance_schema.preserved_transactions;
+SELECT v FROM t_batch_local_idle_context;
+
+DROP TABLE t_batch_local_idle_context;
+SET GLOBAL rds_preserve_trx_enable=ON;
