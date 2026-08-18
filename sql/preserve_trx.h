@@ -308,6 +308,14 @@ class Preserve_trx_drain_ownership_state {
   bool acknowledge_commit();
   bool shutdown_without_commit();
   bool restore_allowed() const;
+  /*
+    Atomically claim the local restore of a commit that was never sent
+    (RUNNING / FINAL_METADATA_ACCEPTED_LOCAL -> SOURCE_RESTORE_PENDING).
+    Returns false when a RESET already won the claim or the ownership moved
+    past the commit-send boundary; callers must join the winning flow instead
+    of restoring on their own.
+  */
+  bool claim_local_restore();
 
  private:
   std::atomic<Preserve_trx_drain_terminal> m_state{

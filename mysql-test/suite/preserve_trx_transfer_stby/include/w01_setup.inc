@@ -6,7 +6,47 @@ xfer2-smoke-w01-secret
 EOF
 --exec chmod 600 $credential_file
 
---connect(xfer2_receiver,127.0.0.1,root,,test,$SERVER_MYPORT_2,)
+#
+# Every test in this suite owns its .cnf and the previous test ends with
+# force_restart, so the receiver instance (mysqld.2) is restarted right
+# before this file runs.  Under parallel MTR the new listener can still be
+# settling when the first connect is attempted (observed as an immediate
+# connect failure with the server never seeing the client), which used to
+# abort whichever test lost that race.  Probe the receiver port with a
+# separate client until it answers (up to ~120s); $mysqltest_errno is NOT
+# reliable after a failed --connect, so success is detected from the probe
+# output instead of the connect error code.
+#
+--let $xfer2_receiver_connect_attempts= 0
+--let $xfer2_receiver_connected= 0
+while ($xfer2_receiver_connect_attempts < 120)
+{
+  inc $xfer2_receiver_connect_attempts;
+  --error 0,2003
+  --connect(xfer2_receiver,127.0.0.1,root,,test,$SERVER_MYPORT_2,)
+  #
+  # mysqltest does not set $mysqltest_errno for connect failures: a failed
+  # --connect (tolerated above) silently keeps the current connection on
+  # the source, so success must be verified by the receiver-only server_id
+  # instead of an error code.
+  #
+  --let $xfer2_receiver_server_id= query_get_value(SELECT @@server_id AS v,v,1)
+  if ($xfer2_receiver_server_id == 2)
+  {
+    --let $xfer2_receiver_connected= 1
+    # Sentinel exit: must equal the while bound above (mysqltest has no
+    # logical-&& in loop conditions and no break command).
+    --let $xfer2_receiver_connect_attempts= 120
+  }
+  if (!$xfer2_receiver_connected)
+  {
+    --sleep 1
+  }
+}
+if (!$xfer2_receiver_connected)
+{
+  --die Could not establish the receiver connection (mysqld.2) within 120s
+}
 --disable_warnings
 DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
 --enable_warnings

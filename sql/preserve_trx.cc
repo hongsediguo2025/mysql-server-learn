@@ -328,6 +328,23 @@ bool Preserve_trx_drain_ownership_state::begin_source_restore() {
          expected == Preserve_trx_drain_terminal::SOURCE_RESTORE_PENDING;
 }
 
+bool Preserve_trx_drain_ownership_state::claim_local_restore() {
+  Preserve_trx_drain_terminal expected =
+      Preserve_trx_drain_terminal::RUNNING;
+  if (m_state.compare_exchange_strong(
+          expected, Preserve_trx_drain_terminal::SOURCE_RESTORE_PENDING)) {
+    return true;
+  }
+  if (expected ==
+      Preserve_trx_drain_terminal::FINAL_METADATA_ACCEPTED_LOCAL) {
+    return m_state.compare_exchange_strong(
+               expected,
+               Preserve_trx_drain_terminal::SOURCE_RESTORE_PENDING) ||
+           expected == Preserve_trx_drain_terminal::SOURCE_RESTORE_PENDING;
+  }
+  return expected == Preserve_trx_drain_terminal::SOURCE_RESTORE_PENDING;
+}
+
 bool Preserve_trx_drain_ownership_state::complete_source_restore() {
   Preserve_trx_drain_terminal expected =
       Preserve_trx_drain_terminal::SOURCE_RESTORE_PENDING;
@@ -20438,14 +20455,145 @@ bool Preserve_trx_drain_service::execute(
                Preserve_trx_drain_terminal::HANDOFF_PENDING ||
            active_drain_attempt->ownership.state() ==
                Preserve_trx_drain_terminal::COMMIT_UNKNOWN)) {
+        /*
+          The COMMIT frame was sent, so the receiver may hold a committed or
+          corrupt terminal opinion the transport cannot certify.  Retry the
+          commit-anchored ABANDON under the same bounded budget: a proven
+          NOT_COMMITTED_CLEAN restores locally; anything still undecided
+          (including a receiver CORRUPT tombstone, which is not process-bound)
+          fails closed as COMMIT_UNKNOWN for HA arbitration.
+        */
+        constexpr uint64_t kSentAbandonRetryBudgetUs =
+            static_cast<uint64_t>(kPreserveTrxTransferOperationTimeoutMs) *
+            1000ULL;
+        constexpr uint32_t kSentAbandonRetryIntervalMs = 200;
+        const uint64_t sent_abandon_deadline_us =
+            preserve_trx_monotonic_us() + kSentAbandonRetryBudgetUs;
+        for (;;) {
+          if (reset_requested()) {
+            return finish_phase2_reset(
+                &preserved_batch_items,
+                "reset_during_sent_commit_abandon_retry");
+          }
+          const Preserve_trx_transfer_status sent_abandon_status =
+              batch_transfer_source_session == nullptr
+                  ? Preserve_trx_transfer_status::UNSUPPORTED
+                  : batch_transfer_source_session->cleanup_cancelled_epoch(
+                        "standby_transfer_commit_failed");
+          if (sent_abandon_status ==
+              Preserve_trx_transfer_status::NOT_COMMITTED_CLEAN) {
+            if (active_drain_attempt->ownership
+                    .resolve_not_committed_clean()) {
+              preserve_trx_transfer_note_source_handoff_committed();
+              const bool cleanup_error =
+                  restore_current_items_to_original_thds();
+              if (cleanup_error) {
+                return finish_cleanup_failure_without_shutdown(
+                    "standby_transfer_abandon_not_committed_restore_failed");
+              }
+              if (!active_drain_attempt->ownership
+                       .complete_source_restore()) {
+                return finish_cleanup_failure_without_shutdown(
+                    "standby_transfer_abandon_not_committed_state_failed");
+              }
+              preserve_trx_publish_active_drain_reset_barrier(
+                  active_drain_attempt);
+              abort_drain_participants(
+                  "standby_transfer_abandon_not_committed_clean");
+              return preserve_trx_reject_unsupported();
+            }
+            break;
+          }
+          if (sent_abandon_status ==
+                  Preserve_trx_transfer_status::COMMITTED_READY ||
+              sent_abandon_status ==
+                  Preserve_trx_transfer_status::COMMITTED_NOT_READY) {
+            LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+                   "PRESERVE: receiver reported the epoch committed during "
+                   "the post-failure ABANDON; failing closed to HA");
+            break;
+          }
+          if (preserve_trx_monotonic_us() >= sent_abandon_deadline_us) break;
+          my_sleep(kSentAbandonRetryIntervalMs);
+        }
         return enter_uncertain(commit_status, true);
       }
       LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
              ("PRESERVE: standby transfer source epoch commit failed status=" +
               std::to_string(static_cast<int>(commit_status)))
                  .c_str());
-      if (!receiver_committed) {
-        abort_batch_transfer_epoch("standby_transfer_commit_failed");
+      if (receiver_committed) {
+        /*
+          Unreachable by construction (COMMITTED_* implies receiver_commit_
+          succeeded above): a receiver must not report the epoch committed
+          when the COMMIT frame was never sent.  Fail-stop for HA takeover.
+        */
+        preserve_trx_reset_invariant_failure(
+            "standby_transfer_committed_without_commit_send",
+            active_drain_attempt);
+      }
+      if (batch_transfer_phase1_sender != nullptr) {
+        batch_transfer_phase1_sender->abort();
+        batch_transfer_phase1_sender.reset();
+      }
+      /*
+        The COMMIT frame was never sent (ownership is still RUNNING or
+        FINAL_METADATA_ACCEPTED_LOCAL), so the source may restore locally;
+        but first settle the receiver epoch with the commit-anchored ABANDON
+        under one bounded retry budget.  A definitive NOT_COMMITTED_CLEAN (or
+        the receiver having nothing to abandon) settles immediately; an
+        undecided receiver is left to its own deadline/reaper and only warned
+        about, never trusted.  RESET may still win at any checkpoint.
+      */
+      constexpr uint64_t kCommitAbandonRetryBudgetUs =
+          static_cast<uint64_t>(kPreserveTrxTransferOperationTimeoutMs) *
+          1000ULL;
+      constexpr uint32_t kCommitAbandonRetryIntervalMs = 200;
+      const uint64_t abandon_deadline_us =
+          preserve_trx_monotonic_us() + kCommitAbandonRetryBudgetUs;
+      bool abandon_settled = false;
+      for (;;) {
+        if (reset_requested()) {
+          return finish_phase2_reset(
+              &preserved_batch_items,
+              "reset_during_commit_failure_abandon_retry");
+        }
+        const Preserve_trx_transfer_status abandon_status =
+            batch_transfer_source_session == nullptr
+                ? Preserve_trx_transfer_status::UNSUPPORTED
+                : batch_transfer_source_session->cleanup_cancelled_epoch(
+                      "standby_transfer_commit_failed");
+        if (abandon_status == Preserve_trx_transfer_status::
+                                  NOT_COMMITTED_CLEAN ||
+            abandon_status == Preserve_trx_transfer_status::UNSUPPORTED) {
+          abandon_settled = true;
+          break;
+        }
+        if (abandon_status == Preserve_trx_transfer_status::COMMITTED_READY ||
+            abandon_status ==
+                Preserve_trx_transfer_status::COMMITTED_NOT_READY) {
+          preserve_trx_reset_invariant_failure(
+              "standby_transfer_committed_without_commit_send",
+              active_drain_attempt);
+        }
+        if (preserve_trx_monotonic_us() >= abandon_deadline_us) {
+          LogErr(WARNING_LEVEL, ER_LOG_PRINTF_MSG,
+                 "PRESERVE: receiver epoch cleanup after unsent commit "
+                 "deferred to receiver reaper");
+          break;
+        }
+        my_sleep(kCommitAbandonRetryIntervalMs);
+      }
+      (void)abandon_settled;
+      if (active_drain_attempt != nullptr &&
+          !active_drain_attempt->ownership.claim_local_restore()) {
+        /*
+          A RESET won the restore claim while the ABANDON settled: join the
+          reset flow instead of restoring on our own.
+        */
+        return finish_phase2_reset(
+            &preserved_batch_items,
+            "reset_won_commit_failure_local_restore");
       }
       const bool cleanup_error = restore_current_items_to_original_thds();
       if (cleanup_error) {
@@ -20454,6 +20602,14 @@ bool Preserve_trx_drain_service::execute(
                "transfer source epoch commit error");
         return finish_cleanup_failure_without_shutdown(
             "standby_transfer_commit_cleanup_failed");
+      }
+      if (active_drain_attempt != nullptr &&
+          !active_drain_attempt->ownership.complete_source_restore()) {
+        return finish_cleanup_failure_without_shutdown(
+            "standby_transfer_commit_state_failed");
+      }
+      if (active_drain_attempt != nullptr) {
+        preserve_trx_publish_active_drain_reset_barrier(active_drain_attempt);
       }
       abort_drain_participants("standby_transfer_commit_failed");
       return preserve_trx_reject_unsupported();

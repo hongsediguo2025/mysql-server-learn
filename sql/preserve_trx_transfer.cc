@@ -223,6 +223,9 @@ static std::atomic<uint64_t> g_receiver_staged_token_active{0};
 std::mutex g_receiver_staged_token_gate_mutex;
 std::set<std::string> g_receiver_staged_token_gate_epochs;
 
+/* Debug-only F1a object prewarm gate state, first worker per epoch. */
+std::set<std::string> g_receiver_object_prewarm_gate_epochs;
+
 /* Debug-only GUnit gate for an already-active staged-token worker. */
 std::mutex g_receiver_staged_token_unit_pause_mutex;
 std::condition_variable g_receiver_staged_token_unit_pause_cv;
@@ -232,6 +235,13 @@ bool g_receiver_staged_token_unit_pause_arrived{false};
 /* Debug-only RR-M3 concurrent COMMIT apply gate state. */
 std::atomic<bool> g_receiver_commit_gate_a_consumed{false};
 std::atomic<bool> g_receiver_commit_duplicate_waiter_consumed{false};
+
+/* Debug-only F2 commit-apply failure injection, one-shot per process. */
+std::atomic<bool> g_receiver_fail_commit_apply_once_consumed{false};
+
+/* Debug-only F1b one-shot staging load failure injections. */
+std::atomic<bool> g_receiver_fail_staging_load_corrupt_consumed{false};
+std::atomic<bool> g_receiver_fail_staging_load_unsupported_consumed{false};
 #endif
 static std::atomic<uint64_t> g_receiver_staged_token_max_active{0};
 static std::atomic<uint64_t> g_receiver_projection_publish_count{0};
@@ -9133,7 +9143,7 @@ Preserve_trx_transfer_status
 Preserve_trx_transfer_receiver_registry::mark_cleanup_pending(
     const std::string &root_dir, const std::string &epoch_id, uint64_t token,
     uint64_t now_us, Preserve_trx_transfer_receiver_state target_state,
-    const std::string &reason) {
+    const std::string &reason, bool keep_objects) {
   static constexpr uint64_t kCleanupRetryBaseUs = 1000000;
   if (root_dir.empty() ||
       (target_state != Preserve_trx_transfer_receiver_state::SAVED_ONLINE &&
@@ -9191,9 +9201,14 @@ Preserve_trx_transfer_receiver_registry::mark_cleanup_pending(
     Once the token is terminal/cancelled, no future receiver worker may consume
     the in-memory wire objects. Drop registry ownership now so a permanently
     tainted filesystem cleanup cannot pin a full inflight window in heap.
-    Readers that already copied a shared_ptr remain lifetime-safe.
+    Readers that already copied a shared_ptr remain lifetime-safe.  The
+    deferral path (keep_objects) instead keeps the objects until the debt
+    completes: an already-running worker may still be reading them, and the
+    debt completion performs the deferred erase.
   */
-  m_strict_v1_objects.erase(key);
+  if (!keep_objects) {
+    m_strict_v1_objects.erase(key);
+  }
   m_last_failed_token = token;
   m_last_failed_reason = reason;
   return Preserve_trx_transfer_status::OK;
@@ -10630,21 +10645,39 @@ bool Preserve_trx_transfer_receiver_registry::
 Preserve_trx_transfer_status
 Preserve_trx_transfer_receiver_registry::mark_corrupt(
     const std::string &epoch_id, uint64_t token,
-    const std::string &reason) {
+    const std::string &reason, bool keep_objects) {
   std::lock_guard<std::mutex> guard(m_mutex);
   return mark_terminal_locked(Token_key(epoch_id, token),
                               Preserve_trx_transfer_receiver_state::CORRUPT,
-                              reason);
+                              reason, keep_objects);
 }
 
 Preserve_trx_transfer_status
 Preserve_trx_transfer_receiver_registry::mark_aborted(
     const std::string &epoch_id, uint64_t token,
-    const std::string &reason) {
+    const std::string &reason, bool keep_objects) {
   std::lock_guard<std::mutex> guard(m_mutex);
   return mark_terminal_locked(Token_key(epoch_id, token),
                               Preserve_trx_transfer_receiver_state::ABORTED,
-                              reason);
+                              reason, keep_objects);
+}
+
+void Preserve_trx_transfer_receiver_registry::note_derived_purge_owed(
+    const std::string &root_dir, const std::string &epoch_id) {
+  std::lock_guard<std::mutex> guard(m_mutex);
+  m_derived_purge_owed_epochs[epoch_id] = root_dir;
+}
+
+std::map<std::string, std::string>
+Preserve_trx_transfer_receiver_registry::derived_purge_owed_epochs() const {
+  std::lock_guard<std::mutex> guard(m_mutex);
+  return m_derived_purge_owed_epochs;
+}
+
+void Preserve_trx_transfer_receiver_registry::clear_derived_purge_owed(
+    const std::string &epoch_id) {
+  std::lock_guard<std::mutex> guard(m_mutex);
+  m_derived_purge_owed_epochs.erase(epoch_id);
 }
 
 Preserve_trx_transfer_status
@@ -11850,7 +11883,7 @@ Preserve_trx_transfer_receiver_registry::status_counts() const {
 Preserve_trx_transfer_status
 Preserve_trx_transfer_receiver_registry::mark_terminal_locked(
     const Token_key &key, Preserve_trx_transfer_receiver_state state,
-    const std::string &reason) {
+    const std::string &reason, bool keep_objects) {
   auto found = m_records.find(key);
   if (found == m_records.end()) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
@@ -11862,7 +11895,16 @@ Preserve_trx_transfer_receiver_registry::mark_terminal_locked(
   found->second.state = state;
   found->second.reserved_bytes = 0;
   found->second.last_error = reason;
-  m_strict_v1_objects.erase(key);
+  /*
+    Terminal publish first, destructive cleanup second: a prewarm worker that
+    is already past its lifecycle checkpoint must still be able to finish its
+    reads, so the keep_objects variant defers the in-memory object erase to
+    the deferred cleanup debt (or the immediate cleanup below, which erases
+    the objects explicitly when no worker is active).
+  */
+  if (!keep_objects) {
+    m_strict_v1_objects.erase(key);
+  }
   m_last_failed_token = found->second.token;
   m_last_failed_reason = reason;
   return Preserve_trx_transfer_status::OK;
@@ -14944,6 +14986,11 @@ Preserve_trx_transfer_source_epoch_session::commit_epoch() {
       "preserve_trx_transfer_fail_final_metadata_ack_uncertain", {
         debug_force_final_metadata_ack_uncertain = true;
       });
+  bool debug_fail_final_metadata_deterministic = false;
+  DBUG_EXECUTE_IF(
+      "preserve_trx_transfer_fail_final_metadata_deterministic", {
+        debug_fail_final_metadata_deterministic = true;
+      });
 #endif
   guard.unlock();
   if (!final_token_payloads.empty()) {
@@ -14982,6 +15029,15 @@ Preserve_trx_transfer_source_epoch_session::commit_epoch() {
             !debug_injection_consumed.exchange(true,
                                                std::memory_order_acq_rel)) {
           send_status = Preserve_trx_transfer_status::ACK_UNCERTAIN;
+        }
+        if (debug_fail_final_metadata_deterministic &&
+            send_status == Preserve_trx_transfer_status::OK) {
+          /*
+            F2 debug injection: a deterministic, non-uncertain final-metadata
+            send failure (the connection stays untouched, so no uncertainty
+            latch is armed) while the COMMIT frame has not been sent yet.
+          */
+          send_status = Preserve_trx_transfer_status::IO_ERROR;
         }
 #endif
         if (send_status != Preserve_trx_transfer_status::OK) {
@@ -17209,6 +17265,21 @@ void receiver_reaper_scan_once(
     }
   }
   (void)registry->retry_cleanup_debt_once(now_us);
+  /*
+    Unique-cleaner completion: an epoch whose derived-state purge was deferred
+    behind an active prewarm worker is purged here once the last worker for
+    the epoch has stopped, so the deferred epoch-level cleanup always has an
+    owner.
+  */
+  for (const auto &owed : registry->derived_purge_owed_epochs()) {
+    if (receiver_epoch_has_active_prewarm_job(registry, owed.first)) {
+      continue;
+    }
+    purge_receiver_epoch_derived_state_after_worker_stop(owed.second,
+                                                         owed.first,
+                                                         registry);
+    registry->clear_derived_purge_owed(owed.first);
+  }
   for (const auto &request : registry->abandoning_epoch_requests(now_us)) {
     g_receiver_precommit_abandon_reaper_attempts.fetch_add(1);
     const Preserve_trx_transfer_epoch_terminal_outcome outcome =
@@ -17504,16 +17575,61 @@ Receiver_staged_token_prewarm_result run_receiver_staged_token_prewarm_job(
   throttle_receiver_prewarm_io(
       receiver_staged_token_file_read_bytes(manifest), runtime_policy);
   Preserved_trx_bundle staged_bundle;
-  const Preserve_trx_transfer_status load_status =
+  Preserve_trx_transfer_status load_status =
       preserve_trx_transfer_load_standby_bundle_from_staging(
           root_dir, manifest, &staged_bundle, objects_already_sealed, registry);
+#ifndef DBUG_OFF
+  if (load_status == Preserve_trx_transfer_status::OK &&
+      DBUG_EVALUATE_IF("preserve_trx_receiver_fail_staging_load_corrupt",
+                       true, false) &&
+      !g_receiver_fail_staging_load_corrupt_consumed.exchange(true)) {
+    load_status = Preserve_trx_transfer_status::CORRUPT;
+  }
+  if (load_status == Preserve_trx_transfer_status::OK &&
+      DBUG_EVALUATE_IF("preserve_trx_receiver_fail_staging_load_unsupported",
+                       true, false) &&
+      !g_receiver_fail_staging_load_unsupported_consumed.exchange(true)) {
+    load_status = Preserve_trx_transfer_status::UNSUPPORTED;
+  }
+  if (load_status == Preserve_trx_transfer_status::OK) {
+    DBUG_EXECUTE_IF("preserve_trx_receiver_fail_staging_load_io_error",
+                    { load_status = Preserve_trx_transfer_status::IO_ERROR; });
+  }
+#endif
   if (load_status != Preserve_trx_transfer_status::OK) {
-    note_receiver_seal_prewarm_status(
-        Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT);
-    note_receiver_epoch_global_failure(root_dir, manifest.epoch_id);
+    /*
+      A staging load failure is a single-token verdict, never an epoch-wide
+      one: a confirmed-damaged or unsupported token lands in the partial-ready
+      failure partition, a transient IO failure retries within the staged
+      budget and is classified PREWARM_DEADLINE at the deadline.  Escalating
+      to note_receiver_epoch_global_failure here would poison healthy sibling
+      tokens and block the selection publication.
+    */
+    const bool terminal_load_failure =
+        load_status == Preserve_trx_transfer_status::CORRUPT ||
+        load_status == Preserve_trx_transfer_status::UNSUPPORTED;
+    const Preserve_trx_promotion_adopt_status adopt_status =
+        load_status == Preserve_trx_transfer_status::CORRUPT
+            ? Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT
+            : load_status == Preserve_trx_transfer_status::UNSUPPORTED
+                  ? Preserve_trx_promotion_adopt_status::UNSUPPORTED_ARTIFACT
+                  : Preserve_trx_promotion_adopt_status::IO_ERROR;
+    note_receiver_seal_prewarm_status(adopt_status);
+    if (terminal_load_failure) {
+      const Preserve_trx_receiver_failure_reason reason =
+          load_status == Preserve_trx_transfer_status::CORRUPT
+              ? Preserve_trx_receiver_failure_reason::TOKEN_CORRUPT_ARTIFACT
+              : Preserve_trx_receiver_failure_reason::
+                    UNSUPPORTED_TOKEN_SEMANTICS;
+      record_token_failure(reason);
+      return receiver_staged_token_result(
+          Receiver_staged_token_prewarm_outcome::TERMINAL_TOKEN_FAILURE,
+          adopt_status, reason);
+    }
     return receiver_staged_token_result(
-        Receiver_staged_token_prewarm_outcome::GLOBAL_FAILURE,
-        Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT);
+        Receiver_staged_token_prewarm_outcome::RETRYABLE_NOT_READY,
+        adopt_status, Preserve_trx_receiver_failure_reason::NONE,
+        Receiver_staged_token_prewarm_stage::READY_CACHE_BUNDLE);
   }
   if (staged_bundle.metadata.global_log_bin != mysql_bin_log.is_open() ||
       !staged_bundle.metadata.has_binlog_gtid_mode ||
@@ -17556,8 +17672,12 @@ Receiver_staged_token_prewarm_result run_receiver_staged_token_prewarm_job(
         manifest.source_epoch_commit_lsn, staged_bundle);
   }
   if (receiver_epoch_expired_or_removed(root_dir, registry, manifest)) {
-    purge_receiver_epoch_derived_state_after_worker_stop(
-        root_dir, manifest.epoch_id, registry);
+    /*
+      Unique-cleaner rule: a single worker exiting early must not purge the
+      epoch's derived state under still-active sibling workers.  The debt
+      reaper's owed-purge sweep completes any deferred epoch-level cleanup
+      once the last worker for the epoch has stopped.
+    */
     return receiver_staged_token_result(
         Receiver_staged_token_prewarm_outcome::EXPIRED,
         Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY);
@@ -17615,8 +17735,7 @@ Receiver_staged_token_prewarm_result run_receiver_staged_token_prewarm_job(
       prepare_strict_bundle_for_receiver(root_dir, manifest,
                                          std::move(staged_bundle), registry);
   if (receiver_epoch_expired_or_removed(root_dir, registry, manifest)) {
-    purge_receiver_epoch_derived_state_after_worker_stop(
-        root_dir, manifest.epoch_id, registry);
+    /* Unique-cleaner rule: see the identical checkpoint above. */
     return receiver_staged_token_result(
         Receiver_staged_token_prewarm_outcome::EXPIRED,
         Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY);
@@ -17837,6 +17956,39 @@ static bool run_receiver_object_prewarm_job(
     }
     return false;
   }
+#ifndef DBUG_OFF
+  /*
+    Debug-only F1a gate: park the first object prewarm worker for the epoch
+    after the lifecycle check and before any staging lookup/read, so a
+    terminal publish (token ABORT, generic frame failure, COMMIT_EPOCH
+    failure family) can race the worker's reads.  The actor verifies the
+    controller-armed syncpoint_release symbol after the wait; a bare timeout
+    is a named harness invariant, never a successful release.
+  */
+  if (DBUG_EVALUATE_IF("syncpoint_xfer2_prewarm_object_read_gate", true,
+                       false)) {
+    bool first_for_epoch = false;
+    {
+      std::lock_guard<std::mutex> gate_lock(
+          g_receiver_staged_token_gate_mutex);
+      first_for_epoch =
+          g_receiver_object_prewarm_gate_epochs.insert(manifest.epoch_id)
+              .second;
+    }
+    if (first_for_epoch) {
+      CONDITIONAL_SYNC_POINT("xfer2_prewarm_object_read_gate");
+      if (!DBUG_EVALUATE_IF(
+              "syncpoint_release_xfer2_prewarm_object_read_gate", true,
+              false)) {
+        LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+               "PRESERVE: object prewarm gate resumed without controller "
+               "syncpoint_release symbol "
+               "(harness invariant xfer2_prewarm_object_read_gate)");
+        std::abort();
+      }
+    }
+  }
+#endif
   Preserve_trx_transfer_manifest effective_manifest = manifest;
   const Preserve_trx_transfer_object_descriptor *object =
       find_object(effective_manifest, object_id);
@@ -18900,7 +19052,8 @@ Preserve_trx_transfer_status mark_epoch_records_corrupt(
       continue;
     }
     const Preserve_trx_transfer_status status =
-        registry->mark_corrupt(record.epoch_id, record.token, reason);
+        registry->mark_corrupt(record.epoch_id, record.token, reason,
+                               /*keep_objects=*/true);
     if (status != Preserve_trx_transfer_status::OK &&
         first_status == Preserve_trx_transfer_status::OK) {
       first_status = status;
@@ -18915,6 +19068,27 @@ Preserve_trx_transfer_status cleanup_epoch_transfer_staging(
     Preserve_trx_transfer_receiver_registry *registry) {
   Preserve_trx_transfer_status first_status = Preserve_trx_transfer_status::OK;
   for (const Preserve_trx_transfer_receiver_record &record : records) {
+    if (registry != nullptr &&
+        receiver_token_has_active_prewarm_job(registry, record.epoch_id,
+                                              record.token)) {
+      /*
+        A worker may still be reading this token's staging.  Publish the
+        deferral as exactly one cleanup debt; the debt reaper completes the
+        deferred deletion once the worker has stopped.
+      */
+      const Preserve_trx_transfer_status debt_status =
+          registry->mark_cleanup_pending(
+              root_dir, record.epoch_id, record.token,
+              transfer_monotonic_us(),
+              Preserve_trx_transfer_receiver_state::CORRUPT,
+              "epoch_staging_cleanup_deferred:active_prewarm",
+              /*keep_objects=*/true);
+      if (first_status == Preserve_trx_transfer_status::OK &&
+          debt_status != Preserve_trx_transfer_status::OK) {
+        first_status = debt_status;
+      }
+      continue;
+    }
     erase_receiver_strict_record_lock_state(root_dir, record.epoch_id,
                                             record.token);
     erase_receiver_binlog_prepared(root_dir, record.epoch_id, record.token);
@@ -19009,8 +19183,26 @@ Preserve_trx_transfer_status mark_epoch_records_corrupt_and_purge(
     const std::string &reason) {
   const Preserve_trx_transfer_status status =
       mark_epoch_records_corrupt(registry, records, reason);
-  purge_receiver_epoch_derived_state(root_dir, epoch_id,
-                                     receiver_boot_incarnation());
+  /*
+    The epoch-wide derived-state purge must not run under an active prewarm
+    worker of this epoch (its strict-registry operations would fail and be
+    misclassified as an epoch-global failure).  Defer it as an owed purge that
+    the receiver reaper completes once no worker for the epoch is active.
+  */
+  bool any_active_worker = false;
+  for (const auto &record : records) {
+    if (receiver_token_has_active_prewarm_job(registry, epoch_id,
+                                              record.token)) {
+      any_active_worker = true;
+      break;
+    }
+  }
+  if (any_active_worker) {
+    registry->note_derived_purge_owed(root_dir, epoch_id);
+  } else {
+    purge_receiver_epoch_derived_state(root_dir, epoch_id,
+                                       receiver_boot_incarnation());
+  }
   return status;
 }
 
@@ -19347,8 +19539,23 @@ preserve_trx_transfer_apply_receiver_frame_internal(
         record.state != Preserve_trx_transfer_receiver_state::RECEIVING) {
       return Preserve_trx_transfer_status::UNSUPPORTED;
     }
-    status = registry->mark_aborted(frame.epoch_id, frame.token, frame.reason);
+    /*
+      Publish the terminal state first (keeping the in-memory objects), then
+      observe the prewarm workers.  A worker that is already past its
+      lifecycle checkpoint may still be reading this token's staging, so all
+      destructive cleanup is deferred to exactly one cleanup debt while any
+      worker is active; the debt reaper completes it after the workers stop.
+    */
+    status = registry->mark_aborted(frame.epoch_id, frame.token, frame.reason,
+                                    /*keep_objects=*/true);
     if (status != Preserve_trx_transfer_status::OK) return status;
+    if (receiver_token_has_active_prewarm_job(registry, frame.epoch_id,
+                                              frame.token)) {
+      return registry->mark_cleanup_pending(
+          root_dir, frame.epoch_id, frame.token, transfer_monotonic_us(),
+          Preserve_trx_transfer_receiver_state::ABORTED,
+          "abort_cleanup_deferred:active_prewarm", /*keep_objects=*/true);
+    }
     preserved_trx_promotion_ready_cache_purge_token(root_dir, frame.epoch_id,
                                                     frame.token);
     erase_receiver_strict_record_lock_state(root_dir, frame.epoch_id,
@@ -19668,6 +19875,18 @@ preserve_trx_transfer_apply_receiver_frame_internal(
               debug_fail_second_commit_after_fact_build) {
             status = Preserve_trx_transfer_status::CORRUPT;
           }
+          if (status == Preserve_trx_transfer_status::OK &&
+              DBUG_EVALUATE_IF(
+                  "preserve_trx_receiver_fail_commit_apply_once", true,
+                  false) &&
+              !g_receiver_fail_commit_apply_once_consumed.exchange(true)) {
+            /*
+              F2 face-3 debug injection: the COMMIT apply fails after its
+              snapshot and gate A, routing into the commit failure cleanup
+              family while an object prewarm worker may still be active.
+            */
+            status = Preserve_trx_transfer_status::IO_ERROR;
+          }
 #endif
           if (status == Preserve_trx_transfer_status::OK) {
             try {
@@ -19873,8 +20092,26 @@ preserve_trx_transfer_apply_receiver_frame_internal(
     std::string reason =
         "apply_receiver_frame:" + transfer_status_name(status);
     const Preserve_trx_transfer_status mark_status =
-        registry->mark_corrupt(frame.epoch_id, frame.token, reason);
+        registry->mark_corrupt(frame.epoch_id, frame.token, reason,
+                               /*keep_objects=*/true);
     if (mark_status != Preserve_trx_transfer_status::OK) return mark_status;
+    if (receiver_token_has_active_prewarm_job(registry, frame.epoch_id,
+                                              frame.token)) {
+      /*
+        Terminal state is already published; an active worker may still be
+        reading this token's staging, so defer every destructive layer to a
+        single cleanup debt instead of purging under the worker.
+      */
+      const Preserve_trx_transfer_status debt_status =
+          registry->mark_cleanup_pending(
+              root_dir, frame.epoch_id, frame.token, transfer_monotonic_us(),
+              Preserve_trx_transfer_receiver_state::CORRUPT,
+              "token_cleanup_deferred:active_prewarm",
+              /*keep_objects=*/true);
+      return debt_status == Preserve_trx_transfer_status::OK
+                 ? status
+                 : debt_status;
+    }
     purge_receiver_epoch_derived_state(
         root_dir, frame.epoch_id, receiver_boot_incarnation());
     erase_receiver_strict_record_lock_state(root_dir, frame.epoch_id,
@@ -20155,9 +20392,7 @@ Preserve_trx_transfer_status apply_receiver_frame_segment_with_workers(
   auto remember_failure = [&](Preserve_trx_transfer_status status) {
     if (status == Preserve_trx_transfer_status::OK) return;
     std::lock_guard<std::mutex> guard(status_mutex);
-    if (first_status == Preserve_trx_transfer_status::OK) {
-      first_status = status;
-    }
+    first_status = merge_receiver_batch_failure(first_status, status);
   };
 
   auto apply_in_caller = [&]() {

@@ -1,0 +1,134 @@
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+# F1a (face 1): a token ABORT must not delete staging while an object
+# prewarm worker of the same token is active past its first terminal check.
+# One owner runs a W04 transaction.  A receiver object-prewarm worker parks
+# at xfer2_prewarm_object_read_gate (after the first terminal check, before
+# any lookup/read); the source DRAIN parks at the phase-1 boundary; RESET
+# DRAIN wins and the reset cleanup sends an authenticated token ABORT.
+#
+# GREEN contract: the ABORT publishes ABORTED keeping the in-memory objects
+# and defers all destructive cleanup to exactly one cleanup debt while the
+# worker is parked; after release the worker finishes without reading
+# deleted files and the debt reaper completes the deletion.
+# On old code the ABORT deletes staging under the active worker (no debt).
+
+--source suite/preserve_trx_transfer_stby/include/w01_setup.inc
+
+--connection xfer2_receiver
+# All syncpoint release symbols must be armed before the transfer starts:
+# existing threads snapshot the global dbug list, and a late arm trips the
+# harness invariant abort.
+SET GLOBAL debug='+d,syncpoint_xfer2_prewarm_object_read_gate,syncpoint_release_xfer2_prewarm_object_read_gate';
+SET GLOBAL rds_preserve_trx_token_retention_timeout_ms=120000;
+
+--let $online_before= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_online_epochs', v, 1)
+--let $terminal_wins_before= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins', v, 1)
+--let $tombstones_before= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_status_tombstones', v, 1)
+--let $debt_tokens_before= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_tokens', v, 1)
+--let $debt_bytes_before= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_bytes', v, 1)
+--let $retry_done_before= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_retry_completions', v, 1)
+--let $inflight_tokens_before= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens', v, 1)
+--let $inflight_bytes_before= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes', v, 1)
+--let $staged_before= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes', v, 1)
+
+--connection default
+UPDATE xfer2_w01_accounts
+   SET balance=balance+1,version=version+1 WHERE id=32;
+
+--connect(xfer2_f1a_owner,localhost,xfer2_w01_app,,test)
+--let $owner_id= query_get_value(SELECT CONNECTION_ID() AS id,id,1)
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+UPDATE xfer2_w01_accounts
+   SET balance=balance-11,version=version+1 WHERE id=1;
+UPDATE xfer2_w01_accounts
+   SET balance=balance+11,version=version+1 WHERE id=2;
+INSERT INTO xfer2_w01_audit(account_id,delta) VALUES(1,-11),(2,11);
+SELECT COUNT(*)=2 AND SUM(balance)=2000 AND SUM(version)=2
+         AS owner_w04_balance_conserved
+  FROM xfer2_w01_accounts WHERE id IN (1,2);
+
+# T0: async DRAIN owner parked at the phase-1 boundary so RESET stays
+# winnable while the receiver object worker is parked.
+--connect(xfer2_f1a_drain,localhost,root,,test)
+SET DEBUG_SYNC=
+  'preserve_trx_transfer_after_phase1_binlog_stream SIGNAL f1a_phase1_staged WAIT_FOR f1a_phase1_release';
+--send DRAIN TRANSACTIONS PRESERVE
+
+# The receiver object-prewarm worker parks after its first terminal check,
+# before any lookup/read of the token staging.
+--connection xfer2_receiver
+SET DEBUG_SYNC='now WAIT_FOR reached_xfer2_prewarm_object_read_gate TIMEOUT 60';
+
+--connection xfer2_source_ha
+SET DEBUG_SYNC='now WAIT_FOR f1a_phase1_staged TIMEOUT 60';
+--let $reset_wins_before= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_reset_drain_wins', v, 1)
+
+# T2: RESET wins; the reset cleanup sends the token ABORT while the object
+# worker is still parked.
+--connect(xfer2_f1a_reset,localhost,preserve_trx_ha_admin,xfer2-smoke-w01-secret,test)
+--send RESET DRAIN
+
+--connection xfer2_source_ha
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_reset_drain_wins')>$reset_wins_before
+--let $wait_timeout= 30
+--source include/wait_condition_or_abort.inc
+SET DEBUG_SYNC='now SIGNAL f1a_phase1_release';
+
+# While the worker is parked, the ABORT must defer destructive cleanup to
+# exactly one cleanup debt instead of deleting staging.
+--connection xfer2_receiver
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_tokens')=$debt_tokens_before+1
+--let $wait_timeout= 30
+--source include/wait_condition_or_abort.inc
+--eval SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_tokens')=$debt_tokens_before+1 AS exactly_one_deferred_cleanup_debt, (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_worker_active')>0 AS object_worker_still_active;
+SELECT VARIABLE_VALUE='abort_cleanup_deferred:active_prewarm'
+         AS deferred_reason_is_exact
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_last_failed_reason';
+
+# Release the parked worker: it finishes without reading deleted files and
+# the debt reaper completes the cleanup.
+SET DEBUG_SYNC='now SIGNAL continue_xfer2_prewarm_object_read_gate';
+SET GLOBAL debug='-d,syncpoint_xfer2_prewarm_object_read_gate,syncpoint_release_xfer2_prewarm_object_read_gate';
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_tokens')=$debt_tokens_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_retry_completions')>=$retry_done_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_worker_active')=0
+--let $wait_timeout= 30
+--source include/wait_condition_or_abort.inc
+
+--eval SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_tokens')=$debt_tokens_before AS deferred_debt_completed, (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_bytes')=$debt_bytes_before AS deferred_debt_bytes_released, (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')=$inflight_tokens_before AS inflight_tokens_released, (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')=$inflight_bytes_before AS inflight_bytes_released, (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes')=$staged_before AS staging_memory_released
+# Token-level ABORT cleanup is not an epoch terminal decision: no terminal
+# CAS and no tombstone are expected from the per-token ABORT flow.
+--eval SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins')=$terminal_wins_before AS no_epoch_terminal_cas_for_token_abort, (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_status_tombstones')=$tombstones_before AS no_tombstone_for_token_abort
+--let $receiver_connection= xfer2_receiver
+--source suite/preserve_trx_transfer_stby/include/assert_receiver_quiescent.inc
+
+--connection xfer2_f1a_reset
+--reap
+
+--connection xfer2_f1a_drain
+--error ER_PRESERVE_TRX_DRAIN_RESET
+--reap
+SET DEBUG_SYNC='RESET';
+
+--connection xfer2_source_ha
+SELECT COUNT(*)=0 AS no_detached_source_token
+  FROM performance_schema.preserved_transactions;
+
+# I02: the owner is restored on the source, can continue, and rolls back.
+--connection xfer2_f1a_owner
+--replace_result $owner_id OWNER_ID
+--eval SELECT CONNECTION_ID()=$owner_id AS owner_connection_restored
+SELECT COUNT(*)=2 AND SUM(balance)=2000 AND SUM(version)=2
+         AS owner_w04_survives_reset
+  FROM xfer2_w01_accounts WHERE id IN (1,2);
+ROLLBACK;
+
+--disconnect xfer2_f1a_owner
+--disconnect xfer2_f1a_drain
+--disconnect xfer2_f1a_reset
+
+--source suite/preserve_trx_transfer_stby/include/w01_teardown.inc

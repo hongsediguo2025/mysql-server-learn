@@ -706,5 +706,126 @@ class LockWarmcopyInvasiveSurfaceTest(unittest.TestCase):
             invasive_surface.audit_mdl_file = original_audit_mdl_file
 
 
+    def test_cli_blocker_fails_without_any_flag(self):
+        original_git_changed_paths = invasive_surface.git_changed_paths
+        original_audit_paths = invasive_surface.audit_paths
+        original_audit_lock0lock_file = invasive_surface.audit_lock0lock_file
+        original_audit_binlog_file = invasive_surface.audit_binlog_file
+        original_audit_sql_parse_file = invasive_surface.audit_sql_parse_file
+        original_audit_sys_vars_file = invasive_surface.audit_sys_vars_file
+        original_audit_mysqld_file = invasive_surface.audit_mysqld_file
+        original_audit_mdl_file = invasive_surface.audit_mdl_file
+        try:
+            invasive_surface.git_changed_paths = lambda: []
+            invasive_surface.audit_paths = lambda paths: []
+            invasive_surface.audit_lock0lock_file = lambda: []
+            invasive_surface.audit_binlog_file = lambda: []
+            invasive_surface.audit_sql_parse_file = lambda: []
+            invasive_surface.audit_sys_vars_file = lambda: []
+            invasive_surface.audit_mysqld_file = lambda: []
+            invasive_surface.audit_mdl_file = lambda: [
+                invasive_surface.SurfaceFinding(
+                    path="sql/mdl.cc",
+                    state="modified",
+                    category="forbidden_mdl_payload_exporter",
+                    severity="blocker",
+                    requirement="simulated mdl exporter",
+                    blocks_release=True,
+                )
+            ]
+
+            with redirect_stdout(StringIO()):
+                exit_code = invasive_surface.main([])
+            self.assertEqual(1, exit_code)
+        finally:
+            invasive_surface.git_changed_paths = original_git_changed_paths
+            invasive_surface.audit_paths = original_audit_paths
+            invasive_surface.audit_lock0lock_file = original_audit_lock0lock_file
+            invasive_surface.audit_binlog_file = original_audit_binlog_file
+            invasive_surface.audit_sql_parse_file = original_audit_sql_parse_file
+            invasive_surface.audit_sys_vars_file = original_audit_sys_vars_file
+            invasive_surface.audit_mysqld_file = original_audit_mysqld_file
+            invasive_surface.audit_mdl_file = original_audit_mdl_file
+
+    def test_cli_unclassified_gate_only_fires_for_unclassified_category(self):
+        finding = invasive_surface.SurfaceFinding(
+            path="sql/preserve_trx.cc",
+            state="modified",
+            category="unclassified_core_change",
+            severity="high",
+            requirement="simulated unclassified core change",
+        )
+        original_git_changed_paths = invasive_surface.git_changed_paths
+        original_audit_paths = invasive_surface.audit_paths
+        original_audit_lock0lock_file = invasive_surface.audit_lock0lock_file
+        original_audit_binlog_file = invasive_surface.audit_binlog_file
+        original_audit_sql_parse_file = invasive_surface.audit_sql_parse_file
+        original_audit_sys_vars_file = invasive_surface.audit_sys_vars_file
+        original_audit_mysqld_file = invasive_surface.audit_mysqld_file
+        original_audit_mdl_file = invasive_surface.audit_mdl_file
+        try:
+            invasive_surface.git_changed_paths = lambda: []
+            invasive_surface.audit_paths = lambda paths: [finding]
+            invasive_surface.audit_lock0lock_file = lambda: []
+            invasive_surface.audit_binlog_file = lambda: []
+            invasive_surface.audit_sql_parse_file = lambda: []
+            invasive_surface.audit_sys_vars_file = lambda: []
+            invasive_surface.audit_mysqld_file = lambda: []
+            invasive_surface.audit_mdl_file = lambda: []
+
+            with redirect_stdout(StringIO()):
+                self.assertEqual(0, invasive_surface.main([]))
+            with redirect_stdout(StringIO()):
+                self.assertEqual(
+                    1, invasive_surface.main(["--fail-on-unclassified"])
+                )
+        finally:
+            invasive_surface.git_changed_paths = original_git_changed_paths
+            invasive_surface.audit_paths = original_audit_paths
+            invasive_surface.audit_lock0lock_file = original_audit_lock0lock_file
+            invasive_surface.audit_binlog_file = original_audit_binlog_file
+            invasive_surface.audit_sql_parse_file = original_audit_sql_parse_file
+            invasive_surface.audit_sys_vars_file = original_audit_sys_vars_file
+            invasive_surface.audit_mysqld_file = original_audit_mysqld_file
+            invasive_surface.audit_mdl_file = original_audit_mdl_file
+
+    def test_off_guard_accepts_long_lock_free_prelude(self):
+        # Regression shape of preserved_trx_recover_all(): a long metrics
+        # prelude precedes the OFF guard, which still runs before the first
+        # lock/state/I/O side effect.
+        prelude = "".join(
+            f"  uint64_t metric_{index}{{0}};\n" for index in range(120)
+        )
+        content = (
+            "bool preserved_trx_recover_all() {\n"
+            + prelude
+            + "  if (!preserve_trx_is_enabled()) {\n"
+            "    return true;\n"
+            "  }\n"
+            "  auto store = create_preserved_trx_default_store(dir);\n"
+            "}\n"
+        )
+        self.assertTrue(
+            invasive_surface.helper_has_top_level_off_guard(
+                content, "bool preserved_trx_recover_all("
+            )
+        )
+
+    def test_off_guard_rejects_guard_after_side_effect(self):
+        content = (
+            "bool preserved_trx_recover_all() {\n"
+            "  mysql_mutex_lock(&some_mutex);\n"
+            "  if (!preserve_trx_is_enabled()) {\n"
+            "    return true;\n"
+            "  }\n"
+            "}\n"
+        )
+        self.assertFalse(
+            invasive_surface.helper_has_top_level_off_guard(
+                content, "bool preserved_trx_recover_all("
+            )
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

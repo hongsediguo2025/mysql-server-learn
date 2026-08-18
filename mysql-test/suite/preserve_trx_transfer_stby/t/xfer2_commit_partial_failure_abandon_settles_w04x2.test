@@ -1,0 +1,122 @@
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+# F2: when the final-metadata send fails deterministically partway (the last
+# payload is never written to the wire, COMMIT is never sent), the source
+# must settle the receiver epoch through the commit-anchored ABANDON — not
+# per-token ABORTs after a sequence rewind that collides with already
+# admitted sequences.
+#
+# GREEN contract: the receiver epoch ends NOT_COMMITTED_CLEAN (terminal CAS
+# + bounded tombstone), all token staging/inflight state is released, no
+# cleanup debt, and the source restores both owners locally (COMMIT was
+# never sent, so restore is unconditionally safe).
+# On old code the rewound per-token ABORTs are rejected CORRUPT by the
+# receiver (sequence reuse), no terminal tombstone is installed, and the
+# tokens stay RECEIVING with their budgets held.
+
+--source suite/preserve_trx_transfer_stby/include/w01_setup.inc
+CALL mtr.add_suppression(
+  "PRESERVE: standby transfer source epoch commit failed status=");
+CALL mtr.add_suppression(
+  "PRESERVE: receiver epoch cleanup after unsent commit deferred to receiver "
+  "reaper");
+
+# Arm the deterministic failure on the source BEFORE the drain connection
+# exists: threads snapshot the global dbug list at creation.
+--connection default
+SET GLOBAL debug='+d,preserve_trx_transfer_fail_final_metadata_deterministic';
+UPDATE xfer2_w01_accounts
+   SET balance=balance+1,version=version+1 WHERE id=32;
+
+--connection xfer2_receiver
+SET GLOBAL rds_preserve_trx_token_retention_timeout_ms=120000;
+--let $online_before= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_online_epochs', v, 1)
+--let $terminal_wins_before= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins', v, 1)
+--let $tombstones_before= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_status_tombstones', v, 1)
+--let $inflight_tokens_before= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens', v, 1)
+--let $inflight_bytes_before= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes', v, 1)
+--let $staged_before= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes', v, 1)
+--let $debt_tokens_before= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_tokens', v, 1)
+--let $debt_bytes_before= query_get_value(SELECT VARIABLE_VALUE+0 AS v FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_bytes', v, 1)
+
+--connect(xfer2_f2_owner1,localhost,xfer2_w01_app,,test)
+--let $f2_owner1_id= query_get_value(SELECT CONNECTION_ID() AS id,id,1)
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+UPDATE xfer2_w01_accounts
+   SET balance=balance-17,version=version+1 WHERE id=1;
+UPDATE xfer2_w01_accounts
+   SET balance=balance+17,version=version+1 WHERE id=2;
+INSERT INTO xfer2_w01_audit(account_id,delta)
+VALUES(1,-17),(2,17);
+SELECT COUNT(*)=2 AND SUM(balance)=2000 AND SUM(version)=2
+         AS owner1_w04_balance_conserved
+  FROM xfer2_w01_accounts WHERE id IN (1,2);
+
+--connect(xfer2_f2_owner2,localhost,xfer2_w01_app,,test)
+--let $f2_owner2_id= query_get_value(SELECT CONNECTION_ID() AS id,id,1)
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+UPDATE xfer2_w01_accounts
+   SET balance=balance-23,version=version+1 WHERE id=3;
+UPDATE xfer2_w01_accounts
+   SET balance=balance+23,version=version+1 WHERE id=4;
+INSERT INTO xfer2_w01_audit(account_id,delta)
+VALUES(3,-23),(4,23);
+SELECT COUNT(*)=2 AND SUM(balance)=2000 AND SUM(version)=2
+         AS owner2_w04_balance_conserved
+  FROM xfer2_w01_accounts WHERE id IN (3,4);
+
+--connect(xfer2_f2_drain,localhost,root,,test)
+--replace_result $f2_owner1_id OWNER1_ID $f2_owner2_id OWNER2_ID
+--replace_column 1 GENERATION 6 CLOSING_STARTED_US 7 CLOSING_DEADLINE_US
+--error ER_PRESERVE_TRX_UNSUPPORTED
+DRAIN TRANSACTIONS PRESERVE;
+
+--connection xfer2_receiver
+# The commit-anchored ABANDON installs the terminal tombstone and cleans the
+# epoch; token ABORTs after a sequence rewind would have been rejected.
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins')=$terminal_wins_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_status_tombstones')=$tombstones_before+1
+--let $wait_timeout= 30
+--source include/wait_condition_or_abort.inc
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')=$inflight_tokens_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')=$inflight_bytes_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes')=$staged_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_worker_active')=0
+--let $wait_timeout= 30
+--source include/wait_condition_or_abort.inc
+
+--eval SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins')=$terminal_wins_before+1 AS abandon_won_terminal_cas, (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_status_tombstones')=$tombstones_before+1 AS bounded_abandon_tombstone
+--eval SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')=$inflight_tokens_before AS inflight_tokens_released, (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')=$inflight_bytes_before AS inflight_bytes_released, (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes')=$staged_before AS staging_memory_released, (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_tokens')=$debt_tokens_before AS no_cleanup_debt_token, (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_bytes')=$debt_bytes_before AS no_cleanup_debt_bytes
+--let $receiver_connection= xfer2_receiver
+--source suite/preserve_trx_transfer_stby/include/assert_receiver_quiescent.inc
+
+--connection xfer2_source_ha
+SELECT COUNT(*)=0 AS no_detached_source_token
+  FROM performance_schema.preserved_transactions;
+SELECT VARIABLE_VALUE+0=0 AS no_commit_unknown
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_source_commit_unknown_epochs';
+
+# Both owners are restored locally (COMMIT was never sent) and roll back.
+--connection xfer2_f2_owner1
+--replace_result $f2_owner1_id OWNER1_ID
+--eval SELECT CONNECTION_ID()=$f2_owner1_id AS owner1_connection_restored
+SELECT COUNT(*)=2 AND SUM(balance)=2000 AND SUM(version)=2
+         AS owner1_w04_survives_restore
+  FROM xfer2_w01_accounts WHERE id IN (1,2);
+ROLLBACK;
+
+--connection xfer2_f2_owner2
+--replace_result $f2_owner2_id OWNER2_ID
+--eval SELECT CONNECTION_ID()=$f2_owner2_id AS owner2_connection_restored
+ROLLBACK;
+
+--connection default
+SET GLOBAL debug='-d,preserve_trx_transfer_fail_final_metadata_deterministic';
+
+--disconnect xfer2_f2_owner1
+--disconnect xfer2_f2_owner2
+--disconnect xfer2_f2_drain
+
+--source suite/preserve_trx_transfer_stby/include/w01_teardown.inc

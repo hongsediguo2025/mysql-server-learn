@@ -859,7 +859,12 @@ def helper_has_top_level_off_guard(content: str, signature: str) -> bool:
     if body_offset < 0:
         return False
 
-    body_prefix = content[body_offset + 1 : body_offset + 600]
+    # The contract is "the OFF guard precedes the first lock/state/I/O side
+    # effect".  Helpers may legitimately open with a long lock-free prelude
+    # (metric structs, logging) before the guard, so the guard is searched
+    # over a generously sized body window and judged by ORDER against the
+    # side-effect tokens, not by a fixed small prefix window.
+    body_prefix = content[body_offset + 1 : body_offset + 50000]
     guard_offset = body_prefix.find("!preserve_trx_is_enabled()")
     if guard_offset < 0:
         return False
@@ -1037,10 +1042,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         print(render_markdown(findings))
 
-    if blocking_findings(findings) and args.fail_on_unclassified:
+    # Release-blocking findings fail the gate unconditionally; the opt-in
+    # flags only tighten the gate further.
+    if blocking_findings(findings):
         return 1
 
-    if expanded_high_risk_findings(findings) and args.fail_on_expanded_high_risk:
+    if args.fail_on_unclassified and any(
+        finding.category == "unclassified_core_change" for finding in findings
+    ):
+        return 1
+
+    if args.fail_on_expanded_high_risk and expanded_high_risk_findings(findings):
         return 1
 
     return 0

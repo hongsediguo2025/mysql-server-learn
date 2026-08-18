@@ -18909,6 +18909,19 @@ TEST_F(PreserveSnapshotTest,
             preserve_trx_transfer_apply_receiver_frame(
                 m_dir, abort, &store, &registry, 300, nullptr));
 
+  /*
+    The object worker is delayed at job start and still active, so the ABORT
+    publishes a deferred cleanup debt (CLEANUP_PENDING) instead of deleting
+    staging under the active worker.
+  */
+  {
+    Preserve_trx_transfer_receiver_record deferred_record;
+    ASSERT_TRUE(registry.lookup(manifest.epoch_id, manifest.token,
+                                &deferred_record));
+    EXPECT_EQ(Preserve_trx_transfer_receiver_state::CLEANUP_PENDING,
+              deferred_record.state);
+  }
+
   for (uint attempt = 0; attempt < 1000; ++attempt) {
     if (preserve_trx_transfer_receiver_active_jobs_for_unit_test(&registry) ==
         0) {
@@ -18920,6 +18933,10 @@ TEST_F(PreserveSnapshotTest,
             preserve_trx_transfer_receiver_active_jobs_for_unit_test(&registry));
   EXPECT_EQ(miss_before,
             preserve_trx_transfer_receiver_object_prewarm_miss_count_status());
+
+  /* The debt reaper finishes the deferred cleanup once the worker quiesced. */
+  EXPECT_LE(1U, registry.retry_cleanup_debt_once(
+                    std::numeric_limits<uint64_t>::max()));
 
   Preserve_trx_transfer_receiver_record record;
   ASSERT_TRUE(registry.lookup(manifest.epoch_id, manifest.token, &record));
@@ -19961,6 +19978,12 @@ TEST_F(PreserveSnapshotTest, TransferReceiverBeginRejectsEmptyRootDir) {
 
 TEST_F(PreserveSnapshotTest, TransferReceiverAbortRemovesStagedTokenFiles) {
   Transfer_codec_context_guard codec_guard;
+  /* Keep the prewarm pool paused: this test pins the quiesced immediate
+     cleanup contract; the active-worker deferral is covered elsewhere. */
+  preserve_trx_transfer_set_prewarm_paused_for_unit_test(true);
+  auto restore_pause = create_scope_guard([] {
+    preserve_trx_transfer_set_prewarm_paused_for_unit_test(false);
+  });
   const uint64_t transfer_token = 106;
   Preserve_snapshot_metadata meta = metadata();
   meta.token = test_transfer_token_string(transfer_token);
@@ -20062,6 +20085,16 @@ TEST_F(PreserveSnapshotTest, TransferReceiverAbortRemovesStagedTokenFiles) {
 
 TEST_F(PreserveSnapshotTest, TransferReceiverCorruptFrameRemovesStagedTokenFiles) {
   Transfer_codec_context_guard codec_guard;
+  /*
+    Keep the prewarm pool paused so no worker can be active at the corrupt
+    frame: this test pins the quiesced immediate-cleanup contract.  The
+    active-worker deferred variant is covered by the abort/commit failure
+    deferral tests and the F1a MTR cases.
+  */
+  preserve_trx_transfer_set_prewarm_paused_for_unit_test(true);
+  auto restore_pause = create_scope_guard([] {
+    preserve_trx_transfer_set_prewarm_paused_for_unit_test(false);
+  });
   const uint64_t transfer_token = 107;
   Preserve_snapshot_metadata meta = metadata();
   meta.token = test_transfer_token_string(transfer_token);
@@ -20388,6 +20421,12 @@ TEST_F(PreserveSnapshotTest,
 TEST_F(PreserveSnapshotTest,
        TransferReceiverStrictCommitWithoutTrxIdStoreProofFailsBeforeSavedFact) {
   Transfer_codec_context_guard codec_guard;
+  /* Keep the prewarm pool paused: this test pins the quiesced immediate
+     cleanup contract; the active-worker deferral is covered elsewhere. */
+  preserve_trx_transfer_set_prewarm_paused_for_unit_test(true);
+  auto restore_pause = create_scope_guard([] {
+    preserve_trx_transfer_set_prewarm_paused_for_unit_test(false);
+  });
   preserved_trx_promotion_ready_cache_clear_for_unit_test();
   auto clear_ready_cache = create_scope_guard(
       [] { preserved_trx_promotion_ready_cache_clear_for_unit_test(); });
@@ -21920,6 +21959,12 @@ TEST_F(PreserveSnapshotTest,
 TEST_F(PreserveSnapshotTest,
        TransferReceiverCommitEpochRejectsUnsealedReceivingToken) {
   Transfer_codec_context_guard codec_guard;
+  /* Keep the prewarm pool paused: this test pins the quiesced immediate
+     cleanup contract; the active-worker deferral is covered elsewhere. */
+  preserve_trx_transfer_set_prewarm_paused_for_unit_test(true);
+  auto restore_pause = create_scope_guard([] {
+    preserve_trx_transfer_set_prewarm_paused_for_unit_test(false);
+  });
   auto build_bundle = [&](uint64_t transfer_token, Preserved_trx_bundle *bundle,
                           Preserve_trx_transfer_manifest *manifest,
                           std::vector<Preserve_trx_transfer_object_payload>
@@ -22509,6 +22554,71 @@ TEST_F(PreserveSnapshotTest,
     last_sequence_for_610 = entry.second;
   }
   EXPECT_EQ(2U, last_sequence_for_610);
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferReceiverBatchFailureMergeHardFailureWinsOverSoft) {
+  const auto merge = &merge_receiver_batch_failure;
+  const auto kSoft = Preserve_trx_transfer_status::RESOURCE_EXHAUSTED;
+  const auto kCorrupt = Preserve_trx_transfer_status::CORRUPT;
+  const auto kIo = Preserve_trx_transfer_status::IO_ERROR;
+  // First reporter wins among same-class results.
+  EXPECT_EQ(kSoft, merge(Preserve_trx_transfer_status::OK, kSoft));
+  EXPECT_EQ(kCorrupt, merge(Preserve_trx_transfer_status::OK, kCorrupt));
+  EXPECT_EQ(kSoft, merge(kSoft, kSoft));
+  EXPECT_EQ(kCorrupt, merge(kCorrupt, kIo));
+  // A hard failure always upgrades a recorded soft failure, never reverse.
+  EXPECT_EQ(kCorrupt, merge(kSoft, kCorrupt));
+  EXPECT_EQ(kIo, merge(kSoft, kIo));
+  EXPECT_EQ(kCorrupt, merge(kCorrupt, kSoft));
+  EXPECT_EQ(kIo, merge(kIo, kSoft));
+}
+
+struct Transfer_receiver_soft_then_hard_probe {
+  std::mutex mutex;
+  std::condition_variable condition;
+  bool soft_returned{false};
+};
+
+static Preserve_trx_transfer_status transfer_receiver_soft_then_hard_apply(
+    const Preserve_trx_transfer_frame &frame, void *context) {
+  auto *probe = static_cast<Transfer_receiver_soft_then_hard_probe *>(context);
+  if (frame.token == 631) {
+    // Soft failure: report, then hand over to the hard-failure worker.
+    {
+      std::lock_guard<std::mutex> guard(probe->mutex);
+      probe->soft_returned = true;
+    }
+    probe->condition.notify_all();
+    return Preserve_trx_transfer_status::RESOURCE_EXHAUSTED;
+  }
+  // Hard failure: only report after the soft failure has been recorded.
+  {
+    std::unique_lock<std::mutex> lock(probe->mutex);
+    probe->condition.wait(lock, [&] { return probe->soft_returned; });
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  return Preserve_trx_transfer_status::CORRUPT;
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferReceiverBatchWorkersSoftFailureNeverMasksHardFailure) {
+  std::vector<Preserve_trx_transfer_frame> frames;
+  auto add_frame = [&](uint64_t token) {
+    Preserve_trx_transfer_frame frame;
+    frame.type = Preserve_trx_transfer_frame_type::OBJECT_CHUNK;
+    frame.epoch_id = "epoch-batch-soft-hard";
+    frame.token = token;
+    frame.sequence = 1;
+    frames.push_back(frame);
+  };
+  add_frame(631);  // soft: RESOURCE_EXHAUSTED, returns first
+  add_frame(632);  // hard: CORRUPT, returns strictly after the soft failure
+
+  Transfer_receiver_soft_then_hard_probe probe;
+  EXPECT_EQ(Preserve_trx_transfer_status::CORRUPT,
+            preserve_trx_transfer_apply_receiver_frame_batch_with_workers(
+                frames, 2, transfer_receiver_soft_then_hard_apply, &probe));
 }
 
 TEST_F(PreserveSnapshotTest,
@@ -25530,6 +25640,38 @@ TEST(PreservedTrxDrainHandoff,
   EXPECT_TRUE(ownership.resolve_not_committed_clean());
   ASSERT_TRUE(ownership.complete_source_restore());
   EXPECT_EQ(Preserve_trx_drain_terminal::SOURCE_RESTORED, ownership.state());
+}
+
+TEST(PreservedTrxDrainHandoff, LocalRestoreClaimFromRunningIsExclusive) {
+  Preserve_trx_drain_ownership_state ownership;
+  EXPECT_EQ(Preserve_trx_drain_terminal::RUNNING, ownership.state());
+  ASSERT_TRUE(ownership.claim_local_restore());
+  EXPECT_EQ(Preserve_trx_drain_terminal::SOURCE_RESTORE_PENDING,
+            ownership.state());
+  /* A late RESET joins instead of preempting the claimed local restore. */
+  EXPECT_EQ(Preserve_trx_drain_reset_request::JOINED,
+            ownership.request_reset());
+  ASSERT_TRUE(ownership.complete_source_restore());
+  EXPECT_EQ(Preserve_trx_drain_terminal::SOURCE_RESTORED, ownership.state());
+}
+
+TEST(PreservedTrxDrainHandoff, LocalRestoreClaimYieldsToWonReset) {
+  Preserve_trx_drain_ownership_state ownership;
+  ASSERT_EQ(Preserve_trx_drain_reset_request::WON, ownership.request_reset());
+  EXPECT_FALSE(ownership.claim_local_restore());
+  /* The RESET winner owns the restore path. */
+  ASSERT_TRUE(ownership.begin_source_restore());
+  EXPECT_EQ(Preserve_trx_drain_terminal::SOURCE_RESTORE_PENDING,
+            ownership.state());
+}
+
+TEST(PreservedTrxDrainHandoff, LocalRestoreClaimRejectedAfterCommitSend) {
+  Preserve_trx_drain_ownership_state ownership;
+  ASSERT_TRUE(ownership.begin_commit_send());
+  EXPECT_EQ(Preserve_trx_drain_terminal::HANDOFF_PENDING, ownership.state());
+  EXPECT_FALSE(ownership.claim_local_restore());
+  ASSERT_TRUE(ownership.acknowledge_commit());
+  EXPECT_FALSE(ownership.claim_local_restore());
 }
 
 TEST(PreservedTrxDrainHandoff,

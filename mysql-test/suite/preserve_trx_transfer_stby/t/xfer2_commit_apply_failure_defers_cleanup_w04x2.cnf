@@ -1,0 +1,9 @@
+!include ../my.cnf
+
+[mysqld.1]
+skip-log-bin
+rds-preserve-trx-transfer-runtime-profile=PROMOTION_PREPARE
+
+[mysqld.2]
+skip-log-bin
+rds-preserve-trx-transfer-runtime-profile=PROMOTION_PREPARE

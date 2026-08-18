@@ -1,9 +1,0 @@
---disable_query_log
---disable_result_log
-SELECT @@GLOBAL.preserve_trx_max_temp_sidecar_bytes;
---enable_result_log
---enable_query_log
-SET GLOBAL preserve_trx_max_temp_sidecar_bytes=4294967296;
-SELECT @@GLOBAL.preserve_trx_max_temp_sidecar_bytes;
-SET GLOBAL preserve_trx_max_temp_sidecar_bytes=DEFAULT;
---echo ok

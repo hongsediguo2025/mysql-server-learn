@@ -657,8 +657,27 @@ enum class Preserve_trx_receiver_failure_reason : uint8_t {
   UNSUPPORTED_TOKEN_SEMANTICS,
   TOKEN_RESOURCE_LIMIT,
   PREWARM_DEADLINE,
-  FINAL_FACT_BIND_FAILED
+  FINAL_FACT_BIND_FAILED,
+  TOKEN_CORRUPT_ARTIFACT
 };
+
+/*
+  Deterministic failure merge for parallel receiver frame-apply batches: a
+  hard failure (anything but RESOURCE_EXHAUSTED) always upgrades a recorded
+  soft failure and is never downgraded by a later soft failure; within the
+  same class the first reporter wins. OK never changes a recorded failure and
+  adopts the first incoming failure.
+*/
+inline Preserve_trx_transfer_status merge_receiver_batch_failure(
+    Preserve_trx_transfer_status recorded, Preserve_trx_transfer_status next) {
+  if (next == Preserve_trx_transfer_status::OK) return recorded;
+  if (recorded == Preserve_trx_transfer_status::OK) return next;
+  if (recorded == Preserve_trx_transfer_status::RESOURCE_EXHAUSTED &&
+      next != Preserve_trx_transfer_status::RESOURCE_EXHAUSTED) {
+    return next;
+  }
+  return recorded;
+}
 
 struct Preserve_trx_receiver_failed_token {
   uint64_t token{0};
@@ -796,7 +815,7 @@ class Preserve_trx_transfer_receiver_registry {
   Preserve_trx_transfer_status mark_cleanup_pending(
       const std::string &root_dir, const std::string &epoch_id, uint64_t token,
       uint64_t now_us, Preserve_trx_transfer_receiver_state target_state,
-      const std::string &reason);
+      const std::string &reason, bool keep_objects = false);
   Preserve_trx_transfer_status complete_cleanup_pending(
       const std::string &root_dir, const std::string &epoch_id,
       uint64_t token);
@@ -875,10 +894,22 @@ class Preserve_trx_transfer_receiver_registry {
       const Preserve_trx_transfer_acknowledged_epoch_retirement &retirement);
   Preserve_trx_transfer_status mark_corrupt(const std::string &epoch_id,
                                             uint64_t token,
-                                            const std::string &reason);
+                                            const std::string &reason,
+                                            bool keep_objects = false);
   Preserve_trx_transfer_status mark_aborted(const std::string &epoch_id,
                                             uint64_t token,
-                                            const std::string &reason);
+                                            const std::string &reason,
+                                            bool keep_objects = false);
+  /*
+    Epoch-level derived state (ready cache, strict prepared registry, proofs)
+    that a terminal publish skipped because a prewarm worker was still active
+    is owed a later purge; the receiver reaper completes it once the epoch has
+    no active prewarm worker left.
+  */
+  void note_derived_purge_owed(const std::string &root_dir,
+                               const std::string &epoch_id);
+  std::map<std::string, std::string> derived_purge_owed_epochs() const;
+  void clear_derived_purge_owed(const std::string &epoch_id);
   Preserve_trx_transfer_status mark_object_sealed(
       const std::string &epoch_id, uint64_t token,
       const std::string &object_id);
@@ -978,7 +1009,7 @@ class Preserve_trx_transfer_receiver_registry {
 
   Preserve_trx_transfer_status mark_terminal_locked(
       const Token_key &key, Preserve_trx_transfer_receiver_state state,
-      const std::string &reason);
+      const std::string &reason, bool keep_objects = false);
   Preserve_trx_transfer_status erase_cleaned_epoch(
       const std::string &root_dir, const std::string &epoch_id,
       Preserve_trx_transfer_epoch_lifecycle expected_lifecycle);
@@ -1032,6 +1063,7 @@ class Preserve_trx_transfer_receiver_registry {
   std::map<Token_key, std::map<std::string, Strict_v1_object>>
       m_strict_v1_objects;
   std::map<Token_key, Cleanup_debt> m_cleanup_debts;
+  std::map<std::string, std::string> m_derived_purge_owed_epochs;
   uint64_t m_last_failed_token{0};
   std::string m_last_failed_reason;
   struct Online_epoch {

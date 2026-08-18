@@ -1,0 +1,187 @@
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+# F1a (face 3): a failing COMMIT apply must not purge epoch derived state or
+# delete token staging while a prewarm worker of the token is active past
+# its terminal checks.  Two owners reach one real STANDBY_TRANSFER_SAVE
+# epoch.  A receiver object-prewarm worker parks at
+# xfer2_prewarm_object_read_gate (after the first terminal check, before any
+# lookup/read); the owning COMMIT apply parks at xfer2_commit_gate_a, then a
+# one-shot debug fault fails it (commit_epoch_finalize:CORRUPT).
+#
+# GREEN contract: while the worker is parked, the failure cleanup publishes
+# CORRUPT keeping the in-memory objects, defers staging deletion to exactly
+# one cleanup debt, and skips the epoch-wide derived-state purge; after the
+# load gate is released the worker exits through its terminal checkpoint
+# without reading deleted staging and the debt reaper finishes the cleanup.
+# On old code the failure cleanup deletes staging under the active worker
+# (no debt) and the resumed worker misclassifies the missing files.
+
+--source suite/preserve_trx_transfer_stby/include/w01_setup.inc
+CALL mtr.add_suppression(
+  "PRESERVE: standby transfer source epoch commit failed status=");
+CALL mtr.add_suppression(
+  "PRESERVE: standby transfer source entered COMMIT_UNKNOWN");
+
+--connection xfer2_receiver
+SET GLOBAL rds_preserve_trx_token_retention_timeout_ms=120000;
+SET GLOBAL debug='+d,syncpoint_xfer2_prewarm_object_read_gate,syncpoint_xfer2_commit_gate_a,syncpoint_release_xfer2_prewarm_object_read_gate,syncpoint_release_xfer2_commit_gate_a,preserve_trx_receiver_fail_commit_apply_once';
+
+SET @f1c_terminal_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_terminal_cas_wins');
+SET @f1c_tombstones_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_terminal_status_tombstones');
+SET @f1c_debt_tokens_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_cleanup_debt_tokens');
+SET @f1c_debt_bytes_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_cleanup_debt_bytes');
+SET @f1c_retry_done_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_cleanup_retry_completions');
+SET @f1c_inflight_tokens_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_inflight_tokens');
+SET @f1c_staged_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_staged_memory_bytes');
+SET @f1c_classified_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_auto_prewarm_tokens');
+SET @f1c_seal_before=(SELECT VARIABLE_VALUE+0
+  FROM performance_schema.global_status WHERE VARIABLE_NAME=
+  'Preserve_trx_transfer_receiver_seal_prewarm_tokens');
+
+# Durable source background state outside both W04 transactions.
+--connection default
+UPDATE xfer2_w01_accounts
+   SET balance=balance+1,version=version+1 WHERE id=32;
+
+--connect(xfer2_f1c_owner1,localhost,xfer2_w01_app,,test)
+--let $f1c_owner1_id= query_get_value(SELECT CONNECTION_ID() AS id,id,1)
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+UPDATE xfer2_w01_accounts
+   SET balance=balance-17,version=version+1 WHERE id=1;
+UPDATE xfer2_w01_accounts
+   SET balance=balance+17,version=version+1 WHERE id=2;
+INSERT INTO xfer2_w01_audit(account_id,delta)
+VALUES(1,-17),(2,17);
+SELECT COUNT(*)=2 AND SUM(balance)=2000 AND SUM(version)=2
+         AS owner1_w04_balance_conserved
+  FROM xfer2_w01_accounts WHERE id IN (1,2);
+
+--connect(xfer2_f1c_owner2,localhost,xfer2_w01_app,,test)
+--let $f1c_owner2_id= query_get_value(SELECT CONNECTION_ID() AS id,id,1)
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+UPDATE xfer2_w01_accounts
+   SET balance=balance-23,version=version+1 WHERE id=3;
+UPDATE xfer2_w01_accounts
+   SET balance=balance+23,version=version+1 WHERE id=4;
+INSERT INTO xfer2_w01_audit(account_id,delta)
+VALUES(3,-23),(4,23);
+SELECT COUNT(*)=2 AND SUM(balance)=2000 AND SUM(version)=2
+         AS owner2_w04_balance_conserved
+  FROM xfer2_w01_accounts WHERE id IN (3,4);
+
+# The DRAIN runs synchronously: the final SEAL enqueues the staged prewarm
+# job whose worker parks before the staging load, and the owning COMMIT
+# apply parks at gate A right behind it.
+--connect(xfer2_f1c_drain,localhost,root,,test)
+--replace_result $f1c_owner1_id OWNER1_ID $f1c_owner2_id OWNER2_ID
+--replace_column 1 GENERATION 6 CLOSING_STARTED_US 7 CLOSING_DEADLINE_US
+--send DRAIN TRANSACTIONS PRESERVE
+
+--connection xfer2_receiver
+SET DEBUG_SYNC='now WAIT_FOR reached_xfer2_prewarm_object_read_gate TIMEOUT 60';
+SET DEBUG_SYNC='now WAIT_FOR reached_xfer2_commit_gate_a TIMEOUT 60';
+
+# Release the COMMIT apply: the injected failure makes its cleanup run while
+# the staged worker is still parked before the load.  (All syncpoint_release
+# symbols were armed before the transfer: existing threads snapshot the
+# global dbug list, so late arming would trip the harness invariant abort.)
+SET DEBUG_SYNC='now SIGNAL continue_xfer2_commit_gate_a';
+
+# While the worker is parked, the token cleanup must be deferred to exactly
+# one cleanup debt and the worker must still be active.
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_tokens')>=@f1c_debt_tokens_before+1
+--let $wait_timeout= 30
+--source include/wait_condition_or_abort.inc
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_worker_active')>0
+       AS prewarm_worker_still_active_during_cleanup;
+SELECT VARIABLE_VALUE='epoch_staging_cleanup_deferred:active_prewarm'
+         AS deferred_reason_is_exact
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_last_failed_reason';
+
+# Release the parked worker: it finishes without reading deleted files and
+# the debt reaper completes the cleanup.
+SET DEBUG_SYNC='now SIGNAL continue_xfer2_prewarm_object_read_gate';
+SET GLOBAL debug='-d,syncpoint_xfer2_prewarm_object_read_gate,syncpoint_xfer2_commit_gate_a,syncpoint_release_xfer2_commit_gate_a,syncpoint_release_xfer2_prewarm_object_read_gate,preserve_trx_receiver_fail_commit_apply_once';
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_tokens')=@f1c_debt_tokens_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_retry_completions')>=@f1c_retry_done_before+1 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_worker_active')=0
+--let $wait_timeout= 30
+--source include/wait_condition_or_abort.inc
+
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_tokens')
+       =@f1c_debt_tokens_before AS deferred_debt_completed,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_cleanup_debt_bytes')
+       =@f1c_debt_bytes_before AS deferred_debt_bytes_released,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens')
+       =@f1c_inflight_tokens_before AS inflight_tokens_released,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_staged_memory_bytes')
+       =@f1c_staged_before AS staging_memory_released;
+# The parked worker never reached the staged-token load/classification.
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_tokens')
+       =@f1c_classified_before AS no_classification_for_corrupt_epoch,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_seal_prewarm_tokens')
+       =@f1c_seal_before AS parked_worker_never_loaded_staging;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_status_tombstones')
+       =@f1c_tombstones_before+1 AS bounded_corrupt_tombstone;
+
+--connection xfer2_f1c_drain
+--error ER_PRESERVE_TRX_UNSUPPORTED
+--reap
+
+# F2 source-side settlement: the receiver's definitive CORRUPT tombstone is
+# not a process-bound answer (R8 degradation), so the commit-anchored
+# ABANDON stays undecided until the shared deadline and the source hands off
+# fail-closed as COMMIT_UNKNOWN with the batch quarantined.
+--connection xfer2_source_ha
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_source_commit_unknown_epochs')
+       =1 AS source_entered_commit_unknown,
+       (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+         WHERE VARIABLE_NAME='Preserve_trx_transfer_quarantine_tokens')
+       =2 AS both_tokens_quarantined;
+
+# The owners stay fenced while the epoch is COMMIT_UNKNOWN.
+--connection xfer2_f1c_owner1
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT 1;
+--connection xfer2_f1c_owner2
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT 1;
+
+--connection xfer2_receiver
+--let $receiver_connection= xfer2_receiver
+--source suite/preserve_trx_transfer_stby/include/assert_receiver_quiescent.inc
+
+--disconnect xfer2_f1c_owner1
+--disconnect xfer2_f1c_owner2
+--disconnect xfer2_f1c_drain
+
+--source suite/preserve_trx_transfer_stby/include/w01_teardown.inc
