@@ -76,12 +76,10 @@ UPDATE t_resume_required_mixed SET v=31 WHERE id=3;
 # authenticated by COMMIT_EPOCH. None of the three transaction IDs enters S.
 --connection mixed_source_ha
 SET GLOBAL debug='+d,preserve_trx_early_fail_candidate_finalize';
-SET GLOBAL debug='+d,preserve_trx_transfer_drop_commit_ack_twice';
 --connection default
 DRAIN TRANSACTIONS PRESERVE;
 --connection mixed_source_ha
 SET GLOBAL debug='-d,preserve_trx_early_fail_candidate_finalize';
-SET GLOBAL debug='-d,preserve_trx_transfer_drop_commit_ack_twice';
 
 # The MTR instances have independent datadirs, so neither transferred
 # transaction can acquire the physical dictionary lease required for READY.
@@ -132,6 +130,9 @@ SHUTDOWN;
 --disable_result_log
 
 --connect(mixed_source_cleanup,localhost,root,,test)
+--enable_result_log
+SELECT id, v FROM t_resume_required_mixed ORDER BY id;
+--disable_result_log
 DROP TABLE t_resume_required_mixed;
 DROP USER resume_required_mixed_app@localhost;
 DROP USER preserve_trx_ha_admin@localhost;

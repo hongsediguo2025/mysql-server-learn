@@ -1,0 +1,8 @@
+include/assert.inc [source restore keeps the original idle connection alive]
+include/assert.inc [pre-send failure must not enter COMMIT_UNKNOWN]
+include/assert.inc [pre-send failure must not leave an accepted receiver epoch]
+id	v
+1	20
+2	21
+control_only_unsent_ack_restore
+ok

@@ -1,0 +1,10 @@
+include/assert.inc [RESET winner preserves the original transaction connection]
+include/assert.inc [source restore claimant preserves the original transaction connection]
+include/assert.inc [neither pre-send failure enters COMMIT_UNKNOWN]
+id	v
+1	21
+2	22
+3	41
+4	44
+unsent_transaction_restore_reset_race
+ok

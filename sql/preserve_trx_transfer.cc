@@ -2446,8 +2446,57 @@ class Preserve_trx_transfer_client_frame_sink final
     if (connection == nullptr) {
       return Preserve_trx_transfer_status::IO_ERROR;
     }
+#ifndef DBUG_OFF
+    if (debug_drop_commit_send(encoded_frame)) {
+      return Preserve_trx_transfer_status::ACK_UNCERTAIN;
+    }
+#endif
     return m_ops->send_frame(connection, encoded_frame, ack);
   }
+
+#ifndef DBUG_OFF
+  bool debug_drop_commit_send(const std::string &encoded_frame) {
+    Preserve_trx_transfer_frame frame;
+    if (preserve_trx_transfer_decode_frame(encoded_frame, &frame) !=
+            Preserve_trx_transfer_status::OK ||
+        frame.type != Preserve_trx_transfer_frame_type::COMMIT_EPOCH) {
+      return false;
+    }
+    if (!m_debug_commit_send_drop_budget_loaded) {
+      m_debug_commit_send_drop_budget_loaded = true;
+      DBUG_EXECUTE_IF("preserve_trx_transfer_drop_commit_send_twice",
+                      { m_debug_commit_send_drop_remaining = 2; });
+    }
+    if (m_debug_commit_send_drop_remaining == 0) return false;
+    --m_debug_commit_send_drop_remaining;
+    DEBUG_SYNC(current_thd, "preserve_trx_transfer_commit_send_dropped");
+    return true;
+  }
+
+  bool debug_drop_verified_commit_ack(
+      const std::string &encoded_frame,
+      Preserve_trx_transfer_status status) {
+    if (!transfer_status_has_authenticated_ack(status)) return false;
+    Preserve_trx_transfer_frame frame;
+    if (preserve_trx_transfer_decode_frame(encoded_frame, &frame) !=
+            Preserve_trx_transfer_status::OK ||
+        frame.type != Preserve_trx_transfer_frame_type::COMMIT_EPOCH) {
+      return false;
+    }
+    if (!m_debug_commit_ack_drop_budget_loaded) {
+      m_debug_commit_ack_drop_budget_loaded = true;
+      DBUG_EXECUTE_IF("preserve_trx_transfer_drop_commit_ack_once",
+                      { m_debug_commit_ack_drop_remaining = 1; });
+      DBUG_EXECUTE_IF("preserve_trx_transfer_drop_commit_ack_twice",
+                      { m_debug_commit_ack_drop_remaining = 2; });
+    }
+    if (m_debug_commit_ack_drop_remaining == 0) return false;
+    --m_debug_commit_ack_drop_remaining;
+    DEBUG_SYNC(current_thd,
+               "preserve_trx_transfer_verified_commit_ack_dropped");
+    return true;
+  }
+#endif
 
   Preserve_trx_transfer_status send_encoded_frame_on_connection(
       const std::string &encoded_frame, size_t connection_index,
@@ -2495,10 +2544,18 @@ class Preserve_trx_transfer_client_frame_sink final
           disconnect_owned_connection(connection_index);
           return Preserve_trx_transfer_status::CORRUPT;
         }
-        if (out_ack != nullptr) *out_ack = ack;
-        uncertain_payload.clear();
+#ifndef DBUG_OFF
+        if (debug_drop_verified_commit_ack(encoded_frame, status)) {
+          status = Preserve_trx_transfer_status::ACK_UNCERTAIN;
+        } else
+#endif
+        {
+          if (out_ack != nullptr) *out_ack = ack;
+          uncertain_payload.clear();
+          return status;
+        }
       }
-      return status;
+      if (status != Preserve_trx_transfer_status::ACK_UNCERTAIN) return status;
     }
 
     /* An uncertain response retries the exact encoded payload and sequence. */
@@ -2528,9 +2585,16 @@ class Preserve_trx_transfer_client_frame_sink final
         disconnect_owned_connection(connection_index);
         return Preserve_trx_transfer_status::CORRUPT;
       }
-      if (out_ack != nullptr) *out_ack = ack;
-      uncertain_payload.clear();
-      return status;
+#ifndef DBUG_OFF
+      if (debug_drop_verified_commit_ack(encoded_frame, status)) {
+        status = Preserve_trx_transfer_status::ACK_UNCERTAIN;
+      } else
+#endif
+      {
+        if (out_ack != nullptr) *out_ack = ack;
+        uncertain_payload.clear();
+        return status;
+      }
     }
     if (status == Preserve_trx_transfer_status::IO_ERROR ||
         status == Preserve_trx_transfer_status::ACK_UNCERTAIN) {
@@ -2668,6 +2732,12 @@ class Preserve_trx_transfer_client_frame_sink final
   uint64_t m_absolute_monotonic_deadline_us{0};
   std::atomic<uint> m_reconnect_attempts{0};
   std::atomic<bool> m_cancel_requested{false};
+#ifndef DBUG_OFF
+  bool m_debug_commit_send_drop_budget_loaded{false};
+  uint m_debug_commit_send_drop_remaining{0};
+  bool m_debug_commit_ack_drop_budget_loaded{false};
+  uint m_debug_commit_ack_drop_remaining{0};
+#endif
 };
 
 std::string normalize_dir(const std::string &dir) {
@@ -6274,18 +6344,20 @@ static Preserve_trx_transfer_status build_session_only_token_set(
 }
 
 Preserve_trx_transfer_resume_handoff
-preserve_trx_transfer_resume_handoff_for_token(const std::string &token) {
+preserve_trx_transfer_begin_resume_handoff_for_token(
+    const std::string &token, bool transaction_candidate) {
   if (token.empty() || token.front() == '0' ||
       std::any_of(token.begin(), token.end(),
                   [](unsigned char value) { return !std::isdigit(value); })) {
-    return default_receiver_registry().resume_handoff(0);
+    return default_receiver_registry().begin_resume_handoff(0, false);
   }
   uint64_t parsed = 0;
   if (!parse_uint64_strict(token, &parsed) || parsed == 0 ||
       std::to_string(parsed) != token) {
-    return default_receiver_registry().resume_handoff(0);
+    return default_receiver_registry().begin_resume_handoff(0, false);
   }
-  return default_receiver_registry().resume_handoff(parsed);
+  return default_receiver_registry().begin_resume_handoff(
+      parsed, transaction_candidate);
 }
 
 bool preserve_trx_transfer_consume_session_only_token(
@@ -6297,18 +6369,9 @@ bool preserve_trx_transfer_consume_session_only_token(
       handoff.token, handoff.epoch_id, handoff.generation);
 }
 
-bool preserve_trx_transfer_claim_transaction_handoff(
-    const Preserve_trx_transfer_resume_handoff &handoff) {
-  if (!handoff.available || handoff.session_only || handoff.token == 0) {
-    return false;
-  }
-  return default_receiver_registry().claim_transaction_handoff(
-      handoff.token, handoff.epoch_id, handoff.generation);
-}
-
 void preserve_trx_transfer_release_transaction_handoff(
     const Preserve_trx_transfer_resume_handoff &handoff) {
-  if (!handoff.available || handoff.session_only || handoff.token == 0) return;
+  if (!handoff.transaction_claimed || handoff.token == 0) return;
   default_receiver_registry().release_transaction_handoff(handoff.token,
                                                           handoff.generation);
 }
@@ -9080,6 +9143,22 @@ Preserve_trx_transfer_receiver_registry::publish_control_only_epoch(
       transfer_digest_is_zero(fact_digest) || now_us == 0) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
+#ifndef DBUG_OFF
+  bool inject_resource_exhausted = false;
+  DBUG_EXECUTE_IF(
+      "preserve_trx_receiver_control_only_publish_resource_exhausted_once", {
+        inject_resource_exhausted =
+            !m_debug_control_only_resource_exhausted_consumed.exchange(true);
+      });
+  if (inject_resource_exhausted) {
+    LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
+           ("PRESERVE: debug injected control-only publish "
+            "RESOURCE_EXHAUSTED epoch=" +
+            epoch_id)
+               .c_str());
+    return Preserve_trx_transfer_status::RESOURCE_EXHAUSTED;
+  }
+#endif
   std::unordered_set<uint64_t> next_session_only_tokens;
   Preserve_trx_transfer_status status = build_session_only_token_set(
       session_only_tokens, &next_session_only_tokens);
@@ -9149,16 +9228,35 @@ void Preserve_trx_transfer_receiver_registry::publish_active_session_only_set(
 }
 
 Preserve_trx_transfer_resume_handoff
-Preserve_trx_transfer_receiver_registry::resume_handoff(uint64_t token) const {
+Preserve_trx_transfer_receiver_registry::begin_resume_handoff(
+    uint64_t token, bool transaction_candidate) {
   Preserve_trx_transfer_resume_handoff handoff;
-  std::lock_guard<std::mutex> guard(m_session_only_mutex);
-  if (!m_active_session_only_set_valid) return handoff;
-  handoff.available = true;
-  handoff.session_only =
-      token != 0 && m_active_session_only_tokens.count(token) != 0;
   handoff.token = token;
-  handoff.epoch_id = m_active_session_only_epoch_id;
-  handoff.generation = m_active_session_only_generation;
+  std::lock_guard<std::mutex> guard(m_session_only_mutex);
+  try {
+    if (m_active_session_only_set_valid) {
+      handoff.epoch_id = m_active_session_only_epoch_id;
+      handoff.available = true;
+      handoff.session_only =
+          token != 0 && m_active_session_only_tokens.count(token) != 0;
+      handoff.generation = m_active_session_only_generation;
+    }
+    if (token == 0 || !transaction_candidate || handoff.session_only) {
+      return handoff;
+    }
+    for (const auto &claim : m_transaction_handoff_claims) {
+      if (claim.second == token) return handoff;
+    }
+    handoff.transaction_claimed =
+        m_transaction_handoff_claims.insert({handoff.generation, token})
+            .second;
+  } catch (...) {
+    handoff.available = false;
+    handoff.session_only = false;
+    handoff.transaction_claimed = false;
+    handoff.epoch_id.clear();
+    handoff.generation = 0;
+  }
   return handoff;
 }
 
@@ -9181,30 +9279,9 @@ bool Preserve_trx_transfer_receiver_registry::consume_session_only_token(
   return true;
 }
 
-bool Preserve_trx_transfer_receiver_registry::claim_transaction_handoff(
-    uint64_t token, const std::string &epoch_id, uint64_t generation) {
-  if (token == 0 || epoch_id.empty() || generation == 0) return false;
-
-  std::lock_guard<std::mutex> guard(m_session_only_mutex);
-  if (!m_active_session_only_set_valid ||
-      epoch_id != m_active_session_only_epoch_id ||
-      generation != m_active_session_only_generation ||
-      m_active_session_only_tokens.count(token) != 0) {
-    return false;
-  }
-  for (const auto &claim : m_transaction_handoff_claims) {
-    if (claim.second == token) return false;
-  }
-  try {
-    return m_transaction_handoff_claims.insert({generation, token}).second;
-  } catch (...) {
-    return false;
-  }
-}
-
 void Preserve_trx_transfer_receiver_registry::release_transaction_handoff(
     uint64_t token, uint64_t generation) {
-  if (token == 0 || generation == 0) return;
+  if (token == 0) return;
   std::lock_guard<std::mutex> guard(m_session_only_mutex);
   m_transaction_handoff_claims.erase({generation, token});
 }
@@ -13744,6 +13821,17 @@ Preserve_trx_transfer_source_epoch_session::commit_epoch_impl(
       status == Preserve_trx_transfer_status::OK &&
       send_pending_final_metadata;
 
+#ifndef DBUG_OFF
+  if (!m_debug_commit_before_send_failure_consumed) {
+    DBUG_EXECUTE_IF("preserve_trx_transfer_fail_commit_before_send_once", {
+      m_debug_commit_before_send_failure_consumed = true;
+      status = Preserve_trx_transfer_status::ACK_UNCERTAIN;
+      DEBUG_SYNC(current_thd,
+                 "preserve_trx_transfer_commit_before_send_failed");
+    });
+  }
+#endif
+
   uint64_t ack_start_us = 0;
   uint64_t ack_end_us = 0;
   if (status == Preserve_trx_transfer_status::OK) {
@@ -13769,28 +13857,6 @@ Preserve_trx_transfer_source_epoch_session::commit_epoch_impl(
         } catch (...) {
           status = Preserve_trx_transfer_status::UNSUPPORTED;
         }
-#ifndef DBUG_OFF
-        /*
-          Debug-only ACK-loss injections: the COMMIT frame was delivered (the
-          send succeeded above), but the source pretends the ACK never
-          arrived.  The status-query resolution must then observe the
-          receiver's committed state without re-applying the replacement.
-        */
-        if (status == Preserve_trx_transfer_status::OK) {
-          bool drop_this_ack = false;
-          DBUG_EXECUTE_IF("preserve_trx_transfer_drop_commit_ack_once", {
-            static std::atomic<bool> consumed{false};
-            if (!consumed.exchange(true)) drop_this_ack = true;
-          });
-          DBUG_EXECUTE_IF("preserve_trx_transfer_drop_commit_ack_twice", {
-            static std::atomic<uint> consumed{0};
-            if (consumed.fetch_add(1) < 2) drop_this_ack = true;
-          });
-          if (drop_this_ack) {
-            status = Preserve_trx_transfer_status::ACK_UNCERTAIN;
-          }
-        }
-#endif
         ack_end_us = transfer_monotonic_us();
       }
     }
@@ -17407,6 +17473,9 @@ preserve_trx_transfer_apply_receiver_frame_internal(
         root_dir, frame.epoch_id, frame.sequence, commit_frame_digest,
         frame.terminal_fact_digest, transfer_monotonic_us(),
         session_only_tokens);
+    if (status == Preserve_trx_transfer_status::RESOURCE_EXHAUSTED) {
+      return status;
+    }
     if (status != Preserve_trx_transfer_status::OK) {
       return fail_commit_epoch(status, "control_only_commit_publish_failed");
     }

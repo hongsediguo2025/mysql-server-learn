@@ -1,3 +1,7 @@
 include/assert.inc [mixed receiver prewarm has exactly two not-ready tokens]
+id	v
+1	10
+2	20
+3	30
 resume_required_mixed
 ok

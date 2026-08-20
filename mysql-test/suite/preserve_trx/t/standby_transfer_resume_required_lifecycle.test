@@ -1,4 +1,5 @@
 --source include/have_debug.inc
+--source include/have_debug_sync.inc
 --source include/not_windows.inc
 --source include/force_restart.inc
 
@@ -20,7 +21,8 @@ CREATE USER preserve_trx_ha_admin@localhost
   IDENTIFIED BY 'resume-required-lifecycle-secret';
 GRANT PRESERVE_TRX_TRANSFER_ADMIN,
       RESUME_ANY_PRESERVED_TRANSACTION,
-      PROCESS ON *.* TO preserve_trx_ha_admin@localhost;
+      PROCESS, SYSTEM_VARIABLES_ADMIN ON *.*
+  TO preserve_trx_ha_admin@localhost;
 GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
 GRANT CREATE TEMPORARY TABLES ON test.*
   TO preserve_trx_ha_admin@localhost;
@@ -57,7 +59,7 @@ CREATE TABLE t_resume_required_lifecycle(
   id INT PRIMARY KEY,
   v INT NOT NULL
 ) ENGINE=InnoDB;
-INSERT INTO t_resume_required_lifecycle VALUES(1,10);
+INSERT INTO t_resume_required_lifecycle VALUES(1,10),(2,20);
 
 --connect(required_source_ha,localhost,preserve_trx_ha_admin,resume-required-lifecycle-secret,test)
 --connect(required_source_txn,localhost,resume_required_app,,test)
@@ -148,20 +150,46 @@ SHUTDOWN;
 
 --connect(required_source_ha_second,localhost,preserve_trx_ha_admin,resume-required-lifecycle-secret,test)
 --connect(required_source_drain_second,localhost,root,,test)
+--connect(required_source_idle_second,localhost,resume_required_app,,test)
+--let $idle_second_id= query_get_value(SELECT CONNECTION_ID() AS id, id, 1)
+UPDATE t_resume_required_lifecycle SET v=21 WHERE id=2;
 # Lose the first control-only COMMIT ACK. Status-query resolution must observe
 # the committed receiver state without applying the replacement twice.
---connection required_source_ha_second
-SET GLOBAL debug='+d,preserve_trx_transfer_drop_commit_ack_once';
 --connection required_source_drain_second
-DRAIN TRANSACTIONS PRESERVE;
+SET SESSION debug='+d,preserve_trx_transfer_drop_commit_ack_once';
+SET DEBUG_SYNC=
+  'preserve_trx_transfer_verified_commit_ack_dropped SIGNAL lifecycle_ack_dropped';
+--send DRAIN TRANSACTIONS PRESERVE
 --connection required_source_ha_second
-SET GLOBAL debug='-d,preserve_trx_transfer_drop_commit_ack_once';
+SET DEBUG_SYNC='now WAIT_FOR lifecycle_ack_dropped TIMEOUT 30';
+--connection required_source_drain_second
+--reap
 
 --connection required_receiver_resume
 --error ER_PRESERVE_TRX_HANDOFF_UNAVAILABLE
 --eval RESUME PRESERVED TRANSACTION '$txn_id'
 --error ER_PRESERVE_TRX_HANDOFF_UNAVAILABLE
 --eval RESUME PRESERVED TRANSACTION '$idle_spare_id'
+
+# Park the successful consume after the token is erased. A concurrent receiver
+# must observe the one-shot removal, not consume the same source session.
+--connection required_receiver_resume
+SET DEBUG_SYNC=
+  'preserve_trx_session_only_after_consume_before_reply SIGNAL lifecycle_session_consumed WAIT_FOR lifecycle_session_reply';
+--send_eval RESUME PRESERVED TRANSACTION '$idle_second_id'
+--connection required_receiver_admin
+SET DEBUG_SYNC='now WAIT_FOR lifecycle_session_consumed TIMEOUT 30';
+--connection required_receiver_replay
+--error ER_PRESERVE_TRX_HANDOFF_UNAVAILABLE
+--eval RESUME PRESERVED TRANSACTION '$idle_second_id'
+--connection required_receiver_admin
+SET DEBUG_SYNC='now SIGNAL lifecycle_session_reply';
+--connection required_receiver_resume
+--reap
+SET DEBUG_SYNC='RESET';
+--connection required_receiver_replay
+--error ER_PRESERVE_TRX_HANDOFF_UNAVAILABLE
+--eval RESUME PRESERVED TRANSACTION '$idle_second_id'
 
 --connection required_source_ha_second
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
@@ -176,6 +204,9 @@ SHUTDOWN;
 --disable_result_log
 
 --connect(required_source_cleanup,localhost,root,,test)
+--enable_result_log
+SELECT id,v FROM t_resume_required_lifecycle ORDER BY id;
+--disable_result_log
 DROP TABLE t_resume_required_lifecycle;
 DROP USER resume_required_app@localhost;
 DROP USER preserve_trx_ha_admin@localhost;

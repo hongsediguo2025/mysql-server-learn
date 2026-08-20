@@ -1,0 +1,7 @@
+include/assert.inc [clean arbitration preserves the original transaction connection]
+include/assert.inc [NOT_COMMITTED_CLEAN does not enter COMMIT_UNKNOWN]
+id	v
+1	21
+2	22
+not_committed_clean_reset_barrier
+ok

@@ -7481,6 +7481,150 @@ TEST(PreservedTrxTransfer,
   EXPECT_EQ(4, client_state.send_count);
 }
 
+#ifndef DBUG_OFF
+TEST(PreservedTrxTransfer,
+     ConfiguredFrameSinkDropsVerifiedCommitAckInsideRetryStateMachine) {
+  Transfer_source_config_guard config;
+  config.tcp("127.0.0.1", 3307, "transfer_user",
+             "transfer_credential");
+  Fake_transfer_client_state client_state;
+  Transfer_client_ops_guard client_ops(&client_state);
+
+  Preserve_trx_transfer_frame commit;
+  commit.type = Preserve_trx_transfer_frame_type::COMMIT_EPOCH;
+  commit.sequence = 23;
+  commit.epoch_id =
+      preserve_trx_transfer_make_epoch_id_for_unit_test("debug-ack-loss");
+  commit.token = 831;
+  commit.chunk_offset = 140;
+  commit.terminal_fact_digest[0] = 0x7c;
+  std::string encoded_commit;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_encode_frame(commit, &encoded_commit));
+
+  DBUG_SET("+d,preserve_trx_transfer_drop_commit_ack_once");
+  auto reset_debug = create_scope_guard(
+      [] { DBUG_SET("-d,preserve_trx_transfer_drop_commit_ack_once"); });
+  client_state.scripted_send_statuses = {
+      Preserve_trx_transfer_status::COMMITTED_NOT_READY,
+      Preserve_trx_transfer_status::COMMITTED_NOT_READY};
+  std::unique_ptr<Preserve_trx_transfer_encoded_frame_sink> sink;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_make_configured_frame_sink(&sink));
+  EXPECT_EQ(Preserve_trx_transfer_status::COMMITTED_NOT_READY,
+            sink->send_encoded_frame(encoded_commit));
+  ASSERT_EQ(2U, client_state.frames.size());
+  EXPECT_EQ(client_state.frames[0], client_state.frames[1]);
+
+  DBUG_SET("-d,preserve_trx_transfer_drop_commit_ack_once");
+  DBUG_SET("+d,preserve_trx_transfer_drop_commit_ack_twice");
+  client_state.frames.clear();
+  client_state.scripted_send_statuses = {
+      Preserve_trx_transfer_status::COMMITTED_NOT_READY,
+      Preserve_trx_transfer_status::COMMITTED_NOT_READY,
+      Preserve_trx_transfer_status::COMMITTED_NOT_READY};
+  sink.reset();
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_make_configured_frame_sink(&sink));
+  EXPECT_EQ(Preserve_trx_transfer_status::COMMITTED_NOT_READY,
+            sink->send_encoded_frame(encoded_commit));
+  ASSERT_EQ(3U, client_state.frames.size());
+  EXPECT_EQ(client_state.frames[0], client_state.frames[1]);
+  Preserve_trx_transfer_frame query;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_decode_frame(client_state.frames[2],
+                                               &query));
+  EXPECT_EQ(Preserve_trx_transfer_frame_type::QUERY_EPOCH_STATUS, query.type);
+  DBUG_SET("-d,preserve_trx_transfer_drop_commit_ack_twice");
+}
+
+TEST(PreservedTrxTransfer,
+     ConfiguredFrameSinkAckLossBudgetRearmsForEachSink) {
+  Transfer_source_config_guard config;
+  config.tcp("127.0.0.1", 3307, "transfer_user",
+             "transfer_credential");
+  Fake_transfer_client_state client_state;
+  Transfer_client_ops_guard client_ops(&client_state);
+
+  Preserve_trx_transfer_frame commit;
+  commit.type = Preserve_trx_transfer_frame_type::COMMIT_EPOCH;
+  commit.sequence = 24;
+  commit.epoch_id = preserve_trx_transfer_make_epoch_id_for_unit_test(
+      "debug-ack-loss-rearm");
+  commit.token = 832;
+  commit.chunk_offset = 140;
+  commit.terminal_fact_digest[0] = 0x7d;
+  std::string encoded_commit;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_encode_frame(commit, &encoded_commit));
+
+  DBUG_SET("+d,preserve_trx_transfer_drop_commit_ack_once");
+  auto reset_debug = create_scope_guard(
+      [] { DBUG_SET("-d,preserve_trx_transfer_drop_commit_ack_once"); });
+  client_state.scripted_send_statuses = {
+      Preserve_trx_transfer_status::COMMITTED_NOT_READY,
+      Preserve_trx_transfer_status::COMMITTED_NOT_READY,
+      Preserve_trx_transfer_status::COMMITTED_NOT_READY,
+      Preserve_trx_transfer_status::COMMITTED_NOT_READY};
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    std::unique_ptr<Preserve_trx_transfer_encoded_frame_sink> sink;
+    ASSERT_EQ(Preserve_trx_transfer_status::OK,
+              preserve_trx_transfer_make_configured_frame_sink(&sink));
+    EXPECT_EQ(Preserve_trx_transfer_status::COMMITTED_NOT_READY,
+              sink->send_encoded_frame(encoded_commit));
+  }
+  ASSERT_EQ(4U, client_state.frames.size());
+  EXPECT_EQ(client_state.frames[0], client_state.frames[1]);
+  EXPECT_EQ(client_state.frames[2], client_state.frames[3]);
+}
+
+TEST(PreservedTrxTransfer,
+     ConfiguredFrameSinkReconcilesTwoCommitSendFailuresWithAbandon) {
+  Transfer_source_config_guard config;
+  config.tcp("127.0.0.1", 3307, "transfer_user",
+             "transfer_credential");
+  Fake_transfer_client_state client_state;
+  client_state.scripted_send_statuses = {
+      Preserve_trx_transfer_status::NOT_COMMITTED,
+      Preserve_trx_transfer_status::NOT_COMMITTED_CLEAN};
+  Transfer_client_ops_guard client_ops(&client_state);
+
+  Preserve_trx_transfer_frame commit;
+  commit.type = Preserve_trx_transfer_frame_type::COMMIT_EPOCH;
+  commit.sequence = 25;
+  commit.epoch_id = preserve_trx_transfer_make_epoch_id_for_unit_test(
+      "debug-commit-send-loss");
+  commit.token = 833;
+  commit.chunk_offset = 140;
+  commit.terminal_fact_digest[0] = 0x7e;
+  std::string encoded_commit;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_encode_frame(commit, &encoded_commit));
+
+  DBUG_SET("+d,preserve_trx_transfer_drop_commit_send_twice");
+  auto reset_debug = create_scope_guard(
+      [] { DBUG_SET("-d,preserve_trx_transfer_drop_commit_send_twice"); });
+  std::unique_ptr<Preserve_trx_transfer_encoded_frame_sink> sink;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_make_configured_frame_sink(&sink));
+  EXPECT_EQ(Preserve_trx_transfer_status::NOT_COMMITTED_CLEAN,
+            sink->send_encoded_frame(encoded_commit));
+  ASSERT_EQ(2U, client_state.frames.size());
+  Preserve_trx_transfer_frame query;
+  Preserve_trx_transfer_frame abandon;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_decode_frame(client_state.frames[0],
+                                               &query));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_decode_frame(client_state.frames[1],
+                                               &abandon));
+  EXPECT_EQ(Preserve_trx_transfer_frame_type::QUERY_EPOCH_STATUS, query.type);
+  EXPECT_EQ(
+      Preserve_trx_transfer_frame_type::ABANDON_EPOCH_IF_NOT_COMMITTED,
+      abandon.type);
+}
+#endif
+
 TEST(PreservedTrxTransfer,
      ConfiguredFrameSinkQueriesCurrentProcessAcceptanceAfterCommitAckUncertain) {
   Transfer_source_config_guard config;
@@ -15853,6 +15997,264 @@ TEST_F(PreserveSnapshotTest, ReceiverTerminalCasDuplicateCommitIsIdempotent) {
             registry.query_epoch_terminal(
                 m_dir, "epoch-terminal-duplicate", &terminal));
 }
+
+TEST(PreservedTrxTransfer, SessionOnlyTokenCodecRoundTripsCanonicalPayload) {
+  std::string encoded;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_encode_session_only_tokens({}, &encoded));
+  std::vector<uint64_t> decoded{99};
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_decode_session_only_tokens(encoded,
+                                                               &decoded));
+  EXPECT_TRUE(decoded.empty());
+
+  const std::vector<uint64_t> tokens{1, 7, 42, 9001};
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_encode_session_only_tokens(tokens,
+                                                               &encoded));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_decode_session_only_tokens(encoded,
+                                                               &decoded));
+  EXPECT_EQ(tokens, decoded);
+}
+
+TEST(PreservedTrxTransfer, SessionOnlyTokenCodecRejectsNonCanonicalPayload) {
+  std::string encoded;
+  EXPECT_EQ(Preserve_trx_transfer_status::INVALID_ARGUMENT,
+            preserve_trx_transfer_encode_session_only_tokens({1}, nullptr));
+  EXPECT_EQ(Preserve_trx_transfer_status::INVALID_ARGUMENT,
+            preserve_trx_transfer_encode_session_only_tokens({0}, &encoded));
+  EXPECT_EQ(Preserve_trx_transfer_status::INVALID_ARGUMENT,
+            preserve_trx_transfer_encode_session_only_tokens({1, 1},
+                                                               &encoded));
+  EXPECT_EQ(Preserve_trx_transfer_status::INVALID_ARGUMENT,
+            preserve_trx_transfer_encode_session_only_tokens({2, 1},
+                                                               &encoded));
+  std::vector<uint64_t> too_many(131071);
+  for (size_t index = 0; index < too_many.size(); ++index) {
+    too_many[index] = index + 1;
+  }
+  EXPECT_EQ(Preserve_trx_transfer_status::INVALID_ARGUMENT,
+            preserve_trx_transfer_encode_session_only_tokens(too_many,
+                                                               &encoded));
+
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_encode_session_only_tokens({1, 2},
+                                                               &encoded));
+  ASSERT_GT(encoded.size(), 16U);
+  auto expect_corrupt_without_output_mutation = [](const std::string &payload) {
+    std::vector<uint64_t> decoded{77};
+    EXPECT_EQ(Preserve_trx_transfer_status::CORRUPT,
+              preserve_trx_transfer_decode_session_only_tokens(payload,
+                                                                 &decoded));
+    EXPECT_EQ(std::vector<uint64_t>({77}), decoded);
+  };
+
+  std::string bad_magic = encoded;
+  bad_magic.front() ^= 0x01;
+  expect_corrupt_without_output_mutation(bad_magic);
+  std::string truncated = encoded;
+  truncated.pop_back();
+  expect_corrupt_without_output_mutation(truncated);
+  std::string trailing = encoded;
+  trailing.push_back('\0');
+  expect_corrupt_without_output_mutation(trailing);
+  std::string zero = encoded;
+  std::fill(zero.end() - 16, zero.end() - 8, '\0');
+  expect_corrupt_without_output_mutation(zero);
+  std::string duplicate = encoded;
+  std::copy(duplicate.end() - 16, duplicate.end() - 8,
+            duplicate.end() - 8);
+  expect_corrupt_without_output_mutation(duplicate);
+  std::string unsorted = encoded;
+  for (size_t index = 0; index < sizeof(uint64_t); ++index) {
+    std::swap(unsorted[unsorted.size() - 16 + index],
+              unsorted[unsorted.size() - 8 + index]);
+  }
+  expect_corrupt_without_output_mutation(unsorted);
+  std::string oversized_count = encoded;
+  ASSERT_GE(oversized_count.size(),
+            sizeof(uint32_t) + 2 * sizeof(uint64_t));
+  const size_t count_offset =
+      oversized_count.size() - 2 * sizeof(uint64_t) - sizeof(uint32_t);
+  std::fill(oversized_count.begin() + count_offset,
+            oversized_count.begin() + count_offset + sizeof(uint32_t),
+            static_cast<char>(0xff));
+  expect_corrupt_without_output_mutation(oversized_count);
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferSourceCommitRejectsTransactionSessionOnlyOverlap) {
+  Transfer_codec_context_guard codec_guard;
+  constexpr uint64_t token = 1921;
+  Preserve_snapshot_metadata meta = metadata();
+  meta.token = test_transfer_token_string(token);
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = meta;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  Capturing_transfer_frame_sink sink;
+  Preserve_trx_transfer_source_epoch_session session(
+      "epoch-transaction-session-overlap", 1024, &sink);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK, session.declare_token(token));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.send_token_bundle(bundle, token));
+  const size_t frames_before_commit = sink.frames().size();
+  EXPECT_EQ(Preserve_trx_transfer_status::CORRUPT,
+            session.commit_epoch({token}));
+  EXPECT_EQ(frames_before_commit, sink.frames().size());
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferTransactionClaimFromUnavailableHandoffBlocksLaterSessionOnlyConsume) {
+  Preserve_trx_transfer_receiver_registry registry;
+  constexpr uint64_t token = 1921;
+
+  Preserve_trx_transfer_resume_handoff transaction =
+      registry.begin_resume_handoff(token, true);
+  EXPECT_FALSE(transaction.available);
+  EXPECT_FALSE(transaction.session_only);
+  EXPECT_TRUE(transaction.transaction_claimed);
+  EXPECT_EQ(token, transaction.token);
+  EXPECT_EQ(0U, transaction.generation);
+
+  const std::string epoch_id = "epoch-session-only-after-claim";
+  const std::string principal = "17:preserve_transfer|1:%";
+  const std::string nonce = "00112233445566778899aabbccddeeff";
+  uint64_t accepted_retention_us = 0;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.open_online_epoch(epoch_id, principal, 60000000, nonce,
+                                       &accepted_retention_us));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.acknowledge_epoch(m_dir, epoch_id, 1000, 60000000));
+  const auto frame_digest = test_sha256("session-only-after-claim-frame");
+  const auto fact_digest = test_sha256("session-only-after-claim-fact");
+  bool duplicate = false;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.begin_epoch_commit_admission(
+                epoch_id, 1, frame_digest, &duplicate, &m_dir, &fact_digest,
+                1001));
+  std::vector<Preserve_trx_transfer_receiver_record> records;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.snapshot_epoch_for_commit(epoch_id, 1, frame_digest,
+                                               &records, true));
+  ASSERT_TRUE(records.empty());
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.publish_control_only_epoch(
+                m_dir, epoch_id, 1, frame_digest, fact_digest, 1002,
+                {token}));
+
+  const Preserve_trx_transfer_resume_handoff session_only =
+      registry.begin_resume_handoff(token, true);
+  ASSERT_TRUE(session_only.available);
+  ASSERT_TRUE(session_only.session_only);
+  EXPECT_FALSE(session_only.transaction_claimed);
+  const Preserve_trx_transfer_resume_handoff invalid =
+      registry.begin_resume_handoff(0, false);
+  EXPECT_TRUE(invalid.available);
+  EXPECT_FALSE(invalid.session_only);
+  EXPECT_EQ(0U, invalid.token);
+  EXPECT_EQ(session_only.epoch_id, invalid.epoch_id);
+  EXPECT_EQ(session_only.generation, invalid.generation);
+  EXPECT_FALSE(registry.consume_session_only_token(
+      token, session_only.epoch_id, session_only.generation));
+
+  registry.release_transaction_handoff(transaction.token,
+                                       transaction.generation);
+  EXPECT_TRUE(registry.consume_session_only_token(
+      token, session_only.epoch_id, session_only.generation));
+  EXPECT_FALSE(registry.consume_session_only_token(
+      token, session_only.epoch_id, session_only.generation));
+}
+
+TEST(PreservedTrxTransfer,
+     TransferTransactionClaimRejectsConcurrentDuplicateCandidate) {
+  Preserve_trx_transfer_receiver_registry registry;
+  constexpr uint64_t token = 1922;
+  const Preserve_trx_transfer_resume_handoff non_candidate =
+      registry.begin_resume_handoff(token, false);
+  EXPECT_FALSE(non_candidate.available);
+  EXPECT_FALSE(non_candidate.transaction_claimed);
+  const Preserve_trx_transfer_resume_handoff first =
+      registry.begin_resume_handoff(token, true);
+  ASSERT_TRUE(first.transaction_claimed);
+  const Preserve_trx_transfer_resume_handoff duplicate =
+      registry.begin_resume_handoff(token, true);
+  EXPECT_FALSE(duplicate.transaction_claimed);
+  registry.release_transaction_handoff(first.token, first.generation);
+  const Preserve_trx_transfer_resume_handoff after_release =
+      registry.begin_resume_handoff(token, true);
+  EXPECT_TRUE(after_release.transaction_claimed);
+  registry.release_transaction_handoff(after_release.token,
+                                       after_release.generation);
+}
+
+#ifndef DBUG_OFF
+TEST_F(PreserveSnapshotTest,
+       TransferControlOnlyResourceExhaustedDoesNotPoisonExactRetry) {
+  Transfer_codec_context_guard codec_guard;
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow();
+
+  const std::string epoch_id = "epoch-control-only-resource-retry";
+  constexpr uint64_t session_only_token = 1923;
+  Online_context_transfer_frame_sink sink;
+  Preserve_trx_transfer_source_epoch_session source(epoch_id, 1024, &sink);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            source.open_epoch(60000000,
+                              std::numeric_limits<uint64_t>::max()));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            source.commit_epoch({session_only_token}));
+  ASSERT_EQ(1U, sink.frames().size());
+
+  Preserve_trx_transfer_frame commit;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_decode_frame(sink.frames().front(),
+                                               &commit));
+  ASSERT_EQ(Preserve_trx_transfer_frame_type::COMMIT_EPOCH, commit.type);
+
+  Preserve_trx_transfer_receiver_registry registry;
+  uint64_t accepted_retention_us = 0;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.open_online_epoch(epoch_id, "17:preserve_transfer|1:%",
+                                       60000000,
+                                       source.receiver_process_nonce(),
+                                       &accepted_retention_us));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.acknowledge_epoch(m_dir, epoch_id, 1000, 60000000));
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+
+  DBUG_SET(
+      "+d,preserve_trx_receiver_control_only_publish_resource_exhausted_once");
+  auto reset_injection = create_scope_guard([] {
+    DBUG_SET(
+        "-d,preserve_trx_receiver_control_only_publish_resource_exhausted_once");
+  });
+  EXPECT_EQ(Preserve_trx_transfer_status::RESOURCE_EXHAUSTED,
+            preserve_trx_transfer_handle_receiver_payload_batch(
+                m_dir, sink.frames(), &store, &registry, 300, 1));
+  Preserve_trx_transfer_epoch_terminal_status terminal;
+  EXPECT_EQ(Preserve_trx_transfer_epoch_terminal_outcome::NOT_COMMITTED,
+            registry.query_epoch_terminal(m_dir, epoch_id, &terminal));
+
+  DBUG_SET(
+      "-d,preserve_trx_receiver_control_only_publish_resource_exhausted_once");
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_handle_receiver_payload_batch(
+                m_dir, sink.frames(), &store, &registry, 300, 1));
+  const Preserve_trx_transfer_resume_handoff handoff =
+      registry.begin_resume_handoff(session_only_token, false);
+  ASSERT_TRUE(handoff.available);
+  ASSERT_TRUE(handoff.session_only);
+  EXPECT_TRUE(registry.consume_session_only_token(
+      session_only_token, handoff.epoch_id, handoff.generation));
+  EXPECT_FALSE(registry.consume_session_only_token(
+      session_only_token, handoff.epoch_id, handoff.generation));
+}
+#endif
 
 TEST_F(PreserveSnapshotTest,
        ReceiverTerminalTombstoneRemainsAuthenticatedAfterEpochCleanup) {
@@ -24482,6 +24884,34 @@ TEST(PreservedTrxDrainHandoff,
 }
 
 TEST(PreservedTrxDrainHandoff,
+     UnsentSourceRestoreClaimWinsBeforeReset) {
+  Preserve_trx_drain_ownership_state ownership;
+  ASSERT_TRUE(ownership.claim_source_restore_before_commit_send());
+  EXPECT_EQ(Preserve_trx_drain_terminal::SOURCE_RESTORE_PENDING,
+            ownership.state());
+  EXPECT_EQ(Preserve_trx_drain_reset_request::JOINED,
+            ownership.request_reset());
+  ASSERT_TRUE(ownership.complete_source_restore());
+  EXPECT_EQ(Preserve_trx_drain_terminal::SOURCE_RESTORED, ownership.state());
+}
+
+TEST(PreservedTrxDrainHandoff,
+     UnsentSourceRestoreClaimLosesToResetOrCommitSend) {
+  Preserve_trx_drain_ownership_state reset_wins;
+  ASSERT_EQ(Preserve_trx_drain_reset_request::WON,
+            reset_wins.request_reset());
+  EXPECT_FALSE(reset_wins.claim_source_restore_before_commit_send());
+  EXPECT_EQ(Preserve_trx_drain_terminal::RESET_REQUESTED,
+            reset_wins.state());
+
+  Preserve_trx_drain_ownership_state commit_wins;
+  ASSERT_TRUE(commit_wins.begin_commit_send());
+  EXPECT_FALSE(commit_wins.claim_source_restore_before_commit_send());
+  EXPECT_EQ(Preserve_trx_drain_terminal::HANDOFF_PENDING,
+            commit_wins.state());
+}
+
+TEST(PreservedTrxDrainHandoff,
      CommitUnknownRequiresCleanProofBeforeSourceRestore) {
   Preserve_trx_drain_ownership_state ownership;
   ASSERT_TRUE(ownership.begin_commit_send());
@@ -24708,6 +25138,66 @@ TEST_F(PreserveSnapshotTest,
             preserve_trx_transfer_decode_frame(sink.frames().back(), &commit));
   EXPECT_EQ(Preserve_trx_transfer_frame_type::COMMIT_EPOCH, commit.type);
 }
+
+#ifndef DBUG_OFF
+TEST_F(PreserveSnapshotTest,
+       TransferSourcePreSendFailureDoesNotCrossHandoffBoundary) {
+  Transfer_codec_context_guard codec_guard;
+  const uint64_t transfer_token = 7105;
+  Preserve_snapshot_metadata meta = metadata();
+  meta.token = test_transfer_token_string(transfer_token);
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = meta;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  Before_commit_send_state before_commit;
+  before_commit.allow = true;
+  Preserve_trx_transfer_source_epoch_options options;
+  options.runtime_policy = preserve_trx_transfer_current_runtime_policy();
+  options.chunk_bytes = 7;
+  options.max_inflight_bytes = preserve_trx_transfer_max_inflight_bytes;
+  options.phase1_batch_bytes = options.runtime_policy.phase1_batch_bytes;
+  options.before_commit_send = before_commit_send_probe;
+  options.before_commit_send_context = &before_commit;
+  Capturing_transfer_frame_sink sink;
+  Preserve_trx_transfer_source_epoch_session session(
+      "epoch-session-pre-send-failure", options, &sink);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.declare_token(transfer_token));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.send_token_bundle(bundle, transfer_token));
+
+  const size_t frames_before_commit = sink.frames().size();
+  DBUG_SET("+d,preserve_trx_transfer_fail_commit_before_send_once");
+  auto reset_debug = create_scope_guard([] {
+    DBUG_SET("-d,preserve_trx_transfer_fail_commit_before_send_once");
+  });
+  EXPECT_EQ(Preserve_trx_transfer_status::ACK_UNCERTAIN,
+            session.commit_epoch());
+  EXPECT_EQ(0U, before_commit.calls);
+  for (size_t index = frames_before_commit; index < sink.frames().size();
+       ++index) {
+    std::vector<std::string> encoded_frames;
+    Preserve_trx_transfer_frame single;
+    if (preserve_trx_transfer_decode_frame(sink.frames()[index], &single) ==
+        Preserve_trx_transfer_status::OK) {
+      encoded_frames.push_back(sink.frames()[index]);
+    } else {
+      ASSERT_EQ(Preserve_trx_transfer_status::OK,
+                preserve_trx_transfer_decode_frame_batch(
+                    sink.frames()[index], &encoded_frames));
+    }
+    for (const std::string &encoded_frame : encoded_frames) {
+      Preserve_trx_transfer_frame frame;
+      ASSERT_EQ(Preserve_trx_transfer_status::OK,
+                preserve_trx_transfer_decode_frame(encoded_frame, &frame));
+      EXPECT_NE(Preserve_trx_transfer_frame_type::COMMIT_EPOCH, frame.type);
+    }
+  }
+}
+#endif
 
 TEST_F(PreserveSnapshotTest,
        TransferResetCleanupAbandonsFinalMetadataWithoutCommit) {

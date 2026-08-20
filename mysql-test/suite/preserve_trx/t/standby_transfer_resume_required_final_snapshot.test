@@ -98,6 +98,9 @@ SHUTDOWN;
 --disable_result_log
 
 --connect(final_snapshot_source_cleanup,localhost,root,,test)
+--enable_result_log
+SELECT id, v FROM t_resume_required_final_snapshot ORDER BY id;
+--disable_result_log
 DROP TABLE t_resume_required_final_snapshot;
 DROP USER rr_final_app@localhost;
 DROP USER preserve_trx_ha_admin@localhost;

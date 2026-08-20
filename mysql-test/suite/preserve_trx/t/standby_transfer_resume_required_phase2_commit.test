@@ -105,6 +105,9 @@ SHUTDOWN;
 --disable_result_log
 
 --connect(phase2_source_cleanup,localhost,root,,test)
+--enable_result_log
+SELECT id, v FROM t_resume_required_phase2_commit ORDER BY id;
+--disable_result_log
 DROP TABLE t_resume_required_phase2_commit;
 DROP USER resume_required_phase2_app@localhost;
 DROP USER preserve_trx_ha_admin@localhost;

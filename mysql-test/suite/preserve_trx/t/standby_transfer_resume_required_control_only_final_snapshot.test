@@ -26,6 +26,7 @@ GRANT PRESERVE_TRX_TRANSFER_ADMIN,
 --disable_warnings
 DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
 DROP USER IF EXISTS rr_ctrlfinal_app@localhost;
+DROP TABLE IF EXISTS t_resume_required_control_final;
 --enable_warnings
 CREATE USER preserve_trx_ha_admin@localhost
   IDENTIFIED BY 'resume-required-control-final-secret';
@@ -43,6 +44,13 @@ GRANT SYSTEM_VARIABLES_ADMIN ON *.*
 --let $restart_parameters=
 --disable_query_log
 --disable_result_log
+
+CREATE TABLE t_resume_required_control_final(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_resume_required_control_final VALUES(1,10);
+UPDATE t_resume_required_control_final SET v=11 WHERE id=1;
 
 --connect(control_final_source_ha,localhost,preserve_trx_ha_admin,resume-required-control-final-secret,test)
 --connect(control_final_source_idle,localhost,rr_ctrlfinal_app,,test)
@@ -132,6 +140,10 @@ SHUTDOWN;
 --disable_result_log
 
 --connect(control_final_source_cleanup,localhost,root,,test)
+--enable_result_log
+SELECT id, v FROM t_resume_required_control_final ORDER BY id;
+--disable_result_log
+DROP TABLE t_resume_required_control_final;
 DROP USER rr_ctrlfinal_app@localhost;
 DROP USER preserve_trx_ha_admin@localhost;
 SET DEBUG_SYNC='RESET';

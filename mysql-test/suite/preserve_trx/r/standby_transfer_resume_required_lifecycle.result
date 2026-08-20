@@ -1,4 +1,7 @@
 include/assert.inc [session-only resume leaves no SQL transaction active]
 include/assert.inc [session-only resume leaves no native InnoDB transaction]
+id	v
+1	10
+2	21
 resume_required_lifecycle
 ok

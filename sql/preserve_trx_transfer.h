@@ -279,6 +279,7 @@ enum class Preserve_trx_transfer_status {
 struct Preserve_trx_transfer_resume_handoff {
   bool available{false};
   bool session_only{false};
+  bool transaction_claimed{false};
   uint64_t token{0};
   std::string epoch_id;
   uint64_t generation{0};
@@ -599,11 +600,10 @@ preserve_trx_transfer_decode_session_only_tokens(
     const std::string &encoded, std::vector<uint64_t> *tokens);
 
 Preserve_trx_transfer_resume_handoff
-preserve_trx_transfer_resume_handoff_for_token(const std::string &token);
+preserve_trx_transfer_begin_resume_handoff_for_token(
+    const std::string &token, bool transaction_candidate);
 
 bool preserve_trx_transfer_consume_session_only_token(
-    const Preserve_trx_transfer_resume_handoff &handoff);
-bool preserve_trx_transfer_claim_transaction_handoff(
     const Preserve_trx_transfer_resume_handoff &handoff);
 void preserve_trx_transfer_release_transaction_handoff(
     const Preserve_trx_transfer_resume_handoff &handoff);
@@ -813,11 +813,10 @@ class Preserve_trx_transfer_receiver_registry {
           &fact_digest,
       uint64_t now_us,
       const std::vector<uint64_t> &session_only_tokens);
-  Preserve_trx_transfer_resume_handoff resume_handoff(uint64_t token) const;
+  Preserve_trx_transfer_resume_handoff begin_resume_handoff(
+      uint64_t token, bool transaction_candidate);
   bool consume_session_only_token(uint64_t token, const std::string &epoch_id,
                                   uint64_t generation);
-  bool claim_transaction_handoff(uint64_t token, const std::string &epoch_id,
-                                 uint64_t generation);
   void release_transaction_handoff(uint64_t token, uint64_t generation);
   Preserve_trx_transfer_status query_accepted_epoch(
       const std::string &root_dir, const std::string &epoch_id,
@@ -1066,6 +1065,9 @@ class Preserve_trx_transfer_receiver_registry {
   uint64_t m_active_session_only_generation{0};
   /* Short-lived claims prevent one numeric ID from resuming concurrently. */
   std::set<std::pair<uint64_t, uint64_t>> m_transaction_handoff_claims;
+#ifndef DBUG_OFF
+  std::atomic<bool> m_debug_control_only_resource_exhausted_consumed{false};
+#endif
   uint64_t m_expired_epoch_count{0};
 };
 
@@ -1371,6 +1373,9 @@ class Preserve_trx_transfer_source_epoch_session {
   std::vector<Preserve_trx_transfer_frame> m_pending_final_metadata_frames;
   std::string m_frozen_commit_payload;
   std::vector<Preserve_trx_transfer_manifest> m_finalized_manifests;
+#ifndef DBUG_OFF
+  bool m_debug_commit_before_send_failure_consumed{false};
+#endif
 #ifndef NDEBUG
   size_t m_pending_frame_cleanup_invocations{0};
 #endif

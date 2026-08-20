@@ -1,3 +1,5 @@
 include/assert.inc [departed source THD is gone before the final snapshot]
+id	v
+1	10
 resume_required_final_snapshot
 ok

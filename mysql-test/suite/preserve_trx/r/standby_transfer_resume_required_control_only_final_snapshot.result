@@ -1,5 +1,7 @@
 include/assert.inc [departed control-only source THD is gone before the final snapshot]
 include/assert.inc [COM_QUIT source THD is still alive at the final snapshot]
 include/assert.inc [rejected-command source THD is still alive at the final snapshot]
+id	v
+1	11
 resume_required_control_only_final_snapshot
 ok

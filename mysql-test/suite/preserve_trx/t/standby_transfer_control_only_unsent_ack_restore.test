@@ -1,0 +1,114 @@
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+--disable_query_log
+--disable_result_log
+
+--let $credential_file= $MYSQL_TMP_DIR/control-only-unsent.secret
+--write_file $credential_file
+control-only-unsent-secret
+EOF
+--exec chmod 600 $credential_file
+
+--connect(control_unsent_receiver,127.0.0.1,root,,test,$SERVER_MYPORT_2,)
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'control-only-unsent-secret';
+GRANT PRESERVE_TRX_TRANSFER_ADMIN, PROCESS ON *.*
+  TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+SET @receiver_active_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs');
+
+--connection default
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+DROP USER IF EXISTS control_unsent_app@localhost;
+DROP TABLE IF EXISTS t_control_only_unsent;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'control-only-unsent-secret';
+GRANT SHUTDOWN, SYSTEM_VARIABLES_ADMIN,
+      PRESERVE_TRX_TRANSFER_ADMIN, PROCESS ON *.*
+  TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+CREATE USER control_unsent_app@localhost;
+GRANT SELECT, UPDATE ON test.* TO control_unsent_app@localhost;
+
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$SERVER_MYPORT_2 --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=control_only_unsent --rds-preserve-trx-transfer-credential-secret-file=$credential_file
+--source include/restart_mysqld.inc
+--let $restart_parameters=
+--disable_query_log
+--disable_result_log
+
+CREATE TABLE t_control_only_unsent(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_control_only_unsent VALUES(1,10),(2,20);
+
+--connect(control_unsent_source_ha,localhost,preserve_trx_ha_admin,control-only-unsent-secret,test)
+SET @unknown_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME='Preserve_trx_transfer_source_commit_unknown_epochs');
+--connect(control_unsent_source_idle,localhost,control_unsent_app,,test)
+--let $idle_connection_id= query_get_value(SELECT CONNECTION_ID() AS id, id, 1)
+--connect(control_unsent_marker,localhost,control_unsent_app,,test)
+UPDATE t_control_only_unsent SET v=21 WHERE id=2;
+
+--connect(control_unsent_drain,localhost,root,,test)
+SET SESSION debug='+d,preserve_trx_transfer_fail_commit_before_send_once';
+SET DEBUG_SYNC=
+  'preserve_trx_transfer_commit_before_send_failed SIGNAL control_unsent_failure_seen';
+--send DRAIN TRANSACTIONS PRESERVE
+
+--connection control_unsent_source_ha
+SET DEBUG_SYNC='now WAIT_FOR control_unsent_failure_seen TIMEOUT 30';
+
+--connection control_unsent_drain
+--error ER_PRESERVE_TRX_UNSUPPORTED
+--reap
+SET SESSION debug='-d,preserve_trx_transfer_fail_commit_before_send_once';
+SET DEBUG_SYNC='RESET';
+
+--connection control_unsent_source_idle
+--let $assert_text= source restore keeps the original idle connection alive
+--let $assert_cond= `SELECT CONNECTION_ID()=$idle_connection_id`
+--source include/assert.inc
+START TRANSACTION;
+UPDATE t_control_only_unsent SET v=v+10 WHERE id=1;
+COMMIT;
+
+--connection control_unsent_source_ha
+--let $assert_text= pre-send failure must not enter COMMIT_UNKNOWN
+--let $assert_cond= `SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_source_commit_unknown_epochs')=@unknown_before`
+--source include/assert.inc
+
+--connection control_unsent_receiver
+--let $assert_text= pre-send failure must not leave an accepted receiver epoch
+--let $assert_cond= `SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')=@receiver_active_before`
+--source include/assert.inc
+
+--connection control_unsent_marker
+--enable_result_log
+SELECT id,v FROM t_control_only_unsent ORDER BY id;
+--disable_result_log
+
+--connection default
+DROP TABLE t_control_only_unsent;
+DROP USER control_unsent_app@localhost;
+DROP USER preserve_trx_ha_admin@localhost;
+
+--connection control_unsent_receiver
+DROP USER preserve_trx_ha_admin@localhost;
+
+--connection default
+--remove_file $credential_file
+--enable_result_log
+SELECT 'ok' AS control_only_unsent_ack_restore;
+--enable_query_log

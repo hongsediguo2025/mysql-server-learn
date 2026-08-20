@@ -3301,9 +3301,16 @@ my $not_committed_clean_claim = $&;
 die "NOT_COMMITTED_CLEAN must claim SOURCE_RESTORE_PENDING before guarded restore, not expose RUNNING to RESET\n"
   unless $not_committed_clean_claim =~ /SOURCE_RESTORE_PENDING/s &&
          $not_committed_clean_claim !~ /Preserve_trx_drain_terminal::RUNNING/s;
-die "online NOT_COMMITTED_CLEAN restore must publish SOURCE_RESTORED only after guarded restore succeeds\n"
+$preserve =~
+  /(auto\s+finish_source_restore\s*=\s*\[&\]\([\s\S]*?^  };)/m
+  or die "could not isolate guarded online source restore helper\n";
+my $finish_source_restore = $&;
+die "online source restore must publish SOURCE_RESTORED and the RESET barrier only after guarded restore succeeds\n"
+  unless $finish_source_restore =~
+           /restore_current_items_to_original_thds\(\)[\s\S]*complete_source_restore\(\)[\s\S]*preserve_trx_publish_active_drain_reset_barrier/s;
+die "online NOT_COMMITTED_CLEAN must use the guarded source restore helper\n"
   unless $preserve =~
-         /standby_transfer_not_committed_clean_restore_failed[\s\S]{0,500}complete_source_restore\(\)[\s\S]{0,300}standby_transfer_not_committed_clean_state_failed/s;
+         /return\s+finish_source_restore\s*\(\s*"standby_transfer_receiver_not_committed_clean"\s*,\s*"standby_transfer_not_committed_clean_restore_failed"\s*,\s*"standby_transfer_not_committed_clean_state_failed"\s*\)/s;
 $preserve =~
   /finalize_drain_participants_for_terminal_handoff\s*\([\s\S]{0,240}"standby_transfer_commit_unknown"[\s\S]{0,160}\)/s
   or die "COMMIT_UNKNOWN must use terminal-handoff participant finalization\n";

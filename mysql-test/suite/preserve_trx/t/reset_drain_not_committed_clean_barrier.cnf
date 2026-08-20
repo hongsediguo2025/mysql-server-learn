@@ -4,7 +4,6 @@ server_id=1
 [mysqld.2]
 server_id=2
 rds-preserve-trx-enable=ON
-rds-preserve-trx-transfer-prewarm-paused=ON
 
 [ENV]
 SERVER_MYPORT_2=@mysqld.2.port

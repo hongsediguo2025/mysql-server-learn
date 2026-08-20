@@ -294,6 +294,21 @@ bool Preserve_trx_drain_ownership_state::begin_commit_send() {
          expected == Preserve_trx_drain_terminal::HANDOFF_PENDING;
 }
 
+bool Preserve_trx_drain_ownership_state::
+    claim_source_restore_before_commit_send() {
+  Preserve_trx_drain_terminal current = state();
+  while (current == Preserve_trx_drain_terminal::RUNNING ||
+         current ==
+             Preserve_trx_drain_terminal::FINAL_METADATA_ACCEPTED_LOCAL) {
+    if (m_state.compare_exchange_weak(
+            current,
+            Preserve_trx_drain_terminal::SOURCE_RESTORE_PENDING)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool Preserve_trx_drain_ownership_state::mark_commit_unknown() {
   Preserve_trx_drain_terminal expected =
       Preserve_trx_drain_terminal::HANDOFF_PENDING;
@@ -1562,13 +1577,7 @@ preserved_trx_consume_session_only_handoff(
     const Preserve_trx_transfer_resume_handoff &handoff) {
   /* Keep record -> handoff lock order for the conflict/erase linearization. */
   std::lock_guard<std::mutex> lock(g_preserved_trx_mutex);
-  bool record_conflict = preserved_trx_record_exists_locked(token);
-#ifndef DBUG_OFF
-  DBUG_EXECUTE_IF("preserve_trx_force_session_only_record_conflict", {
-    record_conflict = true;
-  });
-#endif
-  if (record_conflict) {
+  if (preserved_trx_record_exists_locked(token)) {
     return Preserve_trx_session_only_consume_status::RECORD_CONFLICT;
   }
   if (!preserve_trx_transfer_consume_session_only_token(handoff)) {
@@ -18175,6 +18184,37 @@ bool Preserve_trx_drain_service::execute(
     return preserve_trx_reject_unsupported();
   };
 
+  auto finish_source_restore = [&](const char *participant_reason,
+                                   const char *cleanup_stage,
+                                   const char *state_stage) {
+    if (restore_current_items_to_original_thds()) {
+      return finish_cleanup_failure_without_shutdown(cleanup_stage);
+    }
+    if (active_drain_attempt == nullptr ||
+        !active_drain_attempt->ownership.complete_source_restore()) {
+      return finish_cleanup_failure_without_shutdown(state_stage);
+    }
+    preserve_trx_publish_active_drain_reset_barrier(active_drain_attempt);
+    abort_drain_participants(participant_reason);
+    return preserve_trx_reject_unsupported();
+  };
+
+  auto claim_unsent_source_restore = [&]() {
+#ifndef DBUG_OFF
+    DEBUG_SYNC(thd,
+               "preserve_trx_unsent_failure_before_source_restore_claim");
+#endif
+    const bool claimed =
+        active_drain_attempt != nullptr &&
+        active_drain_attempt->ownership
+            .claim_source_restore_before_commit_send();
+#ifndef DBUG_OFF
+    if (claimed) {
+      DEBUG_SYNC(thd, "preserve_trx_unsent_source_restore_claimed");
+    }
+#endif
+    return claimed;
+  };
 
   auto revalidate_session_only_thread_ids = [&]() {
     Preserve_batch_session_only_final_snapshot final_snapshot(
@@ -18213,12 +18253,6 @@ bool Preserve_trx_drain_service::execute(
         batch_transfer_source_session->commit_epoch(session_only_tokens);
     phase2_metrics.transfer_commit_epoch_us +=
         elapsed_since(commit_epoch_started_us);
-    if (commit_status == Preserve_trx_transfer_status::ACK_UNCERTAIN &&
-        active_drain_attempt != nullptr &&
-        active_drain_attempt->ownership.state() ==
-            Preserve_trx_drain_terminal::RUNNING) {
-      return enter_commit_unknown(commit_status);
-    }
     const bool receiver_committed =
         commit_status == Preserve_trx_transfer_status::COMMITTED_READY ||
         commit_status == Preserve_trx_transfer_status::COMMITTED_NOT_READY;
@@ -18236,19 +18270,24 @@ bool Preserve_trx_drain_service::execute(
             !active_drain_attempt->ownership.resolve_not_committed_clean()) {
           return enter_commit_unknown(commit_status);
         }
+        DEBUG_SYNC(thd,
+                   "preserve_trx_not_committed_clean_source_restore_pending");
         preserve_trx_transfer_note_source_handoff_committed();
-        const bool cleanup_error = restore_current_items_to_original_thds();
-        if (cleanup_error) {
-          return finish_cleanup_failure_without_shutdown(
-              "control_only_not_committed_clean_restore_failed");
-        }
-        if (!active_drain_attempt->ownership.complete_source_restore()) {
-          return finish_cleanup_failure_without_shutdown(
-              "control_only_not_committed_clean_state_failed");
-        }
-        preserve_trx_publish_active_drain_reset_barrier(active_drain_attempt);
-        abort_drain_participants("control_only_receiver_not_committed_clean");
-        return preserve_trx_reject_unsupported();
+        return finish_source_restore(
+            "control_only_receiver_not_committed_clean",
+            "control_only_not_committed_clean_restore_failed",
+            "control_only_not_committed_clean_state_failed");
+      }
+      if (claim_unsent_source_restore()) {
+        abort_batch_transfer_epoch("control_only_commit_failed");
+        return finish_source_restore(
+            "control_only_commit_failed",
+            "control_only_commit_cleanup_failed",
+            "control_only_commit_restore_state_failed");
+      }
+      if (reset_requested()) {
+        return finish_phase2_reset(
+            &preserved_batch_items, "reset_during_control_only_commit");
       }
       if (active_drain_attempt != nullptr &&
           (active_drain_attempt->ownership.state() ==
@@ -18257,15 +18296,8 @@ bool Preserve_trx_drain_service::execute(
                Preserve_trx_drain_terminal::COMMIT_UNKNOWN)) {
         return enter_commit_unknown(commit_status);
       }
-      if (!receiver_committed) {
-        abort_batch_transfer_epoch("control_only_commit_failed");
-      }
-      const bool cleanup_error = restore_current_items_to_original_thds();
-      abort_drain_participants("control_only_commit_failed");
-      return cleanup_error
-                 ? finish_cleanup_failure_without_shutdown(
-                       "control_only_commit_cleanup_failed")
-                 : preserve_trx_reject_unsupported();
+      return finish_cleanup_failure_without_shutdown(
+          "control_only_commit_ownership_invalid");
     }
 
     transfer_final_ack_accepted =
@@ -20581,9 +20613,6 @@ bool Preserve_trx_drain_service::execute(
         batch_transfer_source_session->commit_epoch(session_only_tokens);
     phase2_metrics.transfer_commit_epoch_us +=
         elapsed_since(commit_epoch_started_us);
-    const bool receiver_committed =
-        commit_status == Preserve_trx_transfer_status::COMMITTED_READY ||
-        commit_status == Preserve_trx_transfer_status::COMMITTED_NOT_READY;
     const bool receiver_commit_succeeded =
         commit_status == Preserve_trx_transfer_status::OK ||
         commit_status == Preserve_trx_transfer_status::COMMITTED_READY ||
@@ -20598,19 +20627,28 @@ bool Preserve_trx_drain_service::execute(
             !active_drain_attempt->ownership.resolve_not_committed_clean()) {
           return enter_commit_unknown(commit_status);
         }
+        DEBUG_SYNC(thd,
+                   "preserve_trx_not_committed_clean_source_restore_pending");
         preserve_trx_transfer_note_source_handoff_committed();
-        const bool cleanup_error = restore_current_items_to_original_thds();
-        if (cleanup_error) {
-          return finish_cleanup_failure_without_shutdown(
-              "standby_transfer_not_committed_clean_restore_failed");
-        }
-        if (!active_drain_attempt->ownership.complete_source_restore()) {
-          return finish_cleanup_failure_without_shutdown(
-              "standby_transfer_not_committed_clean_state_failed");
-        }
-        abort_drain_participants(
-            "standby_transfer_receiver_not_committed_clean");
-        return preserve_trx_reject_unsupported();
+        return finish_source_restore(
+            "standby_transfer_receiver_not_committed_clean",
+            "standby_transfer_not_committed_clean_restore_failed",
+            "standby_transfer_not_committed_clean_state_failed");
+      }
+      LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+             ("PRESERVE: standby transfer source epoch commit failed status=" +
+              std::to_string(static_cast<int>(commit_status)))
+                 .c_str());
+      if (claim_unsent_source_restore()) {
+        abort_batch_transfer_epoch("standby_transfer_commit_failed");
+        return finish_source_restore(
+            "standby_transfer_commit_failed",
+            "standby_transfer_commit_cleanup_failed",
+            "standby_transfer_commit_restore_state_failed");
+      }
+      if (reset_requested()) {
+        return finish_phase2_reset(
+            &preserved_batch_items, "reset_during_transfer_commit");
       }
       if (active_drain_attempt != nullptr &&
           (active_drain_attempt->ownership.state() ==
@@ -20619,23 +20657,8 @@ bool Preserve_trx_drain_service::execute(
                Preserve_trx_drain_terminal::COMMIT_UNKNOWN)) {
         return enter_commit_unknown(commit_status);
       }
-      LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
-             ("PRESERVE: standby transfer source epoch commit failed status=" +
-              std::to_string(static_cast<int>(commit_status)))
-                 .c_str());
-      if (!receiver_committed) {
-        abort_batch_transfer_epoch("standby_transfer_commit_failed");
-      }
-      const bool cleanup_error = restore_current_items_to_original_thds();
-      if (cleanup_error) {
-        LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
-               "Preserved transaction batch cleanup failed after standby "
-               "transfer source epoch commit error");
-        return finish_cleanup_failure_without_shutdown(
-            "standby_transfer_commit_cleanup_failed");
-      }
-      abort_drain_participants("standby_transfer_commit_failed");
-      return preserve_trx_reject_unsupported();
+      return finish_cleanup_failure_without_shutdown(
+          "standby_transfer_commit_ownership_invalid");
     }
 
     transfer_final_ack_accepted =
@@ -21366,8 +21389,7 @@ static dberr_t activate_resumed_trx_shared(Preserved_trx_record *record) {
 static Preserved_trx_promotion_resume_status
 preserved_trx_resume_adopted_for_promotion_on_current_thd(
     THD *target, const Preserve_trx_prepared_token_key &key,
-    uint64_t requested_deadline_us,
-    const Preserve_trx_transfer_resume_handoff &handoff);
+    uint64_t requested_deadline_us);
 
 static bool preserved_trx_resume_record_on_current_thd(
     THD *thd, const LEX_CSTRING &resume_token) {
@@ -21414,8 +21436,22 @@ static bool preserved_trx_resume_record_on_current_thd(
   const bool has_resume_any_privilege =
       preserve_trx_has_resume_any_privilege(thd);
   preserved_trx_wait_recovery_complete();
+  Preserved_trx_record record;
+  const bool record_found = preserved_trx_find_record(token, &record);
+#ifndef DBUG_OFF
+  bool transaction_candidate = record_found;
+  DBUG_EXECUTE_IF("preserve_trx_force_transaction_resume_candidate",
+                  { transaction_candidate = true; });
+#else
+  const bool transaction_candidate = record_found;
+#endif
   const Preserve_trx_transfer_resume_handoff handoff =
-      preserve_trx_transfer_resume_handoff_for_token(token);
+      preserve_trx_transfer_begin_resume_handoff_for_token(
+          token, transaction_candidate);
+  const auto handoff_claim_guard = create_scope_guard([&] {
+    preserve_trx_transfer_release_transaction_handoff(handoff);
+  });
+  DEBUG_SYNC(thd, "preserve_trx_resume_after_handoff_begin");
   auto reject_unavailable_record = [&]() {
     if (handoff.available) {
       log_redacted_resume_failure(token, "handoff entry is unavailable");
@@ -21425,8 +21461,13 @@ static bool preserved_trx_resume_record_on_current_thd(
     }
     return true;
   };
-  Preserved_trx_record record;
-  const bool record_found = preserved_trx_find_record(token, &record);
+  if (record_found && handoff.token != 0 && !handoff.session_only &&
+      !handoff.transaction_claimed) {
+    log_redacted_resume_failure(token,
+                                "transaction handoff is already claimed");
+    my_error(ER_PRESERVE_TRX_HANDOFF_UNAVAILABLE, MYF(0));
+    return true;
+  }
   if (handoff.available && handoff.session_only) {
     /*
       Membership is a one-shot authorization to omit transaction attachment.
@@ -21452,6 +21493,7 @@ static bool preserved_trx_resume_record_on_current_thd(
     if (consume_status != Preserve_trx_session_only_consume_status::CONSUMED) {
       return reject_unavailable_record();
     }
+    DEBUG_SYNC(thd, "preserve_trx_session_only_after_consume_before_reply");
     audit_preserved_trx_event(thd, token, "resume", "session-only");
     my_ok(thd);
     return false;
@@ -21528,8 +21570,7 @@ static bool preserved_trx_resume_record_on_current_thd(
     }
     const auto status =
         preserved_trx_resume_adopted_for_promotion_on_current_thd(
-            thd, record.promotion_key, std::numeric_limits<uint64_t>::max(),
-            handoff);
+            thd, record.promotion_key, std::numeric_limits<uint64_t>::max());
     if (status == Preserved_trx_promotion_resume_status::OK) {
       my_ok(thd);
       return false;
@@ -21981,8 +22022,7 @@ static Preserved_trx_promotion_resume_status
 preserved_trx_resume_adopted_for_promotion_on_current_thd(
     THD *target,
     const Preserve_trx_prepared_token_key &key,
-    uint64_t requested_deadline_us,
-    const Preserve_trx_transfer_resume_handoff &handoff) {
+    uint64_t requested_deadline_us) {
   const uint64_t started_us = preserve_trx_monotonic_us();
   auto finish = [&](Preserved_trx_promotion_resume_status status) {
     const uint64_t elapsed_us = preserve_trx_monotonic_us() - started_us;
@@ -22048,19 +22088,6 @@ preserved_trx_resume_adopted_for_promotion_on_current_thd(
   if (metadata_has_binlog_cache != snapshot.facts.binlog_cache_present) {
     return finish(Preserved_trx_promotion_resume_status::STAGING_FAILED);
   }
-
-  bool handoff_claimed = false;
-  if (handoff.available) {
-    if (!preserve_trx_transfer_claim_transaction_handoff(handoff)) {
-      return finish(Preserved_trx_promotion_resume_status::REGISTRY_NOT_ADOPTED);
-    }
-    handoff_claimed = true;
-  }
-  const auto handoff_claim_guard = create_scope_guard([&] {
-    if (handoff_claimed) {
-      preserve_trx_transfer_release_transaction_handoff(handoff);
-    }
-  });
 
   Preserve_strict_attach_intent_write_context intent_context;
   intent_context.state = Preserve_trx_strict_attach_intent_state::ATTACHING;

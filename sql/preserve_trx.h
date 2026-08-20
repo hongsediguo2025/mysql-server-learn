@@ -301,6 +301,7 @@ class Preserve_trx_drain_ownership_state {
   Preserve_trx_drain_terminal state() const;
   Preserve_trx_drain_reset_request request_reset();
   bool begin_commit_send();
+  bool claim_source_restore_before_commit_send();
   bool mark_commit_unknown();
   bool resolve_not_committed_clean();
   bool begin_source_restore();

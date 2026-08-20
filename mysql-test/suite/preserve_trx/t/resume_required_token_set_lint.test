@@ -98,7 +98,7 @@ die "final S revalidation must intersect the planned IDs with live eligible THDs
   unless $drain =~ /Preserve_batch_session_only_final_snapshot[\s\S]{0,1600}m_planned_thread_ids\.count\(thread_id\)[\s\S]{0,900}preserve_trx_session_only_candidate_is_eligible_locked\(candidate,\s*true\)/s;
 
 die "receiver handoff snapshot must carry availability, membership, epoch, and generation\n"
-  unless $transfer_h =~ /struct Preserve_trx_transfer_resume_handoff[\s\S]{0,500}available[\s\S]{0,120}session_only[\s\S]{0,160}epoch_id[\s\S]{0,160}generation/s;
+  unless $transfer_h =~ /struct Preserve_trx_transfer_resume_handoff[\s\S]{0,500}available[\s\S]{0,120}session_only[\s\S]{0,120}transaction_claimed[\s\S]{0,160}epoch_id[\s\S]{0,160}generation/s;
 die "receiver must use a dedicated lock for one process-local active set\n"
   unless $transfer_h =~ /m_session_only_mutex/ &&
          $transfer_h =~ /m_active_session_only_set_valid/ &&
@@ -130,9 +130,9 @@ die "legacy no-payload transaction COMMIT must still install a fail-closed empty
   unless $transfer =~ /publish_accepted_epoch\s*\([\s\S]{0,320}!strict_online_epoch\s*,\s*&session_only_tokens\s*,[\s\S]{0,180}&frame\.terminal_fact_digest/s;
 die "atomic consume must validate epoch and generation before erase\n"
   unless $transfer =~ /consume_session_only_token[\s\S]{0,900}epoch_id\s*!=\s*m_active_session_only_epoch_id[\s\S]{0,300}generation\s*!=\s*m_active_session_only_generation[\s\S]{0,500}m_active_session_only_tokens\.erase\(/s;
-die "transaction RESUME must claim the current handoff generation once\n"
-  unless $transfer_h =~ /claim_transaction_handoff[\s\S]{0,220}release_transaction_handoff/s &&
-         $transfer =~ /claim_transaction_handoff[\s\S]{0,1200}generation\s*!=\s*m_active_session_only_generation[\s\S]{0,700}m_transaction_handoff_claims\.insert/s;
+die "transaction RESUME must use the atomic handoff-begin API\n"
+  unless $transfer_h =~ /begin_resume_handoff\(\s*uint64_t token,\s*bool transaction_candidate\)/s &&
+         $transfer_h =~ /release_transaction_handoff\(uint64_t token,\s*uint64_t generation\)/s;
 die "a sent COMMIT attempt must freeze its canonical session-only set\n"
   unless $transfer_h =~ /m_frozen_commit_payload/s &&
          $transfer =~ /commit\.manifest_payload\s*!=\s*canonical_session_only_payload[\s\S]{0,180}Preserve_trx_transfer_status::CORRUPT/s;
@@ -171,8 +171,6 @@ die "session-only success must happen only after one-shot consume\n"
   unless $drain =~ /preserved_trx_consume_session_only_handoff[\s\S]{0,900}audit_preserved_trx_event[\s\S]{0,250}my_ok\(thd\)[\s\S]{0,120}return false/s;
 die "active handoff transaction records must match the current epoch\n"
   unless $drain =~ /record\.promotion_key\.epoch_id\s*!=\s*handoff\.epoch_id/s;
-die "transaction attach must claim the current handoff before begin_attach\n"
-  unless $drain =~ /preserve_trx_transfer_claim_transaction_handoff[\s\S]{0,1200}registry\.begin_attach/s;
 die "unavailable handoff IDs must use one dedicated SQL error\n"
   unless $drain =~ /ER_PRESERVE_TRX_HANDOFF_UNAVAILABLE/ &&
          $messages =~ /ER_PRESERVE_TRX_HANDOFF_UNAVAILABLE/;
