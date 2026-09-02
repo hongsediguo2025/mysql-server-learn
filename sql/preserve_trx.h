@@ -56,6 +56,31 @@ struct trx_preserve_resurrection_facts;
 struct Mysql_binlog_preserve_cache_facts;
 struct Mysql_binlog_preserve_token_identity;
 
+class Preserve_trx_external_thd_pin_handle {
+ public:
+  Preserve_trx_external_thd_pin_handle();
+  Preserve_trx_external_thd_pin_handle(
+      Preserve_trx_external_thd_pin_handle &&) noexcept;
+  Preserve_trx_external_thd_pin_handle &operator=(
+      Preserve_trx_external_thd_pin_handle &&) noexcept;
+  Preserve_trx_external_thd_pin_handle(
+      const Preserve_trx_external_thd_pin_handle &) = delete;
+  Preserve_trx_external_thd_pin_handle &operator=(
+      const Preserve_trx_external_thd_pin_handle &) = delete;
+  ~Preserve_trx_external_thd_pin_handle();
+
+  explicit operator bool() const;
+  THD *thd() const;
+
+ private:
+  struct Impl;
+  explicit Preserve_trx_external_thd_pin_handle(std::unique_ptr<Impl> impl);
+  std::unique_ptr<Impl> m_impl;
+
+  friend Preserve_trx_external_thd_pin_handle
+  preserve_trx_acquire_external_thd_pin_locked(THD *thd);
+};
+
 extern bool preserve_trx_enable;
 extern bool preserve_trx_temp_table_enable;
 extern const uint preserve_trx_recovery_max_count;
@@ -82,6 +107,13 @@ enum class Preserved_trx_recover_load_profile {
 };
 extern uint preserve_trx_drain_phase1_timeout_ms;
 extern uint preserve_trx_drain_phase2_timeout_ms;
+
+enum Preserve_trx_standby_phase2_scheduler_mode : ulong {
+  PRESERVE_TRX_PHASE2_SCHEDULER_LEGACY = 0,
+  PRESERVE_TRX_PHASE2_SCHEDULER_DEPENDENCY_CONVERGENCE_V1 = 1
+};
+
+extern ulong preserve_trx_standby_phase2_scheduler_mode;
 extern const ulonglong preserve_trx_warmcopy_max_total_bytes;
 extern const uint preserve_trx_warmcopy_pending_range_limit;
 extern const ulonglong preserve_trx_warmcopy_pending_bytes_limit;
@@ -317,6 +349,8 @@ class Preserve_trx_drain_ownership_state {
 
 enum class Preserve_trx_command_block_result {
   ALLOW,
+  RETRY_NATIVE_ADMISSION,
+  NATIVE_PRE_BODY_EXIT,
   BLOCK_DRAINING,
   BLOCK_CLOSING_DRAINED,
   BLOCK_SESSION_DRAINED
@@ -489,6 +523,13 @@ void preserved_trx_enter_server_startup();
 void preserved_trx_leave_server_startup();
 bool preserved_trx_server_startup_active();
 bool preserved_trx_skip_local_startup_recovery();
+bool preserve_trx_standby_phase2_source_capture_enabled();
+Preserve_trx_external_thd_pin_handle
+preserve_trx_acquire_external_thd_pin_locked(THD *thd);
+bool preserve_trx_external_thd_scheduler_teardown_started(THD *thd);
+bool preserve_trx_phase2_scheduler_bypass_actor(THD *thd,
+                                                my_thread_id owner_thread_id);
+bool preserve_trx_phase2_existing_closing_gate_active();
 bool preserved_trx_ensure_snapshot_support();
 bool preserved_trx_validate_snapshot_support(bool allow_create_missing);
 bool preserved_trx_preflight_recoverability();
@@ -577,7 +618,12 @@ void preserved_trx_classify_protocol_command(
     THD *thd, enum enum_server_command command);
 Preserve_trx_command_block_result preserved_trx_command_block_result(
     THD *thd, enum_sql_command sql_command);
+Preserve_trx_command_block_result preserved_trx_command_block_result(
+    THD *thd, LEX *lex, enum_sql_command sql_command);
 Preserve_trx_command_block_result preserved_trx_protocol_command_block_result(
+    THD *thd, enum enum_server_command command);
+Preserve_trx_command_block_result
+preserved_trx_protocol_command_body_block_result(
     THD *thd, enum enum_server_command command);
 bool preserved_trx_mark_inflight_risky_statement(THD *thd,
                                                  enum_sql_command sql_command);
@@ -590,6 +636,13 @@ bool preserved_trx_consume_inflight_command_packet(
 bool preserved_trx_mark_inflight_unknown_query(THD *thd);
 void preserved_trx_clear_inflight_risky_statement(THD *thd);
 void preserved_trx_clear_inflight_unknown_query(THD *thd);
+void preserved_trx_phase2_finish_protocol_command(THD *thd);
+bool preserved_trx_phase2_defer_command_response(THD *thd);
+bool preserved_trx_phase2_wait_for_deferred_command_response(THD *thd);
+bool preserved_trx_phase2_command_is_captured(THD *thd);
+bool preserved_trx_phase2_command_body_already_entered(THD *thd);
+void preserved_trx_phase2_begin_synthetic_protocol_command(
+    THD *thd, enum enum_server_command command);
 Preserved_trx_view_rows preserved_trx_snapshot(THD *thd);
 size_t preserved_trx_record_count();
 bool preserved_trx_row_visible(THD *thd, const Preserved_trx_view_row &row);

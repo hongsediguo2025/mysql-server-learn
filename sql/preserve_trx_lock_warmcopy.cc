@@ -2871,6 +2871,67 @@ bool Preserve_trx_lock_warmcopy_drain_participant::
 }
 
 bool Preserve_trx_lock_warmcopy_drain_participant::
+    phase1_record_prebuilt_blob_if_current(
+        uint64_t thread_id,
+        const lock_warmcopy_trx_lock_fence_t &current_live_fence,
+        PrebuiltRecordLocksBlob *blob) const {
+  if (blob == nullptr) return false;
+  const auto target = m_targets.find(thread_id);
+  if (target == m_targets.end() ||
+      !target->second.record_locks_candidate_valid ||
+      !target->second.record_locks_seeded_in_phase1 ||
+      !target->second.has_phase1_record_prebuilt_blob ||
+      !target->second.phase1_record_prebuilt_fence_valid ||
+      !target->second.phase1_record_live_fence_valid ||
+      target->second.phase1_record_prebuilt_blob.warmcopy_id.empty() ||
+      target->second.phase1_record_prebuilt_blob.size == 0 ||
+      !record_live_fence_matches_phase1(
+          target->second.phase1_record_live_fence, current_live_fence)) {
+    return false;
+  }
+
+  lock_warmcopy_record_store_fence_t current_store_fence;
+  if (!lock_warmcopy_record_store_fence_for_target(thread_id,
+                                                    &current_store_fence) ||
+      !lock_warmcopy_record_store_fence_equal(
+          target->second.phase1_record_prebuilt_fence,
+          current_store_fence)) {
+    return false;
+  }
+
+  *blob = target->second.phase1_record_prebuilt_blob;
+  return true;
+}
+
+bool Preserve_trx_lock_warmcopy_drain_participant::
+    refresh_phase1_record_live_fence_for_thread(
+        uint64_t thread_id,
+        const lock_warmcopy_trx_lock_fence_t &live_fence,
+        uint64_t minimum_publication_generation) {
+  auto target = m_targets.find(thread_id);
+  if (target == m_targets.end() ||
+      !target->second.has_phase1_record_prebuilt_blob ||
+      !target->second.phase1_record_prebuilt_fence_valid) {
+    return false;
+  }
+  if (minimum_publication_generation ==
+      std::numeric_limits<uint64_t>::max()) {
+    return false;
+  }
+  target->second.phase1_record_live_fence = live_fence;
+  target->second.phase1_record_live_fence_valid = true;
+  attach_record_store_contract(
+      target->second.phase1_record_prebuilt_fence,
+      &target->second.phase1_record_prebuilt_blob, &live_fence);
+  if (target->second.phase1_record_prebuilt_blob
+          .source_live_lock_generation <= minimum_publication_generation) {
+    target->second.phase1_record_prebuilt_blob
+        .source_live_lock_generation = minimum_publication_generation + 1;
+  }
+  return true;
+}
+
+bool Preserve_trx_lock_warmcopy_drain_participant::
     record_locks_seeded_in_phase1_for_unit_test(uint64_t thread_id) const {
   const auto it = m_targets.find(thread_id);
   return it != m_targets.end() && it->second.record_locks_seeded_in_phase1;

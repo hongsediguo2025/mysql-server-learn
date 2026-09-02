@@ -1,0 +1,199 @@
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+--disable_query_log
+
+SELECT @@GLOBAL.rds_preserve_trx_standby_phase2_scheduler_mode AS suite_mode;
+
+--disable_result_log
+--error ER_INCORRECT_GLOBAL_LOCAL_VAR
+SET GLOBAL rds_preserve_trx_standby_phase2_scheduler_mode=
+  'DEPENDENCY_CONVERGENCE_V1';
+--enable_result_log
+
+--let $credential_file= $MYSQL_TMP_DIR/phase2-scheduler-mode.secret
+--write_file $credential_file
+phase2-scheduler-mode-secret
+EOF
+--exec chmod 600 $credential_file
+
+--connect(mode_receiver,127.0.0.1,root,,test,$SERVER_MYPORT_2,)
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'phase2-scheduler-mode-secret';
+GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.*
+  TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+GRANT PROCESS ON *.* TO preserve_trx_ha_admin@localhost;
+
+--connection default
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+DROP USER IF EXISTS phase2_scheduler_mode_app@localhost;
+DROP TABLE IF EXISTS t_phase2_scheduler_mode;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'phase2-scheduler-mode-secret';
+GRANT SHUTDOWN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.*
+  TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+GRANT PROCESS ON *.* TO preserve_trx_ha_admin@localhost;
+CREATE USER phase2_scheduler_mode_app@localhost;
+GRANT SELECT, UPDATE ON test.* TO phase2_scheduler_mode_app@localhost;
+
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-standby-phase2-scheduler-mode=DEPENDENCY_CONVERGENCE_V1 --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$SERVER_MYPORT_2 --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=phase2_scheduler_mode --rds-preserve-trx-transfer-credential-secret-file=$credential_file
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--let $restart_parameters=
+--disable_query_log
+
+SELECT @@GLOBAL.rds_preserve_trx_standby_phase2_scheduler_mode
+  AS dependency_mode;
+
+--connect(mode_dependency_ha,localhost,preserve_trx_ha_admin,phase2-scheduler-mode-secret,test)
+--connect(mode_dependency_admin,localhost,root,,test)
+CREATE TABLE t_phase2_scheduler_mode(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_phase2_scheduler_mode VALUES(1,10);
+
+--connect(mode_dependency_app,localhost,phase2_scheduler_mode_app,,test)
+START TRANSACTION;
+UPDATE t_phase2_scheduler_mode SET v=11 WHERE id=1;
+
+--connection mode_dependency_admin
+--replace_column 1 GENERATION 3 SOURCE_ID 6 CLOSING_STARTED_US 7 CLOSING_DEADLINE_US
+DRAIN TRANSACTIONS PRESERVE;
+
+--let _PHASE2_FINAL_LOG= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--let _PHASE2_FINAL_MODE= DEPENDENCY_CONVERGENCE_V1
+--perl
+use strict;
+use warnings;
+
+my $path = $ENV{'_PHASE2_FINAL_LOG'} or die "missing source error log";
+my $expected_mode = $ENV{'_PHASE2_FINAL_MODE'} or die "missing expected mode";
+open(my $fh, '<', $path) or die "cannot read source error log: $!";
+my $record;
+my $summary;
+while (my $line = <$fh>) {
+  if ($line =~
+      /CURRENT_TEST: preserve_trx\.standby_transfer_phase2_scheduler_mode/) {
+    undef($record);
+    undef($summary);
+  }
+  $summary = $line if $line =~ /PRESERVE_PHASE2_SCHED_V1 /;
+  $record = $line if $line =~ /PRESERVE_PHASE2_FINAL_V1 /;
+}
+close($fh);
+die "missing PRESERVE_PHASE2_SCHED_V1" unless defined($summary);
+die "missing PRESERVE_PHASE2_FINAL_V1" unless defined($record);
+my %field = ($record =~ /([a-z0-9_]+)=([^\s]+)/g);
+my %scheduler = ($summary =~ /([a-z0-9_]+)=([^\s]+)/g);
+die "wrong final-record mode" unless ($field{'mode'} // '') eq $expected_mode;
+die "scheduler/final attempt mismatch"
+  unless ($scheduler{'attempt_id'} // '') eq ($field{'attempt_id'} // '') &&
+         ($scheduler{'generation'} // '') eq ($field{'generation'} // '') &&
+         ($scheduler{'mode'} // '') eq $expected_mode;
+die "scheduler did not reach clean quiescent HARD"
+  unless ($scheduler{'terminal_result'} // '') eq 'HARD_QUIESCENT' &&
+         ($scheduler{'hard_cause'} // '') eq 'QUIESCENT' &&
+         ($scheduler{'abort_cause'} // '') eq 'NONE';
+for my $name (qw(scheduler_fatal_count scan_unknown_result lineage_unknown
+                 lock_proof_unknown
+                 execution_returned_4020_conflict
+                 invariant_violation_count)) {
+  die "nonzero scheduler fatal field $name"
+    unless ($scheduler{$name} // -1) == 0;
+}
+die "missing progress-due crossing diagnostic"
+  unless ($scheduler{'tick_crossed_unserviced_progress_deadline'} // '') =~
+         /^\d+$/;
+for my $name (qw(attempt_id generation pre_closing_policy_started_us
+                 hard_published_us closing_published_us final_ack_us
+                 phase2_end_monotonic_us attempt_terminal_us
+                 strict_interval_us)) {
+  die "missing or zero $name" unless ($field{$name} // 0) =~ /^\d+$/ &&
+                                      $field{$name} > 0;
+}
+die "missing transfer epoch" unless ($field{'transfer_epoch_id'} // '') ne '-';
+die "wrong empty-body state"
+  unless ($field{'last_body_exit_state'} // '') eq 'NO_ELIGIBLE_BODY' &&
+         ($field{'eligible_body_count'} // -1) == 0 &&
+         ($field{'exact_body_exit_coverage_complete'} // 0) == 1 &&
+         ($field{'last_command_end_missing'} // 0) == 1 &&
+         ($field{'tail_fallback_used'} // 1) == 0;
+die "invalid eligible digest"
+  unless ($field{'eligible_body_key_digest_v1'} // '') =~ /^[0-9a-f]{64}$/;
+die "milestone order is inconsistent"
+  unless $field{'pre_closing_policy_started_us'} <= $field{'hard_published_us'} &&
+         $field{'hard_published_us'} <= $field{'closing_published_us'} &&
+         $field{'closing_published_us'} <= $field{'final_ack_us'} &&
+         $field{'final_ack_us'} <= $field{'phase2_end_monotonic_us'} &&
+         $field{'phase2_end_monotonic_us'} <= $field{'attempt_terminal_us'};
+EOF
+--let _PHASE2_FINAL_LOG=
+--let _PHASE2_FINAL_MODE=
+
+--connection mode_receiver
+SELECT VARIABLE_VALUE=1 AS dependency_epoch_accepted
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs';
+
+--connection mode_dependency_ha
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+SHUTDOWN;
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+
+--exec echo "restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-standby-phase2-scheduler-mode=LEGACY_READINESS_THEN_CLOSING --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$SERVER_MYPORT_2 --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=phase2_scheduler_mode --rds-preserve-trx-transfer-credential-secret-file=$credential_file" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+--disable_query_log
+
+--connect(mode_legacy_admin,localhost,root,,test)
+SELECT @@GLOBAL.rds_preserve_trx_standby_phase2_scheduler_mode AS legacy_mode;
+
+--connect(mode_legacy_ha,localhost,preserve_trx_ha_admin,phase2-scheduler-mode-secret,test)
+--connect(mode_legacy_app,localhost,phase2_scheduler_mode_app,,test)
+START TRANSACTION;
+UPDATE t_phase2_scheduler_mode SET v=12 WHERE id=1;
+
+--connection mode_legacy_admin
+--replace_column 1 GENERATION 3 SOURCE_ID 6 CLOSING_STARTED_US 7 CLOSING_DEADLINE_US
+DRAIN TRANSACTIONS PRESERVE;
+
+--connection mode_receiver
+SELECT VARIABLE_VALUE>=2 AS legacy_epoch_accepted
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs';
+
+--connection mode_legacy_ha
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+SHUTDOWN;
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+--disable_query_log
+
+--connect(mode_cleanup,localhost,root,,test)
+DROP TABLE t_phase2_scheduler_mode;
+DROP USER preserve_trx_ha_admin@localhost;
+DROP USER phase2_scheduler_mode_app@localhost;
+
+--connection mode_receiver
+DROP USER preserve_trx_ha_admin@localhost;
+
+--connection mode_cleanup
+--remove_file $credential_file
+
+--enable_query_log

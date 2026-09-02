@@ -1,0 +1,8 @@
+include/assert.inc [pre-COMMIT-send failure restores the original transaction connection]
+include/assert.inc [transaction restore does not enter COMMIT_UNKNOWN]
+include/assert.inc [transaction restore leaves no accepted receiver epoch]
+id	v
+1	21
+2	22
+unsent_transaction_restore
+ok

@@ -56,6 +56,37 @@
 extern MYSQL_PLUGIN_IMPORT CHARSET_INFO *system_charset_info;
 
 static PSI_memory_key key_memory_MDL_context_acquire_locks;
+static std::atomic<bool> g_mdl_phase2_wait_capture_enabled{false};
+
+void mdl_set_phase2_wait_capture_enabled(bool enabled) {
+  g_mdl_phase2_wait_capture_enabled.store(enabled, std::memory_order_release);
+}
+
+static bool mdl_phase2_prlock_tryrdlock(mysql_prlock_t *lock) {
+  int result;
+
+#ifdef HAVE_PSI_RWLOCK_INTERFACE
+  PSI_rwlock_locker *locker = nullptr;
+  PSI_rwlock_locker_state state;
+  if (lock->m_psi != nullptr) {
+    locker = PSI_RWLOCK_CALL(start_rwlock_rdwait)(
+        &state, lock->m_psi, PSI_RWLOCK_TRYREADLOCK, __FILE__, __LINE__);
+  }
+#endif
+
+  result = native_mutex_trylock(&lock->m_prlock.lock);
+  if (result == 0) {
+    ++lock->m_prlock.active_readers;
+    native_mutex_unlock(&lock->m_prlock.lock);
+  }
+
+#ifdef HAVE_PSI_RWLOCK_INTERFACE
+  if (locker != nullptr) {
+    PSI_RWLOCK_CALL(end_rwlock_rdwait)(locker, result);
+  }
+#endif
+  return result == 0;
+}
 
 #ifdef HAVE_PSI_INTERFACE
 static PSI_mutex_key key_MDL_wait_LOCK_wait_status;
@@ -1428,9 +1459,24 @@ MDL_context::MDL_context()
       m_needs_thr_lock_abort(false),
       m_force_dml_deadlock_weight(false),
       m_waiting_for(nullptr),
+      m_waiting_for_duration(MDL_DURATION_END),
       m_pins(nullptr),
       m_rand_state(UINT_MAX32) {
   mysql_prlock_init(key_MDL_context_LOCK_waiting_for, &m_LOCK_waiting_for);
+}
+
+void MDL_context::will_wait_for(
+    MDL_wait_for_subgraph *waiting_for_arg, enum_mdl_duration duration) {
+  /* A waiter must materialize fast-path tickets before joining the graph. */
+  materialize_fast_path_locks();
+
+  mysql_prlock_wrlock(&m_LOCK_waiting_for);
+  m_waiting_for = waiting_for_arg;
+  m_waiting_for_duration =
+      g_mdl_phase2_wait_capture_enabled.load(std::memory_order_acquire)
+          ? duration
+          : MDL_DURATION_END;
+  mysql_prlock_unlock(&m_LOCK_waiting_for);
 }
 
 /**
@@ -3422,7 +3468,7 @@ bool MDL_context::acquire_lock(MDL_request *mdl_request,
   }
 #endif
 
-  will_wait_for(ticket);
+  will_wait_for(ticket, mdl_request->duration);
 
   /* There is a shared or exclusive lock on the object. */
   DEBUG_SYNC(get_thd(), "mdl_acquire_lock_wait");
@@ -4418,6 +4464,102 @@ bool MDL_context::visit_tickets(enum_mdl_duration duration,
     if (visitor(ticket, arg)) return true;
   }
   return false;
+}
+
+MDL_phase2_wait_probe_status MDL_context::try_snapshot_phase2_wait(
+    MDL_phase2_wait_snapshot *snapshot) {
+  if (snapshot == nullptr) {
+    return MDL_phase2_wait_probe_status::UNKNOWN_INCOMPLETE;
+  }
+  snapshot->key.reset();
+  snapshot->request_type = MDL_TYPE_END;
+
+  bool forced_context_busy = false;
+  DBUG_EXECUTE_IF("phase2_sched_mdl_probe_context_busy",
+                  forced_context_busy = true;);
+  if (forced_context_busy ||
+      !mdl_phase2_prlock_tryrdlock(&m_LOCK_waiting_for)) {
+    return MDL_phase2_wait_probe_status::RETRYABLE_BUSY;
+  }
+
+  MDL_phase2_wait_probe_status result =
+      MDL_phase2_wait_probe_status::NOT_WAITING;
+  MDL_wait_for_subgraph *const waiting_for = m_waiting_for;
+  const enum_mdl_duration duration = m_waiting_for_duration;
+  if (waiting_for == nullptr) goto end_context;
+  if (duration == MDL_DURATION_END) {
+    result = MDL_phase2_wait_probe_status::NON_MDL_WAIT;
+    goto end_context;
+  }
+  if (duration != MDL_TRANSACTION) {
+    result = MDL_phase2_wait_probe_status::UNSUPPORTED_DURATION;
+    goto end_context;
+  }
+
+  {
+    MDL_ticket *const waiting_ticket =
+        static_cast<MDL_ticket *>(waiting_for);
+    MDL_lock *const lock = waiting_ticket->m_lock;
+    if (lock == nullptr) {
+      result = MDL_phase2_wait_probe_status::STALE;
+      goto end_context;
+    }
+
+    bool forced_lock_busy = false;
+    DBUG_EXECUTE_IF("phase2_sched_mdl_probe_lock_busy",
+                    forced_lock_busy = true;);
+    if (forced_lock_busy || !mdl_phase2_prlock_tryrdlock(&lock->m_rwlock)) {
+      result = MDL_phase2_wait_probe_status::RETRYABLE_BUSY;
+      goto end_context;
+    }
+
+    if (m_waiting_for != waiting_for ||
+        m_waiting_for_duration != duration ||
+        m_wait.get_status() != MDL_wait::WS_EMPTY) {
+      result = MDL_phase2_wait_probe_status::STALE;
+      goto end_lock;
+    }
+
+    {
+      size_t visited = 0;
+      bool ticket_found = false;
+      bool pending_priority_blocker = false;
+      MDL_lock::Ticket_iterator it(lock->m_waiting);
+      for (MDL_ticket *ticket = it++; ticket != nullptr; ticket = it++) {
+        if (++visited > MDL_PHASE2_MAX_WAITING_TICKETS) {
+          result = MDL_phase2_wait_probe_status::UNKNOWN_INCOMPLETE;
+          goto end_lock;
+        }
+        if (ticket == waiting_ticket) {
+          ticket_found = true;
+        } else if (ticket->get_ctx() != this &&
+                   ticket->is_incompatible_when_waiting(
+                       waiting_ticket->get_type())) {
+          pending_priority_blocker = true;
+        }
+      }
+      if (!ticket_found) {
+        result = MDL_phase2_wait_probe_status::STALE;
+        goto end_lock;
+      }
+      snapshot->key.mdl_key_init(&lock->key);
+      snapshot->request_type = waiting_ticket->get_type();
+      if (pending_priority_blocker) {
+        result = MDL_phase2_wait_probe_status::
+            UNSUPPORTED_PENDING_PRIORITY_BLOCKER;
+        goto end_lock;
+      }
+    }
+
+    result = MDL_phase2_wait_probe_status::COMPLETE_TRANSACTION;
+
+  end_lock:
+    mysql_prlock_unlock(&lock->m_rwlock);
+  }
+
+end_context:
+  mysql_prlock_unlock(&m_LOCK_waiting_for);
+  return result;
 }
 
 bool MDL_context::export_savepoint_ordinals(

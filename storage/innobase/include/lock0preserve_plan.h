@@ -21,6 +21,56 @@
 struct dict_index_t;
 struct trx_t;
 
+constexpr size_t LOCK_PRESERVE_PHASE2_MAX_QUEUE_PREDECESSORS = 256;
+
+enum class lock_preserve_phase2_probe_status : uint8_t {
+  NOT_WAITING = 0,
+  RETRYABLE_LOCK_SYS_BUSY,
+  RETRYABLE_STALE_IDENTITY,
+  COMPLETE,
+  UNSUPPORTED_PENDING_PREDECESSOR,
+  UNSUPPORTED_RELEASE_CLASS,
+  UNKNOWN_INCOMPLETE,
+  UNKNOWN_IDENTITY
+};
+
+struct lock_preserve_phase2_identity {
+  uint64_t immutable_id{0};
+  uint64_t version{0};
+  uint64_t raw_cookie{0};
+  uint64_t owner_thd_cookie{0};
+};
+
+enum class lock_preserve_phase2_release_class : uint8_t {
+  TABLE_TRANSACTION_END = 0,
+  RECORD_RR_OR_STRONGER
+};
+
+struct lock_preserve_phase2_blocker {
+  lock_preserve_phase2_identity identity;
+  uint32_t type_mode{0};
+  lock_preserve_phase2_release_class release_class{
+      lock_preserve_phase2_release_class::TABLE_TRANSACTION_END};
+};
+
+struct lock_preserve_phase2_wait_snapshot {
+  lock_preserve_phase2_identity waiter;
+  size_t predecessor_count{0};
+  size_t blocker_count{0};
+  uint32_t wait_type_mode{0};
+};
+
+/** Try to copy the complete native queue prefix for one waiting transaction.
+The raw cookie is opaque outside this call and is dereferenced only while the
+exclusive lock_sys latch is owned. The caller-provided blocker array is
+published only for COMPLETE results. expected_waiter_version may be zero when
+the same native snapshot is responsible for sealing the T0 identity. */
+lock_preserve_phase2_probe_status lock_preserve_phase2_probe_wait(
+    uint64_t raw_waiter_cookie, uint64_t expected_waiter_version,
+    uint64_t expected_owner_thd_cookie,
+    lock_preserve_phase2_blocker *blockers, size_t blocker_capacity,
+    lock_preserve_phase2_wait_snapshot *snapshot);
+
 enum class lock_preserve_metadata_plan_status : uint8_t {
   OK = 0,
   INVALID_ARGUMENT,

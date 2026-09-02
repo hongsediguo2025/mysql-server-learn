@@ -1,0 +1,118 @@
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+--disable_query_log
+--disable_result_log
+
+--let $credential_file= $MYSQL_TMP_DIR/not-committed-clean-source-restore.secret
+--write_file $credential_file
+not-committed-clean-source-restore-secret
+EOF
+--exec chmod 600 $credential_file
+
+--connect(clean_restore_receiver,127.0.0.1,root,,test,$SERVER_MYPORT_2,)
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'not-committed-clean-source-restore-secret';
+GRANT PRESERVE_TRX_TRANSFER_ADMIN, PROCESS ON *.*
+  TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+SET @receiver_active_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs');
+
+--connection default
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+DROP USER IF EXISTS clean_restore_app@localhost;
+DROP TABLE IF EXISTS t_not_committed_clean_source_restore;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'not-committed-clean-source-restore-secret';
+GRANT SHUTDOWN, SYSTEM_VARIABLES_ADMIN,
+      PRESERVE_TRX_TRANSFER_ADMIN, PROCESS ON *.*
+  TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+CREATE USER clean_restore_app@localhost;
+GRANT SELECT, UPDATE ON test.* TO clean_restore_app@localhost;
+
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$SERVER_MYPORT_2 --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=not_committed_clean_source_restore --rds-preserve-trx-transfer-credential-secret-file=$credential_file
+--source include/restart_mysqld.inc
+--let $restart_parameters=
+--disable_query_log
+--disable_result_log
+--source suite/preserve_trx/include/assert_phase2_dependency_mode.inc
+
+CREATE TABLE t_not_committed_clean_source_restore(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_not_committed_clean_source_restore VALUES(1,10),(2,20);
+
+--connect(clean_restore_source_ha,localhost,preserve_trx_ha_admin,not-committed-clean-source-restore-secret,test)
+SET @unknown_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME='Preserve_trx_transfer_source_commit_unknown_epochs');
+
+--connect(clean_restore_app,localhost,clean_restore_app,,test)
+--let $app_connection_id= query_get_value(SELECT CONNECTION_ID() AS id, id, 1)
+START TRANSACTION;
+UPDATE t_not_committed_clean_source_restore SET v=11 WHERE id=1;
+
+--connect(clean_restore_marker,localhost,clean_restore_app,,test)
+UPDATE t_not_committed_clean_source_restore SET v=22 WHERE id=2;
+
+--connect(clean_restore_drain,localhost,root,,test)
+SET SESSION debug='+d,preserve_trx_transfer_drop_commit_send_twice';
+SET DEBUG_SYNC=
+  'preserve_trx_not_committed_clean_source_restore_pending SIGNAL clean_restore_pending WAIT_FOR clean_restore_release';
+--send DRAIN TRANSACTIONS PRESERVE
+
+--connection clean_restore_source_ha
+SET DEBUG_SYNC='now WAIT_FOR clean_restore_pending TIMEOUT 30';
+SET DEBUG_SYNC='now SIGNAL clean_restore_release';
+
+--connection clean_restore_drain
+--error ER_PRESERVE_TRX_UNSUPPORTED
+--reap
+SET SESSION debug='-d,preserve_trx_transfer_drop_commit_send_twice';
+SET DEBUG_SYNC='RESET';
+
+--connection clean_restore_app
+--let $assert_text= NOT_COMMITTED_CLEAN source restore preserves the original transaction connection
+--let $assert_cond= `SELECT CONNECTION_ID()=$app_connection_id`
+--source include/assert.inc
+UPDATE t_not_committed_clean_source_restore SET v=v+10 WHERE id=1;
+COMMIT;
+
+--connection clean_restore_source_ha
+--let $assert_text= NOT_COMMITTED_CLEAN does not enter COMMIT_UNKNOWN
+--let $assert_cond= `SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_source_commit_unknown_epochs')=@unknown_before`
+--source include/assert.inc
+
+--connection clean_restore_receiver
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')=@receiver_active_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_worker_active')=0 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_queued_bytes')=0
+--source include/wait_condition.inc
+
+--connection clean_restore_marker
+--enable_result_log
+SELECT id,v FROM t_not_committed_clean_source_restore ORDER BY id;
+--disable_result_log
+
+--connection default
+DROP TABLE t_not_committed_clean_source_restore;
+DROP USER clean_restore_app@localhost;
+DROP USER preserve_trx_ha_admin@localhost;
+
+--connection clean_restore_receiver
+DROP USER preserve_trx_ha_admin@localhost;
+
+--connection default
+--remove_file $credential_file
+--enable_result_log
+SELECT 'ok' AS not_committed_clean_source_restore;
+--enable_query_log

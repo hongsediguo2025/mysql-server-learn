@@ -1,0 +1,145 @@
+# A transaction can start after the final phase-1 target scan but before
+# T0. The authoritative dependency target set must
+# declare that token before streaming its final binlog cache.
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_query_log
+CALL mtr.add_suppression(".*Got an error reading communication packets.*");
+CALL mtr.add_suppression(".*Got an error writing communication packets.*");
+--let $credential_file= $MYSQL_TMP_DIR/closing_late_transfer_target.secret
+--write_file $credential_file
+closing-late-transfer-target-secret
+EOF
+--exec chmod 600 $credential_file
+
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+DROP USER IF EXISTS closing_late_app@localhost;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'closing-late-transfer-target-secret';
+GRANT SHUTDOWN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.*
+  TO preserve_trx_ha_admin@localhost;
+CREATE USER closing_late_app@localhost;
+GRANT SELECT, UPDATE ON test.* TO closing_late_app@localhost;
+
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$MASTER_MYPORT --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=closing_late_transfer_target --rds-preserve-trx-transfer-credential-secret-file=$credential_file
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--let $restart_parameters=
+--disable_query_log
+--source suite/preserve_trx/include/assert_phase2_dependency_mode.inc
+
+CALL mtr.add_suppression(
+  "PRESERVE: standby transfer source epoch commit failed status=9");
+
+--let $old_closing_timeout= `SELECT @@GLOBAL.rds_preserve_trx_drain_phase2_timeout_ms`
+--let $old_prewarm_paused= `SELECT @@GLOBAL.rds_preserve_trx_transfer_prewarm_paused`
+
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms=60000;
+SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=ON;
+
+CREATE TABLE t_closing_late_transfer_target(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_closing_late_transfer_target VALUES (1,10);
+
+--connect(closing_late_ha,localhost,preserve_trx_ha_admin,closing-late-transfer-target-secret,test)
+--connect(closing_late_app,localhost,closing_late_app,,test)
+--connection closing_late_ha
+SET @unknown_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME='Preserve_trx_transfer_source_commit_unknown_epochs');
+--let $receiver_active_before= query_get_value(SELECT VARIABLE_VALUE+0 AS value FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs', value, 1)
+
+--connect(closing_late_owner,localhost,root,,test)
+SET SESSION debug='+d,preserve_trx_transfer_fail_commit_before_send_once';
+SET DEBUG_SYNC=
+  'preserve_trx_transfer_after_phase1_binlog_stream SIGNAL closing_late_phase1_scanned WAIT_FOR closing_late_transaction_started';
+SET DEBUG_SYNC=
+  'preserve_trx_batch_after_one_target_preserved SIGNAL closing_late_target_staged WAIT_FOR closing_late_target_continue';
+SET DEBUG_SYNC=
+  'preserve_trx_transfer_commit_before_send_failed SIGNAL closing_late_unsent_ready WAIT_FOR closing_late_unsent_continue';
+--send DRAIN TRANSACTIONS PRESERVE
+
+# This transaction did not exist during either phase-1 declaration scan.
+--connection closing_late_ha
+SET DEBUG_SYNC='now WAIT_FOR closing_late_phase1_scanned TIMEOUT 30';
+--connection closing_late_app
+--let $app_connection_id= query_get_value(SELECT CONNECTION_ID() AS id, id, 1)
+START TRANSACTION;
+UPDATE t_closing_late_transfer_target SET v=v+1 WHERE id=1;
+--connection closing_late_ha
+SET DEBUG_SYNC='now SIGNAL closing_late_transaction_started';
+SET DEBUG_SYNC='now WAIT_FOR closing_late_target_staged TIMEOUT 30';
+SET DEBUG_SYNC='now SIGNAL closing_late_target_continue';
+SET DEBUG_SYNC='now WAIT_FOR closing_late_unsent_ready TIMEOUT 30';
+SET DEBUG_SYNC='now SIGNAL closing_late_unsent_continue';
+
+--connection closing_late_owner
+--error ER_PRESERVE_TRX_UNSUPPORTED
+--reap
+SET SESSION debug='-d,preserve_trx_transfer_fail_commit_before_send_once';
+SET DEBUG_SYNC='RESET';
+
+--let $assert_text= late transaction is staged as an authoritative target
+--let $assert_cond= `SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_early_staged_tokens')=1`
+--source include/assert.inc
+
+--connection closing_late_app
+--let $assert_text= late target failure restores the original transaction connection
+--let $assert_cond= `SELECT CONNECTION_ID()=$app_connection_id`
+--source include/assert.inc
+UPDATE t_closing_late_transfer_target SET v=v+10 WHERE id=1;
+COMMIT;
+
+--connection closing_late_ha
+--let $assert_text= late target failure avoids COMMIT_UNKNOWN
+--let $assert_cond= `SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_source_commit_unknown_epochs')=@unknown_before`
+--source include/assert.inc
+
+--connection default
+--enable_query_log
+SELECT v FROM t_closing_late_transfer_target WHERE id=1;
+--disable_query_log
+
+--disconnect closing_late_owner
+--disconnect closing_late_app
+--disconnect closing_late_ha
+
+--connection default
+# Prewarm is intentionally paused in this scenario, so only receiver epoch
+# ownership is required to resolve before the teardown restart.
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')=$receiver_active_before
+--source include/wait_condition.inc
+
+# Tear down target-local prepared handles after the restored source commits.
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$MASTER_MYPORT --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=closing_late_transfer_target --rds-preserve-trx-transfer-credential-secret-file=$credential_file
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--let $restart_parameters=
+--disable_query_log
+--source suite/preserve_trx/include/assert_phase2_dependency_mode.inc
+--let $assert_text= late target source commit survives restart
+--let $assert_cond= `SELECT v=21 FROM t_closing_late_transfer_target WHERE id=1`
+--source include/assert.inc
+
+DROP TABLE t_closing_late_transfer_target;
+DROP USER closing_late_app@localhost;
+DROP USER preserve_trx_ha_admin@localhost;
+SET GLOBAL rds_preserve_trx_enable=ON;
+--remove_file $credential_file
+--disable_result_log
+--eval SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms=$old_closing_timeout
+--eval SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=$old_prewarm_paused
+--enable_result_log

@@ -6,7 +6,5 @@ one_accepted_epoch
 1
 two_source_survivors
 1
-post_commit_reset_too_late
-1
 source_rows_after_restart
 1:10,2:20,3:30

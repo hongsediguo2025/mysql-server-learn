@@ -89,6 +89,31 @@ die "prejoin result must control the join guard cancellation path\n"
   unless $src =~
     /const\s+bool\s+prejoin_failure[\s\S]{0,500}cancel_workers_before_join\s*=\s*prejoin_failure[\s\S]{0,200}join_workers\.rollback\(\)/s;
 
+my $early_threads_start = index(
+  $src, 'static uint preserve_trx_effective_early_pipeline_threads(');
+my $early_threads_end = index(
+  $src, 'bool warmcopy_close_deadline_expired(', $early_threads_start);
+my $early_threads_body =
+  $early_threads_start >= 0 && $early_threads_end > $early_threads_start
+    ? substr($src, $early_threads_start,
+             $early_threads_end - $early_threads_start)
+    : '';
+die "large-cohort early pipeline must have an isolated worker selector\n"
+  unless $early_threads_body =~
+    /preserve_trx_effective_parallel_preserve_threads\(/s &&
+    $early_threads_body =~ /final_hwm_async_capable/s &&
+    $early_threads_body =~ /target_count\s*<\s*128/s &&
+    $early_threads_body =~ /std::min<uint>\(16,/s;
+die "early pipeline worker tuning must stay independent of scheduler mode\n"
+  if $early_threads_body =~
+    /phase2_scheduler|DEPENDENCY_CONVERGENCE|standby_phase2/s;
+die "startup recovery auto worker cap must remain ten\n"
+  unless $src =~
+    /preserve_trx_auto_parallel_preserve_threads[\s\S]{0,300}std::min<uint>\(requested,\s*10\)/s;
+die "only the async early pipeline may use the isolated worker selector\n"
+  unless $src =~
+    /final_hwm_async_capable[\s\S]{0,900}preserve_trx_effective_early_pipeline_threads\(\s*target_ids\.size\(\),\s*final_hwm_async_capable\)/s;
+
 die "CLOSING coordinator must not synchronously prune Phase1 lock candidates\n"
   if $src =~ /retain_early_candidate_targets\(/s;
 
@@ -112,18 +137,64 @@ die "final survivor pruning must batch process-local record-blob removal\n"
 die "final survivor pruning must not delete one record blob per token\n"
   if $lock_prune_body =~ /discard_phase1_record_blob\(/s;
 
-my $join_pos = index($src, 'join_workers.rollback()');
-my $flush_pos = index($src, 'batch_transfer_phase1_sender->flush()', $join_pos);
-my $preseal_pos = index($src, 'object_presealed_for_token', $flush_pos);
-my $publish_pos = index($src,
-  'publish_acked_transfer_binlog_cache_progress', $preseal_pos);
-my $commit_pos = index($src, 'batch_transfer_source_session->commit_epoch(',
-                       $flush_pos);
-die "terminal final-HWM barrier must flush, verify exact preseal, then commit\n"
-  if $flush_pos < 0 || $preseal_pos < $flush_pos ||
-     $commit_pos < $preseal_pos;
-die "stale ownership side effects must publish after exact preseal validation\n"
-  if $publish_pos < $preseal_pos || $publish_pos > $commit_pos;
+my $wave_start = index($src, 'auto stage_ready_candidates =');
+my $wave_end = index($src, 'std::set<my_thread_id> pending', $wave_start);
+my $wave_body =
+  $wave_start >= 0 && $wave_end > $wave_start
+    ? substr($src, $wave_start, $wave_end - $wave_start)
+    : '';
+my $first_flush_pos = index(
+  $wave_body, 'batch_transfer_phase1_sender->flush()');
+my $preseal_pos = index(
+  $wave_body, 'object_presealed_for_token', $first_flush_pos);
+my $publish_pos = index(
+  $wave_body, 'publish_acked_transfer_binlog_cache_progress', $preseal_pos);
+my $stage_pos = index(
+  $wave_body,
+  'preserve_trx_transfer_stage_deferred_candidate_external_objects',
+  $publish_pos);
+my $second_flush_pos = index(
+  $wave_body, 'batch_transfer_phase1_sender->flush()', $stage_pos);
+my $fact_pos = index(
+  $wave_body, 'token_prewarm_lsn_fact', $second_flush_pos);
+my $staged_pos = index(
+  $wave_body, 'execution.early_objects_staged = true', $fact_pos);
+die "candidate wave must flush, verify exact preseal, publish, and stage\n"
+  if $first_flush_pos < 0 || $preseal_pos < $first_flush_pos ||
+     $publish_pos < $preseal_pos || $stage_pos < $publish_pos;
+die "candidate wave must flush staged seeds and publish facts before ready\n"
+  if $second_flush_pos < $stage_pos || $fact_pos < $second_flush_pos ||
+     $staged_pos < $fact_pos;
+die "candidate wave must pass the exact pending final-HWM descriptor\n"
+  unless $wave_body =~
+    /pending_descriptor[\s\S]{0,700}preserve_trx_transfer_stage_deferred_candidate_external_objects\([\s\S]{0,500}pending_descriptor/s;
+
+my $first_wave_call_pos = index(
+  $src, '!stage_ready_candidates()', $wave_end);
+my $join_pos = index($src, 'join_workers.rollback()', $first_wave_call_pos);
+my $commit_pos = index(
+  $src, 'batch_transfer_source_session->commit_epoch(', $join_pos);
+die "candidate waves must run before worker join and epoch commit\n"
+  if $first_wave_call_pos < 0 || $join_pos < $first_wave_call_pos ||
+     $commit_pos < $join_pos;
+
+my $scheduler_path = File::Spec->catfile(
+  $source_root, 'sql', 'preserve_trx_standby_phase2_scheduler.cc');
+open(my $scheduler_fh, '<', $scheduler_path)
+  or die "cannot open $scheduler_path: $!";
+my $scheduler_src = do { local $/; <$scheduler_fh> };
+close($scheduler_fh);
+my $terminal_check_start = index(
+  $scheduler_src, 'if (!executing || deadline)');
+my $terminal_check_end = index(
+  $scheduler_src, 'const Terminal_result result', $terminal_check_start);
+my $terminal_check_body =
+  $terminal_check_start >= 0 && $terminal_check_end > $terminal_check_start
+    ? substr($scheduler_src, $terminal_check_start,
+             $terminal_check_end - $terminal_check_start)
+    : '';
+die "disposable boundary hints must not delay HARD publication\n"
+  if $terminal_check_body =~ /stable_boundary_hints/s;
 
 EOF
 

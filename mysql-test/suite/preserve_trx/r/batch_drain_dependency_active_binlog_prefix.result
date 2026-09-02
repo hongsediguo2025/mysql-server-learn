@@ -1,0 +1,18 @@
+SELECT VARIABLE_VALUE+0 > @binlog_prewarm_before
+AS active_binlog_prefix_streamed_before_command_boundary
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME=
+'Preserve_trx_recv_binlog_obj_prewarm_first_start_us';
+active_binlog_prefix_streamed_before_command_boundary
+1
+include/wait_for_pattern_in_file.inc [PRESERVE: drain-owned active binlog mirror rebuild target=[0-9]+ prepared=1]
+include/assert_grep.inc [quiesced target closed on a final or already-published receiver high watermark]
+include/assert_grep.inc [quiesced final high watermark joined the coordinator batch]
+include/assert_grep.inc [final HWM admission overlapped local Preserve]
+include/assert_grep.inc [contiguous active binlog appends did not exhaust the pending range limit]
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+include/assert.inc [active-prefix failure restores the original transaction connection]
+include/assert.inc [active-prefix failure avoids COMMIT_UNKNOWN]
+row_count	value_sum	min_payload_bytes	max_payload_bytes
+433	849	4096	4096
+include/assert.inc [active-prefix committed image survives restart]

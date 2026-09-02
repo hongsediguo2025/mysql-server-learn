@@ -4,6 +4,7 @@
 
 --disable_query_log
 --disable_result_log
+--source suite/preserve_trx/include/assert_phase2_dependency_mode.inc
 
 --let $credential_file= $MYSQL_TMP_DIR/resume-required-phase2-commit.secret
 --write_file $credential_file
@@ -44,6 +45,7 @@ GRANT SYSTEM_VARIABLES_ADMIN ON *.*
 --let $restart_parameters=
 --disable_query_log
 --disable_result_log
+--source suite/preserve_trx/include/assert_phase2_dependency_mode.inc
 
 CALL mtr.add_suppression(
   "PRESERVE: rolled back prepared transaction without snapshot during recovery");
@@ -60,7 +62,7 @@ INSERT INTO t_resume_required_phase2_commit VALUES(1,10);
 START TRANSACTION;
 UPDATE t_resume_required_phase2_commit SET v=11 WHERE id=1;
 SET DEBUG_SYNC=
-  'before_execute_sql_command SIGNAL phase2_commit_entered WAIT_FOR phase2_commit_execute';
+  'phase2_sched_after_execution_entered SIGNAL phase2_commit_entered WAIT_FOR phase2_commit_execute TIMEOUT 30';
 --send COMMIT
 
 --connection phase2_source_ha
@@ -68,19 +70,23 @@ SET DEBUG_SYNC='now WAIT_FOR phase2_commit_entered TIMEOUT 30';
 
 --connect(phase2_drain_owner,localhost,root,,test)
 SET DEBUG_SYNC=
+  'phase2_sched_after_t0_registration SIGNAL phase2_t0_registered WAIT_FOR phase2_t0_continue TIMEOUT 30';
+SET DEBUG_SYNC=
   'preserve_trx_warmcopy_after_targets_classified SIGNAL phase2_targets_classified WAIT_FOR phase2_drain_continue';
 --send DRAIN TRANSACTIONS PRESERVE
 
 --connection phase2_source_ha
-SET DEBUG_SYNC='now WAIT_FOR phase2_targets_classified TIMEOUT 30';
+SET DEBUG_SYNC='now WAIT_FOR phase2_t0_registered TIMEOUT 30';
 
-# Let COMMIT finish only after classification. Its command-boundary
-# DRAINED_NO_TRANSACTION transition must insert the ID into S before
-# COMMIT_EPOCH is sent.
+# T0 must observe COMMIT in BODY. Let it finish before normal HARD; its
+# command-boundary DRAINED_NO_TRANSACTION transition must insert the ID into
+# the session-only set before COMMIT_EPOCH is sent.
 SET DEBUG_SYNC='now SIGNAL phase2_commit_execute';
 --connection phase2_source_app
 --reap
 --connection phase2_source_ha
+SET DEBUG_SYNC='now SIGNAL phase2_t0_continue';
+SET DEBUG_SYNC='now WAIT_FOR phase2_targets_classified TIMEOUT 30';
 SET DEBUG_SYNC='now SIGNAL phase2_drain_continue';
 --connection phase2_drain_owner
 --reap
@@ -91,8 +97,6 @@ SET DEBUG_SYNC='now SIGNAL phase2_drain_continue';
 --eval RESUME PRESERVED TRANSACTION '$app_id'
 
 --connection phase2_source_ha
---error ER_PRESERVE_TRX_RESET_TOO_LATE
-RESET DRAIN;
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 SHUTDOWN;
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
@@ -103,6 +107,7 @@ SHUTDOWN;
 --disable_reconnect
 --disable_query_log
 --disable_result_log
+--source suite/preserve_trx/include/assert_phase2_dependency_mode.inc
 
 --connect(phase2_source_cleanup,localhost,root,,test)
 --enable_result_log

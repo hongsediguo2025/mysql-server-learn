@@ -30,6 +30,7 @@ GRANT SELECT, UPDATE ON test.* TO source_token_local_app@localhost;
 --enable_result_log
 --let $restart_parameters=
 --disable_query_log
+--source suite/preserve_trx/include/assert_phase2_dependency_mode.inc
 CALL mtr.add_suppression(
   "PRESERVE: rolled back prepared transaction without snapshot during recovery");
 
@@ -58,9 +59,6 @@ START TRANSACTION;
 UPDATE t_source_token_local_failure SET v=31 WHERE id=3;
 
 --connection source_token_local_ha
-SET @reset_too_late_before=(
-  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
-  WHERE VARIABLE_NAME='Preserve_trx_reset_drain_too_late');
 SET GLOBAL debug='+d,preserve_trx_early_fail_candidate_finalize';
 
 --connection default
@@ -76,14 +74,6 @@ SELECT VARIABLE_VALUE=1 AS one_accepted_epoch
 SELECT VARIABLE_VALUE=2 AS two_source_survivors
   FROM performance_schema.global_status
  WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens';
-
---disable_result_log
---error ER_PRESERVE_TRX_RESET_TOO_LATE
-RESET DRAIN;
---enable_result_log
-SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
-        WHERE VARIABLE_NAME='Preserve_trx_reset_drain_too_late')
-       - @reset_too_late_before AS post_commit_reset_too_late;
 
 --connection source_token_local_app1
 --disable_result_log
@@ -115,6 +105,7 @@ SHUTDOWN;
 --source include/wait_until_connected_again.inc
 --disable_reconnect
 --disable_query_log
+--source suite/preserve_trx/include/assert_phase2_dependency_mode.inc
 
 --connect(source_token_local_cleanup,localhost,root,,test)
 SELECT GROUP_CONCAT(CONCAT(id, ':', v) ORDER BY id)

@@ -1,0 +1,8 @@
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+include/assert.inc [late transaction is staged as an authoritative target]
+include/assert.inc [late target failure restores the original transaction connection]
+include/assert.inc [late target failure avoids COMMIT_UNKNOWN]
+SELECT v FROM t_closing_late_transfer_target WHERE id=1;
+v
+21
+include/assert.inc [late target source commit survives restart]

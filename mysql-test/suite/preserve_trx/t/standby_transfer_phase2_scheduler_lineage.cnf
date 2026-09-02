@@ -1,0 +1,12 @@
+[mysqld.1]
+server_id=1
+rds-preserve-trx-standby-phase2-scheduler-mode=LEGACY_READINESS_THEN_CLOSING
+
+[mysqld.2]
+server_id=2
+rds-preserve-trx-enable=ON
+rds-preserve-trx-transfer-prewarm-paused=ON
+
+[ENV]
+SERVER_MYPORT_2=@mysqld.2.port
+SERVER_MYSOCK_2=@mysqld.2.socket

@@ -1,0 +1,13 @@
+include/assert.inc [idle target record-lock candidate refreshed before conversion]
+ERROR HY000: Lock wait timeout exceeded; try restarting transaction
+ERROR HY000: Lock wait timeout exceeded; try restarting transaction
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+stale_prebuilt_rejected	live_lock_list_fallback	early_token_staged
+1	1	1
+include/assert.inc [lock-reseal failure restores the original transaction connection]
+include/assert.inc [lock-reseal failure avoids COMMIT_UNKNOWN]
+id	v
+1	11
+2	20
+3	30
+include/assert.inc [lock-reseal committed rows survive restart]

@@ -1,0 +1,236 @@
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+--disable_query_log
+
+--let $credential_file= $MYSQL_TMP_DIR/phase2-scheduler-innodb-duplicate-shard.secret
+--write_file $credential_file
+phase2-scheduler-innodb-secret
+EOF
+--exec chmod 600 $credential_file
+
+--connect(innodb_receiver,127.0.0.1,root,,test,$SERVER_MYPORT_2,)
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'phase2-scheduler-innodb-secret';
+GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+GRANT PROCESS ON *.* TO preserve_trx_ha_admin@localhost;
+
+--connection default
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+DROP USER IF EXISTS phase2_scheduler_innodb_app@localhost;
+DROP TABLE IF EXISTS t_phase2_scheduler_innodb;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'phase2-scheduler-innodb-secret';
+GRANT SHUTDOWN, SYSTEM_VARIABLES_ADMIN,
+      PRESERVE_TRX_TRANSFER_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+CREATE USER phase2_scheduler_innodb_app@localhost;
+GRANT SELECT, UPDATE ON test.* TO phase2_scheduler_innodb_app@localhost;
+GRANT SESSION_VARIABLES_ADMIN ON *.*
+  TO phase2_scheduler_innodb_app@localhost;
+
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-standby-phase2-scheduler-mode=DEPENDENCY_CONVERGENCE_V1 --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$SERVER_MYPORT_2 --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=phase2_scheduler_innodb --rds-preserve-trx-transfer-credential-secret-file=$credential_file --rds-preserve-trx-drain-phase1-timeout-ms=10000 --rds-preserve-trx-drain-phase2-timeout-ms=10000 --log-error-verbosity=3
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--let $restart_parameters=
+--disable_query_log
+
+CREATE TABLE t_phase2_scheduler_innodb(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_phase2_scheduler_innodb
+  VALUES(1,10),(2,20),(3,30),(4,40),(5,50),(6,60),(7,70);
+
+--connect(innodb_unchanged_survivor,localhost,phase2_scheduler_innodb_app,,test)
+START TRANSACTION;
+UPDATE t_phase2_scheduler_innodb SET v=66 WHERE id=6;
+
+--connect(innodb_idle_survivor,localhost,phase2_scheduler_innodb_app,,test)
+START TRANSACTION;
+UPDATE t_phase2_scheduler_innodb SET v=44 WHERE id=4;
+
+--connect(innodb_blocker_a,localhost,phase2_scheduler_innodb_app,,test)
+START TRANSACTION;
+--disable_result_log
+SELECT id FROM t_phase2_scheduler_innodb WHERE id=1 LOCK IN SHARE MODE;
+--enable_result_log
+SET DEBUG_SYNC=
+  'phase2_sched_after_execution_entered SIGNAL innodb_blocker_a_progress_body';
+
+--connect(innodb_blocker_b,localhost,phase2_scheduler_innodb_app,,test)
+START TRANSACTION;
+--disable_result_log
+SELECT id FROM t_phase2_scheduler_innodb WHERE id=1 LOCK IN SHARE MODE;
+--enable_result_log
+SET DEBUG_SYNC=
+  'phase2_sched_after_execution_entered SIGNAL innodb_blocker_b_progress_body';
+
+--connect(innodb_waiter,localhost,phase2_scheduler_innodb_app,,test)
+START TRANSACTION;
+UPDATE t_phase2_scheduler_innodb SET v=77 WHERE id=7;
+SET DEBUG_SYNC='lock_wait_will_wait SIGNAL innodb_waiter_lock_wait';
+--send UPDATE t_phase2_scheduler_innodb SET v=12 WHERE id=1
+
+--connect(innodb_ha,localhost,preserve_trx_ha_admin,phase2-scheduler-innodb-secret,test)
+SET DEBUG_SYNC='now WAIT_FOR innodb_waiter_lock_wait TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die waiter did not enter an InnoDB record-lock wait before T0
+}
+
+--connect(innodb_owner,localhost,root,,test)
+SET DEBUG_SYNC=
+  'preserve_trx_transfer_after_phase1_binlog_stream SIGNAL innodb_phase1_record_sent WAIT_FOR innodb_idle_boundary_ready';
+SET DEBUG_SYNC=
+  'phase2_sched_after_innodb_support_registered SIGNAL innodb_support_ready';
+--send DRAIN TRANSACTIONS PRESERVE
+
+--connection innodb_ha
+SET DEBUG_SYNC='now WAIT_FOR innodb_phase1_record_sent TIMEOUT 10';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die owner did not reach the post-phase1-record boundary
+}
+
+--connection innodb_idle_survivor
+UPDATE t_phase2_scheduler_innodb SET v=55 WHERE id=5;
+
+--connection innodb_ha
+SET DEBUG_SYNC='now SIGNAL innodb_idle_boundary_ready';
+SET DEBUG_SYNC='now WAIT_FOR innodb_support_ready TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die scheduler did not prove the InnoDB waiter to blocker dependency
+}
+
+--connection innodb_blocker_a
+--send UPDATE t_phase2_scheduler_innodb SET v=22 WHERE id=2
+--connection innodb_blocker_b
+--send UPDATE t_phase2_scheduler_innodb SET v=33 WHERE id=3
+--connection innodb_ha
+SET DEBUG_SYNC='now WAIT_FOR innodb_blocker_a_progress_body TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die first shared-lock blocker did not receive support
+}
+SET DEBUG_SYNC='now WAIT_FOR innodb_blocker_b_progress_body TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die second shared-lock blocker did not receive support concurrently
+}
+--connection innodb_blocker_a
+--reap
+COMMIT;
+--connection innodb_blocker_b
+--reap
+COMMIT;
+
+--connection innodb_waiter
+--reap
+
+--connection innodb_owner
+--replace_column 1 GENERATION 3 SOURCE_ID 6 CLOSING_STARTED_US 7 CLOSING_DEADLINE_US
+--reap
+
+--let _PHASE2_FINAL_LOG= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--perl
+use strict;
+use warnings;
+
+open(my $fh, '<', $ENV{'_PHASE2_FINAL_LOG'})
+  or die "cannot read source error log: $!";
+my $record;
+my $warmcopy_record;
+while (my $line = <$fh>) {
+  if ($line =~
+      /CURRENT_TEST: preserve_trx\.standby_transfer_phase2_scheduler_innodb_duplicate_shard/) {
+    undef($record);
+    undef($warmcopy_record);
+  }
+  $record = $line if $line =~ /PRESERVE_PHASE2_FINAL_V1 /;
+  $warmcopy_record = $line
+    if $line =~ /PRESERVE: warm-copy drain metrics /;
+}
+close($fh);
+die "missing exact final record" unless defined($record);
+die "missing lock warmcopy record" unless defined($warmcopy_record);
+my %field = ($record =~ /([a-z0-9_]+)=([^\s]+)/g);
+my %warmcopy = ($warmcopy_record =~ /([a-z0-9_]+)=([^\s]+)/g);
+die "wrong exact final-record identity"
+  unless ($field{'attempt_id'} // 0) == 1 &&
+         ($field{'generation'} // 0) == 1 &&
+         ($field{'mode'} // '') eq 'DEPENDENCY_CONVERGENCE_V1';
+die "eligible BODY exit was not exact"
+  unless ($field{'eligible_body_count'} // 0) > 0 &&
+         ($field{'last_body_exit_state'} // '') eq 'EXACT' &&
+         ($field{'exact_body_exit_coverage_complete'} // 0) == 1 &&
+         ($field{'last_body_exit_us'} // 0) > 0 &&
+         ($field{'last_body_exit_connection_incarnation'} // 0) > 0 &&
+         ($field{'last_body_exit_command_sequence'} // 0) > 0 &&
+         ($field{'last_body_exit_thread_id'} // 0) > 0 &&
+         ($field{'last_command_end_missing'} // 1) == 0 &&
+         ($field{'tail_fallback_used'} // 1) == 0;
+die "invalid eligible BODY digest"
+  unless ($field{'eligible_body_key_digest_v1'} // '') =~ /^[0-9a-f]{64}$/;
+die "wrong scheduler/source terminal result"
+  unless ($field{'scheduler_terminal_result'} // '') eq 'HARD_QUIESCENT' &&
+         ($field{'source_terminal_status'} // '') eq 'COMMITTED_HANDOFF';
+die "strict interval is not self-consistent"
+  unless $field{'strict_interval_us'} ==
+         $field{'phase2_end_monotonic_us'} -
+         $field{'pre_closing_policy_started_us'};
+die "exact tail is not self-consistent"
+  unless $field{'final_ack_us'} >= $field{'last_body_exit_us'} &&
+         $field{'last_command_end_to_final_ack_us'} ==
+         $field{'final_ack_us'} - $field{'last_body_exit_us'};
+die "duplicate-shard waiter did not retain a complete transfer path"
+  unless ($warmcopy{'phase1_record_prebuilt_target_count'} // 0) == 4 &&
+         ($warmcopy{'phase1_record_active_scan_target_count'} // 0) == 1 &&
+         ($warmcopy{'phase2_record_prebuilt_target_count'} // 0) == 2 &&
+         ($warmcopy{'phase2_record_materialized_target_count'} // 0) == 1 &&
+         ($warmcopy{'phase2_record_lock_count'} // 0) == 5;
+EOF
+--let _PHASE2_FINAL_LOG=
+
+--connection innodb_receiver
+SELECT VARIABLE_VALUE=1 AS one_epoch_accepted
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs';
+
+--connection innodb_ha
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+SHUTDOWN;
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+--disable_query_log
+
+--connect(innodb_cleanup,localhost,root,,test)
+SELECT id,v FROM t_phase2_scheduler_innodb ORDER BY id;
+DROP TABLE t_phase2_scheduler_innodb;
+DROP USER phase2_scheduler_innodb_app@localhost;
+DROP USER preserve_trx_ha_admin@localhost;
+SET DEBUG_SYNC='RESET';
+
+--connection innodb_receiver
+DROP USER preserve_trx_ha_admin@localhost;
+
+--connection innodb_cleanup
+--remove_file $credential_file

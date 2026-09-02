@@ -1,0 +1,259 @@
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+--disable_query_log
+
+--let $credential_file= $MYSQL_TMP_DIR/phase2-scheduler-lineage.secret
+--write_file $credential_file
+phase2-scheduler-lineage-secret
+EOF
+--exec chmod 600 $credential_file
+
+--connect(lineage_receiver,127.0.0.1,root,,test,$SERVER_MYPORT_2,)
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'phase2-scheduler-lineage-secret';
+GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+GRANT PROCESS ON *.* TO preserve_trx_ha_admin@localhost;
+
+--connection default
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+DROP USER IF EXISTS phase2_scheduler_lineage_app@localhost;
+DROP TABLE IF EXISTS t_phase2_scheduler_lineage;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'phase2-scheduler-lineage-secret';
+GRANT SHUTDOWN, SYSTEM_VARIABLES_ADMIN,
+      PRESERVE_TRX_TRANSFER_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+CREATE USER phase2_scheduler_lineage_app@localhost;
+GRANT SELECT, UPDATE, ALTER ON test.*
+  TO phase2_scheduler_lineage_app@localhost;
+GRANT SESSION_VARIABLES_ADMIN ON *.*
+  TO phase2_scheduler_lineage_app@localhost;
+
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-standby-phase2-scheduler-mode=DEPENDENCY_CONVERGENCE_V1 --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$SERVER_MYPORT_2 --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=phase2_scheduler_lineage --rds-preserve-trx-transfer-credential-secret-file=$credential_file --rds-preserve-trx-drain-phase1-timeout-ms=30000 --rds-preserve-trx-drain-phase2-timeout-ms=10000
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--let $restart_parameters=
+--disable_query_log
+
+CREATE TABLE t_phase2_scheduler_lineage(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_phase2_scheduler_lineage VALUES
+  (1,10),(2,20),(3,30),(4,40),(5,50),(6,60);
+
+--connect(lineage_commit,localhost,phase2_scheduler_lineage_app,,test)
+SET autocommit=0;
+UPDATE t_phase2_scheduler_lineage SET v=11 WHERE id=1;
+SET DEBUG_SYNC=
+  'phase2_sched_after_execution_entered SIGNAL lineage_commit_body';
+
+--connect(lineage_rollback,localhost,phase2_scheduler_lineage_app,,test)
+START TRANSACTION;
+UPDATE t_phase2_scheduler_lineage SET v=21 WHERE id=2;
+SET DEBUG_SYNC=
+  'phase2_sched_after_execution_entered SIGNAL lineage_rollback_body';
+
+--connect(lineage_chain,localhost,phase2_scheduler_lineage_app,,test)
+START TRANSACTION;
+UPDATE t_phase2_scheduler_lineage SET v=31 WHERE id=3;
+SET DEBUG_SYNC='phase2_sched_after_command_held SIGNAL lineage_chain_held';
+
+--connect(lineage_ddl,localhost,phase2_scheduler_lineage_app,,test)
+START TRANSACTION;
+UPDATE t_phase2_scheduler_lineage SET v=41 WHERE id=4;
+SET DEBUG_SYNC='phase2_sched_after_command_held SIGNAL lineage_ddl_held';
+
+--connect(lineage_default_deny,localhost,phase2_scheduler_lineage_app,,test)
+START TRANSACTION;
+UPDATE t_phase2_scheduler_lineage SET v=51 WHERE id=5;
+SET DEBUG_SYNC='phase2_sched_after_command_held SIGNAL lineage_deny_held';
+
+# An implicit autocommit=0 transaction is part of the same old-transaction
+# cohort as START TRANSACTION.  Keep it active through HARD while an ordinary
+# command is held, so the batch boundary must publish QUIESCED, not
+# DRAINED_NO_TRANSACTION.
+--connect(lineage_implicit_survivor,localhost,phase2_scheduler_lineage_app,,test)
+SET autocommit=0;
+UPDATE t_phase2_scheduler_lineage SET v=61 WHERE id=6;
+SET DEBUG_SYNC=
+  'phase2_sched_after_command_held SIGNAL lineage_implicit_held';
+
+# Reuse an allocated InnoDB trx object, but do not start the SQL transaction
+# until the existing phase-1 scans have completed.
+--connect(lineage_pending_engine,localhost,phase2_scheduler_lineage_app,,test)
+SELECT v INTO @lineage_pending_probe
+  FROM t_phase2_scheduler_lineage WHERE id=1;
+
+--connect(lineage_ha,localhost,preserve_trx_ha_admin,phase2-scheduler-lineage-secret,test)
+--connect(lineage_owner,localhost,root,,test)
+SET DEBUG_SYNC=
+  'preserve_trx_transfer_after_phase1_binlog_stream SIGNAL lineage_phase1_done WAIT_FOR lineage_pending_ready TIMEOUT 30';
+SET DEBUG_SYNC=
+  'phase2_sched_after_t0_registration SIGNAL lineage_t0_done WAIT_FOR lineage_begin_hard TIMEOUT 30';
+SET DEBUG_SYNC=
+  'phase2_sched_after_hard_published SIGNAL lineage_hard_done WAIT_FOR lineage_release_hard TIMEOUT 30';
+--send DRAIN TRANSACTIONS PRESERVE
+
+--connection lineage_ha
+SET DEBUG_SYNC='now WAIT_FOR lineage_phase1_done TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die dependency drain did not finish its existing phase-1 stream
+}
+
+--connection lineage_pending_engine
+START TRANSACTION;
+
+--connection lineage_ha
+SET DEBUG_SYNC='now SIGNAL lineage_pending_ready';
+SET DEBUG_SYNC='now WAIT_FOR lineage_t0_done TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die dependency scheduler did not complete T0 registration
+}
+
+--connection lineage_commit
+--send COMMIT
+--connection lineage_ha
+SET DEBUG_SYNC='now WAIT_FOR lineage_commit_body TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die idle autocommit=0 transaction did not receive terminal permit
+}
+--connection lineage_commit
+--reap
+--send SELECT * FROM t_phase2_scheduler_lineage WHERE id=1
+
+--connection lineage_rollback
+--send ROLLBACK
+--connection lineage_ha
+SET DEBUG_SYNC='now WAIT_FOR lineage_rollback_body TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die old transaction ROLLBACK did not receive terminal permit
+}
+--connection lineage_rollback
+--reap
+
+# Engine NONE is a legal pending identity.  COMMIT must close the SQL-only
+# transaction without turning the dependency attempt into SAFETY_ABORT.
+--connection lineage_pending_engine
+COMMIT;
+
+--connect(lineage_fresh,localhost,phase2_scheduler_lineage_app,,test)
+--send SELECT * FROM t_phase2_scheduler_lineage WHERE id=2
+
+--connection lineage_chain
+--send COMMIT AND CHAIN
+--connection lineage_ha
+SET DEBUG_SYNC='now WAIT_FOR lineage_chain_held TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die COMMIT AND CHAIN was not held in scheduler SOFT state
+}
+
+--connection lineage_ddl
+--send ALTER TABLE t_phase2_scheduler_lineage ADD COLUMN c INT
+--connection lineage_ha
+SET DEBUG_SYNC='now WAIT_FOR lineage_ddl_held TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die support-free DDL was not held in scheduler SOFT state
+}
+
+--connection lineage_default_deny
+--send SET @phase2_scheduler_default_deny=1
+--connection lineage_ha
+SET DEBUG_SYNC='now WAIT_FOR lineage_deny_held TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die default-deny SQL was not held in scheduler SOFT state
+}
+
+--connection lineage_implicit_survivor
+--send SET @phase2_scheduler_implicit_survivor=1
+--connection lineage_ha
+SET DEBUG_SYNC='now WAIT_FOR lineage_implicit_held TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die autocommit=0 old transaction command was not held in scheduler SOFT state
+}
+
+SET DEBUG_SYNC='now SIGNAL lineage_begin_hard';
+SET DEBUG_SYNC='now WAIT_FOR lineage_hard_done TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die dependency scheduler did not publish private HARD
+}
+
+SET DEBUG_SYNC='now SIGNAL lineage_release_hard';
+
+--connection lineage_commit
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+--reap
+--connection lineage_fresh
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+--reap
+--connection lineage_chain
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+--reap
+--connection lineage_ddl
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+--reap
+--connection lineage_default_deny
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+--reap
+--connection lineage_implicit_survivor
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+--reap
+
+--connection lineage_owner
+--replace_column 1 GENERATION 3 SOURCE_ID 6 CLOSING_STARTED_US 7 CLOSING_DEADLINE_US
+--reap
+
+--connection lineage_receiver
+SELECT VARIABLE_VALUE=1 AS one_epoch_accepted
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs';
+
+--connection lineage_ha
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+SHUTDOWN;
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+--disable_query_log
+
+--connect(lineage_cleanup,localhost,root,,test)
+DROP TABLE t_phase2_scheduler_lineage;
+DROP USER phase2_scheduler_lineage_app@localhost;
+DROP USER preserve_trx_ha_admin@localhost;
+SET DEBUG_SYNC='RESET';
+
+--connection lineage_receiver
+DROP USER preserve_trx_ha_admin@localhost;
+
+--connection lineage_cleanup
+--remove_file $credential_file

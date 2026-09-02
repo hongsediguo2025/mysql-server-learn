@@ -1,4 +1,4 @@
---echo # Preserve/Resume product parameter surface is exactly 16 rds_ names.
+--echo # Preserve/Resume product parameter surface is exactly 17 rds_ names.
 
 SELECT COUNT(*) AS rds_parameter_count
   FROM performance_schema.global_variables

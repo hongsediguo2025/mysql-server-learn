@@ -74,9 +74,17 @@ for my $entry (
     unless $body =~ /preserved_trx_skip_local_startup_recovery/s;
 }
 
+$preserve =~ /void preserved_trx_leave_server_startup\(\)\s*\{[\s\S]*?^}/m
+  or die "could not isolate preserved_trx_leave_server_startup\n";
+my $leave_startup = $&;
+my $reaper_pos = index($leave_startup,
+                       'preserved_trx_start_expired_reaper_if_ready()');
+my $read_only_pos = index($leave_startup, '!srv_read_only_mode');
+my $promotion_worker_pos = index(
+  $leave_startup, 'preserved_trx_promotion_start_gate_workers()');
 die "Transfer startup must defer workers until the startup marker is cleared\n"
-  unless $preserve =~ /preserved_trx_leave_server_startup[\s\S]{0,1000}preserved_trx_start_expired_reaper_if_ready/s &&
-         $preserve =~ /preserved_trx_leave_server_startup[\s\S]{0,1300}!srv_read_only_mode[\s\S]{0,300}preserved_trx_promotion_start_gate_workers/s;
+  unless $reaper_pos >= 0 && $read_only_pos > $reaper_pos &&
+         $promotion_worker_pos > $read_only_pos;
 
 die "production promotion wrappers must use the canonical Preserve root\n"
   unless $promotion =~ /preserved_trx_prepare_before_trx_sys_init_for_physical_promotion[\s\S]{0,2500}preserved_trx_dir_value/s &&

@@ -21,6 +21,7 @@ as published by the Free Software Foundation.
 #include <sys/types.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <limits>
 #include <memory>
@@ -43,6 +44,7 @@ as published by the Free Software Foundation.
 #include "fil0fil.h"
 #include "ha_prototypes.h"
 #include "lock0lock.h"
+#include "lock0guards.h"
 #include "lock0priv.h"
 #include "mach0data.h"
 #include "os0file.h"
@@ -82,6 +84,272 @@ bool lock_preserve_record_lock_object_has_conflict(
     ulint precise_mode, const lock_t *lock, bool lock_is_on_supremum,
     trx_t *trx);
 static thread_local const char *lock_preserve_record_export_error = nullptr;
+
+namespace {
+
+enum class Phase2_identity_copy_status : uint8_t {
+  COMPLETE = 0,
+  RETRYABLE_STALE,
+  UNKNOWN
+};
+
+Phase2_identity_copy_status lock_preserve_phase2_copy_identity_locked(
+    const trx_t *trx, lock_preserve_phase2_identity *identity) {
+  ut_ad(trx == nullptr || trx_mutex_own(trx));
+  if (trx == nullptr || identity == nullptr) {
+    return Phase2_identity_copy_status::UNKNOWN;
+  }
+  if (trx->state != TRX_STATE_ACTIVE || trx->abort || trx->killed_by != 0) {
+    return Phase2_identity_copy_status::RETRYABLE_STALE;
+  }
+  if (trx->mysql_thd == nullptr || trx->version == 0) {
+    return Phase2_identity_copy_status::UNKNOWN;
+  }
+  identity->immutable_id = trx_immutable_id(trx);
+  identity->version = static_cast<uint64_t>(trx->version);
+  identity->raw_cookie =
+      static_cast<uint64_t>(reinterpret_cast<uintptr_t>(trx));
+  identity->owner_thd_cookie = static_cast<uint64_t>(
+      reinterpret_cast<uintptr_t>(trx->mysql_thd));
+  return identity->immutable_id != 0 && identity->raw_cookie != 0 &&
+                 identity->owner_thd_cookie != 0
+             ? Phase2_identity_copy_status::COMPLETE
+             : Phase2_identity_copy_status::UNKNOWN;
+}
+
+bool lock_preserve_phase2_classify_lock(
+    const lock_t *lock, bool waiting_allowed,
+    lock_preserve_phase2_release_class *release_class) {
+  if (lock == nullptr || release_class == nullptr) return false;
+  const uint32_t type_mode = lock->type_mode;
+  const uint32_t type = type_mode & LOCK_TYPE_MASK;
+  const uint32_t mode = type_mode & LOCK_MODE_MASK;
+  const bool waiting = (type_mode & LOCK_WAIT) != 0;
+  if (waiting != waiting_allowed) return false;
+
+  if (type == LOCK_REC) {
+    constexpr uint32_t allowed_flags =
+        LOCK_MODE_MASK | LOCK_TYPE_MASK | LOCK_WAIT | LOCK_GAP |
+        LOCK_REC_NOT_GAP | LOCK_INSERT_INTENTION;
+    if ((type_mode & ~allowed_flags) != 0 ||
+        (mode != LOCK_S && mode != LOCK_X) ||
+        (type_mode & (LOCK_GAP | LOCK_REC_NOT_GAP)) ==
+            (LOCK_GAP | LOCK_REC_NOT_GAP)) {
+      return false;
+    }
+    if ((type_mode & LOCK_INSERT_INTENTION) != 0 &&
+        (mode != LOCK_X || (type_mode & LOCK_REC_NOT_GAP) != 0)) {
+      return false;
+    }
+    *release_class =
+        lock_preserve_phase2_release_class::RECORD_RR_OR_STRONGER;
+    return true;
+  }
+  if (type != LOCK_TABLE) return false;
+  constexpr uint32_t allowed_flags =
+      LOCK_MODE_MASK | LOCK_TYPE_MASK | LOCK_WAIT;
+  if ((type_mode & ~allowed_flags) != 0) return false;
+  switch (mode) {
+    case LOCK_IS:
+    case LOCK_IX:
+    case LOCK_S:
+    case LOCK_X:
+      *release_class =
+          lock_preserve_phase2_release_class::TABLE_TRANSACTION_END;
+      return true;
+    case LOCK_AUTO_INC:
+    case LOCK_NONE:
+      return false;
+  }
+  return false;
+}
+
+lock_preserve_phase2_probe_status lock_preserve_phase2_add_blocker(
+    const lock_t *wait_lock, const lock_t *candidate,
+    std::array<lock_preserve_phase2_blocker,
+               LOCK_PRESERVE_PHASE2_MAX_QUEUE_PREDECESSORS> *blockers,
+    size_t *blocker_count) {
+  if (wait_lock == nullptr || candidate == nullptr ||
+      lock_get_type_low(wait_lock) != lock_get_type_low(candidate)) {
+    return lock_preserve_phase2_probe_status::UNSUPPORTED_RELEASE_CLASS;
+  }
+  lock_preserve_phase2_release_class release_class;
+  if (!lock_preserve_phase2_classify_lock(
+          candidate, lock_get_wait(candidate), &release_class)) {
+    return lock_preserve_phase2_probe_status::UNSUPPORTED_RELEASE_CLASS;
+  }
+  if (!lock_has_to_wait(wait_lock, candidate)) {
+    return lock_preserve_phase2_probe_status::COMPLETE;
+  }
+  if (lock_get_wait(candidate)) {
+    return lock_preserve_phase2_probe_status::
+        UNSUPPORTED_PENDING_PREDECESSOR;
+  }
+  lock_preserve_phase2_identity identity;
+  trx_mutex_enter(candidate->trx);
+  const Phase2_identity_copy_status identity_status =
+      lock_preserve_phase2_copy_identity_locked(candidate->trx, &identity);
+  trx_mutex_exit(candidate->trx);
+  if (identity_status == Phase2_identity_copy_status::RETRYABLE_STALE) {
+    return lock_preserve_phase2_probe_status::RETRYABLE_STALE_IDENTITY;
+  }
+  if (identity_status != Phase2_identity_copy_status::COMPLETE) {
+    return lock_preserve_phase2_probe_status::UNKNOWN_IDENTITY;
+  }
+  for (size_t i = 0; i < *blocker_count; ++i) {
+    if ((*blockers)[i].identity.raw_cookie == identity.raw_cookie &&
+        (*blockers)[i].identity.version == identity.version) {
+      if (release_class ==
+          lock_preserve_phase2_release_class::RECORD_RR_OR_STRONGER) {
+        (*blockers)[i].release_class = release_class;
+        (*blockers)[i].type_mode = candidate->type_mode;
+      }
+      return lock_preserve_phase2_probe_status::COMPLETE;
+    }
+  }
+  if (*blocker_count >= blockers->size()) {
+    return lock_preserve_phase2_probe_status::UNKNOWN_INCOMPLETE;
+  }
+  (*blockers)[*blocker_count].identity = identity;
+  (*blockers)[*blocker_count].type_mode = candidate->type_mode;
+  (*blockers)[*blocker_count].release_class = release_class;
+  ++*blocker_count;
+  return lock_preserve_phase2_probe_status::COMPLETE;
+}
+
+}  // namespace
+
+lock_preserve_phase2_probe_status lock_preserve_phase2_probe_wait(
+    uint64_t raw_waiter_cookie, uint64_t expected_waiter_version,
+    uint64_t expected_owner_thd_cookie,
+    lock_preserve_phase2_blocker *blockers, size_t blocker_capacity,
+    lock_preserve_phase2_wait_snapshot *snapshot) {
+  if (snapshot == nullptr || raw_waiter_cookie == 0 ||
+      expected_owner_thd_cookie == 0 ||
+      (blocker_capacity != 0 && blockers == nullptr)) {
+    return lock_preserve_phase2_probe_status::UNKNOWN_IDENTITY;
+  }
+  *snapshot = {};
+
+  DBUG_EXECUTE_IF("phase2_sched_innodb_probe_lock_sys_busy", {
+    return lock_preserve_phase2_probe_status::RETRYABLE_LOCK_SYS_BUSY;
+  });
+  locksys::Global_exclusive_try_latch lock_sys_latch;
+  if (!lock_sys_latch.owns_lock()) {
+    return lock_preserve_phase2_probe_status::RETRYABLE_LOCK_SYS_BUSY;
+  }
+
+  trx_t *waiter = reinterpret_cast<trx_t *>(
+      static_cast<uintptr_t>(raw_waiter_cookie));
+  /* trx_t pool elements outlive an individual use, but their non-atomic
+     fields do not. A live waiting lock, stabilized by the global latch, is
+     the generation anchor that makes taking this trx mutex safe. */
+  const lock_t *wait_lock =
+      waiter->lock.wait_lock.load(std::memory_order_acquire);
+  if (wait_lock == nullptr) {
+    return lock_preserve_phase2_probe_status::RETRYABLE_STALE_IDENTITY;
+  }
+  if (wait_lock->trx != waiter || !lock_get_wait(wait_lock)) {
+    return lock_preserve_phase2_probe_status::RETRYABLE_STALE_IDENTITY;
+  }
+  lock_preserve_phase2_release_class wait_release_class;
+  if (!lock_preserve_phase2_classify_lock(wait_lock, true,
+                                          &wait_release_class)) {
+    return lock_preserve_phase2_probe_status::UNSUPPORTED_RELEASE_CLASS;
+  }
+
+  lock_preserve_phase2_wait_snapshot local_snapshot;
+  trx_mutex_enter(waiter);
+  const Phase2_identity_copy_status waiter_identity_status =
+      lock_preserve_phase2_copy_identity_locked(waiter,
+                                                &local_snapshot.waiter);
+  const lock_t *revalidated_wait_lock =
+      waiter->lock.wait_lock.load(std::memory_order_acquire);
+  const trx_que_t waiter_que_state = waiter->lock.que_state;
+  trx_mutex_exit(waiter);
+  if (waiter_identity_status == Phase2_identity_copy_status::RETRYABLE_STALE) {
+    return lock_preserve_phase2_probe_status::RETRYABLE_STALE_IDENTITY;
+  }
+  if (waiter_identity_status != Phase2_identity_copy_status::COMPLETE) {
+    return lock_preserve_phase2_probe_status::UNKNOWN_IDENTITY;
+  }
+  if (local_snapshot.waiter.raw_cookie != raw_waiter_cookie ||
+      (expected_waiter_version != 0 &&
+       local_snapshot.waiter.version != expected_waiter_version) ||
+      local_snapshot.waiter.owner_thd_cookie != expected_owner_thd_cookie) {
+    /* The trx pool element outlives each use; a mismatched generation is a
+       stale command hint, never an identity proof failure. */
+    return lock_preserve_phase2_probe_status::RETRYABLE_STALE_IDENTITY;
+  }
+
+  if (revalidated_wait_lock != wait_lock || wait_lock->trx != waiter ||
+      !lock_get_wait(wait_lock) ||
+      waiter_que_state != TRX_QUE_LOCK_WAIT) {
+    return lock_preserve_phase2_probe_status::RETRYABLE_STALE_IDENTITY;
+  }
+  local_snapshot.wait_type_mode = wait_lock->type_mode;
+
+  std::array<lock_preserve_phase2_blocker,
+             LOCK_PRESERVE_PHASE2_MAX_QUEUE_PREDECESSORS>
+      local_blockers{};
+  size_t local_blocker_count = 0;
+  const lock_t *candidate = nullptr;
+
+  if (lock_get_type_low(wait_lock) == LOCK_REC) {
+    const ulint heap_no = lock_rec_find_set_bit(wait_lock);
+    if (heap_no == ULINT_UNDEFINED) {
+      return lock_preserve_phase2_probe_status::UNKNOWN_INCOMPLETE;
+    }
+    const ulint bit_offset = heap_no / 8;
+    const ulint bit_mask = static_cast<ulint>(1) << (heap_no % 8);
+    candidate = lock_rec_get_first_on_page_addr(
+        lock_hash_get(wait_lock->type_mode), wait_lock->rec_lock.page_id);
+    for (; candidate != nullptr && candidate != wait_lock;
+         candidate = lock_rec_get_next_on_page_const(candidate)) {
+      if (++local_snapshot.predecessor_count >
+          LOCK_PRESERVE_PHASE2_MAX_QUEUE_PREDECESSORS) {
+        return lock_preserve_phase2_probe_status::UNKNOWN_INCOMPLETE;
+      }
+      if (heap_no >= lock_rec_get_n_bits(candidate)) continue;
+      const byte *bitmap = reinterpret_cast<const byte *>(&candidate[1]);
+      if ((bitmap[bit_offset] & bit_mask) == 0) continue;
+      const lock_preserve_phase2_probe_status status =
+          lock_preserve_phase2_add_blocker(
+              wait_lock, candidate, &local_blockers, &local_blocker_count);
+      if (status != lock_preserve_phase2_probe_status::COMPLETE) {
+        return status;
+      }
+    }
+  } else if (lock_get_type_low(wait_lock) == LOCK_TABLE) {
+    candidate = UT_LIST_GET_FIRST(wait_lock->tab_lock.table->locks);
+    for (; candidate != nullptr && candidate != wait_lock;
+         candidate = UT_LIST_GET_NEXT(tab_lock.locks, candidate)) {
+      if (++local_snapshot.predecessor_count >
+          LOCK_PRESERVE_PHASE2_MAX_QUEUE_PREDECESSORS) {
+        return lock_preserve_phase2_probe_status::UNKNOWN_INCOMPLETE;
+      }
+      const lock_preserve_phase2_probe_status status =
+          lock_preserve_phase2_add_blocker(
+              wait_lock, candidate, &local_blockers, &local_blocker_count);
+      if (status != lock_preserve_phase2_probe_status::COMPLETE) {
+        return status;
+      }
+    }
+  } else {
+    return lock_preserve_phase2_probe_status::UNSUPPORTED_RELEASE_CLASS;
+  }
+
+  if (candidate != wait_lock || local_blocker_count == 0 ||
+      local_blocker_count > blocker_capacity) {
+    return lock_preserve_phase2_probe_status::UNKNOWN_INCOMPLETE;
+  }
+  for (size_t i = 0; i < local_blocker_count; ++i) {
+    blockers[i] = local_blockers[i];
+  }
+  local_snapshot.blocker_count = local_blocker_count;
+  *snapshot = local_snapshot;
+  return lock_preserve_phase2_probe_status::COMPLETE;
+}
 
 static void lock_preserve_set_record_export_error(const char *reason) {
   lock_preserve_record_export_error = reason;

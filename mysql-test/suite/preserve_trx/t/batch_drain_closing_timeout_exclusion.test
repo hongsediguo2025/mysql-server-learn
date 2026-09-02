@@ -34,6 +34,7 @@ GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO closing_exclusion_app@localhost;
 --enable_result_log
 --let $restart_parameters=
 --disable_query_log
+--source suite/preserve_trx/include/assert_phase2_dependency_mode.inc
 
 CALL mtr.add_suppression(
   "PRESERVE: rolled back prepared transaction without snapshot during recovery");
@@ -116,13 +117,14 @@ SET DEBUG_SYNC='now WAIT_FOR closing_exclusion_timeout_classified TIMEOUT 30';
 # command that remains PENDING_QUIESCE may be excluded at the deadline. The
 # final structured result below proves the exact survivor/exclusion roles.
 SET DEBUG_SYNC='now SIGNAL closing_exclusion_race_reject_continue';
+# V1 releases the deferred 4020 after authoritative target classification.
+SET DEBUG_SYNC='now SIGNAL closing_exclusion_timeout_classified_continue';
 
 --connection closing_exclusion_race
 --error ER_PRESERVE_TRX_SESSION_DRAINED
 --reap
 
 --connection closing_exclusion_ha
-SET DEBUG_SYNC='now SIGNAL closing_exclusion_timeout_classified_continue';
 SET DEBUG_SYNC='now WAIT_FOR closing_exclusion_handoff TIMEOUT 60';
 
 # FINAL_ACK already transferred ownership. The strict v1 receiver is
@@ -176,6 +178,7 @@ SHUTDOWN;
 --source include/wait_until_connected_again.inc
 --disable_reconnect
 --disable_query_log
+--source suite/preserve_trx/include/assert_phase2_dependency_mode.inc
 
 --eval SELECT @@GLOBAL.log_bin=$initial_log_bin AS binlog_mode_restored
 

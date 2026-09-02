@@ -1702,32 +1702,12 @@ bool seed_record_payload_entry_into_store(
       return false;
     }
   }
-  if (store->find(key) != store->end()) {
-    return false;
-  }
-
   const uint32_t set_bits = record_bitmap_set_bit_count(normalized_bitmap);
   if (set_bits == 0 || heap_offsets_len != set_bits * 4U) return false;
   const bool compact_stable_page_payload = record_images.empty();
 
-  lock_warmcopy_record_shard_state_t &shard =
-      find_or_create_record_shard_in_store(store, key);
-  shard.key = key;
-  shard.normalized_bitmap = normalized_bitmap;
-  shard.record_images.clear();
-  shard.page_lsn = page_lsn;
-  shard.page_n_heap = page_n_heap;
-  shard.set_bit_count = set_bits;
-  shard.shard_state_flags = 0;
-  shard.missing_record_image_count = 0;
-  shard.forced_invalid = false;
-  shard.mutation_generation = 1;
-  shard.implicit_exclusion_generation = 0;
-  shard.journal_cursor = 0;
-  shard.last_applied_journal_seq = 0;
-  shard.journal_bytes = 0;
-  for (uint64_t &word : shard.rolling_fingerprint) word = 0;
-  shard.last_diagnostic_reason.clear();
+  std::map<uint32_t, lock_warmcopy_record_image_entry_t>
+      parsed_record_images;
 
   size_t heap_offsets_offset = 0;
   size_t record_images_offset = 0;
@@ -1736,6 +1716,7 @@ bool seed_record_payload_entry_into_store(
     const unsigned char bit_mask =
         static_cast<unsigned char>(1U << (heap_no % 8U));
     if ((normalized_bitmap[byte_pos] & bit_mask) == 0) continue;
+    if (heap_no >= page_n_heap) return false;
 
     uint32_t heap_offset = 0;
     if (!read_u32_le_from_payload(heap_offsets, &heap_offsets_offset,
@@ -1760,19 +1741,67 @@ bool seed_record_payload_entry_into_store(
     SHA_EVP256(reinterpret_cast<const unsigned char *>(
                    encoded_record_image.data()),
                encoded_record_image.size(), entry.digest.bytes);
-    shard.record_images[heap_no] = entry;
+    parsed_record_images[heap_no] = entry;
   }
 
   if (heap_offsets_offset != heap_offsets.size() ||
       record_images_offset != record_images.size() ||
-      (!compact_stable_page_payload && shard.record_images.size() != set_bits)) {
+      (!compact_stable_page_payload && parsed_record_images.size() != set_bits)) {
     return false;
   }
 
-  for (const auto &entry : shard.record_images) {
-    update_record_shard_rolling_fingerprint_locked(
-        &shard, 8, entry.second.heap_no, &entry.second.digest,
-        entry.second.heap_offset);
+  auto existing = store->find(key);
+  if (existing == store->end()) {
+    lock_warmcopy_record_shard_state_t &shard =
+        find_or_create_record_shard_in_store(store, key);
+    shard.key = key;
+    shard.normalized_bitmap = normalized_bitmap;
+    shard.record_images = std::move(parsed_record_images);
+    shard.page_lsn = page_lsn;
+    shard.page_n_heap = page_n_heap;
+    shard.set_bit_count = set_bits;
+    shard.shard_state_flags = 0;
+    shard.missing_record_image_count = 0;
+    shard.forced_invalid = false;
+    shard.mutation_generation = 1;
+    shard.implicit_exclusion_generation = 0;
+    shard.journal_cursor = 0;
+    shard.last_applied_journal_seq = 0;
+    shard.journal_bytes = 0;
+    for (uint64_t &word : shard.rolling_fingerprint) word = 0;
+    shard.last_diagnostic_reason.clear();
+  } else {
+    lock_warmcopy_record_shard_state_t &shard = existing->second;
+    if (shard.normalized_bitmap.size() != normalized_bitmap.size() ||
+        shard.record_images.empty() != compact_stable_page_payload) {
+      return false;
+    }
+
+    /*
+      A granted waiter remains a separate native lock_t. It can therefore
+      export another disjoint bitmap for the same canonical page shard.
+      Overlap is ambiguous and remains fail-closed.
+    */
+    for (size_t i = 0; i < normalized_bitmap.size(); ++i) {
+      if ((shard.normalized_bitmap[i] & normalized_bitmap[i]) != 0) {
+        return false;
+      }
+    }
+    for (const auto &entry : parsed_record_images) {
+      if (shard.record_images.find(entry.first) != shard.record_images.end()) {
+        return false;
+      }
+    }
+
+    for (size_t i = 0; i < normalized_bitmap.size(); ++i) {
+      shard.normalized_bitmap[i] = static_cast<unsigned char>(
+          shard.normalized_bitmap[i] | normalized_bitmap[i]);
+    }
+    shard.record_images.insert(parsed_record_images.begin(),
+                               parsed_record_images.end());
+    shard.page_lsn = std::max(shard.page_lsn, page_lsn);
+    shard.page_n_heap = std::max(shard.page_n_heap, page_n_heap);
+    shard.set_bit_count += set_bits;
   }
 
   if (lock_count != nullptr) *lock_count += set_bits;
@@ -1800,7 +1829,18 @@ bool seed_record_payload_into_store(const std::string &payload,
       return false;
     }
   }
-  return offset == payload.size();
+  if (offset != payload.size()) return false;
+
+  for (auto &shard_entry : *store) {
+    lock_warmcopy_record_shard_state_t &shard = shard_entry.second;
+    for (uint64_t &word : shard.rolling_fingerprint) word = 0;
+    for (const auto &record_entry : shard.record_images) {
+      update_record_shard_rolling_fingerprint_locked(
+          &shard, 8, record_entry.second.heap_no, &record_entry.second.digest,
+          record_entry.second.heap_offset);
+    }
+  }
+  return true;
 }
 
 bool lock_warmcopy_record_store_fence_equal(

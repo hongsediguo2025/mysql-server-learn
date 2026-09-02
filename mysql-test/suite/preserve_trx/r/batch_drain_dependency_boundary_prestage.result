@@ -1,0 +1,10 @@
+include/assert.inc [boundary candidate refreshed before the second BODY exits]
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+include/assert.inc [first original transaction connection is restored]
+include/assert.inc [second original transaction connection is restored]
+include/assert.inc [boundary prestage failure avoids COMMIT_UNKNOWN]
+SELECT GROUP_CONCAT(CONCAT(id, ':', v) ORDER BY id) AS committed_values
+FROM t_dependency_boundary_prestage;
+committed_values
+1:111,2:241,3:40
+include/assert.inc [boundary prestage commits survive restart]

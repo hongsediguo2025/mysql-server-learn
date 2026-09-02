@@ -958,6 +958,61 @@ static trx_t *trx_preserve_current_thd_get_trx_if_available(THD *thd) {
   return static_cast<innodb_session_t *>(ha_data->ha_ptr)->m_trx;
 }
 
+uint64_t trx_preserve_phase2_peek_raw_cookie(THD *thd) {
+  if (thd == nullptr) return 0;
+  mysql_mutex_assert_owner(&thd->LOCK_thd_data);
+  trx_t *trx = trx_preserve_current_thd_get_trx_if_available(thd);
+  return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(trx));
+}
+
+trx_preserve_phase2_identity_status
+trx_preserve_phase2_owner_identity_snapshot(
+    THD *thd, trx_preserve_phase2_identity *identity) {
+  if (identity == nullptr) {
+    return trx_preserve_phase2_identity_status::UNSUPPORTED_STATE;
+  }
+  *identity = {};
+  if (thd == nullptr || current_thd != thd) {
+    return trx_preserve_phase2_identity_status::UNSUPPORTED_STATE;
+  }
+  if (innodb_hton == nullptr || innodb_hton->slot < 0) {
+    return trx_preserve_phase2_identity_status::NO_ENGINE_SESSION;
+  }
+  Ha_data *ha_data = thd->get_ha_data(innodb_hton->slot);
+  if (ha_data == nullptr || ha_data->ha_ptr == nullptr) {
+    return trx_preserve_phase2_identity_status::NO_ENGINE_SESSION;
+  }
+  innodb_session_t *session =
+      static_cast<innodb_session_t *>(ha_data->ha_ptr);
+  trx_t *trx = session->m_trx;
+  if (trx == nullptr) {
+    return trx_preserve_phase2_identity_status::NO_ENGINE_TRANSACTION;
+  }
+
+  trx_mutex_enter(trx);
+  if (session->m_trx != trx || trx->mysql_thd != thd) {
+    trx_mutex_exit(trx);
+    return trx_preserve_phase2_identity_status::RETRY_LIFECYCLE;
+  }
+  const trx_state_t state = trx->state;
+  if (state == TRX_STATE_ACTIVE && !trx->abort && trx->killed_by == 0) {
+    identity->raw_cookie = static_cast<uint64_t>(
+        reinterpret_cast<uintptr_t>(trx));
+    identity->version = static_cast<uint64_t>(trx->version);
+    trx_mutex_exit(trx);
+    return trx_preserve_phase2_identity_status::EXACT_ACTIVE;
+  }
+  trx_mutex_exit(trx);
+  if (state == TRX_STATE_NOT_STARTED) {
+    return trx_preserve_phase2_identity_status::NO_ACTIVE_TRANSACTION;
+  }
+  if (state == TRX_STATE_COMMITTED_IN_MEMORY ||
+      state == TRX_STATE_FORCED_ROLLBACK) {
+    return trx_preserve_phase2_identity_status::RETRY_LIFECYCLE;
+  }
+  return trx_preserve_phase2_identity_status::UNSUPPORTED_STATE;
+}
+
 bool trx_preserve_current_thd_has_no_redo_undo(THD *thd) {
   trx_t *trx = trx_preserve_current_thd_get_trx_if_available(thd);
   if (trx == nullptr) {

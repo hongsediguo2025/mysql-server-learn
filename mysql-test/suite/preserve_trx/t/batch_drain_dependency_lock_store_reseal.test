@@ -1,0 +1,196 @@
+# An idle target is refreshed at a stable command boundary. A concurrent
+# waiter then converts its implicit record lock to an explicit lock, making
+# that refreshed Phase1 blob stale. Final preserve must use the live fallback.
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/have_log_bin.inc
+--source include/force_restart.inc
+
+--disable_query_log
+--let $credential_file= $MYSQL_TMP_DIR/dependency_lock_reseal.secret
+--write_file $credential_file
+dependency-lock-reseal-secret
+EOF
+--exec chmod 600 $credential_file
+
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+DROP USER IF EXISTS dependency_lock_reseal_app@localhost;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'dependency-lock-reseal-secret';
+GRANT SHUTDOWN, SYSTEM_VARIABLES_ADMIN,
+      PRESERVE_TRX_TRANSFER_ADMIN ON *.*
+  TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+CREATE USER dependency_lock_reseal_app@localhost;
+GRANT SELECT, INSERT, UPDATE ON test.* TO dependency_lock_reseal_app@localhost;
+GRANT SESSION_VARIABLES_ADMIN ON *.* TO dependency_lock_reseal_app@localhost;
+
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$MASTER_MYPORT --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=dependency_lock_reseal --rds-preserve-trx-transfer-credential-secret-file=$credential_file
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--let $restart_parameters=
+--disable_query_log
+--source suite/preserve_trx/include/assert_phase2_dependency_mode.inc
+
+CALL mtr.add_suppression(
+  "PRESERVE: standby transfer source epoch commit failed status=9");
+SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms=60000;
+SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=ON;
+
+SET @lock_reseal_valid_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME='Preserve_trx_lock_warmcopy_sealed_valid');
+SET @lock_reseal_fallback_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME='Preserve_trx_lock_warmcopy_live_fallback');
+
+CREATE TABLE t_dependency_lock_reseal(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_dependency_lock_reseal VALUES (1,10);
+
+--connect(lock_reseal_ha,localhost,preserve_trx_ha_admin,dependency-lock-reseal-secret,test)
+SET @unknown_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME='Preserve_trx_transfer_source_commit_unknown_epochs');
+--let $receiver_active_before= query_get_value(SELECT VARIABLE_VALUE+0 AS value FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs', value, 1)
+
+--connect(lock_reseal_target,localhost,dependency_lock_reseal_app,,test)
+--let $target_connection_id= query_get_value(SELECT CONNECTION_ID() AS id, id, 1)
+START TRANSACTION;
+UPDATE t_dependency_lock_reseal SET v=v+1 WHERE id=1;
+INSERT INTO t_dependency_lock_reseal VALUES(2,20);
+INSERT INTO t_dependency_lock_reseal VALUES(3,30);
+
+--connect(lock_reseal_waiter_first,localhost,dependency_lock_reseal_app,,test)
+SET SESSION innodb_lock_wait_timeout=5;
+SET DEBUG_SYNC=
+  'before_lock_rec_convert_impl_to_expl_for_trx SIGNAL first_lock_conversion_ready WAIT_FOR first_lock_conversion_go';
+SET DEBUG_SYNC=
+  'after_lock_rec_convert_impl_to_expl_for_trx SIGNAL first_lock_conversion_done';
+--send SELECT id FROM t_dependency_lock_reseal WHERE id=2 FOR UPDATE
+
+--connect(lock_reseal_waiter_second,localhost,dependency_lock_reseal_app,,test)
+SET SESSION innodb_lock_wait_timeout=5;
+SET DEBUG_SYNC=
+  'before_lock_rec_convert_impl_to_expl_for_trx SIGNAL second_lock_conversion_ready WAIT_FOR second_lock_conversion_go';
+SET DEBUG_SYNC=
+  'after_lock_rec_convert_impl_to_expl_for_trx SIGNAL second_lock_conversion_done';
+--send SELECT id FROM t_dependency_lock_reseal WHERE id=3 FOR UPDATE
+
+--connection lock_reseal_ha
+SET DEBUG_SYNC='now WAIT_FOR first_lock_conversion_ready TIMEOUT 30';
+SET DEBUG_SYNC='now WAIT_FOR second_lock_conversion_ready TIMEOUT 30';
+
+--connect(lock_reseal_owner,localhost,root,,test)
+SET SESSION debug='+d,preserve_trx_transfer_fail_commit_before_send_once';
+SET DEBUG_SYNC=
+  'preserve_trx_transfer_after_phase1_binlog_stream SIGNAL lock_reseal_phase1_sent WAIT_FOR lock_reseal_phase1_continue';
+SET DEBUG_SYNC=
+  'phase2_sched_after_t0_registration SIGNAL lock_reseal_t0_registered WAIT_FOR lock_reseal_t0_continue TIMEOUT 30';
+SET DEBUG_SYNC=
+  'phase2_sched_after_hard_published SIGNAL lock_reseal_hard_published WAIT_FOR lock_reseal_hard_continue TIMEOUT 30';
+SET DEBUG_SYNC=
+  'preserve_trx_batch_after_one_target_preserved SIGNAL lock_reseal_target_staged WAIT_FOR lock_reseal_target_continue';
+SET DEBUG_SYNC=
+  'preserve_trx_transfer_commit_before_send_failed SIGNAL lock_reseal_unsent_ready WAIT_FOR lock_reseal_unsent_continue';
+--send DRAIN TRANSACTIONS PRESERVE
+
+--connection lock_reseal_ha
+SET DEBUG_SYNC='now WAIT_FOR lock_reseal_phase1_sent TIMEOUT 30';
+--let $record_send_before= query_get_value(SELECT VARIABLE_VALUE+0 AS value FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_phase1_record_last_batch_send_us', value, 1)
+
+# The first asynchronous implicit-to-explicit conversion invalidates the
+# Phase1 lock blob. T0's stable-boundary prestage must refresh this version
+# before the second conversion invalidates it again.
+SET DEBUG_SYNC='now SIGNAL first_lock_conversion_go';
+SET DEBUG_SYNC='now WAIT_FOR first_lock_conversion_done TIMEOUT 30';
+SET DEBUG_SYNC='now SIGNAL lock_reseal_phase1_continue';
+SET DEBUG_SYNC='now WAIT_FOR lock_reseal_t0_registered TIMEOUT 30';
+SET DEBUG_SYNC='now SIGNAL lock_reseal_t0_continue';
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_phase1_record_last_batch_send_us')>$record_send_before
+--source include/wait_condition.inc
+--let $assert_text= idle target record-lock candidate refreshed before conversion
+--let $assert_cond= `SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_phase1_record_last_batch_send_us')>$record_send_before`
+--source include/assert.inc
+
+SET DEBUG_SYNC='now SIGNAL second_lock_conversion_go';
+SET DEBUG_SYNC='now WAIT_FOR second_lock_conversion_done TIMEOUT 30';
+
+--connection lock_reseal_waiter_first
+--error ER_LOCK_WAIT_TIMEOUT
+--reap
+--connection lock_reseal_waiter_second
+--error ER_LOCK_WAIT_TIMEOUT
+--reap
+
+--connection lock_reseal_ha
+SET DEBUG_SYNC='now WAIT_FOR lock_reseal_hard_published TIMEOUT 30';
+SET DEBUG_SYNC='now SIGNAL lock_reseal_hard_continue';
+SET DEBUG_SYNC='now WAIT_FOR lock_reseal_target_staged TIMEOUT 30';
+SET DEBUG_SYNC='now SIGNAL lock_reseal_target_continue';
+SET DEBUG_SYNC='now WAIT_FOR lock_reseal_unsent_ready TIMEOUT 30';
+SET DEBUG_SYNC='now SIGNAL lock_reseal_unsent_continue';
+
+--connection lock_reseal_owner
+--error ER_PRESERVE_TRX_UNSUPPORTED
+--reap
+SET SESSION debug='-d,preserve_trx_transfer_fail_commit_before_send_once';
+SET DEBUG_SYNC='RESET';
+
+--connection default
+SELECT
+  (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME='Preserve_trx_lock_warmcopy_sealed_valid')
+     = @lock_reseal_valid_before AS stale_prebuilt_rejected,
+  (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME='Preserve_trx_lock_warmcopy_live_fallback')
+     > @lock_reseal_fallback_before AS live_lock_list_fallback,
+  (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME='Preserve_trx_early_staged_tokens')=1
+     AS early_token_staged;
+
+--connection lock_reseal_target
+--let $assert_text= lock-reseal failure restores the original transaction connection
+--let $assert_cond= `SELECT CONNECTION_ID()=$target_connection_id`
+--source include/assert.inc
+COMMIT;
+
+--connection lock_reseal_ha
+--let $assert_text= lock-reseal failure avoids COMMIT_UNKNOWN
+--let $assert_cond= `SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_source_commit_unknown_epochs')=@unknown_before`
+--source include/assert.inc
+
+--connection default
+SELECT id,v FROM t_dependency_lock_reseal ORDER BY id;
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')=$receiver_active_before
+--source include/wait_condition.inc
+
+--disconnect lock_reseal_target
+--disconnect lock_reseal_waiter_first
+--disconnect lock_reseal_waiter_second
+--disconnect lock_reseal_owner
+--disconnect lock_reseal_ha
+
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$MASTER_MYPORT --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=dependency_lock_reseal --rds-preserve-trx-transfer-credential-secret-file=$credential_file
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--let $restart_parameters=
+--disable_query_log
+--source suite/preserve_trx/include/assert_phase2_dependency_mode.inc
+--let $assert_text= lock-reseal committed rows survive restart
+--let $assert_cond= `SELECT GROUP_CONCAT(CONCAT(id, ':', v) ORDER BY id)='1:11,2:20,3:30' FROM t_dependency_lock_reseal`
+--source include/assert.inc
+
+DROP TABLE t_dependency_lock_reseal;
+DROP USER dependency_lock_reseal_app@localhost;
+DROP USER preserve_trx_ha_admin@localhost;
+SET DEBUG_SYNC='RESET';
+SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=OFF;
+--remove_file $credential_file

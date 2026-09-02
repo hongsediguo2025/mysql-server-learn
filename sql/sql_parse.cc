@@ -1146,6 +1146,7 @@ void execute_init_command(THD *thd, LEX_STRING *init_command,
   save_vio = protocol->get_vio();
   protocol->set_vio(nullptr);
   protocol->create_command(&com_data, COM_QUERY, (uchar *)buf, len);
+  preserved_trx_phase2_begin_synthetic_protocol_command(thd, COM_QUERY);
   dispatch_command(thd, &com_data, COM_QUERY);
   protocol->set_client_capabilities(save_client_capabilities);
   protocol->set_vio(save_vio);
@@ -1204,6 +1205,11 @@ bool do_command(THD *thd) {
   COM_DATA com_data;
   DBUG_TRACE;
   DBUG_ASSERT(thd->is_classic_protocol());
+
+  if (preserved_trx_phase2_wait_for_deferred_command_response(thd)) {
+    thd->send_statement_status();
+    thd->rpl_thd_ctx.session_gtids_ctx().notify_after_response_packet(thd);
+  }
 
   /*
     indicator of uninitialized lex => normal flow of errors handling
@@ -1279,6 +1285,7 @@ bool do_command(THD *thd) {
   if (!rc && preserved_trx_reject_if_batch_session_drained(thd)) rc = 1;
 
   if (rc) {
+    preserved_trx_phase2_finish_protocol_command(thd);
 #ifndef DBUG_OFF
     char desc[VIO_DESCRIPTION_SIZE];
     vio_description(net->vio, desc);
@@ -1478,6 +1485,50 @@ static void check_secondary_engine_statement(THD *thd,
                                    query_length);
 }
 
+static bool preserve_trx_sql_body_blocked(THD *thd, LEX *lex,
+                                          enum_sql_command sql_command) {
+  switch (preserved_trx_command_block_result(thd, lex, sql_command)) {
+    case Preserve_trx_command_block_result::ALLOW:
+      return false;
+    case Preserve_trx_command_block_result::NATIVE_PRE_BODY_EXIT:
+      return true;
+    case Preserve_trx_command_block_result::RETRY_NATIVE_ADMISSION:
+      DBUG_ASSERT(false);
+      return true;
+    case Preserve_trx_command_block_result::BLOCK_SESSION_DRAINED:
+    case Preserve_trx_command_block_result::BLOCK_CLOSING_DRAINED:
+      my_error(ER_PRESERVE_TRX_SESSION_DRAINED, MYF(0));
+      return true;
+    case Preserve_trx_command_block_result::BLOCK_DRAINING:
+      my_error(ER_PRESERVE_TRX_UNSUPPORTED, MYF(0));
+      return true;
+  }
+  DBUG_ASSERT(false);
+  return true;
+}
+
+static bool preserve_trx_protocol_body_blocked(
+    THD *thd, enum enum_server_command command) {
+  switch (preserved_trx_protocol_command_body_block_result(thd, command)) {
+    case Preserve_trx_command_block_result::ALLOW:
+      return false;
+    case Preserve_trx_command_block_result::NATIVE_PRE_BODY_EXIT:
+      return true;
+    case Preserve_trx_command_block_result::RETRY_NATIVE_ADMISSION:
+      DBUG_ASSERT(false);
+      return true;
+    case Preserve_trx_command_block_result::BLOCK_SESSION_DRAINED:
+    case Preserve_trx_command_block_result::BLOCK_CLOSING_DRAINED:
+      my_error(ER_PRESERVE_TRX_SESSION_DRAINED, MYF(0));
+      return true;
+    case Preserve_trx_command_block_result::BLOCK_DRAINING:
+      my_error(ER_PRESERVE_TRX_UNSUPPORTED, MYF(0));
+      return true;
+  }
+  DBUG_ASSERT(false);
+  return true;
+}
+
 /**
   Perform one connection-level (COM_XXXX) command.
 
@@ -1625,6 +1676,11 @@ bool dispatch_command(THD *thd, const COM_DATA *com_data,
   switch (preserved_trx_protocol_command_block_result(thd, command)) {
     case Preserve_trx_command_block_result::ALLOW:
       break;
+    case Preserve_trx_command_block_result::NATIVE_PRE_BODY_EXIT:
+      goto done;
+    case Preserve_trx_command_block_result::RETRY_NATIVE_ADMISSION:
+      DBUG_ASSERT(false);
+      goto done;
     case Preserve_trx_command_block_result::BLOCK_SESSION_DRAINED:
       my_error(ER_PRESERVE_TRX_SESSION_DRAINED, MYF(0));
       goto done;
@@ -1684,6 +1740,12 @@ bool dispatch_command(THD *thd, const COM_DATA *com_data,
 
       thd->lex->m_sql_cmd = clone_cmd;
       thd->lex->sql_command = SQLCOM_CLONE;
+      if (clone_cmd != nullptr &&
+          preserved_trx_phase2_command_is_captured(thd) &&
+          preserve_trx_protocol_body_blocked(thd, command)) {
+        clone_cmd = nullptr;
+        thd->lex->m_sql_cmd = nullptr;
+      }
 
       break;
     }
@@ -1740,9 +1802,14 @@ bool dispatch_command(THD *thd, const COM_DATA *com_data,
 
       Prepared_statement *stmt = nullptr;
       if (!mysql_stmt_precheck(thd, com_data, command, &stmt)) {
-        PS_PARAM *parameters = com_data->com_stmt_execute.parameters;
-        mysqld_stmt_execute(thd, stmt, com_data->com_stmt_execute.has_new_types,
-                            com_data->com_stmt_execute.open_cursor, parameters);
+        if (!preserved_trx_phase2_command_is_captured(thd) ||
+            !preserve_trx_sql_body_blocked(thd, stmt->lex,
+                                           stmt->lex->sql_command)) {
+          PS_PARAM *parameters = com_data->com_stmt_execute.parameters;
+          mysqld_stmt_execute(
+              thd, stmt, com_data->com_stmt_execute.has_new_types,
+              com_data->com_stmt_execute.open_cursor, parameters);
+        }
       }
       break;
     }
@@ -2232,18 +2299,24 @@ done:
   DBUG_ASSERT(thd->open_tables == nullptr ||
               (thd->locked_tables_mode == LTM_LOCK_TABLES));
 
+  if (clone_cmd == nullptr) preserved_trx_phase2_finish_protocol_command(thd);
+  const bool phase2_deferred_response =
+      preserved_trx_phase2_defer_command_response(thd);
+
   /* Finalize server status flags after executing a command. */
   thd->update_slow_query_status();
   if (thd->killed) thd->send_kill_message();
-  thd->send_statement_status();
+  if (!phase2_deferred_response) thd->send_statement_status();
 
   /* After sending response, switch to clone protocol */
   if (clone_cmd != nullptr) {
     DBUG_ASSERT(command == COM_CLONE);
     error = clone_cmd->execute_server(thd);
+    preserved_trx_phase2_finish_protocol_command(thd);
   }
 
-  thd->rpl_thd_ctx.session_gtids_ctx().notify_after_response_packet(thd);
+  if (!phase2_deferred_response)
+    thd->rpl_thd_ctx.session_gtids_ctx().notify_after_response_packet(thd);
 
   if (!thd->is_error() && !thd->killed)
     mysql_audit_notify(thd, AUDIT_EVENT(MYSQL_AUDIT_GENERAL_RESULT), 0, nullptr,
@@ -2745,19 +2818,10 @@ int mysql_execute_command(THD *thd, bool first_level) {
   if (thd->get_command() == COM_STMT_EXECUTE)
     preserve_trx_inflight_guard.mark(thd, lex->sql_command);
 
-  switch (preserved_trx_command_block_result(thd, lex->sql_command)) {
-    case Preserve_trx_command_block_result::ALLOW:
-      break;
-    case Preserve_trx_command_block_result::BLOCK_SESSION_DRAINED:
-      my_error(ER_PRESERVE_TRX_SESSION_DRAINED, MYF(0));
-      return 1;
-    case Preserve_trx_command_block_result::BLOCK_CLOSING_DRAINED:
-      my_error(ER_PRESERVE_TRX_SESSION_DRAINED, MYF(0));
-      return 1;
-    case Preserve_trx_command_block_result::BLOCK_DRAINING:
-      my_error(ER_PRESERVE_TRX_UNSUPPORTED, MYF(0));
-      return 1;
-  }
+  /* COM_STMT_EXECUTE passed the same native and scheduler gate in dispatch. */
+  if (!preserved_trx_phase2_command_body_already_entered(thd) &&
+      preserve_trx_sql_body_blocked(thd, lex, lex->sql_command))
+    return 1;
 
   /*
     If there is a CREATE TABLE...START TRANSACTION command which

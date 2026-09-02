@@ -1,0 +1,261 @@
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+--disable_query_log
+
+--let $credential_file= $MYSQL_TMP_DIR/phase2-scheduler-mdl.secret
+--write_file $credential_file
+phase2-scheduler-mdl-secret
+EOF
+--exec chmod 600 $credential_file
+
+--connect(mdl_receiver,127.0.0.1,root,,test,$SERVER_MYPORT_2,)
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'phase2-scheduler-mdl-secret';
+GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+GRANT PROCESS ON *.* TO preserve_trx_ha_admin@localhost;
+
+--connection default
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+DROP USER IF EXISTS phase2_scheduler_mdl_app@localhost;
+DROP TABLE IF EXISTS t_phase2_scheduler_mdl;
+DROP TABLE IF EXISTS t_phase2_scheduler_mdl_survivor;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'phase2-scheduler-mdl-secret';
+GRANT SHUTDOWN, SYSTEM_VARIABLES_ADMIN,
+      PRESERVE_TRX_TRANSFER_ADMIN, CONNECTION_ADMIN
+  ON *.* TO preserve_trx_ha_admin@localhost;
+CREATE USER phase2_scheduler_mdl_app@localhost;
+GRANT SELECT, UPDATE, ALTER ON test.* TO phase2_scheduler_mdl_app@localhost;
+GRANT SESSION_VARIABLES_ADMIN ON *.* TO phase2_scheduler_mdl_app@localhost;
+
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-standby-phase2-scheduler-mode=DEPENDENCY_CONVERGENCE_V1 --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$SERVER_MYPORT_2 --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=phase2_scheduler_mdl --rds-preserve-trx-transfer-credential-secret-file=$credential_file --rds-preserve-trx-drain-phase1-timeout-ms=10000 --rds-preserve-trx-drain-phase2-timeout-ms=10000
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--let $restart_parameters=
+--disable_query_log
+
+CREATE TABLE t_phase2_scheduler_mdl(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_phase2_scheduler_mdl VALUES
+  (1,10),(2,20),(3,30),(4,40),(5,50),(6,60);
+CREATE TABLE t_phase2_scheduler_mdl_survivor(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_phase2_scheduler_mdl_survivor VALUES(1,10);
+
+# Two transactions hold compatible SW metadata locks. The ALTER waiter needs
+# both holders to reach a transaction boundary before its X request can run.
+--connect(mdl_blocker_a,localhost,phase2_scheduler_mdl_app,,test)
+START TRANSACTION;
+UPDATE t_phase2_scheduler_mdl SET v=11 WHERE id=1;
+SET DEBUG_SYNC=
+  'phase2_sched_after_execution_entered SIGNAL mdl_blocker_a_body';
+
+--connect(mdl_blocker_b,localhost,phase2_scheduler_mdl_app,,test)
+START TRANSACTION;
+UPDATE t_phase2_scheduler_mdl SET v=21 WHERE id=2;
+SET DEBUG_SYNC=
+  'phase2_sched_after_execution_entered SIGNAL mdl_blocker_b_body';
+
+# This holder has both a transaction-duration SW ticket and an explicit
+# HANDLER ticket on the same key. COMMIT would not release the latter.
+--connect(mdl_blocker_explicit,localhost,phase2_scheduler_mdl_app,,test)
+--let $mdl_blocker_explicit_id= query_get_value(SELECT CONNECTION_ID() AS id, id, 1)
+HANDLER t_phase2_scheduler_mdl OPEN;
+START TRANSACTION;
+UPDATE t_phase2_scheduler_mdl SET v=51 WHERE id=5;
+SET DEBUG_SYNC=
+  'phase2_sched_after_execution_entered SIGNAL mdl_blocker_explicit_body';
+
+--connect(mdl_survivor,localhost,phase2_scheduler_mdl_app,,test)
+START TRANSACTION;
+UPDATE t_phase2_scheduler_mdl_survivor SET v=11 WHERE id=1;
+
+--connect(mdl_waiter,localhost,phase2_scheduler_mdl_app,,test)
+SET lock_wait_timeout=30;
+SET DEBUG_SYNC='mdl_acquire_lock_wait SIGNAL mdl_waiter_lock_wait';
+
+--connect(mdl_waiter_pending,localhost,phase2_scheduler_mdl_app,,test)
+--let $mdl_waiter_pending_id= query_get_value(SELECT CONNECTION_ID() AS id, id, 1)
+SET lock_wait_timeout=30;
+START TRANSACTION;
+SET DEBUG_SYNC=
+  'mdl_acquire_lock_wait SIGNAL mdl_waiter_pending_lock_wait';
+
+--connect(mdl_ha,localhost,preserve_trx_ha_admin,phase2-scheduler-mdl-secret,test)
+
+--connect(mdl_owner,localhost,root,,test)
+SET DEBUG_SYNC=
+  'phase2_sched_after_t0_registration SIGNAL mdl_t0_registered';
+SET DEBUG_SYNC=
+  'preserve_trx_warmcopy_after_phase1_open SIGNAL mdl_phase1_opened WAIT_FOR mdl_waiter_ready TIMEOUT 10';
+SET DEBUG_SYNC=
+  'phase2_sched_after_probe_borrow_before_thd_snapshot SIGNAL mdl_candidate_scanned';
+SET DEBUG_SYNC=
+  'phase2_sched_after_mdl_demand_registered SIGNAL mdl_demand_ready';
+SET DEBUG_SYNC=
+  'phase2_sched_after_mdl_shared_write_pending_priority_unsupported SIGNAL mdl_pending_priority_unsupported';
+--send DRAIN TRANSACTIONS PRESERVE
+
+--connection mdl_ha
+SET DEBUG_SYNC='now WAIT_FOR mdl_phase1_opened TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die DRAIN did not reach the existing Phase1 seam
+}
+
+# DRAIN has already passed its unchanged backup-lock precondition. Put the
+# high-priority ALTER into the native queue, then a transaction-duration SW
+# request behind it, all before scheduler T0.
+--connection mdl_waiter
+--send ALTER TABLE t_phase2_scheduler_mdl ADD COLUMN c INT
+
+--connection mdl_ha
+SET DEBUG_SYNC='now WAIT_FOR mdl_waiter_lock_wait TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die ALTER did not enter an MDL wait before T0
+}
+
+--connection mdl_waiter_pending
+--send UPDATE t_phase2_scheduler_mdl SET v=62 WHERE id=6
+
+--connection mdl_ha
+SET DEBUG_SYNC='now WAIT_FOR mdl_waiter_pending_lock_wait TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die SW request did not wait behind the pending exclusive request
+}
+SET DEBUG_SYNC='now SIGNAL mdl_waiter_ready';
+
+SET DEBUG_SYNC='now WAIT_FOR mdl_t0_registered TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die scheduler did not complete T0 registration
+}
+SET DEBUG_SYNC='now WAIT_FOR mdl_candidate_scanned TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die scheduler did not scan the executing MDL waiter
+}
+SET DEBUG_SYNC='now WAIT_FOR mdl_pending_priority_unsupported TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die scheduler did not reject the priority-conflicting pending request
+}
+
+# The shared-write waiter has proved the pending-priority branch. Removing it
+# leaves the ALTER demand and avoids adding a second transaction to the drain.
+--eval KILL CONNECTION $mdl_waiter_pending_id
+SET DEBUG_SYNC='now WAIT_FOR mdl_demand_ready TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die scheduler did not publish the transaction-duration MDL demand
+}
+
+# Both blockers must receive support from the same waiter. Serially waiting
+# for one holder to commit before proving the other would make this time out.
+--connection mdl_blocker_a
+--send UPDATE t_phase2_scheduler_mdl SET v=31 WHERE id=3
+--connection mdl_blocker_b
+--send UPDATE t_phase2_scheduler_mdl SET v=41 WHERE id=4
+--connection mdl_blocker_explicit
+--send UPDATE t_phase2_scheduler_mdl SET v=61 WHERE id=6
+
+--connection mdl_ha
+SET DEBUG_SYNC='now WAIT_FOR mdl_blocker_a_body TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die first MDL blocker did not receive support
+}
+SET DEBUG_SYNC='now WAIT_FOR mdl_blocker_b_body TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die second MDL blocker did not receive support
+}
+--disable_warnings
+SET DEBUG_SYNC='now WAIT_FOR mdl_blocker_explicit_body TIMEOUT 1';
+--let $sync_warning_count= `SELECT @@warning_count`
+--enable_warnings
+if (!$sync_warning_count)
+{
+  --die explicit-duration conflict incorrectly received transaction support
+}
+
+--connection mdl_blocker_a
+--reap
+COMMIT;
+--connection mdl_blocker_b
+--reap
+COMMIT;
+
+# The explicit holder still blocks the DDL after both supported holders commit.
+# Disconnecting it releases both durations and lets the native waiter finish.
+--connection mdl_ha
+--eval KILL CONNECTION $mdl_blocker_explicit_id
+
+--connection mdl_blocker_explicit
+--error 1317,2013
+--reap
+
+--connection mdl_waiter_pending
+--error 1317,2013
+--reap
+
+--connection mdl_waiter
+--reap
+
+--connection mdl_owner
+--replace_column 1 GENERATION 3 SOURCE_ID 6 CLOSING_STARTED_US 7 CLOSING_DEADLINE_US
+--reap
+
+--connection mdl_receiver
+SELECT VARIABLE_VALUE=1 AS one_epoch_accepted
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs';
+
+--connection mdl_ha
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+SHUTDOWN;
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+--disable_query_log
+
+--connect(mdl_cleanup,localhost,root,,test)
+DROP TABLE t_phase2_scheduler_mdl;
+DROP TABLE t_phase2_scheduler_mdl_survivor;
+DROP USER phase2_scheduler_mdl_app@localhost;
+DROP USER preserve_trx_ha_admin@localhost;
+SET DEBUG_SYNC='RESET';
+
+--connection mdl_receiver
+DROP USER preserve_trx_ha_admin@localhost;
+
+--connection mdl_cleanup
+--remove_file $credential_file

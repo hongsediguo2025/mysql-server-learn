@@ -51,6 +51,7 @@ GRANT SELECT, UPDATE ON test.* TO resume_required_app@localhost;
 --let $restart_parameters=
 --disable_query_log
 --disable_result_log
+--source suite/preserve_trx/include/assert_phase2_dependency_mode.inc
 
 CALL mtr.add_suppression(
   "PRESERVE: rolled back prepared transaction without snapshot during recovery");
@@ -131,10 +132,7 @@ DROP TEMPORARY TABLE t_resume_required_target_dirty;
 --error ER_PRESERVE_TRX_HANDOFF_UNAVAILABLE
 --eval RESUME PRESERVED TRANSACTION '$idle_id'
 
-# The control-only COMMIT is the ownership boundary, so RESET is too late.
 --connection required_source_ha
---error ER_PRESERVE_TRX_RESET_TOO_LATE
-RESET DRAIN;
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 SHUTDOWN;
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
@@ -147,6 +145,7 @@ SHUTDOWN;
 --disable_reconnect
 --disable_query_log
 --disable_result_log
+--source suite/preserve_trx/include/assert_phase2_dependency_mode.inc
 
 --connect(required_source_ha_second,localhost,preserve_trx_ha_admin,resume-required-lifecycle-secret,test)
 --connect(required_source_drain_second,localhost,root,,test)
@@ -202,6 +201,7 @@ SHUTDOWN;
 --disable_reconnect
 --disable_query_log
 --disable_result_log
+--source suite/preserve_trx/include/assert_phase2_dependency_mode.inc
 
 --connect(required_source_cleanup,localhost,root,,test)
 --enable_result_log

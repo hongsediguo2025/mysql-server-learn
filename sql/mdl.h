@@ -771,6 +771,26 @@ struct MDL_key {
   static PSI_stage_info m_namespace_to_wait_state_name[NAMESPACE_END];
 };
 
+static constexpr size_t MDL_PHASE2_MAX_WAITING_TICKETS = 256;
+
+enum class MDL_phase2_wait_probe_status : uint8_t {
+  NOT_WAITING = 0,
+  NON_MDL_WAIT,
+  RETRYABLE_BUSY,
+  COMPLETE_TRANSACTION,
+  UNSUPPORTED_DURATION,
+  UNSUPPORTED_PENDING_PRIORITY_BLOCKER,
+  STALE,
+  UNKNOWN_INCOMPLETE
+};
+
+struct MDL_phase2_wait_snapshot {
+  MDL_key key;
+  enum_mdl_type request_type{MDL_TYPE_END};
+};
+
+void mdl_set_phase2_wait_capture_enabled(bool enabled);
+
 /**
   A pending metadata lock request.
 
@@ -1454,6 +1474,8 @@ class MDL_context {
   typedef bool (*Ticket_visitor)(const MDL_ticket *ticket, void *arg);
   bool visit_tickets(enum_mdl_duration duration, Ticket_visitor visitor,
                      void *arg) const;
+  MDL_phase2_wait_probe_status try_snapshot_phase2_wait(
+      MDL_phase2_wait_snapshot *snapshot);
 
   MDL_savepoint mdl_savepoint() {
     return MDL_savepoint(m_ticket_store.front(MDL_STATEMENT),
@@ -1636,6 +1658,7 @@ class MDL_context {
     readily available to the wait-for graph iterator.
    */
   MDL_wait_for_subgraph *m_waiting_for;
+  enum_mdl_duration m_waiting_for_duration;
   /**
     Thread's pins (a.k.a. hazard pointers) to be used by lock-free
     implementation of MDL_map::m_locks container. NULL if pins are
@@ -1666,28 +1689,15 @@ class MDL_context {
   bool visit_subgraph(MDL_wait_for_graph_visitor *dvisitor);
 
   /** Inform the deadlock detector there is an edge in the wait-for graph. */
-  void will_wait_for(MDL_wait_for_subgraph *waiting_for_arg) {
-    /*
-      Before starting wait for any resource we need to materialize
-      all "fast path" tickets belonging to this thread. Otherwise
-      locks acquired which are represented by these tickets won't
-      be present in wait-for graph and could cause missed deadlocks.
-
-      It is OK for context which doesn't wait for any resource to
-      have "fast path" tickets, as such context can't participate
-      in any deadlock.
-    */
-    materialize_fast_path_locks();
-
-    mysql_prlock_wrlock(&m_LOCK_waiting_for);
-    m_waiting_for = waiting_for_arg;
-    mysql_prlock_unlock(&m_LOCK_waiting_for);
-  }
+  void will_wait_for(
+      MDL_wait_for_subgraph *waiting_for_arg,
+      enum_mdl_duration duration = MDL_DURATION_END);
 
   /** Remove the wait-for edge from the graph after we're done waiting. */
   void done_waiting_for() {
     mysql_prlock_wrlock(&m_LOCK_waiting_for);
     m_waiting_for = nullptr;
+    m_waiting_for_duration = MDL_DURATION_END;
     mysql_prlock_unlock(&m_LOCK_waiting_for);
   }
   void lock_deadlock_victim() { mysql_prlock_rdlock(&m_LOCK_waiting_for); }

@@ -1,0 +1,235 @@
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+--disable_query_log
+
+--let $credential_file= $MYSQL_TMP_DIR/phase2-scheduler-ddl.secret
+--write_file $credential_file
+phase2-scheduler-ddl-secret
+EOF
+--exec chmod 600 $credential_file
+
+--connect(ddl_receiver,127.0.0.1,root,,test,$SERVER_MYPORT_2,)
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'phase2-scheduler-ddl-secret';
+GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+GRANT PROCESS ON *.* TO preserve_trx_ha_admin@localhost;
+
+--connection default
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+DROP USER IF EXISTS phase2_scheduler_ddl_app@localhost;
+DROP TABLE IF EXISTS t_phase2_scheduler_ddl_lock;
+DROP TABLE IF EXISTS t_phase2_scheduler_ddl_success;
+DROP TABLE IF EXISTS t_phase2_scheduler_ddl_failure;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'phase2-scheduler-ddl-secret';
+GRANT SHUTDOWN, SYSTEM_VARIABLES_ADMIN,
+      PRESERVE_TRX_TRANSFER_ADMIN, CONNECTION_ADMIN
+  ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+GRANT PROCESS ON *.* TO preserve_trx_ha_admin@localhost;
+CREATE USER phase2_scheduler_ddl_app@localhost;
+GRANT SELECT, UPDATE, CREATE, CREATE TEMPORARY TABLES, ALTER ON test.*
+  TO phase2_scheduler_ddl_app@localhost;
+GRANT SESSION_VARIABLES_ADMIN ON *.* TO phase2_scheduler_ddl_app@localhost;
+
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-standby-phase2-scheduler-mode=DEPENDENCY_CONVERGENCE_V1 --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$SERVER_MYPORT_2 --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=phase2_scheduler_ddl --rds-preserve-trx-transfer-credential-secret-file=$credential_file --rds-preserve-trx-drain-phase1-timeout-ms=30000 --rds-preserve-trx-drain-phase2-timeout-ms=10000
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--let $restart_parameters=
+--disable_query_log
+
+CREATE TABLE t_phase2_scheduler_ddl_lock(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_phase2_scheduler_ddl_lock VALUES(1,10),(2,20),(3,30);
+CREATE TABLE t_phase2_scheduler_ddl_success(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+CREATE TABLE t_phase2_scheduler_ddl_failure(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+
+--connect(ddl_success_blocker,localhost,phase2_scheduler_ddl_app,,test)
+START TRANSACTION;
+UPDATE t_phase2_scheduler_ddl_lock SET v=11 WHERE id=1;
+SET DEBUG_SYNC=
+  'phase2_sched_after_execution_entered SIGNAL ddl_success_body';
+
+--connect(ddl_failure_blocker,localhost,phase2_scheduler_ddl_app,,test)
+START TRANSACTION;
+UPDATE t_phase2_scheduler_ddl_lock SET v=21 WHERE id=2;
+SET DEBUG_SYNC=
+  'phase2_sched_after_execution_entered SIGNAL ddl_failure_body';
+
+--connect(ddl_temp_blocker,localhost,phase2_scheduler_ddl_app,,test)
+--let $ddl_temp_blocker_id= `SELECT CONNECTION_ID()`
+START TRANSACTION;
+UPDATE t_phase2_scheduler_ddl_lock SET v=31 WHERE id=3;
+SET DEBUG_SYNC=
+  'phase2_sched_after_execution_entered SIGNAL ddl_temp_wrong_body';
+SET DEBUG_SYNC=
+  'phase2_sched_after_command_held SIGNAL ddl_temp_held';
+
+--connect(ddl_waiter_success,localhost,phase2_scheduler_ddl_app,,test)
+START TRANSACTION;
+SET DEBUG_SYNC='lock_wait_will_wait SIGNAL ddl_waiter_success_wait';
+--send UPDATE t_phase2_scheduler_ddl_lock SET v=12 WHERE id=1
+
+--connect(ddl_waiter_failure,localhost,phase2_scheduler_ddl_app,,test)
+START TRANSACTION;
+SET DEBUG_SYNC='lock_wait_will_wait SIGNAL ddl_waiter_failure_wait';
+--send UPDATE t_phase2_scheduler_ddl_lock SET v=22 WHERE id=2
+
+--connect(ddl_waiter_temp,localhost,phase2_scheduler_ddl_app,,test)
+START TRANSACTION;
+SET DEBUG_SYNC='lock_wait_will_wait SIGNAL ddl_waiter_temp_wait';
+--send UPDATE t_phase2_scheduler_ddl_lock SET v=32 WHERE id=3
+
+--connect(ddl_ha,localhost,preserve_trx_ha_admin,phase2-scheduler-ddl-secret,test)
+SET DEBUG_SYNC='now WAIT_FOR ddl_waiter_success_wait TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die successful DDL blocker waiter did not enter lock wait
+}
+SET DEBUG_SYNC='now WAIT_FOR ddl_waiter_failure_wait TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die failing DDL blocker waiter did not enter lock wait
+}
+SET DEBUG_SYNC='now WAIT_FOR ddl_waiter_temp_wait TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die temporary DDL blocker waiter did not enter lock wait
+}
+
+--connect(ddl_owner,localhost,root,,test)
+SET DEBUG_SYNC=
+  'phase2_sched_after_t0_registration SIGNAL ddl_t0_registered';
+--send DRAIN TRANSACTIONS PRESERVE
+
+--connection ddl_ha
+SET DEBUG_SYNC='now WAIT_FOR ddl_t0_registered TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die dependency scheduler did not complete T0 registration
+}
+
+--connection ddl_success_blocker
+--send ALTER TABLE t_phase2_scheduler_ddl_success ADD COLUMN c INT
+--connection ddl_failure_blocker
+--send ALTER TABLE t_phase2_scheduler_ddl_failure ADD COLUMN v INT
+--connection ddl_temp_blocker
+--send CREATE TEMPORARY TABLE tmp_phase2_scheduler_ddl(id INT PRIMARY KEY) ENGINE=InnoDB
+
+--connection ddl_ha
+SET DEBUG_SYNC='now WAIT_FOR ddl_success_body TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die supported implicit-commit DDL did not enter BODY
+}
+SET DEBUG_SYNC='now WAIT_FOR ddl_failure_body TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die supported DDL body-failure case did not enter BODY
+}
+SET DEBUG_SYNC='now WAIT_FOR ddl_temp_held TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die non-allowlisted temporary-table CREATE was not default-denied and held
+}
+
+--connection ddl_success_blocker
+--reap
+--send SELECT 1
+
+--connection ddl_failure_blocker
+--error ER_DUP_FIELDNAME
+--reap
+--send SELECT 1
+
+--connection ddl_waiter_success
+--reap
+--connection ddl_waiter_failure
+--reap
+
+# Killing the held non-allowlisted DDL releases its old row lock. It must not
+# receive a terminalizing permit merely because it is an implicit-DDL family.
+--connection ddl_ha
+--eval KILL CONNECTION $ddl_temp_blocker_id
+--connection ddl_temp_blocker
+--error 1317,2013
+--reap
+--connection ddl_waiter_temp
+--reap
+
+--connection ddl_success_blocker
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+--reap
+--connection ddl_failure_blocker
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+--reap
+
+--connection ddl_owner
+--replace_column 1 GENERATION 3 SOURCE_ID 6 CLOSING_STARTED_US 7 CLOSING_DEADLINE_US
+--reap
+
+--connection ddl_receiver
+SELECT VARIABLE_VALUE=1 AS one_epoch_accepted
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs';
+
+--connection ddl_ha
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+SHUTDOWN;
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+--disable_query_log
+
+--connect(ddl_cleanup,localhost,root,,test)
+SELECT id,v FROM t_phase2_scheduler_ddl_lock ORDER BY id;
+SELECT COUNT(*)=1 AS success_column_created
+  FROM information_schema.columns
+ WHERE table_schema='test'
+   AND table_name='t_phase2_scheduler_ddl_success'
+   AND column_name='c';
+SELECT COUNT(*)=1 AS failed_ddl_kept_original_column
+  FROM information_schema.columns
+ WHERE table_schema='test'
+   AND table_name='t_phase2_scheduler_ddl_failure'
+   AND column_name='v';
+DROP TABLE t_phase2_scheduler_ddl_lock;
+DROP TABLE t_phase2_scheduler_ddl_success;
+DROP TABLE t_phase2_scheduler_ddl_failure;
+DROP USER phase2_scheduler_ddl_app@localhost;
+DROP USER preserve_trx_ha_admin@localhost;
+SET DEBUG_SYNC='RESET';
+
+--connection ddl_receiver
+DROP USER preserve_trx_ha_admin@localhost;
+
+--connection ddl_cleanup
+--remove_file $credential_file

@@ -100,7 +100,7 @@ die "batch target enumeration must include in-flight risky statements\n"
          $target_counter =~ /preserve_trx_thd_has_batch_inflight_statement/s;
 die "batch target enumeration must wait explicit transactions that are already inside an unmarked command packet\n"
   unless $target_counter =~ /pending_target/s &&
-         $target_counter =~ /active_explicit_transaction/s &&
+         $target_counter =~ /active_batch_transaction/s &&
          $target_counter =~ /!\s*candidate->m_server_idle/s;
 die "batch target enumeration must wait non-idle unclassified classic command packets\n"
   unless $target_counter =~ /nonidle_unclassified_command_packet/s &&

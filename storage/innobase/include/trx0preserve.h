@@ -182,7 +182,27 @@ struct trx_preserve_record_lock_residency_t {
   uint64_t missing_pages{0};
 };
 
+enum class trx_preserve_phase2_identity_status : uint8_t {
+  NO_ENGINE_SESSION = 0,
+  NO_ENGINE_TRANSACTION,
+  NO_ACTIVE_TRANSACTION,
+  EXACT_ACTIVE,
+  RETRY_LIFECYCLE,
+  UNSUPPORTED_STATE
+};
+
+struct trx_preserve_phase2_identity {
+  uint64_t raw_cookie{0};
+  uint64_t version{0};
+};
+
 trx_t *trx_preserve_current_thd_trx(THD *thd);
+/** Return only the opaque existing InnoDB trx pointer. The caller owns
+THD::LOCK_thd_data; this helper never dereferences trx_t. */
+uint64_t trx_preserve_phase2_peek_raw_cookie(THD *thd);
+trx_preserve_phase2_identity_status
+trx_preserve_phase2_owner_identity_snapshot(
+    THD *thd, trx_preserve_phase2_identity *identity);
 uint64_t trx_preserve_current_redo_lsn();
 dberr_t trx_preserve_flush_redo_up_to(uint64_t lsn);
 dberr_t trx_preserve_claim_detached_active_undo(trx_t *trx);

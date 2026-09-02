@@ -1076,6 +1076,8 @@ static Sys_var_uint Sys_preserve_trx_lock_warmcopy_conversion_wait_timeout_ms(
 
 static const char *preserve_trx_transfer_artifact_mode_names[] = {
     "LOCAL_CARRIER", "STANDBY_TRANSFER_SAVE", nullptr};
+static const char *preserve_trx_standby_phase2_scheduler_mode_names[] = {
+    "LEGACY_READINESS_THEN_CLOSING", "DEPENDENCY_CONVERGENCE_V1", nullptr};
 static const char *preserve_trx_transfer_runtime_profile_names[] = {
     "BUSINESS_FIRST", "BALANCED", "PROMOTION_PREPARE", nullptr};
 
@@ -1094,6 +1096,19 @@ static bool check_preserve_trx_transfer_artifact_mode(sys_var *, THD *,
     my_error(ER_WRONG_ARGUMENTS, MYF(0),
              "rds_preserve_trx_transfer_artifact_mode is a startup-only "
              "option");
+    return true;
+  }
+  return false;
+}
+
+static bool check_preserve_trx_standby_phase2_scheduler_mode(sys_var *, THD *,
+                                                             set_var *var) {
+  const ulong requested_mode =
+      static_cast<ulong>(var->save_result.ulonglong_value);
+  if (requested_mode != preserve_trx_standby_phase2_scheduler_mode) {
+    my_error(ER_WRONG_ARGUMENTS, MYF(0),
+             "rds_preserve_trx_standby_phase2_scheduler_mode is a "
+             "startup-only option");
     return true;
   }
   return false;
@@ -1148,6 +1163,17 @@ static Sys_var_enum Sys_preserve_trx_transfer_artifact_mode(
     DEFAULT(PRESERVE_TRX_TRANSFER_ARTIFACT_STANDBY_TRANSFER_SAVE),
     NO_MUTEX_GUARD,
     NOT_IN_BINLOG, ON_CHECK(check_preserve_trx_transfer_artifact_mode));
+
+static Sys_var_enum Sys_preserve_trx_standby_phase2_scheduler_mode(
+    "rds_preserve_trx_standby_phase2_scheduler_mode",
+    "Phase 2 command-admission policy for standby transfer. "
+    "LEGACY_READINESS_THEN_CLOSING preserves the existing readiness path; "
+    "DEPENDENCY_CONVERGENCE_V1 enables dependency-guided command scheduling.",
+    READ_ONLY GLOBAL_VAR(preserve_trx_standby_phase2_scheduler_mode),
+    CMD_LINE(REQUIRED_ARG), preserve_trx_standby_phase2_scheduler_mode_names,
+    DEFAULT(PRESERVE_TRX_PHASE2_SCHEDULER_DEPENDENCY_CONVERGENCE_V1),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG,
+    ON_CHECK(check_preserve_trx_standby_phase2_scheduler_mode));
 
 static Sys_var_enum Sys_preserve_trx_transfer_runtime_profile(
     "rds_preserve_trx_transfer_runtime_profile",

@@ -1612,8 +1612,8 @@ my $preflight_window = $&;
 die "startup preserve-trx preflight must run even when --skip-log-bin is used\n"
   if $preflight_window =~ /\bopt_bin_log\b/s;
 
-$preserve =~ /Preserve_trx_command_block_result preserved_trx_command_block_result\([\s\S]*?^}/m
-  or die "could not isolate preserved_trx_command_block_result\n";
+$preserve =~ /static Preserve_trx_command_block_result\s+preserved_trx_native_command_block_result\([\s\S]*?^}/m
+  or die "could not isolate preserved_trx_native_command_block_result\n";
 my $sql_command_gate = $&;
 my $sql_gate_ha_bypass_pos =
   index($sql_command_gate, 'preserve_trx_is_ha_control_connection(thd)');
@@ -1627,8 +1627,8 @@ die "CLOSING SQL gate must wait for initial target classification before decidin
   unless $sql_command_gate =~
          /preserve_trx_closing_command_gate_active[\s\S]*Preserve_trx_batch_thd_state::NONE[\s\S]*preserve_trx_command_packet_before_closing[\s\S]*g_closing_target_classification_mutex/s;
 
-$preserve =~ /Preserve_trx_command_block_result preserved_trx_protocol_command_block_result[\s\S]*?^}/m
-  or die "could not isolate preserved_trx_protocol_command_block_result\n";
+$preserve =~ /static Preserve_trx_command_block_result\s+preserved_trx_native_protocol_command_block_result[\s\S]*?^}/m
+  or die "could not isolate preserved_trx_native_protocol_command_block_result\n";
 my $protocol_command_gate = $&;
 die "protocol command gate must block COM_FIELD_LIST and COM_REFRESH when drain is blocking lock-taking commands\n"
   unless $protocol_command_gate =~ /preserve_trx_protocol_command_may_create_trx_or_lock/s &&
@@ -1646,6 +1646,23 @@ die "dispatch_command must run preserve protocol command gate before the protoco
          $protocol_gate_pos < $dispatch_switch_pos &&
          $dispatch_command =~ /ER_PRESERVE_TRX_UNSUPPORTED/s &&
          $dispatch_command =~ /ER_PRESERVE_TRX_SESSION_DRAINED/s;
+my $phase2_response_defer_pos = index(
+  $dispatch_command, 'preserved_trx_phase2_defer_command_response');
+my $phase2_finish_pos = rindex(
+  $dispatch_command, 'preserved_trx_phase2_finish_protocol_command',
+  $phase2_response_defer_pos);
+my $statement_status_pos = index(
+  $dispatch_command, 'thd->send_statement_status()',
+  $phase2_response_defer_pos);
+die "dependency 4020 response defer must run after command retirement and guard the native response send\n"
+  unless $phase2_finish_pos >= 0 && $phase2_response_defer_pos >= 0 &&
+         $statement_status_pos >= 0 &&
+         $phase2_finish_pos < $phase2_response_defer_pos &&
+         $phase2_response_defer_pos < $statement_status_pos &&
+         $dispatch_command =~
+         /if\s*\(!phase2_deferred_response\)\s*thd->send_statement_status\(\)/s &&
+         $dispatch_command =~
+         /if\s*\(!phase2_deferred_response\)\s*thd->rpl_thd_ctx\.session_gtids_ctx\(\)\.notify_after_response_packet\(thd\)/s;
 die "CLOSING protocol gate must admit pending packets only when they arrived before the closing cutoff\n"
   unless $protocol_command_gate =~
          /batch_state\s*==\s*Preserve_trx_batch_thd_state::PENDING_QUIESCE[\s\S]*batch_inflight_statement[\s\S]*command_packet_before_closing[\s\S]*return\s+Preserve_trx_command_block_result::ALLOW/s;
@@ -1655,6 +1672,34 @@ die "CLOSING protocol gate must wait for initial target classification before de
 die "CLOSING protocol gate must default-deny every command except protocol-defined no-response cleanup\n"
   unless $protocol_command_gate =~
          /if\s*\(preserve_trx_protocol_command_is_no_response_cleanup\(command\)\)\s*return\s+Preserve_trx_command_block_result::ALLOW\s*;\s*return\s+Preserve_trx_command_block_result::BLOCK_CLOSING_DRAINED\s*;/s;
+$preserve =~ /bool preserved_trx_phase2_defer_command_response\(THD \*thd\)[\s\S]*?^}/m
+  or die "could not isolate dependency cutoff response defer\n";
+my $phase2_response_defer = $&;
+die "dependency cutoff response defer must apply only to pending 4020\n"
+  unless $phase2_response_defer =~ /cutoff_response_handoff_pending/s &&
+         $phase2_response_defer =~ /ER_PRESERVE_TRX_SESSION_DRAINED/s &&
+         $phase2_response_defer =~
+         /preserve_trx_phase2_cutoff_response_deferred\s*=\s*true/s;
+$preserve =~ /bool preserved_trx_phase2_wait_for_deferred_command_response\(THD \*thd\)[\s\S]*?^}/m
+  or die "could not isolate dependency cutoff response idle wait\n";
+my $phase2_response_wait = $&;
+die "dependency cutoff response wait must publish the real idle boundary before waiting\n"
+  unless $phase2_response_wait =~
+         /preserve_trx_phase2_cutoff_response_deferred/s &&
+         $phase2_response_wait =~ /m_server_idle\s*=\s*true/s &&
+         $phase2_response_wait =~ /preserve_trx_publish_pending_quiesce_at_idle_boundary/s &&
+         $phase2_response_wait =~ /wait_for_cutoff_response_handoff/s;
+$sql_parse =~ /bool do_command\(THD \*thd\)[\s\S]*?^}/m
+  or die "could not isolate do_command\n";
+my $do_command = $&;
+my $deferred_idle_wait_pos = index(
+  $do_command, 'preserved_trx_phase2_wait_for_deferred_command_response');
+my $next_da_reset_pos = index($do_command, 'thd->clear_error()');
+die "deferred 4020 must wait and send at the next command-read entry before diagnostics reset\n"
+  unless $deferred_idle_wait_pos >= 0 && $next_da_reset_pos >= 0 &&
+         $deferred_idle_wait_pos < $next_da_reset_pos &&
+         $do_command =~
+         /preserved_trx_phase2_wait_for_deferred_command_response\(thd\)[\s\S]*thd->send_statement_status\(\)[\s\S]*notify_after_response_packet\(thd\)/s;
 $preserve =~
   /static bool preserve_trx_protocol_command_is_no_response_cleanup\s*\([^\{]*\)\s*\{([\s\S]*?)^}/m
   or die "could not isolate CLOSING no-response cleanup allowlist\n";
@@ -3381,6 +3426,7 @@ my @rds_preserve_parameters = qw(
   rds_preserve_trx_drain_phase2_timeout_ms
   rds_preserve_trx_token_retention_timeout_ms
   rds_preserve_trx_lock_warmcopy_conversion_wait_timeout_ms
+  rds_preserve_trx_standby_phase2_scheduler_mode
   rds_preserve_trx_transfer_artifact_mode
   rds_preserve_trx_transfer_target_host
   rds_preserve_trx_transfer_target_port
@@ -3399,8 +3445,8 @@ for my $parameter (@rds_preserve_parameters) {
 my @registered_rds_parameters =
   $sys_vars =~
     /static\s+Sys_var_[A-Za-z0-9_]+\s+Sys_[A-Za-z0-9_]+\s*\(\s*"(rds_preserve_trx_[a-z0-9_]+)"/sg;
-die "Preserve product parameter surface must contain exactly 16 rds_ names\n"
-  unless @registered_rds_parameters == 16;
+die "Preserve product parameter surface must contain exactly 17 rds_ names\n"
+  unless @registered_rds_parameters == 17;
 die "legacy Preserve sysvar registrations must be removed\n"
   if $sys_vars =~
     /static\s+Sys_var_[A-Za-z0-9_]+\s+Sys_[A-Za-z0-9_]+\s*\(\s*"preserve_trx_[a-z0-9_]+"/s;

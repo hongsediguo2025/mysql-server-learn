@@ -188,8 +188,14 @@ def validate_receiver_read_load_report(
     max_qps_drop_pct: float,
     max_p99_increase_pct: float,
     enforce_performance_budget: bool = True,
+    enforce_p99_budget: Optional[bool] = None,
 ) -> None:
     failures: List[str] = []
+    check_p99_budget = (
+        enforce_performance_budget
+        if enforce_p99_budget is None
+        else enforce_p99_budget
+    )
     qps_drop_pct = float(report.get("receiver_read_load_qps_drop_pct", 0.0))
     p99_increase_pct = float(
         report.get("receiver_read_load_p99_increase_pct", 0.0)
@@ -203,7 +209,7 @@ def validate_receiver_read_load_report(
         failures.append(
             f"QPS drop {qps_drop_pct:.3f}% exceeds {max_qps_drop_pct:.3f}%"
         )
-    if enforce_performance_budget and p99_increase_pct > max_p99_increase_pct:
+    if check_p99_budget and p99_increase_pct > max_p99_increase_pct:
         failures.append(
             "P99 increase "
             f"{p99_increase_pct:.3f}% exceeds {max_p99_increase_pct:.3f}%"
@@ -600,6 +606,10 @@ class HarnessConfig:
     drain_interval_s: float = 30.0
     drain_ready_timeout_s: float = 0.0
     business_run_before_drain_s: float = 0.0
+    continuous_business_through_drain: bool = False
+    short_transaction_sessions: int = 0
+    short_transaction_table_count: int = 0
+    short_transaction_rows_per_table: int = 0
     duration_s: float = 0.0
     max_transactions_per_worker: int = 0
     min_statements_before_drain_pause: int = 0
@@ -698,6 +708,83 @@ class HarnessConfig:
             raise ValueError("sessions must be positive")
         if self.table_count <= 0:
             raise ValueError("table_count must be positive")
+        if self.continuous_business_through_drain:
+            if self.scenario != "standby_transfer_receiver_drain_metrics":
+                raise ValueError(
+                    "continuous_business_through_drain is only valid for "
+                    "standby_transfer_receiver_drain_metrics"
+                )
+            if self.business_run_before_drain_s <= 0:
+                raise ValueError(
+                    "continuous business through DRAIN requires a positive "
+                    "business window"
+                )
+            if self.cycles != 1:
+                raise ValueError(
+                    "continuous business through DRAIN requires exactly one cycle"
+                )
+            if self.max_transactions_per_worker != 0:
+                raise ValueError(
+                    "continuous business workers must remain unbounded until DRAIN"
+                )
+            if self.mixed_pressure_workload or self.source_continuous_tiered_load:
+                raise ValueError(
+                    "continuous large/short transactions cannot be combined with "
+                    "mixed or tiered source workloads"
+                )
+            if (
+                self.lockset_batch_size <= 0
+                or not self.lockset_session_table_shards
+                or not self.lockset_noop_update
+                or not self.lockset_touch_one_row
+                or not self.lockset_minimal_table
+                or self.lockset_select_for_update
+            ):
+                raise ValueError(
+                    "continuous large transactions require the sharded minimal "
+                    "no-op range UPDATE lockset with one touched row"
+                )
+            if (
+                self.statements_per_tx
+                != self.seed_rows_per_table_per_session
+                or self.statements_per_tx % self.lockset_batch_size != 0
+            ):
+                raise ValueError(
+                    "continuous large transactions require an exact integral "
+                    "partition of the configured logical rows"
+                )
+            if self.short_transaction_sessions <= 0:
+                raise ValueError("short_transaction_sessions must be positive")
+            if self.short_transaction_sessions % 2 != 0:
+                raise ValueError("short_transaction_sessions must be even")
+            if (
+                self.short_transaction_table_count * 2
+                != self.short_transaction_sessions
+            ):
+                raise ValueError(
+                    "short_transaction_table_count must be half of "
+                    "short_transaction_sessions"
+                )
+            if self.short_transaction_rows_per_table < 8:
+                raise ValueError(
+                    "short_transaction_rows_per_table must be at least 8"
+                )
+            if self.strict_token_count:
+                raise ValueError(
+                    "continuous business through DRAIN requires partial tokens"
+                )
+        elif any(
+            value != 0
+            for value in (
+                self.short_transaction_sessions,
+                self.short_transaction_table_count,
+                self.short_transaction_rows_per_table,
+            )
+        ):
+            raise ValueError(
+                "short-transaction settings require "
+                "continuous_business_through_drain"
+            )
         if self.shutdown_gap_replay_probe:
             if self.scenario in {
                 "standby_transfer_receiver_drain_metrics",
@@ -1363,6 +1450,26 @@ class WorkloadPlan:
 
     def table_names(self) -> List[str]:
         return [f"rtx_e2e_t{i:02d}" for i in range(self.config.table_count)]
+
+    def short_transaction_table_names(self) -> List[str]:
+        return [
+            f"rtx_short_lock_{index:03d}"
+            for index in range(self.config.short_transaction_table_count)
+        ]
+
+    def short_transaction_table_for_sid(self, sid: int) -> str:
+        if sid < 1 or sid > self.config.short_transaction_sessions:
+            raise ValueError(f"invalid short-transaction sid: {sid}")
+        return self.short_transaction_table_names()[(sid - 1) // 2]
+
+    def short_transaction_private_range(self, sid: int) -> Tuple[int, int]:
+        if sid < 1 or sid > self.config.short_transaction_sessions:
+            raise ValueError(f"invalid short-transaction sid: {sid}")
+        rows = self.config.short_transaction_rows_per_table
+        first_half_rows = (rows - 1) // 2
+        if (sid - 1) % 2 == 0:
+            return 2, 1 + first_half_rows
+        return 2 + first_half_rows, rows
 
     def create_table_sql(self, table: str) -> str:
         if self.config.lockset_minimal_table:
@@ -4685,6 +4792,142 @@ class ReceiverReadLoadProbe:
                     pass
 
 
+class ShortTransactionWorker(threading.Thread):
+    """Run one peer of a shared-gate-first short-transaction pair."""
+
+    _MAX_LATENCY_SAMPLES = 2048
+
+    def __init__(
+        self,
+        sid: int,
+        plan: WorkloadPlan,
+        runtime: MySQLRuntime,
+        coordinator: ResumeCoordinator,
+        stop_event: threading.Event,
+    ) -> None:
+        super().__init__(name=f"rtx-short-worker-{sid:03d}")
+        self.daemon = True
+        self.sid = sid
+        self.plan = plan
+        self.runtime = runtime
+        self.coordinator = coordinator
+        self.stop_event = stop_event
+        self.transactions_started = 0
+        self.transactions_completed = 0
+        self.statements_completed = 0
+        self.drained_command_rejections = 0
+        self.waiting_after_4020 = threading.Event()
+        self.connection_retained_while_waiting = False
+        self.connection_closed_without_4020_monotonic_us = 0
+        self._latency_lock = threading.Lock()
+        self.transaction_latency_samples_us: Deque[int] = deque(
+            maxlen=self._MAX_LATENCY_SAMPLES
+        )
+        self.transaction_latency_total_us = 0
+        self.transaction_latency_max_us = 0
+        self.transaction_latency_min_us: Optional[int] = None
+
+    def run(self) -> None:
+        conn = None
+        try:
+            conn = self.runtime.connect(database=True, autocommit=False)
+            tx_id = 0
+            while not self.stop_event.is_set():
+                tx_id += 1
+                if not self._run_transaction(conn, tx_id):
+                    return
+        except BaseException as exc:
+            if self.stop_event.is_set() and self.runtime.is_connection_error(exc):
+                return
+            LOG.exception("short worker sid=%s failed", self.sid)
+            self.coordinator.errors.put(exc)
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            self.connection_retained_while_waiting = False
+
+    def _run_transaction(self, conn, tx_id: int) -> bool:
+        table = self.plan.short_transaction_table_for_sid(self.sid)
+        private_low, private_high = (
+            self.plan.short_transaction_private_range(self.sid)
+        )
+        private_width = private_high - private_low + 1
+        private_update_id = private_low + ((tx_id * 2) % private_width)
+        private_delete_id = private_low + ((tx_id * 2 + 1) % private_width)
+        value = self.sid * 1_000_000 + tx_id
+        statements = (
+            f"UPDATE `{table}` SET k=k+1 WHERE id=1",
+            f"UPDATE `{table}` SET k=k+1 WHERE id={private_update_id}",
+            f"UPDATE `{table}` SET c='c-{value}' WHERE id={private_update_id}",
+            f"DELETE FROM `{table}` WHERE id={private_delete_id}",
+            f"INSERT INTO `{table}`(id,k,c,pad) VALUES "
+            f"({private_delete_id},{value},'c-{value}','pad-{self.sid}')",
+        )
+        started_ns = time.monotonic_ns()
+        self.transactions_started += 1
+        try:
+            self.runtime.execute(conn, "START TRANSACTION")
+            for sql in statements:
+                self.runtime.execute(conn, sql)
+                self.statements_completed += 1
+            conn.commit()
+        except BaseException as exc:
+            if self.runtime.is_preserve_session_drained(exc):
+                self.drained_command_rejections += 1
+                self.connection_retained_while_waiting = True
+                self.waiting_after_4020.set()
+                if not self.stop_event.wait(
+                    self.plan.resume_connection_wait_timeout_s()
+                ):
+                    raise TimeoutError(
+                        "timed out waiting for standby transfer completion "
+                        f"for short sid {self.sid}"
+                    ) from exc
+                return False
+            if self.runtime.is_connection_error(exc):
+                self.connection_closed_without_4020_monotonic_us = (
+                    time.monotonic_ns() // 1000
+                )
+                return False
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"short worker sid={self.sid} tx={tx_id} failed"
+            ) from exc
+
+        elapsed_us = max(1, (time.monotonic_ns() - started_ns) // 1000)
+        with self._latency_lock:
+            self.transactions_completed += 1
+            self.transaction_latency_samples_us.append(int(elapsed_us))
+            self.transaction_latency_total_us += int(elapsed_us)
+            self.transaction_latency_max_us = max(
+                self.transaction_latency_max_us, int(elapsed_us)
+            )
+            if (
+                self.transaction_latency_min_us is None
+                or elapsed_us < self.transaction_latency_min_us
+            ):
+                self.transaction_latency_min_us = int(elapsed_us)
+        return True
+
+    def latency_snapshot(
+        self,
+    ) -> Tuple[List[int], int, Optional[int], int, int]:
+        with self._latency_lock:
+            return (
+                list(self.transaction_latency_samples_us),
+                int(self.transaction_latency_total_us),
+                self.transaction_latency_min_us,
+                int(self.transaction_latency_max_us),
+                int(self.transactions_completed),
+            )
+
+
 class BusinessWorker(threading.Thread):
     def __init__(
         self,
@@ -4715,6 +4958,8 @@ class BusinessWorker(threading.Thread):
         self.mixed_tens_seconds_command_observed_us_max = 0
         self.drained_command_rejections = 0
         self.unsupported_handoff_rejections = 0
+        self.waiting_after_4020 = threading.Event()
+        self.connection_retained_while_waiting = False
 
     def run(self) -> None:
         conn = None
@@ -4767,6 +5012,7 @@ class BusinessWorker(threading.Thread):
                     conn.close()
                 except Exception:
                     pass
+            self.connection_retained_while_waiting = False
 
     def _configure_connection(self, conn) -> None:
         if (
@@ -4806,6 +5052,8 @@ class BusinessWorker(threading.Thread):
     def _consume_expected_drain_handoff_error(self, exc: BaseException) -> bool:
         if self.runtime.is_preserve_session_drained(exc):
             self.drained_command_rejections += 1
+            self.connection_retained_while_waiting = True
+            self.waiting_after_4020.set()
             return True
         if not self.plan.config.mixed_pressure_workload:
             return False
@@ -5483,6 +5731,7 @@ class BusinessE2ERunner:
         )
         self.stop_event = threading.Event()
         self.workers: List[BusinessWorker] = []
+        self.short_workers: List[ShortTransactionWorker] = []
         self.server_processes: List[subprocess.Popen] = []
         self.phase2_pause_samples: List[Phase2PauseSample] = []
         self.warmcopy_drain_metrics: List[WarmcopyDrainMetrics] = []
@@ -5670,6 +5919,8 @@ class BusinessE2ERunner:
         self.configure_preserve_globals()
         self.validate_standby_transfer_endpoint_config()
         self.prewarm_receiver_dictionary_for_transfer()
+        if self.config.continuous_business_through_drain:
+            self.capture_continuous_scheduler_mode()
         if (
             self.config.max_transactions_per_worker > 0
             and self.config.business_run_before_drain_s <= 0
@@ -5693,11 +5944,20 @@ class BusinessE2ERunner:
                         "WHERE sid=1 AND k=0"
                     ),
                 )
-                if self.config.mixed_pressure_workload:
+                if (
+                    self.config.mixed_pressure_workload
+                    or self.config.continuous_business_through_drain
+                ):
                     read_load_probe.start_baseline()
                     time.sleep(self.config.receiver_read_load_baseline_s)
+                    if self.config.continuous_business_through_drain:
+                        self.continuous_receiver_baseline_ready_monotonic_us = (
+                            time.monotonic_ns() // 1000
+                        )
             self.start_workers()
-            if self.config.business_run_before_drain_s > 0:
+            if self.config.continuous_business_through_drain:
+                self._run_continuous_business_window()
+            elif self.config.business_run_before_drain_s > 0:
                 self._run_business_before_drain(cycle=1)
                 if not self.config.mixed_pressure_workload:
                     generation = self.coordinator.request_drain_checkpoint()
@@ -5718,6 +5978,7 @@ class BusinessE2ERunner:
             if (
                 read_load_probe is not None
                 and not self.config.mixed_pressure_workload
+                and not self.config.continuous_business_through_drain
             ):
                 read_load_probe.start_baseline()
                 time.sleep(self.config.receiver_read_load_baseline_s)
@@ -5727,6 +5988,8 @@ class BusinessE2ERunner:
                     timeout_s=min(60.0, self.config.resume_timeout_s),
                 )
             error_log_offset = self.warmcopy_error_log_offset()
+            if self.config.continuous_business_through_drain:
+                self.source_log_window_offset = int(error_log_offset or 0)
             LOG.info(
                 "issuing standby-transfer DRAIN TRANSACTIONS PRESERVE for receiver metrics"
             )
@@ -5735,6 +5998,34 @@ class BusinessE2ERunner:
                 source_tiered_drain_started = True
             if read_load_probe is not None:
                 read_load_probe.begin_transfer()
+            if self.config.continuous_business_through_drain:
+                self.continuous_checkpoint_generation_before_drain = (
+                    self.coordinator.current_drain_generation()
+                )
+                if self.continuous_checkpoint_generation_before_drain != 0:
+                    raise AssertionError(
+                        "continuous workload observed an unexpected DRAIN "
+                        "generation before the control call"
+                    )
+                self.continuous_pre_drain_snapshot = (
+                    self._continuous_business_snapshot()
+                )
+                if (
+                    self.continuous_pre_drain_snapshot["large_alive_count"]
+                    != self.config.sessions
+                    or self.continuous_pre_drain_snapshot["short_alive_count"]
+                    != self.config.short_transaction_sessions
+                ):
+                    raise AssertionError(
+                        "continuous workload lost a worker before the control "
+                        f"DRAIN: {self.continuous_pre_drain_snapshot}"
+                    )
+                self.continuous_drain_call_start_monotonic_us = (
+                    time.monotonic_ns() // 1000
+                )
+                self.continuous_drain_call_count = int(
+                    getattr(self, "continuous_drain_call_count", 0)
+                ) + 1
             try:
                 drain_will_restart = self._execute_drain_preserve()
             except BaseException as exc:
@@ -5800,6 +6091,7 @@ class BusinessE2ERunner:
                     timeout_s=self.config.resume_timeout_s,
                     connection_factory=self._receiver_admin_connection,
                 )
+            self.receiver_remained_online_after_transfer = True
             self.source_transfer_ownership_metrics = (
                 self.read_source_transfer_ownership_metrics_from_status(
                     connection_factory=self._source_ha_control_connection
@@ -5811,6 +6103,8 @@ class BusinessE2ERunner:
                     "HA control connection after DRAIN"
                 )
             self.source_remained_online_after_transfer = True
+            if self.config.continuous_business_through_drain:
+                self._wait_for_continuous_4020_observation()
             if source_tiered_load_probe is not None:
                 self.source_tiered_load_report = (
                     source_tiered_load_probe.stop(
@@ -5829,6 +6123,9 @@ class BusinessE2ERunner:
                     ),
                     max_p99_increase_pct=(
                         self.config.receiver_read_load_max_p99_increase_pct
+                    ),
+                    enforce_p99_budget=(
+                        not self.config.continuous_business_through_drain
                     ),
                 )
             completed_stmt_total = sum(
@@ -7689,6 +7986,7 @@ class BusinessE2ERunner:
             "scenario": "standby_transfer_receiver_drain_metrics",
             **_evidence_contract(EVIDENCE_KIND_STANDALONE_TRANSFER_E2E),
             **self.mixed_pressure_report_fields(),
+            **self.continuous_business_report_fields(),
             "receiver_readiness_contract": (
                 "COMMITTED_NOT_READY"
                 if self.config.standalone_transfer_accept_committed_not_ready
@@ -7704,6 +8002,11 @@ class BusinessE2ERunner:
             "source_remained_online_after_transfer": bool(
                 getattr(
                     self, "source_remained_online_after_transfer", False
+                )
+            ),
+            "receiver_remained_online_after_transfer": bool(
+                getattr(
+                    self, "receiver_remained_online_after_transfer", False
                 )
             ),
             "drain_result_rows": list(
@@ -8899,6 +9202,8 @@ class BusinessE2ERunner:
             cur.execute(f"USE `{self.config.database}`")
             for table in self.plan.table_names():
                 cur.execute(self.plan.create_table_sql(table))
+            if self.config.continuous_business_through_drain:
+                self._setup_short_transaction_schema(cur)
             if self.config.source_continuous_tiered_load:
                 cur.execute(
                     self.plan.continuous_tiered_load_procedure_sql()
@@ -8974,6 +9279,44 @@ END
             cur.close()
         finally:
             conn.close()
+
+    def _setup_short_transaction_schema(self, cur) -> None:
+        row_count = self.config.short_transaction_rows_per_table
+        batch_size = 1000
+        LOG.info(
+            "creating %s short-transaction tables with %s rows each",
+            self.config.short_transaction_table_count,
+            row_count,
+        )
+        for table_index, table in enumerate(
+            self.plan.short_transaction_table_names()
+        ):
+            cur.execute(
+                f"CREATE TABLE `{table}` ("
+                "id INT NOT NULL, "
+                "k BIGINT NOT NULL, "
+                "c CHAR(120) NOT NULL, "
+                "pad CHAR(60) NOT NULL, "
+                "PRIMARY KEY(id)"
+                ") ENGINE=InnoDB"
+            )
+            insert_sql = (
+                f"INSERT INTO `{table}`(id,k,c,pad) VALUES (%s,%s,%s,%s)"
+            )
+            for low in range(1, row_count + 1, batch_size):
+                high = min(row_count + 1, low + batch_size)
+                cur.executemany(
+                    insert_sql,
+                    [
+                        (
+                            row_id,
+                            row_id,
+                            f"seed-{table_index}-{row_id}",
+                            f"pad-{table_index}",
+                        )
+                        for row_id in range(low, high)
+                    ],
+                )
 
     def _setup_mixed_pressure_schema(self, cur) -> None:
         cur.execute(
@@ -9261,11 +9604,40 @@ END
             plan = WorkloadPlan(self.config)
         conn = self._receiver_read_connection()
         try:
-            for table in plan.table_names():
+            tables = plan.table_names()
+            if self.config.continuous_business_through_drain:
+                tables += plan.short_transaction_table_names()
+            for table in tables:
                 self.runtime.execute(
                     conn,
                     f"SELECT 1 FROM {quote_identifier(table)} LIMIT 0",
                     fetch=True,
+                )
+        finally:
+            conn.close()
+
+    def capture_continuous_scheduler_mode(self) -> None:
+        conn = self.runtime.connect(database=False)
+        try:
+            rows = self.runtime.execute(
+                conn,
+                "SELECT "
+                "@@GLOBAL.rds_preserve_trx_standby_phase2_scheduler_mode",
+                fetch=True,
+            )
+            if len(rows) != 1:
+                raise AssertionError(
+                    "continuous workload could not read the scheduler mode"
+                )
+            self.continuous_effective_scheduler_mode = str(rows[0][0])
+            if (
+                self.continuous_effective_scheduler_mode
+                != "DEPENDENCY_CONVERGENCE_V1"
+            ):
+                raise AssertionError(
+                    "continuous workload requires "
+                    "DEPENDENCY_CONVERGENCE_V1, observed "
+                    f"{self.continuous_effective_scheduler_mode!r}"
                 )
         finally:
             conn.close()
@@ -9451,13 +9823,33 @@ END
         ]
         for worker in self.workers:
             worker.start()
+        if self.config.continuous_business_through_drain:
+            self.short_workers = [
+                ShortTransactionWorker(
+                    sid,
+                    self.plan,
+                    worker_runtime,
+                    self.coordinator,
+                    self.stop_event,
+                )
+                for sid in range(
+                    1, self.config.short_transaction_sessions + 1
+                )
+            ]
+            for worker in self.short_workers:
+                worker.start()
 
     def join_workers(self) -> None:
         deadline = time.monotonic() + self.config.worker_join_timeout_s
-        for worker in self.workers:
+        all_workers = [
+            worker
+            for worker in [*self.workers, *self.short_workers]
+            if worker.ident is not None
+        ]
+        for worker in all_workers:
             remaining = max(0.1, deadline - time.monotonic())
             worker.join(remaining)
-        alive = [worker.name for worker in self.workers if worker.is_alive()]
+        alive = [worker.name for worker in all_workers if worker.is_alive()]
         if alive:
             raise TimeoutError(f"workers did not finish: {alive[:10]}")
 
@@ -10039,6 +10431,132 @@ END
                 )
             time.sleep(min(0.2, remaining))
 
+    def _continuous_business_snapshot(self) -> Dict[str, int]:
+        large_workers = list(getattr(self, "workers", []))
+        short_workers = list(getattr(self, "short_workers", []))
+        return {
+            "large_worker_count": len(large_workers),
+            "large_alive_count": sum(
+                1 for worker in large_workers if worker.is_alive()
+            ),
+            "large_ready_count": sum(
+                1
+                for worker in large_workers
+                if int(worker.statements_completed) >= 1
+            ),
+            "large_statements_completed": sum(
+                int(worker.statements_completed) for worker in large_workers
+            ),
+            "large_transactions_completed": sum(
+                int(worker.transactions_completed) for worker in large_workers
+            ),
+            "short_worker_count": len(short_workers),
+            "short_alive_count": sum(
+                1 for worker in short_workers if worker.is_alive()
+            ),
+            "short_ready_count": sum(
+                1
+                for worker in short_workers
+                if int(worker.transactions_completed) >= 1
+            ),
+            "short_statements_completed": sum(
+                int(worker.statements_completed) for worker in short_workers
+            ),
+            "short_transactions_completed": sum(
+                int(worker.transactions_completed) for worker in short_workers
+            ),
+        }
+
+    def _run_continuous_business_window(self) -> None:
+        readiness_deadline = time.monotonic() + max(
+            60.0, self.config.resume_timeout_s
+        )
+        while True:
+            self._raise_worker_error_if_any()
+            snapshot = self._continuous_business_snapshot()
+            all_alive = (
+                snapshot["large_alive_count"] == self.config.sessions
+                and snapshot["short_alive_count"]
+                == self.config.short_transaction_sessions
+            )
+            all_ready = (
+                snapshot["large_ready_count"] == self.config.sessions
+                and snapshot["short_ready_count"]
+                == self.config.short_transaction_sessions
+            )
+            if not all_alive:
+                raise AssertionError(
+                    "continuous workload lost a worker before readiness: "
+                    f"snapshot={snapshot}"
+                )
+            if all_ready:
+                break
+            remaining = readiness_deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "continuous workload did not reach post-start readiness: "
+                    f"snapshot={snapshot}"
+                )
+            time.sleep(min(0.05, remaining))
+
+        self.continuous_business_start_snapshot = snapshot
+        self.continuous_checkpoint_generation_at_window_start = (
+            self.coordinator.current_drain_generation()
+        )
+        if self.continuous_checkpoint_generation_at_window_start != 0:
+            raise AssertionError(
+                "continuous workload observed an unexpected DRAIN generation "
+                "before T_business"
+            )
+        start_us = time.monotonic_ns() // 1000
+        deadline_us = start_us + int(
+            math.ceil(self.config.business_run_before_drain_s * 1_000_000)
+        )
+        self.continuous_business_window_start_monotonic_us = start_us
+        self.continuous_business_window_deadline_monotonic_us = deadline_us
+        LOG.info(
+            "continuous large/short workload ready; running %.3fs before "
+            "time-driven DRAIN",
+            self.config.business_run_before_drain_s,
+        )
+        while True:
+            self._raise_worker_error_if_any()
+            now_us = time.monotonic_ns() // 1000
+            if now_us >= deadline_us:
+                break
+            snapshot = self._continuous_business_snapshot()
+            if (
+                snapshot["large_alive_count"] != self.config.sessions
+                or snapshot["short_alive_count"]
+                != self.config.short_transaction_sessions
+            ):
+                raise AssertionError(
+                    "continuous workload lost a worker during the business "
+                    f"window: snapshot={snapshot}"
+                )
+            time.sleep(min(0.2, (deadline_us - now_us) / 1_000_000.0))
+        self.continuous_business_window_end_monotonic_us = (
+            time.monotonic_ns() // 1000
+        )
+        self.continuous_business_end_snapshot = (
+            self._continuous_business_snapshot()
+        )
+
+    def _wait_for_continuous_4020_observation(self) -> None:
+        deadline = time.monotonic() + min(5.0, self.config.resume_timeout_s)
+        all_workers = [*self.workers, *self.short_workers]
+        while True:
+            self._raise_worker_error_if_any()
+            if any(worker.waiting_after_4020.is_set() for worker in all_workers):
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "continuous workload did not observe a real 4020 response "
+                    "after DRAIN"
+                )
+            time.sleep(min(0.01, remaining))
+
     def mixed_pressure_readiness_snapshot(self) -> Dict[str, object]:
         operation_counts: Counter = Counter()
         duration_class_counts: Counter = Counter()
@@ -10315,6 +10833,195 @@ END
                 getattr(self, "resume_token_elapsed_samples_us", [])
             ),
             "max_sql_resume_ms": self.config.max_sql_resume_ms,
+        }
+
+    def continuous_business_report_fields(self) -> Dict[str, object]:
+        if not self.config.continuous_business_through_drain:
+            return {"continuous_business_through_drain": False}
+
+        large_workers = list(getattr(self, "workers", []))
+        short_workers = list(getattr(self, "short_workers", []))
+        short_latency_snapshots = [
+            worker.latency_snapshot() for worker in short_workers
+        ]
+        short_latency_samples = [
+            sample
+            for samples, _total_us, _minimum_us, _maximum_us, _completed
+            in short_latency_snapshots
+            for sample in samples
+        ]
+        short_transactions = sum(
+            completed
+            for _samples, _total_us, _minimum_us, _maximum_us, completed
+            in short_latency_snapshots
+        )
+        short_latency_total_us = sum(
+            total_us
+            for _samples, total_us, _minimum_us, _maximum_us, _completed
+            in short_latency_snapshots
+        )
+        large_4020 = sum(
+            int(worker.drained_command_rejections) for worker in large_workers
+        )
+        short_4020 = sum(
+            int(worker.drained_command_rejections) for worker in short_workers
+        )
+        short_connection_close_us = [
+            int(worker.connection_closed_without_4020_monotonic_us)
+            for worker in short_workers
+            if worker.connection_closed_without_4020_monotonic_us > 0
+        ]
+        waiting_workers = [
+            worker
+            for worker in [*large_workers, *short_workers]
+            if worker.waiting_after_4020.is_set()
+        ]
+        retained_workers = [
+            worker
+            for worker in waiting_workers
+            if bool(worker.connection_retained_while_waiting)
+        ]
+        start_us = int(
+            getattr(
+                self, "continuous_business_window_start_monotonic_us", 0
+            )
+        )
+        drain_call_us = int(
+            getattr(self, "continuous_drain_call_start_monotonic_us", 0)
+        )
+        return {
+            "continuous_business_through_drain": True,
+            "source_log_window_offset": int(
+                getattr(self, "source_log_window_offset", 0)
+            ),
+            "continuous_effective_scheduler_mode": getattr(
+                self, "continuous_effective_scheduler_mode", None
+            ),
+            "continuous_large_transaction_sessions": self.config.sessions,
+            "continuous_large_transaction_tables": self.config.table_count,
+            "continuous_large_transaction_rows_per_session": (
+                self.config.seed_rows_per_table_per_session
+            ),
+            "continuous_large_transaction_range_update_rows": (
+                self.config.lockset_batch_size
+            ),
+            "continuous_short_transaction_sessions": (
+                self.config.short_transaction_sessions
+            ),
+            "continuous_short_transaction_tables": (
+                self.config.short_transaction_table_count
+            ),
+            "continuous_short_transaction_rows_per_table": (
+                self.config.short_transaction_rows_per_table
+            ),
+            "continuous_business_window_requested_us": int(
+                math.ceil(
+                    self.config.business_run_before_drain_s * 1_000_000
+                )
+            ),
+            "continuous_business_window_actual_us": (
+                max(0, drain_call_us - start_us)
+                if start_us > 0 and drain_call_us > 0
+                else 0
+            ),
+            "continuous_business_window_start_monotonic_us": start_us,
+            "continuous_receiver_baseline_ready_monotonic_us": int(
+                getattr(
+                    self,
+                    "continuous_receiver_baseline_ready_monotonic_us",
+                    0,
+                )
+            ),
+            "continuous_business_window_deadline_monotonic_us": int(
+                getattr(
+                    self,
+                    "continuous_business_window_deadline_monotonic_us",
+                    0,
+                )
+            ),
+            "continuous_business_window_end_monotonic_us": int(
+                getattr(
+                    self, "continuous_business_window_end_monotonic_us", 0
+                )
+            ),
+            "continuous_drain_call_start_monotonic_us": drain_call_us,
+            "continuous_checkpoint_generation_at_window_start": int(
+                getattr(
+                    self,
+                    "continuous_checkpoint_generation_at_window_start",
+                    -1,
+                )
+            ),
+            "continuous_checkpoint_generation_before_drain": int(
+                getattr(
+                    self,
+                    "continuous_checkpoint_generation_before_drain",
+                    -1,
+                )
+            ),
+            "continuous_harness_checkpoint_before_drain": False,
+            "continuous_drain_trigger_mode": (
+                "independent_control_connection"
+            ),
+            "continuous_drain_call_count": int(
+                getattr(self, "continuous_drain_call_count", 0)
+            ),
+            "continuous_lock_wait_sensing_before_drain": False,
+            "continuous_second_drain_on_no_lock_wait": False,
+            "receiver_read_load_qps_gate_enforced": True,
+            "receiver_read_load_p99_gate_enforced": False,
+            "continuous_business_start_snapshot": dict(
+                getattr(self, "continuous_business_start_snapshot", {})
+            ),
+            "continuous_business_end_snapshot": dict(
+                getattr(self, "continuous_business_end_snapshot", {})
+            ),
+            "continuous_pre_drain_snapshot": dict(
+                getattr(self, "continuous_pre_drain_snapshot", {})
+            ),
+            "continuous_short_transaction_latency": {
+                **_summarize_us_samples(short_latency_samples),
+                "completed_transaction_count": short_transactions,
+                "average_us": (
+                    short_latency_total_us // short_transactions
+                    if short_transactions > 0
+                    else None
+                ),
+                "minimum_us": min(
+                    (
+                        int(minimum_us)
+                        for _samples, _total_us, minimum_us, _maximum_us, _completed
+                        in short_latency_snapshots
+                        if minimum_us is not None
+                    ),
+                    default=None,
+                ),
+                "maximum_us": max(
+                    (
+                        int(maximum_us)
+                        for _samples, _total_us, _minimum_us, maximum_us, _completed
+                        in short_latency_snapshots
+                    ),
+                    default=None,
+                ),
+            },
+            "continuous_large_4020_count": large_4020,
+            "continuous_short_4020_count": short_4020,
+            "continuous_4020_count": large_4020 + short_4020,
+            "continuous_workers_waiting_after_4020": len(waiting_workers),
+            "continuous_workers_retaining_original_connection": len(
+                retained_workers
+            ),
+            "continuous_business_reconnect_count": 0,
+            "continuous_short_connection_closed_without_4020_count": len(
+                short_connection_close_us
+            ),
+            "continuous_short_connection_closed_without_4020_monotonic_us": (
+                short_connection_close_us
+            ),
+            "standby_transfer_survivor_count": int(
+                getattr(self, "standby_transfer_survivor_count", 0)
+            ),
         }
 
     def purge_old_binary_logs_after_resume(self) -> None:
@@ -11617,7 +12324,7 @@ END
             return self.config.sessions
 
         survivor_count = int(
-            getattr(self, "mixed_preserved_survivor_count", 0)
+            getattr(self, "standby_transfer_survivor_count", 0)
         )
         if survivor_count > 0:
             return survivor_count
@@ -11629,7 +12336,9 @@ END
             and metrics.phase2_target_count > 0
         ):
             survivor_count = int(metrics.phase2_target_count)
-            self.mixed_preserved_survivor_count = survivor_count
+            self.standby_transfer_survivor_count = survivor_count
+            if self.config.mixed_pressure_workload:
+                self.mixed_preserved_survivor_count = survivor_count
             return survivor_count
 
         raise AssertionError(
@@ -11711,6 +12420,7 @@ END
             )
         if any(row["reason"] != "NONE" for row in survivors):
             raise AssertionError("standby transfer survivor carried an error reason")
+        self.standby_transfer_survivor_count = len(survivors)
         if self.config.mixed_pressure_workload:
             self.mixed_preserved_survivor_count = len(survivors)
 
@@ -13290,6 +14000,10 @@ command is used after each DRAIN command shuts that server down.
     parser.add_argument("--drain-interval", dest="drain_interval_s", type=float, default=30.0, help="seconds between maintenance cycles")
     parser.add_argument("--drain-ready-timeout", dest="drain_ready_timeout_s", type=float, default=0.0, help="harness watchdog while workers finish their current transaction and pause before DRAIN; 0 keeps the legacy resume-timeout fallback")
     parser.add_argument("--business-run-before-drain", dest="business_run_before_drain_s", type=float, default=0.0, help="seconds to let workers run real business DML before issuing DRAIN directly; 0 keeps the deterministic pre-paused mode")
+    parser.add_argument("--continuous-business-through-drain", action="store_true", help="run independent large and paired short transactions continuously until the time-driven control DRAIN cuts them off")
+    parser.add_argument("--short-transaction-sessions", type=int, default=0, help="paired short-transaction source connections for continuous-through-DRAIN evidence")
+    parser.add_argument("--short-transaction-table-count", type=int, default=0, help="disjoint short-transaction tables; exactly one table per connection pair")
+    parser.add_argument("--short-transaction-rows-per-table", type=int, default=0, help="seed rows in each disjoint short-transaction table")
     parser.add_argument("--duration", dest="duration_s", type=float, default=0.0, help="total business workload seconds; workers continue after the last drain until this duration is reached")
     parser.add_argument("--max-transactions-per-worker", type=int, default=0, help="stop each worker after this many committed transactions; 0 means unbounded")
     parser.add_argument("--min-statements-before-drain-pause", type=int, default=0, help="when a drain is requested, let workers execute at least this many statements in the current transaction before pausing")
@@ -13453,6 +14167,14 @@ command is used after each DRAIN command shuts that server down.
         drain_interval_s=args.drain_interval_s,
         drain_ready_timeout_s=args.drain_ready_timeout_s,
         business_run_before_drain_s=args.business_run_before_drain_s,
+        continuous_business_through_drain=(
+            args.continuous_business_through_drain
+        ),
+        short_transaction_sessions=args.short_transaction_sessions,
+        short_transaction_table_count=args.short_transaction_table_count,
+        short_transaction_rows_per_table=(
+            args.short_transaction_rows_per_table
+        ),
         duration_s=args.duration_s,
         max_transactions_per_worker=max_transactions_per_worker,
         min_statements_before_drain_pause=args.min_statements_before_drain_pause,

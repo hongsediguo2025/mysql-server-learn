@@ -1,0 +1,27 @@
+dependency_mode
+DEPENDENCY_CONVERGENCE_V1
+include/wait_for_pattern_in_file.inc [raw_abort_long_data_ready]
+include/wait_for_pattern_in_file.inc [raw_abort_soft_done]
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+include/wait_for_pattern_in_file.inc [raw_abort_long_data_complete]
+native_admission_restored
+1
+long_data_preserved
+1
+include/wait_for_pattern_in_file.inc [raw_hard_cutoff_ready]
+include/wait_for_pattern_in_file.inc [raw_ps_body_error_ready]
+aborted_epoch_not_active
+1
+include/assert.inc [Phase1 transport metrics are nonzero before dependency scheduling]
+include/assert.inc [rejected nested drain does not reset Phase1 transport metrics]
+include/wait_for_pattern_in_file.inc [raw_ps_body_error_complete]
+include/wait_for_pattern_in_file.inc [raw_hard_cutoff_complete]
+ERROR HY000: Preserve drain is active; this command was not executed
+ERROR HY000: Preserve drain is active; this command was not executed
+ERROR HY000: Preserve drain is active; this command was not executed
+generation	outcome	source_connection_id	token_role	reason	closing_started_us	closing_deadline_us
+GENERATION	SUCCESS	SOURCE_ID	SURVIVOR	NONE	CLOSING_STARTED_US	CLOSING_DEADLINE_US
+GENERATION	SUCCESS	SOURCE_ID	SURVIVOR	NONE	CLOSING_STARTED_US	CLOSING_DEADLINE_US
+GENERATION	SUCCESS	SOURCE_ID	SURVIVOR	NONE	CLOSING_STARTED_US	CLOSING_DEADLINE_US
+one_epoch_accepted
+1

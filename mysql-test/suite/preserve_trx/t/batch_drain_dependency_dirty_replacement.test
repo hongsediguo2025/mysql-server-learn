@@ -1,0 +1,181 @@
+# Dirty classification is injected only at the existing fast-scan boundary.
+# Final-fence rejection restores the source without a RESET race.
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_query_log
+--let $credential_file= $MYSQL_TMP_DIR/closing_early_dirty.secret
+--write_file $credential_file
+closing-early-dirty-secret
+EOF
+--exec chmod 600 $credential_file
+
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+DROP USER IF EXISTS closing_early_dirty_app@localhost;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'closing-early-dirty-secret';
+GRANT SHUTDOWN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.*
+  TO preserve_trx_ha_admin@localhost;
+CREATE USER closing_early_dirty_app@localhost;
+GRANT SELECT, UPDATE ON test.* TO closing_early_dirty_app@localhost;
+
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$MASTER_MYPORT --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=closing_early_dirty --rds-preserve-trx-transfer-credential-secret-file=$credential_file
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--let $restart_parameters=
+--disable_query_log
+--source suite/preserve_trx/include/assert_phase2_dependency_mode.inc
+
+SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms=60000;
+SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=ON;
+
+CREATE TABLE t_closing_early_dirty(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_closing_early_dirty VALUES (1,10);
+
+--connect(closing_early_dirty_ha,localhost,preserve_trx_ha_admin,closing-early-dirty-secret,test)
+--connect(closing_early_dirty_app,localhost,closing_early_dirty_app,,test)
+--connect(closing_early_dirty_owner,localhost,root,,test)
+--connection closing_early_dirty_ha
+SET @unknown_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME='Preserve_trx_transfer_source_commit_unknown_epochs');
+--let $receiver_active_before= query_get_value(SELECT VARIABLE_VALUE+0 AS value FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs', value, 1)
+
+# A forced coordinate drift must finish a higher-generation replacement. The
+# synthetic fence then fails the final validation and restores the source.
+--connection closing_early_dirty_app
+--let $app_connection_id= query_get_value(SELECT CONNECTION_ID() AS id, id, 1)
+START TRANSACTION;
+UPDATE t_closing_early_dirty SET v=v+1 WHERE id=1;
+
+--connection closing_early_dirty_ha
+SET GLOBAL debug='+d,preserve_trx_early_force_one_coordinate_drift';
+
+--connection closing_early_dirty_owner
+SET DEBUG_SYNC=
+  'preserve_trx_early_after_dirty_replacement SIGNAL early_dirty_replaced WAIT_FOR early_dirty_continue';
+--send DRAIN TRANSACTIONS PRESERVE
+
+--connection closing_early_dirty_ha
+SET DEBUG_SYNC='now WAIT_FOR early_dirty_replaced TIMEOUT 30';
+# The one-coordinate fault has already forced the replacement. Disabling the
+# injection does not rewrite the synthetic replacement fence; final validation
+# must still reject it and restore source authority.
+SET GLOBAL debug='-d,preserve_trx_early_force_one_coordinate_drift';
+SET DEBUG_SYNC='now SIGNAL early_dirty_continue';
+
+--connection closing_early_dirty_owner
+--error ER_PRESERVE_TRX_UNSUPPORTED
+--reap
+SET DEBUG_SYNC='RESET';
+
+--enable_query_log
+SELECT
+  (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME='Preserve_trx_lock_warmcopy_sealed_valid')>=1
+    AS early_prebuilt_sealed,
+  (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME='Preserve_trx_early_staged_tokens')=1
+    AS replacement_staged_one,
+  (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME='Preserve_trx_final_dirty_tokens')=1
+    AS replacement_dirty_one,
+  (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME='Preserve_trx_final_replacement_tokens')=1
+    AS replacement_sent_one,
+  (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME='Preserve_trx_final_validation_rejects')=1
+    AS replacement_final_fence_rejected;
+--disable_query_log
+
+--connection closing_early_dirty_app
+--let $assert_text= dirty replacement failure restores the original transaction connection
+--let $assert_cond= `SELECT CONNECTION_ID()=$app_connection_id`
+--source include/assert.inc
+UPDATE t_closing_early_dirty SET v=v+10 WHERE id=1;
+COMMIT;
+
+--connection closing_early_dirty_ha
+--let $assert_text= dirty replacement failure avoids COMMIT_UNKNOWN
+--let $assert_cond= `SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_source_commit_unknown_epochs')=@unknown_before`
+--source include/assert.inc
+
+--connection default
+--enable_query_log
+SELECT v AS value_after_replacement_restore FROM t_closing_early_dirty;
+--disable_query_log
+
+# A mutation observed by the second scan must fail closed before COMMIT_EPOCH
+# and restore the source transaction to its original THD.
+--connection closing_early_dirty_app
+START TRANSACTION;
+UPDATE t_closing_early_dirty SET v=v+1 WHERE id=1;
+
+--connection closing_early_dirty_ha
+SET GLOBAL debug='+d,preserve_trx_early_force_final_fence_change';
+
+--connection closing_early_dirty_owner
+SET DEBUG_SYNC='RESET';
+--error ER_PRESERVE_TRX_UNSUPPORTED
+DRAIN TRANSACTIONS PRESERVE;
+
+--connection closing_early_dirty_ha
+SET GLOBAL debug='-d,preserve_trx_early_force_final_fence_change';
+--enable_query_log
+SELECT
+  (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME='Preserve_trx_early_staged_tokens')=1
+    AS reject_staged_one,
+  (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME='Preserve_trx_final_validation_rejects')=1
+    AS reject_count_one;
+--disable_query_log
+
+--connection closing_early_dirty_app
+UPDATE t_closing_early_dirty SET v=v+100 WHERE id=1;
+COMMIT;
+
+--connection default
+--enable_query_log
+SELECT v AS value_after_final_scan_reject FROM t_closing_early_dirty;
+--disable_query_log
+
+# Prewarm is intentionally paused; queued target-local work is retired by the
+# teardown restart after source transactions are committed.
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')=$receiver_active_before
+--source include/wait_condition.inc
+
+--disconnect closing_early_dirty_app
+--disconnect closing_early_dirty_owner
+--disconnect closing_early_dirty_ha
+
+--connection default
+# The failed self-transfer may retain target-local prepared handles until
+# teardown; restart only after both source transactions have committed.
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$MASTER_MYPORT --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=closing_early_dirty --rds-preserve-trx-transfer-credential-secret-file=$credential_file
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--let $restart_parameters=
+--disable_query_log
+--source suite/preserve_trx/include/assert_phase2_dependency_mode.inc
+
+--let $assert_text= dirty replacement source commits survive restart
+--let $assert_cond= `SELECT v=122 FROM t_closing_early_dirty`
+--source include/assert.inc
+
+DROP TABLE t_closing_early_dirty;
+DROP USER closing_early_dirty_app@localhost;
+DROP USER preserve_trx_ha_admin@localhost;
+--remove_file $credential_file

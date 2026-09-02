@@ -356,6 +356,14 @@ class Preserve_trx_lock_warmcopy_drain_participant final
       uint64_t thread_id, PrebuiltRecordLocksBlob *blob);
   bool phase1_record_prebuilt_blob_for_thread(
       uint64_t thread_id, PrebuiltRecordLocksBlob *blob) const;
+  bool phase1_record_prebuilt_blob_if_current(
+      uint64_t thread_id,
+      const lock_warmcopy_trx_lock_fence_t &current_live_fence,
+      PrebuiltRecordLocksBlob *blob) const;
+  bool refresh_phase1_record_live_fence_for_thread(
+      uint64_t thread_id,
+      const lock_warmcopy_trx_lock_fence_t &live_fence,
+      uint64_t minimum_publication_generation);
   bool record_locks_seeded_in_phase1_for_unit_test(uint64_t thread_id) const;
   bool target_observation_for_thread_for_unit_test(
       uint64_t thread_id,

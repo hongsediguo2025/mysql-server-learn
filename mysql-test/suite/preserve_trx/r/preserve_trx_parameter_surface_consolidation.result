@@ -1,9 +1,9 @@
-# Preserve/Resume product parameter surface is exactly 16 rds_ names.
+# Preserve/Resume product parameter surface is exactly 17 rds_ names.
 SELECT COUNT(*) AS rds_parameter_count
 FROM performance_schema.global_variables
 WHERE VARIABLE_NAME LIKE 'rds_preserve_trx_%';
 rds_parameter_count
-16
+17
 SELECT COUNT(*) AS legacy_parameter_count
 FROM performance_schema.global_variables
 WHERE VARIABLE_NAME LIKE 'preserve_trx_%';

@@ -1,0 +1,18 @@
+ERROR 42S21: Duplicate column name 'v'
+Got one of the listed errors
+ERROR HY000: Preserve drain is active; this command was not executed
+ERROR HY000: Preserve drain is active; this command was not executed
+generation	outcome	source_connection_id	token_role	reason	closing_started_us	closing_deadline_us
+GENERATION	SUCCESS	SOURCE_ID	SURVIVOR	NONE	CLOSING_STARTED_US	CLOSING_DEADLINE_US
+GENERATION	SUCCESS	SOURCE_ID	SURVIVOR	NONE	CLOSING_STARTED_US	CLOSING_DEADLINE_US
+GENERATION	SUCCESS	SOURCE_ID	SURVIVOR	NONE	CLOSING_STARTED_US	CLOSING_DEADLINE_US
+one_epoch_accepted
+1
+id	v
+1	11
+2	21
+3	30
+success_column_created
+1
+failed_ddl_kept_original_column
+1

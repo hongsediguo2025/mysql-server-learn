@@ -1,7 +1,6 @@
 generation	outcome	source_connection_id	token_role	reason	closing_started_us	closing_deadline_us
 GENERATION	NO_PRESERVABLE_TOKENS	APP_ID	EXCLUDED	FINAL_METADATA_BUILD_FAILED	CLOSING_STARTED_US	CLOSING_DEADLINE_US
 ERROR HY000: Preserve drain is active; this command was not executed
-ERROR HY000: RESET DRAIN arrived after shutdown handoff
 ERROR HY000: Preserve drain is active; this command was not executed
 SELECT v AS value_after_finalize_failure FROM t_closing_early_failure;
 value_after_finalize_failure
@@ -9,7 +8,6 @@ value_after_finalize_failure
 generation	outcome	source_connection_id	token_role	reason	closing_started_us	closing_deadline_us
 GENERATION	NO_PRESERVABLE_TOKENS	APP_ID	EXCLUDED	LOCK_PLAN_REPLACEMENT_FAILED	CLOSING_STARTED_US	CLOSING_DEADLINE_US
 ERROR HY000: Preserve drain is active; this command was not executed
-ERROR HY000: RESET DRAIN arrived after shutdown handoff
 ERROR HY000: Preserve drain is active; this command was not executed
 SELECT v AS value_after_replacement_failure FROM t_closing_early_failure;
 value_after_replacement_failure

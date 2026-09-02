@@ -42,9 +42,16 @@ die "shared helper must only publish PENDING_QUIESCE targets at an idle boundary
   unless $shared_helper =~ /Preserve_trx_batch_thd_state::PENDING_QUIESCE/s &&
          $shared_helper =~ /m_server_idle/s;
 die "shared helper must publish both active and transactionless target states\n"
-  unless $shared_helper =~ /preserve_trx_has_explicit_active_transaction/s &&
+  unless $shared_helper =~ /preserve_trx_has_batch_active_transaction/s &&
          $shared_helper =~ /Preserve_trx_batch_thd_state::QUIESCED/s &&
          $shared_helper =~ /Preserve_trx_batch_thd_state::DRAINED_NO_TRANSACTION/s;
+
+my $batch_active_helper = extract_function_body(
+  $preserve_src,
+  'static bool preserve_trx_has_batch_active_transaction(THD *thd)');
+die "batch active predicate must preserve legacy explicit semantics and add only dependency activity\n"
+  unless $batch_active_helper =~ /preserve_trx_has_explicit_active_transaction/s &&
+         $batch_active_helper =~ /dependency_transaction_is_active/s;
 
 $preserve_src =~
   /class Preserve_batch_target_state_reader.*?class Preserve_batch_clear_target_generation/ms

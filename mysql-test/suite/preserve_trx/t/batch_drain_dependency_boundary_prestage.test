@@ -1,0 +1,191 @@
+# Dependency Phase2 may refresh discardable transfer candidates while an
+# original T0 BODY is still running, but it must not publish HARD until every
+# original BODY has exited.
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/have_log_bin.inc
+--source include/force_restart.inc
+
+--disable_query_log
+--let $credential_file= $MYSQL_TMP_DIR/dependency_boundary_prestage.secret
+--write_file $credential_file
+dependency-boundary-prestage-secret
+EOF
+--exec chmod 600 $credential_file
+
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+DROP USER IF EXISTS boundary_prestage_app@localhost;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'dependency-boundary-prestage-secret';
+GRANT SHUTDOWN, SYSTEM_VARIABLES_ADMIN,
+      PRESERVE_TRX_TRANSFER_ADMIN ON *.*
+  TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+CREATE USER boundary_prestage_app@localhost;
+GRANT SELECT, UPDATE ON test.* TO boundary_prestage_app@localhost;
+GRANT SESSION_VARIABLES_ADMIN ON *.* TO boundary_prestage_app@localhost;
+
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$MASTER_MYPORT --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=dependency_boundary_prestage --rds-preserve-trx-transfer-credential-secret-file=$credential_file
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--let $restart_parameters=
+--disable_query_log
+--source suite/preserve_trx/include/assert_phase2_dependency_mode.inc
+
+CALL mtr.add_suppression(
+  "PRESERVE: standby transfer source epoch commit failed status=9");
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms=60000;
+SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=ON;
+
+CREATE TABLE t_dependency_boundary_prestage(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_dependency_boundary_prestage VALUES (1,10),(2,20),(3,30);
+delimiter |;
+CREATE PROCEDURE p_dependency_boundary_prestage()
+BEGIN
+  UPDATE t_dependency_boundary_prestage SET v=v+20 WHERE id=2;
+END|
+delimiter ;|
+GRANT EXECUTE ON PROCEDURE test.p_dependency_boundary_prestage
+  TO boundary_prestage_app@localhost;
+
+--connect(boundary_ha,localhost,preserve_trx_ha_admin,dependency-boundary-prestage-secret,test)
+SET @unknown_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME='Preserve_trx_transfer_source_commit_unknown_epochs');
+--let $receiver_active_before= query_get_value(SELECT VARIABLE_VALUE+0 AS value FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs', value, 1)
+
+--connect(boundary_app_1,localhost,boundary_prestage_app,,test)
+--let $app_1_id= query_get_value(SELECT CONNECTION_ID() AS id, id, 1)
+START TRANSACTION;
+UPDATE t_dependency_boundary_prestage SET v=v+1 WHERE id=1;
+SET DEBUG_SYNC=
+  'phase2_sched_after_execution_entered SIGNAL boundary_app_1_body WAIT_FOR boundary_app_1_continue TIMEOUT 30';
+--send UPDATE t_dependency_boundary_prestage SET v=v+10 WHERE id=3
+
+--connect(boundary_app_2,localhost,boundary_prestage_app,,test)
+--let $app_2_id= query_get_value(SELECT CONNECTION_ID() AS id, id, 1)
+START TRANSACTION;
+UPDATE t_dependency_boundary_prestage SET v=v+1 WHERE id=2;
+SET DEBUG_SYNC=
+  'sp_lex_instr_before_exec_core SIGNAL boundary_app_2_body WAIT_FOR boundary_app_2_continue';
+--send CALL p_dependency_boundary_prestage()
+
+--connection boundary_ha
+SET DEBUG_SYNC='now WAIT_FOR boundary_app_1_body TIMEOUT 10';
+SET DEBUG_SYNC='now WAIT_FOR boundary_app_2_body TIMEOUT 10';
+
+--connect(boundary_owner,localhost,root,,test)
+SET SESSION debug='+d,preserve_trx_transfer_fail_commit_before_send_once';
+SET DEBUG_SYNC=
+  'preserve_trx_transfer_after_phase1_binlog_stream SIGNAL boundary_phase1_streamed WAIT_FOR boundary_phase1_continue';
+SET DEBUG_SYNC=
+  'phase2_sched_after_t0_registration SIGNAL boundary_t0_registered WAIT_FOR boundary_t0_continue TIMEOUT 30';
+SET DEBUG_SYNC=
+  'phase2_sched_after_hard_published SIGNAL boundary_hard_published WAIT_FOR boundary_hard_continue TIMEOUT 30';
+SET DEBUG_SYNC=
+  'preserve_trx_transfer_commit_before_send_failed SIGNAL boundary_unsent_ready WAIT_FOR boundary_unsent_continue';
+--send DRAIN TRANSACTIONS PRESERVE
+
+--connection boundary_ha
+SET DEBUG_SYNC='now WAIT_FOR boundary_phase1_streamed TIMEOUT 30';
+--let $record_send_before= query_get_value(SELECT VARIABLE_VALUE+0 AS value FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_phase1_record_last_batch_send_us', value, 1)
+SET DEBUG_SYNC='now SIGNAL boundary_phase1_continue';
+SET DEBUG_SYNC='now WAIT_FOR boundary_t0_registered TIMEOUT 30';
+
+--connection boundary_ha
+SET DEBUG_SYNC='now SIGNAL boundary_app_1_continue';
+--connection boundary_app_1
+--reap
+
+--connection boundary_ha
+SET DEBUG_SYNC='now SIGNAL boundary_t0_continue';
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_phase1_record_last_batch_send_us')>$record_send_before
+--source include/wait_condition.inc
+--let $assert_text= boundary candidate refreshed before the second BODY exits
+--let $assert_cond= `SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_phase1_record_last_batch_send_us')>$record_send_before`
+--source include/assert.inc
+
+--disable_warnings
+SET DEBUG_SYNC='now WAIT_FOR boundary_hard_published TIMEOUT 1';
+--let $sync_warning_count= `SELECT @@warning_count`
+--enable_warnings
+if (!$sync_warning_count)
+{
+  --die HARD published while an original T0 BODY was still running
+}
+
+--connection boundary_ha
+SET DEBUG_SYNC='now SIGNAL boundary_app_2_continue';
+--connection boundary_app_2
+--reap
+
+--connection boundary_ha
+SET DEBUG_SYNC='now WAIT_FOR boundary_hard_published TIMEOUT 30';
+SET DEBUG_SYNC='now SIGNAL boundary_hard_continue';
+SET DEBUG_SYNC='now WAIT_FOR boundary_unsent_ready TIMEOUT 30';
+SET DEBUG_SYNC='now SIGNAL boundary_unsent_continue';
+
+--connection boundary_owner
+--error ER_PRESERVE_TRX_UNSUPPORTED
+--reap
+SET SESSION debug='-d,preserve_trx_transfer_fail_commit_before_send_once';
+SET DEBUG_SYNC='RESET';
+
+--connection boundary_app_1
+--let $assert_text= first original transaction connection is restored
+--let $assert_cond= `SELECT CONNECTION_ID()=$app_1_id`
+--source include/assert.inc
+UPDATE t_dependency_boundary_prestage SET v=v+100 WHERE id=1;
+COMMIT;
+--connection boundary_app_2
+--let $assert_text= second original transaction connection is restored
+--let $assert_cond= `SELECT CONNECTION_ID()=$app_2_id`
+--source include/assert.inc
+UPDATE t_dependency_boundary_prestage SET v=v+200 WHERE id=2;
+COMMIT;
+
+--connection boundary_ha
+--let $assert_text= boundary prestage failure avoids COMMIT_UNKNOWN
+--let $assert_cond= `SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_source_commit_unknown_epochs')=@unknown_before`
+--source include/assert.inc
+
+--connection default
+--enable_query_log
+SELECT GROUP_CONCAT(CONCAT(id, ':', v) ORDER BY id) AS committed_values
+  FROM t_dependency_boundary_prestage;
+--disable_query_log
+# This test pauses prewarm by design; target-local queued work is retired by
+# the teardown restart after both source transactions commit.
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')=$receiver_active_before
+--source include/wait_condition.inc
+
+--disconnect boundary_app_1
+--disconnect boundary_app_2
+--disconnect boundary_owner
+--disconnect boundary_ha
+
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$MASTER_MYPORT --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=dependency_boundary_prestage --rds-preserve-trx-transfer-credential-secret-file=$credential_file
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--let $restart_parameters=
+--disable_query_log
+--source suite/preserve_trx/include/assert_phase2_dependency_mode.inc
+--let $assert_text= boundary prestage commits survive restart
+--let $assert_cond= `SELECT GROUP_CONCAT(CONCAT(id, ':', v) ORDER BY id)='1:111,2:241,3:40' FROM t_dependency_boundary_prestage`
+--source include/assert.inc
+
+DROP PROCEDURE p_dependency_boundary_prestage;
+DROP TABLE t_dependency_boundary_prestage;
+DROP USER boundary_prestage_app@localhost;
+DROP USER preserve_trx_ha_admin@localhost;
+SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=OFF;
+--remove_file $credential_file

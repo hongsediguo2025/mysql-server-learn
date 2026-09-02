@@ -1,0 +1,123 @@
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+--disable_query_log
+--disable_result_log
+
+--let $credential_file= $MYSQL_TMP_DIR/unsent-transaction-restore.secret
+--write_file $credential_file
+unsent-transaction-restore-secret
+EOF
+--exec chmod 600 $credential_file
+
+--connect(unsent_tx_receiver,127.0.0.1,root,,test,$SERVER_MYPORT_2,)
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'unsent-transaction-restore-secret';
+GRANT PRESERVE_TRX_TRANSFER_ADMIN, PROCESS ON *.*
+  TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+SET @receiver_active_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs');
+
+--connection default
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+DROP USER IF EXISTS unsent_tx_restore_app@localhost;
+DROP TABLE IF EXISTS t_unsent_transaction_restore;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'unsent-transaction-restore-secret';
+GRANT SHUTDOWN, SYSTEM_VARIABLES_ADMIN,
+      PRESERVE_TRX_TRANSFER_ADMIN, PROCESS ON *.*
+  TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+CREATE USER unsent_tx_restore_app@localhost;
+GRANT SELECT, UPDATE ON test.* TO unsent_tx_restore_app@localhost;
+
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$SERVER_MYPORT_2 --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=unsent_transaction_restore --rds-preserve-trx-transfer-credential-secret-file=$credential_file
+--source include/restart_mysqld.inc
+--let $restart_parameters=
+--disable_query_log
+--disable_result_log
+--source suite/preserve_trx/include/assert_phase2_dependency_mode.inc
+
+CALL mtr.add_suppression(
+  "PRESERVE: standby transfer source epoch commit failed status=9");
+
+CREATE TABLE t_unsent_transaction_restore(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_unsent_transaction_restore VALUES(1,10),(2,20);
+
+--connect(unsent_tx_source_ha,localhost,preserve_trx_ha_admin,unsent-transaction-restore-secret,test)
+SET @unknown_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME='Preserve_trx_transfer_source_commit_unknown_epochs');
+
+--connect(unsent_tx_app,localhost,unsent_tx_restore_app,,test)
+--let $app_connection_id= query_get_value(SELECT CONNECTION_ID() AS id, id, 1)
+START TRANSACTION;
+UPDATE t_unsent_transaction_restore SET v=11 WHERE id=1;
+
+--connect(unsent_tx_marker,localhost,unsent_tx_restore_app,,test)
+UPDATE t_unsent_transaction_restore SET v=22 WHERE id=2;
+
+--connect(unsent_tx_drain,localhost,root,,test)
+SET SESSION debug='+d,preserve_trx_transfer_fail_commit_before_send_once';
+SET DEBUG_SYNC=
+  'preserve_trx_transfer_commit_before_send_failed SIGNAL unsent_tx_failure_seen';
+--send DRAIN TRANSACTIONS PRESERVE
+
+--connection unsent_tx_source_ha
+SET DEBUG_SYNC='now WAIT_FOR unsent_tx_failure_seen TIMEOUT 30';
+
+--connection unsent_tx_drain
+--error ER_PRESERVE_TRX_UNSUPPORTED
+--reap
+SET SESSION debug='-d,preserve_trx_transfer_fail_commit_before_send_once';
+SET DEBUG_SYNC='RESET';
+
+--connection unsent_tx_app
+--let $assert_text= pre-COMMIT-send failure restores the original transaction connection
+--let $assert_cond= `SELECT CONNECTION_ID()=$app_connection_id`
+--source include/assert.inc
+UPDATE t_unsent_transaction_restore SET v=v+10 WHERE id=1;
+COMMIT;
+
+--connection unsent_tx_source_ha
+--let $assert_text= transaction restore does not enter COMMIT_UNKNOWN
+--let $assert_cond= `SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_source_commit_unknown_epochs')=@unknown_before`
+--source include/assert.inc
+
+--connection unsent_tx_receiver
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')=@receiver_active_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_worker_active')=0
+--source include/wait_condition.inc
+--let $assert_text= transaction restore leaves no accepted receiver epoch
+--let $assert_cond= `SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')=@receiver_active_before`
+--source include/assert.inc
+
+--connection unsent_tx_marker
+--enable_result_log
+SELECT id,v FROM t_unsent_transaction_restore ORDER BY id;
+--disable_result_log
+
+--connection default
+DROP TABLE t_unsent_transaction_restore;
+DROP USER unsent_tx_restore_app@localhost;
+DROP USER preserve_trx_ha_admin@localhost;
+
+--connection unsent_tx_receiver
+DROP USER preserve_trx_ha_admin@localhost;
+
+--connection default
+--remove_file $credential_file
+--enable_result_log
+SELECT 'ok' AS unsent_transaction_restore;
+--enable_query_log

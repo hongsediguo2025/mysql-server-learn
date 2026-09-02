@@ -1,0 +1,540 @@
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+--disable_query_log
+
+--let $credential_file= $MYSQL_TMP_DIR/phase2-scheduler-protocol.secret
+--write_file $credential_file
+phase2-scheduler-protocol-secret
+EOF
+--exec chmod 600 $credential_file
+
+--connect(protocol_receiver,127.0.0.1,root,,test,$SERVER_MYPORT_2,)
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'phase2-scheduler-protocol-secret';
+GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+GRANT PROCESS ON *.* TO preserve_trx_ha_admin@localhost;
+
+--connection default
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+DROP USER IF EXISTS phase2_scheduler_protocol_app@localhost;
+DROP TABLE IF EXISTS t_phase2_scheduler_protocol;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'phase2-scheduler-protocol-secret';
+GRANT SHUTDOWN, SYSTEM_VARIABLES_ADMIN,
+      PRESERVE_TRX_TRANSFER_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+CREATE USER phase2_scheduler_protocol_app@localhost;
+GRANT SELECT, INSERT, UPDATE ON test.*
+  TO phase2_scheduler_protocol_app@localhost;
+GRANT SESSION_VARIABLES_ADMIN ON *.*
+  TO phase2_scheduler_protocol_app@localhost;
+
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-standby-phase2-scheduler-mode=DEPENDENCY_CONVERGENCE_V1 --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$SERVER_MYPORT_2 --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=phase2_scheduler_protocol --rds-preserve-trx-transfer-credential-secret-file=$credential_file --rds-preserve-trx-drain-phase1-timeout-ms=10000 --rds-preserve-trx-drain-phase2-timeout-ms=10000
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--let $restart_parameters=
+--disable_query_log
+
+SELECT @@GLOBAL.rds_preserve_trx_standby_phase2_scheduler_mode
+  AS dependency_mode;
+
+--connection default
+CREATE TABLE t_phase2_scheduler_protocol(
+  id INT PRIMARY KEY,
+  v INT NOT NULL,
+  payload VARBINARY(128) NOT NULL DEFAULT ''
+) ENGINE=InnoDB;
+INSERT INTO t_phase2_scheduler_protocol(id,v) VALUES(1,10);
+INSERT INTO t_phase2_scheduler_protocol(id,v) VALUES(2,20);
+INSERT INTO t_phase2_scheduler_protocol(id,v) VALUES(3,30);
+INSERT INTO t_phase2_scheduler_protocol(id,v) VALUES(4,40);
+INSERT INTO t_phase2_scheduler_protocol(id,v) VALUES(5,50);
+INSERT INTO t_phase2_scheduler_protocol(id,v) VALUES(6,60);
+INSERT INTO t_phase2_scheduler_protocol(id,v) VALUES(7,70);
+INSERT INTO t_phase2_scheduler_protocol(id,v) VALUES(8,80);
+
+--let $raw_ready= $MYSQLTEST_VARDIR/tmp/phase2_protocol_raw_ready
+--let $raw_soft_go= $MYSQLTEST_VARDIR/tmp/phase2_protocol_raw_soft_go
+--let $raw_soft_done= $MYSQLTEST_VARDIR/tmp/phase2_protocol_raw_soft_done
+--let $raw_restore_go= $MYSQLTEST_VARDIR/tmp/phase2_protocol_raw_restore_go
+--let $raw_output= $MYSQLTEST_VARDIR/tmp/phase2_protocol_raw.out
+--exec echo "raw_client_start" > $raw_output
+--exec_in_background perl $MYSQL_TEST_DIR/suite/preserve_trx/include/phase2_scheduler_raw_protocol_client.pl $SERVER_MYSOCK_1 abort_long_data $raw_ready $raw_soft_go $raw_soft_done $raw_restore_go >> $raw_output 2>&1
+--let $grep_file= $raw_output
+--let $grep_pattern= raw_abort_long_data_ready
+--let $wait_timeout= 10
+--source include/wait_for_pattern_in_file.inc
+
+--connect(protocol_ha,localhost,preserve_trx_ha_admin,phase2-scheduler-protocol-secret,test)
+
+# A native proof UNKNOWN aborts only the scheduler attempt. A BODY command
+# keeps running, while a HELD command waits for native admission restoration
+# and then executes without inheriting a stale permit.
+--connect(protocol_abort_body,localhost,phase2_scheduler_protocol_app,,test)
+START TRANSACTION;
+UPDATE t_phase2_scheduler_protocol SET v=31 WHERE id=3;
+SET DEBUG_SYNC=
+  'phase2_sched_after_execution_entered SIGNAL protocol_abort_body_entered WAIT_FOR protocol_release_abort_body TIMEOUT 30';
+--send UPDATE t_phase2_scheduler_protocol SET v=v+100 WHERE id=3
+
+--connection protocol_ha
+SET DEBUG_SYNC='now WAIT_FOR protocol_abort_body_entered TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die abort anchor did not enter BODY before scheduler publication
+}
+
+--connect(protocol_abort_held,localhost,phase2_scheduler_protocol_app,,test)
+START TRANSACTION;
+UPDATE t_phase2_scheduler_protocol SET v=41 WHERE id=4;
+SET DEBUG_SYNC=
+  'phase2_sched_after_command_held SIGNAL protocol_abort_command_held';
+
+--connect(protocol_abort_owner,localhost,root,,test)
+SET SESSION DEBUG='+d,phase2_sched_force_innodb_unknown';
+SET DEBUG_SYNC=
+  'phase2_sched_after_t0_registration SIGNAL protocol_abort_t0_registered WAIT_FOR protocol_run_abort_probe TIMEOUT 30';
+--send DRAIN TRANSACTIONS PRESERVE
+
+--connection protocol_ha
+SET DEBUG_SYNC='now WAIT_FOR protocol_abort_t0_registered TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die abort attempt did not complete T0 registration
+}
+--exec echo "soft" > $raw_soft_go
+--let $grep_file= $raw_output
+--let $grep_pattern= raw_abort_soft_done
+--let $wait_timeout= 10
+--source include/wait_for_pattern_in_file.inc
+
+--connection protocol_abort_held
+--send UPDATE t_phase2_scheduler_protocol SET v=v+100 WHERE id=4
+
+--connection protocol_ha
+SET DEBUG_SYNC='now WAIT_FOR protocol_abort_command_held TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die abort candidate did not enter HELD
+}
+SET DEBUG_SYNC='now SIGNAL protocol_run_abort_probe';
+
+--connection protocol_abort_owner
+--error ER_PRESERVE_TRX_UNSUPPORTED
+--reap
+
+--connection protocol_abort_held
+--reap
+
+--connection protocol_ha
+SET DEBUG_SYNC='now SIGNAL protocol_release_abort_body';
+
+--connection protocol_abort_body
+--reap
+COMMIT;
+--connection protocol_abort_held
+COMMIT;
+
+--connection protocol_ha
+--exec echo "restore" > $raw_restore_go
+--let $grep_file= $raw_output
+--let $grep_pattern= raw_abort_long_data_complete
+--let $wait_timeout= 10
+--source include/wait_for_pattern_in_file.inc
+
+--connection protocol_ha
+SELECT SUM(v)=272 AS native_admission_restored
+  FROM t_phase2_scheduler_protocol WHERE id IN (3,4);
+SELECT HEX(payload)=HEX('phase2-long-data') AS long_data_preserved
+  FROM t_phase2_scheduler_protocol WHERE id=3;
+SET GLOBAL rds_preserve_trx_drain_phase1_timeout_ms=2000;
+
+--let $raw_hard_ready= $MYSQLTEST_VARDIR/tmp/phase2_protocol_raw_hard_ready
+--let $raw_hard_soft_go= $MYSQLTEST_VARDIR/tmp/phase2_protocol_raw_hard_soft_go
+--let $raw_hard_done= $MYSQLTEST_VARDIR/tmp/phase2_protocol_raw_hard_done
+--let $raw_hard_unused= $MYSQLTEST_VARDIR/tmp/phase2_protocol_raw_hard_unused
+--let $raw_hard_output= $MYSQLTEST_VARDIR/tmp/phase2_protocol_raw_hard.out
+--exec echo "raw_hard_client_start" > $raw_hard_output
+--exec_in_background perl $MYSQL_TEST_DIR/suite/preserve_trx/include/phase2_scheduler_raw_protocol_client.pl $SERVER_MYSOCK_1 hard_cutoff $raw_hard_ready $raw_hard_soft_go $raw_hard_done $raw_hard_unused >> $raw_hard_output 2>&1
+--let $grep_file= $raw_hard_output
+--let $grep_pattern= raw_hard_cutoff_ready
+--let $wait_timeout= 10
+--source include/wait_for_pattern_in_file.inc
+
+--let $raw_ps_ready= $MYSQLTEST_VARDIR/tmp/phase2_protocol_raw_ps_ready
+--let $raw_ps_execute_go= $MYSQLTEST_VARDIR/tmp/phase2_protocol_raw_ps_execute_go
+--let $raw_ps_done= $MYSQLTEST_VARDIR/tmp/phase2_protocol_raw_ps_done
+--let $raw_ps_unused= $MYSQLTEST_VARDIR/tmp/phase2_protocol_raw_ps_unused
+--let $raw_ps_output= $MYSQLTEST_VARDIR/tmp/phase2_protocol_raw_ps.out
+--exec echo "raw_ps_client_start" > $raw_ps_output
+--exec_in_background perl $MYSQL_TEST_DIR/suite/preserve_trx/include/phase2_scheduler_raw_protocol_client.pl $SERVER_MYSOCK_1 ps_body_error $raw_ps_ready $raw_ps_execute_go $raw_ps_done $raw_ps_unused >> $raw_ps_output 2>&1
+--let $grep_file= $raw_ps_output
+--let $grep_pattern= raw_ps_body_error_ready
+--let $wait_timeout= 10
+--source include/wait_for_pattern_in_file.inc
+
+--connection protocol_receiver
+SELECT VARIABLE_VALUE=0 AS aborted_epoch_not_active
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs';
+
+--connection protocol_ha
+
+--connect(protocol_body_wins,localhost,phase2_scheduler_protocol_app,,test)
+START TRANSACTION;
+UPDATE t_phase2_scheduler_protocol SET v=11 WHERE id=1;
+SET DEBUG_SYNC=
+  'phase2_sched_after_execution_entered SIGNAL protocol_body_entered WAIT_FOR protocol_release_body TIMEOUT 30';
+
+--connect(protocol_t0_wins,localhost,phase2_scheduler_protocol_app,,test)
+START TRANSACTION;
+UPDATE t_phase2_scheduler_protocol SET v=21 WHERE id=2;
+SET DEBUG_SYNC=
+  'phase2_sched_after_command_held SIGNAL protocol_t0_command_held';
+SET DEBUG_SYNC=
+  'phase2_sched_after_route_null_before_body_cas SIGNAL protocol_admission_ready WAIT_FOR protocol_release_admission TIMEOUT 30';
+
+# This idle transaction sends a new command only after CLOSING is visible.
+# Its native 4020 response must wait for the authoritative lifetime-pin
+# handoff, even though it never entered the scheduler HELD set.
+--connect(protocol_post_closing,localhost,phase2_scheduler_protocol_app,,test)
+START TRANSACTION;
+UPDATE t_phase2_scheduler_protocol SET v=51 WHERE id=5;
+--let $protocol_post_closing_id= `SELECT CONNECTION_ID()`
+SET DEBUG_SYNC=
+  'phase2_sched_native_closing_waiting_for_handoff SIGNAL protocol_native_handoff_wait';
+
+--connection protocol_ha
+--connection protocol_body_wins
+--send UPDATE t_phase2_scheduler_protocol SET v=v+100 WHERE id=1
+
+--connection protocol_ha
+SET DEBUG_SYNC='now WAIT_FOR protocol_body_entered TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die command did not win the BODY CAS before scheduler publication
+}
+--exec echo "execute" > $raw_ps_execute_go
+SET DEBUG_SYNC='now WAIT_FOR raw_ps_body_entered TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die prepared statement did not enter BODY before scheduler publication
+}
+
+--connection protocol_t0_wins
+--send UPDATE t_phase2_scheduler_protocol SET v=v+100 WHERE id=2
+
+--connection protocol_ha
+SET DEBUG_SYNC='now WAIT_FOR protocol_admission_ready TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die command did not pause in pre-BODY admission
+}
+
+--connect(protocol_owner,localhost,root,,test)
+SET DEBUG_SYNC=
+  'preserve_trx_transfer_after_phase1_binlog_stream SIGNAL protocol_phase1_streamed WAIT_FOR protocol_phase1_release';
+SET DEBUG_SYNC=
+  'phase2_sched_after_publish_before_t0 SIGNAL protocol_route_published';
+SET DEBUG_SYNC=
+  'phase2_sched_after_t0_claim_before_register SIGNAL protocol_t0_claimed WAIT_FOR protocol_release_t0_claim TIMEOUT 30';
+SET DEBUG_SYNC=
+  'phase2_sched_after_t0_executing_registered SIGNAL protocol_body_registered';
+SET DEBUG_SYNC=
+  'phase2_sched_after_t0_registration SIGNAL protocol_t0_registered WAIT_FOR protocol_begin_hard TIMEOUT 30';
+SET DEBUG_SYNC=
+  'phase2_sched_after_hard_published SIGNAL protocol_hard_published WAIT_FOR protocol_release_hard TIMEOUT 30';
+SET DEBUG_SYNC=
+  'phase2_sched_after_authoritative_counter_before_handoff_pins SIGNAL protocol_counter_classified WAIT_FOR protocol_release_handoff_pins TIMEOUT 30';
+SET DEBUG_SYNC=
+  'preserve_trx_warmcopy_after_targets_classified SIGNAL protocol_targets_classified WAIT_FOR protocol_release_targets TIMEOUT 30';
+SET DEBUG_SYNC=
+  'preserve_trx_batch_after_targets_quiesced_before_attach SIGNAL protocol_before_non_survivor_prune WAIT_FOR protocol_run_non_survivor_prune TIMEOUT 30';
+--send DRAIN TRANSACTIONS PRESERVE
+
+--connection protocol_ha
+SET DEBUG_SYNC='now WAIT_FOR protocol_phase1_streamed TIMEOUT 30';
+SET @phase1_frame_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME='Preserve_trx_transfer_phase1_frame_count');
+SET @phase1_send_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME='Preserve_trx_transfer_phase1_network_send_count');
+SET @phase1_batch_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME='Preserve_trx_transfer_phase1_batch_count');
+--let $assert_text= Phase1 transport metrics are nonzero before dependency scheduling
+--let $assert_cond= `SELECT @phase1_frame_before>0 AND @phase1_send_before>0 AND @phase1_batch_before>0`
+--source include/assert.inc
+--disable_result_log
+--error ER_PRESERVE_TRX_UNSUPPORTED
+DRAIN TRANSACTIONS PRESERVE;
+--enable_result_log
+--let $assert_text= rejected nested drain does not reset Phase1 transport metrics
+--let $assert_cond= `SELECT @phase1_frame_before=(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_phase1_frame_count') AND @phase1_send_before=(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_phase1_network_send_count') AND @phase1_batch_before=(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_phase1_batch_count')`
+--source include/assert.inc
+SET DEBUG_SYNC='now SIGNAL protocol_phase1_release';
+
+SET DEBUG_SYNC='now WAIT_FOR protocol_route_published TIMEOUT 2';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die dependency scheduler route was not published before T0
+}
+SET DEBUG_SYNC='now WAIT_FOR protocol_t0_claimed TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die T0 did not claim the command paused before BODY
+}
+SET DEBUG_SYNC='now SIGNAL protocol_release_admission';
+SET DEBUG_SYNC='now SIGNAL protocol_release_t0_claim';
+SET DEBUG_SYNC='now WAIT_FOR protocol_t0_registered TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die dependency scheduler did not complete T0 registration
+}
+--exec echo "soft" > $raw_hard_soft_go
+SET DEBUG_SYNC='now WAIT_FOR raw_hard_fetch_held TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die raw COM_STMT_FETCH did not enter HELD
+}
+SET DEBUG_SYNC='now WAIT_FOR protocol_body_registered TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die T0 did not retain the command that already entered BODY
+}
+SET DEBUG_SYNC='now WAIT_FOR protocol_t0_command_held TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die T0-claimed command did not remain HELD before HARD
+}
+SET DEBUG_SYNC='now SIGNAL protocol_begin_hard';
+SET DEBUG_SYNC='now WAIT_FOR protocol_hard_published TIMEOUT 10';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die dependency scheduler did not publish deadline HARD with BODY active
+}
+SET DEBUG_SYNC='now SIGNAL raw_release_ps_body';
+SET DEBUG_SYNC='now SIGNAL protocol_release_body';
+--let $grep_file= $raw_ps_output
+--let $grep_pattern= raw_ps_body_error_complete
+--let $wait_timeout= 10
+--source include/wait_for_pattern_in_file.inc
+
+# HARD freezes the command as CUTOFF, but the response must remain private
+# until CLOSING has taken the authoritative target snapshot. Otherwise a
+# 4020-triggered client disconnect can change the target set being captured.
+--perl
+use strict;
+use warnings;
+select(undef, undef, undef, 0.2);
+my $path = $ENV{'MYSQLTEST_VARDIR'} . '/tmp/phase2_protocol_raw_hard.out';
+open(my $fh, '<', $path)
+  or die "cannot read hard-cutoff output: $!";
+my $text = do { local $/; <$fh> };
+close($fh);
+die "HARD exposed 4020 before CLOSING target snapshot"
+  if $text =~ /raw_hard_cutoff_complete/;
+EOF
+
+--connection protocol_ha
+SET DEBUG_SYNC='now SIGNAL protocol_release_hard';
+SET DEBUG_SYNC='now WAIT_FOR protocol_counter_classified TIMEOUT 10';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die CLOSING did not finish its authoritative target counter
+}
+
+--connection protocol_post_closing
+--send SELECT v FROM t_phase2_scheduler_protocol WHERE id=5
+
+--connection protocol_ha
+SET DEBUG_SYNC='now WAIT_FOR protocol_native_handoff_wait TIMEOUT 10';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die post-CLOSING native command did not wait for the handoff barrier
+}
+SET DEBUG_SYNC='now SIGNAL protocol_release_handoff_pins';
+SET DEBUG_SYNC='now WAIT_FOR protocol_targets_classified TIMEOUT 10';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die CLOSING did not complete authoritative target classification
+}
+
+--perl
+use strict;
+use warnings;
+my $path = $ENV{'MYSQLTEST_VARDIR'} . '/tmp/phase2_protocol_raw_hard.out';
+open(my $fh, '<', $path)
+  or die "cannot read hard-cutoff output: $!";
+my $text = do { local $/; <$fh> };
+close($fh);
+die "4020 escaped before target-classification handoff"
+  if $text =~ /raw_hard_cutoff_complete/;
+EOF
+
+--connection protocol_ha
+SET DEBUG_SYNC='now SIGNAL protocol_release_targets';
+SET DEBUG_SYNC='now WAIT_FOR protocol_before_non_survivor_prune TIMEOUT 10';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die CLOSING did not reach the existing non-survivor prune barrier
+}
+
+# Counter/pin completion is only response-release eligibility.  The rejected
+# command must finish the complete native dispatch cleanup and reach its next
+# real idle boundary before target attach is allowed, while its 4020 remains
+# unsent until the existing non-survivor prune succeeds.  PROCESSLIST Sleep is
+# the server-side cleanup proof; the raw client below is the response proof.
+--let $post_closing_safe_idle= `SELECT COUNT(*) FROM performance_schema.threads WHERE PROCESSLIST_ID=$protocol_post_closing_id AND PROCESSLIST_COMMAND='Sleep'`
+if (!$post_closing_safe_idle)
+{
+  --die native 4020 did not reach the post-dispatch idle boundary before non-survivor prune
+}
+--perl
+use strict;
+use warnings;
+select(undef, undef, undef, 0.2);
+my $path = $ENV{'MYSQLTEST_VARDIR'} . '/tmp/phase2_protocol_raw_hard.out';
+open(my $fh, '<', $path)
+  or die "cannot read hard-cutoff output: $!";
+my $text = do { local $/; <$fh> };
+close($fh);
+die "HARD-frozen 4020 escaped before non-survivor prune"
+  if $text =~ /raw_hard_cutoff_complete/;
+EOF
+
+--connection protocol_ha
+SET DEBUG_SYNC='now SIGNAL protocol_run_non_survivor_prune';
+--let $grep_file= $raw_hard_output
+--let $grep_pattern= raw_hard_cutoff_complete
+--let $wait_timeout= 10
+--source include/wait_for_pattern_in_file.inc
+
+--connection protocol_post_closing
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+--reap
+
+--connection protocol_t0_wins
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+--reap
+
+--connection protocol_body_wins
+--reap
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT * FROM t_phase2_scheduler_protocol;
+
+--connection protocol_owner
+--replace_column 1 GENERATION 3 SOURCE_ID 6 CLOSING_STARTED_US 7 CLOSING_DEADLINE_US
+--reap
+
+--let _PHASE2_FINAL_LOG= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--perl
+use strict;
+use warnings;
+
+open(my $fh, '<', $ENV{'_PHASE2_FINAL_LOG'})
+  or die "cannot read source error log: $!";
+my @records;
+while (my $line = <$fh>) {
+  @records = () if $line =~
+      /CURRENT_TEST: preserve_trx\.standby_transfer_phase2_scheduler_protocol/;
+  push @records, $line if $line =~ /PRESERVE_PHASE2_FINAL_V1 /;
+}
+close($fh);
+die "expected one abort and one deadline final record" unless @records == 2;
+my @field = map { +{ /([a-z0-9_]+)=([^\s]+)/g } } @records;
+die "safety-abort final record is inconsistent"
+  unless ($field[0]{'attempt_id'} // 0) == 1 &&
+         ($field[0]{'generation'} // 0) == 1 &&
+         ($field[0]{'scheduler_terminal_result'} // '') eq 'SAFETY_ABORT' &&
+         ($field[0]{'hard_published_us'} // 1) == 0 &&
+         ($field[0]{'final_ack_us'} // 1) == 0 &&
+         ($field[0]{'last_body_exit_state'} // '') eq
+             'COVERAGE_INCOMPLETE' &&
+         ($field[0]{'eligible_body_count'} // 0) > 0 &&
+         ($field[0]{'tail_fallback_used'} // 1) == 0;
+die "deadline-HARD final record is inconsistent"
+  unless ($field[1]{'attempt_id'} // 0) == 2 &&
+         ($field[1]{'generation'} // 0) == 2 &&
+         ($field[1]{'scheduler_terminal_result'} // '') eq 'HARD_DEADLINE' &&
+         ($field[1]{'hard_published_us'} // 0) > 0 &&
+         ($field[1]{'closing_published_us'} // 0) >=
+             $field[1]{'hard_published_us'} &&
+         ($field[1]{'final_ack_us'} // 0) >=
+             $field[1]{'closing_published_us'} &&
+         ($field[1]{'last_body_exit_state'} // '') eq
+             'COVERAGE_INCOMPLETE' &&
+         ($field[1]{'exact_body_exit_coverage_complete'} // 1) == 0 &&
+         ($field[1]{'last_command_end_missing'} // 0) == 1 &&
+         ($field[1]{'tail_fallback_used'} // 1) == 0;
+EOF
+--let _PHASE2_FINAL_LOG=
+
+--connection protocol_receiver
+SELECT VARIABLE_VALUE=1 AS one_epoch_accepted
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs';
+
+--connection protocol_ha
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+SHUTDOWN;
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+--disable_query_log
+
+--connect(protocol_cleanup,localhost,root,,test)
+DROP TABLE t_phase2_scheduler_protocol;
+DROP USER phase2_scheduler_protocol_app@localhost;
+DROP USER preserve_trx_ha_admin@localhost;
+SET DEBUG_SYNC='RESET';
+
+--connection protocol_receiver
+DROP USER preserve_trx_ha_admin@localhost;
+
+--connection protocol_cleanup
+--remove_file $credential_file
+--remove_file $raw_ready
+--remove_file $raw_soft_go
+--remove_file $raw_soft_done
+--remove_file $raw_restore_go
+--remove_file $raw_output
+--remove_file $raw_hard_ready
+--remove_file $raw_hard_soft_go
+--remove_file $raw_hard_done
+--remove_file $raw_hard_output
+--remove_file $raw_ps_ready
+--remove_file $raw_ps_execute_go
+--remove_file $raw_ps_done
+--remove_file $raw_ps_output

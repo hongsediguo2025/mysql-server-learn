@@ -1,0 +1,11 @@
+SELECT 1 AS server_survived_idle_to_active_race;
+server_survived_idle_to_active_race
+1
+include/assert.inc [idle-to-active source restore keeps the original transaction connection]
+include/assert.inc [idle-to-active pre-COMMIT-send failure avoids COMMIT_UNKNOWN]
+SELECT COUNT(*) AS row_count, SUM(v) AS value_sum
+FROM t_idle_to_active_binlog_race;
+row_count	value_sum
+2	2
+include/assert.inc [idle-to-active preserves the exact committed rows]
+include/assert.inc [idle-to-active committed rows survive source restart]

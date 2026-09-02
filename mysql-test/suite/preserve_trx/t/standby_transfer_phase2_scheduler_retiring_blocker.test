@@ -1,0 +1,196 @@
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+--disable_query_log
+
+--let $credential_file= $MYSQL_TMP_DIR/phase2-scheduler-retiring.secret
+--write_file $credential_file
+phase2-scheduler-retiring-secret
+EOF
+--exec chmod 600 $credential_file
+
+--connect(retiring_receiver,127.0.0.1,root,,test,$SERVER_MYPORT_2,)
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'phase2-scheduler-retiring-secret';
+GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+GRANT PROCESS ON *.* TO preserve_trx_ha_admin@localhost;
+
+--connection default
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+DROP USER IF EXISTS phase2_scheduler_retiring_app@localhost;
+DROP TABLE IF EXISTS t_phase2_scheduler_retiring;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'phase2-scheduler-retiring-secret';
+GRANT SHUTDOWN, SYSTEM_VARIABLES_ADMIN,
+      PRESERVE_TRX_TRANSFER_ADMIN, CONNECTION_ADMIN
+  ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+GRANT PROCESS ON *.* TO preserve_trx_ha_admin@localhost;
+CREATE USER phase2_scheduler_retiring_app@localhost;
+GRANT SELECT, UPDATE ON test.* TO phase2_scheduler_retiring_app@localhost;
+GRANT SESSION_VARIABLES_ADMIN ON *.*
+  TO phase2_scheduler_retiring_app@localhost;
+
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-standby-phase2-scheduler-mode=DEPENDENCY_CONVERGENCE_V1 --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$SERVER_MYPORT_2 --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=phase2_scheduler_retiring --rds-preserve-trx-transfer-credential-secret-file=$credential_file --rds-preserve-trx-drain-phase1-timeout-ms=10000 --rds-preserve-trx-drain-phase2-timeout-ms=10000
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--let $restart_parameters=
+--disable_query_log
+
+CREATE TABLE t_phase2_scheduler_retiring(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_phase2_scheduler_retiring VALUES(1,10),(2,20);
+
+--connect(retiring_survivor,localhost,phase2_scheduler_retiring_app,,test)
+START TRANSACTION;
+UPDATE t_phase2_scheduler_retiring SET v=21 WHERE id=2;
+
+--connect(retiring_blocker,localhost,phase2_scheduler_retiring_app,,test)
+--let $retiring_blocker_id= `SELECT CONNECTION_ID()`
+START TRANSACTION;
+UPDATE t_phase2_scheduler_retiring SET v=11 WHERE id=1;
+SET DEBUG_SYNC=
+  'phase2_sched_after_teardown_begin SIGNAL retiring_teardown_published WAIT_FOR retiring_teardown_continue';
+
+--connect(retiring_waiter,localhost,phase2_scheduler_retiring_app,,test)
+START TRANSACTION;
+SET DEBUG_SYNC='lock_wait_will_wait SIGNAL retiring_waiter_waiting';
+SET DEBUG_SYNC=
+  'phase2_sched_before_execution_retire SIGNAL retiring_waiter_native_done WAIT_FOR retiring_waiter_retire';
+--send UPDATE t_phase2_scheduler_retiring SET v=12 WHERE id=1
+
+--connect(retiring_ha,localhost,preserve_trx_ha_admin,phase2-scheduler-retiring-secret,test)
+SET DEBUG_SYNC='now WAIT_FOR retiring_waiter_waiting TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die waiter did not enter an InnoDB lock wait before T0
+}
+
+--connect(retiring_owner,localhost,root,,test)
+SET DEBUG_SYNC=
+  'phase2_sched_after_t0_registration SIGNAL retiring_t0_registered';
+SET DEBUG_SYNC=
+  'phase2_sched_after_innodb_probe_before_merge SIGNAL retiring_snapshot_captured WAIT_FOR retiring_snapshot_merge';
+SET DEBUG_SYNC=
+  'phase2_sched_after_retiring_blocker_stale SIGNAL retiring_snapshot_stale';
+--send DRAIN TRANSACTIONS PRESERVE
+
+--connection retiring_ha
+SET DEBUG_SYNC='now WAIT_FOR retiring_t0_registered TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die dependency scheduler did not complete T0 registration
+}
+SET DEBUG_SYNC='now WAIT_FOR retiring_snapshot_captured TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die exact InnoDB wait snapshot was not captured before merge
+}
+
+--eval KILL CONNECTION $retiring_blocker_id
+SET DEBUG_SYNC='now WAIT_FOR retiring_teardown_published TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die blocker teardown was not published to the scheduler
+}
+SET DEBUG_SYNC='now SIGNAL retiring_teardown_continue';
+SET DEBUG_SYNC='now WAIT_FOR retiring_waiter_native_done TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die waiter did not finish its native BODY before scheduler retirement
+}
+SET DEBUG_SYNC='now SIGNAL retiring_snapshot_merge';
+SET DEBUG_SYNC='now WAIT_FOR retiring_snapshot_stale TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die retiring blocker snapshot was not stale-discarded
+}
+SET DEBUG_SYNC='now SIGNAL retiring_waiter_retire';
+
+--connection retiring_waiter
+--reap
+
+--connection retiring_owner
+--disable_result_log
+--reap
+--enable_result_log
+
+--let _PHASE2_RETIRING_LOG= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--perl
+use strict;
+use warnings;
+
+open(my $fh, '<', $ENV{'_PHASE2_RETIRING_LOG'})
+  or die "cannot read source error log: $!";
+my $record;
+while (my $line = <$fh>) {
+  if ($line =~
+      /CURRENT_TEST: preserve_trx\.standby_transfer_phase2_scheduler_retiring_blocker/) {
+    undef($record);
+  }
+  $record = $line if $line =~ /PRESERVE_PHASE2_SCHED_V1 /;
+}
+close($fh);
+die "missing scheduler final record" unless defined($record);
+my %field = ($record =~ /([a-z0-9_]+)=([^\s]+)/g);
+die "scheduler did not commit the handoff"
+  unless ($field{'exit_reason'} // '') eq 'COMMITTED_HANDOFF' &&
+         ($field{'terminal_result'} // '') eq 'HARD_QUIESCENT' &&
+         ($field{'abort_cause'} // '') eq 'NONE';
+die "retiring blocker snapshot was not classified as stale"
+  unless ($field{'scan_stale_discarded'} // 0) >= 1 &&
+         ($field{'teardown_started'} // 0) >= 1;
+die "retiring blocker snapshot caused an invariant failure"
+  unless ($field{'lineage_unknown'} // 1) == 0 &&
+         ($field{'lock_proof_unknown'} // 1) == 0 &&
+         ($field{'invariant_violation_count'} // 1) == 0;
+EOF
+--let _PHASE2_RETIRING_LOG=
+
+--connection retiring_receiver
+--let $active_epoch_count= `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs'`
+if ($active_epoch_count != 1)
+{
+  --die receiver did not accept the preserved survivor epoch
+}
+
+--connection retiring_ha
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+SHUTDOWN;
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+--disable_query_log
+
+--connect(retiring_cleanup,localhost,root,,test)
+SELECT id,v FROM t_phase2_scheduler_retiring ORDER BY id;
+DROP TABLE t_phase2_scheduler_retiring;
+DROP USER phase2_scheduler_retiring_app@localhost;
+DROP USER preserve_trx_ha_admin@localhost;
+SET DEBUG_SYNC='RESET';
+
+--connection retiring_receiver
+DROP USER preserve_trx_ha_admin@localhost;
+
+--connection retiring_cleanup
+--remove_file $credential_file

@@ -1,0 +1,9 @@
+include/assert_grep.inc [final stale token avoided drain-owned mirror rebuild]
+include/assert_grep.inc [final stale token published one batched replacement]
+include/assert_grep.inc [stale inline replacement overlapped local Preserve]
+include/assert.inc [final-stale failure restores the original transaction connection]
+include/assert.inc [final-stale failure avoids COMMIT_UNKNOWN]
+SELECT note FROM t_final_stale_inline WHERE id=1;
+note
+transfer-final-B
+include/assert.inc [final-stale committed row survives restart]

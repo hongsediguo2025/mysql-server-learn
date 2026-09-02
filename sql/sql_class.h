@@ -158,6 +158,18 @@ enum class Preserve_trx_batch_thd_state {
   PRESERVED_DRAINED
 };
 
+enum class Preserve_trx_phase2_command_stage : uint8_t {
+  IDLE = 0,
+  ADMISSION_INFLIGHT,
+  T0_CLAIMED_PRE_GATE,
+  HELD,
+  CUTOFF,
+  PERMIT_RESERVED,
+  NATIVE_PRE_BODY_EXIT,
+  WAIT_NATIVE_RESTORE,
+  EXECUTING
+};
+
 namespace dd {
 namespace cache {
 class Dictionary_client;
@@ -1357,6 +1369,22 @@ class THD : public MDL_context_owner,
   ulonglong preserve_trx_batch_generation{0};
   Preserve_trx_batch_thd_state preserve_trx_batch_state{
       Preserve_trx_batch_thd_state::NONE};
+  /**
+    Dependency-convergence command identity. The incarnation and aggregate
+    sequence are protected by LOCK_thd_data; the stage is the command/T0/HARD
+    linearization word. A zero incarnation is assigned lazily by the scheduler.
+  */
+  ulonglong preserve_trx_phase2_connection_incarnation{0};
+  ulonglong preserve_trx_phase2_aggregate_sequence{0};
+  std::atomic<Preserve_trx_phase2_command_stage>
+      preserve_trx_phase2_command_stage{
+          Preserve_trx_phase2_command_stage::IDLE};
+  /**
+    A dependency-mode 4020 whose native dispatch cleanup has to complete before
+    its packet may become visible. Only the owning connection thread reads or
+    writes this flag.
+  */
+  bool preserve_trx_phase2_cutoff_response_deferred{false};
   /**
     Warmcopy participant id assigned by the preserve/drain coordinator while
     this THD is admitted to an open warmcopy epoch. The id lets mirror callbacks

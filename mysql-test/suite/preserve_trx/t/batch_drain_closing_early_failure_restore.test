@@ -33,6 +33,10 @@ GRANT SELECT, UPDATE ON test.* TO closing_early_failure_app@localhost;
 --let $restart_parameters=
 --disable_query_log
 
+--disable_result_log
+--source suite/preserve_trx/include/assert_phase2_dependency_mode.inc
+--enable_result_log
+
 SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms=60000;
 SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=ON;
 
@@ -68,10 +72,6 @@ SET GLOBAL debug='-d,preserve_trx_early_fail_candidate_finalize';
 --error ER_PRESERVE_TRX_SESSION_DRAINED
 SELECT 1;
 
---connection closing_early_failure_ha
---error ER_PRESERVE_TRX_RESET_TOO_LATE
-RESET DRAIN;
-
 --connection closing_early_failure_app
 --error ER_PRESERVE_TRX_SESSION_DRAINED
 UPDATE t_closing_early_failure SET v=v+10 WHERE id=1;
@@ -89,6 +89,7 @@ SHUTDOWN;
 --source include/wait_until_connected_again.inc
 --disable_reconnect
 --connect(closing_early_failure_check1,localhost,root,,test)
+--source suite/preserve_trx/include/assert_phase2_dependency_mode.inc
 --enable_query_log
 SELECT v AS value_after_finalize_failure FROM t_closing_early_failure;
 --disable_query_log
@@ -119,10 +120,6 @@ SET GLOBAL debug='-d,preserve_trx_early_force_one_coordinate_drift,preserve_trx_
 --error ER_PRESERVE_TRX_SESSION_DRAINED
 SELECT 1;
 
---connection closing_early_failure_ha
---error ER_PRESERVE_TRX_RESET_TOO_LATE
-RESET DRAIN;
-
 --connection closing_early_failure_app
 --error ER_PRESERVE_TRX_SESSION_DRAINED
 UPDATE t_closing_early_failure SET v=v+100 WHERE id=1;
@@ -138,6 +135,7 @@ SHUTDOWN;
 --source include/wait_until_connected_again.inc
 --disable_reconnect
 --connect(closing_early_failure_check2,localhost,root,,test)
+--source suite/preserve_trx/include/assert_phase2_dependency_mode.inc
 --enable_query_log
 SELECT v AS value_after_replacement_failure FROM t_closing_early_failure;
 --disable_query_log

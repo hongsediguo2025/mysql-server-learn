@@ -1,0 +1,194 @@
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+--disable_query_log
+
+--let $credential_file= $MYSQL_TMP_DIR/phase2-scheduler-ledger.secret
+--write_file $credential_file
+phase2-scheduler-ledger-secret
+EOF
+--exec chmod 600 $credential_file
+
+--connect(ledger_receiver,127.0.0.1,root,,test,$SERVER_MYPORT_2,)
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'phase2-scheduler-ledger-secret';
+GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+GRANT PROCESS ON *.* TO preserve_trx_ha_admin@localhost;
+
+--connection default
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+DROP USER IF EXISTS phase2_scheduler_ledger_app@localhost;
+DROP TABLE IF EXISTS t_phase2_scheduler_ledger;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'phase2-scheduler-ledger-secret';
+GRANT SHUTDOWN, SYSTEM_VARIABLES_ADMIN,
+      PRESERVE_TRX_TRANSFER_ADMIN, CONNECTION_ADMIN
+  ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+GRANT PROCESS ON *.* TO preserve_trx_ha_admin@localhost;
+CREATE USER phase2_scheduler_ledger_app@localhost;
+GRANT SELECT, UPDATE ON test.* TO phase2_scheduler_ledger_app@localhost;
+GRANT SESSION_VARIABLES_ADMIN ON *.*
+  TO phase2_scheduler_ledger_app@localhost;
+
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-standby-phase2-scheduler-mode=DEPENDENCY_CONVERGENCE_V1 --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$SERVER_MYPORT_2 --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=phase2_scheduler_ledger --rds-preserve-trx-transfer-credential-secret-file=$credential_file --rds-preserve-trx-drain-phase1-timeout-ms=10000 --rds-preserve-trx-drain-phase2-timeout-ms=10000
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--let $restart_parameters=
+--disable_query_log
+
+CREATE TABLE t_phase2_scheduler_ledger(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_phase2_scheduler_ledger VALUES(1,10),(2,20),(3,30),(4,40);
+
+--connect(ledger_blocker,localhost,phase2_scheduler_ledger_app,,test)
+--let $ledger_blocker_id= `SELECT CONNECTION_ID()`
+START TRANSACTION;
+UPDATE t_phase2_scheduler_ledger SET v=11 WHERE id=1;
+SET DEBUG_SYNC=
+  'phase2_sched_after_execution_entered SIGNAL ledger_blocker_supported_body';
+
+--connect(ledger_waiter_a,localhost,phase2_scheduler_ledger_app,,test)
+--let $ledger_waiter_a_id= `SELECT CONNECTION_ID()`
+START TRANSACTION;
+SET DEBUG_SYNC='lock_wait_will_wait SIGNAL ledger_waiter_a_lock_wait';
+--send UPDATE t_phase2_scheduler_ledger SET v=12 WHERE id=1
+
+--connect(ledger_waiter_b,localhost,phase2_scheduler_ledger_app,,test)
+--let $ledger_waiter_b_id= `SELECT CONNECTION_ID()`
+START TRANSACTION;
+SET DEBUG_SYNC='lock_wait_will_wait SIGNAL ledger_waiter_b_lock_wait';
+--send UPDATE t_phase2_scheduler_ledger SET v=13 WHERE id=1
+
+--connect(ledger_ha,localhost,preserve_trx_ha_admin,phase2-scheduler-ledger-secret,test)
+SET DEBUG_SYNC='now WAIT_FOR ledger_waiter_a_lock_wait TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die first waiter did not enter an InnoDB lock wait
+}
+SET DEBUG_SYNC='now WAIT_FOR ledger_waiter_b_lock_wait TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die second waiter did not enter an InnoDB lock wait
+}
+
+# Keep Phase2 in SOFT after the waiters leave. Without an executing BODY the
+# owner may correctly publish HARD before the post-disconnect probe command.
+--connect(ledger_anchor,localhost,phase2_scheduler_ledger_app,,test)
+START TRANSACTION;
+SET DEBUG_SYNC=
+  'phase2_sched_after_execution_entered SIGNAL ledger_anchor_body WAIT_FOR ledger_anchor_continue TIMEOUT 30';
+--send UPDATE t_phase2_scheduler_ledger SET v=44 WHERE id=4
+--connection ledger_ha
+SET DEBUG_SYNC='now WAIT_FOR ledger_anchor_body TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die anchor command did not enter the T0 executing set
+}
+
+--connect(ledger_owner,localhost,root,,test)
+SET DEBUG_SYNC=
+  'phase2_sched_after_innodb_support_registered SIGNAL ledger_support_seen EXECUTE 2';
+--send DRAIN TRANSACTIONS PRESERVE
+
+--connection ledger_ha
+SET DEBUG_SYNC='now WAIT_FOR ledger_support_seen TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die scheduler did not register waiter support
+}
+
+# Removing one waiter must remove only its own vote.
+--eval KILL CONNECTION $ledger_waiter_a_id
+--let $wait_condition= SELECT COUNT(*)=0 FROM performance_schema.threads WHERE PROCESSLIST_ID=$ledger_waiter_a_id
+--source include/wait_condition.inc
+--connection ledger_waiter_a
+--error 1317,2013
+--reap
+
+# The second waiter still supports the same blocker, so this DML must run.
+--connection ledger_blocker
+--send UPDATE t_phase2_scheduler_ledger SET v=22 WHERE id=2
+--connection ledger_ha
+SET DEBUG_SYNC='now WAIT_FOR ledger_blocker_supported_body TIMEOUT 5';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die blocker lost permission while one dependent waiter remained
+}
+--connection ledger_blocker
+--reap
+
+# Removing the last waiter must revoke the blocker's ordinary-command vote.
+--connection ledger_ha
+--eval KILL CONNECTION $ledger_waiter_b_id
+--let $wait_condition= SELECT COUNT(*)=0 FROM performance_schema.threads WHERE PROCESSLIST_ID=$ledger_waiter_b_id
+--source include/wait_condition.inc
+--connection ledger_waiter_b
+--error 1317,2013
+--reap
+
+--connection ledger_blocker
+--send UPDATE t_phase2_scheduler_ledger SET v=33 WHERE id=3
+--connection ledger_ha
+--let $wait_condition= SELECT COUNT(*)=1 FROM performance_schema.threads WHERE PROCESSLIST_ID=$ledger_blocker_id AND PROCESSLIST_COMMAND='Query' AND PROCESSLIST_INFO LIKE 'UPDATE t_phase2_scheduler_ledger%id=3%'
+--source include/wait_condition.inc
+--sleep 0.1
+--eval SELECT COUNT(*)=1 AS blocker_held_after_last_vote_removed FROM performance_schema.threads WHERE PROCESSLIST_ID=$ledger_blocker_id AND PROCESSLIST_COMMAND='Query' AND PROCESSLIST_INFO LIKE 'UPDATE t_phase2_scheduler_ledger%id=3%'
+
+# Teardown ends the held command without granting a stale permit.
+--eval KILL CONNECTION $ledger_blocker_id
+--let $wait_condition= SELECT COUNT(*)=0 FROM performance_schema.threads WHERE PROCESSLIST_ID=$ledger_blocker_id
+--source include/wait_condition.inc
+--connection ledger_blocker
+--error 1317,2013
+--reap
+
+--connection ledger_ha
+SET DEBUG_SYNC='now SIGNAL ledger_anchor_continue';
+--connection ledger_anchor
+--reap
+
+--connection ledger_owner
+--disable_result_log
+--reap
+--enable_result_log
+
+--connection ledger_ha
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+SHUTDOWN;
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+--disable_query_log
+
+--connect(ledger_cleanup,localhost,root,,test)
+SELECT id,v FROM t_phase2_scheduler_ledger ORDER BY id;
+DROP TABLE t_phase2_scheduler_ledger;
+DROP USER phase2_scheduler_ledger_app@localhost;
+DROP USER preserve_trx_ha_admin@localhost;
+SET DEBUG_SYNC='RESET';
+
+--connection ledger_receiver
+DROP USER preserve_trx_ha_admin@localhost;
+
+--connection ledger_cleanup
+--remove_file $credential_file

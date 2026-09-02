@@ -32,6 +32,13 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from preserve_trx_phase2_scheduler_e2e import (
+    parse_final_records,
+    parse_scheduler_summaries,
+    validate_final_records,
+    validate_scheduler_summaries,
+)
+
 
 RUNNER_NAME = "preserve_trx_full_pressure_runner"
 RUNNER_VERSION = 1
@@ -85,6 +92,16 @@ class FullPressureProfile:
     source_tiered_load_threads_per_tier: int = 0
     source_tiered_load_work_units: Tuple[int, ...] = ()
     source_tiered_load_min_samples_per_tier: int = 0
+    formal_rounds: int = 1
+    sysbench_runtime_s: int = 0
+    sysbench_table_size: int = 0
+    scheduler_strict_interval_limit_us: int = 0
+    drain_phase1_timeout_ms: int = 0
+    short_transaction_sessions: int = 0
+    short_transaction_tables: int = 0
+    short_transaction_rows_per_table: int = 0
+    continuous_min_eligible_body_count: int = 0
+    continuous_min_record_locks: int = 0
 
     @property
     def source_tiered_load_threads(self) -> int:
@@ -231,6 +248,77 @@ MIXED_SMOKE_PROFILE = dataclasses.replace(
     source_phase2_limit_us=180_000_000,
     ready_after_final_spool_ack_limit_us=500_000,
     max_sql_resume_ms=100,
+)
+
+DEPENDENCY_SYSBENCH_FULL_PROFILE = dataclasses.replace(
+    FULL_PROFILE,
+    name="dependency-sysbench-full",
+    sessions=1000,
+    tables=128,
+    seed_rows_per_table_per_session=20_000,
+    formal_rounds=5,
+    sysbench_runtime_s=300,
+    sysbench_table_size=20_000,
+    scheduler_strict_interval_limit_us=2_000_000,
+    drain_phase1_timeout_ms=60_000,
+    preserve_memory_budget_bytes=2 * 1024**3,
+)
+
+DEPENDENCY_SYSBENCH_SMOKE_PROFILE = dataclasses.replace(
+    SMOKE_PROFILE,
+    name="dependency-sysbench-smoke",
+    sessions=8,
+    tables=4,
+    formal_rounds=1,
+    sysbench_runtime_s=5,
+    sysbench_table_size=1_000,
+    scheduler_strict_interval_limit_us=5_000_000,
+    drain_phase1_timeout_ms=60_000,
+)
+
+DEPENDENCY_MIXED_FULL_PROFILE = dataclasses.replace(
+    MIXED_FULL_PROFILE,
+    name="dependency-mixed-transfer-full",
+    source_post_command_tail_limit_us=500_000,
+    ready_after_final_spool_ack_limit_us=500_000,
+)
+
+DEPENDENCY_MIXED_SMOKE_PROFILE = dataclasses.replace(
+    MIXED_SMOKE_PROFILE,
+    name="dependency-mixed-transfer-smoke",
+    source_post_command_tail_limit_us=2_000_000,
+)
+
+DEPENDENCY_CONTINUOUS_LARGE_TX_FULL_PROFILE = dataclasses.replace(
+    FULL_PROFILE,
+    name="dependency-continuous-large-tx-full",
+    lockset_batch_size=10_000,
+    business_run_before_drain_s=300.0,
+    short_transaction_sessions=100,
+    short_transaction_tables=50,
+    short_transaction_rows_per_table=20_000,
+    continuous_min_eligible_body_count=900,
+    continuous_min_record_locks=5_000_000,
+    scheduler_strict_interval_limit_us=2_000_000,
+    source_post_command_tail_limit_us=500_000,
+    ready_after_final_spool_ack_limit_us=500_000,
+    preserve_memory_budget_bytes=2 * 1024**3,
+)
+
+DEPENDENCY_CONTINUOUS_LARGE_TX_SMOKE_PROFILE = dataclasses.replace(
+    SMOKE_PROFILE,
+    name="dependency-continuous-large-tx-smoke",
+    statements_per_tx=1_000,
+    seed_rows_per_table_per_session=1_000,
+    lockset_batch_size=100,
+    business_run_before_drain_s=3.0,
+    short_transaction_sessions=4,
+    short_transaction_tables=2,
+    short_transaction_rows_per_table=1_000,
+    continuous_min_eligible_body_count=1,
+    continuous_min_record_locks=1,
+    scheduler_strict_interval_limit_us=5_000_000,
+    source_post_command_tail_limit_us=2_000_000,
 )
 
 
@@ -460,6 +548,7 @@ def build_mysqld_commands(
     source_port: int,
     receiver_port: int,
     transfer_enabled: bool = True,
+    phase2_scheduler_mode: Optional[str] = None,
 ) -> Tuple[List[str], List[str]]:
     ssl_data_dir = paths.repo_root / "mysql-test" / "std_data"
     common = [
@@ -493,6 +582,31 @@ def build_mysqld_commands(
         f"--log-bin={paths.source_root / 'mysql-bin'}",
         f"--innodb-buffer-pool-size={profile.source_buffer_pool_bytes}",
     ]
+    if phase2_scheduler_mode is not None:
+        source.append(
+            "--rds-preserve-trx-standby-phase2-scheduler-mode="
+            f"{phase2_scheduler_mode}"
+        )
+    if profile.drain_phase1_timeout_ms > 0:
+        source.append(
+            "--rds-preserve-trx-drain-phase1-timeout-ms="
+            f"{profile.drain_phase1_timeout_ms}"
+        )
+    if profile.sysbench_runtime_s > 0:
+        source.extend(
+            [
+                "--back-log=1400",
+                "--max-prepared-stmt-count=700000",
+                "--table-open-cache=8192",
+                "--performance-schema=ON",
+                "--performance-schema-instrument=%=ON",
+                "--performance-schema-consumer-global-instrumentation=ON",
+                "--performance-schema-consumer-thread-instrumentation=ON",
+                "--performance-schema-consumer-events-statements-current=ON",
+                "--performance-schema-consumer-events-transactions-current=ON",
+                "--performance-schema-consumer-events-waits-current=ON",
+            ]
+        )
     if profile.mixed_seed_rows_per_table > 0:
         mixed_close_timeout_ms = max(
             120_000, (profile.source_phase2_limit_us + 999) // 1000
@@ -558,8 +672,71 @@ def build_e2e_command(
         "reset-drain",
         "mixed-shutdown-startup",
         "mixed-transfer",
+        "dependency-sysbench",
+        "dependency-mixed-transfer",
+        "dependency-continuous-large-tx-transfer",
     }:
         raise ValueError(f"unknown evidence mode: {evidence}")
+
+    if evidence == "dependency-sysbench":
+        return [
+            sys.executable,
+            str(paths.repo_root / "scripts" /
+                "preserve_trx_phase2_scheduler_e2e.py"),
+            "--scenario",
+            "sysbench-write-only-drain",
+            "--source-error-log",
+            str(paths.source_error_log),
+            "--report-json",
+            str(paths.e2e_report),
+            "--expected-mode",
+            "DEPENDENCY_CONVERGENCE_V1",
+            "--expected-record-count",
+            "1",
+            "--strict-limit-us",
+            str(profile.scheduler_strict_interval_limit_us),
+            "--require-exact-body",
+            "--source-start-command",
+            shell_join(source_command),
+            "--receiver-start-command",
+            shell_join(receiver_command),
+            "--source-host",
+            "127.0.0.1",
+            "--source-port",
+            str(source_port),
+            "--receiver-host",
+            "127.0.0.1",
+            "--receiver-port",
+            str(receiver_port),
+            "--source-datadir",
+            str(paths.source_datadir),
+            "--receiver-datadir",
+            str(paths.receiver_datadir),
+            "--work-dir",
+            str(paths.work_dir),
+            "--credential-secret-file",
+            str(paths.credential_secret_file),
+            "--sysbench-threads",
+            str(profile.sessions),
+            "--sysbench-tables",
+            str(profile.tables),
+            "--sysbench-table-size",
+            str(profile.sysbench_table_size),
+            "--sysbench-runtime-seconds",
+            str(profile.sysbench_runtime_s),
+            "--report-interval-seconds",
+            str(10 if profile.sysbench_runtime_s >= 300 else 1),
+            "--expected-phase1-timeout-ms",
+            str(profile.drain_phase1_timeout_ms),
+            "--receiver-ready-timeout-seconds",
+            str(profile.resume_timeout_s),
+            "--preserve-timeout-seconds",
+            str(profile.preserve_timeout_s),
+            "--startup-timeout-seconds",
+            str(profile.startup_timeout_s),
+            "--shutdown-timeout-seconds",
+            str(profile.shutdown_timeout_s),
+        ]
 
     mixed_arguments = [
         "--mixed-pressure-workload",
@@ -750,7 +927,24 @@ def build_e2e_command(
         )
         return command
 
-    if evidence == "mixed-transfer":
+    if evidence == "dependency-continuous-large-tx-transfer":
+        command.extend(
+            [
+                "--continuous-business-through-drain",
+                "--business-run-before-drain",
+                str(profile.business_run_before_drain_s),
+                "--short-transaction-sessions",
+                str(profile.short_transaction_sessions),
+                "--short-transaction-table-count",
+                str(profile.short_transaction_tables),
+                "--short-transaction-rows-per-table",
+                str(profile.short_transaction_rows_per_table),
+                "--allow-partial-tokens",
+            ]
+        )
+        return command
+
+    if evidence in {"mixed-transfer", "dependency-mixed-transfer"}:
         for flag in (
             "--lockset-session-table-shards",
             "--lockset-noop-update",
@@ -1020,6 +1214,77 @@ def git_value(repo_root: Path, args: Sequence[str], default: Any) -> Any:
 def build_acceptance_contract(
     profile: FullPressureProfile, evidence: str
 ) -> Dict[str, Any]:
+    if evidence == "dependency-sysbench":
+        return {
+            "evidence_kind": "DEPENDENCY_SYSBENCH_STANDBY_TRANSFER",
+            "scheduler_mode": "DEPENDENCY_CONVERGENCE_V1",
+            "formal_rounds": profile.formal_rounds,
+            "threads": profile.sessions,
+            "tables": profile.tables,
+            "rows_per_table": profile.sysbench_table_size,
+            "steady_run_seconds": profile.sysbench_runtime_s,
+            "workload": "oltp_write_only",
+            "reconnect": False,
+            "drain_success_required": True,
+            "receiver_epoch_required": True,
+            "strict_interval_us_max": (
+                profile.scheduler_strict_interval_limit_us
+            ),
+            "eligible_body_state": "EXACT",
+            "scheduler_fatal_count": 0,
+        }
+    if evidence == "dependency-continuous-large-tx-transfer":
+        return {
+            "evidence_kind": (
+                "DEPENDENCY_CONTINUOUS_LARGE_TX_STANDBY_TRANSFER"
+            ),
+            "scheduler_mode": "DEPENDENCY_CONVERGENCE_V1",
+            "large_transaction_sessions": profile.sessions,
+            "large_transaction_tables": profile.tables,
+            "large_transaction_rows_per_session": (
+                profile.seed_rows_per_table_per_session
+            ),
+            "large_transaction_range_update_rows": (
+                profile.lockset_batch_size
+            ),
+            "short_transaction_sessions": profile.short_transaction_sessions,
+            "short_transaction_tables": profile.short_transaction_tables,
+            "short_transaction_rows_per_table": (
+                profile.short_transaction_rows_per_table
+            ),
+            "steady_run_seconds": profile.business_run_before_drain_s,
+            "drain_trigger_mode": "independent_control_connection",
+            "harness_checkpoint_before_drain": False,
+            "lock_wait_sensing_before_drain": False,
+            "second_drain_on_no_lock_wait": False,
+            "partial_tokens_allowed": True,
+            "minimum_survivor_count": 1,
+            "minimum_eligible_body_count": (
+                profile.continuous_min_eligible_body_count
+            ),
+            "record_lock_count_min": profile.continuous_min_record_locks,
+            "strict_interval_us_max": (
+                profile.scheduler_strict_interval_limit_us
+            ),
+            "last_command_end_to_final_ack_us_strictly_below": (
+                profile.source_post_command_tail_limit_us
+            ),
+            "receiver_ready_after_final_spool_ack_us_strictly_below": (
+                profile.ready_after_final_spool_ack_limit_us
+            ),
+            "lock_wait_coverage": "OPTIONAL_POST_HOC",
+            "eligible_body_state": "EXACT",
+            "scheduler_fatal_count": 0,
+        }
+    if evidence == "dependency-mixed-transfer":
+        return {
+            **build_acceptance_contract(profile, "mixed-transfer"),
+            "scheduler_mode": "DEPENDENCY_CONVERGENCE_V1",
+            "last_command_end_to_final_ack_us_strictly_below": (
+                profile.source_post_command_tail_limit_us
+            ),
+            "eligible_body_state": "EXACT",
+        }
     if evidence == "continuous-tiered-transfer":
         return {
             **build_acceptance_contract(profile, "transfer-phase2"),
@@ -1244,6 +1509,8 @@ def archive_run_evidence(
         paths.source_init_log: "source-initialize.err",
         paths.receiver_init_log: "receiver-initialize.err",
         paths.build_log: "release-build.log",
+        paths.work_dir / "sysbench.log": "sysbench.log",
+        paths.work_dir / "sysbench-prepare.log": "sysbench-prepare.log",
     }
     for source, name in explicit_files.items():
         if not source.is_file():
@@ -1321,6 +1588,56 @@ def _metric_max_float(report: Mapping[str, Any], key: str) -> float:
     if value is None:
         raise RuntimeError(f"report metric is missing: {key}")
     return float(value)
+
+
+def validate_dependency_final_record(
+    profile: FullPressureProfile,
+    source_error_log: Path,
+    *,
+    log_offset: int = 0,
+    tail_limit_us: int = 0,
+) -> Dict[str, Any]:
+    if not source_error_log.is_file():
+        raise RuntimeError("dependency source error log is missing")
+    with source_error_log.open("r", encoding="utf-8", errors="replace") as stream:
+        stream.seek(log_offset)
+        log_lines = stream.readlines()
+    records = parse_final_records(log_lines)
+    summaries = parse_scheduler_summaries(log_lines)
+    validation = validate_final_records(
+        records,
+        expected_mode="DEPENDENCY_CONVERGENCE_V1",
+        expected_count=1,
+        require_success=True,
+        require_exact_body=True,
+        strict_limit_us=profile.scheduler_strict_interval_limit_us,
+        tail_limit_us=tail_limit_us,
+    )
+    summary_validation = validate_scheduler_summaries(
+        summaries,
+        records,
+        expected_mode="DEPENDENCY_CONVERGENCE_V1",
+        require_success=True,
+    )
+    values = validation["records"][0]
+    summary_values = summary_validation["records"][0]
+    return {
+        "attempt_id": values["attempt_id"],
+        "generation": values["generation"],
+        "scheduler_mode": values["mode"],
+        "strict_interval_us": values["strict_interval_us"],
+        "last_command_end_to_final_ack_us": (
+            values["last_command_end_to_final_ack_us"]
+        ),
+        "eligible_body_count": values["eligible_body_count"],
+        "eligible_body_key_digest_v1": (
+            values["eligible_body_key_digest_v1"]
+        ),
+        "last_body_exit_state": values["last_body_exit_state"],
+        "source_terminal_status": values["source_terminal_status"],
+        "transfer_epoch_id": values["transfer_epoch_id"],
+        "scheduler_summary": summary_values,
+    }
 
 
 def validate_mixed_pressure_report(
@@ -1688,11 +2005,546 @@ def validate_mixed_pressure_report(
     }
 
 
+def validate_continuous_large_tx_report(
+    profile: FullPressureProfile,
+    report: Mapping[str, Any],
+) -> Dict[str, Any]:
+    failures: List[str] = []
+
+    def require_equal(key: str, expected: Any) -> None:
+        actual = report.get(key)
+        if actual != expected:
+            failures.append(f"{key}: expected={expected!r} actual={actual!r}")
+
+    def require_mapping(key: str) -> Mapping[str, Any]:
+        value = report.get(key)
+        if not isinstance(value, Mapping):
+            failures.append(f"{key}: expected mapping actual={value!r}")
+            return {}
+        return value
+
+    def max_metric(key: str) -> int:
+        try:
+            return _metric_max(report, key)
+        except (RuntimeError, TypeError, ValueError) as exc:
+            failures.append(str(exc))
+            return 0
+
+    require_equal("status", "success")
+    require_equal("success", True)
+    require_equal("scenario", "standby_transfer_receiver_drain_metrics")
+    require_equal("evidence_kind", "STANDALONE_TRANSFER_E2E")
+    require_equal("physical_replication", False)
+    require_equal("production_provider", False)
+    require_equal("write_enable_exercised", False)
+    require_equal("continuous_business_through_drain", True)
+    require_equal(
+        "continuous_effective_scheduler_mode", "DEPENDENCY_CONVERGENCE_V1"
+    )
+    require_equal("receiver_readiness_contract", "READY")
+    require_equal("continuous_large_transaction_sessions", profile.sessions)
+    require_equal("continuous_large_transaction_tables", profile.tables)
+    require_equal(
+        "continuous_large_transaction_rows_per_session",
+        profile.seed_rows_per_table_per_session,
+    )
+    require_equal(
+        "continuous_large_transaction_range_update_rows",
+        profile.lockset_batch_size,
+    )
+    require_equal(
+        "continuous_short_transaction_sessions",
+        profile.short_transaction_sessions,
+    )
+    require_equal(
+        "continuous_short_transaction_tables", profile.short_transaction_tables
+    )
+    require_equal(
+        "continuous_short_transaction_rows_per_table",
+        profile.short_transaction_rows_per_table,
+    )
+    require_equal(
+        "continuous_drain_trigger_mode", "independent_control_connection"
+    )
+    require_equal("continuous_harness_checkpoint_before_drain", False)
+    require_equal("continuous_checkpoint_generation_at_window_start", 0)
+    require_equal("continuous_checkpoint_generation_before_drain", 0)
+    require_equal("continuous_lock_wait_sensing_before_drain", False)
+    require_equal("continuous_second_drain_on_no_lock_wait", False)
+    require_equal("receiver_read_load_qps_gate_enforced", True)
+    require_equal("receiver_read_load_p99_gate_enforced", False)
+    require_equal("continuous_drain_call_count", 1)
+    require_equal("continuous_business_reconnect_count", 0)
+    require_equal("drain_result_outcome", "SUCCESS")
+    require_equal("source_remained_online_after_transfer", True)
+    require_equal("receiver_remained_online_after_transfer", True)
+
+    requested_us = int(report.get("continuous_business_window_requested_us") or 0)
+    actual_us = int(report.get("continuous_business_window_actual_us") or 0)
+    baseline_ready_us = int(
+        report.get("continuous_receiver_baseline_ready_monotonic_us") or 0
+    )
+    start_us = int(
+        report.get("continuous_business_window_start_monotonic_us") or 0
+    )
+    deadline_us = int(
+        report.get("continuous_business_window_deadline_monotonic_us") or 0
+    )
+    end_us = int(report.get("continuous_business_window_end_monotonic_us") or 0)
+    drain_us = int(report.get("continuous_drain_call_start_monotonic_us") or 0)
+    expected_requested_us = int(
+        math.ceil(profile.business_run_before_drain_s * 1_000_000)
+    )
+    if requested_us != expected_requested_us:
+        failures.append(
+            "continuous business window request mismatch: "
+            f"expected={expected_requested_us} actual={requested_us}"
+        )
+    if actual_us < requested_us or actual_us != drain_us - start_us:
+        failures.append(
+            "continuous business window is short or inconsistent: "
+            f"requested={requested_us} actual={actual_us} "
+            f"derived={drain_us - start_us}"
+        )
+    if not (
+        baseline_ready_us > 0
+        and baseline_ready_us <= start_us
+        and start_us > 0
+        and deadline_us == start_us + requested_us
+        and deadline_us <= end_us <= drain_us
+    ):
+        failures.append(
+            "continuous business timing order is invalid: "
+            f"baseline_ready={baseline_ready_us} start={start_us} "
+            f"deadline={deadline_us} end={end_us} drain={drain_us}"
+        )
+
+    start_snapshot = require_mapping("continuous_business_start_snapshot")
+    end_snapshot = require_mapping("continuous_business_end_snapshot")
+    pre_drain_snapshot = require_mapping("continuous_pre_drain_snapshot")
+    expected_snapshot_counts = {
+        "large_worker_count": profile.sessions,
+        "large_alive_count": profile.sessions,
+        "large_ready_count": profile.sessions,
+        "short_worker_count": profile.short_transaction_sessions,
+        "short_alive_count": profile.short_transaction_sessions,
+        "short_ready_count": profile.short_transaction_sessions,
+    }
+    for snapshot_name, snapshot in (
+        ("start", start_snapshot),
+        ("end", end_snapshot),
+        ("pre_drain", pre_drain_snapshot),
+    ):
+        for key, expected in expected_snapshot_counts.items():
+            actual = int(snapshot.get(key, -1))
+            if actual != expected:
+                failures.append(
+                    f"continuous {snapshot_name} {key}: "
+                    f"expected={expected} actual={actual}"
+                )
+    progress_fields = (
+        "large_statements_completed",
+        "large_transactions_completed",
+        "short_statements_completed",
+        "short_transactions_completed",
+    )
+    for key in progress_fields:
+        start_value = int(start_snapshot.get(key, -1))
+        end_value = int(end_snapshot.get(key, -1))
+        pre_drain_value = int(pre_drain_snapshot.get(key, -1))
+        if end_value <= start_value or pre_drain_value < end_value:
+            failures.append(
+                f"continuous {key} did not advance monotonically: "
+                f"start={start_value} end={end_value} pre_drain={pre_drain_value}"
+            )
+
+    short_latency = require_mapping("continuous_short_transaction_latency")
+    short_transactions = int(
+        short_latency.get("completed_transaction_count", 0)
+    )
+    if (
+        short_transactions <= 0
+        or int(short_latency.get("sample_count", 0)) <= 0
+        or int(short_latency.get("p50_us", 0) or 0) <= 0
+    ):
+        failures.append(
+            "continuous short-transaction latency evidence is empty: "
+            f"{dict(short_latency)!r}"
+        )
+
+    large_4020 = int(report.get("continuous_large_4020_count") or 0)
+    short_4020 = int(report.get("continuous_short_4020_count") or 0)
+    total_4020 = int(report.get("continuous_4020_count") or 0)
+    waiting_4020 = int(
+        report.get("continuous_workers_waiting_after_4020") or 0
+    )
+    retained_4020 = int(
+        report.get("continuous_workers_retaining_original_connection") or 0
+    )
+    if total_4020 <= 0 or total_4020 != large_4020 + short_4020:
+        failures.append(
+            "continuous workload did not report a consistent real 4020: "
+            f"large={large_4020} short={short_4020} total={total_4020}"
+        )
+    if waiting_4020 != total_4020 or retained_4020 != waiting_4020:
+        failures.append(
+            "4020 workers did not all retain their original connection: "
+            f"responses={total_4020} waiting={waiting_4020} "
+            f"retained={retained_4020}"
+        )
+    short_connection_close_values = report.get(
+        "continuous_short_connection_closed_without_4020_monotonic_us"
+    )
+    if not isinstance(short_connection_close_values, list):
+        failures.append(
+            "continuous short-connection close timestamps are missing"
+        )
+        short_connection_close_values = []
+    short_connection_close_us = [
+        int(value) for value in short_connection_close_values
+    ]
+    short_connection_close_count = int(
+        report.get("continuous_short_connection_closed_without_4020_count")
+        or 0
+    )
+    if short_connection_close_count != len(short_connection_close_us):
+        failures.append(
+            "continuous short-connection close count is inconsistent: "
+            f"count={short_connection_close_count} "
+            f"timestamps={len(short_connection_close_us)}"
+        )
+    if any(value < drain_us for value in short_connection_close_us):
+        failures.append(
+            "a short workload connection closed before the control DRAIN call: "
+            f"drain={drain_us} closes={short_connection_close_us}"
+        )
+
+    survivor_count = int(report.get("standby_transfer_survivor_count") or 0)
+    if survivor_count <= 0:
+        failures.append(
+            f"standby_transfer_survivor_count must be positive: {survivor_count}"
+        )
+    for key, expected in (
+        ("standby_tokens", survivor_count),
+        ("receiver_expected_prewarm_tokens", survivor_count),
+        ("receiver_ready_tokens", survivor_count),
+        ("receiver_not_ready_tokens", 0),
+        ("receiver_auto_prewarm_tokens", survivor_count),
+        ("receiver_auto_prewarm_ready_tokens", survivor_count),
+        ("receiver_auto_prewarm_not_ready_tokens", 0),
+        ("receiver_seal_prewarm_tokens", survivor_count),
+        ("receiver_seal_prewarm_success_tokens", survivor_count),
+        ("receiver_seal_prewarm_not_ready_tokens", 0),
+        ("receiver_prewarm_backlog_at_phase2_end", 0),
+        ("phase2_transfer_bulk_bytes", 0),
+        ("receiver_record_cold_gets", 0),
+        ("receiver_queued_bytes", 0),
+        ("receiver_worker_active", 0),
+        ("receiver_resource_admission_open_failed_count", 0),
+        ("receiver_strict_record_index_page_reads", 0),
+        ("receiver_strict_ibuf_merges", 0),
+        ("receiver_strict_target_local_redo_bytes", 0),
+    ):
+        actual = int(report.get(key) or 0)
+        if actual != expected:
+            failures.append(f"{key}: expected={expected} actual={actual}")
+    require_equal("receiver_record_object_prewarm_phase1_overlap", True)
+    require_equal("receiver_epoch_fact_bound", True)
+    require_equal("receiver_epoch_storage", "PROCESS_LOCAL")
+    require_equal("receiver_process_local_epoch_accepted", True)
+    require_equal("receiver_epoch_fact_count", 0)
+    require_equal("receiver_epoch_commit_count", 0)
+    require_equal("receiver_epoch_ready_bind_attempts", 1)
+
+    record_object_prewarm_count = int(
+        report.get("receiver_record_object_prewarm_count") or 0
+    )
+    if record_object_prewarm_count < survivor_count:
+        failures.append(
+            "receiver_record_object_prewarm_count: "
+            f"minimum={survivor_count} actual={record_object_prewarm_count}"
+        )
+
+    phase2_us = max_metric("source_phase2_total_us")
+    ready_us = max_metric("receiver_ready_after_final_spool_ack_us")
+    record_locks = max_metric("phase2_record_lock_count_samples")
+    lock_plan_peak = max_metric("receiver_lock_plan_epoch_peak_bytes")
+    lock_plan_cap = max_metric("receiver_lock_plan_subpool_cap_bytes")
+    batch_tokens_avg = max_metric("source_phase1_record_batch_tokens_avg")
+    network_sends = max_metric("source_phase1_transfer_network_send_count")
+    frame_count = max_metric("source_phase1_transfer_frame_count")
+    early_staged_tokens = max_metric("source_early_staged_tokens_samples")
+    final_dirty_tokens = max_metric("source_final_dirty_tokens_samples")
+    final_replacement_tokens = max_metric(
+        "source_final_replacement_tokens_samples"
+    )
+    final_validation_rejects = max_metric(
+        "source_final_validation_rejects_samples"
+    )
+    if phase2_us > profile.source_phase2_limit_us:
+        failures.append(
+            f"source_phase2_total_us: limit={profile.source_phase2_limit_us} "
+            f"actual={phase2_us}"
+        )
+    if ready_us <= 0 or ready_us >= profile.ready_after_final_spool_ack_limit_us:
+        failures.append(
+            "receiver_ready_after_final_spool_ack_us: "
+            f"expected_range=(0,{profile.ready_after_final_spool_ack_limit_us}) "
+            f"actual={ready_us}"
+        )
+    if record_locks < profile.continuous_min_record_locks:
+        failures.append(
+            "phase2_record_lock_count_samples: "
+            f"minimum={profile.continuous_min_record_locks} actual={record_locks}"
+        )
+    if lock_plan_peak <= 0 or lock_plan_peak > lock_plan_cap:
+        failures.append(
+            f"receiver lock-plan budget invalid: peak={lock_plan_peak} "
+            f"cap={lock_plan_cap}"
+        )
+    if batch_tokens_avg <= 1:
+        failures.append(
+            "source_phase1_record_batch_tokens_avg must exceed 1: "
+            f"actual={batch_tokens_avg}"
+        )
+    if frame_count <= 0 or network_sends * 4 > frame_count:
+        failures.append(
+            "phase1 network-send reduction is below 75%: "
+            f"network_sends={network_sends} frame_count={frame_count}"
+        )
+    if early_staged_tokens <= 0:
+        failures.append("source_early_staged_tokens_samples must be positive")
+    if final_dirty_tokens != final_replacement_tokens:
+        failures.append(
+            "final dirty/replacement mismatch: "
+            f"dirty={final_dirty_tokens} replacement={final_replacement_tokens}"
+        )
+    if final_validation_rejects != 0:
+        failures.append(
+            "source_final_validation_rejects_samples: "
+            f"expected=0 actual={final_validation_rejects}"
+        )
+
+    require_equal("receiver_read_load_threads", profile.receiver_read_load_threads)
+    require_equal("receiver_read_load_error_count", 0)
+    read_baseline_queries = max_metric("receiver_read_load_baseline_query_count")
+    read_transfer_queries = max_metric("receiver_read_load_transfer_query_count")
+    read_baseline_qps = float(report.get("receiver_read_load_baseline_qps") or 0.0)
+    read_transfer_qps = float(report.get("receiver_read_load_transfer_qps") or 0.0)
+    read_baseline_p99_us = max_metric("receiver_read_load_baseline_p99_us")
+    read_transfer_p99_us = max_metric("receiver_read_load_transfer_p99_us")
+    read_baseline_duration_s = float(
+        report.get("receiver_read_load_baseline_duration_s") or 0.0
+    )
+    read_transfer_duration_s = float(
+        report.get("receiver_read_load_transfer_duration_s") or 0.0
+    )
+    read_baseline_latency_samples = int(
+        report.get("receiver_read_load_baseline_latency_sample_count") or 0
+    )
+    read_transfer_latency_samples = int(
+        report.get("receiver_read_load_transfer_latency_sample_count") or 0
+    )
+    read_qps_drop_pct = float(
+        report.get("receiver_read_load_qps_drop_pct", float("inf"))
+    )
+    read_p99_increase_pct = float(
+        report.get("receiver_read_load_p99_increase_pct", float("inf"))
+    )
+    if (
+        read_baseline_queries <= 0
+        or read_transfer_queries <= 0
+        or read_baseline_qps <= 0
+        or read_transfer_qps <= 0
+        or read_baseline_p99_us <= 0
+        or read_transfer_p99_us <= 0
+    ):
+        failures.append("receiver read-load evidence is empty")
+    if read_qps_drop_pct > profile.receiver_read_load_max_qps_drop_pct:
+        failures.append(
+            "receiver_read_load_qps_drop_pct: "
+            f"limit={profile.receiver_read_load_max_qps_drop_pct} "
+            f"actual={read_qps_drop_pct}"
+        )
+    if failures:
+        raise RuntimeError(
+            "continuous large-transaction acceptance failed: "
+            + "; ".join(failures)
+        )
+    return {
+        "business_window_requested_us": requested_us,
+        "business_window_actual_us": actual_us,
+        "large_statements_at_start": int(
+            start_snapshot.get("large_statements_completed", 0)
+        ),
+        "large_statements_before_drain": int(
+            pre_drain_snapshot.get("large_statements_completed", 0)
+        ),
+        "short_transactions_at_start": int(
+            start_snapshot.get("short_transactions_completed", 0)
+        ),
+        "short_transactions_before_drain": int(
+            pre_drain_snapshot.get("short_transactions_completed", 0)
+        ),
+        "short_transaction_latency": dict(short_latency),
+        "drained_4020_workers": total_4020,
+        "post_drain_short_connection_closes_without_4020": (
+            short_connection_close_count
+        ),
+        "preserved_survivors": survivor_count,
+        "source_phase2_total_us": phase2_us,
+        "receiver_ready_after_final_spool_ack_us": ready_us,
+        "phase2_record_lock_count": record_locks,
+        "receiver_record_object_prewarm_count": record_object_prewarm_count,
+        "receiver_lock_plan_epoch_peak_bytes": lock_plan_peak,
+        "receiver_lock_plan_subpool_cap_bytes": lock_plan_cap,
+        "source_phase1_transfer_network_send_count": network_sends,
+        "source_phase1_transfer_frame_count": frame_count,
+        "source_phase1_transfer_network_send_reduction_pct": round(
+            (frame_count - network_sends) * 100.0 / frame_count, 6
+        ),
+        "source_phase1_transfer_network_send_reduction_pct_min": 75.0,
+        "source_phase1_record_batch_tokens_avg": batch_tokens_avg,
+        "source_early_staged_tokens": early_staged_tokens,
+        "source_phase2_total_us_limit": profile.source_phase2_limit_us,
+        "receiver_ready_after_final_spool_ack_us_limit": (
+            profile.ready_after_final_spool_ack_limit_us
+        ),
+        "phase2_record_lock_count_min": profile.continuous_min_record_locks,
+        "receiver_read_load_threads": profile.receiver_read_load_threads,
+        "receiver_read_load_baseline_duration_s": read_baseline_duration_s,
+        "receiver_read_load_baseline_query_count": read_baseline_queries,
+        "receiver_read_load_baseline_latency_sample_count": (
+            read_baseline_latency_samples
+        ),
+        "receiver_read_load_baseline_qps": read_baseline_qps,
+        "receiver_read_load_baseline_p99_us": read_baseline_p99_us,
+        "receiver_read_load_transfer_duration_s": read_transfer_duration_s,
+        "receiver_read_load_transfer_query_count": read_transfer_queries,
+        "receiver_read_load_transfer_latency_sample_count": (
+            read_transfer_latency_samples
+        ),
+        "receiver_read_load_transfer_qps": read_transfer_qps,
+        "receiver_read_load_transfer_p99_us": read_transfer_p99_us,
+        "receiver_read_load_qps_drop_pct": read_qps_drop_pct,
+        "receiver_read_load_qps_drop_pct_limit": (
+            profile.receiver_read_load_max_qps_drop_pct
+        ),
+        "receiver_read_load_qps_gate_enforced": True,
+        "receiver_read_load_p99_increase_pct": read_p99_increase_pct,
+        "receiver_read_load_p99_increase_pct_reference_limit": (
+            profile.receiver_read_load_max_p99_increase_pct
+        ),
+        "receiver_read_load_p99_gate_enforced": False,
+        "receiver_read_load_p99_increase_pct_report_only": True,
+        "receiver_read_load_error_count": int(
+            report.get("receiver_read_load_error_count") or 0
+        ),
+    }
+
+
 def validate_e2e_report(
     profile: FullPressureProfile,
     report: Mapping[str, Any],
     evidence: str = "transfer-phase2",
 ) -> Dict[str, Any]:
+    if evidence == "dependency-sysbench":
+        if report.get("success") is not True:
+            raise RuntimeError("dependency sysbench report is not successful")
+        if report.get("scenario") != "sysbench-write-only-drain":
+            raise RuntimeError("dependency sysbench scenario identity is invalid")
+        workload = report.get("sysbench")
+        if not isinstance(workload, Mapping):
+            raise RuntimeError("dependency sysbench workload evidence is missing")
+        expected = {
+            "threads": profile.sessions,
+            "tables": profile.tables,
+            "table_size": profile.sysbench_table_size,
+            "runtime_seconds": profile.sysbench_runtime_s,
+            "reconnect": False,
+        }
+        for key, value in expected.items():
+            if workload.get(key) != value:
+                raise RuntimeError(
+                    f"dependency sysbench {key}: expected={value!r} "
+                    f"actual={workload.get(key)!r}"
+                )
+        interval_s = int(workload.get("report_interval_seconds", 0))
+        expected_reports = int(
+            math.ceil(profile.sysbench_runtime_s / interval_s)
+        ) if interval_s > 0 else 0
+        reports = workload.get("steady_reports")
+        failures: List[str] = []
+        if int(workload.get("connections_ready", 0)) != profile.sessions:
+            failures.append("not all sysbench connections reached ready")
+        if not isinstance(reports, list) or len(reports) != expected_reports:
+            failures.append(
+                f"steady report count expected={expected_reports} "
+                f"actual={len(reports) if isinstance(reports, list) else 'missing'}"
+            )
+            reports = []
+        elapsed_values = [int(item.get("elapsed_s", 0)) for item in reports]
+        if any(
+            right - left != interval_s
+            for left, right in zip(elapsed_values, elapsed_values[1:])
+        ):
+            failures.append("steady reports are not contiguous")
+        if any(int(item.get("threads", 0)) != profile.sessions for item in reports):
+            failures.append("a steady report did not retain all threads")
+        if any(float(item.get("reconnects_per_s", -1)) != 0.0 for item in reports):
+            failures.append("a steady report observed reconnects")
+        if int(workload.get("steady_window_us", 0)) < int(
+            profile.sysbench_runtime_s * 950_000
+        ):
+            failures.append("post-ready steady window is shorter than the contract")
+        if int(workload.get("post_ready_runtime_us", 0)) < int(
+            profile.sysbench_runtime_s * 1_000_000
+        ):
+            failures.append("DRAIN started before the full post-ready runtime")
+        if report.get("effective_scheduler_mode") != "DEPENDENCY_CONVERGENCE_V1":
+            failures.append("effective scheduler mode is not dependency V1")
+        if report.get("effective_artifact_mode") != "STANDBY_TRANSFER_SAVE":
+            failures.append("effective artifact mode is not standby transfer")
+        if int(report.get("effective_phase1_timeout_ms", 0)) != 60_000:
+            failures.append("effective Phase1 timeout is not 60000ms")
+        if report.get("source_alive_after_drain") is not True:
+            failures.append("source is not alive after DRAIN")
+        if report.get("receiver_alive_after_drain") is not True:
+            failures.append("receiver is not alive after DRAIN")
+        if int(report.get("receiver_not_ready_tokens", -1)) != 0:
+            failures.append("receiver has NOT_READY tokens")
+        if int(report.get("receiver_ready_tokens", 0)) < int(
+            report.get("drain_survivor_count", 0)
+        ):
+            failures.append("receiver READY token count is incomplete")
+        oracle_self_check = report.get("oracle_self_check")
+        if not isinstance(oracle_self_check, Mapping) or not all(
+            value is True for value in oracle_self_check.values()
+        ):
+            failures.append("final-record oracle self-check is incomplete")
+        if failures:
+            raise RuntimeError(
+                "dependency sysbench acceptance failed: " + "; ".join(failures)
+            )
+        if report.get("drain_success") is not True:
+            raise RuntimeError("dependency sysbench DRAIN did not succeed")
+        if int(report.get("receiver_epoch_delta", 0)) <= 0:
+            raise RuntimeError("dependency sysbench receiver epoch did not advance")
+        return {
+            "threads": profile.sessions,
+            "tables": profile.tables,
+            "rows_per_table": profile.sysbench_table_size,
+            "runtime_seconds": profile.sysbench_runtime_s,
+            "transactions": int(workload.get("transactions", 0)),
+            "queries": int(workload.get("queries", 0)),
+            "receiver_epoch_delta": int(report.get("receiver_epoch_delta", 0)),
+        }
+    if evidence == "dependency-mixed-transfer":
+        return validate_mixed_pressure_report(
+            profile, report, "mixed-transfer"
+        )
+    if evidence == "dependency-continuous-large-tx-transfer":
+        return validate_continuous_large_tx_report(profile, report)
     if evidence == "continuous-tiered-transfer":
         base_metrics = validate_e2e_report(
             profile, report, evidence="transfer-phase2"
@@ -2310,6 +3162,11 @@ class FullPressureRunner:
 
     def run(self) -> int:
         transfer_enabled = self.evidence != "mixed-shutdown-startup"
+        dependency_evidence = self.evidence in {
+            "dependency-sysbench",
+            "dependency-mixed-transfer",
+            "dependency-continuous-large-tx-transfer",
+        }
         source_command, receiver_command = build_mysqld_commands(
             self.profile,
             self.paths,
@@ -2318,6 +3175,10 @@ class FullPressureRunner:
             source_port=self.source_port,
             receiver_port=self.receiver_port,
             transfer_enabled=transfer_enabled,
+            phase2_scheduler_mode=(
+                "DEPENDENCY_CONVERGENCE_V1"
+                if dependency_evidence else None
+            ),
         )
         e2e_command = build_e2e_command(
             self.profile,
@@ -2407,6 +3268,65 @@ class FullPressureRunner:
                 metrics = validate_e2e_report(
                     self.profile, report, evidence=self.evidence
                 )
+                if dependency_evidence:
+                    final_metrics = validate_dependency_final_record(
+                        self.profile,
+                        self.paths.source_error_log,
+                        log_offset=int(report.get("source_log_window_offset", 0)),
+                        tail_limit_us=(
+                            self.profile.source_post_command_tail_limit_us
+                            if self.evidence in {
+                                "dependency-mixed-transfer",
+                                "dependency-continuous-large-tx-transfer",
+                            }
+                            else 0
+                        ),
+                    )
+                    if self.evidence == "dependency-continuous-large-tx-transfer":
+                        eligible_body_count = int(
+                            final_metrics["eligible_body_count"]
+                        )
+                        if (
+                            eligible_body_count
+                            < self.profile.continuous_min_eligible_body_count
+                        ):
+                            raise RuntimeError(
+                                "dependency continuous eligible BODY count is "
+                                "below the profile minimum: "
+                                f"minimum={self.profile.continuous_min_eligible_body_count} "
+                                f"actual={eligible_body_count}"
+                            )
+                        scheduler_summary = final_metrics["scheduler_summary"]
+                        support_edges = int(
+                            scheduler_summary["support_edge_registered"]
+                        )
+                        positive_probes = int(
+                            scheduler_summary["scan_positive_result"]
+                        )
+                        if support_edges > 0 and positive_probes <= 0:
+                            raise RuntimeError(
+                                "scheduler reported support edges without a "
+                                "positive exact lock probe"
+                            )
+                        metrics = {
+                            **metrics,
+                            "eligible_body_count": eligible_body_count,
+                            "lock_wait_coverage": (
+                                "OBSERVED"
+                                if support_edges > 0
+                                else "NOT_OBSERVED"
+                            ),
+                            "lock_wait_positive_probe_count": positive_probes,
+                            "lock_wait_waiter_observation_count": positive_probes,
+                            "lock_wait_blocker_edge_observation_count": (
+                                support_edges
+                            ),
+                            "support_edge_registered": support_edges,
+                        }
+                    metrics = {
+                        **metrics,
+                        "phase2_scheduler_final_record": final_metrics,
+                    }
                 result.update(status="success", success=True, metrics=metrics)
         except BaseException as exc:
             primary_error = exc
@@ -2431,7 +3351,9 @@ class FullPressureRunner:
             except BaseException as exc:
                 cleanup_errors.append(f"server cleanup: {exc}")
             cleanup_errors.extend(detect_server_shutdown_failures(self.paths))
-            remaining_run_processes = matching_run_processes(self.paths)
+            remaining_run_processes = (
+                [] if self.check_only else matching_run_processes(self.paths)
+            )
             result["remaining_run_processes"] = [
                 {"pid": pid, "command": command}
                 for pid, command in remaining_run_processes
@@ -2512,6 +3434,191 @@ def default_run_id(profile_name: str) -> str:
     return f"{profile_name}-{timestamp}-{secrets.token_hex(3)}"
 
 
+def run_dependency_sysbench_formal_rounds(
+    profile: FullPressureProfile,
+    args: argparse.Namespace,
+    suite_paths: FullPressurePaths,
+    *,
+    required_free_bytes: int,
+) -> int:
+    if profile.formal_rounds <= 1:
+        raise RuntimeError("formal round coordinator requires more than one round")
+    if bool(args.source_port) != bool(args.receiver_port):
+        raise RuntimeError(
+            "--source-port and --receiver-port must be specified together"
+        )
+
+    suite_paths.history_dir.mkdir(parents=True, exist_ok=False)
+    index_path = suite_paths.history_dir / "index.json"
+    started = time.monotonic()
+    rounds: List[Dict[str, Any]] = []
+    expected_binary_sha256: Optional[str] = None
+    suite: Dict[str, Any] = {
+        "runner": RUNNER_NAME,
+        "runner_version": RUNNER_VERSION,
+        "run_id": suite_paths.run_id,
+        "profile": profile.name,
+        "evidence": "dependency-sysbench",
+        "status": "running",
+        "success": False,
+        "check_only": bool(args.check_only),
+        "formal_evidence": False,
+        "formal_rounds_expected": profile.formal_rounds,
+        "formal_rounds_completed": 0,
+        "steady_run_seconds_per_round": profile.sysbench_runtime_s,
+        "threads": profile.sessions,
+        "tables": profile.tables,
+        "rows_per_table": profile.sysbench_table_size,
+        "rounds": rounds,
+        "started_at_utc": utc_now(),
+    }
+    write_json_atomic(index_path, suite)
+
+    unsafe_to_continue = False
+    for round_number in range(1, profile.formal_rounds + 1):
+        child_run_id = f"{suite_paths.run_id}-r{round_number:02d}"
+        child_paths = FullPressurePaths.resolve(
+            repo_root=suite_paths.repo_root,
+            build_dir=suite_paths.build_dir,
+            work_root=suite_paths.work_root,
+            history_root=suite_paths.history_dir,
+            run_id=child_run_id,
+        )
+        if args.source_port or args.receiver_port:
+            source_port, receiver_port = args.source_port, args.receiver_port
+        else:
+            source_port, receiver_port = allocate_port_pair()
+        runner = FullPressureRunner(
+            profile,
+            child_paths,
+            source_port=source_port,
+            receiver_port=receiver_port,
+            required_free_bytes=required_free_bytes,
+            keep_work_dir=args.keep_work_dir,
+            check_only=args.check_only,
+            build_jobs=args.build_jobs,
+            skip_build=args.skip_build or round_number > 1,
+            evidence="dependency-sysbench",
+        )
+
+        runner_error: Optional[str] = None
+        try:
+            runner.run()
+        except Exception as exc:
+            runner_error = f"{type(exc).__name__}: {exc}"
+
+        result_path = child_paths.history_dir / "result.json"
+        checklist_path = child_paths.history_dir / "checklist.json"
+        report_path = child_paths.history_dir / "report.json"
+        result = (
+            json.loads(result_path.read_text(encoding="utf-8"))
+            if result_path.is_file() else {}
+        )
+        checklist = (
+            json.loads(checklist_path.read_text(encoding="utf-8"))
+            if checklist_path.is_file() else {}
+        )
+        binary_sha256 = str(
+            checklist.get("release_binary", {}).get("sha256", "")
+        )
+        binary_sha256_after = ""
+        if child_paths.mysqld.is_file():
+            try:
+                binary_sha256_after = sha256_file(child_paths.mysqld)
+            except OSError:
+                binary_sha256_after = ""
+        binary_changed_during_round = (
+            not binary_sha256_after or
+            binary_sha256_after != binary_sha256
+        )
+        binary_mismatch = binary_changed_during_round
+        if binary_sha256:
+            if expected_binary_sha256 is None:
+                expected_binary_sha256 = binary_sha256
+            else:
+                binary_mismatch = (
+                    binary_mismatch or
+                    binary_sha256 != expected_binary_sha256
+                )
+        else:
+            binary_mismatch = True
+
+        cleanup_errors = list(result.get("cleanup_errors", []))
+        remaining = list(result.get("remaining_run_processes", []))
+        round_check_success = (
+            runner_error is None
+            and bool(result.get("success"))
+            and not binary_mismatch
+        )
+        round_success = (
+            not args.check_only
+            and round_check_success
+            and report_path.is_file()
+        )
+        round_record: Dict[str, Any] = {
+            "round": round_number,
+            "run_id": child_run_id,
+            "history_dir": str(child_paths.history_dir),
+            "report_json": str(report_path),
+            "success": round_success,
+            "formal_evidence": not args.check_only,
+            "check_only_success": round_check_success,
+            "status": result.get("status", "missing-result"),
+            "runner_error": runner_error,
+            "binary_sha256_before": binary_sha256,
+            "binary_sha256_after": binary_sha256_after,
+            "binary_changed_during_round": binary_changed_during_round,
+            "binary_mismatch": binary_mismatch,
+            "elapsed_seconds": result.get("elapsed_seconds"),
+            "cleanup_errors": cleanup_errors,
+            "remaining_run_processes": remaining,
+        }
+        if result.get("metrics") is not None:
+            round_record["metrics"] = result.get("metrics")
+        rounds.append(round_record)
+        suite["formal_rounds_completed"] = len(rounds)
+        suite["release_binary_sha256"] = expected_binary_sha256
+        write_json_atomic(index_path, suite)
+
+        unsafe_to_continue = bool(cleanup_errors or remaining)
+        if unsafe_to_continue or not binary_sha256:
+            break
+
+    suite_checks_pass = (
+        not unsafe_to_continue
+        and len(rounds) == profile.formal_rounds
+        and all(bool(item.get("check_only_success")) for item in rounds)
+        and expected_binary_sha256 is not None
+    )
+    suite_success = (
+        not args.check_only
+        and suite_checks_pass
+        and all(bool(item.get("success")) for item in rounds)
+    )
+    if args.check_only:
+        suite.update(
+            status="checked" if suite_checks_pass else "failed",
+            success=False,
+            formal_evidence=False,
+            check_only_success=suite_checks_pass,
+            steady_state_executed=False,
+        )
+    else:
+        suite.update(
+            status="success" if suite_success else "failed",
+            success=suite_success,
+            formal_evidence=True,
+            steady_state_executed=True,
+        )
+    suite.update(
+        elapsed_seconds=round(time.monotonic() - started, 3),
+        finished_at_utc=utc_now(),
+    )
+    write_json_atomic(index_path, suite)
+    print(f"Formal evidence index: {index_path}", flush=True)
+    return 0 if (suite_checks_pass if args.check_only else suite_success) else 1
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
@@ -2530,6 +3637,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "reset-drain",
             "mixed-shutdown-startup",
             "mixed-transfer",
+            "dependency-sysbench",
+            "dependency-mixed-transfer",
+            "dependency-continuous-large-tx-transfer",
         ),
         default="transfer-phase2",
         help=(
@@ -2554,6 +3664,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--required-free-gib",
         type=float,
         help="override the profile disk-space preflight threshold",
+    )
+    parser.add_argument(
+        "--business-run-before-drain",
+        type=float,
+        help=(
+            "override the continuous large/short-transaction business window"
+        ),
     )
     parser.add_argument(
         "--check-only",
@@ -2589,7 +3706,38 @@ def main(
     args = parse_args(argv)
     if forced_evidence is not None:
         args.evidence = forced_evidence
-    if args.evidence in {"mixed-shutdown-startup", "mixed-transfer"}:
+    if (
+        args.business_run_before_drain is not None
+        and args.evidence != "dependency-continuous-large-tx-transfer"
+    ):
+        raise RuntimeError(
+            "--business-run-before-drain is only valid for "
+            "dependency-continuous-large-tx-transfer"
+        )
+    if (
+        args.business_run_before_drain is not None
+        and args.business_run_before_drain <= 0
+    ):
+        raise RuntimeError("--business-run-before-drain must be positive")
+    if args.evidence == "dependency-sysbench":
+        profile = (
+            DEPENDENCY_SYSBENCH_FULL_PROFILE
+            if args.profile == "full"
+            else DEPENDENCY_SYSBENCH_SMOKE_PROFILE
+        )
+    elif args.evidence == "dependency-mixed-transfer":
+        profile = (
+            DEPENDENCY_MIXED_FULL_PROFILE
+            if args.profile == "full"
+            else DEPENDENCY_MIXED_SMOKE_PROFILE
+        )
+    elif args.evidence == "dependency-continuous-large-tx-transfer":
+        profile = (
+            DEPENDENCY_CONTINUOUS_LARGE_TX_FULL_PROFILE
+            if args.profile == "full"
+            else DEPENDENCY_CONTINUOUS_LARGE_TX_SMOKE_PROFILE
+        )
+    elif args.evidence in {"mixed-shutdown-startup", "mixed-transfer"}:
         profile = (
             MIXED_FULL_PROFILE
             if args.profile == "full"
@@ -2609,6 +3757,11 @@ def main(
         )
     else:
         profile = FULL_PROFILE if args.profile == "full" else SMOKE_PROFILE
+    if args.business_run_before_drain is not None:
+        profile = dataclasses.replace(
+            profile,
+            business_run_before_drain_s=args.business_run_before_drain,
+        )
     run_id = args.run_id or default_run_id(profile.name)
     repo_root = args.repo_root.expanduser().resolve(strict=False)
     build_dir = (
@@ -2635,6 +3788,7 @@ def main(
                 if args.evidence in {
                     "mixed-shutdown-startup",
                     "mixed-transfer",
+                    "dependency-mixed-transfer",
                 }
                 else DEFAULT_FULL_REQUIRED_FREE_BYTES
             )
@@ -2647,6 +3801,16 @@ def main(
     if args.build_jobs <= 0:
         raise RuntimeError("--build-jobs must be positive")
     with RunnerLock(paths.history_root):
+        if (
+            args.evidence == "dependency-sysbench"
+            and profile.formal_rounds > 1
+        ):
+            return run_dependency_sysbench_formal_rounds(
+                profile,
+                args,
+                paths,
+                required_free_bytes=required_free_bytes,
+            )
         if args.source_port or args.receiver_port:
             if not args.source_port or not args.receiver_port:
                 raise RuntimeError(

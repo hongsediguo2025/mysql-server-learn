@@ -447,6 +447,7 @@ SET(SQL_SHARED_SOURCES
   preserve_trx_resource.cc
   preserve_trx_resurrection_index.cc
   preserve_trx_rewrite.cc
+  preserve_trx_standby_phase2_scheduler.cc
   preserve_trx_temp_table.cc
   preserve_trx_temp_table_carrier.cc
   preserve_trx_transfer.cc
