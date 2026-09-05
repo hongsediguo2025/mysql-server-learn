@@ -1,0 +1,190 @@
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+--disable_query_log
+
+--let $credential_file= $MYSQL_TMP_DIR/phase1-wait-grant-fallback.secret
+--write_file $credential_file
+phase1-wait-grant-fallback-secret
+EOF
+--exec chmod 600 $credential_file
+
+--connect(wait_grant_receiver,127.0.0.1,root,,test,$SERVER_MYPORT_2,)
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'phase1-wait-grant-fallback-secret';
+GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.*
+  TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+GRANT PROCESS ON *.* TO preserve_trx_ha_admin@localhost;
+
+--connection default
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+DROP USER IF EXISTS phase1_wait_grant_app@localhost;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'phase1-wait-grant-fallback-secret';
+GRANT SHUTDOWN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.*
+  TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+GRANT PROCESS ON *.* TO preserve_trx_ha_admin@localhost;
+CREATE USER phase1_wait_grant_app@localhost;
+GRANT SELECT, UPDATE ON test.* TO phase1_wait_grant_app@localhost;
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO phase1_wait_grant_app@localhost;
+
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$SERVER_MYPORT_2 --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=phase1_wait_grant_fallback --rds-preserve-trx-transfer-credential-secret-file=$credential_file --rds-preserve-trx-phase1-capture-mode=BOUNDED_PIPELINE_V1 --rds-preserve-trx-phase1-pipeline-workers=2 --log-error-verbosity=3
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--let $restart_parameters=
+--disable_query_log
+
+CALL mtr.add_suppression(
+  "PRESERVE: rolled back prepared transaction without snapshot during recovery");
+SET GLOBAL rds_preserve_trx_enable=ON;
+
+--connect(wait_grant_ha,localhost,preserve_trx_ha_admin,phase1-wait-grant-fallback-secret,test)
+
+--connection default
+--disable_warnings
+DROP TABLE IF EXISTS t_phase1_wait_grant_fallback;
+--enable_warnings
+CREATE TABLE t_phase1_wait_grant_fallback(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_phase1_wait_grant_fallback VALUES (1,10),(2,20);
+
+--connect(wait_grant_blocker,localhost,phase1_wait_grant_app,,test)
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+UPDATE t_phase1_wait_grant_fallback SET v=v+1 WHERE id=2;
+
+--connect(wait_grant_target,localhost,phase1_wait_grant_app,,test)
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+UPDATE t_phase1_wait_grant_fallback SET v=v+1 WHERE id=1;
+--let $target_connection_id= `SELECT CONNECTION_ID()`
+
+--connection wait_grant_ha
+--let $trx_id_before= query_get_value(SELECT trx_id AS id FROM information_schema.innodb_trx WHERE trx_mysql_thread_id=$target_connection_id, id, 1)
+
+--connection default
+SET DEBUG_SYNC=
+  'preserve_trx_transfer_after_phase1_binlog_stream SIGNAL wait_grant_baseline_sent WAIT_FOR wait_grant_continue';
+--send DRAIN TRANSACTIONS PRESERVE
+
+--connection wait_grant_ha
+SET DEBUG_SYNC='now WAIT_FOR wait_grant_baseline_sent TIMEOUT 20';
+
+# Create a record-lock wait only after the first candidate was published, then
+# grant it before T0. The final transaction owns the newly granted lock, but a
+# mirror that did not track WAIT-to-GRANTED must not be trusted.
+--connection wait_grant_target
+SET DEBUG_SYNC='lock_wait_will_wait SIGNAL wait_grant_waiting';
+--send UPDATE t_phase1_wait_grant_fallback SET v=v+1 WHERE id=2
+
+--connection wait_grant_ha
+SET DEBUG_SYNC='now WAIT_FOR wait_grant_waiting TIMEOUT 20';
+
+--connection wait_grant_blocker
+COMMIT;
+
+--connection wait_grant_target
+--reap
+SET DEBUG_SYNC='RESET';
+
+--connection wait_grant_ha
+--let $trx_id_after= query_get_value(SELECT trx_id AS id FROM information_schema.innodb_trx WHERE trx_mysql_thread_id=$target_connection_id, id, 1)
+--let $assert_text= granted waiter stays in the same source transaction
+--let $assert_cond= `SELECT '$trx_id_before'='$trx_id_after' AND '$trx_id_before'<>''`
+--source include/assert.inc
+SET DEBUG_SYNC='now SIGNAL wait_grant_continue';
+
+--connection default
+--replace_column 1 GENERATION 3 SOURCE_ID 6 CLOSING_STARTED_US 7 CLOSING_DEADLINE_US
+--reap
+
+--let PHASE1_WAIT_GRANT_LOG= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--perl
+use strict;
+use warnings;
+my $path = $ENV{'PHASE1_WAIT_GRANT_LOG'} or die "missing source error log";
+open(my $fh, '<', $path) or die "cannot read $path: $!";
+my $native_fallback = 0;
+my $stage_metrics = 0;
+my $in_current_test = 0;
+while (my $line = <$fh>) {
+  if ($line =~ /CURRENT_TEST:\s+preserve_trx\.(\S+)/) {
+    $in_current_test =
+      $1 eq 'batch_drain_phase1_pipeline_wait_grant_fallback';
+    next;
+  }
+  next unless $in_current_test;
+  $native_fallback = 1
+    if $line =~ /PRESERVE_PHASE1_OWNER_V1 / &&
+       $line =~ /event=FINAL_RECORD_RECONCILE_COMPLETE/ &&
+       $line =~ /targets=1/ && $line =~ /captured=1/ &&
+       $line =~ /store_refresh_targets=0/ &&
+       $line =~ /store_fallback_coordinate=1/ &&
+       $line =~ /deferred=0/ && $line =~ /exact=1/ &&
+       $line =~ /failed=0/;
+  $stage_metrics = 1
+    if $line =~ /PRESERVE_PHASE1_PIPELINE_V1 / &&
+       $line =~ /event=STOPPED/ &&
+       $line =~ /final_record_capture_operation_samples=1/ &&
+       $line =~ /final_record_store_snapshot_operation_samples=0/ &&
+       $line =~ /final_record_prepare_operation_samples=1/ &&
+       $line =~ /operation_budget_overruns=0/;
+}
+close($fh);
+die "granted waiter did not force native final capture"
+  unless $native_fallback;
+die "granted waiter did not use the bounded native fallback stages"
+  unless $stage_metrics;
+EOF
+--let PHASE1_WAIT_GRANT_LOG=
+
+--connection wait_grant_receiver
+SELECT VARIABLE_VALUE=1 AS one_accepted_epoch
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs';
+
+--connection default
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT 1;
+
+--connection wait_grant_target
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT 1;
+
+--connection wait_grant_ha
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+SHUTDOWN;
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+--disable_query_log
+
+--connect(wait_grant_cleanup,localhost,root,,test)
+DROP TABLE t_phase1_wait_grant_fallback;
+DROP USER preserve_trx_ha_admin@localhost;
+DROP USER phase1_wait_grant_app@localhost;
+
+--connection wait_grant_receiver
+DROP USER preserve_trx_ha_admin@localhost;
+
+--connection wait_grant_cleanup
+--remove_file $credential_file
+
+--enable_query_log

@@ -273,22 +273,55 @@ class Mysql_binlog_warmcopy_session final
   }
 
   bool begin(bool *has_blob) {
+    Mysql_binlog_warmcopy_begin_step_status status = initialize_begin();
+    if (status == Mysql_binlog_warmcopy_begin_step_status::NOT_ELIGIBLE)
+      return false;
+    if (status == Mysql_binlog_warmcopy_begin_step_status::ERROR) return true;
+    do {
+      status = copy_initial_prefix_step(false, has_blob);
+    } while (status == Mysql_binlog_warmcopy_begin_step_status::MORE);
+    return status != Mysql_binlog_warmcopy_begin_step_status::READY;
+  }
+
+  Mysql_binlog_warmcopy_begin_step_status begin_step(bool *has_blob) {
     if (has_blob != nullptr) *has_blob = false;
-    if (m_thd == nullptr || m_carrier == nullptr || m_degraded) return true;
+    if (m_begin_complete) {
+      if (has_blob != nullptr) *has_blob = m_prefix_end != 0;
+      return Mysql_binlog_warmcopy_begin_step_status::READY;
+    }
+    Mysql_binlog_warmcopy_begin_step_status status =
+        m_begin_initialized
+            ? Mysql_binlog_warmcopy_begin_step_status::MORE
+            : initialize_begin();
+    if (status != Mysql_binlog_warmcopy_begin_step_status::MORE) {
+      if (status == Mysql_binlog_warmcopy_begin_step_status::READY &&
+          has_blob != nullptr) {
+        *has_blob = m_prefix_end != 0;
+      }
+      return status;
+    }
+    return copy_initial_prefix_step(true, has_blob);
+  }
+
+ private:
+  Mysql_binlog_warmcopy_begin_step_status initialize_begin() {
+    if (m_thd == nullptr || m_carrier == nullptr || m_degraded)
+      return Mysql_binlog_warmcopy_begin_step_status::ERROR;
     uint64_t ignored_length = 0;
     bool ignored_has_blob = false;
     bool source_eligible = false;
     if (mysql_binlog_warmcopy_source_eligible(
             m_thd, false, &ignored_length, &ignored_has_blob, &source_eligible,
             m_allow_inflight_statement)) {
-      return true;
+      return Mysql_binlog_warmcopy_begin_step_status::ERROR;
     }
-    if (!source_eligible) return false;
+    if (!source_eligible)
+      return Mysql_binlog_warmcopy_begin_step_status::NOT_ELIGIBLE;
 
     if (m_carrier->create_warm_external_blob_writer(
             m_warmcopy_id, kPreservedTrxBlobBinlogCache, m_epoch,
             &m_writer) != Preserved_trx_carrier_status::OK) {
-      return true;
+      return Mysql_binlog_warmcopy_begin_step_status::ERROR;
     }
 
     bool installed = false;
@@ -297,79 +330,106 @@ class Mysql_binlog_warmcopy_session final
             &m_cache_lease, &installed)) {
       (void)m_writer->abort();
       m_writer.reset();
-      return true;
+      return Mysql_binlog_warmcopy_begin_step_status::ERROR;
     }
     if (!installed) {
       (void)m_writer->abort();
       m_writer.reset();
-      return false;
+      return Mysql_binlog_warmcopy_begin_step_status::NOT_ELIGIBLE;
     }
     if (m_prefix_end > m_max_blob_bytes) {
       mark_degraded("warm-copy prefix exceeds configured limit");
-      return true;
+      return Mysql_binlog_warmcopy_begin_step_status::ERROR;
     }
 
-    /*
-      Copy the stable prefix in configured chunks. The truncate generation is
-      sampled when the mirror is installed; a generation change while copying
-      means the prefix no longer describes the same source cache and the mirror
-      must degrade instead of guessing.
-    */
-    uint64_t copied = 0;
+    m_begin_initialized = true;
+    return m_prefix_end == 0
+               ? finish_initial_prefix(nullptr)
+               : Mysql_binlog_warmcopy_begin_step_status::MORE;
+  }
+
+  Mysql_binlog_warmcopy_begin_step_status copy_initial_prefix_step(
+      bool bounded_mode, bool *has_blob) {
+    if (!m_begin_initialized || m_begin_complete || m_writer == nullptr ||
+        m_cache_lease == nullptr || m_prefix_copy_until > m_prefix_end) {
+      return m_begin_complete
+                 ? Mysql_binlog_warmcopy_begin_step_status::READY
+                 : Mysql_binlog_warmcopy_begin_step_status::ERROR;
+    }
+    const uint64_t remaining = m_prefix_end - m_prefix_copy_until;
+    if (remaining == 0) return finish_initial_prefix(has_blob);
+    const uint64_t step_limit =
+        bounded_mode
+            ? m_copy_chunk_bytes
+            : std::min<uint64_t>(m_copy_chunk_bytes,
+                                 kWarmcopyActivePrefixSnapshotBytes);
+    const size_t bytes_to_copy =
+        static_cast<size_t>(std::min<uint64_t>(remaining, step_limit));
+    const bool first_step = m_prefix_copy_until == 0;
+    Warmcopy_prefix_buffer_ostream ostream(bytes_to_copy);
     bool stale_generation = false;
-    while (copied < m_prefix_end) {
-      const uint64_t remaining = m_prefix_end - copied;
-      const size_t bytes_to_copy = static_cast<size_t>(
-          std::min<uint64_t>(
-              remaining,
-              std::min<uint64_t>(m_copy_chunk_bytes,
-                                 kWarmcopyActivePrefixSnapshotBytes)));
-      Warmcopy_prefix_buffer_ostream ostream(bytes_to_copy);
+    size_t copied_in_step = 0;
+    while (copied_in_step < bytes_to_copy) {
+      const size_t native_chunk = std::min<size_t>(
+          bytes_to_copy - copied_in_step,
+          kWarmcopyActivePrefixSnapshotBytes);
       if (mysql_binlog_warmcopy_source_copy_range(
-              m_thd, copied, bytes_to_copy, &ostream, m_truncate_generation,
+              m_thd, m_prefix_copy_until + copied_in_step, native_chunk,
+              &ostream, m_truncate_generation,
               &stale_generation) ||
-          stale_generation || ostream.size() != bytes_to_copy) {
+          stale_generation) {
+        if (stale_generation) {
+          m_stale_rebuildable.store(true, std::memory_order_release);
+        }
         mark_degraded(stale_generation ? "warm-copy prefix generation stale"
                                        : "warm-copy prefix copy failed");
-        return true;
+        return stale_generation
+                   ? Mysql_binlog_warmcopy_begin_step_status::STALE
+                   : Mysql_binlog_warmcopy_begin_step_status::ERROR;
       }
-      /*
-        The source cache lock protects only the bounded in-memory snapshot.
-        Mirror file I/O and digest work run through the existing lease after
-        that lock is released, while concurrent source appends remain ordered
-        as pending ranges.
-      */
-      if (m_cache_lease == nullptr ||
-          m_cache_lease->write_at(copied, ostream.data(), ostream.size()) ==
-              Binlog_warmcopy_mirror_status::ERROR) {
-        mark_degraded("warm-copy prefix mirror write failed");
-        return true;
-      }
-      copied += bytes_to_copy;
-      m_prefix_copy_until = copied;
-      if (copied == bytes_to_copy) {
-        DEBUG_SYNC(current_thd,
-                   "preserve_trx_warmcopy_after_first_active_prefix_chunk");
-      }
+      copied_in_step += native_chunk;
     }
+    if (ostream.size() != bytes_to_copy ||
+        m_cache_lease->write_at(m_prefix_copy_until, ostream.data(),
+                                ostream.size()) ==
+            Binlog_warmcopy_mirror_status::ERROR) {
+      mark_degraded("warm-copy prefix mirror write failed");
+      return Mysql_binlog_warmcopy_begin_step_status::ERROR;
+    }
+    m_prefix_copy_until += bytes_to_copy;
+    if (first_step) {
+      DEBUG_SYNC(current_thd,
+                 "preserve_trx_warmcopy_after_first_active_prefix_chunk");
+    }
+    return m_prefix_copy_until == m_prefix_end
+               ? finish_initial_prefix(has_blob)
+               : Mysql_binlog_warmcopy_begin_step_status::MORE;
+  }
+
+  Mysql_binlog_warmcopy_begin_step_status finish_initial_prefix(
+      bool *has_blob) {
     DBUG_EXECUTE_IF("preserve_trx_warmcopy_fail_after_source_copy", {
       mark_degraded("warm-copy injected failure after prefix source copy");
-      return true;
+      return Mysql_binlog_warmcopy_begin_step_status::ERROR;
     });
     if (m_prefix_copy_until != m_prefix_end) {
       mark_degraded("warm-copy prefix digest failed");
-      return true;
+      return Mysql_binlog_warmcopy_begin_step_status::ERROR;
     }
     DEBUG_SYNC(current_thd, "preserve_trx_warmcopy_before_prefix_digest_replay");
     absorb_pending_ranges();
-    if (m_degraded) return true;
+    if (m_degraded) return Mysql_binlog_warmcopy_begin_step_status::ERROR;
 
     preserve_trx_warmcopy_note_prefix_bytes(m_prefix_end);
     m_destination_length = std::max(m_destination_length, m_prefix_end);
-    if (flush_writer_durable_watermark()) return true;
+    if (flush_writer_durable_watermark())
+      return Mysql_binlog_warmcopy_begin_step_status::ERROR;
+    m_begin_complete = true;
     if (has_blob != nullptr) *has_blob = m_prefix_end != 0;
-    return false;
+    return Mysql_binlog_warmcopy_begin_step_status::READY;
   }
+
+ public:
 
   bool active() const { return m_writer != nullptr; }
 
@@ -384,7 +444,8 @@ class Mysql_binlog_warmcopy_session final
   bool snapshot_prefix(PrebuiltBinlogCacheBlob *blob,
                        bool *has_blob) const override {
     if (has_blob != nullptr) *has_blob = false;
-    if (blob == nullptr || m_degraded || m_digest_ctx == nullptr ||
+    if (blob == nullptr || !m_begin_complete || m_degraded ||
+        m_digest_ctx == nullptr ||
         m_digest_until != m_destination_length ||
         m_digest_until != m_durable_length || !m_pending_ranges.empty()) {
       return true;
@@ -788,6 +849,8 @@ class Mysql_binlog_warmcopy_session final
   uint64_t m_reserved_bytes{0};
   bool m_reservation_transferred{false};
   bool m_allow_inflight_statement{false};
+  bool m_begin_initialized{false};
+  bool m_begin_complete{false};
   std::unique_ptr<Preserved_trx_external_blob_writer> m_writer;
   std::shared_ptr<Binlog_cache_warmcopy_lease> m_cache_lease;
   EVP_MD_CTX *m_digest_ctx{nullptr};
@@ -936,6 +999,48 @@ bool mysql_binlog_preserve_warmcopy_begin_session(
 
   *session = owned_session.release();
   return false;
+}
+
+Mysql_binlog_warmcopy_begin_step_status
+mysql_binlog_preserve_warmcopy_begin_session_step(
+    THD *thd, const std::string &warmcopy_id, uint64_t epoch,
+    Preserved_trx_warm_external_blob_carrier *carrier,
+    uint64_t max_blob_bytes, std::atomic<uint64_t> *total_reserved_bytes,
+    uint64_t max_total_bytes, uint64_t reservation_chunk_bytes,
+    uint64_t copy_chunk_bytes, Mysql_binlog_warmcopy_session **session,
+    bool *has_blob, uint64_t *prefix_bytes, bool allow_inflight_statement) {
+  if (has_blob != nullptr) *has_blob = false;
+  if (prefix_bytes != nullptr) *prefix_bytes = 0;
+  if (thd == nullptr || carrier == nullptr || total_reserved_bytes == nullptr ||
+      max_total_bytes == 0 || reservation_chunk_bytes == 0 ||
+      copy_chunk_bytes == 0 || session == nullptr) {
+    return Mysql_binlog_warmcopy_begin_step_status::ERROR;
+  }
+
+  std::unique_ptr<Mysql_binlog_warmcopy_session> owned_session;
+  Mysql_binlog_warmcopy_session *current = *session;
+  if (current == nullptr) {
+    owned_session.reset(new Mysql_binlog_warmcopy_session(
+        thd, warmcopy_id, epoch, carrier, max_blob_bytes,
+        total_reserved_bytes, max_total_bytes, reservation_chunk_bytes,
+        copy_chunk_bytes, allow_inflight_statement));
+    current = owned_session.get();
+  }
+
+  const Mysql_binlog_warmcopy_begin_step_status status =
+      current->begin_step(has_blob);
+  if (status == Mysql_binlog_warmcopy_begin_step_status::MORE ||
+      status == Mysql_binlog_warmcopy_begin_step_status::READY) {
+    if (prefix_bytes != nullptr) *prefix_bytes = current->prefix_bytes();
+    if (*session == nullptr) *session = owned_session.release();
+    return status;
+  }
+
+  if (*session != nullptr) {
+    delete *session;
+    *session = nullptr;
+  }
+  return status;
 }
 
 bool mysql_binlog_preserve_warmcopy_finalize_session(

@@ -1,0 +1,12 @@
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+include/assert.inc [first binlog target stayed on its original connection]
+include/assert.inc [second binlog target stayed on its original connection]
+include/assert.inc [empty binlog target stayed on its original connection]
+SELECT @@GLOBAL.rds_preserve_trx_phase1_capture_mode AS capture_mode;
+capture_mode
+BOUNDED_PIPELINE_V1
+SELECT id, v FROM t_phase1_pipeline_binlog ORDER BY id;
+id	v
+1	64
+2	64
+3	0

@@ -1,0 +1,2 @@
+--rds-preserve-trx-phase1-capture-mode=BOUNDED_PIPELINE_V1
+--rds-preserve-trx-phase1-pipeline-ordinary-active-limit=1

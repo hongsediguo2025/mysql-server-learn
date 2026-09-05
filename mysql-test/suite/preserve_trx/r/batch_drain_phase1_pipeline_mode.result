@@ -1,0 +1,91 @@
+SELECT @@GLOBAL.rds_preserve_trx_phase1_capture_mode AS capture_mode,
+@@GLOBAL.rds_preserve_trx_phase1_pipeline_workers AS workers,
+@@GLOBAL.rds_preserve_trx_phase1_pipeline_ordinary_active_limit AS ordinary_active_limit,
+@@GLOBAL.rds_preserve_trx_phase1_pipeline_credit_bytes AS credit_bytes;
+capture_mode	workers	ordinary_active_limit	credit_bytes
+BOUNDED_PIPELINE_V1	2	1	1048576
+SET GLOBAL rds_preserve_trx_phase1_capture_mode='LEGACY_SERIAL';
+ERROR HY000: Variable 'rds_preserve_trx_phase1_capture_mode' is a read only variable
+SET GLOBAL rds_preserve_trx_phase1_pipeline_workers=3;
+ERROR HY000: Variable 'rds_preserve_trx_phase1_pipeline_workers' is a read only variable
+SET GLOBAL rds_preserve_trx_phase1_pipeline_ordinary_active_limit=2;
+ERROR HY000: Variable 'rds_preserve_trx_phase1_pipeline_ordinary_active_limit' is a read only variable
+CREATE TABLE t_phase1_pipeline_mode(
+id INT PRIMARY KEY,
+v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_phase1_pipeline_mode VALUES(1,10),(2,20);
+CREATE TABLE t_phase1_pipeline_global_s(
+id INT PRIMARY KEY,
+v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_phase1_pipeline_global_s VALUES(1,10);
+START TRANSACTION;
+UPDATE t_phase1_pipeline_mode SET v=12 WHERE id=1;
+SET SESSION lock_wait_timeout=2;
+SET SESSION debug='+d,preserve_trx_phase1_pipeline_exercise_record_capture,preserve_trx_phase1_record_resolve_expect_mdl_retryable,preserve_trx_phase1_pipeline_fail_after_start';
+SET DEBUG_SYNC='preserve_trx_phase1_pipeline_before_record_exercise SIGNAL phase1_pipeline_started WAIT_FOR phase1_mdl_waiting';
+DRAIN TRANSACTIONS PRESERVE;
+SET DEBUG_SYNC='now WAIT_FOR phase1_pipeline_started TIMEOUT 10';
+ALTER TABLE t_phase1_pipeline_mode ADD COLUMN mdl_nowait_marker INT;
+SET DEBUG_SYNC='now SIGNAL phase1_mdl_waiting';
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SET DEBUG_SYNC='RESET';
+SET SESSION debug='-d,preserve_trx_phase1_pipeline_exercise_record_capture,preserve_trx_phase1_record_resolve_expect_mdl_retryable,preserve_trx_phase1_pipeline_fail_after_start';
+SET SESSION lock_wait_timeout=DEFAULT;
+COMMIT;
+START TRANSACTION;
+UPDATE t_phase1_pipeline_mode SET v=13 WHERE id=1;
+SET SESSION debug='+d,preserve_trx_phase1_pipeline_exercise_record_capture,preserve_trx_phase1_record_compact_resolve_without_page,preserve_trx_phase1_record_resolve_page_retryable,preserve_trx_phase1_pipeline_fail_after_start';
+DRAIN TRANSACTIONS PRESERVE;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SET SESSION debug='-d,preserve_trx_phase1_pipeline_exercise_record_capture,preserve_trx_phase1_record_compact_resolve_without_page,preserve_trx_phase1_record_resolve_page_retryable,preserve_trx_phase1_pipeline_fail_after_start';
+COMMIT;
+START TRANSACTION;
+UPDATE t_phase1_pipeline_mode SET v=11 WHERE id=1;
+SET SESSION debug='+d,preserve_trx_phase1_pipeline_exercise_core,preserve_trx_phase1_pipeline_exercise_record_capture,preserve_trx_phase1_record_compact_delta_exercise,preserve_trx_phase1_owner_inject_one_retry,preserve_trx_phase1_pipeline_fail_after_start';
+DRAIN TRANSACTIONS PRESERVE;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SET SESSION debug='-d,preserve_trx_phase1_pipeline_exercise_core,preserve_trx_phase1_pipeline_exercise_record_capture,preserve_trx_phase1_record_compact_delta_exercise,preserve_trx_phase1_owner_inject_one_retry,preserve_trx_phase1_pipeline_fail_after_start';
+COMMIT;
+START TRANSACTION;
+UPDATE t_phase1_pipeline_mode SET v=15 WHERE id=1;
+SET SESSION debug='+d,preserve_trx_phase1_pipeline_exercise_record_capture,preserve_trx_phase1_owner_expect_rebind,preserve_trx_phase1_pipeline_fail_after_start';
+SET DEBUG_SYNC='preserve_trx_phase1_owner_after_record_reconcile SIGNAL phase1_owner_bound WAIT_FOR phase1_owner_replaced';
+DRAIN TRANSACTIONS PRESERVE;
+SET DEBUG_SYNC='now WAIT_FOR phase1_owner_bound TIMEOUT 10';
+UPDATE t_phase1_pipeline_mode SET v=v+1 WHERE id=2;
+COMMIT;
+START TRANSACTION;
+UPDATE t_phase1_pipeline_mode SET v=16 WHERE id=1;
+SET DEBUG_SYNC='now SIGNAL phase1_owner_replaced';
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SET DEBUG_SYNC='RESET';
+SET SESSION debug='-d,preserve_trx_phase1_pipeline_exercise_record_capture,preserve_trx_phase1_owner_expect_rebind,preserve_trx_phase1_pipeline_fail_after_start';
+COMMIT;
+START TRANSACTION;
+UPDATE t_phase1_pipeline_mode SET v=18 WHERE id=1;
+SET SESSION debug='+d,preserve_trx_phase1_pipeline_exercise_record_capture,preserve_trx_phase1_owner_expect_gap_rebind,preserve_trx_phase1_pipeline_fail_after_start';
+SET DEBUG_SYNC='preserve_trx_phase1_owner_after_live_gap SIGNAL phase1_owner_gap_seen WAIT_FOR phase1_owner_gap_replacement';
+SET DEBUG_SYNC='preserve_trx_phase1_owner_after_record_reconcile SIGNAL phase1_owner_gap_bound WAIT_FOR phase1_owner_gap_capture';
+DRAIN TRANSACTIONS PRESERVE;
+SET DEBUG_SYNC='now WAIT_FOR phase1_owner_gap_bound TIMEOUT 10';
+COMMIT;
+SET DEBUG_SYNC='now SIGNAL phase1_owner_gap_capture';
+SET DEBUG_SYNC='now WAIT_FOR phase1_owner_gap_seen TIMEOUT 10';
+START TRANSACTION;
+UPDATE t_phase1_pipeline_mode SET v=19 WHERE id=1;
+SET DEBUG_SYNC='now SIGNAL phase1_owner_gap_replacement';
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SET DEBUG_SYNC='RESET';
+SET SESSION debug='-d,preserve_trx_phase1_pipeline_exercise_record_capture,preserve_trx_phase1_owner_expect_gap_rebind,preserve_trx_phase1_pipeline_fail_after_start';
+COMMIT;
+START TRANSACTION;
+UPDATE t_phase1_pipeline_mode SET v=13 WHERE id=1;
+SET SESSION debug='+d,preserve_trx_phase1_pipeline_worker_init_fail';
+DRAIN TRANSACTIONS PRESERVE;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SET SESSION debug='-d,preserve_trx_phase1_pipeline_worker_init_fail';
+COMMIT;
+DROP TABLE t_phase1_pipeline_mode;
+DROP TABLE t_phase1_pipeline_global_s;

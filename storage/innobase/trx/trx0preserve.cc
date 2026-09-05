@@ -965,6 +965,37 @@ uint64_t trx_preserve_phase2_peek_raw_cookie(THD *thd) {
   return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(trx));
 }
 
+uint64_t trx_preserve_phase1_peek_raw_cookie(THD *thd) {
+  if (thd == nullptr) return 0;
+  mysql_mutex_assert_owner(&thd->LOCK_thd_data);
+  trx_t *trx = trx_preserve_current_thd_get_trx_if_available(thd);
+  return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(trx));
+}
+
+bool trx_preserve_phase1_owner_identity_snapshot(
+    THD *thd, trx_preserve_phase1_identity *identity) {
+  if (identity == nullptr) return false;
+  *identity = {};
+  trx_t *trx = trx_preserve_current_thd_get_trx_if_available(thd);
+  if (thd == nullptr || trx == nullptr) return false;
+
+  trx_mutex_enter(trx);
+  const bool active =
+      trx_preserve_current_thd_get_trx_if_available(thd) == trx &&
+      trx->state == TRX_STATE_ACTIVE && !trx->abort && trx->killed_by == 0 &&
+      trx->mysql_thd == thd && trx->version != 0 && trx_immutable_id(trx) != 0;
+  if (active) {
+    identity->raw_cookie =
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(trx));
+    identity->owner_thd_cookie =
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(thd));
+    identity->immutable_trx_id = trx_immutable_id(trx);
+    identity->trx_version = static_cast<uint64_t>(trx->version);
+  }
+  trx_mutex_exit(trx);
+  return active;
+}
+
 trx_preserve_phase2_identity_status
 trx_preserve_phase2_owner_identity_snapshot(
     THD *thd, trx_preserve_phase2_identity *identity) {
@@ -2158,6 +2189,94 @@ dberr_t trx_preserve_export_record_locks_stable_page_only(
 
   return trx_preserve_export_record_locks_stable_page_only(
       trx, payload, max_lock_count);
+}
+
+lock_preserve_phase1_record_capture_status
+trx_preserve_phase1_capture_record_lock_values(
+    THD *thd, uint32_t max_lock_count, uint64_t max_snapshot_bytes,
+    lock_preserve_phase1_record_snapshot *snapshot) {
+  if (snapshot != nullptr) *snapshot = {};
+  if (thd == nullptr || snapshot == nullptr) {
+    return lock_preserve_phase1_record_capture_status::INVALID_ARGUMENT;
+  }
+  trx_t *trx = trx_preserve_current_thd_get_trx_if_available(thd);
+  if (trx == nullptr) {
+    return lock_preserve_phase1_record_capture_status::
+        RETRYABLE_STALE_IDENTITY;
+  }
+  const lock_preserve_phase1_record_capture_status status =
+      lock_preserve_phase1_capture_record_values(
+          trx, max_lock_count, max_snapshot_bytes, snapshot);
+  if (status == lock_preserve_phase1_record_capture_status::OK &&
+      (snapshot->raw_trx_cookie !=
+           static_cast<uint64_t>(reinterpret_cast<uintptr_t>(trx)) ||
+       snapshot->owner_thd_cookie !=
+           static_cast<uint64_t>(reinterpret_cast<uintptr_t>(thd)))) {
+    *snapshot = {};
+    return lock_preserve_phase1_record_capture_status::
+        RETRYABLE_STALE_IDENTITY;
+  }
+  return status;
+}
+
+lock_preserve_phase1_record_identity_status
+trx_preserve_phase1_validate_record_lock_snapshot(
+    THD *thd, const lock_preserve_phase1_record_snapshot &snapshot) {
+  if (thd == nullptr || snapshot.immutable_trx_id == 0 ||
+      snapshot.trx_version == 0 || snapshot.raw_trx_cookie == 0 ||
+      snapshot.owner_thd_cookie == 0) {
+    return lock_preserve_phase1_record_identity_status::INVALID_ARGUMENT;
+  }
+
+  trx_t *trx = trx_preserve_current_thd_get_trx_if_available(thd);
+  if (trx == nullptr ||
+      snapshot.raw_trx_cookie !=
+          static_cast<uint64_t>(reinterpret_cast<uintptr_t>(trx)) ||
+      snapshot.owner_thd_cookie !=
+          static_cast<uint64_t>(reinterpret_cast<uintptr_t>(thd))) {
+    return lock_preserve_phase1_record_identity_status::TRANSACTION_STALE;
+  }
+
+  trx_mutex_enter(trx);
+  const bool identity_matches =
+      trx->state == TRX_STATE_ACTIVE && !trx->abort && trx->killed_by == 0 &&
+      trx->mysql_thd == thd &&
+      static_cast<uint64_t>(trx->version) == snapshot.trx_version &&
+      trx_immutable_id(trx) == snapshot.immutable_trx_id;
+  bool fence_matches = false;
+  if (identity_matches) {
+    fence_matches =
+        trx->lock.trx_locks_version == snapshot.trx_locks_version &&
+        trx->lock.n_rec_locks.load(std::memory_order_relaxed) ==
+            snapshot.native_record_lock_count &&
+        trx->lock.lock_warmcopy_coordinate_generation.load(
+            std::memory_order_relaxed) == snapshot.coordinate_generation &&
+        trx->lock.lock_warmcopy_freeze_generation ==
+            snapshot.freeze_generation &&
+        trx->lock.lock_warmcopy_conversion_attempt_after_freeze ==
+            snapshot.conversion_attempt_after_freeze &&
+        trx->lock.lock_warmcopy_conversion_unhandled_after_freeze ==
+            snapshot.conversion_unhandled_after_freeze;
+  }
+  trx_mutex_exit(trx);
+
+  if (!identity_matches) {
+    return lock_preserve_phase1_record_identity_status::TRANSACTION_STALE;
+  }
+  return fence_matches
+             ? lock_preserve_phase1_record_identity_status::MATCH
+             : lock_preserve_phase1_record_identity_status::
+                   LOCK_FENCE_CHANGED;
+}
+
+lock_preserve_phase1_record_resolve_status
+trx_preserve_phase1_resolve_record_lock_values(
+    THD *worker_thd, lock_preserve_phase1_record_snapshot *snapshot,
+    const lock_preserve_phase1_record_resolve_control &control,
+    std::string *payload,
+    lock_preserve_phase1_record_resolve_metrics *metrics) {
+  return lock_preserve_phase1_resolve_record_values(
+      worker_thd, snapshot, control, payload, metrics);
 }
 
 bool trx_preserve_sample_lock_warmcopy_fence(

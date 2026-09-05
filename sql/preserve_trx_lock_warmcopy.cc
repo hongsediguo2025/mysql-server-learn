@@ -288,9 +288,9 @@ bool read_canonical_record_entry(const std::string &payload, size_t *offset,
 
   const uint32_t set_bits = bitmap_set_bit_count(entry->bitmap);
   if (set_bits == 0 || entry->heap_offsets.empty() ||
-      entry->record_images.empty() ||
       entry->heap_offsets.size() != static_cast<size_t>(set_bits) * 4 ||
-      !record_images_payload_is_valid(entry->record_images, set_bits)) {
+      (!entry->record_images.empty() &&
+       !record_images_payload_is_valid(entry->record_images, set_bits))) {
     return false;
   }
 
@@ -1835,7 +1835,11 @@ bool Preserve_trx_lock_warmcopy_drain_participant::open_phase1() {
     cannot contaminate each other's target state.
   */
   m_epoch = lock_warmcopy_sql_epoch.fetch_add(1, std::memory_order_relaxed) + 1;
-  lock_warmcopy_open_epoch(m_epoch, m_options.max_journal_bytes);
+  lock_warmcopy_open_epoch(
+      m_epoch, m_options.max_journal_bytes,
+      m_options.compact_stable_page_record_store
+          ? lock_warmcopy_record_payload_mode_t::COMPACT_STABLE_PAGE
+          : lock_warmcopy_record_payload_mode_t::IMAGE_IDENTITY);
   m_observation.state = Preserve_trx_drain_participant_state::OPEN;
   m_observation.owns_artifact = false;
   m_observation.bytes_used = 0;
@@ -1858,6 +1862,9 @@ bool Preserve_trx_lock_warmcopy_drain_participant::open_phase1() {
   m_observation.failure_reason.clear();
   m_observation.phase2_slo_reason.clear();
   m_phase1_record_active_scan_targets.clear();
+  m_retired_phase1_record_blob_ids.clear();
+  m_phase1_legacy_record_scan_calls = 0;
+  m_phase1_legacy_store_rebuild_calls = 0;
   return true;
 }
 
@@ -2384,6 +2391,7 @@ void Preserve_trx_lock_warmcopy_drain_participant::
     targets.push_back(&target.second);
   }
   discard_phase1_record_blobs(targets);
+  discard_retired_phase1_record_blobs();
   m_record_store_cleanup_deferred_for_shutdown = false;
 }
 
@@ -2478,7 +2486,11 @@ void Preserve_trx_lock_warmcopy_drain_participant::
 bool Preserve_trx_lock_warmcopy_drain_participant::
     build_phase1_record_blob_for_target(uint64_t thread_id,
                                         Target_session *target,
-                                        const std::string &payload) {
+                                        const std::string &payload,
+                                        const lock_warmcopy_record_store_fence_t
+                                            *installed_fence,
+                                        uint64_t target_incarnation,
+                                        uint64_t capture_generation) {
   if (target == nullptr) return false;
   discard_phase1_record_blob(target);
   /*
@@ -2498,9 +2510,13 @@ bool Preserve_trx_lock_warmcopy_drain_participant::
   }
 
   lock_warmcopy_record_store_fence_t prebuilt_fence;
-  if (!lock_warmcopy_record_store_fence_for_target(thread_id,
-                                                   &prebuilt_fence)) {
-    return false;
+  if (installed_fence != nullptr) {
+    prebuilt_fence = *installed_fence;
+  } else {
+    if (!lock_warmcopy_record_store_fence_for_target(thread_id,
+                                                     &prebuilt_fence)) {
+      return false;
+    }
   }
 
   std::unique_ptr<Preserved_trx_warm_external_blob_carrier> carrier =
@@ -2508,8 +2524,12 @@ bool Preserve_trx_lock_warmcopy_drain_participant::
           m_options.preserve_dir);
   if (carrier == nullptr) return false;
 
-  const std::string warmcopy_id = "lockrec_" + std::to_string(m_epoch) + "_" +
-                                  std::to_string(thread_id);
+  std::string warmcopy_id =
+      "lockrec_" + std::to_string(m_epoch) + "_" + std::to_string(thread_id);
+  if (target_incarnation != 0 && capture_generation != 0) {
+    warmcopy_id += "_i" + std::to_string(target_incarnation) + "_g" +
+                   std::to_string(capture_generation);
+  }
   std::unique_ptr<Preserved_trx_external_blob_writer> writer;
   Preserved_trx_carrier_status carrier_status =
       carrier->create_warm_external_blob_writer(
@@ -2575,6 +2595,189 @@ bool Preserve_trx_lock_warmcopy_drain_participant::
   return true;
 }
 
+bool Preserve_trx_lock_warmcopy_drain_participant::
+    adopt_installed_phase1_record_candidate(
+        uint64_t thread_id, uint64_t target_incarnation,
+        uint64_t capture_generation, uint64_t publication_token,
+        const lock_warmcopy_record_store_compare_token_t &installed_token,
+        const lock_warmcopy_trx_lock_fence_t &captured_live_fence,
+        const std::string &serialized_payload, uint32_t record_lock_count,
+        bool active_scan, PrebuiltRecordLocksBlob *blob) {
+  if (blob != nullptr) *blob = {};
+  if (!m_options.enabled ||
+      m_observation.state != Preserve_trx_drain_participant_state::OPEN ||
+      thread_id == 0 || target_incarnation == 0 || capture_generation == 0 ||
+      publication_token == 0 ||
+      installed_token.epoch != m_epoch ||
+      installed_token.target_id != thread_id ||
+      !installed_token.store_present ||
+      (serialized_payload.empty() != (record_lock_count == 0))) {
+    return false;
+  }
+
+  Target_session replacement;
+  if (!serialized_payload.empty() &&
+      !build_phase1_record_blob_for_target(
+          thread_id, &replacement, serialized_payload,
+          &installed_token.store_fence, target_incarnation,
+          capture_generation)) {
+    return false;
+  }
+
+  Target_session *target = ensure_target_session(thread_id);
+  if (target == nullptr) return false;
+  retire_phase1_record_blob(target);
+  target->record_locks_candidate_valid = true;
+  target->record_locks_seeded_in_phase1 = true;
+  target->phase1_record_target_incarnation = target_incarnation;
+  target->phase1_record_capture_generation = capture_generation;
+  target->phase1_record_publication_token = publication_token;
+  target->record_lock_count = record_lock_count;
+  target->phase1_record_fence = installed_token.store_fence;
+  target->phase1_record_fence_valid = true;
+  target->phase1_record_prebuilt_fence = installed_token.store_fence;
+  target->phase1_record_prebuilt_fence_valid = true;
+  target->phase1_record_live_fence = captured_live_fence;
+  target->phase1_record_live_fence_valid = true;
+  target->record_locks_payload = std::move(replacement.record_locks_payload);
+  target->phase1_record_prebuilt_blob =
+      std::move(replacement.phase1_record_prebuilt_blob);
+  target->phase1_record_prebuilt_fence =
+      replacement.phase1_record_prebuilt_fence_valid
+          ? replacement.phase1_record_prebuilt_fence
+          : installed_token.store_fence;
+  target->phase1_record_prebuilt_fence_valid = true;
+  target->has_phase1_record_prebuilt_blob =
+      replacement.has_phase1_record_prebuilt_blob;
+  if (target->has_phase1_record_prebuilt_blob) {
+    attach_record_store_contract(target->phase1_record_prebuilt_fence,
+                                 &target->phase1_record_prebuilt_blob,
+                                 &target->phase1_record_live_fence);
+  }
+  if (active_scan) {
+    m_phase1_record_active_scan_targets.insert(thread_id);
+  } else {
+    m_phase1_record_active_scan_targets.erase(thread_id);
+  }
+  refresh_phase1_record_prebuilt_observation();
+  if (blob != nullptr && target->has_phase1_record_prebuilt_blob) {
+    *blob = target->phase1_record_prebuilt_blob;
+  }
+  return true;
+}
+
+bool Preserve_trx_lock_warmcopy_drain_participant::
+    bounded_phase1_record_candidate_current(
+        const Preserve_trx_phase1_final_record_candidate &candidate) const {
+  if (!candidate.current || !candidate.live_fence_valid ||
+      candidate.thread_id == 0 || candidate.target_incarnation == 0 ||
+      candidate.capture_generation == 0 ||
+      candidate.publication_token == 0) {
+    return false;
+  }
+  const auto found = m_targets.find(candidate.thread_id);
+  if (found == m_targets.end()) return false;
+  const Target_session &target = found->second;
+  if (!target.record_locks_candidate_valid ||
+      !target.record_locks_seeded_in_phase1 ||
+      target.phase1_record_target_incarnation !=
+          candidate.target_incarnation ||
+      target.phase1_record_capture_generation !=
+          candidate.capture_generation ||
+      target.phase1_record_publication_token != candidate.publication_token ||
+      candidate.absent != (target.record_lock_count == 0) ||
+      !target.phase1_record_prebuilt_fence_valid ||
+      !target.phase1_record_live_fence_valid ||
+      !record_live_fence_matches_phase1(target.phase1_record_live_fence,
+                                        candidate.live_fence) ||
+      (!candidate.absent &&
+       (!target.has_phase1_record_prebuilt_blob ||
+        target.phase1_record_prebuilt_blob.warmcopy_id.empty()))) {
+    return false;
+  }
+  lock_warmcopy_record_store_fence_t current_store_fence;
+  return lock_warmcopy_record_store_fence_for_target(
+             candidate.thread_id, &current_store_fence) &&
+         lock_warmcopy_record_store_fence_equal(
+             target.phase1_record_prebuilt_fence, current_store_fence);
+}
+
+bool Preserve_trx_lock_warmcopy_drain_participant::
+    reconcile_bounded_final_record_candidates(
+        const std::vector<Preserve_trx_phase1_final_record_candidate>
+            &candidates,
+        uint64_t *retained, uint64_t *invalidated) {
+  if (retained != nullptr) *retained = 0;
+  if (invalidated != nullptr) *invalidated = 0;
+  if (!m_options.enabled ||
+      m_observation.state != Preserve_trx_drain_participant_state::OPEN) {
+    return false;
+  }
+
+  std::set<uint64_t> final_thread_ids;
+  for (const Preserve_trx_phase1_final_record_candidate &candidate :
+       candidates) {
+    if (candidate.thread_id == 0 ||
+        !final_thread_ids.insert(candidate.thread_id).second ||
+        (candidate.current &&
+         (candidate.target_incarnation == 0 ||
+          candidate.capture_generation == 0 ||
+          candidate.publication_token == 0))) {
+      return false;
+    }
+
+    Target_session *target = ensure_target_session(candidate.thread_id);
+    if (target == nullptr) return false;
+    const bool exact = bounded_phase1_record_candidate_current(candidate);
+    if (exact) {
+      target->phase1_record_fence = target->phase1_record_prebuilt_fence;
+      target->phase1_record_fence_valid = true;
+      target->phase1_record_live_fence = candidate.live_fence;
+      target->phase1_record_live_fence_valid = true;
+      if (target->has_phase1_record_prebuilt_blob) {
+        attach_record_store_contract(target->phase1_record_prebuilt_fence,
+                                     &target->phase1_record_prebuilt_blob,
+                                     &target->phase1_record_live_fence);
+      }
+      if (retained != nullptr) ++*retained;
+      continue;
+    }
+
+    /*
+      Keep the target shell: the final quiesced pass still has to capture the
+      current transaction's table locks and MDL. Only candidates owned by the
+      earlier transaction incarnation are retired here. The record store is
+      deliberately not cleared because the same thread id may already name a
+      replacement transaction's store.
+    */
+    retire_phase1_record_blob(target);
+    target->phase1_record_target_incarnation = 0;
+    target->phase1_record_capture_generation = 0;
+    target->phase1_record_publication_token = 0;
+    target->phase1_record_fence_valid = false;
+    target->phase1_record_fence = lock_warmcopy_record_store_fence_t{};
+    target->record_locks_candidate_valid = false;
+    target->record_locks_seeded_in_phase1 = false;
+    target->record_locks_payload.clear();
+    target->record_lock_count = 0;
+    target->phase1_table_locks_candidate_valid = false;
+    target->phase1_table_locks_payload.clear();
+    target->phase1_table_lock_count = 0;
+    target->phase1_autoinc_lock_owned = false;
+    target->table_locks_phase1_fingerprint_valid = false;
+    target->phase1_mdl_candidate_valid = false;
+    target->phase1_mdl_descriptors_payload.clear();
+    target->phase1_mdl_descriptor_count = 0;
+    target->mdl_phase1_fingerprint_valid = false;
+    m_phase1_record_active_scan_targets.erase(candidate.thread_id);
+    m_artifacts.erase(candidate.thread_id);
+    if (invalidated != nullptr) ++*invalidated;
+  }
+  discard_retired_phase1_record_blobs();
+  refresh_phase1_record_prebuilt_observation();
+  return true;
+}
+
 void Preserve_trx_lock_warmcopy_drain_participant::
     discard_phase1_record_blobs(
         const std::vector<Target_session *> &targets) {
@@ -2608,6 +2811,37 @@ void Preserve_trx_lock_warmcopy_drain_participant::
 void Preserve_trx_lock_warmcopy_drain_participant::discard_phase1_record_blob(
     Target_session *target) {
   discard_phase1_record_blobs({target});
+}
+
+void Preserve_trx_lock_warmcopy_drain_participant::retire_phase1_record_blob(
+    Target_session *target) {
+  if (target == nullptr) return;
+  if (target->has_phase1_record_prebuilt_blob &&
+      !target->phase1_record_prebuilt_blob.warmcopy_id.empty()) {
+    m_retired_phase1_record_blob_ids.insert(
+        target->phase1_record_prebuilt_blob.warmcopy_id);
+  }
+  target->has_phase1_record_prebuilt_blob = false;
+  target->phase1_record_prebuilt_blob = PrebuiltRecordLocksBlob{};
+  target->phase1_record_prebuilt_fence_valid = false;
+  target->phase1_record_prebuilt_fence = lock_warmcopy_record_store_fence_t{};
+  target->phase1_record_live_fence_valid = false;
+  target->phase1_record_live_fence = lock_warmcopy_trx_lock_fence_t{};
+}
+
+void Preserve_trx_lock_warmcopy_drain_participant::
+    discard_retired_phase1_record_blobs() {
+  if (!m_retired_phase1_record_blob_ids.empty() &&
+      !m_options.preserve_dir.empty()) {
+    std::unique_ptr<Preserved_trx_warm_external_blob_carrier> carrier =
+        create_preserved_trx_default_warm_external_blob_carrier(
+            m_options.preserve_dir);
+    if (carrier != nullptr) {
+      (void)carrier->remove_warm_external_blobs(
+          m_retired_phase1_record_blob_ids, kPreservedTrxBlobRecordLocks);
+    }
+  }
+  m_retired_phase1_record_blob_ids.clear();
 }
 
 bool Preserve_trx_lock_warmcopy_drain_participant::
@@ -2949,6 +3183,7 @@ bool Preserve_trx_lock_warmcopy_drain_participant::
       target == nullptr) {
     return true;
   }
+  ++m_phase1_legacy_record_scan_calls;
 
   /*
     Phase-1 scan seeds the record store while the target is still attached.
@@ -3002,6 +3237,7 @@ bool Preserve_trx_lock_warmcopy_drain_participant::
       m_observation.state != Preserve_trx_drain_participant_state::OPEN) {
     return true;
   }
+  ++m_phase1_legacy_store_rebuild_calls;
 
   std::vector<uint64_t> target_ids;
   std::vector<uint64_t> prebuilt_target_ids;
@@ -3023,6 +3259,46 @@ bool Preserve_trx_lock_warmcopy_drain_participant::
       prebuilt_target_ids.push_back(target_id);
     }
   }
+  return finish_phase1_record_store_targets(target_ids, prebuilt_target_ids,
+                                            blob_ready);
+}
+
+bool Preserve_trx_lock_warmcopy_drain_participant::
+    prepare_installed_phase1_record_store_targets(
+        const Phase1_record_blob_ready_callback &blob_ready) {
+  if (!m_options.enabled ||
+      m_observation.state != Preserve_trx_drain_participant_state::OPEN) {
+    return true;
+  }
+  std::vector<uint64_t> target_ids = m_target_thread_ids;
+  std::vector<uint64_t> prebuilt_target_ids;
+  prebuilt_target_ids.reserve(target_ids.size());
+  for (const uint64_t target_id : target_ids) {
+    const auto found = m_targets.find(target_id);
+    if (found != m_targets.end() &&
+        found->second.has_phase1_record_prebuilt_blob) {
+      prebuilt_target_ids.push_back(target_id);
+    }
+  }
+  return finish_phase1_record_store_targets(target_ids, prebuilt_target_ids,
+                                            blob_ready);
+}
+
+uint64_t Preserve_trx_lock_warmcopy_drain_participant::
+    phase1_legacy_record_scan_calls() const {
+  return m_phase1_legacy_record_scan_calls;
+}
+
+uint64_t Preserve_trx_lock_warmcopy_drain_participant::
+    phase1_legacy_store_rebuild_calls() const {
+  return m_phase1_legacy_store_rebuild_calls;
+}
+
+bool Preserve_trx_lock_warmcopy_drain_participant::
+    finish_phase1_record_store_targets(
+        const std::vector<uint64_t> &target_ids,
+        const std::vector<uint64_t> &prebuilt_target_ids,
+        const Phase1_record_blob_ready_callback &blob_ready) {
   if (!target_ids.empty() && Global_THD_manager::get_instance() != nullptr) {
     const std::set<uint64_t> skip_record_export_thread_ids(target_ids.begin(),
                                                            target_ids.end());
@@ -3258,39 +3534,47 @@ bool Preserve_trx_lock_warmcopy_drain_participant::prepare_quiesced_target(
   candidate.mdl_descriptor_count = mdl_descriptor_count;
 
   if (current_live_fence.n_rec_locks != 0) {
-    if (!phase1.record_locks_candidate_valid ||
-        !phase1.record_locks_seeded_in_phase1 ||
-        !phase1.has_phase1_record_prebuilt_blob ||
-        !phase1.phase1_record_prebuilt_fence_valid ||
-        !phase1.phase1_record_live_fence_valid ||
-        phase1.phase1_record_prebuilt_blob.warmcopy_id.empty() ||
-        phase1.phase1_record_prebuilt_blob.size == 0 ||
-        phase1.phase1_record_prebuilt_blob.lock_plan_contract_version == 0 ||
-        phase1.phase1_record_prebuilt_blob.source_live_lock_generation == 0) {
+    const bool prebuilt_candidate_ready =
+        phase1.record_locks_candidate_valid &&
+        phase1.record_locks_seeded_in_phase1 &&
+        phase1.has_phase1_record_prebuilt_blob &&
+        phase1.phase1_record_prebuilt_fence_valid &&
+        phase1.phase1_record_live_fence_valid &&
+        !phase1.phase1_record_prebuilt_blob.warmcopy_id.empty() &&
+        phase1.phase1_record_prebuilt_blob.size != 0 &&
+        phase1.phase1_record_prebuilt_blob.lock_plan_contract_version != 0 &&
+        phase1.phase1_record_prebuilt_blob.source_live_lock_generation != 0;
+    if (!prebuilt_candidate_ready) {
       return reject_candidate(
           Preserve_trx_lock_warmcopy_reason::ARTIFACT_INVALID);
     }
-    if (!record_live_fence_matches_phase1(
-            phase1.phase1_record_live_fence, current_live_fence)) {
+
+    lock_warmcopy_record_store_compare_token_t current_store;
+    if (!lock_warmcopy_record_store_compare_token_for_target(
+            thread_id, &current_store) ||
+        current_store.epoch != m_epoch || current_store.target_id != thread_id ||
+        !current_store.store_present || current_store.target_invalid) {
       return reject_candidate(
           Preserve_trx_lock_warmcopy_reason::SEAL_FENCE_CHANGED);
     }
 
-    lock_warmcopy_record_store_fence_t current_store_fence;
-    if (!lock_warmcopy_record_store_fence_for_target(
-            thread_id, &current_store_fence) ||
-        !lock_warmcopy_record_store_fence_equal(
-            phase1.phase1_record_prebuilt_fence, current_store_fence)) {
+    const bool use_prebuilt_record_blob =
+        prebuilt_candidate_ready &&
+        record_live_fence_matches_phase1(phase1.phase1_record_live_fence,
+                                         current_live_fence) &&
+        lock_warmcopy_record_store_fence_equal(
+            phase1.phase1_record_prebuilt_fence, current_store.store_fence);
+    if (!use_prebuilt_record_blob) {
       return reject_candidate(
           Preserve_trx_lock_warmcopy_reason::SEAL_FENCE_CHANGED);
     }
 
     lock_warmcopy_record_seal_result_t seal_result;
-    if (!lock_warmcopy_record_store_seal_metadata_for_target(
-            thread_id, phase1.phase1_record_prebuilt_fence,
-            phase1.record_lock_count, m_options.max_lock_count,
-            m_options.max_journal_bytes, m_options.max_dirty_shards,
-            &seal_result)) {
+    const bool seal_ok = lock_warmcopy_record_store_seal_metadata_for_target(
+        thread_id, current_store.store_fence, phase1.record_lock_count,
+        m_options.max_lock_count, m_options.max_journal_bytes,
+        m_options.max_dirty_shards, &seal_result);
+    if (!seal_ok) {
       return false;
     }
     preserve_trx_lock_warmcopy_note_record_store_observation(
@@ -3305,10 +3589,12 @@ bool Preserve_trx_lock_warmcopy_drain_participant::prepare_quiesced_target(
               : Preserve_trx_lock_warmcopy_reason::SEAL_FENCE_CHANGED;
       return reject_candidate(reason);
     }
-
+    if (seal_result.record_lock_count == 0) {
+      return reject_candidate(
+          Preserve_trx_lock_warmcopy_reason::SEAL_FENCE_CHANGED);
+    }
     candidate.has_prebuilt_record_locks_blob = true;
-    candidate.prebuilt_record_locks_blob =
-        phase1.phase1_record_prebuilt_blob;
+    candidate.prebuilt_record_locks_blob = phase1.phase1_record_prebuilt_blob;
     candidate.record_store_fence_valid = true;
     candidate.record_store_fence = seal_result.seal_fence;
     candidate.record_lock_count = seal_result.record_lock_count;

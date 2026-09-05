@@ -35,6 +35,7 @@ SYSBENCH_REPORT_RE = re.compile(
 INTEGER_FIELDS = (
     "attempt_id",
     "generation",
+    "phase1_started_us",
     "pre_closing_policy_started_us",
     "hard_published_us",
     "closing_published_us",
@@ -59,6 +60,7 @@ REQUIRED_FIELDS = (
     "mode",
     "generation",
     "transfer_epoch_id",
+    "phase1_started_us",
     "pre_closing_policy_started_us",
     "hard_published_us",
     "closing_published_us",
@@ -321,6 +323,7 @@ def validate_final_records(
             )
 
         strict_us = record.integer("strict_interval_us")
+        phase1_started_us = record.integer("phase1_started_us")
         policy_us = record.integer("pre_closing_policy_started_us")
         phase2_end_us = record.integer("phase2_end_monotonic_us")
         derived_strict_us = (
@@ -331,6 +334,12 @@ def validate_final_records(
             raise FinalRecordError(
                 f"attempt {attempt_id} strict interval is not derived from "
                 "its own milestones"
+            )
+        if require_success and (
+            phase1_started_us == 0 or phase1_started_us > policy_us
+        ):
+            raise FinalRecordError(
+                f"attempt {attempt_id} has an invalid Phase1 start milestone"
             )
         if strict_limit_us and strict_us > strict_limit_us:
             raise FinalRecordError(
@@ -455,6 +464,7 @@ def validate_final_records(
             _require_ordered(
                 record,
                 (
+                    "phase1_started_us",
                     "pre_closing_policy_started_us",
                     "hard_published_us",
                     "closing_published_us",
@@ -618,6 +628,7 @@ def _synthetic_record(
         "mode": EXPECTED_MODE,
         "generation": generation,
         "transfer_epoch_id": f"epoch-{attempt_id}",
+        "phase1_started_us": base_us - 100,
         "pre_closing_policy_started_us": base_us,
         "hard_published_us": base_us + 100,
         "closing_published_us": base_us + 200,

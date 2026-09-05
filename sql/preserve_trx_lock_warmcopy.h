@@ -50,6 +50,8 @@ class MDL_context;
 struct Preserve_trx_lock_warmcopy_options {
   bool enabled{true};
   bool fallback_to_live_export{true};
+  /* Bounded Phase1 keeps record identity as page plus native heap bitmap. */
+  bool compact_stable_page_record_store{false};
   /*
     Debug/test equivalence validation compares live export with the warm artifact
     after canonicalization. It is not required for production routing because a
@@ -69,6 +71,21 @@ struct Preserve_trx_lock_warmcopy_options {
   uint32_t conversion_wait_timeout_ms{30000};
   /* Preserve directory used for participant-owned spill and owner markers. */
   std::string preserve_dir;
+};
+
+/*
+  Drain-owner value snapshot used to bind a bounded Phase1 record candidate to
+  the transaction that still owns the connection at the CLOSING boundary.
+*/
+struct Preserve_trx_phase1_final_record_candidate {
+  uint64_t thread_id{0};
+  uint64_t target_incarnation{0};
+  uint64_t capture_generation{0};
+  uint64_t publication_token{0};
+  lock_warmcopy_trx_lock_fence_t live_fence;
+  bool current{false};
+  bool absent{false};
+  bool live_fence_valid{false};
 };
 
 /*
@@ -165,8 +182,6 @@ struct Preserve_trx_lock_warmcopy_artifact {
   uint64_t spill_checksum{0};
   /* Lock-family semantic flags imported into snapshot metadata. */
   bool autoinc_lock_owned{false};
-  /* Reserved for future native implicit-lock continuity reporting. */
-  bool implicit_native_validated{false};
   /*
     record_live_seal_fence is the quiesced/seal-boundary record-lock sample
     captured before per-target conversion freeze. The preserve path later
@@ -326,10 +341,31 @@ class Preserve_trx_lock_warmcopy_drain_participant final
   bool prepare_phase1_idle_target(THD *target);
   bool prepare_phase1_record_scan_target(THD *target,
                                          bool active_scan = false);
+  /*
+    Owner-only bounded-pipeline handoff. The record store has already been
+    installed by compare-and-swap; publish that exact generation into the
+    existing participant without rescanning the THD or reseeding the store.
+  */
+  bool adopt_installed_phase1_record_candidate(
+      uint64_t thread_id, uint64_t target_incarnation,
+      uint64_t capture_generation, uint64_t publication_token,
+      const lock_warmcopy_record_store_compare_token_t &installed_token,
+      const lock_warmcopy_trx_lock_fence_t &captured_live_fence,
+      const std::string &serialized_payload, uint32_t record_lock_count,
+      bool active_scan, PrebuiltRecordLocksBlob *blob);
+  bool bounded_phase1_record_candidate_current(
+      const Preserve_trx_phase1_final_record_candidate &candidate) const;
+  bool reconcile_bounded_final_record_candidates(
+      const std::vector<Preserve_trx_phase1_final_record_candidate> &candidates,
+      uint64_t *retained, uint64_t *invalidated);
   using Phase1_record_blob_ready_callback =
       std::function<bool(uint64_t, const PrebuiltRecordLocksBlob &)>;
   bool prepare_phase1_record_store_targets(
       const Phase1_record_blob_ready_callback &blob_ready = {});
+  bool prepare_installed_phase1_record_store_targets(
+      const Phase1_record_blob_ready_callback &blob_ready = {});
+  uint64_t phase1_legacy_record_scan_calls() const;
+  uint64_t phase1_legacy_store_rebuild_calls() const;
   bool prepare_quiesced_targets(const std::vector<uint64_t> &thread_ids);
   bool prepare_quiesced_target(
       THD *target, Preserve_trx_lock_warmcopy_artifact *artifact);
@@ -402,6 +438,9 @@ class Preserve_trx_lock_warmcopy_drain_participant final
     lock_warmcopy_trx_lock_fence_t record_live_seal_fence;
     bool record_locks_candidate_valid{false};
     bool record_locks_seeded_in_phase1{false};
+    uint64_t phase1_record_target_incarnation{0};
+    uint64_t phase1_record_capture_generation{0};
+    uint64_t phase1_record_publication_token{0};
     bool has_phase1_record_prebuilt_blob{false};
     PrebuiltRecordLocksBlob phase1_record_prebuilt_blob;
     bool phase1_record_prebuilt_fence_valid{false};
@@ -446,7 +485,10 @@ class Preserve_trx_lock_warmcopy_drain_participant final
   std::vector<std::string> m_spill_paths;
   std::vector<uint64_t> m_target_thread_ids;
   std::set<uint64_t> m_phase1_record_active_scan_targets;
+  std::set<std::string> m_retired_phase1_record_blob_ids;
   uint64_t m_epoch{0};
+  uint64_t m_phase1_legacy_record_scan_calls{0};
+  uint64_t m_phase1_legacy_store_rebuild_calls{0};
   bool m_record_store_cleanup_deferred_for_shutdown{false};
   bool m_early_targets_prepared{false};
 
@@ -461,10 +503,20 @@ class Preserve_trx_lock_warmcopy_drain_participant final
   void refresh_phase1_non_record_fingerprints(Target_session *target);
   bool build_phase1_record_blob_for_target(uint64_t thread_id,
                                            Target_session *target,
-                                           const std::string &payload);
+                                           const std::string &payload,
+                                           const lock_warmcopy_record_store_fence_t
+                                               *installed_fence = nullptr,
+                                           uint64_t target_incarnation = 0,
+                                           uint64_t capture_generation = 0);
+  bool finish_phase1_record_store_targets(
+      const std::vector<uint64_t> &target_ids,
+      const std::vector<uint64_t> &prebuilt_target_ids,
+      const Phase1_record_blob_ready_callback &blob_ready);
   void discard_phase1_record_blobs(
       const std::vector<Target_session *> &targets);
   void discard_phase1_record_blob(Target_session *target);
+  void retire_phase1_record_blob(Target_session *target);
+  void discard_retired_phase1_record_blobs();
   void clear_record_stores_for_targets();
 };
 

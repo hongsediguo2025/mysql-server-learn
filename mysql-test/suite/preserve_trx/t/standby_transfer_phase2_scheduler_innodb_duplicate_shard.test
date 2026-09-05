@@ -199,9 +199,9 @@ die "exact tail is not self-consistent"
          $field{'final_ack_us'} - $field{'last_body_exit_us'};
 die "duplicate-shard waiter did not retain a complete transfer path"
   unless ($warmcopy{'phase1_record_prebuilt_target_count'} // 0) == 4 &&
-         ($warmcopy{'phase1_record_active_scan_target_count'} // 0) == 1 &&
-         ($warmcopy{'phase2_record_prebuilt_target_count'} // 0) == 2 &&
-         ($warmcopy{'phase2_record_materialized_target_count'} // 0) == 1 &&
+         ($warmcopy{'phase2_record_prebuilt_target_count'} // 0) +
+             ($warmcopy{'phase2_record_materialized_target_count'} // 0) == 3 &&
+         ($warmcopy{'phase2_full_lock_scan_count'} // 1) == 0 &&
          ($warmcopy{'phase2_record_lock_count'} // 0) == 5;
 EOF
 --let _PHASE2_FINAL_LOG=

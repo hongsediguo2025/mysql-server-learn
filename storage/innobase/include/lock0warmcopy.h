@@ -27,6 +27,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -44,7 +45,14 @@ extern std::atomic<uint64_t> lock_warmcopy_epoch;
 static constexpr uint32_t LOCK_WARMCOPY_RECORD_SHARD_DIRTY = 1U << 0;
 static constexpr uint32_t LOCK_WARMCOPY_RECORD_SHARD_INVALID = 1U << 1;
 static constexpr uint32_t LOCK_WARMCOPY_RECORD_SHARD_TOMBSTONE = 1U << 2;
+static constexpr uint32_t LOCK_WARMCOPY_RECORD_SHARD_COMPACT_STABLE_PAGE =
+    1U << 3;
 static constexpr size_t LOCK_WARMCOPY_SHA256_DIGEST_LENGTH = 32;
+
+enum class lock_warmcopy_record_payload_mode_t : uint8_t {
+  IMAGE_IDENTITY = 0,
+  COMPACT_STABLE_PAGE
+};
 
 struct lock_warmcopy_debug_stats_t {
   uint64_t observed_hook_events{0};
@@ -141,6 +149,82 @@ struct lock_warmcopy_record_store_fence_t {
   uint64_t dirty_generation{0};
   /* Stable digest over shard keys, generations, and record identity state. */
   unsigned char canonical_fingerprint[LOCK_WARMCOPY_SHA256_DIGEST_LENGTH]{};
+};
+
+/*
+  Full target-store token used only around a Phase1 baseline capture/install.
+  It covers the target-level journal and invalid state that is intentionally
+  not part of the existing payload fence.
+*/
+struct lock_warmcopy_record_store_compare_token_t {
+  uint64_t epoch{0};
+  uint64_t target_id{0};
+  uint64_t baseline_generation{0};
+  uint64_t journal_sequence{0};
+  uint64_t expected_delta_sequence{0};
+  uint64_t journal_bytes{0};
+  bool store_present{false};
+  bool target_invalid{false};
+  bool journal_sequence_present{false};
+  bool expected_delta_sequence_present{false};
+  bool journal_bytes_present{false};
+  unsigned char invalid_reason_digest[LOCK_WARMCOPY_SHA256_DIGEST_LENGTH]{};
+  lock_warmcopy_record_store_fence_t store_fence;
+};
+
+/*
+  Allocation-free target head used by the Phase1 owner to choose between the
+  tracked store and the native final capture.  The full store fence is sampled
+  only by the selected capture path.
+*/
+struct lock_warmcopy_record_store_head_t {
+  uint64_t epoch{0};
+  uint64_t target_id{0};
+  uint64_t baseline_generation{0};
+  bool store_present{false};
+  bool target_invalid{false};
+};
+
+enum class lock_warmcopy_record_store_snapshot_status_t : uint8_t {
+  CAPTURED = 0,
+  INVALID_ARGUMENT,
+  EPOCH_MISMATCH,
+  BASELINE_MISMATCH,
+  STORE_NOT_PRESENT,
+  STORE_INVALID,
+  RESOURCE_EXHAUSTED
+};
+
+struct lock_warmcopy_record_store_candidate_t;
+
+struct lock_warmcopy_record_candidate_plan_t {
+  uint64_t retained_logical_bytes{0};
+  uint64_t scratch_logical_bytes{0};
+  uint64_t payload_bytes{0};
+  uint32_t entry_count{0};
+  uint32_t record_lock_count{0};
+};
+
+enum class lock_warmcopy_record_candidate_status_t : uint8_t {
+  PREPARED = 0,
+  INVALID_ARGUMENT,
+  INVALID_PAYLOAD,
+  RESOURCE_EXHAUSTED
+};
+
+enum class lock_warmcopy_record_install_status_t : uint8_t {
+  INSTALLED = 0,
+  COMPARE_MISMATCH,
+  INVALID_ARGUMENT,
+  CANDIDATE_CONSUMED
+};
+
+struct lock_warmcopy_record_install_result_t {
+  lock_warmcopy_record_install_status_t status{
+      lock_warmcopy_record_install_status_t::INVALID_ARGUMENT};
+  uint64_t publication_token{0};
+  uint32_t record_lock_count{0};
+  lock_warmcopy_record_store_compare_token_t installed_token;
 };
 
 enum class lock_warmcopy_record_seal_status_t {
@@ -256,8 +340,11 @@ inline bool lock_warmcopy_hooks_enabled() {
 
 void lock_warmcopy_open_epoch(
     uint64_t epoch,
-    uint64_t max_journal_bytes = std::numeric_limits<uint64_t>::max());
+    uint64_t max_journal_bytes = std::numeric_limits<uint64_t>::max(),
+    lock_warmcopy_record_payload_mode_t record_payload_mode =
+        lock_warmcopy_record_payload_mode_t::IMAGE_IDENTITY);
 void lock_warmcopy_close_epoch();
+bool lock_warmcopy_record_compact_stable_page_enabled();
 void lock_warmcopy_record_hook_event();
 /*
   Native lock hooks report warmcopy bookkeeping only. A false return means the
@@ -280,6 +367,12 @@ bool lock_warmcopy_record_bitmap_reset_for_lock(const ib_lock_t *lock,
                                                 uint32_t heap_no);
 bool lock_warmcopy_record_note_bulk_mutation_for_lock(
     const ib_lock_t *lock, lock_warmcopy_record_bulk_mutation_t mutation);
+/*
+  The compact store records the waiting key but does not rewrite that key when
+  the request becomes granted. Advance the transaction coordinate before the
+  transition can occur.
+*/
+bool lock_warmcopy_record_note_wait_request_for_lock(const ib_lock_t *lock);
 bool lock_warmcopy_record_mark_discard_for_lock(const ib_lock_t *lock);
 bool lock_warmcopy_record_bitmap_set_with_image_for_trx(
     const trx_t *trx, const lock_warmcopy_record_shard_key_t &key,
@@ -310,6 +403,44 @@ bool lock_warmcopy_record_store_fence_for_target(
 bool lock_warmcopy_record_store_fence_equal(
     const lock_warmcopy_record_store_fence_t &lhs,
     const lock_warmcopy_record_store_fence_t &rhs);
+bool lock_warmcopy_record_store_compare_token_for_target(
+    uint64_t target_id,
+    lock_warmcopy_record_store_compare_token_t *token);
+bool lock_warmcopy_record_store_head_for_target(
+    uint64_t target_id, lock_warmcopy_record_store_head_t *head);
+/*
+  Phase1-only exact store snapshot.  The target partition mutex covers both
+  payload serialization and the returned compare token; it never acquires
+  lock_sys or opens a page.
+*/
+lock_warmcopy_record_store_snapshot_status_t
+lock_warmcopy_record_store_snapshot_candidate_for_target(
+    uint64_t target_id, uint64_t expected_epoch,
+    uint64_t expected_baseline_generation, uint32_t max_lock_count,
+    uint64_t max_payload_bytes, std::string *payload, uint32_t *lock_count,
+    lock_warmcopy_record_store_compare_token_t *token);
+bool lock_warmcopy_record_store_compare_token_equal(
+    const lock_warmcopy_record_store_compare_token_t &lhs,
+    const lock_warmcopy_record_store_compare_token_t &rhs);
+/* Allocation-free plan for a compact stable-page Phase1 payload. */
+lock_warmcopy_record_candidate_status_t
+lock_warmcopy_record_store_plan_candidate(
+    const std::string &payload,
+    lock_warmcopy_record_candidate_plan_t *plan);
+lock_warmcopy_record_candidate_status_t
+lock_warmcopy_record_store_prepare_candidate(
+    const std::string &payload,
+    std::shared_ptr<lock_warmcopy_record_store_candidate_t> *candidate,
+    uint32_t *record_lock_count);
+/*
+  Owner-only Phase1 CAS. The caller proves S0 == S1, validates the source
+  transaction identity, and serializes this call with epoch close/abort.
+*/
+bool lock_warmcopy_record_store_compare_and_install_candidate(
+    uint64_t target_id,
+    const lock_warmcopy_record_store_compare_token_t &expected,
+    const std::shared_ptr<lock_warmcopy_record_store_candidate_t> &candidate,
+    lock_warmcopy_record_install_result_t *result);
 bool lock_warmcopy_record_store_seal_for_target(
     uint64_t target_id, const lock_warmcopy_record_store_fence_t &phase1_fence,
     uint32_t max_lock_count, uint64_t max_journal_bytes,
@@ -359,6 +490,10 @@ bool lock_warmcopy_record_bitmap_set_with_image_for_target_for_unit_test(
     uint32_t heap_offset, const std::string &encoded_record_image);
 bool lock_warmcopy_record_bitmap_reset_for_unit_test(
     const lock_warmcopy_record_shard_key_t &key, uint32_t heap_no);
+#ifndef DBUG_OFF
+bool lock_warmcopy_record_discard_for_target_for_unit_test(
+    uint64_t target_id, const lock_warmcopy_record_shard_key_t &key);
+#endif
 bool lock_warmcopy_record_journal_upsert_for_target_for_unit_test(
     uint64_t target_id, uint64_t journal_sequence,
     const lock_warmcopy_record_shard_key_t &key, uint32_t heap_no,

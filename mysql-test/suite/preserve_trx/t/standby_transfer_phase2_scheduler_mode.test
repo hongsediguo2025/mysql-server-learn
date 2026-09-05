@@ -115,7 +115,8 @@ for my $name (qw(scheduler_fatal_count scan_unknown_result lineage_unknown
 die "missing progress-due crossing diagnostic"
   unless ($scheduler{'tick_crossed_unserviced_progress_deadline'} // '') =~
          /^\d+$/;
-for my $name (qw(attempt_id generation pre_closing_policy_started_us
+for my $name (qw(attempt_id generation phase1_started_us
+                 pre_closing_policy_started_us
                  hard_published_us closing_published_us final_ack_us
                  phase2_end_monotonic_us attempt_terminal_us
                  strict_interval_us)) {
@@ -132,7 +133,9 @@ die "wrong empty-body state"
 die "invalid eligible digest"
   unless ($field{'eligible_body_key_digest_v1'} // '') =~ /^[0-9a-f]{64}$/;
 die "milestone order is inconsistent"
-  unless $field{'pre_closing_policy_started_us'} <= $field{'hard_published_us'} &&
+  unless $field{'phase1_started_us'} <=
+             $field{'pre_closing_policy_started_us'} &&
+         $field{'pre_closing_policy_started_us'} <= $field{'hard_published_us'} &&
          $field{'hard_published_us'} <= $field{'closing_published_us'} &&
          $field{'closing_published_us'} <= $field{'final_ack_us'} &&
          $field{'final_ack_us'} <= $field{'phase2_end_monotonic_us'} &&

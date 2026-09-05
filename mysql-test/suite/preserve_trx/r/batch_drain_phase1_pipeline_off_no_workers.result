@@ -1,0 +1,5 @@
+SELECT @@GLOBAL.rds_preserve_trx_enable AS preserve_enabled,
+@@GLOBAL.rds_preserve_trx_phase1_capture_mode AS capture_mode;
+preserve_enabled	capture_mode
+0	BOUNDED_PIPELINE_V1
+ERROR HY000: Resumable transactions across shutdown are disabled

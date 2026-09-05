@@ -46,7 +46,6 @@ constexpr uint64_t kMdlOwnerProofPeriodUs = 5000;
 constexpr size_t kMdlMaxOwnerTickets = 256;
 constexpr size_t kMdlMaxOwnerMatches = 256;
 constexpr size_t kMdlMaxDemandCandidates = 256;
-constexpr size_t kStableBoundaryHintBatchLimit = 16;
 
 struct Command_key_less {
   bool operator()(const Command_key &left, const Command_key &right) const {
@@ -329,8 +328,6 @@ class Attempt {
   friend Attempt_handle publish_and_register_t0(THD *, const Owner_config &);
   friend Gate_action gate_command(THD *, const Admission_request &);
   friend Finish_result finish_command(THD *, const Command_exit_fact &);
-  friend void take_stable_boundary_hints(
-      const Attempt_handle &, std::vector<Stable_boundary_hint> *);
   friend void note_teardown_begin(uint64_t);
   friend void note_transaction_cleanup(uint64_t, const Transaction_key &);
   friend Terminal_result tick(const Attempt_handle &, uint64_t, uint64_t,
@@ -425,7 +422,6 @@ class Attempt {
       eligible_bodies;
   std::map<std::pair<uint64_t, uint64_t>, Command_key>
       eligible_projection_index;
-  std::map<uint64_t, Stable_boundary_hint> stable_boundary_hints;
   Terminal_result terminal{Terminal_result::RUNNING};
   uint32_t terminal_cause{0};
   Terminal_snapshot frozen_terminal_snapshot;
@@ -834,7 +830,6 @@ void enter_fail_closed_locked(Attempt *attempt, Terminal_result terminal,
   attempt->scan_candidates.clear();
   attempt->scan_round_open = false;
   attempt->scan_cursor = 0;
-  attempt->stable_boundary_hints.clear();
   for (auto &entry : attempt->commands) {
     entry.second.terminalizing = false;
   }
@@ -1097,8 +1092,6 @@ void close_transaction_locked(Attempt *attempt,
   }
   transaction->state = Attempt::Transaction_state::TERMINAL;
   erase_transaction_support_locked(attempt, transaction->key);
-  attempt->stable_boundary_hints.erase(
-      transaction->key.connection_incarnation);
   connection->has_old_transaction = false;
   connection->old_transaction = {};
 }
@@ -1289,11 +1282,6 @@ void apply_command_exit_locked(
       transaction->state == Attempt::Transaction_state::TERMINALIZING) {
     mark_safety_abort_locked(attempt);
     return;
-  }
-  if (fact.entered_body && fact.thread_id_projection != 0 &&
-      attempt->terminal == Terminal_result::RUNNING) {
-    attempt->stable_boundary_hints[command.key.connection_incarnation] =
-        Stable_boundary_hint{command.key, fact.thread_id_projection};
   }
 }
 
@@ -1597,17 +1585,6 @@ Attempt_handle publish_and_register_t0(THD *owner,
               key.connection_incarnation, raw_engine_cookie,
               isolation_level);
         }
-        if (!command_is_t0 && old_transaction != nullptr &&
-            candidate->thread_id() != 0 &&
-            m_attempt->terminal == Terminal_result::RUNNING) {
-          /*
-            An idle T0 transaction is already at a native command boundary.
-            Publish the same disposable Phase1 refresh hint that a later BODY
-            exit would publish; a new BODY erases it before entering EXECUTING.
-          */
-          m_attempt->stable_boundary_hints[key.connection_incarnation] =
-              Stable_boundary_hint{key, candidate->thread_id()};
-        }
         if (command_is_t0 &&
             m_attempt->retired_during_t0.count(key) == 0) {
           Attempt::Command_record record;
@@ -1775,8 +1752,6 @@ Gate_action gate_command(THD *command_thd,
         command_thd->preserve_trx_phase2_command_stage.load(
             std::memory_order_acquire);
     if (stage == Preserve_trx_phase2_command_stage::EXECUTING) {
-      attempt->stable_boundary_hints.erase(
-          request.command.connection_incarnation);
       Attempt::Command_record record;
       record.key = request.command;
       record.entered_body = true;
@@ -2006,8 +1981,6 @@ Gate_action gate_command(THD *command_thd,
         continue;
       }
       command_record.entered_body = true;
-      attempt->stable_boundary_hints.erase(
-          request.command.connection_incarnation);
       if (!note_eligible_body_locked(attempt.get(), request.command,
                                      command_thd->thread_id())) {
         mark_safety_abort_locked(attempt.get());
@@ -2148,37 +2121,6 @@ Finish_result finish_command(THD *command_thd,
   return finish_result;
 }
 
-void take_stable_boundary_hints(
-    const Attempt_handle &attempt,
-    std::vector<Stable_boundary_hint> *hints) {
-  if (hints == nullptr) return;
-  hints->clear();
-  if (attempt == nullptr) return;
-  std::lock_guard<std::mutex> lock(attempt->mutex);
-  if (attempt->terminal != Terminal_result::RUNNING ||
-      !attempt->t0_registration_complete) {
-    return;
-  }
-  hints->reserve(std::min(kStableBoundaryHintBatchLimit,
-                          attempt->stable_boundary_hints.size()));
-  for (auto entry = attempt->stable_boundary_hints.begin();
-       entry != attempt->stable_boundary_hints.end() &&
-       hints->size() < kStableBoundaryHintBatchLimit;) {
-    const auto connection = attempt->connections.find(entry->first);
-    if (connection != attempt->connections.end() &&
-        connection->second.thd != nullptr) {
-      const Preserve_trx_phase2_command_stage stage =
-          connection->second.thd->preserve_trx_phase2_command_stage.load(
-              std::memory_order_acquire);
-      if (stage == Preserve_trx_phase2_command_stage::IDLE ||
-          stage == Preserve_trx_phase2_command_stage::HELD) {
-        hints->push_back(entry->second);
-      }
-    }
-    entry = attempt->stable_boundary_hints.erase(entry);
-  }
-}
-
 void note_teardown_begin(uint64_t connection_incarnation) {
   Attempt_handle attempt = callback_attempt_snapshot();
   if (attempt == nullptr || connection_incarnation == 0) return;
@@ -2189,7 +2131,6 @@ void note_teardown_begin(uint64_t connection_incarnation) {
     auto connection = attempt->connections.find(connection_incarnation);
     if (connection == attempt->connections.end()) return;
     ++attempt->teardown_started;
-    attempt->stable_boundary_hints.erase(connection_incarnation);
     connection->second.thd = nullptr;
     for (auto command = attempt->commands.begin();
          command != attempt->commands.end();) {
@@ -2367,7 +2308,6 @@ Terminal_result tick(const Attempt_handle &attempt, uint64_t now_us,
         attempt->allow_new_probe_borrows = false;
         attempt->terminal = result;
         attempt->terminal_cause = deadline ? 1 : 0;
-        attempt->stable_boundary_hints.clear();
         clear_support_locked(attempt.get());
         attempt->mdl_demands.clear();
         attempt->mdl_demand_index.clear();

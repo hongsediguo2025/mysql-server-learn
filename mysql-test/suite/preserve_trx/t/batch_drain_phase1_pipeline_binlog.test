@@ -1,0 +1,198 @@
+# Bounded Phase1 must prepare non-empty binlog-cache prefixes through the
+# shared worker pipeline.  The legacy cohort prepare and serial stream paths
+# must not run in this mode.
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/have_log_bin.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+--disable_query_log
+--let $credential_file= $MYSQL_TMP_DIR/phase1-pipeline-binlog.secret
+--write_file $credential_file
+phase1-pipeline-binlog-secret
+EOF
+--exec chmod 600 $credential_file
+
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+DROP USER IF EXISTS phase1_pipeline_binlog_app@localhost;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'phase1-pipeline-binlog-secret';
+GRANT SHUTDOWN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.*
+  TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+CREATE USER phase1_pipeline_binlog_app@localhost;
+GRANT SELECT, UPDATE ON test.* TO phase1_pipeline_binlog_app@localhost;
+
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$MASTER_MYPORT --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=phase1_pipeline_binlog --rds-preserve-trx-transfer-credential-secret-file=$credential_file --rds-preserve-trx-phase1-capture-mode=BOUNDED_PIPELINE_V1 --rds-preserve-trx-phase1-pipeline-workers=4 --rds-preserve-trx-phase1-pipeline-result-slots=16 --rds-preserve-trx-phase1-pipeline-copy-chunk-bytes=65536 --rds-preserve-trx-drain-phase1-timeout-ms=30000 --rds-preserve-trx-drain-phase2-timeout-ms=30000
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--disable_query_log
+--let $restart_parameters=
+--source suite/preserve_trx/include/assert_phase2_dependency_mode.inc
+
+CALL mtr.add_suppression(
+  "PRESERVE: standby transfer source epoch commit failed status=9");
+
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=PROMOTION_PREPARE;
+SET GLOBAL binlog_format=ROW;
+
+CREATE TABLE t_phase1_pipeline_binlog(
+  id INT PRIMARY KEY,
+  v INT NOT NULL,
+  payload VARBINARY(4096) NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_phase1_pipeline_binlog VALUES
+  (1, 0, REPEAT('a', 4096)),
+  (2, 0, REPEAT('b', 4096)),
+  (3, 0, REPEAT('c', 4096));
+delimiter |;
+CREATE PROCEDURE p_phase1_pipeline_binlog(IN p_id INT, IN p_seed INT)
+BEGIN
+  DECLARE i INT DEFAULT 0;
+  WHILE i < 64 DO
+    SET i=i+1;
+    UPDATE t_phase1_pipeline_binlog
+       SET v=v+1,
+           payload=REPEAT(CHAR(65 + MOD(p_seed+i, 26)), 4096)
+     WHERE id=p_id;
+  END WHILE;
+END|
+delimiter ;|
+GRANT EXECUTE ON PROCEDURE test.p_phase1_pipeline_binlog
+  TO phase1_pipeline_binlog_app@localhost;
+
+--connect(phase1_binlog_app_1,localhost,phase1_pipeline_binlog_app,,test)
+--let $app_1_id= query_get_value(SELECT CONNECTION_ID() AS id, id, 1)
+START TRANSACTION;
+CALL p_phase1_pipeline_binlog(1, 1);
+
+--connect(phase1_binlog_app_2,localhost,phase1_pipeline_binlog_app,,test)
+--let $app_2_id= query_get_value(SELECT CONNECTION_ID() AS id, id, 1)
+START TRANSACTION;
+CALL p_phase1_pipeline_binlog(2, 7);
+
+# A real active transaction can legitimately have an empty binlog cache.  Its
+# live mirror remains useful for later appends, but its Phase1 baseline is
+# ABSENT and must not retry until the Phase1 deadline.
+--connect(phase1_binlog_app_3,localhost,phase1_pipeline_binlog_app,,test)
+--let $app_3_id= query_get_value(SELECT CONNECTION_ID() AS id, id, 1)
+START TRANSACTION;
+SAVEPOINT empty_cache;
+UPDATE t_phase1_pipeline_binlog SET v=v+1 WHERE id=3;
+ROLLBACK TO SAVEPOINT empty_cache;
+--disable_result_log
+SELECT id FROM t_phase1_pipeline_binlog WHERE id=3 FOR UPDATE;
+--enable_result_log
+
+--connect(phase1_binlog_owner,localhost,root,,test)
+SET SESSION debug='+d,preserve_trx_phase1_binlog_owner_inject_identity_stale,preserve_trx_phase1_owner_inject_one_retry';
+SET SESSION debug='+d,preserve_trx_transfer_fail_commit_before_send_once';
+--error ER_PRESERVE_TRX_UNSUPPORTED
+DRAIN TRANSACTIONS PRESERVE;
+SET SESSION debug='-d,preserve_trx_transfer_fail_commit_before_send_once';
+SET SESSION debug='-d,preserve_trx_phase1_binlog_owner_inject_identity_stale,preserve_trx_phase1_owner_inject_one_retry';
+
+# The source failure is before ownership send, so both original business
+# connections must remain usable and can complete their own transactions.
+--connection phase1_binlog_app_1
+--let $assert_text= first binlog target stayed on its original connection
+--let $assert_cond= `SELECT CONNECTION_ID()=$app_1_id`
+--source include/assert.inc
+COMMIT;
+--disconnect phase1_binlog_app_1
+--connection default
+--let $wait_condition= SELECT COUNT(*)=0 FROM performance_schema.threads WHERE PROCESSLIST_ID=$app_1_id
+--source include/wait_condition.inc
+
+--connection phase1_binlog_app_2
+--let $assert_text= second binlog target stayed on its original connection
+--let $assert_cond= `SELECT CONNECTION_ID()=$app_2_id`
+--source include/assert.inc
+COMMIT;
+--disconnect phase1_binlog_app_2
+
+--connection default
+--let $wait_condition= SELECT COUNT(*)=0 FROM performance_schema.threads WHERE PROCESSLIST_ID=$app_2_id
+--source include/wait_condition.inc
+
+--connection phase1_binlog_app_3
+--let $assert_text= empty binlog target stayed on its original connection
+--let $assert_cond= `SELECT CONNECTION_ID()=$app_3_id`
+--source include/assert.inc
+ROLLBACK;
+--disconnect phase1_binlog_app_3
+
+--connection default
+--let $wait_condition= SELECT COUNT(*)=0 FROM performance_schema.threads WHERE PROCESSLIST_ID=$app_3_id
+--source include/wait_condition.inc
+--let PHASE1_BINLOG_LOG= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--perl
+use strict;
+use warnings;
+
+my $path = $ENV{'PHASE1_BINLOG_LOG'} or die "missing error log";
+open(my $fh, '<', $path) or die "cannot read $path: $!";
+my $in_current_test = 0;
+my $bounded_complete = 0;
+my $record_retry_converged = 0;
+while (my $line = <$fh>) {
+  if ($line =~ /CURRENT_TEST:\s+preserve_trx\.(\S+)/) {
+    $in_current_test =
+      $1 eq 'batch_drain_phase1_pipeline_binlog';
+    next;
+  }
+  next unless $in_current_test;
+  if ($line =~ /PRESERVE_PHASE1_BINLOG_ADAPTER_V1 / &&
+      $line =~ /event=BASELINE_COMPLETE/ &&
+      $line =~ /targets=3/ &&
+      $line =~ /deferred_to_final=1/ &&
+      $line =~ /identity_churn_deferred=1/ &&
+      $line =~ /inflight=0/ && $line =~ /failed=0/) {
+    my ($targets) = $line =~ /targets=(\d+)/;
+    my ($prepared) = $line =~ /prepared=(\d+)/;
+    my ($absent) = $line =~ /absent=(\d+)/;
+    my ($deferred) = $line =~ /deferred_to_final=(\d+)/;
+    $bounded_complete = 1
+      if defined($targets) && defined($prepared) && defined($absent) &&
+         defined($deferred) &&
+         $prepared + $absent + $deferred == $targets;
+  }
+  if ($line =~ /PRESERVE_PHASE1_OWNER_V1 / &&
+      $line =~ /event=PRODUCTION_RECORD_BASELINE_COMPLETE/ &&
+      $line =~ /targets=3/ &&
+      $line =~ /published=3/ &&
+      $line =~ /deferred_to_final=0/ &&
+      $line =~ /retries=1/ &&
+      $line =~ /retry_delay_total_us=1000/ &&
+      $line =~ /retry_delay_max_us=1000/ &&
+      $line =~ /inflight=0/ && $line =~ /failed=0/) {
+    $record_retry_converged = 1;
+  }
+}
+close($fh);
+die "bounded binlog adapter did not defer transaction churn to final capture\n"
+  unless $bounded_complete;
+die "bounded record adapter did not converge after its one retry\n"
+  unless $record_retry_converged;
+EOF
+--let PHASE1_BINLOG_LOG=
+
+--enable_query_log
+SELECT @@GLOBAL.rds_preserve_trx_phase1_capture_mode AS capture_mode;
+SELECT id, v FROM t_phase1_pipeline_binlog ORDER BY id;
+--disable_query_log
+
+DROP PROCEDURE p_phase1_pipeline_binlog;
+DROP TABLE t_phase1_pipeline_binlog;
+DROP USER preserve_trx_ha_admin@localhost;
+DROP USER phase1_pipeline_binlog_app@localhost;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=BUSINESS_FIRST;
+SET GLOBAL rds_preserve_trx_enable=ON;
+--remove_file $credential_file

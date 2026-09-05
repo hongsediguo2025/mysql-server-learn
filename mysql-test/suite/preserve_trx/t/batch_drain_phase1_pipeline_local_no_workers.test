@@ -1,0 +1,53 @@
+--source include/have_debug.inc
+--source include/not_windows.inc
+
+SELECT @@GLOBAL.rds_preserve_trx_transfer_artifact_mode AS artifact_mode,
+       @@GLOBAL.rds_preserve_trx_phase1_capture_mode AS capture_mode;
+
+--disable_query_log
+CREATE TABLE t_phase1_pipeline_local(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_phase1_pipeline_local VALUES(1,10);
+
+--connect(pipeline_local_app,localhost,root,,test)
+START TRANSACTION;
+UPDATE t_phase1_pipeline_local SET v=11 WHERE id=1;
+
+--connect(pipeline_local_owner,localhost,root,,test)
+SET SESSION debug='+d,preserve_trx_warmcopy_fail_after_source_copy';
+--error ER_PRESERVE_TRX_UNSUPPORTED
+DRAIN TRANSACTIONS PRESERVE;
+SET SESSION debug='-d,preserve_trx_warmcopy_fail_after_source_copy';
+
+--connection pipeline_local_app
+COMMIT;
+
+--connection default
+--let PIPELINE_LOCAL_LOG= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--perl
+use strict;
+use warnings;
+my $path = $ENV{'PIPELINE_LOCAL_LOG'} or die "missing error log";
+open(my $fh, '<', $path) or die "cannot read $path: $!";
+my $in_current_test = 0;
+while (my $line = <$fh>) {
+  if ($line =~ /CURRENT_TEST:\s+preserve_trx\.(\S+)/) {
+    $in_current_test =
+      $1 eq 'batch_drain_phase1_pipeline_local_no_workers';
+    next;
+  }
+  next unless $in_current_test;
+  die "local carrier unexpectedly started standby Phase1 pipeline"
+    if $line =~ /PRESERVE_PHASE1_PIPELINE_V1 /;
+}
+close($fh);
+EOF
+--let PIPELINE_LOCAL_LOG=
+
+DROP TABLE t_phase1_pipeline_local;
+--enable_query_log
+
+--disconnect pipeline_local_owner
+--disconnect pipeline_local_app

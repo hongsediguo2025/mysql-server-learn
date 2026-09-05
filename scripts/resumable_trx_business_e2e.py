@@ -36,6 +36,12 @@ import time
 import zlib
 from typing import Callable, Deque, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
+from preserve_trx_phase2_scheduler_e2e import (
+    FinalRecordError,
+    parse_final_records,
+    validate_final_records,
+)
+
 
 LOG = logging.getLogger("resumable_trx_business_e2e")
 
@@ -63,6 +69,16 @@ EVIDENCE_KIND_STANDALONE_TRANSFER_RESET_E2E = (
 EVIDENCE_KIND_WARM_GATE_SIMULATOR = "WARM_GATE_SIMULATOR"
 PRESERVE_TRX_HA_ADMIN_USER = "preserve_trx_ha_admin"
 SOURCE_TIERED_LOAD_LABELS = ("10ms", "100ms", "200ms")
+PHASE2_FINAL_RECORD_MARKER = "PRESERVE_PHASE2_FINAL_V1"
+RECEIVER_READY_RECORD_MARKER = "PRESERVE_RECEIVER_READY_V1"
+PHASE1_PIPELINE_RECORD_MARKER = "PRESERVE_PHASE1_PIPELINE_V1"
+CONTINUOUS_COMMAND_SUCCESS_KINDS = (
+    "transaction_begin",
+    "large_dml",
+    "short_private_dml",
+    "intentional_lock_wait",
+    "transaction_commit",
+)
 
 
 def _evidence_contract(evidence_kind: str) -> Dict[str, object]:
@@ -540,6 +556,137 @@ class Operation:
         return self._sql.replace("{payload_expr}", payload_expr)
 
 
+@dataclasses.dataclass
+class ContinuousCommandLatencyStats:
+    """Fixed-size, worker-local command response latency statistics."""
+
+    limit_us: int
+    count: int = 0
+    total_us: int = 0
+    min_us: Optional[int] = None
+    max_us: int = 0
+    over_limit_count: int = 0
+    worst_command: Optional[str] = None
+
+    def record(self, elapsed_us: int, command_identity: str) -> None:
+        value = max(1, int(elapsed_us))
+        self.count += 1
+        self.total_us += value
+        if self.min_us is None or value < self.min_us:
+            self.min_us = value
+        if value > self.max_us:
+            self.max_us = value
+            self.worst_command = command_identity
+        if value > self.limit_us:
+            self.over_limit_count += 1
+
+    def merge(self, other: "ContinuousCommandLatencyStats") -> None:
+        if self.limit_us != other.limit_us:
+            raise ValueError(
+                "cannot merge command latency stats with different limits"
+            )
+        self.count += other.count
+        self.total_us += other.total_us
+        if other.min_us is not None and (
+            self.min_us is None or other.min_us < self.min_us
+        ):
+            self.min_us = other.min_us
+        if other.max_us > self.max_us:
+            self.max_us = other.max_us
+            self.worst_command = other.worst_command
+        self.over_limit_count += other.over_limit_count
+
+    def report(self) -> Dict[str, object]:
+        return {
+            "count": self.count,
+            "total_us": self.total_us,
+            "average_us": (
+                self.total_us // self.count if self.count > 0 else None
+            ),
+            "min_us": self.min_us,
+            "max_us": self.max_us if self.count > 0 else None,
+            "over_limit_count": self.over_limit_count,
+            "worst_command": self.worst_command,
+        }
+
+
+class ContinuousCommandLatencyRecorder:
+    """Single-writer latency recorder; aggregation happens after worker join."""
+
+    def __init__(self, limit_us: int) -> None:
+        self.limit_us = limit_us
+        self.successful_by_kind = {
+            kind: ContinuousCommandLatencyStats(limit_us)
+            for kind in CONTINUOUS_COMMAND_SUCCESS_KINDS
+        }
+        self.expected_4020 = ContinuousCommandLatencyStats(limit_us)
+
+    def record_success(
+        self, kind: str, elapsed_us: int, command_identity: str
+    ) -> None:
+        self.successful_by_kind[kind].record(
+            elapsed_us, command_identity
+        )
+
+    def record_expected_4020(
+        self, elapsed_us: int, command_identity: str
+    ) -> None:
+        self.expected_4020.record(elapsed_us, command_identity)
+
+
+def _continuous_command_latency_report(
+    workers: Sequence[object], limit_us: int
+) -> Dict[str, object]:
+    successful_by_kind = {
+        kind: ContinuousCommandLatencyStats(limit_us)
+        for kind in CONTINUOUS_COMMAND_SUCCESS_KINDS
+    }
+    expected_4020 = ContinuousCommandLatencyStats(limit_us)
+    worker_recorders_expected = len(workers)
+    worker_recorders_observed = 0
+    for worker in workers:
+        recorder = getattr(worker, "command_latency", None)
+        if not isinstance(recorder, ContinuousCommandLatencyRecorder):
+            continue
+        worker_recorders_observed += 1
+        if recorder.limit_us != limit_us:
+            raise ValueError(
+                "worker command latency limit differs from harness limit"
+            )
+        for kind, stats in recorder.successful_by_kind.items():
+            successful_by_kind[kind].merge(stats)
+        expected_4020.merge(recorder.expected_4020)
+
+    overall = ContinuousCommandLatencyStats(limit_us)
+    for stats in successful_by_kind.values():
+        overall.merge(stats)
+    overall.merge(expected_4020)
+    return {
+        "clock": "client_monotonic_send_to_server_response",
+        "limit_us": limit_us,
+        "worker_recorders_expected": worker_recorders_expected,
+        "worker_recorders_observed": worker_recorders_observed,
+        "worker_recorders_missing": (
+            worker_recorders_expected - worker_recorders_observed
+        ),
+        "worker_coverage_complete": (
+            worker_recorders_observed == worker_recorders_expected
+        ),
+        "successful_by_kind": {
+            kind: successful_by_kind[kind].report()
+            for kind in CONTINUOUS_COMMAND_SUCCESS_KINDS
+        },
+        "expected_4020": expected_4020.report(),
+        "overall": overall.report(),
+        "within_limit": (
+            worker_recorders_observed == worker_recorders_expected
+            and overall.count > 0
+            and overall.max_us <= limit_us
+            and overall.over_limit_count == 0
+        ),
+    }
+
+
 @dataclasses.dataclass(frozen=True)
 class RowState:
     sid: int
@@ -607,6 +754,10 @@ class HarnessConfig:
     drain_ready_timeout_s: float = 0.0
     business_run_before_drain_s: float = 0.0
     continuous_business_through_drain: bool = False
+    continuous_large_tx_shape: str = ""
+    continuous_large_tx_no_commit: bool = False
+    business_transaction_isolation: Optional[str] = None
+    business_command_latency_limit_us: int = 1_000_000
     short_transaction_sessions: int = 0
     short_transaction_table_count: int = 0
     short_transaction_rows_per_table: int = 0
@@ -628,6 +779,8 @@ class HarnessConfig:
     mixed_min_completed_statements: int = 0
     max_sql_resume_ms: int = 0
     compact_expected_state_row_threshold: int = 1_000_000
+    drain_phase1_timeout_ms: int = 600_000
+    source_post_command_tail_limit_us: int = 500_000
     preserve_timeout_s: int = 3600
     inflight_drain_probe: bool = False
     inflight_probe_min_waits: int = 1
@@ -700,6 +853,11 @@ class HarnessConfig:
     def __post_init__(self) -> None:
         if self.strict_binlog_transaction_order is None:
             self.strict_binlog_transaction_order = self.scenario in BINLOG_SCENARIOS
+        if (
+            self.continuous_business_through_drain
+            and self.business_transaction_isolation is None
+        ):
+            self.business_transaction_isolation = "REPEATABLE-READ"
 
     def validate(self) -> "HarnessConfig":
         if self.scenario not in SCENARIOS:
@@ -708,6 +866,25 @@ class HarnessConfig:
             raise ValueError("sessions must be positive")
         if self.table_count <= 0:
             raise ValueError("table_count must be positive")
+        if self.drain_phase1_timeout_ms <= 0:
+            raise ValueError("drain_phase1_timeout_ms must be positive")
+        if self.source_post_command_tail_limit_us <= 0:
+            raise ValueError(
+                "source_post_command_tail_limit_us must be positive"
+            )
+        if self.business_command_latency_limit_us <= 0:
+            raise ValueError(
+                "business_command_latency_limit_us must be positive"
+            )
+        if self.business_transaction_isolation not in {
+            None,
+            "READ-COMMITTED",
+            "REPEATABLE-READ",
+        }:
+            raise ValueError(
+                "business_transaction_isolation must be READ-COMMITTED or "
+                "REPEATABLE-READ"
+            )
         if self.continuous_business_through_drain:
             if self.scenario != "standby_transfer_receiver_drain_metrics":
                 raise ValueError(
@@ -718,6 +895,19 @@ class HarnessConfig:
                 raise ValueError(
                     "continuous business through DRAIN requires a positive "
                     "business window"
+                )
+            if self.business_transaction_isolation != "REPEATABLE-READ":
+                raise ValueError(
+                    "continuous business through DRAIN requires "
+                    "REPEATABLE-READ"
+                )
+            if self.continuous_large_tx_shape and self.continuous_large_tx_shape not in {
+                "RANGE_10000",
+                "RANGE_1000",
+                "RANGE_100000",
+            }:
+                raise ValueError(
+                    "unknown continuous large transaction shape"
                 )
             if self.cycles != 1:
                 raise ValueError(
@@ -735,14 +925,15 @@ class HarnessConfig:
             if (
                 self.lockset_batch_size <= 0
                 or not self.lockset_session_table_shards
-                or not self.lockset_noop_update
-                or not self.lockset_touch_one_row
+                or self.lockset_noop_update == self.continuous_large_tx_no_commit
+                or self.lockset_touch_one_row == self.continuous_large_tx_no_commit
                 or not self.lockset_minimal_table
                 or self.lockset_select_for_update
             ):
                 raise ValueError(
-                    "continuous large transactions require the sharded minimal "
-                    "no-op range UPDATE lockset with one touched row"
+                    "continuous large transactions require sharded minimal tables; "
+                    "no-op/touch-one-row flags must be OFF for no-commit "
+                    "and ON for the committing model"
                 )
             if (
                 self.statements_per_tx
@@ -784,6 +975,21 @@ class HarnessConfig:
             raise ValueError(
                 "short-transaction settings require "
                 "continuous_business_through_drain"
+            )
+        elif self.continuous_large_tx_shape:
+            raise ValueError(
+                "continuous_large_tx_shape requires "
+                "continuous_business_through_drain"
+            )
+        if self.continuous_large_tx_no_commit and (
+            not self.continuous_business_through_drain
+            or self.continuous_large_tx_shape != "RANGE_10000"
+            or self.lockset_batch_size != 10
+            or self.temp_table_workload
+        ):
+            raise ValueError(
+                "continuous_large_tx_no_commit requires continuous RANGE_10000 "
+                "with ten-row batches and no temporary tables"
             )
         if self.shutdown_gap_replay_probe:
             if self.scenario in {
@@ -1024,8 +1230,12 @@ class HarnessConfig:
             )
         if self.lockset_minimal_table and self.lockset_batch_size <= 0:
             raise ValueError("lockset_minimal_table requires lockset_batch_size")
-        if self.lockset_minimal_table and not self.lockset_noop_update:
-            raise ValueError("lockset_minimal_table requires lockset_noop_update")
+        if (
+            self.lockset_minimal_table
+            and not self.lockset_noop_update
+            and not self.continuous_large_tx_no_commit
+        ):
+            raise ValueError("lockset_minimal_table requires no-op or uncommitted UPDATEs")
         if self.lockset_minimal_table and self.lockset_select_for_update:
             raise ValueError(
                 "lockset_minimal_table cannot be combined with lockset_select_for_update"
@@ -1090,7 +1300,9 @@ class HarnessConfig:
         if self.compact_expected_state_row_threshold < 0:
             raise ValueError("compact_expected_state_row_threshold must be non-negative")
         if self.lockset_batch_size > 0:
-            operation_count = math.ceil(self.statements_per_tx / self.lockset_batch_size)
+            operation_count = math.ceil(
+                self.statements_per_tx / self.lockset_batch_size
+            )
             if self.min_statements_before_drain_pause > operation_count:
                 raise ValueError(
                     "min_statements_before_drain_pause cannot exceed lockset operation count"
@@ -1503,6 +1715,8 @@ CREATE TABLE `{table}` (
 """.strip()
 
     def transaction_statement_count(self, sid: int) -> int:
+        if self.config.lockset_batch_size > 0:
+            return self.bulk_lockset_operation_count()
         if not self.config.mixed_pressure_workload:
             return self.config.statements_per_tx
         if sid < 1 or sid > self.config.sessions:
@@ -2166,7 +2380,16 @@ WHERE n < {row_count}
     def bulk_lockset_operation_count(self) -> int:
         if self.config.lockset_batch_size <= 0:
             return self.config.statements_per_tx
-        return math.ceil(self.config.statements_per_tx / self.config.lockset_batch_size)
+        return math.ceil(
+            self.config.statements_per_tx / self.config.lockset_batch_size
+        )
+
+    def bulk_lockset_unique_range_count(self) -> int:
+        if self.config.lockset_batch_size <= 0:
+            return 0
+        return math.ceil(
+            self.config.statements_per_tx / self.config.lockset_batch_size
+        )
 
     def expected_seed_row_count(self) -> int:
         if self.config.repeated_row_write_workload:
@@ -2245,51 +2468,87 @@ WHERE n < {row_count}
             table_index = stmt_no % len(tables)
             table_batch_index = stmt_no // len(tables)
         low = table_batch_index * self.config.lockset_batch_size
-        remaining = self.config.statements_per_tx - stmt_no * self.config.lockset_batch_size
+        remaining = (
+            self.config.statements_per_tx
+            - table_batch_index * self.config.lockset_batch_size
+        )
         batch_rows = max(0, min(self.config.lockset_batch_size, remaining))
         return tables[table_index], low, low + batch_rows
 
-    def _bulk_lockset_operations(self, sid: int, tx_id: int) -> List[Operation]:
-        ops: List[Operation] = []
-        for stmt_no in range(self.bulk_lockset_operation_count()):
-            table, low, high = self.bulk_lockset_operation_range(sid, stmt_no)
-            value = sid * 10_000_000 + tx_id * 10_000 + stmt_no
-            note_prefix = f"bulk-s{sid:03d}-t{tx_id:05d}-n"
-            note_suffix = f"-stmt{stmt_no:05d}"
-            if self.config.lockset_select_for_update:
-                sql = (
-                    f"SELECT k FROM `{table}` "
-                    f"WHERE sid = {sid} AND k >= {low} AND k < {high} "
-                    f"FOR UPDATE"
-                )
-            elif self.config.lockset_noop_update:
-                assignment = "counter = counter"
-                if self.config.lockset_touch_one_row:
-                    assignment = f"counter = IF(k = {low}, {value}, counter)"
-                sql = (
-                    f"UPDATE `{table}` SET {assignment} "
-                    f"WHERE sid = {sid} AND k >= {low} AND k < {high}"
-                )
-            else:
-                sql = (
-                    f"UPDATE `{table}` SET v = {value}, counter = {stmt_no}, "
-                    f"amount = {stmt_no}.25, "
-                    f"d = DATE '2026-05-21' + INTERVAL {stmt_no % 20} DAY, "
-                    f"note = CONCAT('{note_prefix}', LPAD(k, 5, '0'), "
-                    f"'{note_suffix}'), "
-                    f"js = JSON_OBJECT('sid',{sid},'tx',{tx_id},"
-                    f"'stmt',{stmt_no},'k',k,'op','bulk_lockset'), deleted = 0 "
-                    f"WHERE sid = {sid} AND k >= {low} AND k < {high}"
-                )
-            ops.append(
-                Operation(
-                    OperationKind.BULK_LOCKSET_UPDATE,
-                    table,
-                    sql,
-                    discard_result=self.config.lockset_select_for_update,
-                )
+    def uncommitted_update_operation(self, sid: int, stmt_no: int) -> Operation:
+        # Four UPDATEs per range; wrap the range, never the transaction.
+        range_index = (stmt_no // 4) % self.bulk_lockset_unique_range_count()
+        table, low, high = self.bulk_lockset_operation_range(sid, range_index)
+        variant = stmt_no % 4
+        assignments = (
+            "counter = counter + 1",
+            "counter = (counter + 7) % 1000000000",
+            "counter = counter + 1",
+            "counter = counter + CASE WHEN MOD(k, 2) = 0 THEN 2 ELSE 3 END",
+        )
+        predicate = (
+            f"k = {low + variant}" if variant < 2
+            else f"k >= {low} AND k < {high}"
+        )
+        return Operation(
+            OperationKind.BULK_LOCKSET_UPDATE,
+            table,
+            f"UPDATE `{table}` FORCE INDEX (PRIMARY) SET {assignments[variant]} "
+            f"WHERE sid = {sid} AND {predicate}",
+        )
+
+    def bulk_lockset_operation(
+        self, sid: int, tx_id: int, stmt_no: int
+    ) -> Operation:
+        if stmt_no < 0 or stmt_no >= self.bulk_lockset_operation_count():
+            raise IndexError(f"bulk lockset statement out of range: {stmt_no}")
+        index_hint = (
+            " FORCE INDEX (PRIMARY)"
+            if self.config.continuous_business_through_drain
+            else ""
+        )
+        table, low, high = self.bulk_lockset_operation_range(sid, stmt_no)
+        value = sid * 10_000_000 + tx_id * 10_000 + stmt_no
+        note_prefix = f"bulk-s{sid:03d}-t{tx_id:05d}-n"
+        note_suffix = f"-stmt{stmt_no:05d}"
+        if self.config.lockset_select_for_update:
+            sql = (
+                f"SELECT k FROM `{table}`{index_hint} "
+                f"WHERE sid = {sid} AND k >= {low} AND k < {high} "
+                f"FOR UPDATE"
             )
-        return ops
+        elif self.config.lockset_noop_update:
+            assignment = "counter = counter"
+            if self.config.lockset_touch_one_row:
+                assignment = f"counter = IF(k = {low}, {value}, counter)"
+            sql = (
+                f"UPDATE `{table}`{index_hint} SET {assignment} "
+                f"WHERE sid = {sid} AND k >= {low} AND k < {high}"
+            )
+        else:
+            sql = (
+                f"UPDATE `{table}`{index_hint} SET v = {value}, "
+                f"counter = {stmt_no}, "
+                f"amount = {stmt_no}.25, "
+                f"d = DATE '2026-05-21' + INTERVAL {stmt_no % 20} DAY, "
+                f"note = CONCAT('{note_prefix}', LPAD(k, 5, '0'), "
+                f"'{note_suffix}'), "
+                f"js = JSON_OBJECT('sid',{sid},'tx',{tx_id},"
+                f"'stmt',{stmt_no},'k',k,'op','bulk_lockset'), deleted = 0 "
+                f"WHERE sid = {sid} AND k >= {low} AND k < {high}"
+            )
+        return Operation(
+            OperationKind.BULK_LOCKSET_UPDATE,
+            table,
+            sql,
+            discard_result=self.config.lockset_select_for_update,
+        )
+
+    def _bulk_lockset_operations(self, sid: int, tx_id: int) -> List[Operation]:
+        return [
+            self.bulk_lockset_operation(sid, tx_id, stmt_no)
+            for stmt_no in range(self.bulk_lockset_operation_count())
+        ]
 
     def transaction_operations(self, sid: int, tx_id: int) -> List[Operation]:
         if self.config.repeated_row_write_workload:
@@ -4792,8 +5051,33 @@ class ReceiverReadLoadProbe:
                     pass
 
 
+def _configure_and_verify_transaction_isolation(
+    runtime: MySQLRuntime, conn, expected: str
+) -> str:
+    sql_level = expected.replace("-", " ")
+    runtime.execute(
+        conn,
+        f"SET SESSION TRANSACTION ISOLATION LEVEL {sql_level}",
+    )
+    rows = runtime.execute(
+        conn, "SELECT @@session.transaction_isolation", fetch=True
+    )
+    if len(rows) != 1 or len(rows[0]) != 1:
+        raise RuntimeError(
+            "could not verify business transaction isolation: "
+            f"expected={expected} rows={rows!r}"
+        )
+    observed = str(rows[0][0]).strip().upper().replace("_", "-")
+    if observed != expected:
+        raise RuntimeError(
+            "business transaction isolation mismatch: "
+            f"expected={expected} observed={observed}"
+        )
+    return observed
+
+
 class ShortTransactionWorker(threading.Thread):
-    """Run one peer of a shared-gate-first short-transaction pair."""
+    """Run one peer of a private-DML-first short-transaction pair."""
 
     _MAX_LATENCY_SAMPLES = 2048
 
@@ -4818,7 +5102,17 @@ class ShortTransactionWorker(threading.Thread):
         self.drained_command_rejections = 0
         self.waiting_after_4020 = threading.Event()
         self.connection_retained_while_waiting = False
+        self.original_connection_retained_after_4020 = False
         self.connection_closed_without_4020_monotonic_us = 0
+        self.lock_wait_timeout_errors = 0
+        self.connection_errors = 0
+        self.reconnects = 0
+        self.unexpected_errors = 0
+        self.rollback_errors = 0
+        self.transaction_isolation: Optional[str] = None
+        self.command_latency = ContinuousCommandLatencyRecorder(
+            self.plan.config.business_command_latency_limit_us
+        )
         self._latency_lock = threading.Lock()
         self.transaction_latency_samples_us: Deque[int] = deque(
             maxlen=self._MAX_LATENCY_SAMPLES
@@ -4831,6 +5125,7 @@ class ShortTransactionWorker(threading.Thread):
         conn = None
         try:
             conn = self.runtime.connect(database=True, autocommit=False)
+            self._configure_connection(conn)
             tx_id = 0
             while not self.stop_event.is_set():
                 tx_id += 1
@@ -4839,6 +5134,7 @@ class ShortTransactionWorker(threading.Thread):
         except BaseException as exc:
             if self.stop_event.is_set() and self.runtime.is_connection_error(exc):
                 return
+            self._classify_unexpected_error(exc)
             LOG.exception("short worker sid=%s failed", self.sid)
             self.coordinator.errors.put(exc)
         finally:
@@ -4848,6 +5144,14 @@ class ShortTransactionWorker(threading.Thread):
                 except Exception:
                     pass
             self.connection_retained_while_waiting = False
+
+    def _configure_connection(self, conn) -> None:
+        isolation = self.plan.config.business_transaction_isolation
+        if isolation is None:
+            return
+        self.transaction_isolation = _configure_and_verify_transaction_isolation(
+            self.runtime, conn, isolation
+        )
 
     def _run_transaction(self, conn, tx_id: int) -> bool:
         table = self.plan.short_transaction_table_for_sid(self.sid)
@@ -4859,25 +5163,86 @@ class ShortTransactionWorker(threading.Thread):
         private_delete_id = private_low + ((tx_id * 2 + 1) % private_width)
         value = self.sid * 1_000_000 + tx_id
         statements = (
-            f"UPDATE `{table}` SET k=k+1 WHERE id=1",
-            f"UPDATE `{table}` SET k=k+1 WHERE id={private_update_id}",
-            f"UPDATE `{table}` SET c='c-{value}' WHERE id={private_update_id}",
-            f"DELETE FROM `{table}` WHERE id={private_delete_id}",
-            f"INSERT INTO `{table}`(id,k,c,pad) VALUES "
-            f"({private_delete_id},{value},'c-{value}','pad-{self.sid}')",
+            (
+                f"UPDATE `{table}` SET k=k+1 "
+                f"WHERE id={private_update_id}",
+                "short_private_dml",
+                f"private_k_update_id={private_update_id}",
+            ),
+            (
+                f"UPDATE `{table}` SET c='c-{value}' "
+                f"WHERE id={private_update_id}",
+                "short_private_dml",
+                f"private_c_update_id={private_update_id}",
+            ),
+            (
+                f"DELETE FROM `{table}` WHERE id={private_delete_id}",
+                "short_private_dml",
+                f"private_delete_id={private_delete_id}",
+            ),
+            (
+                f"INSERT INTO `{table}`(id,k,c,pad) VALUES "
+                f"({private_delete_id},{value},'c-{value}','pad-{self.sid}')",
+                "short_private_dml",
+                f"private_insert_id={private_delete_id}",
+            ),
+            (
+                f"UPDATE `{table}` SET k=k+1 WHERE id=1",
+                "intentional_lock_wait",
+                "shared_gate_update_id=1",
+            ),
         )
         started_ns = time.monotonic_ns()
         self.transactions_started += 1
+        command_identity = (
+            f"short sid={self.sid} tx={tx_id} START TRANSACTION"
+        )
+        command_started_ns = time.monotonic_ns()
         try:
-            self.runtime.execute(conn, "START TRANSACTION")
-            for sql in statements:
-                self.runtime.execute(conn, sql)
+            self.runtime.execute_command_without_connection_probe(
+                conn, "START TRANSACTION"
+            )
+            self.command_latency.record_success(
+                "transaction_begin",
+                max(1, (time.monotonic_ns() - command_started_ns) // 1000),
+                command_identity,
+            )
+            for sql, kind, command_label in statements:
+                command_identity = (
+                    f"short sid={self.sid} tx={tx_id} table={table} "
+                    f"{command_label}"
+                )
+                command_started_ns = time.monotonic_ns()
+                self.runtime.execute_command_without_connection_probe(conn, sql)
+                self.command_latency.record_success(
+                    kind,
+                    max(
+                        1,
+                        (time.monotonic_ns() - command_started_ns) // 1000,
+                    ),
+                    command_identity,
+                )
                 self.statements_completed += 1
+            command_identity = f"short sid={self.sid} tx={tx_id} COMMIT"
+            command_started_ns = time.monotonic_ns()
             conn.commit()
+            self.command_latency.record_success(
+                "transaction_commit",
+                max(1, (time.monotonic_ns() - command_started_ns) // 1000),
+                command_identity,
+            )
         except BaseException as exc:
+            command_response_elapsed_us = max(
+                1, (time.monotonic_ns() - command_started_ns) // 1000
+            )
             if self.runtime.is_preserve_session_drained(exc):
+                self.command_latency.record_expected_4020(
+                    command_response_elapsed_us,
+                    command_identity,
+                )
                 self.drained_command_rejections += 1
                 self.connection_retained_while_waiting = True
+                self.original_connection_retained_after_4020 = True
                 self.waiting_after_4020.set()
                 if not self.stop_event.wait(
                     self.plan.resume_connection_wait_timeout_s()
@@ -4888,6 +5253,7 @@ class ShortTransactionWorker(threading.Thread):
                     ) from exc
                 return False
             if self.runtime.is_connection_error(exc):
+                self.connection_errors += 1
                 self.connection_closed_without_4020_monotonic_us = (
                     time.monotonic_ns() // 1000
                 )
@@ -4895,7 +5261,7 @@ class ShortTransactionWorker(threading.Thread):
             try:
                 conn.rollback()
             except Exception:
-                pass
+                self.rollback_errors += 1
             raise RuntimeError(
                 f"short worker sid={self.sid} tx={tx_id} failed"
             ) from exc
@@ -4914,6 +5280,19 @@ class ShortTransactionWorker(threading.Thread):
             ):
                 self.transaction_latency_min_us = int(elapsed_us)
         return True
+
+    def _classify_unexpected_error(self, exc: BaseException) -> None:
+        chain: List[BaseException] = []
+        current: Optional[BaseException] = exc
+        while current is not None and current not in chain:
+            chain.append(current)
+            current = current.__cause__ or current.__context__
+        if any(self.runtime.is_lock_wait_timeout(item) for item in chain):
+            self.lock_wait_timeout_errors += 1
+        elif any(self.runtime.is_connection_error(item) for item in chain):
+            self.connection_errors += 1
+        else:
+            self.unexpected_errors += 1
 
     def latency_snapshot(
         self,
@@ -4960,6 +5339,20 @@ class BusinessWorker(threading.Thread):
         self.unsupported_handoff_rejections = 0
         self.waiting_after_4020 = threading.Event()
         self.connection_retained_while_waiting = False
+        self.original_connection_retained_after_4020 = False
+        self.lock_wait_timeout_errors = 0
+        self.connection_errors = 0
+        self.reconnects = 0
+        self.unexpected_errors = 0
+        self.rollback_errors = 0
+        self.transaction_isolation: Optional[str] = None
+        self.command_latency = (
+            ContinuousCommandLatencyRecorder(
+                self.plan.config.business_command_latency_limit_us
+            )
+            if self.plan.config.continuous_business_through_drain
+            else None
+        )
 
     def run(self) -> None:
         conn = None
@@ -5002,6 +5395,7 @@ class BusinessWorker(threading.Thread):
                     self.sid,
                 )
                 return
+            self._classify_unexpected_error(exc)
             LOG.exception("worker sid=%s failed", self.sid)
             self.coordinator.errors.put(exc)
         finally:
@@ -5015,6 +5409,14 @@ class BusinessWorker(threading.Thread):
             self.connection_retained_while_waiting = False
 
     def _configure_connection(self, conn) -> None:
+        isolation = self.plan.config.business_transaction_isolation
+        if isolation is not None:
+            self.transaction_isolation = (
+                _configure_and_verify_transaction_isolation(
+                    self.runtime, conn, isolation
+                )
+            )
+            return
         if (
             self.plan.config.lockset_batch_size <= 0
             and not self.plan.config.mixed_pressure_workload
@@ -5024,6 +5426,7 @@ class BusinessWorker(threading.Thread):
             conn,
             "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED",
         )
+        self.transaction_isolation = "READ-COMMITTED"
 
     def _initialize_temp_table(self, conn) -> None:
         if not self.plan.config.temp_table_workload:
@@ -5045,14 +5448,34 @@ class BusinessWorker(threading.Thread):
                     f"for sid {self.sid}"
                 )
             raise RuntimeError("standby transfer drain completed")
-        return self.coordinator.wait_for_resumed_connection(
+        resumed = self.coordinator.wait_for_resumed_connection(
             self.sid, self.plan.resume_connection_wait_timeout_s()
         )
+        if resumed is not None:
+            self.reconnects += 1
+        return resumed
+
+    def _classify_unexpected_error(self, exc: BaseException) -> None:
+        chain: List[BaseException] = []
+        current: Optional[BaseException] = exc
+        while current is not None and current not in chain:
+            chain.append(current)
+            current = current.__cause__ or current.__context__
+        if any(self.runtime.is_lock_wait_timeout(item) for item in chain):
+            self.lock_wait_timeout_errors += 1
+        elif any(self.runtime.is_connection_error(item) for item in chain):
+            self.connection_errors += 1
+        else:
+            self.unexpected_errors += 1
+
+    def _record_connection_error(self) -> None:
+        self.connection_errors += 1
 
     def _consume_expected_drain_handoff_error(self, exc: BaseException) -> bool:
         if self.runtime.is_preserve_session_drained(exc):
             self.drained_command_rejections += 1
             self.connection_retained_while_waiting = True
+            self.original_connection_retained_after_4020 = True
             self.waiting_after_4020.set()
             return True
         if not self.plan.config.mixed_pressure_workload:
@@ -5070,7 +5493,21 @@ class BusinessWorker(threading.Thread):
         self.unsupported_handoff_rejections += 1
         return True
 
+    def _log_expected_drain_response(self, message: str, *args) -> None:
+        log = (
+            LOG.debug
+            if self.plan.config.continuous_business_through_drain
+            else LOG.info
+        )
+        log(message, *args)
+
     def _record_statement_progress(self, conn, tx_id: int, stmt_index: int):
+        if self.plan.config.continuous_business_through_drain:
+            # This pressure model records progress in the client.  A server-side
+            # SET between DML statements is not a business command and is outside
+            # the Phase2 allowlist, so it must not interrupt a proven blocker's
+            # path to COMMIT.
+            return conn
         sql = f"SET @rtx_e2e_stmt_completed = {stmt_index}"
         while True:
             try:
@@ -5090,6 +5527,7 @@ class BusinessWorker(threading.Thread):
                     continue
                 if not self.runtime.is_connection_error(exc):
                     raise
+                self._record_connection_error()
                 LOG.info(
                     "worker sid=%s waiting for resume after tx=%s stmt=%s",
                     self.sid,
@@ -5098,23 +5536,74 @@ class BusinessWorker(threading.Thread):
                 )
                 conn = self._wait_for_resume_or_transfer_completion()
 
+    def _execute_business_command(self, conn, sql: str, fetch: bool = False):
+        if self.plan.config.continuous_business_through_drain and not fetch:
+            # mysql.connector cursor() probes with COM_PING first and masks a
+            # Phase2 4020 response as "Connection not available".  Send the
+            # business command directly so the server response stays visible.
+            self.runtime.execute_command_without_connection_probe(conn, sql)
+            return ()
+        return self.runtime.execute(conn, sql, fetch=fetch)
+
     def _run_transaction(self, conn, tx_id: int):
         large_bucket_mb = self.plan.large_cache_bucket_mb(self.sid, tx_id)
-        transaction_setup_sql = (
-            "START TRANSACTION",
-            f"SET @rtx_e2e_sid = {self.sid}",
-            f"SET @rtx_e2e_tx = {tx_id}",
-            f"SET @rtx_e2e_large_bucket_mb = {large_bucket_mb}",
-            "SET @rtx_e2e_stmt_completed = -1",
+        transaction_setup = (
+            (f"SET @rtx_e2e_sid = {self.sid}", None, "set_sid"),
+            (f"SET @rtx_e2e_tx = {tx_id}", None, "set_tx"),
+            (
+                f"SET @rtx_e2e_large_bucket_mb = {large_bucket_mb}",
+                None,
+                "set_large_bucket",
+            ),
+            (
+                "SET @rtx_e2e_stmt_completed = -1",
+                None,
+                "set_statement_progress",
+            ),
+            (
+                "START TRANSACTION",
+                "transaction_begin",
+                "START TRANSACTION",
+            ),
         )
-        for setup_sql in transaction_setup_sql:
+        for setup_sql, success_kind, setup_label in transaction_setup:
             while True:
+                setup_identity = (
+                    f"large sid={self.sid} tx={tx_id} {setup_label}"
+                )
+                setup_started_ns = time.monotonic_ns()
                 try:
-                    self.runtime.execute(conn, setup_sql)
+                    self._execute_business_command(conn, setup_sql)
+                    if (
+                        self.plan.config.continuous_business_through_drain
+                        and success_kind is not None
+                    ):
+                        self.command_latency.record_success(
+                            success_kind,
+                            max(
+                                1,
+                                (time.monotonic_ns() - setup_started_ns)
+                                // 1000,
+                            ),
+                            setup_identity,
+                        )
                     break
                 except BaseException as exc:
+                    setup_response_elapsed_us = (
+                        max(
+                            1,
+                            (time.monotonic_ns() - setup_started_ns) // 1000,
+                        )
+                        if self.plan.config.continuous_business_through_drain
+                        else 0
+                    )
                     if self._consume_expected_drain_handoff_error(exc):
-                        LOG.info(
+                        if self.plan.config.continuous_business_through_drain:
+                            self.command_latency.record_expected_4020(
+                                setup_response_elapsed_us,
+                                setup_identity,
+                            )
+                        self._log_expected_drain_response(
                             "worker sid=%s received drained-session response "
                             "while starting tx=%s; waiting for local RESUME or "
                             "transfer cleanup",
@@ -5125,6 +5614,7 @@ class BusinessWorker(threading.Thread):
                         continue
                     if not self.runtime.is_connection_error(exc):
                         raise
+                    self._record_connection_error()
                     LOG.info(
                         "worker sid=%s waiting for resume while starting tx=%s",
                         self.sid,
@@ -5134,9 +5624,13 @@ class BusinessWorker(threading.Thread):
         self.coordinator.mark_in_transaction(self.sid, True)
         self.coordinator.mark_drainable_transaction(self.sid, False)
 
+        lazy_bulk_lockset = bool(
+            self.plan.config.continuous_business_through_drain
+            and self.plan.config.lockset_batch_size > 0
+        )
         ops = (
             None
-            if self.plan.config.mixed_pressure_workload
+            if self.plan.config.mixed_pressure_workload or lazy_bulk_lockset
             else self.plan.transaction_operations(self.sid, tx_id)
         )
         statement_count = (
@@ -5148,25 +5642,43 @@ class BusinessWorker(threading.Thread):
         if (
             self.expected_state is not None
             and not self.expected_state.uses_compact_bulk_model()
+            and not self.plan.config.continuous_large_tx_no_commit
         ):
             tx_expected = self.expected_state.transaction_view(self.sid)
         stmt_index = 0
+        no_commit = self.plan.config.continuous_large_tx_no_commit
         pause_log_generation = 0
         finish_after_resume = False
         rollback_after_resume = False
         shutdown_gap_replay_generation: Optional[int] = None
-        while stmt_index < statement_count:
-            op = (
-                self.plan.mixed_pressure_operation(self.sid, tx_id, stmt_index)
-                if ops is None
-                else ops[stmt_index]
-            )
+        while no_commit or stmt_index < statement_count:
+            if no_commit and self.stop_event.is_set():
+                # Exit via the existing transfer cleanup path, never COMMIT.
+                raise RuntimeError("standby transfer drain completed")
+            if no_commit:
+                op = self.plan.uncommitted_update_operation(self.sid, stmt_index)
+            elif self.plan.config.mixed_pressure_workload:
+                op = self.plan.mixed_pressure_operation(
+                    self.sid, tx_id, stmt_index
+                )
+            elif lazy_bulk_lockset:
+                op = self.plan.bulk_lockset_operation(
+                    self.sid, tx_id, stmt_index
+                )
+            else:
+                assert ops is not None
+                op = ops[stmt_index]
             try:
                 if shutdown_gap_replay_generation is not None:
                     self.coordinator.mark_shutdown_gap_replay_sent(
                         self.sid, shutdown_gap_replay_generation, op.sql
                     )
                 operation_started_ns = time.monotonic_ns()
+                operation_identity = (
+                    f"large sid={self.sid} tx={tx_id} stmt={stmt_index} "
+                    f"op={op.kind.value} table={op.table}"
+                )
+                operation_response_elapsed_us: Optional[int] = None
                 is_mixed_tens_seconds_command = (
                     self.plan.config.mixed_pressure_workload
                     and op.duration_class == "tens_seconds"
@@ -5186,16 +5698,47 @@ class BusinessWorker(threading.Thread):
                     self.mixed_tens_seconds_command_inflight.set()
                 try:
                     try:
+                        command_started_ns = (
+                            time.monotonic_ns()
+                            if self.plan.config.continuous_business_through_drain
+                            else operation_started_ns
+                        )
                         if op.discard_result:
                             self.runtime.execute_discarding_result(conn, op.sql)
                             rows = ()
                         else:
-                            rows = self.runtime.execute(
+                            rows = self._execute_business_command(
                                 conn, op.sql, fetch=op.validator is not None
                             )
+                        if self.plan.config.continuous_business_through_drain:
+                            operation_response_elapsed_us = max(
+                                1,
+                                (
+                                    time.monotonic_ns()
+                                    - command_started_ns
+                                )
+                                // 1000,
+                            )
                     except BaseException as exc:
+                        response_elapsed_us = (
+                            max(
+                                1,
+                                (
+                                    time.monotonic_ns()
+                                    - command_started_ns
+                                )
+                                // 1000,
+                            )
+                            if self.plan.config.continuous_business_through_drain
+                            else 0
+                        )
                         if self._consume_expected_drain_handoff_error(exc):
-                            LOG.info(
+                            if self.plan.config.continuous_business_through_drain:
+                                self.command_latency.record_expected_4020(
+                                    response_elapsed_us,
+                                    operation_identity,
+                                )
+                            self._log_expected_drain_response(
                                 "worker sid=%s received drained-session response "
                                 "at tx=%s stmt=%s; waiting for local RESUME or "
                                 "transfer cleanup",
@@ -5255,6 +5798,13 @@ class BusinessWorker(threading.Thread):
                     self.duration_class_min_us[op.duration_class] = int(
                         operation_elapsed_us
                     )
+                if self.plan.config.continuous_business_through_drain:
+                    assert operation_response_elapsed_us is not None
+                    self.command_latency.record_success(
+                        "large_dml",
+                        operation_response_elapsed_us,
+                        operation_identity,
+                    )
                 conn = self._record_statement_progress(
                     conn, tx_id, stmt_index
                 )
@@ -5288,6 +5838,7 @@ class BusinessWorker(threading.Thread):
                         self.sid, self.plan.resume_connection_wait_timeout_s()
                     )
                     if resumed_conn is not None:
+                        self.reconnects += 1
                         conn = resumed_conn
                         if self.plan.finish_temp_transaction_after_resume():
                             finish_after_resume = True
@@ -5298,6 +5849,7 @@ class BusinessWorker(threading.Thread):
             except BaseException as exc:
                 if not self.runtime.is_connection_error(exc):
                     raise
+                self._record_connection_error()
                 if shutdown_gap_replay_generation is not None:
                     raise AssertionError(
                         "shutdown-gap SQL replay result is ambiguous; refusing "
@@ -5318,6 +5870,8 @@ class BusinessWorker(threading.Thread):
                     break
 
         while True:
+            commit_started_ns = 0
+            commit_identity = f"large sid={self.sid} tx={tx_id} COMMIT"
             try:
                 self.coordinator.mark_in_transaction(self.sid, False)
                 self.coordinator.mark_drainable_transaction(self.sid, False)
@@ -5325,9 +5879,22 @@ class BusinessWorker(threading.Thread):
                     conn.rollback()
                     self._verify_temp_table_rollback(conn, tx_id)
                     return conn
+                commit_started_ns = time.monotonic_ns()
                 conn.commit()
+                if self.plan.config.continuous_business_through_drain:
+                    self.command_latency.record_success(
+                        "transaction_commit",
+                        max(
+                            1,
+                            (time.monotonic_ns() - commit_started_ns) // 1000,
+                        ),
+                        commit_identity,
+                    )
                 completed_stmt_count = stmt_index if finish_after_resume else None
-                self._verify_committed_transaction(conn, tx_id, completed_stmt_count)
+                if not self.plan.config.continuous_business_through_drain:
+                    self._verify_committed_transaction(
+                        conn, tx_id, completed_stmt_count
+                    )
                 if finish_after_resume:
                     self._verify_temp_table_commit(
                         conn, tx_id, completed_stmt_count
@@ -5338,8 +5905,22 @@ class BusinessWorker(threading.Thread):
                     )
                 return conn
             except BaseException as exc:
+                commit_response_elapsed_us = (
+                    max(
+                        1,
+                        (time.monotonic_ns() - commit_started_ns) // 1000,
+                    )
+                    if self.plan.config.continuous_business_through_drain
+                    and commit_started_ns > 0
+                    else 0
+                )
                 if self._consume_expected_drain_handoff_error(exc):
-                    LOG.info(
+                    if self.plan.config.continuous_business_through_drain:
+                        self.command_latency.record_expected_4020(
+                            commit_response_elapsed_us,
+                            commit_identity,
+                        )
+                    self._log_expected_drain_response(
                         "worker sid=%s received drained-session response while "
                         "committing tx=%s; waiting for local RESUME or transfer cleanup",
                         self.sid,
@@ -5351,6 +5932,7 @@ class BusinessWorker(threading.Thread):
                     self.plan.config.scenario == "standby_transfer_receiver_drain_metrics"
                     and self.runtime.is_connection_error(exc)
                 ):
+                    self._record_connection_error()
                     LOG.info(
                         "worker sid=%s connection closed by standby-transfer DRAIN at commit",
                         self.sid,
@@ -5359,6 +5941,7 @@ class BusinessWorker(threading.Thread):
                     continue
                 if not self.runtime.is_connection_error(exc):
                     raise
+                self._record_connection_error()
                 LOG.info("worker sid=%s waiting for resume while committing tx=%s", self.sid, tx_id)
                 conn = self._wait_for_resume_or_transfer_completion()
 
@@ -5719,6 +6302,16 @@ class BusinessWorker(threading.Thread):
 
 
 class BusinessE2ERunner:
+    _CONTINUOUS_PROGRESS_SAMPLE_INTERVAL_S = 0.05
+    _CONTINUOUS_PROGRESS_MAX_BOUNDARY_ERROR_US = 500_000
+    # The DRAIN call/response bracket also contains post-terminal client
+    # scheduling. Bound its half-width with the same uncertainty budget used
+    # for the selected progress samples; it is not itself a sample interval.
+    _CONTINUOUS_CLOCK_MAPPING_MAX_INTERVAL_US = 1_000_000
+    _CONTINUOUS_BASELINE_WINDOW_US = 30_000_000
+    _CONTINUOUS_FORMAL_PHASE1_DROP_PCT = 20.0
+    _CONTINUOUS_ENGINEERING_PHASE1_DROP_PCT = 40.0
+
     def __init__(self, config: HarnessConfig):
         self.config = config.validate()
         self.plan = WorkloadPlan(self.config)
@@ -5747,6 +6340,15 @@ class BusinessE2ERunner:
         self.shutdown_gap_replay_samples: List[Dict[str, object]] = []
         self.resume_token_elapsed_samples_us: List[int] = []
         self.mixed_resumed_survivor_details: List[Dict[str, int]] = []
+        self.continuous_business_progress_samples: Deque[
+            Dict[str, int]
+        ] = deque(maxlen=20_000)
+        self._continuous_business_progress_lock = threading.Lock()
+        self._continuous_business_progress_stop = threading.Event()
+        self._continuous_business_progress_thread: Optional[
+            threading.Thread
+        ] = None
+        self._continuous_business_progress_error: Optional[str] = None
 
     def run(self) -> None:
         if self.config.promotion_gate_epoch_id:
@@ -5990,6 +6592,10 @@ class BusinessE2ERunner:
             error_log_offset = self.warmcopy_error_log_offset()
             if self.config.continuous_business_through_drain:
                 self.source_log_window_offset = int(error_log_offset or 0)
+                receiver_log_offset = self.receiver_error_log_offset()
+                self.receiver_log_window_offset = int(
+                    receiver_log_offset or 0
+                )
             LOG.info(
                 "issuing standby-transfer DRAIN TRANSACTIONS PRESERVE for receiver metrics"
             )
@@ -6040,6 +6646,11 @@ class BusinessE2ERunner:
                         f"{format_drain_target_counter_rejection(counter_metrics)}"
                     ) from exc
                 raise
+            finally:
+                if self.config.continuous_business_through_drain:
+                    self.continuous_drain_call_end_monotonic_us = (
+                        time.monotonic_ns() // 1000
+                    )
             if drain_will_restart is False:
                 counter_metrics = self.read_latest_drain_target_counter_rejection_since(
                     error_log_offset
@@ -6124,10 +6735,18 @@ class BusinessE2ERunner:
                     max_p99_increase_pct=(
                         self.config.receiver_read_load_max_p99_increase_pct
                     ),
+                    enforce_performance_budget=(
+                        not self.config.continuous_business_through_drain
+                    ),
                     enforce_p99_budget=(
                         not self.config.continuous_business_through_drain
                     ),
                 )
+            if self.config.continuous_business_through_drain:
+                self.stop_event.set()
+                self.join_workers()
+                self._stop_continuous_business_progress_sampler()
+                self._raise_worker_error_if_any()
             completed_stmt_total = sum(
                 worker.statements_completed for worker in self.workers
             )
@@ -6136,6 +6755,17 @@ class BusinessE2ERunner:
                 completed_stmt_total=completed_stmt_total,
             )
         except BaseException as exc:
+            if self.config.continuous_business_through_drain:
+                self.stop_event.set()
+                try:
+                    self.join_workers()
+                except Exception as join_exc:
+                    LOG.warning(
+                        "worker cleanup before failed continuous report did "
+                        "not finish: %s",
+                        join_exc,
+                    )
+                self._stop_continuous_business_progress_sampler()
             if source_tiered_load_probe is not None:
                 self.source_tiered_load_report = (
                     source_tiered_load_probe.stop(
@@ -6171,6 +6801,8 @@ class BusinessE2ERunner:
                 self.join_workers()
             except Exception as exc:
                 LOG.warning("worker cleanup after standby transfer drain did not finish: %s", exc)
+            if self.config.continuous_business_through_drain:
+                self._stop_continuous_business_progress_sampler()
 
     def run_standby_transfer_reset_drain(self) -> None:
         self.prepare_standby_transfer_credential_secret_files()
@@ -7873,6 +8505,7 @@ class BusinessE2ERunner:
     ) -> None:
         if not self.config.report_json:
             return
+        self.capture_continuous_timeline_records()
         report_path = Path(self.config.report_json).expanduser()
         report_path.parent.mkdir(parents=True, exist_ok=True)
         metrics = list(getattr(self, "warmcopy_drain_metrics", []))
@@ -8603,6 +9236,11 @@ class BusinessE2ERunner:
             report.update(source_tiered_load_report)
         if error:
             report["error"] = error
+        report["formal_evidence"] = bool(
+            status == "success"
+            and report.get("continuous_business_through_drain") is True
+            and report.get("continuous_formal_slo_pass") is True
+        )
         report_path.write_text(
             json.dumps(report, indent=2, sort_keys=True)
             + "\n",
@@ -8731,16 +9369,21 @@ class BusinessE2ERunner:
                     f"cap={receiver_prewarm_metrics.lock_plan_subpool_cap_bytes}"
                 )
 
-        ready_lag_us = receiver_prewarm_metrics.ready_after_final_spool_ack_us
-        ready_lag_label = "receiver_ready_after_final_spool_ack_us"
-        if ready_lag_us == 0:
-            ready_lag_us = receiver_prewarm_metrics.ready_after_final_metadata_us
-            ready_lag_label = "receiver_ready_after_final_metadata_us"
+        final_ack_us = (
+            receiver_prewarm_metrics.final_spool_ack_monotonic_us
+        )
+        ready_us = receiver_prewarm_metrics.ready_monotonic_us
+        if final_ack_us <= 0 or ready_us <= 0:
+            raise AssertionError(
+                "receiver readiness lacks receiver-local final ACK/READY "
+                f"milestones: final_ack_us={final_ack_us} ready_us={ready_us}"
+            )
+        ready_lag_us = max(0, ready_us - final_ack_us)
         max_lag_ms = self.config.max_receiver_ready_after_phase2_ms
         if max_lag_ms > 0 and ready_lag_us > max_lag_ms * 1000:
             raise AssertionError(
                 "receiver readiness lag exceeded threshold after final spool ACK: "
-                f"{ready_lag_label}={ready_lag_us} "
+                f"receiver_ready_after_final_spool_ack_us={ready_lag_us} "
                 f"max_ms={max_lag_ms}"
             )
 
@@ -9446,7 +10089,8 @@ END
             token_retention_timeout_ms = self.config.preserve_timeout_s * 1000
             commands = [
                 "SET GLOBAL rds_preserve_trx_enable=ON",
-                "SET GLOBAL rds_preserve_trx_drain_phase1_timeout_ms=600000",
+                "SET GLOBAL rds_preserve_trx_drain_phase1_timeout_ms="
+                f"{self.config.drain_phase1_timeout_ms}",
                 "SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms="
                 f"{drain_phase2_timeout_ms}",
                 "SET GLOBAL rds_preserve_trx_token_retention_timeout_ms="
@@ -9616,31 +10260,153 @@ END
         finally:
             conn.close()
 
-    def capture_continuous_scheduler_mode(self) -> None:
-        conn = self.runtime.connect(database=False)
+    def _read_global_variables(
+        self,
+        names: Sequence[str],
+        *,
+        connection_factory: Callable[[], object],
+    ) -> Dict[str, str]:
+        quoted = ", ".join(quote_sql_string(name) for name in names)
+        conn = connection_factory()
         try:
             rows = self.runtime.execute(
                 conn,
-                "SELECT "
-                "@@GLOBAL.rds_preserve_trx_standby_phase2_scheduler_mode",
+                "SELECT LOWER(VARIABLE_NAME), VARIABLE_VALUE "
+                "FROM performance_schema.global_variables "
+                f"WHERE LOWER(VARIABLE_NAME) IN ({quoted})",
                 fetch=True,
             )
-            if len(rows) != 1:
-                raise AssertionError(
-                    "continuous workload could not read the scheduler mode"
-                )
-            self.continuous_effective_scheduler_mode = str(rows[0][0])
-            if (
-                self.continuous_effective_scheduler_mode
-                != "DEPENDENCY_CONVERGENCE_V1"
-            ):
-                raise AssertionError(
-                    "continuous workload requires "
-                    "DEPENDENCY_CONVERGENCE_V1, observed "
-                    f"{self.continuous_effective_scheduler_mode!r}"
-                )
+            return {str(name).lower(): str(value) for name, value in rows}
         finally:
             conn.close()
+
+    @staticmethod
+    def _command_sysvar_value(
+        command: Optional[str], variable_name: str
+    ) -> Optional[str]:
+        return _mysqld_command_option(
+            command, "--" + variable_name.replace("_", "-")
+        )
+
+    def capture_continuous_scheduler_mode(self) -> None:
+        source_names = (
+            "rds_preserve_trx_standby_phase2_scheduler_mode",
+            "rds_preserve_trx_drain_phase1_timeout_ms",
+            "rds_preserve_trx_transfer_runtime_profile",
+            "rds_preserve_trx_transfer_max_inflight_bytes",
+            "rds_preserve_trx_memory_budget_bytes",
+            "rds_preserve_trx_phase1_capture_mode",
+            "rds_preserve_trx_phase1_pipeline_workers",
+            "rds_preserve_trx_phase1_pipeline_ordinary_active_limit",
+            "rds_preserve_trx_phase1_pipeline_credit_bytes",
+            "rds_preserve_trx_phase1_pipeline_record_reserve_bytes",
+            "rds_preserve_trx_phase1_pipeline_binlog_reserve_bytes",
+            "rds_preserve_trx_phase1_pipeline_copy_chunk_bytes",
+            "rds_preserve_trx_phase1_pipeline_cleanup_reserve_us",
+            "rds_preserve_trx_phase1_pipeline_result_slots",
+            "rds_preserve_trx_phase1_pipeline_tail_record_credit_bytes",
+        )
+        receiver_names = (
+            "rds_preserve_trx_transfer_runtime_profile",
+            "rds_preserve_trx_transfer_max_inflight_bytes",
+            "rds_preserve_trx_memory_budget_bytes",
+        )
+        source_observed = self._read_global_variables(
+            source_names,
+            connection_factory=lambda: self.runtime.connect(database=False),
+        )
+        receiver_observed = self._read_global_variables(
+            receiver_names,
+            connection_factory=self._receiver_admin_connection,
+        )
+
+        source_requested = {
+            name: self._command_sysvar_value(
+                self.config.source_start_command, name
+            )
+            for name in source_names
+        }
+        source_requested[
+            "rds_preserve_trx_drain_phase1_timeout_ms"
+        ] = str(self.config.drain_phase1_timeout_ms)
+        receiver_requested = {
+            name: self._command_sysvar_value(
+                self.config.receiver_start_command, name
+            )
+            for name in receiver_names
+        }
+
+        required_source = source_names
+        required_receiver = receiver_names
+        mismatches: List[str] = []
+        for endpoint, requested, observed, required in (
+            (
+                "source",
+                source_requested,
+                source_observed,
+                required_source,
+            ),
+            (
+                "receiver",
+                receiver_requested,
+                receiver_observed,
+                required_receiver,
+            ),
+        ):
+            for name in required:
+                expected = requested.get(name)
+                actual = observed.get(name)
+                if expected is None or actual is None:
+                    mismatches.append(
+                        f"{endpoint}.{name}: requested={expected!r} "
+                        f"observed={actual!r}"
+                    )
+                    continue
+                if expected.upper() != actual.upper():
+                    mismatches.append(
+                        f"{endpoint}.{name}: requested={expected!r} "
+                        f"observed={actual!r}"
+                    )
+
+        self.continuous_effective_scheduler_mode = source_observed.get(
+            "rds_preserve_trx_standby_phase2_scheduler_mode"
+        )
+        self.continuous_runtime_configuration = {
+            "source": {
+                "requested": {
+                    name: source_requested.get(name) or "N/A"
+                    for name in source_names
+                },
+                "observed": {
+                    name: source_observed.get(name, "N/A")
+                    for name in source_names
+                },
+            },
+            "receiver": {
+                "requested": {
+                    name: receiver_requested.get(name) or "N/A"
+                    for name in receiver_names
+                },
+                "observed": {
+                    name: receiver_observed.get(name, "N/A")
+                    for name in receiver_names
+                },
+            },
+            "mismatches": mismatches,
+            "required_values_match": not mismatches,
+        }
+        if mismatches:
+            raise AssertionError(
+                "continuous runtime configuration mismatch: "
+                + "; ".join(mismatches)
+            )
+        if self.continuous_effective_scheduler_mode != (
+            "DEPENDENCY_CONVERGENCE_V1"
+        ):
+            raise AssertionError(
+                "continuous workload requires DEPENDENCY_CONVERGENCE_V1, "
+                f"observed {self.continuous_effective_scheduler_mode!r}"
+            )
 
     def configure_standby_transfer_credentials(self) -> None:
         receiver_conn = self._receiver_admin_connection()
@@ -10467,6 +11233,753 @@ END
             ),
         }
 
+    def _capture_continuous_business_progress_sample(self) -> None:
+        collection_started_us = time.monotonic_ns() // 1000
+        snapshot = self._continuous_business_snapshot()
+        collection_ended_us = time.monotonic_ns() // 1000
+        sample = {
+            "monotonic_us": (
+                collection_started_us + collection_ended_us
+            ) // 2,
+            "collection_started_us": collection_started_us,
+            "collection_ended_us": collection_ended_us,
+            "collection_us": collection_ended_us - collection_started_us,
+            **snapshot,
+        }
+        with self._continuous_business_progress_lock:
+            self.continuous_business_progress_samples.append(sample)
+
+    def _continuous_business_progress_sampler_main(self) -> None:
+        try:
+            while not self._continuous_business_progress_stop.wait(
+                self._CONTINUOUS_PROGRESS_SAMPLE_INTERVAL_S
+            ):
+                self._capture_continuous_business_progress_sample()
+        except BaseException as exc:
+            self._continuous_business_progress_error = (
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    def _start_continuous_business_progress_sampler(self) -> None:
+        self._continuous_business_progress_stop.clear()
+        self._continuous_business_progress_error = None
+        with self._continuous_business_progress_lock:
+            self.continuous_business_progress_samples.clear()
+        self._capture_continuous_business_progress_sample()
+        sampler = threading.Thread(
+            target=self._continuous_business_progress_sampler_main,
+            name="rtx-continuous-progress-sampler",
+            daemon=True,
+        )
+        self._continuous_business_progress_thread = sampler
+        sampler.start()
+
+    def _stop_continuous_business_progress_sampler(self) -> None:
+        sampler = self._continuous_business_progress_thread
+        if sampler is None:
+            return
+        self._continuous_business_progress_stop.set()
+        if sampler is not None and sampler.ident is not None:
+            sampler.join(2.0)
+            if sampler.is_alive():
+                self._continuous_business_progress_error = (
+                    "continuous progress sampler did not stop"
+                )
+        self._capture_continuous_business_progress_sample()
+        self._continuous_business_progress_thread = None
+
+    def continuous_business_tps(self) -> Dict[str, object]:
+        with self._continuous_business_progress_lock:
+            samples = [dict(sample) for sample in self.continuous_business_progress_samples]
+        result: Dict[str, object] = {
+            "status": "INVALID",
+            "valid": False,
+            "clock_domain": "harness_monotonic_with_bounded_source_mapping",
+            "sample_interval_us": int(
+                self._CONTINUOUS_PROGRESS_SAMPLE_INTERVAL_S * 1_000_000
+            ),
+            "sample_count": len(samples),
+            "baseline_requested_us": self._CONTINUOUS_BASELINE_WINDOW_US,
+            "max_boundary_error_us": (
+                self._CONTINUOUS_PROGRESS_MAX_BOUNDARY_ERROR_US
+            ),
+            "sampler_error": self._continuous_business_progress_error,
+        }
+        timeline = dict(getattr(self, "continuous_source_timeline", {}))
+        phase1_started_us = int(timeline.get("phase1_started_us", 0) or 0)
+        t0_us = int(
+            timeline.get("pre_closing_policy_started_us", 0) or 0
+        )
+        phase2_end_us = int(
+            timeline.get("phase2_end_monotonic_us", 0) or 0
+        )
+        attempt_terminal_us = int(
+            timeline.get("attempt_terminal_us", 0) or 0
+        )
+        drain_call_start_us = int(
+            getattr(self, "continuous_drain_call_start_monotonic_us", 0)
+        )
+        drain_response_received_us = int(
+            getattr(
+                self,
+                "continuous_drain_response_received_monotonic_us",
+                0,
+            )
+        )
+        drain_call_end_us = int(
+            getattr(self, "continuous_drain_call_end_monotonic_us", 0)
+        )
+        result.update(
+            phase1_started_us=phase1_started_us,
+            t0_us=t0_us,
+            source_phase1_started_us=phase1_started_us,
+            source_t0_us=t0_us,
+            source_phase2_end_us=phase2_end_us,
+            source_attempt_terminal_us=attempt_terminal_us,
+            phase1_duration_us=max(0, t0_us - phase1_started_us),
+        )
+        invalid_reasons: List[str] = []
+        if self._continuous_business_progress_error:
+            invalid_reasons.append(self._continuous_business_progress_error)
+        if len(samples) < 3:
+            invalid_reasons.append("fewer than three progress samples")
+        if not (
+            0
+            < phase1_started_us
+            < t0_us
+            <= phase2_end_us
+            <= attempt_terminal_us
+        ):
+            invalid_reasons.append(
+                "source Phase1/T0/end/terminal milestones are invalid"
+            )
+        if not (
+            0
+            < drain_call_start_us
+            < drain_response_received_us
+            <= drain_call_end_us
+        ):
+            invalid_reasons.append("harness DRAIN call interval is invalid")
+        collection_samples_us: List[int] = []
+        for sample in samples:
+            collection_started_us = int(
+                sample.get("collection_started_us", 0) or 0
+            )
+            collection_ended_us = int(
+                sample.get("collection_ended_us", 0) or 0
+            )
+            collection_us = int(sample.get("collection_us", -1))
+            midpoint_us = int(sample.get("monotonic_us", 0) or 0)
+            if not (
+                0 < collection_started_us <= midpoint_us <= collection_ended_us
+                and collection_us
+                == collection_ended_us - collection_started_us
+            ):
+                invalid_reasons.append(
+                    "a business progress sample has invalid collection timing"
+                )
+                break
+            collection_samples_us.append(collection_us)
+        result["sample_collection_latency_us"] = _summarize_us_samples(
+            collection_samples_us
+        )
+        if invalid_reasons:
+            result["invalid_reasons"] = invalid_reasons
+            return result
+
+        source_drain_us = attempt_terminal_us - phase1_started_us
+        harness_drain_us = (
+            drain_response_received_us - drain_call_start_us
+        )
+        clock_offset_lower_us = drain_call_start_us - phase1_started_us
+        clock_offset_upper_us = (
+            drain_response_received_us - attempt_terminal_us
+        )
+        clock_mapping_interval_us = (
+            clock_offset_upper_us - clock_offset_lower_us
+        )
+        clock_mapping_uncertainty_us = (
+            max(0, clock_mapping_interval_us) + 1
+        ) // 2
+        clock_offset_us = (
+            clock_offset_lower_us + clock_offset_upper_us
+        ) // 2
+        mapped_phase1_started_us = phase1_started_us + clock_offset_us
+        mapped_t0_us = t0_us + clock_offset_us
+        result["clock_mapping"] = {
+            "source_interval_us": source_drain_us,
+            "harness_interval_us": harness_drain_us,
+            "offset_lower_us": clock_offset_lower_us,
+            "offset_upper_us": clock_offset_upper_us,
+            "offset_midpoint_us": clock_offset_us,
+            "offset_interval_us": clock_mapping_interval_us,
+            "offset_uncertainty_us": clock_mapping_uncertainty_us,
+            "max_offset_interval_us": (
+                self._CONTINUOUS_CLOCK_MAPPING_MAX_INTERVAL_US
+            ),
+            "source_phase2_end_us": phase2_end_us,
+            "source_attempt_terminal_us": attempt_terminal_us,
+            "harness_drain_call_start_us": drain_call_start_us,
+            "harness_drain_response_received_us": (
+                drain_response_received_us
+            ),
+            "harness_drain_call_end_us": drain_call_end_us,
+            "mapped_phase1_started_us": mapped_phase1_started_us,
+            "mapped_t0_us": mapped_t0_us,
+        }
+        if clock_mapping_interval_us < 0:
+            invalid_reasons.append(
+                "harness DRAIN interval is shorter than the source interval"
+            )
+        elif (
+            clock_mapping_interval_us
+            > self._CONTINUOUS_CLOCK_MAPPING_MAX_INTERVAL_US
+        ):
+            invalid_reasons.append(
+                "source-to-harness clock mapping interval is too wide"
+            )
+        if invalid_reasons:
+            result["invalid_reasons"] = invalid_reasons
+            return result
+
+        targets = {
+            "baseline_start": (
+                mapped_phase1_started_us - self._CONTINUOUS_BASELINE_WINDOW_US
+            ),
+            "phase1_start": mapped_phase1_started_us,
+            "t0": mapped_t0_us,
+        }
+        selected: Dict[str, Dict[str, int]] = {}
+        boundary_errors: Dict[str, int] = {}
+        boundary_uncertainties: Dict[str, int] = {}
+        for name, target_us in targets.items():
+            sample = min(
+                samples,
+                key=lambda item: abs(int(item["monotonic_us"]) - target_us),
+            )
+            selected[name] = sample
+            boundary_errors[name] = int(sample["monotonic_us"]) - target_us
+            boundary_uncertainties[name] = (
+                abs(boundary_errors[name])
+                + clock_mapping_uncertainty_us
+                + (int(sample["collection_us"]) + 1) // 2
+            )
+        max_abs_boundary_error_us = max(
+            abs(value) for value in boundary_errors.values()
+        )
+        max_boundary_uncertainty_us = max(boundary_uncertainties.values())
+        result["boundary_sample_offsets_us"] = boundary_errors
+        result["boundary_uncertainty_us"] = boundary_uncertainties
+        result["max_abs_boundary_error_us"] = max_abs_boundary_error_us
+        result["max_boundary_uncertainty_us"] = (
+            max_boundary_uncertainty_us
+        )
+        result["boundary_samples"] = selected
+        if (
+            max_boundary_uncertainty_us
+            > self._CONTINUOUS_PROGRESS_MAX_BOUNDARY_ERROR_US
+        ):
+            invalid_reasons.append(
+                "a milestone lacks a sufficiently precise progress sample"
+            )
+
+        baseline_start = selected["baseline_start"]
+        phase1_start = selected["phase1_start"]
+        t0 = selected["t0"]
+        baseline_actual_us = (
+            int(phase1_start["monotonic_us"])
+            - int(baseline_start["monotonic_us"])
+        )
+        phase1_actual_us = (
+            int(t0["monotonic_us"])
+            - int(phase1_start["monotonic_us"])
+        )
+        result["baseline_actual_us"] = baseline_actual_us
+        result["phase1_actual_us"] = phase1_actual_us
+        if baseline_actual_us <= 0 or phase1_actual_us <= 0:
+            invalid_reasons.append("a TPS window has non-positive duration")
+
+        counter_fields = (
+            "large_transactions_completed",
+            "short_transactions_completed",
+            "large_statements_completed",
+            "short_statements_completed",
+        )
+        if any(
+            int(right[field]) < int(left[field])
+            for field in counter_fields
+            for left, right in (
+                (baseline_start, phase1_start),
+                (phase1_start, t0),
+            )
+        ):
+            invalid_reasons.append("a business progress counter regressed")
+
+        def delta(
+            left: Mapping[str, int], right: Mapping[str, int], key: str
+        ) -> int:
+            return int(right[key]) - int(left[key])
+
+        def tps_group(name: str, key: Optional[str]) -> Dict[str, object]:
+            if key is None:
+                baseline_count = sum(
+                    delta(baseline_start, phase1_start, item)
+                    for item in (
+                        "large_transactions_completed",
+                        "short_transactions_completed",
+                    )
+                )
+                phase1_count = sum(
+                    delta(phase1_start, t0, item)
+                    for item in (
+                        "large_transactions_completed",
+                        "short_transactions_completed",
+                    )
+                )
+            else:
+                baseline_count = delta(baseline_start, phase1_start, key)
+                phase1_count = delta(phase1_start, t0, key)
+            baseline_tps = (
+                baseline_count * 1_000_000.0 / baseline_actual_us
+                if baseline_actual_us > 0
+                else None
+            )
+            phase1_tps = (
+                phase1_count * 1_000_000.0 / phase1_actual_us
+                if phase1_actual_us > 0
+                else None
+            )
+            phase1_tps_drop_pct = (
+                max(0.0, (baseline_tps - phase1_tps) * 100.0 / baseline_tps)
+                if baseline_tps is not None
+                and phase1_tps is not None
+                and baseline_tps > 0
+                else None
+            )
+            return {
+                "name": name,
+                "baseline_committed": baseline_count,
+                "phase1_committed": phase1_count,
+                "baseline_tps": (
+                    round(baseline_tps, 6)
+                    if baseline_tps is not None
+                    else None
+                ),
+                "phase1_tps": (
+                    round(phase1_tps, 6)
+                    if phase1_tps is not None
+                    else None
+                ),
+                "phase1_tps_drop_pct": (
+                    round(phase1_tps_drop_pct, 6)
+                    if phase1_tps_drop_pct is not None
+                    else None
+                ),
+            }
+
+        groups = {
+            "large": tps_group(
+                "large", "large_transactions_completed"
+            ),
+            "short": tps_group(
+                "short", "short_transactions_completed"
+            ),
+            "aggregate": tps_group("aggregate", None),
+        }
+        result["groups"] = groups
+        large_statement_baseline = delta(
+            baseline_start, phase1_start, "large_statements_completed"
+        )
+        large_statement_phase1 = delta(
+            phase1_start, t0, "large_statements_completed"
+        )
+        large_statement_baseline_per_s = (
+            large_statement_baseline * 1_000_000.0 / baseline_actual_us
+            if baseline_actual_us > 0
+            else None
+        )
+        large_statement_phase1_per_s = (
+            large_statement_phase1 * 1_000_000.0 / phase1_actual_us
+            if phase1_actual_us > 0
+            else None
+        )
+        large_statement_phase1_drop_pct = (
+            max(
+                0.0,
+                (
+                    large_statement_baseline_per_s
+                    - large_statement_phase1_per_s
+                )
+                * 100.0
+                / large_statement_baseline_per_s,
+            )
+            if large_statement_baseline_per_s is not None
+            and large_statement_phase1_per_s is not None
+            and large_statement_baseline_per_s > 0
+            else None
+        )
+        result["large_statement_progress"] = {
+            "baseline_count": large_statement_baseline,
+            "phase1_count": large_statement_phase1,
+            "baseline_per_s": (
+                round(large_statement_baseline_per_s, 6)
+                if large_statement_baseline_per_s is not None
+                else None
+            ),
+            "phase1_per_s": (
+                round(large_statement_phase1_per_s, 6)
+                if large_statement_phase1_per_s is not None
+                else None
+            ),
+            "phase1_rate_drop_pct": (
+                round(large_statement_phase1_drop_pct, 6)
+                if large_statement_phase1_drop_pct is not None
+                else None
+            ),
+        }
+        if int(groups["aggregate"]["baseline_committed"]) <= 0:
+            invalid_reasons.append("aggregate baseline committed count is zero")
+        if int(groups["short"]["baseline_committed"]) <= 0:
+            invalid_reasons.append(
+                "short-transaction baseline committed count is zero"
+            )
+        if large_statement_baseline <= 0:
+            invalid_reasons.append(
+                "large-transaction baseline statement count is zero"
+            )
+        if large_statement_phase1 <= 0:
+            invalid_reasons.append("large-transaction statements stopped in Phase1")
+        if invalid_reasons:
+            result["invalid_reasons"] = invalid_reasons
+            return result
+        result.update(status="VALID", valid=True, invalid_reasons=[])
+        return result
+
+    def continuous_business_error_counts(self) -> Dict[str, object]:
+        large_workers = list(getattr(self, "workers", []))
+        short_workers = list(getattr(self, "short_workers", []))
+
+        def worker_group(workers: Sequence[threading.Thread]) -> Dict[str, int]:
+            lock_wait_timeout_count = sum(
+                int(getattr(worker, "lock_wait_timeout_errors", 0))
+                for worker in workers
+            )
+            connection_error_count = sum(
+                int(getattr(worker, "connection_errors", 0))
+                for worker in workers
+            )
+            reconnect_count = sum(
+                int(getattr(worker, "reconnects", 0)) for worker in workers
+            )
+            unexpected_error_count = sum(
+                int(getattr(worker, "unexpected_errors", 0))
+                for worker in workers
+            )
+            rollback_error_count = sum(
+                int(getattr(worker, "rollback_errors", 0))
+                for worker in workers
+            )
+            non_4020_error_count = (
+                lock_wait_timeout_count
+                + connection_error_count
+                + unexpected_error_count
+                + rollback_error_count
+            )
+            return {
+                "lock_wait_timeout_count": lock_wait_timeout_count,
+                "connection_error_count": connection_error_count,
+                "reconnect_count": reconnect_count,
+                "unexpected_error_count": unexpected_error_count,
+                "rollback_error_count": rollback_error_count,
+                "non_4020_error_count": non_4020_error_count,
+            }
+
+        large = worker_group(large_workers)
+        short = worker_group(short_workers)
+        aggregate = {
+            key: int(large[key]) + int(short[key]) for key in large
+        }
+        return {"large": large, "short": short, "aggregate": aggregate}
+
+    def continuous_business_slo(
+        self,
+        business_tps: Mapping[str, object],
+        business_error_counts: Mapping[str, object],
+        command_latency: Mapping[str, object],
+    ) -> Dict[str, object]:
+        source_timeline = dict(
+            getattr(self, "continuous_source_timeline", {})
+        )
+        receiver_timeline = dict(
+            getattr(self, "continuous_receiver_timeline", {})
+        )
+        runtime_configuration = dict(
+            getattr(self, "continuous_runtime_configuration", {})
+        )
+        source_runtime = dict(runtime_configuration.get("source", {}))
+        source_observed = dict(source_runtime.get("observed", {}))
+        source_requested = dict(source_runtime.get("requested", {}))
+        aggregate_tps = dict(
+            dict(business_tps.get("groups", {})).get("aggregate", {})
+        )
+        short_tps = dict(
+            dict(business_tps.get("groups", {})).get("short", {})
+        )
+        large_statement_progress = dict(
+            business_tps.get("large_statement_progress", {})
+        )
+        aggregate_errors = dict(
+            business_error_counts.get("aggregate", {})
+        )
+        command_latency_overall = dict(command_latency.get("overall", {}))
+        phase1_us = int(source_timeline.get("phase1_duration_us", 0) or 0)
+        phase2_us = int(source_timeline.get("strict_interval_us", 0) or 0)
+        last_command_to_final_ack_us = int(
+            source_timeline.get("last_command_end_to_final_ack_us", 0) or 0
+        )
+        ready_us = int(
+            receiver_timeline.get(
+                "derived_ready_after_final_ack_us", 0
+            )
+            or 0
+        )
+        aggregate_drop = aggregate_tps.get("phase1_tps_drop_pct")
+        short_drop = short_tps.get("phase1_tps_drop_pct")
+        large_statement_drop = large_statement_progress.get(
+            "phase1_rate_drop_pct"
+        )
+        formal_drop_limit = self._CONTINUOUS_FORMAL_PHASE1_DROP_PCT
+        engineering_drop_limit = (
+            self._CONTINUOUS_ENGINEERING_PHASE1_DROP_PCT
+        )
+        workload_identity_matches = (
+            self.continuous_formal_workload_identity_matches()
+        )
+        pipeline_variables = (
+            "rds_preserve_trx_phase1_capture_mode",
+            "rds_preserve_trx_phase1_pipeline_workers",
+            "rds_preserve_trx_phase1_pipeline_ordinary_active_limit",
+            "rds_preserve_trx_phase1_pipeline_credit_bytes",
+            "rds_preserve_trx_phase1_pipeline_record_reserve_bytes",
+            "rds_preserve_trx_phase1_pipeline_binlog_reserve_bytes",
+            "rds_preserve_trx_phase1_pipeline_copy_chunk_bytes",
+            "rds_preserve_trx_phase1_pipeline_cleanup_reserve_us",
+            "rds_preserve_trx_phase1_pipeline_result_slots",
+            "rds_preserve_trx_phase1_pipeline_tail_record_credit_bytes",
+        )
+        pipeline_configuration_matches = bool(
+            source_observed.get("rds_preserve_trx_phase1_capture_mode")
+            == "BOUNDED_PIPELINE_V1"
+            and all(
+                source_requested.get(name) is not None
+                and source_observed.get(name) == source_requested.get(name)
+                for name in pipeline_variables
+            )
+        )
+        pipeline_snapshot = dict(
+            getattr(self, "continuous_phase1_pipeline_snapshot", {})
+        )
+        try:
+            requested_workers = int(
+                source_requested["rds_preserve_trx_phase1_pipeline_workers"]
+            )
+            requested_limit = int(
+                source_requested[
+                    "rds_preserve_trx_phase1_pipeline_ordinary_active_limit"
+                ]
+            )
+        except (KeyError, TypeError, ValueError):
+            requested_workers = 0
+            requested_limit = 0
+        effective_limit = min(requested_workers, requested_limit)
+        pipeline_attempt_matches = bool(
+            getattr(
+                self,
+                "continuous_phase1_pipeline_identity_matches",
+                False,
+            )
+            and requested_workers > 0
+            and requested_limit > 0
+            and pipeline_snapshot.get("workers_configured")
+            == requested_workers
+            and pipeline_snapshot.get("ordinary_active_limit_requested")
+            == requested_limit
+            and pipeline_snapshot.get("ordinary_active_limit_effective")
+            == effective_limit
+            and 0
+            < int(pipeline_snapshot.get("ordinary_active_high_water", 0))
+            <= effective_limit
+            and int(pipeline_snapshot.get("ordinary_active", -1)) == 0
+            and int(pipeline_snapshot.get("init_failures", -1)) == 0
+            and int(pipeline_snapshot.get("invariant_failures", -1)) == 0
+            and (
+                requested_limit >= requested_workers
+                or int(
+                    pipeline_snapshot.get(
+                        "ordinary_active_limit_deferrals", 0
+                    )
+                )
+                > 0
+            )
+        )
+        checks = {
+            "formal_workload_identity": workload_identity_matches,
+            "runtime_configuration_matches": bool(
+                runtime_configuration.get("required_values_match", False)
+            ),
+            "pipeline_configuration_matches": pipeline_configuration_matches,
+            "pipeline_attempt_matches": pipeline_attempt_matches,
+            "single_control_drain": int(
+                getattr(self, "continuous_drain_call_count", 0)
+            )
+            == 1,
+            "source_receiver_timeline_identity": bool(
+                getattr(
+                    self, "continuous_timeline_identity_matches", False
+                )
+            ),
+            "timeline_values_valid": bool(
+                getattr(self, "continuous_timeline_values_valid", False)
+            ),
+            "phase1_within_60s": 0 < phase1_us <= 60_000_000,
+            "t0_to_source_phase2_end_within_2s": (
+                0 < phase2_us <= 2_000_000
+            ),
+            "last_command_end_to_final_ack_within_limit": (
+                0 <= last_command_to_final_ack_us
+                < self.config.source_post_command_tail_limit_us
+                and bool(
+                    getattr(
+                        self, "continuous_timeline_values_valid", False
+                    )
+                )
+            ),
+            "receiver_final_ack_to_ready_within_500ms": (
+                0 <= ready_us <= 500_000
+                and int(receiver_timeline.get("final_ack_us", 0) or 0) > 0
+                and int(receiver_timeline.get("ready_us", 0) or 0) > 0
+            ),
+            "business_tps_evidence_valid": bool(
+                business_tps.get("valid", False)
+            ),
+            "large_statement_rate_drop_within_20pct": (
+                large_statement_drop is not None
+                and float(large_statement_drop) <= formal_drop_limit
+            ),
+            "short_transaction_tps_drop_within_20pct": (
+                short_drop is not None
+                and float(short_drop) <= formal_drop_limit
+            ),
+            "large_statement_progress_in_phase1": int(
+                large_statement_progress.get("phase1_count", 0) or 0
+            )
+            > 0,
+            "business_errors_zero": all(
+                int(aggregate_errors.get(name, 0) or 0) == 0
+                for name in (
+                    "lock_wait_timeout_count",
+                    "connection_error_count",
+                    "reconnect_count",
+                    "non_4020_error_count",
+                )
+            ),
+            "all_business_command_responses_within_limit": bool(
+                command_latency.get("within_limit", False)
+            )
+            and int(command_latency_overall.get("count", 0) or 0) > 0
+            and int(command_latency_overall.get("over_limit_count", 0) or 0)
+            == 0
+            and int(command_latency_overall.get("max_us", 0) or 0)
+            <= self.config.business_command_latency_limit_us,
+            "receiver_read_load_errors_zero": int(
+                dict(
+                    getattr(self, "receiver_read_load_report", {}) or {}
+                ).get("receiver_read_load_error_count", 0)
+                or 0
+            )
+            == 0,
+        }
+        engineering_checks = {
+            "business_tps_evidence_valid": bool(
+                business_tps.get("valid", False)
+            ),
+            "large_statement_rate_drop_within_40pct": (
+                large_statement_drop is not None
+                and float(large_statement_drop) <= engineering_drop_limit
+            ),
+            "short_transaction_tps_drop_within_40pct": (
+                short_drop is not None
+                and float(short_drop) <= engineering_drop_limit
+            ),
+        }
+        if self.config.continuous_large_tx_no_commit:
+            checks["large_transactions_never_committed"] = (
+                self.continuous_large_no_commit_report()["verified"]
+            )
+        return {
+            "passed": all(checks.values()),
+            "checks": checks,
+            "limits": {
+                "phase1_us": 60_000_000,
+                "t0_to_source_phase2_end_us": 2_000_000,
+                "last_command_end_to_final_ack_us": (
+                    self.config.source_post_command_tail_limit_us
+                ),
+                "receiver_final_ack_to_ready_us": 500_000,
+                "large_statement_rate_drop_pct": formal_drop_limit,
+                "short_transaction_tps_drop_pct": formal_drop_limit,
+                "business_command_response_us": (
+                    self.config.business_command_latency_limit_us
+                ),
+            },
+            "observed": {
+                "phase1_us": phase1_us,
+                "t0_to_source_phase2_end_us": phase2_us,
+                "last_command_end_to_final_ack_us": (
+                    last_command_to_final_ack_us
+                ),
+                "receiver_final_ack_to_ready_us": ready_us,
+                "large_statement_rate_drop_pct": large_statement_drop,
+                "short_transaction_tps_drop_pct": short_drop,
+                "business_command_response_max_us": int(
+                    command_latency_overall.get("max_us", 0) or 0
+                ),
+                "business_command_response_over_limit_count": int(
+                    command_latency_overall.get("over_limit_count", 0) or 0
+                ),
+                "aggregate_phase1_tps_drop_pct": aggregate_drop,
+                "aggregate_phase1_tps_drop_report_only": True,
+                "phase1_pipeline_ordinary_active_limit_requested": (
+                    requested_limit
+                ),
+                "phase1_pipeline_ordinary_active_limit_effective": (
+                    effective_limit
+                ),
+                "phase1_pipeline_ordinary_active_high_water": int(
+                    pipeline_snapshot.get("ordinary_active_high_water", 0)
+                ),
+                "phase1_pipeline_ordinary_active_limit_deferrals": int(
+                    pipeline_snapshot.get(
+                        "ordinary_active_limit_deferrals", 0
+                    )
+                ),
+            },
+            "engineering_milestone_40pct": {
+                "passed": all(engineering_checks.values()),
+                "checks": engineering_checks,
+                "limits": {
+                    "large_statement_rate_drop_pct": engineering_drop_limit,
+                    "short_transaction_tps_drop_pct": engineering_drop_limit,
+                },
+                "observed": {
+                    "large_statement_rate_drop_pct": large_statement_drop,
+                    "short_transaction_tps_drop_pct": short_drop,
+                    "aggregate_phase1_tps_drop_pct": aggregate_drop,
+                    "aggregate_phase1_tps_drop_report_only": True,
+                },
+            },
+        }
+
     def _run_continuous_business_window(self) -> None:
         readiness_deadline = time.monotonic() + max(
             60.0, self.config.resume_timeout_s
@@ -10500,6 +12013,7 @@ END
             time.sleep(min(0.05, remaining))
 
         self.continuous_business_start_snapshot = snapshot
+        self._start_continuous_business_progress_sampler()
         self.continuous_checkpoint_generation_at_window_start = (
             self.coordinator.current_drain_generation()
         )
@@ -10835,12 +12349,167 @@ END
             "max_sql_resume_ms": self.config.max_sql_resume_ms,
         }
 
+    def continuous_transaction_isolation_report(self) -> Dict[str, object]:
+        expected = self.config.business_transaction_isolation
+        large_workers = list(getattr(self, "workers", []))
+        short_workers = list(getattr(self, "short_workers", []))
+
+        def isolation_counts(workers: Sequence[threading.Thread]) -> Dict[str, int]:
+            counts = Counter(
+                str(getattr(worker, "transaction_isolation", None) or "UNVERIFIED")
+                for worker in workers
+            )
+            return dict(sorted(counts.items()))
+
+        large_counts = isolation_counts(large_workers)
+        short_counts = isolation_counts(short_workers)
+        verified = bool(
+            expected
+            and large_workers
+            and short_workers
+            and large_counts == {expected: len(large_workers)}
+            and short_counts == {expected: len(short_workers)}
+        )
+        return {
+            "continuous_business_transaction_isolation": expected,
+            "continuous_large_transaction_isolation_counts": large_counts,
+            "continuous_short_transaction_isolation_counts": short_counts,
+            "continuous_transaction_isolation_verified": verified,
+        }
+
+    def continuous_large_transaction_identity(self) -> Dict[str, object]:
+        plan = getattr(self, "plan", WorkloadPlan(self.config))
+        commands = plan.bulk_lockset_operation_count()
+        unique_ranges = plan.bulk_lockset_unique_range_count()
+        identity = {
+            "continuous_large_transaction_shape": (
+                self.config.continuous_large_tx_shape
+            ),
+            "continuous_large_transaction_update_commands_per_tx": commands,
+            "continuous_large_transaction_rows_per_update": (
+                self.config.lockset_batch_size
+            ),
+            "continuous_large_transaction_unique_rows_per_tx": (
+                self.config.statements_per_tx
+            ),
+            "continuous_large_transaction_range_passes_per_tx": (
+                commands // unique_ranges if unique_ranges > 0 else 0
+            ),
+            "continuous_large_transaction_row_visits_per_tx": (
+                commands * self.config.lockset_batch_size
+            ),
+            "continuous_large_transaction_changed_rows_per_update": 1,
+            "continuous_large_transaction_changed_row_events_per_tx": commands,
+        }
+        if self.config.continuous_large_tx_no_commit:
+            for key in identity:
+                if key.endswith(("_per_tx", "_per_update")):
+                    identity[key] = None
+            identity.update({
+                "continuous_large_transaction_model": "UPDATE_FOREVER",
+                "continuous_large_transaction_commit_policy": "NEVER",
+                "continuous_large_transaction_rows_per_update_min": 1,
+                "continuous_large_transaction_rows_per_update_max": (
+                    self.config.lockset_batch_size
+                ),
+                "continuous_large_transaction_updates_per_range_pass": (
+                    unique_ranges * 4
+                ),
+            })
+        return identity
+
+    def continuous_large_no_commit_report(self) -> Dict[str, object]:
+        workers = []
+        for worker in getattr(self, "workers", []):
+            stats = worker.command_latency.successful_by_kind
+            workers.append({
+                "sid": worker.sid,
+                "transaction_begin_count": stats["transaction_begin"].count,
+                "transaction_commit_count": stats["transaction_commit"].count,
+                "transactions_completed": worker.transactions_completed,
+                "updates_completed": worker.statements_completed,
+            })
+        updates = sum(worker["updates_completed"] for worker in workers)
+        variants = (
+            "point_increment", "point_assignment",
+            "range_increment", "range_conditional",
+        )
+        return {
+            "verified": len(workers) == self.config.sessions and all(
+                worker["transaction_begin_count"] == 1
+                and worker["transaction_commit_count"] == 0
+                and worker["transactions_completed"] == 0
+                and worker["updates_completed"] >= 4
+                for worker in workers
+            ),
+            "updates_completed": updates,
+            "update_variant_counts": {
+                name: sum((worker["updates_completed"] + 3 - index) // 4
+                          for worker in workers)
+                for index, name in enumerate(variants)
+            },
+            "completed_range_passes_min": min((
+                worker["updates_completed"]
+                // (self.plan.bulk_lockset_unique_range_count() * 4)
+                for worker in workers
+            ), default=0),
+            "workers": workers,
+        }
+
+    def continuous_formal_workload_identity_matches(self) -> bool:
+        expected_batch_sizes = {
+            "RANGE_10000": 10,
+            "RANGE_1000": 100,
+            "RANGE_100000": 1,
+        }
+        expected_batch_size = expected_batch_sizes.get(
+            self.config.continuous_large_tx_shape
+        )
+        plan = getattr(self, "plan", WorkloadPlan(self.config))
+        return bool(
+            expected_batch_size is not None
+            and self.config.scenario
+            == "standby_transfer_receiver_drain_metrics"
+            and self.config.continuous_business_through_drain
+            and self.config.business_transaction_isolation
+            == "REPEATABLE-READ"
+            and self.config.sessions == 1000
+            and self.config.table_count == 128
+            and self.config.statements_per_tx == 100_000
+            and self.config.seed_rows_per_table_per_session == 100_000
+            and self.config.lockset_batch_size == expected_batch_size
+            and plan.bulk_lockset_operation_count()
+            == 100_000 // expected_batch_size
+            and self.config.lockset_session_table_shards
+            and self.config.lockset_noop_update != self.config.continuous_large_tx_no_commit
+            and self.config.lockset_touch_one_row != self.config.continuous_large_tx_no_commit
+            and self.config.lockset_minimal_table
+            and not self.config.lockset_select_for_update
+            and self.config.business_run_before_drain_s == 300.0
+            and self.config.short_transaction_sessions == 100
+            and self.config.short_transaction_table_count == 50
+            and self.config.short_transaction_rows_per_table == 20_000
+            and not self.config.strict_token_count
+        )
+
     def continuous_business_report_fields(self) -> Dict[str, object]:
         if not self.config.continuous_business_through_drain:
             return {"continuous_business_through_drain": False}
 
         large_workers = list(getattr(self, "workers", []))
         short_workers = list(getattr(self, "short_workers", []))
+        business_tps = self.continuous_business_tps()
+        business_error_counts = self.continuous_business_error_counts()
+        aggregate_error_counts = dict(
+            business_error_counts.get("aggregate", {})
+        )
+        command_latency = _continuous_command_latency_report(
+            [*large_workers, *short_workers],
+            self.config.business_command_latency_limit_us,
+        )
+        business_slo = self.continuous_business_slo(
+            business_tps, business_error_counts, command_latency
+        )
         short_latency_snapshots = [
             worker.latency_snapshot() for worker in short_workers
         ]
@@ -10879,7 +12548,13 @@ END
         retained_workers = [
             worker
             for worker in waiting_workers
-            if bool(worker.connection_retained_while_waiting)
+            if bool(
+                getattr(
+                    worker,
+                    "original_connection_retained_after_4020",
+                    False,
+                )
+            )
         ]
         start_us = int(
             getattr(
@@ -10889,13 +12564,64 @@ END
         drain_call_us = int(
             getattr(self, "continuous_drain_call_start_monotonic_us", 0)
         )
+        drain_call_end_us = int(
+            getattr(self, "continuous_drain_call_end_monotonic_us", 0)
+        )
+        drain_response_received_us = int(
+            getattr(
+                self,
+                "continuous_drain_response_received_monotonic_us",
+                0,
+            )
+        )
         return {
             "continuous_business_through_drain": True,
+            **self.continuous_transaction_isolation_report(),
+            **self.continuous_large_transaction_identity(),
+            **({"continuous_large_no_commit": self.continuous_large_no_commit_report()}
+               if self.config.continuous_large_tx_no_commit else {}),
             "source_log_window_offset": int(
                 getattr(self, "source_log_window_offset", 0)
             ),
+            "receiver_log_window_offset": int(
+                getattr(self, "receiver_log_window_offset", 0)
+            ),
             "continuous_effective_scheduler_mode": getattr(
                 self, "continuous_effective_scheduler_mode", None
+            ),
+            "continuous_runtime_configuration": dict(
+                getattr(self, "continuous_runtime_configuration", {})
+            ),
+            "continuous_source_final_record_count": len(
+                getattr(self, "continuous_source_final_records", [])
+            ),
+            "continuous_receiver_ready_record_count": len(
+                getattr(self, "continuous_receiver_ready_records", [])
+            ),
+            "continuous_phase1_pipeline_record_count": len(
+                getattr(self, "continuous_phase1_pipeline_records", [])
+            ),
+            "continuous_phase1_pipeline_snapshot": dict(
+                getattr(self, "continuous_phase1_pipeline_snapshot", {})
+            ),
+            "continuous_phase1_pipeline_identity_matches": bool(
+                getattr(
+                    self,
+                    "continuous_phase1_pipeline_identity_matches",
+                    False,
+                )
+            ),
+            "continuous_source_timeline": dict(
+                getattr(self, "continuous_source_timeline", {})
+            ),
+            "continuous_receiver_timeline": dict(
+                getattr(self, "continuous_receiver_timeline", {})
+            ),
+            "continuous_timeline_identity_matches": bool(
+                getattr(self, "continuous_timeline_identity_matches", False)
+            ),
+            "continuous_timeline_values_valid": bool(
+                getattr(self, "continuous_timeline_values_valid", False)
             ),
             "continuous_large_transaction_sessions": self.config.sessions,
             "continuous_large_transaction_tables": self.config.table_count,
@@ -10945,6 +12671,10 @@ END
                 )
             ),
             "continuous_drain_call_start_monotonic_us": drain_call_us,
+            "continuous_drain_response_received_monotonic_us": (
+                drain_response_received_us
+            ),
+            "continuous_drain_call_end_monotonic_us": drain_call_end_us,
             "continuous_checkpoint_generation_at_window_start": int(
                 getattr(
                     self,
@@ -10968,8 +12698,18 @@ END
             ),
             "continuous_lock_wait_sensing_before_drain": False,
             "continuous_second_drain_on_no_lock_wait": False,
-            "receiver_read_load_qps_gate_enforced": True,
+            "receiver_read_load_qps_gate_enforced": False,
             "receiver_read_load_p99_gate_enforced": False,
+            "continuous_business_tps": business_tps,
+            "continuous_business_error_counts": business_error_counts,
+            "continuous_business_command_latency": command_latency,
+            "continuous_slo": business_slo,
+            "continuous_engineering_milestone_40pct": dict(
+                business_slo.get("engineering_milestone_40pct", {})
+            ),
+            "continuous_formal_slo_pass": bool(
+                business_slo.get("passed", False)
+            ),
             "continuous_business_start_snapshot": dict(
                 getattr(self, "continuous_business_start_snapshot", {})
             ),
@@ -11012,7 +12752,18 @@ END
             "continuous_workers_retaining_original_connection": len(
                 retained_workers
             ),
-            "continuous_business_reconnect_count": 0,
+            "continuous_business_lock_wait_timeout_count": int(
+                aggregate_error_counts.get("lock_wait_timeout_count", 0)
+            ),
+            "continuous_business_connection_error_count": int(
+                aggregate_error_counts.get("connection_error_count", 0)
+            ),
+            "continuous_business_reconnect_count": int(
+                aggregate_error_counts.get("reconnect_count", 0)
+            ),
+            "continuous_business_non_4020_error_count": int(
+                aggregate_error_counts.get("non_4020_error_count", 0)
+            ),
             "continuous_short_connection_closed_without_4020_count": len(
                 short_connection_close_us
             ),
@@ -11077,6 +12828,180 @@ END
             return Path(path).stat().st_size
         except FileNotFoundError:
             return 0
+
+    def receiver_error_log_path(self) -> Optional[str]:
+        return _mysqld_command_option(
+            self.config.receiver_start_command, "--log-error"
+        )
+
+    def receiver_error_log_offset(self) -> Optional[int]:
+        path = self.receiver_error_log_path()
+        if path is None:
+            return None
+        try:
+            return Path(path).stat().st_size
+        except FileNotFoundError:
+            return 0
+
+    @staticmethod
+    def _read_marker_records_since(
+        path: Optional[str], offset: Optional[int], marker: str
+    ) -> List[Dict[str, str]]:
+        if path is None or offset is None:
+            return []
+        log_path = Path(path)
+        try:
+            size = log_path.stat().st_size
+        except FileNotFoundError:
+            return []
+        safe_offset = offset if 0 <= offset <= size else 0
+        with log_path.open("r", encoding="utf-8", errors="replace") as reader:
+            reader.seek(safe_offset)
+            text = reader.read()
+        records: List[Dict[str, str]] = []
+        for line in text.splitlines():
+            marker_at = line.find(marker)
+            if marker_at < 0:
+                continue
+            values: Dict[str, str] = {}
+            malformed = False
+            for token in line[marker_at + len(marker):].strip().split():
+                if "=" not in token:
+                    continue
+                name, value = token.split("=", 1)
+                if not name or name in values:
+                    malformed = True
+                    break
+                values[name] = value
+            if not malformed:
+                records.append(values)
+        return records
+
+    def capture_continuous_timeline_records(self) -> None:
+        if not self.config.continuous_business_through_drain:
+            return
+        source_records = self._read_marker_records_since(
+            self.warmcopy_error_log_path(),
+            getattr(self, "source_log_window_offset", None),
+            PHASE2_FINAL_RECORD_MARKER,
+        )
+        receiver_records = self._read_marker_records_since(
+            self.receiver_error_log_path(),
+            getattr(self, "receiver_log_window_offset", None),
+            RECEIVER_READY_RECORD_MARKER,
+        )
+        pipeline_records = self._read_marker_records_since(
+            self.warmcopy_error_log_path(),
+            getattr(self, "source_log_window_offset", None),
+            PHASE1_PIPELINE_RECORD_MARKER,
+        )
+        self.continuous_source_final_records = source_records
+        self.continuous_receiver_ready_records = receiver_records
+        self.continuous_phase1_pipeline_records = pipeline_records
+        self.continuous_phase1_pipeline_snapshot = {}
+        self.continuous_phase1_pipeline_identity_matches = False
+        if len(source_records) != 1 or len(receiver_records) != 1:
+            return
+
+        source = source_records[0]
+        receiver = receiver_records[0]
+        receiver_integer_fields = (
+            "final_ack_us",
+            "ready_us",
+            "ready_after_final_ack_us",
+        )
+        try:
+            canonical_records = parse_final_records(
+                [
+                    PHASE2_FINAL_RECORD_MARKER
+                    + " "
+                    + " ".join(
+                        f"{name}={value}" for name, value in source.items()
+                    )
+                ]
+            )
+            canonical_validation = validate_final_records(
+                canonical_records,
+                require_success=True,
+                require_exact_body=True,
+                tail_limit_us=0,
+            )
+            source_values = dict(canonical_records[0].values)
+            receiver_values = {
+                name: int(receiver[name], 10)
+                for name in receiver_integer_fields
+            }
+        except (FinalRecordError, KeyError, ValueError):
+            return
+        self.continuous_source_final_validation = canonical_validation
+        receiver_values["epoch_id"] = receiver.get("epoch_id", "")
+        stopped_pipeline_records = [
+            record
+            for record in pipeline_records
+            if record.get("event") == "STOPPED"
+            and record.get("attempt_id") == str(source_values["attempt_id"])
+            and record.get("generation") == str(source_values["generation"])
+        ]
+        pipeline_integer_fields = (
+            "attempt_id",
+            "generation",
+            "workers_configured",
+            "workers_ready",
+            "init_failures",
+            "invariant_failures",
+            "ordinary_active_limit_requested",
+            "ordinary_active_limit_effective",
+            "ordinary_active",
+            "ordinary_active_high_water",
+            "ordinary_active_limit_deferrals",
+            "final_record_capture_operation_samples",
+            "final_record_capture_operation_us_total",
+            "final_record_capture_operation_us_max",
+            "final_record_capture_operation_overruns",
+            "final_record_store_snapshot_operation_samples",
+            "final_record_store_snapshot_operation_us_total",
+            "final_record_store_snapshot_operation_us_max",
+            "final_record_store_snapshot_operation_overruns",
+            "final_record_prepare_operation_samples",
+            "final_record_prepare_operation_us_total",
+            "final_record_prepare_operation_us_max",
+            "final_record_prepare_operation_overruns",
+        )
+        if len(stopped_pipeline_records) == 1:
+            try:
+                self.continuous_phase1_pipeline_snapshot = {
+                    name: int(stopped_pipeline_records[0][name], 10)
+                    for name in pipeline_integer_fields
+                }
+                self.continuous_phase1_pipeline_identity_matches = True
+            except (KeyError, ValueError):
+                self.continuous_phase1_pipeline_snapshot = {}
+        source_values["phase1_duration_us"] = max(
+            0,
+            source_values["pre_closing_policy_started_us"]
+            - source_values["phase1_started_us"],
+        )
+        derived_receiver_lag_us = max(
+            0,
+            receiver_values["ready_us"]
+            - receiver_values["final_ack_us"],
+        )
+        receiver_values[
+            "derived_ready_after_final_ack_us"
+        ] = derived_receiver_lag_us
+        self.continuous_source_timeline = source_values
+        self.continuous_receiver_timeline = receiver_values
+        self.continuous_timeline_identity_matches = bool(
+            source_values["transfer_epoch_id"]
+            and source_values["transfer_epoch_id"]
+            == receiver_values["epoch_id"]
+        )
+        self.continuous_timeline_values_valid = bool(
+            receiver_values["final_ack_us"] > 0
+            and receiver_values["ready_us"] > 0
+            and receiver_values["ready_after_final_ack_us"]
+            == derived_receiver_lag_us
+        )
 
     def read_latest_warmcopy_metrics_since(
         self, offset: Optional[int]
@@ -12281,6 +14206,10 @@ END
                 "DRAIN TRANSACTIONS PRESERVE WITH USER VARS",
                 fetch=expects_transfer_result,
             )
+            if self.config.continuous_business_through_drain:
+                self.continuous_drain_response_received_monotonic_us = (
+                    time.monotonic_ns() // 1000
+                )
             if expects_transfer_result:
                 self.drain_result_rows = self._decode_transfer_drain_result(rows)
                 self.validate_standby_transfer_drain_result(
@@ -14001,6 +15930,10 @@ command is used after each DRAIN command shuts that server down.
     parser.add_argument("--drain-ready-timeout", dest="drain_ready_timeout_s", type=float, default=0.0, help="harness watchdog while workers finish their current transaction and pause before DRAIN; 0 keeps the legacy resume-timeout fallback")
     parser.add_argument("--business-run-before-drain", dest="business_run_before_drain_s", type=float, default=0.0, help="seconds to let workers run real business DML before issuing DRAIN directly; 0 keeps the deterministic pre-paused mode")
     parser.add_argument("--continuous-business-through-drain", action="store_true", help="run independent large and paired short transactions continuously until the time-driven control DRAIN cuts them off")
+    parser.add_argument("--continuous-large-tx-shape", choices=("RANGE_10000", "RANGE_1000", "RANGE_100000"), default="", help="identity of the dependency-continuous large transaction shape")
+    parser.add_argument("--large-tx-no-commit", action="store_true", help="keep each large transaction open while looping point/range UPDATEs")
+    parser.add_argument("--business-transaction-isolation", choices=("READ-COMMITTED", "REPEATABLE-READ"), help="explicit transaction isolation for business workers; continuous dependency pressure defaults to REPEATABLE-READ")
+    parser.add_argument("--business-command-latency-limit-us", type=int, default=1_000_000, help="maximum client-observed server response latency for each command included by the continuous dependency workload")
     parser.add_argument("--short-transaction-sessions", type=int, default=0, help="paired short-transaction source connections for continuous-through-DRAIN evidence")
     parser.add_argument("--short-transaction-table-count", type=int, default=0, help="disjoint short-transaction tables; exactly one table per connection pair")
     parser.add_argument("--short-transaction-rows-per-table", type=int, default=0, help="seed rows in each disjoint short-transaction table")
@@ -14021,6 +15954,8 @@ command is used after each DRAIN command shuts that server down.
     parser.add_argument("--mixed-min-started-sessions", type=int, default=0, help="minimum mixed-pressure connections that must execute SQL before DRAIN")
     parser.add_argument("--mixed-min-completed-statements", type=int, default=0, help="minimum aggregate business SQL count required after warmup before DRAIN")
     parser.add_argument("--max-sql-resume-ms", type=int, default=0, help="maximum individual SQL RESUME latency for local startup evidence; 0 disables the gate")
+    parser.add_argument("--drain-phase1-timeout-ms", type=int, default=600_000, help="Phase1 readiness timeout applied by the harness for this attempt")
+    parser.add_argument("--source-post-command-tail-limit-us", type=int, default=500_000, help="strict upper bound for exact last-command-end to source Final ACK evidence")
     parser.add_argument("--preserve-timeout", dest="preserve_timeout_s", type=int, default=3600, help="READY/FAILED token retention in seconds; configures rds_preserve_trx_token_retention_timeout_ms")
     parser.add_argument("--inflight-drain-probe", action="store_true", help="allow even-numbered workers to enter real UPDATE lock waits before each DRAIN")
     parser.add_argument("--inflight-probe-min-waits", dest="inflight_probe_min_waits", type=int, default=1, help="minimum simultaneous harness data_lock_waits required before issuing DRAIN in in-flight probe mode")
@@ -14170,6 +16105,12 @@ command is used after each DRAIN command shuts that server down.
         continuous_business_through_drain=(
             args.continuous_business_through_drain
         ),
+        continuous_large_tx_shape=args.continuous_large_tx_shape,
+        continuous_large_tx_no_commit=args.large_tx_no_commit,
+        business_transaction_isolation=args.business_transaction_isolation,
+        business_command_latency_limit_us=(
+            args.business_command_latency_limit_us
+        ),
         short_transaction_sessions=args.short_transaction_sessions,
         short_transaction_table_count=args.short_transaction_table_count,
         short_transaction_rows_per_table=(
@@ -14192,6 +16133,10 @@ command is used after each DRAIN command shuts that server down.
         mixed_min_started_sessions=args.mixed_min_started_sessions,
         mixed_min_completed_statements=args.mixed_min_completed_statements,
         max_sql_resume_ms=args.max_sql_resume_ms,
+        drain_phase1_timeout_ms=args.drain_phase1_timeout_ms,
+        source_post_command_tail_limit_us=(
+            args.source_post_command_tail_limit_us
+        ),
         preserve_timeout_s=args.preserve_timeout_s,
         inflight_drain_probe=args.inflight_drain_probe,
         inflight_probe_min_waits=args.inflight_probe_min_waits,

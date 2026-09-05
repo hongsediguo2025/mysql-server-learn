@@ -1,0 +1,4 @@
+SELECT @@GLOBAL.rds_preserve_trx_phase1_capture_mode AS capture_mode;
+capture_mode
+LEGACY_SERIAL
+ERROR HY000: Resumable transactions across shutdown do not support this operation

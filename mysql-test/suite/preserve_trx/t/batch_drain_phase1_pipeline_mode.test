@@ -1,0 +1,560 @@
+--source include/have_debug.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+--let $credential_file= $MYSQL_TMP_DIR/phase1-pipeline-mode.secret
+--write_file $credential_file
+phase1-pipeline-mode-secret
+EOF
+--exec chmod 600 $credential_file
+
+--disable_query_log
+--disable_result_log
+--connect(pipeline_mode_receiver,127.0.0.1,root,,test,$SERVER_MYPORT_2,)
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'phase1-pipeline-mode-secret';
+GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.*
+  TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+GRANT PROCESS ON *.* TO preserve_trx_ha_admin@localhost;
+--enable_result_log
+--enable_query_log
+
+--connection default
+--disable_query_log
+--disable_result_log
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'phase1-pipeline-mode-secret';
+GRANT SHUTDOWN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.*
+  TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+GRANT PROCESS ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT ALTER ON test.* TO preserve_trx_ha_admin@localhost;
+
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$SERVER_MYPORT_2 --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=phase1_pipeline_mode --rds-preserve-trx-transfer-credential-secret-file=$credential_file --rds-preserve-trx-phase1-capture-mode=BOUNDED_PIPELINE_V1 --rds-preserve-trx-phase1-pipeline-workers=2 --rds-preserve-trx-phase1-pipeline-ordinary-active-limit=1 --rds-preserve-trx-phase1-pipeline-credit-bytes=1048576 --rds-preserve-trx-phase1-pipeline-record-reserve-bytes=524288 --rds-preserve-trx-phase1-pipeline-binlog-reserve-bytes=524288 --rds-preserve-trx-phase1-pipeline-copy-chunk-bytes=65536 --rds-preserve-trx-phase1-pipeline-result-slots=2 --rds-preserve-trx-phase1-pipeline-tail-record-credit-bytes=262144 --rds-preserve-trx-drain-phase1-timeout-ms=5000 --rds-preserve-trx-drain-phase2-timeout-ms=30000
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--let $restart_parameters=
+
+SELECT @@GLOBAL.rds_preserve_trx_phase1_capture_mode AS capture_mode,
+       @@GLOBAL.rds_preserve_trx_phase1_pipeline_workers AS workers,
+       @@GLOBAL.rds_preserve_trx_phase1_pipeline_ordinary_active_limit AS ordinary_active_limit,
+       @@GLOBAL.rds_preserve_trx_phase1_pipeline_credit_bytes AS credit_bytes;
+
+--error ER_INCORRECT_GLOBAL_LOCAL_VAR
+SET GLOBAL rds_preserve_trx_phase1_capture_mode='LEGACY_SERIAL';
+--error ER_INCORRECT_GLOBAL_LOCAL_VAR
+SET GLOBAL rds_preserve_trx_phase1_pipeline_workers=3;
+--error ER_INCORRECT_GLOBAL_LOCAL_VAR
+SET GLOBAL rds_preserve_trx_phase1_pipeline_ordinary_active_limit=2;
+
+CREATE TABLE t_phase1_pipeline_mode(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_phase1_pipeline_mode VALUES(1,10),(2,20);
+CREATE TABLE t_phase1_pipeline_global_s(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_phase1_pipeline_global_s VALUES(1,10);
+
+--connect(pipeline_mode_owner,localhost,root,,test)
+
+# Once DRAIN has passed its native preflight, a concurrently queued exclusive
+# MDL request must not make the Phase1 resolver wait. The source transaction
+# keeps its row lock and transaction MDL while ALTER waits.
+--connect(pipeline_mode_mdl_app,localhost,root,,test)
+START TRANSACTION;
+UPDATE t_phase1_pipeline_mode SET v=12 WHERE id=1;
+
+--connection pipeline_mode_owner
+SET SESSION lock_wait_timeout=2;
+SET SESSION debug='+d,preserve_trx_phase1_pipeline_exercise_record_capture,preserve_trx_phase1_record_resolve_expect_mdl_retryable,preserve_trx_phase1_pipeline_fail_after_start';
+SET DEBUG_SYNC='preserve_trx_phase1_pipeline_before_record_exercise SIGNAL phase1_pipeline_started WAIT_FOR phase1_mdl_waiting';
+--send DRAIN TRANSACTIONS PRESERVE
+
+--connection default
+SET DEBUG_SYNC='now WAIT_FOR phase1_pipeline_started TIMEOUT 10';
+
+--connect(pipeline_mode_ddl,localhost,preserve_trx_ha_admin,phase1-pipeline-mode-secret,test)
+--let $pipeline_mode_ddl_id= `SELECT CONNECTION_ID()`
+--send ALTER TABLE t_phase1_pipeline_mode ADD COLUMN mdl_nowait_marker INT
+
+--connection default
+--let $wait_condition= SELECT COUNT(*)=1 FROM performance_schema.threads WHERE PROCESSLIST_ID=$pipeline_mode_ddl_id AND PROCESSLIST_STATE='Waiting for table metadata lock'
+--source include/wait_condition.inc
+SET DEBUG_SYNC='now SIGNAL phase1_mdl_waiting';
+
+--connection pipeline_mode_owner
+--error ER_PRESERVE_TRX_UNSUPPORTED
+--reap
+SET DEBUG_SYNC='RESET';
+SET SESSION debug='-d,preserve_trx_phase1_pipeline_exercise_record_capture,preserve_trx_phase1_record_resolve_expect_mdl_retryable,preserve_trx_phase1_pipeline_fail_after_start';
+SET SESSION lock_wait_timeout=DEFAULT;
+
+--connection pipeline_mode_mdl_app
+COMMIT;
+--disconnect pipeline_mode_mdl_app
+--connection pipeline_mode_ddl
+--reap
+--disconnect pipeline_mode_ddl
+
+# A busy global lock_sys latch is retryable; the sequencer must not wait while
+# holding an externally pinned business THD.
+--connection default
+--disable_query_log
+--disable_result_log
+START TRANSACTION;
+UPDATE t_phase1_pipeline_mode SET v=14 WHERE id=1;
+--connection pipeline_mode_owner
+SET SESSION debug='+d,preserve_trx_phase1_pipeline_exercise_record_capture,preserve_trx_phase1_record_capture_expect_lock_sys_busy,preserve_trx_phase1_record_capture_lock_sys_busy,preserve_trx_phase1_pipeline_fail_after_start';
+--error ER_PRESERVE_TRX_UNSUPPORTED
+DRAIN TRANSACTIONS PRESERVE;
+SET SESSION debug='-d,preserve_trx_phase1_pipeline_exercise_record_capture,preserve_trx_phase1_record_capture_expect_lock_sys_busy,preserve_trx_phase1_record_capture_lock_sys_busy,preserve_trx_phase1_pipeline_fail_after_start';
+--connection default
+COMMIT;
+--enable_result_log
+--enable_query_log
+
+# An unrelated transaction may hold lock_sys global S while the Phase1 target
+# shard is free. Record capture must use the target's page shards rather than
+# requiring lock_sys global X.
+--disable_query_log
+--disable_result_log
+--connect(pipeline_mode_shard_app,localhost,root,,test)
+START TRANSACTION;
+UPDATE t_phase1_pipeline_mode SET v=17 WHERE id=1;
+
+--connect(pipeline_mode_global_s,localhost,root,,test)
+SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
+SET SESSION debug='+d,ib_force_release_gap_lock_prepare';
+XA START 'phase1_global_s';
+SELECT * FROM t_phase1_pipeline_global_s WHERE id=1 FOR UPDATE;
+XA END 'phase1_global_s';
+SET DEBUG_SYNC=
+  'try_relatch_trx_and_shard_and_do_noted_expected_version SIGNAL phase1_global_s_held WAIT_FOR phase1_global_s_release';
+--send XA PREPARE 'phase1_global_s'
+
+--connection default
+SET DEBUG_SYNC='now WAIT_FOR phase1_global_s_held TIMEOUT 10';
+
+--connection pipeline_mode_owner
+SET SESSION debug='+d,preserve_trx_phase1_pipeline_exercise_record_capture,preserve_trx_phase1_pipeline_fail_after_start';
+--error ER_PRESERVE_TRX_UNSUPPORTED
+DRAIN TRANSACTIONS PRESERVE;
+SET SESSION debug='-d,preserve_trx_phase1_pipeline_exercise_record_capture,preserve_trx_phase1_pipeline_fail_after_start';
+
+--connection default
+SET DEBUG_SYNC='now SIGNAL phase1_global_s_release';
+--connection pipeline_mode_global_s
+--reap
+XA ROLLBACK 'phase1_global_s';
+SET DEBUG_SYNC='RESET';
+SET SESSION debug='-d,ib_force_release_gap_lock_prepare';
+--disconnect pipeline_mode_global_s
+
+--connection pipeline_mode_shard_app
+COMMIT;
+--disconnect pipeline_mode_shard_app
+--enable_result_log
+--enable_query_log
+
+--connection default
+--let PIPELINE_MODE_LOG= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--perl
+use strict;
+use warnings;
+my $path = $ENV{'PIPELINE_MODE_LOG'} or die "missing error log";
+open(my $fh, '<', $path) or die "cannot read $path: $!";
+my $no_wait = 0;
+my $in_current_test = 0;
+while (my $line = <$fh>) {
+  if ($line =~ /CURRENT_TEST:\s+preserve_trx\.(\S+)/) {
+    $in_current_test =
+      $1 eq 'batch_drain_phase1_pipeline_mode';
+    next;
+  }
+  next unless $in_current_test;
+  next unless $line =~ /PRESERVE_PHASE1_RECORD_CAPTURE_V1 /;
+  if ($line =~ /event=MDL_NOWAIT_EXERCISE_PASSED/ &&
+      $line =~ /elapsed_us=([0-9]+)/ && $1 < 1000000 &&
+      $line =~ /mdl_residual=0/) {
+    $no_wait = 1;
+  }
+}
+close($fh);
+die "bounded record resolve did not classify MDL conflict without waiting"
+  unless $no_wait;
+EOF
+--let PIPELINE_MODE_LOG=
+
+--connect(pipeline_mode_app,localhost,root,,test)
+START TRANSACTION;
+UPDATE t_phase1_pipeline_mode SET v=13 WHERE id=1;
+
+--connection pipeline_mode_owner
+SET SESSION debug='+d,preserve_trx_phase1_pipeline_exercise_record_capture,preserve_trx_phase1_record_compact_resolve_without_page,preserve_trx_phase1_record_resolve_page_retryable,preserve_trx_phase1_pipeline_fail_after_start';
+--error ER_PRESERVE_TRX_UNSUPPORTED
+DRAIN TRANSACTIONS PRESERVE;
+SET SESSION debug='-d,preserve_trx_phase1_pipeline_exercise_record_capture,preserve_trx_phase1_record_compact_resolve_without_page,preserve_trx_phase1_record_resolve_page_retryable,preserve_trx_phase1_pipeline_fail_after_start';
+
+--connection pipeline_mode_app
+COMMIT;
+START TRANSACTION;
+UPDATE t_phase1_pipeline_mode SET v=11 WHERE id=1;
+
+--connection pipeline_mode_owner
+SET SESSION debug='+d,preserve_trx_phase1_pipeline_exercise_core,preserve_trx_phase1_pipeline_exercise_record_capture,preserve_trx_phase1_record_compact_delta_exercise,preserve_trx_phase1_owner_inject_one_retry,preserve_trx_phase1_pipeline_fail_after_start';
+--error ER_PRESERVE_TRX_UNSUPPORTED
+DRAIN TRANSACTIONS PRESERVE;
+SET SESSION debug='-d,preserve_trx_phase1_pipeline_exercise_core,preserve_trx_phase1_pipeline_exercise_record_capture,preserve_trx_phase1_record_compact_delta_exercise,preserve_trx_phase1_owner_inject_one_retry,preserve_trx_phase1_pipeline_fail_after_start';
+
+--connection pipeline_mode_app
+COMMIT;
+
+# After the first baseline is published, the owner registry must bind a
+# replacement transaction on the same THD during its next membership sweep.
+START TRANSACTION;
+UPDATE t_phase1_pipeline_mode SET v=15 WHERE id=1;
+
+--connection pipeline_mode_owner
+SET SESSION debug='+d,preserve_trx_phase1_pipeline_exercise_record_capture,preserve_trx_phase1_owner_expect_rebind,preserve_trx_phase1_pipeline_fail_after_start';
+SET DEBUG_SYNC='preserve_trx_phase1_owner_after_record_reconcile SIGNAL phase1_owner_bound WAIT_FOR phase1_owner_replaced';
+--send DRAIN TRANSACTIONS PRESERVE
+
+--connection default
+SET DEBUG_SYNC='now WAIT_FOR phase1_owner_bound TIMEOUT 10';
+
+--connection pipeline_mode_app
+UPDATE t_phase1_pipeline_mode SET v=v+1 WHERE id=2;
+COMMIT;
+START TRANSACTION;
+UPDATE t_phase1_pipeline_mode SET v=16 WHERE id=1;
+
+--connection default
+SET DEBUG_SYNC='now SIGNAL phase1_owner_replaced';
+
+--connection pipeline_mode_owner
+--error ER_PRESERVE_TRX_UNSUPPORTED
+--reap
+SET DEBUG_SYNC='RESET';
+SET SESSION debug='-d,preserve_trx_phase1_pipeline_exercise_record_capture,preserve_trx_phase1_owner_expect_rebind,preserve_trx_phase1_pipeline_fail_after_start';
+
+--connection pipeline_mode_app
+COMMIT;
+
+# A live business THD may be briefly between transactions at the next
+# membership sweep. The owner must retain the THD membership, wait without
+# pinning it, then bind the next transaction on that same connection.
+START TRANSACTION;
+UPDATE t_phase1_pipeline_mode SET v=18 WHERE id=1;
+
+--connection pipeline_mode_owner
+SET SESSION debug='+d,preserve_trx_phase1_pipeline_exercise_record_capture,preserve_trx_phase1_owner_expect_gap_rebind,preserve_trx_phase1_pipeline_fail_after_start';
+SET DEBUG_SYNC='preserve_trx_phase1_owner_after_live_gap SIGNAL phase1_owner_gap_seen WAIT_FOR phase1_owner_gap_replacement';
+SET DEBUG_SYNC='preserve_trx_phase1_owner_after_record_reconcile SIGNAL phase1_owner_gap_bound WAIT_FOR phase1_owner_gap_capture';
+--send DRAIN TRANSACTIONS PRESERVE
+
+--connection default
+SET DEBUG_SYNC='now WAIT_FOR phase1_owner_gap_bound TIMEOUT 10';
+
+--connection pipeline_mode_app
+COMMIT;
+
+--connection default
+SET DEBUG_SYNC='now SIGNAL phase1_owner_gap_capture';
+SET DEBUG_SYNC='now WAIT_FOR phase1_owner_gap_seen TIMEOUT 10';
+
+--connection pipeline_mode_app
+START TRANSACTION;
+UPDATE t_phase1_pipeline_mode SET v=19 WHERE id=1;
+
+--connection default
+SET DEBUG_SYNC='now SIGNAL phase1_owner_gap_replacement';
+
+--connection pipeline_mode_owner
+--error ER_PRESERVE_TRX_UNSUPPORTED
+--reap
+SET DEBUG_SYNC='RESET';
+SET SESSION debug='-d,preserve_trx_phase1_pipeline_exercise_record_capture,preserve_trx_phase1_owner_expect_gap_rebind,preserve_trx_phase1_pipeline_fail_after_start';
+
+--connection pipeline_mode_app
+COMMIT;
+
+# A confirmed empty record baseline is still an owner-side compare/install
+# result.  It must survive the result queue so stale store state can be
+# cleared deterministically.
+--disable_query_log
+--disable_result_log
+--connect(pipeline_mode_empty_app,localhost,root,,test)
+START TRANSACTION;
+SELECT v FROM t_phase1_pipeline_mode WHERE id=1;
+--connection pipeline_mode_owner
+SET SESSION debug='+d,preserve_trx_phase1_pipeline_exercise_record_capture,preserve_trx_phase1_record_adapter_expect_empty,preserve_trx_phase1_pipeline_fail_after_start';
+--error ER_PRESERVE_TRX_UNSUPPORTED
+DRAIN TRANSACTIONS PRESERVE;
+SET SESSION debug='-d,preserve_trx_phase1_pipeline_exercise_record_capture,preserve_trx_phase1_record_adapter_expect_empty,preserve_trx_phase1_pipeline_fail_after_start';
+--connection pipeline_mode_empty_app
+ROLLBACK;
+--disconnect pipeline_mode_empty_app
+--enable_result_log
+--enable_query_log
+
+--connection default
+--let PIPELINE_MODE_LOG= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--perl
+use strict;
+use warnings;
+my $path = $ENV{'PIPELINE_MODE_LOG'} or die "missing error log";
+open(my $fh, '<', $path) or die "cannot read $path: $!";
+my ($started, $stopped) = (0, 0);
+my $core_exercised = 0;
+my $record_capture_exercised = 0;
+my $record_identity_exercised = 0;
+my $record_resolve_exercised = 0;
+my $record_store_install_exercised = 0;
+my $record_capture_byte_limit_exercised = 0;
+my $record_capture_lock_sys_busy_exercised = 0;
+my $record_compact_delta_exercised = 0;
+my $record_discard_exercised = 0;
+my $record_compact_resolve_without_page_exercised = 0;
+my $record_adapter_exercised = 0;
+my $record_adapter_pipeline_exercised = 0;
+my $record_adapter_empty_exercised = 0;
+my $record_adapter_stale_store_rejected = 0;
+my $record_adapter_credit_plan_exercised = 0;
+my $record_adapter_participant_adopt_exercised = 0;
+my $record_owner_pump_exercised = 0;
+my $record_owner_retry_exercised = 0;
+my $record_owner_rebind_exercised = 0;
+my $record_owner_gap_rebind_exercised = 0;
+my $ordinary_limit_exercised = 0;
+my $in_current_test = 0;
+while (my $line = <$fh>) {
+  if ($line =~ /CURRENT_TEST:\s+preserve_trx\.(\S+)/) {
+    $in_current_test =
+      $1 eq 'batch_drain_phase1_pipeline_mode';
+    next;
+  }
+  next unless $in_current_test;
+  next unless $line =~
+    /(?:PRESERVE_PHASE1_PIPELINE_V1|PRESERVE_PHASE1_RECORD_CAPTURE_V1|PRESERVE_PHASE1_RECORD_ADAPTER_V1|PRESERVE_PHASE1_OWNER_V1) /;
+  $started = 1
+    if $line =~ /event=STARTED/ && $line =~ /mode=BOUNDED_PIPELINE_V1/ &&
+       $line =~ /workers_configured=2/ && $line =~ /workers_ready=2/ &&
+       $line =~ /ordinary_active_limit_effective=1/ &&
+       $line =~ /init_failures=0/;
+  $ordinary_limit_exercised = 1
+    if $line =~ /event=CORE_EXERCISE_PASSED/ &&
+       $line =~ /ordinary_active_limit_requested=1/ &&
+       $line =~ /ordinary_active_limit_effective=1/ &&
+       $line =~ /ordinary_active_high_water=1/ &&
+       $line =~ /ordinary_active_limit_deferrals=([1-9][0-9]*)/ &&
+       $line =~ /ordinary_active=0/;
+  $core_exercised = 1 if $line =~ /event=CORE_EXERCISE_PASSED/;
+  ++$record_capture_exercised
+    if $line =~ /PRESERVE_PHASE1_RECORD_CAPTURE_V1 / &&
+       $line =~ /event=EXERCISE_PASSED/ &&
+       $line =~ /record_bits=[1-9][0-9]*/ &&
+       $line =~ /page_groups=1/;
+  $record_identity_exercised = 1
+    if $line =~ /PRESERVE_PHASE1_RECORD_CAPTURE_V1 / &&
+       $line =~ /event=IDENTITY_EXERCISE_PASSED/;
+  $record_resolve_exercised = 1
+    if $line =~ /PRESERVE_PHASE1_RECORD_CAPTURE_V1 / &&
+       $line =~ /event=RESOLVE_EXERCISE_PASSED/ &&
+       $line =~ /entries=2/ &&
+       $line =~ /page_groups=1/ &&
+       $line =~ /page_ready=1/ &&
+       $line =~ /mdl_residual=0/;
+  $record_store_install_exercised = 1
+    if $line =~ /PRESERVE_PHASE1_RECORD_CAPTURE_V1 / &&
+       $line =~ /event=STORE_INSTALL_EXERCISE_PASSED/;
+  $record_capture_byte_limit_exercised = 1
+    if $line =~ /PRESERVE_PHASE1_RECORD_CAPTURE_V1 / &&
+       $line =~ /event=BYTE_LIMIT_EXERCISE_PASSED/;
+  $record_capture_lock_sys_busy_exercised = 1
+    if $line =~ /PRESERVE_PHASE1_RECORD_CAPTURE_V1 / &&
+       $line =~ /event=LOCK_SYS_BUSY_EXERCISE_PASSED/;
+  $record_compact_delta_exercised = 1
+    if $line =~ /PRESERVE_PHASE1_RECORD_CAPTURE_V1 / &&
+       $line =~ /event=COMPACT_DELTA_EXERCISE_PASSED/ &&
+       $line =~ /delta_mutations=2/ &&
+       $line =~ /record_images=0/ &&
+       $line =~ /canonical_equivalent=1/;
+  $record_discard_exercised = 1
+    if $line =~ /PRESERVE_PHASE1_RECORD_CAPTURE_V1 / &&
+       $line =~ /event=DISCARD_EXERCISE_PASSED/ &&
+       $line =~ /bitmap_nonzero_bytes=0/ &&
+       $line =~ /record_images=0/ &&
+       $line =~ /set_bits=0/ &&
+       $line =~ /dirty=1/ && $line =~ /tombstone=1/ &&
+       $line =~ /compact_preserved=1/ &&
+       $line =~ /journal_advanced=1/ &&
+       $line =~ /fingerprint_changed=1/;
+  $record_compact_resolve_without_page_exercised = 1
+    if $line =~ /PRESERVE_PHASE1_RECORD_CAPTURE_V1 / &&
+       $line =~ /event=COMPACT_RESOLVE_WITHOUT_PAGE_EXERCISE_PASSED/ &&
+       $line =~ /page_groups=0/ &&
+       $line =~ /page_ready=0/;
+  $record_adapter_exercised = 1
+    if $line =~ /PRESERVE_PHASE1_RECORD_ADAPTER_V1 / &&
+       $line =~ /event=EXERCISE_PASSED/;
+  $record_adapter_pipeline_exercised = 1
+    if $line =~ /PRESERVE_PHASE1_RECORD_ADAPTER_V1 / &&
+       $line =~ /event=PIPELINE_EXERCISE_PASSED/;
+  $record_adapter_empty_exercised = 1
+    if $line =~ /PRESERVE_PHASE1_RECORD_ADAPTER_V1 / &&
+       $line =~ /event=EMPTY_PIPELINE_EXERCISE_PASSED/;
+  $record_adapter_stale_store_rejected = 1
+    if $line =~ /PRESERVE_PHASE1_RECORD_ADAPTER_V1 / &&
+       $line =~ /event=STALE_STORE_REJECTED/;
+  $record_adapter_credit_plan_exercised = 1
+    if $line =~ /PRESERVE_PHASE1_RECORD_ADAPTER_V1 / &&
+       $line =~ /event=CREDIT_PLAN_EXERCISE_PASSED/ &&
+       $line =~ /resolve_credit=[1-9][0-9]*/ &&
+       $line =~ /candidate_credit=[1-9][0-9]*/;
+  $record_adapter_participant_adopt_exercised = 1
+    if $line =~ /PRESERVE_PHASE1_RECORD_ADAPTER_V1 / &&
+       $line =~ /event=PARTICIPANT_ADOPT_EXERCISE_PASSED/ &&
+       $line =~ /record_locks=[1-9][0-9]*/;
+  $record_owner_pump_exercised = 1
+    if $line =~ /PRESERVE_PHASE1_OWNER_V1 / &&
+       $line =~ /event=OWNER_(?:PUMP|RETRY)_EXERCISE_PASSED/ &&
+       $line =~ /targets=1/ && $line =~ /published=1/ &&
+       $line =~ /inflight=0/;
+  $record_owner_retry_exercised = 1
+    if $line =~ /PRESERVE_PHASE1_OWNER_V1 / &&
+       $line =~ /event=OWNER_RETRY_EXERCISE_PASSED/ &&
+       $line =~ /retries=1/ &&
+       $line =~ /retry_delay_total_us=1000/ &&
+       $line =~ /retry_delay_max_us=1000/ &&
+       $line =~ /inflight=0/;
+  $record_owner_rebind_exercised = 1
+    if $line =~ /PRESERVE_PHASE1_OWNER_V1 / &&
+       $line =~ /event=OWNER_REBIND_EXERCISE_PASSED/ &&
+       $line =~ /targets=1/ && $line =~ /published=2/ &&
+       $line =~ /rebinds=1/ && $line =~ /inflight=0/;
+  $record_owner_gap_rebind_exercised = 1
+    if $line =~ /PRESERVE_PHASE1_OWNER_V1 / &&
+       $line =~ /event=OWNER_GAP_REBIND_EXERCISE_PASSED/ &&
+       $line =~ /targets=1/ && $line =~ /published=2/ &&
+       $line =~ /rebinds=1/ && $line =~ /live_gaps=[1-9][0-9]*/ &&
+       $line =~ /inflight=0/;
+  $stopped = 1
+    if $line =~ /event=STOPPED/ && $line =~ /inflight=0/ &&
+       $line =~ /queued=0/ && $line =~ /result_count=0/;
+}
+close($fh);
+die "bounded pipeline did not cross a ready startup barrier" unless $started;
+die "bounded pipeline core state machine was not exercised"
+  unless $core_exercised;
+die "record capture did not proceed under an unrelated global S latch"
+  unless $record_capture_exercised >= 4;
+die "bounded pipeline exact record identity was not exercised"
+  unless $record_identity_exercised;
+die "bounded pipeline record lock-out resolve was not exercised"
+  unless $record_resolve_exercised;
+die "bounded pipeline record store compare-install was not exercised"
+  unless $record_store_install_exercised;
+die "bounded record capture byte limit was not exercised"
+  unless $record_capture_byte_limit_exercised;
+die "bounded record capture lock_sys busy path was not exercised"
+  unless $record_capture_lock_sys_busy_exercised;
+die "bounded record store did not retain a compact incremental delta"
+  unless $record_compact_delta_exercised;
+die "bounded record discard state transition was not exercised"
+  unless $record_discard_exercised;
+die "compact record resolve still depended on buffer-pool residency"
+  unless $record_compact_resolve_without_page_exercised;
+die "bounded record family adapter was not exercised"
+  unless $record_adapter_exercised;
+die "bounded record family adapter did not traverse the pipeline"
+  unless $record_adapter_pipeline_exercised;
+die "bounded record empty baseline did not traverse owner compare-install"
+  unless $record_adapter_empty_exercised;
+die "bounded record owner did not reject a result stale after S1"
+  unless $record_adapter_stale_store_rejected;
+die "bounded record adapter did not reserve logical credit before allocation"
+  unless $record_adapter_credit_plan_exercised;
+die "bounded record owner did not adopt the installed candidate"
+  unless $record_adapter_participant_adopt_exercised;
+die "bounded record owner registry/pump was not exercised"
+  unless $record_owner_pump_exercised;
+die "bounded record owner did not exercise its one-retry policy"
+  unless $record_owner_retry_exercised;
+die "bounded record owner did not retire and rebind a stale incarnation"
+  unless $record_owner_rebind_exercised;
+die "bounded record owner retired a live THD during a transaction gap"
+  unless $record_owner_gap_rebind_exercised;
+die "bounded pipeline ordinary active limit was not exercised"
+  unless $ordinary_limit_exercised;
+die "bounded pipeline did not stop empty" unless $stopped;
+EOF
+--let PIPELINE_MODE_LOG=
+
+--connection default
+START TRANSACTION;
+UPDATE t_phase1_pipeline_mode SET v=13 WHERE id=1;
+
+--connection pipeline_mode_owner
+SET SESSION debug='+d,preserve_trx_phase1_pipeline_worker_init_fail';
+--error ER_PRESERVE_TRX_UNSUPPORTED
+DRAIN TRANSACTIONS PRESERVE;
+SET SESSION debug='-d,preserve_trx_phase1_pipeline_worker_init_fail';
+
+--connection default
+COMMIT;
+
+--let PIPELINE_MODE_LOG= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--perl
+use strict;
+use warnings;
+my $path = $ENV{'PIPELINE_MODE_LOG'} or die "missing error log";
+open(my $fh, '<', $path) or die "cannot read $path: $!";
+my $failed = 0;
+my $in_current_test = 0;
+while (my $line = <$fh>) {
+  if ($line =~ /CURRENT_TEST:\s+preserve_trx\.(\S+)/) {
+    $in_current_test =
+      $1 eq 'batch_drain_phase1_pipeline_mode';
+    next;
+  }
+  next unless $in_current_test;
+  next unless $line =~ /PRESERVE_PHASE1_PIPELINE_V1 /;
+  $failed = 1
+    if $line =~ /event=START_FAILED/ && $line =~ /init_failures=1/ &&
+       $line =~ /workers_ready=[0-5]/;
+}
+close($fh);
+die "worker init failure did not fail the complete startup barrier"
+  unless $failed;
+EOF
+--let PIPELINE_MODE_LOG=
+
+DROP TABLE t_phase1_pipeline_mode;
+DROP TABLE t_phase1_pipeline_global_s;
+--disable_query_log
+--disable_result_log
+DROP USER preserve_trx_ha_admin@localhost;
+
+--connection pipeline_mode_receiver
+DROP USER preserve_trx_ha_admin@localhost;
+--enable_result_log
+--enable_query_log
+
+--connection default
+--remove_file $credential_file
+
+--disconnect pipeline_mode_owner
+--disconnect pipeline_mode_app

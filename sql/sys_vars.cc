@@ -1076,6 +1076,8 @@ static Sys_var_uint Sys_preserve_trx_lock_warmcopy_conversion_wait_timeout_ms(
 
 static const char *preserve_trx_transfer_artifact_mode_names[] = {
     "LOCAL_CARRIER", "STANDBY_TRANSFER_SAVE", nullptr};
+static const char *preserve_trx_phase1_capture_mode_names[] = {
+    "LEGACY_SERIAL", "BOUNDED_PIPELINE_V1", nullptr};
 static const char *preserve_trx_standby_phase2_scheduler_mode_names[] = {
     "LEGACY_READINESS_THEN_CLOSING", "DEPENDENCY_CONVERGENCE_V1", nullptr};
 static const char *preserve_trx_transfer_runtime_profile_names[] = {
@@ -1174,6 +1176,93 @@ static Sys_var_enum Sys_preserve_trx_standby_phase2_scheduler_mode(
     DEFAULT(PRESERVE_TRX_PHASE2_SCHEDULER_DEPENDENCY_CONVERGENCE_V1),
     NO_MUTEX_GUARD, NOT_IN_BINLOG,
     ON_CHECK(check_preserve_trx_standby_phase2_scheduler_mode));
+
+static Sys_var_enum Sys_preserve_trx_phase1_capture_mode(
+    "rds_preserve_trx_phase1_capture_mode",
+    "Phase 1 source-capture implementation. LEGACY_SERIAL preserves the "
+    "existing owner path; BOUNDED_PIPELINE_V1 enables the independent "
+    "attempt-scoped bounded capture coordinator.",
+    READ_ONLY GLOBAL_VAR(preserve_trx_phase1_capture_mode),
+    CMD_LINE(REQUIRED_ARG), preserve_trx_phase1_capture_mode_names,
+    DEFAULT(PRESERVE_TRX_PHASE1_BOUNDED_PIPELINE_V1), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_phase1_pipeline_workers(
+    "rds_preserve_trx_phase1_pipeline_workers",
+    "Attempt-frozen number of Phase 1 capture workers shared by record-lock "
+    "and binlog-cache preparation.",
+    READ_ONLY GLOBAL_VAR(preserve_trx_phase1_pipeline_workers),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, 64), DEFAULT(6), BLOCK_SIZE(1),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_phase1_pipeline_ordinary_active_limit(
+    "rds_preserve_trx_phase1_pipeline_ordinary_active_limit",
+    "Attempt-frozen maximum number of ordinary Phase 1 prepare jobs that "
+    "may execute concurrently. Final-generation jobs are not limited.",
+    READ_ONLY GLOBAL_VAR(preserve_trx_phase1_pipeline_ordinary_active_limit),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, 64), DEFAULT(64), BLOCK_SIZE(1),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_ulonglong Sys_preserve_trx_phase1_pipeline_credit_bytes(
+    "rds_preserve_trx_phase1_pipeline_credit_bytes",
+    "Attempt-frozen source byte credit for the Phase 1 capture pipeline.",
+    READ_ONLY GLOBAL_VAR(preserve_trx_phase1_pipeline_credit_bytes),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(1048576, ULLONG_MAX),
+    DEFAULT(1073741824ULL), BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_ulonglong
+    Sys_preserve_trx_phase1_pipeline_record_reserve_bytes(
+        "rds_preserve_trx_phase1_pipeline_record_reserve_bytes",
+        "Attempt-frozen record-lock family reservation within Phase 1 "
+        "pipeline source credit.",
+        READ_ONLY GLOBAL_VAR(
+            preserve_trx_phase1_pipeline_record_reserve_bytes),
+        CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, ULLONG_MAX),
+        DEFAULT(536870912ULL), BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_ulonglong
+    Sys_preserve_trx_phase1_pipeline_binlog_reserve_bytes(
+        "rds_preserve_trx_phase1_pipeline_binlog_reserve_bytes",
+        "Attempt-frozen binlog-cache family reservation within Phase 1 "
+        "pipeline source credit.",
+        READ_ONLY GLOBAL_VAR(
+            preserve_trx_phase1_pipeline_binlog_reserve_bytes),
+        CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, ULLONG_MAX),
+        DEFAULT(268435456ULL), BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_phase1_pipeline_copy_chunk_bytes(
+    "rds_preserve_trx_phase1_pipeline_copy_chunk_bytes",
+    "Maximum bytes processed between cancel/deadline checks by a bounded "
+    "Phase 1 copy operation.",
+    READ_ONLY GLOBAL_VAR(preserve_trx_phase1_pipeline_copy_chunk_bytes),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(4096, 67108864), DEFAULT(1048576),
+    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_ulonglong
+    Sys_preserve_trx_phase1_pipeline_cleanup_reserve_us(
+        "rds_preserve_trx_phase1_pipeline_cleanup_reserve_us",
+        "Attempt-frozen time reserved for cancel, lease release and worker "
+        "join before a Phase 1 deadline.",
+        READ_ONLY GLOBAL_VAR(
+            preserve_trx_phase1_pipeline_cleanup_reserve_us),
+        CMD_LINE(REQUIRED_ARG), VALID_RANGE(1000000, ULLONG_MAX),
+        DEFAULT(1000000ULL), BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_phase1_pipeline_result_slots(
+    "rds_preserve_trx_phase1_pipeline_result_slots",
+    "Attempt-frozen bound for Phase 1 ready and result queue slots.",
+    READ_ONLY GLOBAL_VAR(preserve_trx_phase1_pipeline_result_slots),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, 65536), DEFAULT(256), BLOCK_SIZE(1),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_ulonglong
+    Sys_preserve_trx_phase1_pipeline_tail_record_credit_bytes(
+        "rds_preserve_trx_phase1_pipeline_tail_record_credit_bytes",
+        "Attempt-frozen one-way Phase 2 record-lock tail credit.",
+        READ_ONLY GLOBAL_VAR(
+            preserve_trx_phase1_pipeline_tail_record_credit_bytes),
+        CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, ULLONG_MAX),
+        DEFAULT(67108864ULL), BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
 
 static Sys_var_enum Sys_preserve_trx_transfer_runtime_profile(
     "rds_preserve_trx_transfer_runtime_profile",

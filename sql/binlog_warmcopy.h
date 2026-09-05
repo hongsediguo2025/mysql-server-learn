@@ -40,6 +40,19 @@ struct PrebuiltBinlogCacheBlob;
 
 enum class Binlog_warmcopy_mirror_status { OK, ERROR };
 
+/*
+  Bounded-only initialization result.  MORE retains the returned session and
+  requires another owner-scheduled step; READY has completed the same prefix
+  invariant as the legacy begin_session() helper.
+*/
+enum class Mysql_binlog_warmcopy_begin_step_status {
+  READY,
+  MORE,
+  STALE,
+  NOT_ELIGIBLE,
+  ERROR
+};
+
 class Binlog_cache_warmcopy_mirror {
  public:
   virtual ~Binlog_cache_warmcopy_mirror() = default;
@@ -117,6 +130,15 @@ bool mysql_binlog_preserve_warmcopy_begin_session(
     uint64_t copy_chunk_bytes,
     Mysql_binlog_warmcopy_session **session, bool *has_blob,
     uint64_t *prefix_bytes, bool allow_inflight_statement);
+
+Mysql_binlog_warmcopy_begin_step_status
+mysql_binlog_preserve_warmcopy_begin_session_step(
+    THD *thd, const std::string &warmcopy_id, uint64_t epoch,
+    Preserved_trx_warm_external_blob_carrier *carrier,
+    uint64_t max_blob_bytes, std::atomic<uint64_t> *total_reserved_bytes,
+    uint64_t max_total_bytes, uint64_t reservation_chunk_bytes,
+    uint64_t copy_chunk_bytes, Mysql_binlog_warmcopy_session **session,
+    bool *has_blob, uint64_t *prefix_bytes, bool allow_inflight_statement);
 /*
   Finalize verifies that the live-mirrored tail is bounded and complete, checks
   digest/durable high-water marks and pending ranges, then detaches the mirror

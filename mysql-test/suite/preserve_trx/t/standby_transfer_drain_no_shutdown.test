@@ -1,3 +1,4 @@
+--source include/have_debug.inc
 --source include/not_windows.inc
 --source include/force_restart.inc
 
@@ -36,12 +37,18 @@ GRANT PROCESS ON *.* TO preserve_trx_ha_admin@localhost;
 CREATE USER standby_transfer_app@localhost;
 GRANT SELECT, UPDATE ON test.* TO standby_transfer_app@localhost;
 
---let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$SERVER_MYPORT_2 --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=standby_transfer_no_shutdown --rds-preserve-trx-transfer-credential-secret-file=$credential_file
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$SERVER_MYPORT_2 --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=standby_transfer_no_shutdown --rds-preserve-trx-transfer-credential-secret-file=$credential_file --rds-preserve-trx-phase1-capture-mode=BOUNDED_PIPELINE_V1 --log-error-verbosity=3
 --disable_result_log
 --source include/restart_mysqld.inc
 --enable_result_log
 --let $restart_parameters=
 --disable_query_log
+
+--let $phase1_bounded_mode= `SELECT @@GLOBAL.rds_preserve_trx_phase1_capture_mode='BOUNDED_PIPELINE_V1'`
+if ($phase1_bounded_mode != 1)
+{
+  --die standby transfer source did not restart in BOUNDED_PIPELINE_V1
+}
 
 CALL mtr.add_suppression(
   "PRESERVE: rolled back prepared transaction without snapshot during recovery");
@@ -65,8 +72,105 @@ START TRANSACTION;
 UPDATE t_standby_transfer_no_shutdown SET v=11 WHERE id=1;
 
 --connection default
+SET DEBUG_SYNC='preserve_trx_transfer_after_phase1_binlog_stream SIGNAL phase1_record_batch_flushed WAIT_FOR phase1_record_transaction_replaced';
+--send DRAIN TRANSACTIONS PRESERVE
+
+--connection standby_transfer_ha
+SET DEBUG_SYNC='now WAIT_FOR phase1_record_batch_flushed TIMEOUT 20';
+
+--connection standby_transfer_source
+COMMIT;
+START TRANSACTION;
+UPDATE t_standby_transfer_no_shutdown SET v=12 WHERE id=1;
+
+--connection standby_transfer_ha
+SET DEBUG_SYNC='now SIGNAL phase1_record_transaction_replaced';
+
+--connection default
 --replace_column 1 GENERATION 3 SOURCE_ID 6 CLOSING_STARTED_US 7 CLOSING_DEADLINE_US
-DRAIN TRANSACTIONS PRESERVE;
+--reap
+
+--let PHASE1_OWNER_LOG= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--perl
+use strict;
+use warnings;
+my $path = $ENV{'PHASE1_OWNER_LOG'} or die "missing source error log";
+open(my $fh, '<', $path) or die "cannot read $path: $!";
+my $complete = 0;
+my $identity_rebuilt = 0;
+my $current_record_prebuilt = 0;
+my $in_current_test = 0;
+my $sequence = 0;
+my $pipeline_stopped_at = 0;
+my $phase2_target_work_at = 0;
+my $tail_record_credit_is_actual = 0;
+my $final_record_stage_metrics = 0;
+while (my $line = <$fh>) {
+  if ($line =~ /CURRENT_TEST:\s+preserve_trx\.(\S+)/) {
+    $in_current_test = $1 eq 'standby_transfer_drain_no_shutdown';
+    next;
+  }
+  next unless $in_current_test;
+  ++$sequence;
+  $complete = 1
+    if $line =~ /PRESERVE_PHASE1_OWNER_V1 / &&
+       $line =~ /event=PRODUCTION_RECORD_BASELINE_COMPLETE/ &&
+       $line =~ /targets=1/ && $line =~ /published=1/ &&
+       $line =~ /inflight=0/ &&
+       $line =~ /legacy_record_scan_calls=0/ &&
+       $line =~ /legacy_store_rebuild_calls=0/;
+  $identity_rebuilt = 1
+    if $line =~ /PRESERVE_PHASE1_OWNER_V1 / &&
+       $line =~ /event=FINAL_RECORD_RECONCILE_COMPLETE/ &&
+       $line =~ /targets=1/ && $line =~ /captured=1/ &&
+       $line =~ /deferred=0/ && $line =~ /exact=1/ &&
+       $line =~ /invalidated=0/ && $line =~ /failed=0/;
+  $current_record_prebuilt = 1
+    if $line =~ /PRESERVE: warm-copy drain metrics / &&
+       $line =~ /phase1_record_prebuilt_target_count=1/ &&
+       $line =~ /phase2_record_prebuilt_target_count=1/ &&
+       $line =~ /phase2_record_materialized_target_count=0/ &&
+       $line =~ /materialized_lock_payload_bytes_in_phase2=0/;
+  $pipeline_stopped_at = $sequence
+    if !$pipeline_stopped_at &&
+       $line =~ /PRESERVE_PHASE1_PIPELINE_V1 / &&
+       $line =~ /event=STOPPED/ && $line =~ /lifecycle=STOPPED/ &&
+       $line =~ /publication_aborted=0/ &&
+       $line =~ /invariant_failures=0/;
+  if ($line =~ /PRESERVE_PHASE1_PIPELINE_V1 / &&
+      $line =~ /event=STOPPED/ &&
+      $line =~ /tail_record_credit_consumed_bytes=(\d+)/) {
+    $tail_record_credit_is_actual = $1 > 0 && $1 < 67108864;
+  }
+  $final_record_stage_metrics = 1
+    if $line =~ /PRESERVE_PHASE1_PIPELINE_V1 / &&
+       $line =~ /event=STOPPED/ &&
+       $line =~ /final_record_capture_operation_samples=1/ &&
+       $line =~ /final_record_capture_operation_us_max=[1-9][0-9]*/ &&
+       $line =~ /final_record_capture_operation_overruns=0/ &&
+       $line =~ /final_record_prepare_operation_samples=1/ &&
+       $line =~ /final_record_prepare_operation_us_max=[1-9][0-9]*/ &&
+       $line =~ /final_record_prepare_operation_overruns=0/;
+  $phase2_target_work_at = $sequence
+    if !$phase2_target_work_at &&
+       $line =~ /PRESERVE: standby transfer source early token selection/;
+}
+close($fh);
+die "bounded production record owner did not replace legacy full scans"
+  unless $complete;
+die "bounded record owner did not rebuild the replacement transaction"
+  unless $identity_rebuilt;
+die "replacement transaction record locks were materialized in phase2"
+  unless $current_record_prebuilt;
+die "final record tail credit did not shrink to retained payload bytes"
+  unless $tail_record_credit_is_actual;
+die "final record capture/prepare stage metrics were not emitted"
+  unless $final_record_stage_metrics;
+die "bounded pipeline was not cleanly stopped before phase2 target work"
+  unless $pipeline_stopped_at && $phase2_target_work_at &&
+         $pipeline_stopped_at < $phase2_target_work_at;
+EOF
+--let PHASE1_OWNER_LOG=
 
 --connection standby_transfer_receiver
 SELECT VARIABLE_VALUE=1 AS one_accepted_epoch

@@ -1,0 +1,201 @@
+--echo # Source-shape guard for the Phase1 bounded-pipeline control plane.
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $source_root = File::Spec->rel2abs(
+  File::Spec->catdir($mysql_test_dir, '..'));
+
+sub read_source {
+  my ($relative) = @_;
+  my $path = File::Spec->catfile($source_root, split('/', $relative));
+  open(my $fh, '<', $path) or die "cannot open $path: $!";
+  my $source = do { local $/; <$fh> };
+  close($fh);
+  return $source;
+}
+
+my $business = read_source('scripts/resumable_trx_business_e2e.py');
+my $runner = read_source('scripts/preserve_trx_full_pressure_runner.py');
+my $phase2_oracle = read_source('scripts/preserve_trx_phase2_scheduler_e2e.py');
+my $preserve = read_source('sql/preserve_trx.cc');
+my $transfer = read_source('sql/preserve_trx_transfer.cc');
+my $pipeline_h = read_source('sql/preserve_trx_phase1_pipeline.h');
+my $pipeline_cc = read_source('sql/preserve_trx_phase1_pipeline.cc');
+my $owner_cc = read_source('sql/preserve_trx_phase1_owner.cc');
+my $record_adapter =
+  read_source('sql/preserve_trx_phase1_record_adapter.cc');
+my $binlog_adapter =
+  read_source('sql/preserve_trx_phase1_binlog_adapter.cc');
+my $publication_h =
+  read_source('sql/preserve_trx_phase1_publication.h');
+my $publication_cc =
+  read_source('sql/preserve_trx_phase1_publication.cc');
+my $lock_participant =
+  read_source('sql/preserve_trx_lock_warmcopy.cc');
+my $lock_warmcopy_h = read_source('storage/innobase/include/lock0warmcopy.h');
+my $lock_warmcopy_cc = read_source('storage/innobase/lock/lock0warmcopy.cc');
+my $sys_vars = read_source('sql/sys_vars.cc');
+
+die "Phase1 runtime default must be BOUNDED_PIPELINE_V1\n"
+  unless $pipeline_cc =~
+    /ulong\s+preserve_trx_phase1_capture_mode\s*=\s*PRESERVE_TRX_PHASE1_BOUNDED_PIPELINE_V1\s*;/s;
+die "Phase1 sysvar default must be BOUNDED_PIPELINE_V1\n"
+  unless $sys_vars =~
+    /Sys_preserve_trx_phase1_capture_mode\s*\(.{0,800}DEFAULT\(PRESERVE_TRX_PHASE1_BOUNDED_PIPELINE_V1\)/s;
+die "native record accounting must not be compared as a serialized count\n"
+  if $lock_participant =~
+       /seal_result\.record_lock_count\s*!=\s*current_live_fence\.n_rec_locks/s ||
+     $record_adapter =~
+       /(?:record_lock_count|exported_record_bits|installed\.record_lock_count)\s*!=\s*(?:live_fence_after\.n_rec_locks|capture->snapshot\.native_record_lock_count|prepared->native_fence\.native_record_lock_count)/s;
+die "record count-domain repair must retain fail-closed presence checks\n"
+  unless $record_adapter =~ /record_store_snapshot_presence_mismatch/s &&
+         $record_adapter =~ /record_capture_presence_mismatch/s &&
+         $lock_participant =~
+           /seal_result\.record_lock_count\s*==\s*0.{0,180}SEAL_FENCE_CHANGED/s;
+
+die "business E2E must accept the attempt Phase1 timeout\n"
+  unless $business =~ /drain_phase1_timeout_ms:\s*int\s*=\s*600_000/s &&
+         $business =~ /--drain-phase1-timeout-ms/s;
+die "business E2E must not overwrite the requested Phase1 timeout\n"
+  if $business =~
+    /SET GLOBAL rds_preserve_trx_drain_phase1_timeout_ms=600000/s;
+die "business E2E must configure Phase1 timeout from HarnessConfig\n"
+  unless $business =~
+    /SET GLOBAL rds_preserve_trx_drain_phase1_timeout_ms=["']?.{0,120}self\.config\.drain_phase1_timeout_ms/s;
+die "dependency continuous full profile must explicitly request 60 seconds\n"
+  unless $runner =~
+    /_DEPENDENCY_CONTINUOUS_LARGE_TX_FULL_BASE\s*=\s*dataclasses\.replace\(.{0,1800}drain_phase1_timeout_ms\s*=\s*60_000/s;
+die "dependency continuous full profile must pin the formal workload identity\n"
+  unless $runner =~
+    /_DEPENDENCY_CONTINUOUS_LARGE_TX_FULL_BASE\s*=\s*dataclasses\.replace\(.{0,1200}sessions\s*=\s*1000.{0,1200}tables\s*=\s*128.{0,1200}statements_per_tx\s*=\s*100_000.{0,1200}seed_rows_per_table_per_session\s*=\s*100_000.{0,1200}formal_rounds\s*=\s*5/s;
+die "dependency continuous child command must receive the Phase1 timeout\n"
+  unless $runner =~
+    /--drain-phase1-timeout-ms.{0,120}profile\.drain_phase1_timeout_ms/s;
+die "dependency continuous source must explicitly start bounded capture\n"
+  unless $runner =~
+    /_DEPENDENCY_CONTINUOUS_LARGE_TX_FULL_BASE.{0,2400}phase1_capture_mode\s*=\s*["']BOUNDED_PIPELINE_V1["']/s &&
+         $runner =~ /--rds-preserve-trx-phase1-capture-mode=/s &&
+         $runner =~ /--rds-preserve-trx-phase1-pipeline-workers=/s &&
+         $runner =~ /--rds-preserve-trx-phase1-pipeline-ordinary-active-limit=/s &&
+         $runner =~ /--rds-preserve-trx-phase1-pipeline-credit-bytes=/s;
+for my $profile_name (
+  'DEPENDENCY_SYSBENCH_FULL_PROFILE',
+  'DEPENDENCY_SYSBENCH_SMOKE_PROFILE',
+  'DEPENDENCY_MIXED_FULL_PROFILE',
+  'DEPENDENCY_MIXED_SMOKE_PROFILE') {
+  my ($profile_body) = $runner =~
+    /\Q$profile_name\E\s*=\s*dataclasses\.replace\((.*?)\n\)/s;
+  die "$profile_name must explicitly pin BOUNDED_PIPELINE_V1\n"
+    unless defined($profile_body) && $profile_body =~
+      /phase1_capture_mode\s*=\s*["']BOUNDED_PIPELINE_V1["']/s;
+}
+die "dependency continuous full profile must use the formal round coordinator\n"
+  unless $runner =~
+    /args\.evidence\s+in\s+\{.{0,240}"dependency-sysbench".{0,240}"dependency-continuous-large-tx-transfer".{0,240}\}.{0,120}profile\.formal_rounds\s*>\s*1.{0,240}run_formal_rounds\(/s;
+die "dependency continuous must report requested and observed runtime values\n"
+  unless $business =~ /continuous_runtime_configuration/s &&
+         $business =~ /performance_schema\.global_variables/s &&
+         $business =~ /rds_preserve_trx_transfer_runtime_profile/s &&
+         $business =~ /rds_preserve_trx_transfer_max_inflight_bytes/s &&
+         $business =~ /rds_preserve_trx_memory_budget_bytes/s &&
+         $business =~ /continuous_phase1_pipeline_snapshot/s &&
+         $business =~ /ordinary_active_limit_effective/s;
+die "source final record must carry the Phase1 start milestone\n"
+  unless $preserve =~ /PRESERVE_PHASE2_FINAL_V1.{0,900}phase1_started_us=/s &&
+         $phase2_oracle =~ /["']phase1_started_us["']/s;
+die "Phase1 pipeline/registry lifetime must outlive the existing sender\n"
+  unless $preserve =~
+    /std::unique_ptr<Preserve_trx_phase1_pipeline>\s+phase1_pipeline;.{0,900}struct\s+Phase1_batch_flush_context.{0,900}std::unique_ptr<Preserve_trx_transfer_phase1_batch_sender>/s;
+die "receiver readiness evidence must be keyed by its transfer epoch\n"
+  unless $transfer =~ /PRESERVE_RECEIVER_READY_V1.{0,240}epoch_id=/s &&
+         $business =~ /PRESERVE_RECEIVER_READY_V1/s;
+die "receiver-local READY before final ACK must remain a valid zero lag\n"
+  if $business =~ /if\s+ready_lag_us\s*==\s*0.{0,240}ready_after_final_metadata_us/s;
+die "dependency continuous must sample business progress through Phase1\n"
+  unless $business =~ /continuous_business_progress_samples/s &&
+         $business =~ /continuous_business_tps/s &&
+         $business =~ /phase1_tps_drop_pct/s;
+die "dependency continuous must retain classified worker error evidence\n"
+  unless $business =~ /continuous_business_error_counts/s &&
+         $business =~ /lock_wait_timeout_count/s &&
+         $business =~ /connection_error_count/s &&
+         $business =~ /non_4020_error_count/s;
+die "dependency continuous receiver read-load performance must be report-only\n"
+  unless $business =~ /receiver_read_load_qps_gate_enforced["']:\s*False/s &&
+         $business =~ /enforce_performance_budget=\(\s*not self\.config\.continuous_business_through_drain/s;
+die "dependency continuous success report must follow worker shutdown and join\n"
+  unless $business =~
+    /if self\.config\.continuous_business_through_drain:.{0,240}self\.stop_event\.set\(\).{0,240}self\.join_workers\(\).{0,500}write_standby_transfer_receiver_report\(\s*status=["']success["']/s;
+die "formal rounds must inherit formal evidence from each child report\n"
+  unless $runner =~ /child_report\s*=/s &&
+         $runner =~ /child_formal_evidence\s*=\s*bool\(\s*child_report\.get/s &&
+         $runner =~ /round_formal_evidence\s*=\s*bool\(.{0,300}child_formal_evidence/s &&
+         $runner =~ /all\(bool\(item\.get\(["']formal_evidence["']\)\) for item in rounds\)/s;
+die "child E2E must use the canonical exact-body validator\n"
+  unless $business =~
+           /from\s+preserve_trx_phase2_scheduler_e2e\s+import.{0,400}\bparse_final_records\b/s &&
+         $business =~ /\bvalidate_final_records\s*\(/s &&
+         $business =~ /require_success\s*=\s*True/s &&
+         $business =~ /require_exact_body\s*=\s*True/s &&
+         $business =~ /tail_limit_us\s*=\s*0/s;
+die "continuous SLO must independently enforce the configured exact tail\n"
+  unless $business =~
+    /last_command_end_to_final_ack_within_limit.{0,240}last_command_to_final_ack_us.{0,240}self\.config\.source_post_command_tail_limit_us/s;
+die "continuous child must receive the profile tail limit\n"
+  unless $business =~ /source_post_command_tail_limit_us:\s*int/s &&
+         $business =~ /--source-post-command-tail-limit-us/s &&
+         $runner =~
+           /--source-post-command-tail-limit-us.{0,160}profile\.source_post_command_tail_limit_us/s;
+
+my $phase1_core = join("\n", $pipeline_h, $pipeline_cc, $owner_cc,
+                       $binlog_adapter, $publication_h, $publication_cc);
+my $record_store = join("\n", $lock_warmcopy_h, $lock_warmcopy_cc);
+die "bounded Phase1 must not reserve or poll an unreachable record reclaim queue\n"
+  if $phase1_core =~ /record_reclaim/s || $record_store =~ /record_reclaim/s;
+die "debug-only record dirty-token API must not remain in production sources\n"
+  if $record_store =~ /record_store_dirty_token/s;
+die "unused record-image byte accounting must not remain in hot mutation paths\n"
+  if $record_store =~ /record_image_payload_bytes/s;
+die "unreachable final-binlog credit must not remain a public/configured surface\n"
+  if join("\n", $phase1_core, $preserve, $sys_vars, $business, $runner) =~
+     /tail_binlog_credit/s;
+die "unselected PROVIDER_ENTRY operation kind must not remain in the pipeline\n"
+  if $phase1_core =~ /PROVIDER_ENTRY/s;
+die "dead Phase1 helpers and result fields must not remain\n"
+  if $phase1_core =~ /refresh_or_retire_binding/s ||
+     $phase1_core =~ /publish_checkpoint_result_locked/s ||
+     $owner_cc =~ /\bpending_binding\b/s ||
+     $pipeline_h =~ /struct Preserve_trx_phase1_prepared_result\s*\{.{0,500}\bcredit_bytes\b/s;
+die "release pipeline must not carry debug-only family demand state\n"
+  if $pipeline_cc =~ /\bm_family_demand\b/s;
+die "pressure profiles must not report fields they never apply\n"
+  if $runner =~ /^\s*(?:receiver_workers|phase1_batch_bytes|phase1_batch_linger_ms|transfer_io_bytes_per_sec_base|prewarm_io_bytes_per_sec_base|promotion_prewarm_workers)\s*:\s*int/m;
+die "ordinary-active help must not advertise the removed reclaim subsystem\n"
+  if $sys_vars =~ /ordinary_active_limit.{0,500}Record reclaim/s;
+die "publication snapshot revision is unused and must not remain\n"
+  if join("\n", $publication_h, $publication_cc) =~ /\b(?:publication_)?revision\b/s;
+die "obsolete retry/rebind coalescing and fake legacy scan telemetry remain\n"
+  if $phase1_core =~ /retry_coalesced|rebind_streak|rebind_retry|legacy_open_prepare_scans|legacy_stream_scans/s;
+die "release build must not carry Phase1 debug controls in config or object state\n"
+  unless $pipeline_h =~
+           /#ifndef DBUG_OFF.{0,240}debug_fail_worker_init.{0,120}#endif/s &&
+         $pipeline_cc =~
+           /#ifndef DBUG_OFF.{0,500}m_debug_hold_executors.{0,500}m_debug_family_demand.{0,120}#endif/s &&
+         $owner_cc =~
+           /#ifndef DBUG_OFF.{0,160}m_debug_retry_injected.{0,120}#endif/s &&
+         $binlog_adapter =~
+           /#ifndef DBUG_OFF.{0,160}m_debug_identity_stale_injected.{0,120}#endif/s &&
+         $publication_cc =~
+           /#ifndef DBUG_OFF.{0,160}m_debug_constant_hash.{0,120}#endif/s;
+die "bounded record adoption must defer old blob removal to final reconcile\n"
+  unless $lock_participant =~
+    /adopt_installed_phase1_record_candidate\s*\(.{0,4200}retire_phase1_record_blob\s*\(\s*target\s*\)/s;
+die "bounded final reconcile must retire invalid candidates before one batch cleanup\n"
+  unless $lock_participant =~
+    /reconcile_bounded_final_record_candidates\s*\(.{0,4200}retire_phase1_record_blob\s*\(\s*target\s*\).{0,1600}discard_retired_phase1_record_blobs\s*\(\s*\)/s;
+EOF

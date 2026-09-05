@@ -14,6 +14,32 @@ open(my $fh, '<', $path) or die "cannot open $path: $!";
 my $src = do { local $/; <$fh> };
 close($fh);
 
+my $owner_path = File::Spec->catfile(
+  $source_root, 'sql', 'preserve_trx_phase1_owner.cc');
+open(my $owner_fh, '<', $owner_path) or die "cannot open $owner_path: $!";
+my $owner_src = do { local $/; <$owner_fh> };
+close($owner_fh);
+$owner_src =~ /Record_binding_status resolve_record_binding\([\s\S]*?^}/m
+  or die "cannot isolate record binding lookup\n";
+my $binding_body = $&;
+die "record identity lookup must not compute the unused full store fingerprint\n"
+  if $binding_body =~ /lock_warmcopy_record_store_compare_token_for_target/;
+die "record identity lookup must retain a locked epoch/target head lookup\n"
+  unless $binding_body =~ /lock_warmcopy_record_store_head_for_target/;
+
+my $transfer_path = File::Spec->catfile(
+  $source_root, 'sql', 'preserve_trx_transfer.cc');
+open(my $transfer_fh, '<', $transfer_path)
+  or die "cannot open $transfer_path: $!";
+my $transfer_src = do { local $/; <$transfer_fh> };
+close($transfer_fh);
+die "final metadata must not reallocate all earlier frames for every token\n"
+  if $transfer_src =~
+    /m_pending_final_metadata_frames\.reserve\(\s*m_pending_final_metadata_frames\.size\(\)\s*\+/s;
+die "deferred prebuilt records must share the existing seed batch barrier\n"
+  unless $transfer_src =~
+    /if\s*\(blob\.prebuilt\s*&&\s*blob\.name\s*==\s*kPreservedTrxBlobRecordLocks\s*&&\s*batch_sender\s*!=\s*nullptr\s*&&\s*stage_binlog_seed\)[\s\S]{0,1500}batch_sender->enqueue\(request\)/s;
+
 die "Phase2 execution must own one pending final-HWM publication\n"
   unless $src =~
     /Preserve_batch_target_execution[\s\S]{0,1400}pending_final_binlog_publication/s;
@@ -184,6 +210,20 @@ open(my $scheduler_fh, '<', $scheduler_path)
   or die "cannot open $scheduler_path: $!";
 my $scheduler_src = do { local $/; <$scheduler_fh> };
 close($scheduler_fh);
+my $scheduler_header_path = File::Spec->catfile(
+  $source_root, 'sql', 'preserve_trx_standby_phase2_scheduler.h');
+open(my $scheduler_header_fh, '<', $scheduler_header_path)
+  or die "cannot open $scheduler_header_path: $!";
+my $scheduler_header_src = do { local $/; <$scheduler_header_fh> };
+close($scheduler_header_fh);
+die "command scheduler must not publish Phase1 stable-boundary hints\n"
+  if $scheduler_src =~
+       /Stable_boundary_hint|stable_boundary_hints|take_stable_boundary_hints/s ||
+     $scheduler_header_src =~
+       /Stable_boundary_hint|stable_boundary_hints|take_stable_boundary_hints/s;
+die "dependency readiness must not accept a Phase1 prestage callback\n"
+  if $src =~
+       /boundary_prestage|dependency_phase2_boundary_prestage|PRESTAGE_FAILED/s;
 my $terminal_check_start = index(
   $scheduler_src, 'if (!executing || deadline)');
 my $terminal_check_end = index(

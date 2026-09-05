@@ -243,6 +243,7 @@ class Latches {
   friend class Global_exclusive_latch_guard;
   friend class Global_exclusive_try_latch;
   friend class Global_shared_latch_guard;
+  friend class Phase1_record_shard_set_guard;
   friend class Shard_naked_latch_guard;
   friend class Shard_naked_latches_guard;
 

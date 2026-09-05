@@ -95,6 +95,10 @@ extern const ulonglong preserve_trx_single_phase_max_binlog_cache_bytes;
 extern const uint preserve_trx_max_lock_count;
 extern const uint preserve_trx_max_modified_tables;
 
+/* Called with THD::LOCK_thd_data held by the Phase1 owner repin path. */
+bool preserve_trx_phase1_record_candidate_eligible_locked(THD *thd);
+bool preserve_trx_phase1_target_unsupported_locked(THD *thd);
+
 bool preserved_trx_build_native_binlog_cache_facts(
     const Preserve_snapshot_metadata &metadata,
     const Mysql_binlog_preserve_token_identity &identity,
@@ -107,6 +111,22 @@ enum class Preserved_trx_recover_load_profile {
 };
 extern uint preserve_trx_drain_phase1_timeout_ms;
 extern uint preserve_trx_drain_phase2_timeout_ms;
+
+enum Preserve_trx_phase1_capture_mode : ulong {
+  PRESERVE_TRX_PHASE1_LEGACY_SERIAL = 0,
+  PRESERVE_TRX_PHASE1_BOUNDED_PIPELINE_V1 = 1
+};
+
+extern ulong preserve_trx_phase1_capture_mode;
+extern uint preserve_trx_phase1_pipeline_workers;
+extern uint preserve_trx_phase1_pipeline_ordinary_active_limit;
+extern ulonglong preserve_trx_phase1_pipeline_credit_bytes;
+extern ulonglong preserve_trx_phase1_pipeline_record_reserve_bytes;
+extern ulonglong preserve_trx_phase1_pipeline_binlog_reserve_bytes;
+extern uint preserve_trx_phase1_pipeline_copy_chunk_bytes;
+extern ulonglong preserve_trx_phase1_pipeline_cleanup_reserve_us;
+extern uint preserve_trx_phase1_pipeline_result_slots;
+extern ulonglong preserve_trx_phase1_pipeline_tail_record_credit_bytes;
 
 enum Preserve_trx_standby_phase2_scheduler_mode : ulong {
   PRESERVE_TRX_PHASE2_SCHEDULER_LEGACY = 0,

@@ -1,4 +1,3 @@
-include/assert.inc [boundary candidate refreshed before the second BODY exits]
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 include/assert.inc [first original transaction connection is restored]
 include/assert.inc [second original transaction connection is restored]

@@ -36,7 +36,7 @@ GRANT SELECT, UPDATE ON test.* TO phase2_scheduler_innodb_app@localhost;
 GRANT SESSION_VARIABLES_ADMIN ON *.*
   TO phase2_scheduler_innodb_app@localhost;
 
---let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-standby-phase2-scheduler-mode=DEPENDENCY_CONVERGENCE_V1 --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$SERVER_MYPORT_2 --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=phase2_scheduler_innodb --rds-preserve-trx-transfer-credential-secret-file=$credential_file --rds-preserve-trx-drain-phase1-timeout-ms=10000 --rds-preserve-trx-drain-phase2-timeout-ms=10000 --log-error-verbosity=3
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-standby-phase2-scheduler-mode=DEPENDENCY_CONVERGENCE_V1 --rds-preserve-trx-phase1-capture-mode=BOUNDED_PIPELINE_V1 --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$SERVER_MYPORT_2 --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=phase2_scheduler_innodb --rds-preserve-trx-transfer-credential-secret-file=$credential_file --rds-preserve-trx-drain-phase1-timeout-ms=10000 --rds-preserve-trx-drain-phase2-timeout-ms=10000 --log-error-verbosity=3
 --disable_result_log
 --source include/restart_mysqld.inc
 --enable_result_log
@@ -101,6 +101,12 @@ if ($sync_warning_count)
 {
   --die owner did not reach the post-phase1-record boundary
 }
+
+# Change a page already covered by this transaction's only record lock. The
+# record-lock set stays unchanged, but the final prebuilt descriptor may differ
+# from the Phase1 object and must be published with a newer generation.
+--connection innodb_unchanged_survivor
+UPDATE t_phase2_scheduler_innodb SET v=77 WHERE id=6;
 
 --connection innodb_idle_survivor
 UPDATE t_phase2_scheduler_innodb SET v=55 WHERE id=5;
@@ -197,10 +203,10 @@ die "exact tail is not self-consistent"
          $field{'last_command_end_to_final_ack_us'} ==
          $field{'final_ack_us'} - $field{'last_body_exit_us'};
 die "post-T0 waiter record-lock path was incomplete"
-  unless ($warmcopy{'phase1_record_prebuilt_target_count'} // 0) == 4 &&
-         ($warmcopy{'phase1_record_active_scan_target_count'} // 0) == 1 &&
-         ($warmcopy{'phase2_record_prebuilt_target_count'} // 0) == 2 &&
-         ($warmcopy{'phase2_record_materialized_target_count'} // 0) == 1 &&
+  unless ($warmcopy{'phase1_record_prebuilt_target_count'} // 0) == 5 &&
+         ($warmcopy{'phase2_record_prebuilt_target_count'} // 0) +
+             ($warmcopy{'phase2_record_materialized_target_count'} // 0) == 3 &&
+         ($warmcopy{'phase2_full_lock_scan_count'} // 1) == 0 &&
          ($warmcopy{'phase2_record_lock_count'} // 0) == 4;
 EOF
 --let _PHASE2_FINAL_LOG=

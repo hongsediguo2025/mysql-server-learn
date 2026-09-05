@@ -1,0 +1,30 @@
+--source include/not_windows.inc
+
+SELECT @@GLOBAL.rds_preserve_trx_enable AS preserve_enabled,
+       @@GLOBAL.rds_preserve_trx_phase1_capture_mode AS capture_mode;
+
+--disable_query_log
+--error ER_PRESERVE_TRX_DISABLED
+DRAIN TRANSACTIONS PRESERVE;
+
+--let PIPELINE_OFF_LOG= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--perl
+use strict;
+use warnings;
+my $path = $ENV{'PIPELINE_OFF_LOG'} or die "missing error log";
+open(my $fh, '<', $path) or die "cannot read $path: $!";
+my $in_current_test = 0;
+while (my $line = <$fh>) {
+  if ($line =~ /CURRENT_TEST:\s+preserve_trx\.(\S+)/) {
+    $in_current_test =
+      $1 eq 'batch_drain_phase1_pipeline_off_no_workers';
+    next;
+  }
+  next unless $in_current_test;
+  die "feature OFF unexpectedly started Phase1 pipeline"
+    if $line =~ /PRESERVE_PHASE1_PIPELINE_V1 /;
+}
+close($fh);
+EOF
+--let PIPELINE_OFF_LOG=
+--enable_query_log

@@ -1,0 +1,7 @@
+--rds-preserve-trx-phase1-capture-mode=BOUNDED_PIPELINE_V1
+--rds-preserve-trx-phase1-pipeline-workers=6
+--rds-preserve-trx-phase1-pipeline-credit-bytes=1073741824
+--log-error-verbosity=3
+--rds-preserve-trx-standby-phase2-scheduler-mode=DEPENDENCY_CONVERGENCE_V1
+--rds-preserve-trx-drain-phase1-timeout-ms=5000
+--rds-preserve-trx-drain-phase2-timeout-ms=30000

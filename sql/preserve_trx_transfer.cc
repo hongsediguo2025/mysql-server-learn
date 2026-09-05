@@ -219,11 +219,14 @@ struct Receiver_epoch_ready_state {
   size_t classified_fact_token_count{0};
   size_t failed_fact_token_count{0};
   uint64_t fact_loaded_monotonic_us{0};
+  uint64_t final_spool_ack_monotonic_us{0};
+  uint64_t ready_monotonic_us{0};
   bool fact_loaded{false};
   bool binding{false};
   bool bound{false};
   bool selection_published{false};
   bool global_failure{false};
+  bool readiness_timing_logged{false};
 #ifndef DBUG_OFF
   bool debug_failure_injected{false};
   bool debug_retry_injected{false};
@@ -233,6 +236,35 @@ struct Receiver_epoch_ready_state {
 static std::mutex g_receiver_ready_epoch_mutex;
 static std::map<std::pair<std::string, std::string>, Receiver_epoch_ready_state>
     g_receiver_ready_epoch_state;
+
+static bool take_receiver_epoch_readiness_timing_locked(
+    Receiver_epoch_ready_state *state, uint64_t *final_ack_us,
+    uint64_t *ready_us) {
+  if (state == nullptr || final_ack_us == nullptr || ready_us == nullptr ||
+      state->readiness_timing_logged ||
+      state->final_spool_ack_monotonic_us == 0 ||
+      state->ready_monotonic_us == 0) {
+    return false;
+  }
+  state->readiness_timing_logged = true;
+  *final_ack_us = state->final_spool_ack_monotonic_us;
+  *ready_us = state->ready_monotonic_us;
+  return true;
+}
+
+static void log_receiver_epoch_readiness_timing(const std::string &epoch_id,
+                                                uint64_t final_ack_us,
+                                                uint64_t ready_us) {
+  const uint64_t ready_after_final_ack_us =
+      ready_us > final_ack_us ? ready_us - final_ack_us : 0;
+  const std::string record =
+      "PRESERVE_RECEIVER_READY_V1 epoch_id=" + epoch_id +
+      " final_ack_us=" + std::to_string(final_ack_us) +
+      " ready_us=" + std::to_string(ready_us) +
+      " ready_after_final_ack_us=" +
+      std::to_string(ready_after_final_ack_us);
+  LogErr(SYSTEM_LEVEL, ER_LOG_PRINTF_MSG, record.c_str());
+}
 static std::atomic<bool> g_receiver_epoch_bind_bad_alloc_for_unit_test{false};
 #ifndef NDEBUG
 static std::atomic<Preserve_trx_transfer_before_final_fact_bind_hook>
@@ -5916,6 +5948,9 @@ bool publish_receiver_epoch_ready_from_fact_if_possible_impl(
 
   const uint64_t total_tokens = tokens.size();
   const uint64_t ready_monotonic_us = transfer_monotonic_us();
+  uint64_t readiness_final_ack_us = 0;
+  uint64_t readiness_ready_us = 0;
+  bool log_readiness_timing = false;
   {
     std::lock_guard<std::mutex> guard(g_receiver_ready_epoch_mutex);
     Receiver_epoch_ready_state &state =
@@ -5928,14 +5963,21 @@ bool publish_receiver_epoch_ready_from_fact_if_possible_impl(
         static_cast<uint64_t>(Preserve_trx_promotion_adopt_status::OK));
     g_receiver_prewarm_backlog_at_phase2_end.store(0);
     g_receiver_ready_monotonic_us.store(ready_monotonic_us);
+    state.ready_monotonic_us = ready_monotonic_us;
     state.bound = true;
     state.selection_published = true;
+    log_readiness_timing = take_receiver_epoch_readiness_timing_locked(
+        &state, &readiness_final_ack_us, &readiness_ready_us);
   }
   binding_guard.commit();
   refresh_receiver_ready_after_final_metadata();
   refresh_receiver_ready_after_final_spool_ack();
   refresh_receiver_ready_after_final_metadata_accepted();
   refresh_receiver_ready_after_terminal_commit_admitted();
+  if (log_readiness_timing) {
+    log_receiver_epoch_readiness_timing(epoch_id, readiness_final_ack_us,
+                                        readiness_ready_us);
+  }
   return true;
 }
 
@@ -12312,8 +12354,7 @@ Preserve_trx_transfer_source_epoch_session::send_token_objects_batch(
         stamp_online_epoch_context_locked(&frame);
         frame.sequence = sequence++;
       }
-      m_pending_final_metadata_frames.reserve(
-          m_pending_final_metadata_frames.size() + frames.size());
+      /* Keep amortized growth across tokens; exact reserve here is quadratic. */
       for (Preserve_trx_transfer_frame &frame : frames) {
         m_pending_final_metadata_frames.push_back(std::move(frame));
       }
@@ -13173,7 +13214,25 @@ preserve_trx_transfer_stage_deferred_candidate_external_objects(
 
     Preserve_trx_transfer_status status = Preserve_trx_transfer_status::OK;
     const char *stage = "prebuilt_read";
-    if (blob.prebuilt) {
+    if (blob.prebuilt && blob.name == kPreservedTrxBlobRecordLocks &&
+        batch_sender != nullptr && stage_binlog_seed) {
+      /* The following seed keeps this candidate pending until the wave flush. */
+      Preserve_trx_transfer_phase1_blob_request request;
+      request.transfer_token = candidate->transfer_token;
+      request.object_id = blob.name;
+      request.warmcopy_id = blob.warmcopy_id;
+      request.warmcopy_epoch = blob.warmcopy_epoch;
+      request.size = descriptor.total_size;
+      request.digest = descriptor.digest;
+      request.lock_plan_contract_version = descriptor.lock_plan.version;
+      request.source_live_lock_generation =
+          descriptor.lock_plan.source_live_generation;
+      request.source_live_lock_digest = descriptor.lock_plan.source_live_digest;
+      request.record_store_fingerprint =
+          descriptor.lock_plan.record_store_fingerprint;
+      stage = "prebuilt_enqueue";
+      status = batch_sender->enqueue(request);
+    } else if (blob.prebuilt) {
       status = stream_prebuilt_external_blob_for_transfer(
           session, candidate->transfer_token, preserve_dir, blob.name,
           blob.warmcopy_id, blob.warmcopy_epoch, blob.descriptor.size,
@@ -13517,7 +13576,9 @@ Preserve_trx_transfer_source_epoch_session::abort_epoch_locked(
   if (first_pending_sequence != 0) {
     m_pending_final_metadata_frames.clear();
     m_final_metadata_tokens.clear();
-    m_next_sequence = first_pending_sequence;
+    if (!m_final_metadata_accepted) {
+      m_next_sequence = first_pending_sequence;
+    }
   }
 
   Preserve_trx_transfer_status first_error = Preserve_trx_transfer_status::OK;
@@ -18622,8 +18683,25 @@ static Preserve_trx_transfer_status send_receiver_authenticated_ack(
   ack_context->ack_sent = true;
   if (acknowledge_epoch) {
     const uint64_t ack_us = transfer_monotonic_us();
+    uint64_t readiness_final_ack_us = 0;
+    uint64_t readiness_ready_us = 0;
+    bool log_readiness_timing = false;
+    {
+      std::lock_guard<std::mutex> guard(g_receiver_ready_epoch_mutex);
+      const auto found = g_receiver_ready_epoch_state.find(
+          {ack_context->root_dir, epoch_id});
+      if (found != g_receiver_ready_epoch_state.end()) {
+        found->second.final_spool_ack_monotonic_us = ack_us;
+        log_readiness_timing = take_receiver_epoch_readiness_timing_locked(
+            &found->second, &readiness_final_ack_us, &readiness_ready_us);
+      }
+    }
     g_receiver_final_spool_ack_monotonic_us.store(ack_us);
     refresh_receiver_ready_after_final_spool_ack();
+    if (log_readiness_timing) {
+      log_receiver_epoch_readiness_timing(epoch_id, readiness_final_ack_us,
+                                          readiness_ready_us);
+    }
     const Preserve_trx_transfer_status cleanup_status =
         default_receiver_registry().acknowledge_epoch(
             ack_context->root_dir, epoch_id, ack_us,

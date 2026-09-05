@@ -1,6 +1,5 @@
-# Dependency Phase2 may refresh discardable transfer candidates while an
-# original T0 BODY is still running, but it must not publish HARD until every
-# original BODY has exited.
+# Dependency Phase2 must not publish HARD until every original T0 BODY has
+# exited.  Command scheduling does not own transfer progress or batching.
 --source include/have_debug.inc
 --source include/have_debug_sync.inc
 --source include/not_windows.inc
@@ -96,7 +95,6 @@ SET DEBUG_SYNC=
 
 --connection boundary_ha
 SET DEBUG_SYNC='now WAIT_FOR boundary_phase1_streamed TIMEOUT 30';
---let $record_send_before= query_get_value(SELECT VARIABLE_VALUE+0 AS value FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_phase1_record_last_batch_send_us', value, 1)
 SET DEBUG_SYNC='now SIGNAL boundary_phase1_continue';
 SET DEBUG_SYNC='now WAIT_FOR boundary_t0_registered TIMEOUT 30';
 
@@ -107,11 +105,6 @@ SET DEBUG_SYNC='now SIGNAL boundary_app_1_continue';
 
 --connection boundary_ha
 SET DEBUG_SYNC='now SIGNAL boundary_t0_continue';
---let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_phase1_record_last_batch_send_us')>$record_send_before
---source include/wait_condition.inc
---let $assert_text= boundary candidate refreshed before the second BODY exits
---let $assert_cond= `SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_phase1_record_last_batch_send_us')>$record_send_before`
---source include/assert.inc
 
 --disable_warnings
 SET DEBUG_SYNC='now WAIT_FOR boundary_hard_published TIMEOUT 1';

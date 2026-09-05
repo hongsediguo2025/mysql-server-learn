@@ -1362,6 +1362,9 @@ dberr_t RecLock::add_to_waitq(const lock_t *wait_for, const lock_prdt_t *prdt) {
 
   /* Don't queue the lock to hash table, if high priority transaction. */
   lock_t *lock = create(m_trx, prdt);
+  if (lock_warmcopy_record_compact_stable_page_enabled()) {
+    (void)lock_warmcopy_record_note_wait_request_for_lock(lock);
+  }
 
   lock_create_wait_for_edge(m_trx, wait_for->trx);
 

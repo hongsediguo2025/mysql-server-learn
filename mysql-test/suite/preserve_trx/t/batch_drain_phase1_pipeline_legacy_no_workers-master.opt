@@ -1,0 +1,2 @@
+--rds-preserve-trx-phase1-capture-mode=LEGACY_SERIAL
+--rds-preserve-trx-phase1-pipeline-ordinary-active-limit=1

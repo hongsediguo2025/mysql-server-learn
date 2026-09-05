@@ -1,6 +1,6 @@
-# An idle target is refreshed at a stable command boundary. A concurrent
-# waiter then converts its implicit record lock to an explicit lock, making
-# that refreshed Phase1 blob stale. Final preserve must use the live fallback.
+# Concurrent waiters convert implicit record locks to explicit locks after the
+# first Phase1 stream. BOUNDED_PIPELINE_V1 must refresh the exact per-target
+# store at the final boundary without a second native lock-list capture.
 --source include/have_debug.inc
 --source include/have_debug_sync.inc
 --source include/not_windows.inc
@@ -103,21 +103,15 @@ SET DEBUG_SYNC=
 
 --connection lock_reseal_ha
 SET DEBUG_SYNC='now WAIT_FOR lock_reseal_phase1_sent TIMEOUT 30';
---let $record_send_before= query_get_value(SELECT VARIABLE_VALUE+0 AS value FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_phase1_record_last_batch_send_us', value, 1)
 
-# The first asynchronous implicit-to-explicit conversion invalidates the
-# Phase1 lock blob. T0's stable-boundary prestage must refresh this version
-# before the second conversion invalidates it again.
+# Both asynchronous implicit-to-explicit conversions change the native lock
+# fence. Their ordinary record-lock hooks also update the exact per-target
+# store, so final reconciliation may refresh from that store.
 SET DEBUG_SYNC='now SIGNAL first_lock_conversion_go';
 SET DEBUG_SYNC='now WAIT_FOR first_lock_conversion_done TIMEOUT 30';
 SET DEBUG_SYNC='now SIGNAL lock_reseal_phase1_continue';
 SET DEBUG_SYNC='now WAIT_FOR lock_reseal_t0_registered TIMEOUT 30';
 SET DEBUG_SYNC='now SIGNAL lock_reseal_t0_continue';
---let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_phase1_record_last_batch_send_us')>$record_send_before
---source include/wait_condition.inc
---let $assert_text= idle target record-lock candidate refreshed before conversion
---let $assert_cond= `SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_phase1_record_last_batch_send_us')>$record_send_before`
---source include/assert.inc
 
 SET DEBUG_SYNC='now SIGNAL second_lock_conversion_go';
 SET DEBUG_SYNC='now WAIT_FOR second_lock_conversion_done TIMEOUT 30';
@@ -147,13 +141,44 @@ SET DEBUG_SYNC='RESET';
 SELECT
   (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
    WHERE VARIABLE_NAME='Preserve_trx_lock_warmcopy_sealed_valid')
-     = @lock_reseal_valid_before AS stale_prebuilt_rejected,
+     > @lock_reseal_valid_before AS final_store_candidate_valid,
   (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
    WHERE VARIABLE_NAME='Preserve_trx_lock_warmcopy_live_fallback')
-     > @lock_reseal_fallback_before AS live_lock_list_fallback,
+     = @lock_reseal_fallback_before AS live_lock_list_fallback_avoided,
   (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
    WHERE VARIABLE_NAME='Preserve_trx_early_staged_tokens')=1
      AS early_token_staged;
+
+--let PHASE1_CONVERSION_LOG= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--perl
+use strict;
+use warnings;
+my $path = $ENV{'PHASE1_CONVERSION_LOG'} or die "missing source error log";
+open(my $fh, '<', $path) or die "cannot read $path: $!";
+my $store_refresh = 0;
+my $in_current_test = 0;
+while (my $line = <$fh>) {
+  if ($line =~ /CURRENT_TEST:\s+preserve_trx\.(\S+)/) {
+    $in_current_test =
+      $1 eq 'batch_drain_dependency_lock_store_reseal';
+    next;
+  }
+  next unless $in_current_test;
+  $store_refresh = 1
+    if $line =~ /PRESERVE_PHASE1_OWNER_V1 / &&
+       $line =~ /event=FINAL_RECORD_RECONCILE_COMPLETE/ &&
+       $line =~ /targets=1/ && $line =~ /captured=0/ &&
+       $line =~ /store_refresh_targets=1/ &&
+       $line =~ /store_refreshed=1/ &&
+       $line =~ /store_fallback_coordinate=0/ &&
+       $line =~ /deferred=0/ && $line =~ /exact=1/ &&
+       $line =~ /failed=0/;
+}
+close($fh);
+die "implicit-to-explicit conversion did not use exact final store refresh"
+  unless $store_refresh;
+EOF
+--let PHASE1_CONVERSION_LOG=
 
 --connection lock_reseal_target
 --let $assert_text= lock-reseal failure restores the original transaction connection

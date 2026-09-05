@@ -37,6 +37,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 
 #include "db0err.h"
 #include "sql/preserve_trx_xid.h"
+#include "storage/innobase/include/lock0preserve_capture.h"
 #include "storage/innobase/include/lock0warmcopy.h"
 
 class THD;
@@ -200,6 +201,15 @@ trx_t *trx_preserve_current_thd_trx(THD *thd);
 /** Return only the opaque existing InnoDB trx pointer. The caller owns
 THD::LOCK_thd_data; this helper never dereferences trx_t. */
 uint64_t trx_preserve_phase2_peek_raw_cookie(THD *thd);
+uint64_t trx_preserve_phase1_peek_raw_cookie(THD *thd);
+struct trx_preserve_phase1_identity {
+  uint64_t raw_cookie{0};
+  uint64_t owner_thd_cookie{0};
+  uint64_t immutable_trx_id{0};
+  uint64_t trx_version{0};
+};
+bool trx_preserve_phase1_owner_identity_snapshot(
+    THD *thd, trx_preserve_phase1_identity *identity);
 trx_preserve_phase2_identity_status
 trx_preserve_phase2_owner_identity_snapshot(
     THD *thd, trx_preserve_phase2_identity *identity);
@@ -349,6 +359,19 @@ dberr_t trx_preserve_export_record_locks_stable_page_only(
     trx_t *trx, std::string *payload, uint32_t max_lock_count);
 dberr_t trx_preserve_export_record_locks_stable_page_only(
     THD *thd, std::string *payload, uint32_t max_lock_count);
+lock_preserve_phase1_record_capture_status
+trx_preserve_phase1_capture_record_lock_values(
+    THD *thd, uint32_t max_lock_count, uint64_t max_snapshot_bytes,
+    lock_preserve_phase1_record_snapshot *snapshot);
+lock_preserve_phase1_record_identity_status
+trx_preserve_phase1_validate_record_lock_snapshot(
+    THD *thd, const lock_preserve_phase1_record_snapshot &snapshot);
+lock_preserve_phase1_record_resolve_status
+trx_preserve_phase1_resolve_record_lock_values(
+    THD *worker_thd, lock_preserve_phase1_record_snapshot *snapshot,
+    const lock_preserve_phase1_record_resolve_control &control,
+    std::string *payload,
+    lock_preserve_phase1_record_resolve_metrics *metrics);
 bool trx_preserve_sample_lock_warmcopy_fence(
     THD *thd, lock_warmcopy_trx_lock_fence_t *fence);
 bool trx_preserve_sample_lock_warmcopy_fence(

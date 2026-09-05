@@ -76,11 +76,6 @@ struct Command_exit_fact {
   Transaction_observation transaction_observation;
 };
 
-struct Stable_boundary_hint {
-  Command_key command;
-  uint64_t thread_id_projection{0};
-};
-
 enum class Terminal_result : uint8_t {
   RUNNING,
   HARD_QUIESCENT,
@@ -161,9 +156,6 @@ Gate_action gate_command(THD *command_thd,
                          const Admission_request &request);
 Finish_result finish_command(THD *command_thd,
                              const Command_exit_fact &fact);
-void take_stable_boundary_hints(
-    const Attempt_handle &attempt,
-    std::vector<Stable_boundary_hint> *hints);
 void note_teardown_begin(uint64_t connection_incarnation);
 void note_transaction_cleanup(uint64_t connection_incarnation,
                               const Transaction_key &transaction);

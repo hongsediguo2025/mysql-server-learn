@@ -32,6 +32,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <new>
 #include <string>
 #include <utility>
 #include <vector>
@@ -57,6 +58,7 @@ extern uint preserve_trx_lock_warmcopy_conversion_wait_timeout_ms;
 namespace {
 std::atomic<uint64_t> lock_warmcopy_observed_hook_events{0};
 std::atomic<uint64_t> lock_warmcopy_conversion_freeze_waits{0};
+std::atomic<uint64_t> lock_warmcopy_compact_stable_page_epoch{0};
 std::atomic<uint64_t> lock_warmcopy_max_journal_bytes{
     std::numeric_limits<uint64_t>::max()};
 constexpr uint64_t k_lock_warmcopy_default_target_id = 0;
@@ -142,9 +144,12 @@ using lock_warmcopy_record_shard_map_t =
     std::map<lock_warmcopy_record_shard_key_t,
              lock_warmcopy_record_shard_state_t,
              lock_warmcopy_record_shard_key_less>;
+
 struct lock_warmcopy_record_store_partition_t {
   std::mutex mutex;
   std::map<uint64_t, lock_warmcopy_record_shard_map_t> store_by_target;
+  /* Advances on every full baseline replacement or explicit clear. */
+  std::map<uint64_t, uint64_t> baseline_generation_by_target;
   std::map<uint64_t, uint64_t> journal_sequence_by_target;
   /*
     Expected sequence tracks whether every hook delta for a target was observed
@@ -464,6 +469,45 @@ uint64_t next_record_journal_sequence_for_target_locked(uint64_t target_id) {
                .journal_sequence_by_target[target_id];
 }
 
+uint64_t next_record_baseline_generation_for_target_locked(
+    uint64_t target_id) {
+  uint64_t &generation =
+      record_store_partition_for_target(target_id)
+          .baseline_generation_by_target[target_id];
+  if (generation == std::numeric_limits<uint64_t>::max()) return 0;
+  return ++generation;
+}
+
+bool advance_record_baseline_generation_if_present_locked(
+    uint64_t target_id) {
+  auto &generations = record_store_partition_for_target(target_id)
+                          .baseline_generation_by_target;
+  const auto found = generations.find(target_id);
+  if (found == generations.end()) return true;
+  if (found->second == std::numeric_limits<uint64_t>::max()) return false;
+  ++found->second;
+  return true;
+}
+
+bool record_target_u64_value_locked(
+    const std::map<uint64_t, uint64_t> &values, uint64_t target_id,
+    uint64_t *value) {
+  const auto found = values.find(target_id);
+  *value = found == values.end() ? 0 : found->second;
+  return found != values.end();
+}
+
+void record_target_invalid_state_locked(
+    const lock_warmcopy_record_store_partition_t &partition,
+    uint64_t target_id, bool *invalid, unsigned char *reason_digest) {
+  const auto found = partition.target_invalid_reason_by_target.find(target_id);
+  *invalid = found != partition.target_invalid_reason_by_target.end();
+  std::memset(reason_digest, 0, LOCK_WARMCOPY_SHA256_DIGEST_LENGTH);
+  if (!*invalid) return;
+  SHA_EVP256(reinterpret_cast<const unsigned char *>(found->second.data()),
+             found->second.size(), reason_digest);
+}
+
 uint64_t &expected_record_delta_sequence_for_target_locked(uint64_t target_id) {
   uint64_t &expected =
       record_store_partition_for_target(target_id)
@@ -477,6 +521,24 @@ uint64_t saturating_add_u64(uint64_t lhs, uint64_t rhs) {
     return std::numeric_limits<uint64_t>::max();
   }
   return lhs + rhs;
+}
+
+void record_image_erase_locked(lock_warmcopy_record_shard_state_t *shard,
+                               uint32_t heap_no) {
+  const auto found = shard->record_images.find(heap_no);
+  if (found == shard->record_images.end()) return;
+  shard->record_images.erase(found);
+}
+
+void record_image_upsert_locked(
+    lock_warmcopy_record_shard_state_t *shard, uint32_t heap_no,
+    const lock_warmcopy_record_image_entry_t &entry) {
+  const auto found = shard->record_images.find(heap_no);
+  if (found != shard->record_images.end()) {
+    found->second = entry;
+  } else {
+    shard->record_images.emplace(heap_no, entry);
+  }
 }
 
 uint64_t record_journal_delta_bytes(
@@ -549,6 +611,10 @@ lock_warmcopy_record_shard_state_t &find_or_create_record_shard(
   if (result.second) {
     shard.key = key;
     shard.normalized_bitmap.assign(record_bitmap_len(key.n_bits), 0);
+    if (lock_warmcopy_record_compact_stable_page_enabled()) {
+      shard.shard_state_flags |=
+          LOCK_WARMCOPY_RECORD_SHARD_COMPACT_STABLE_PAGE;
+    }
   }
   return shard;
 }
@@ -573,8 +639,17 @@ bool record_bitmap_bit_is_set(const lock_warmcopy_record_shard_state_t &shard,
   return (shard.normalized_bitmap[byte_pos] & bit_mask) != 0;
 }
 
+bool record_shard_uses_compact_stable_page(
+    const lock_warmcopy_record_shard_state_t &shard) {
+  return (shard.shard_state_flags &
+          LOCK_WARMCOPY_RECORD_SHARD_COMPACT_STABLE_PAGE) != 0;
+}
+
 void refresh_missing_record_image_flag(
     lock_warmcopy_record_shard_state_t *shard) {
+  if (record_shard_uses_compact_stable_page(*shard)) {
+    shard->missing_record_image_count = 0;
+  }
   if (shard->missing_record_image_count == 0 && !shard->forced_invalid) {
     shard->shard_state_flags &= ~LOCK_WARMCOPY_RECORD_SHARD_INVALID;
     shard->last_diagnostic_reason.clear();
@@ -669,6 +744,8 @@ bool record_bitmap_set_locked(
   const bool was_set = record_bitmap_bit_is_set(shard, heap_no);
   const bool had_digest = shard.record_images.find(heap_no) !=
                           shard.record_images.end();
+  const bool compact_stable_page =
+      record_shard_uses_compact_stable_page(shard);
   const size_t byte_pos = heap_no / 8U;
   const unsigned char bit_mask =
       static_cast<unsigned char>(1U << (heap_no % 8U));
@@ -676,9 +753,12 @@ bool record_bitmap_set_locked(
   shard.normalized_bitmap[byte_pos] =
       static_cast<unsigned char>(shard.normalized_bitmap[byte_pos] | bit_mask);
   if (!was_set) ++shard.set_bit_count;
-  if (digest == nullptr) {
+  if (compact_stable_page) {
+    shard.missing_record_image_count = 0;
+    record_image_erase_locked(&shard, heap_no);
+  } else if (digest == nullptr) {
     if (!was_set || had_digest) ++shard.missing_record_image_count;
-    shard.record_images.erase(heap_no);
+    record_image_erase_locked(&shard, heap_no);
   } else {
     if (was_set && !had_digest && shard.missing_record_image_count > 0) {
       --shard.missing_record_image_count;
@@ -690,7 +770,7 @@ bool record_bitmap_set_locked(
     if (encoded_record_image != nullptr) {
       entry.encoded_record_image = *encoded_record_image;
     }
-    shard.record_images[heap_no] = entry;
+    record_image_upsert_locked(&shard, heap_no, entry);
   }
   shard.shard_state_flags |= LOCK_WARMCOPY_RECORD_SHARD_DIRTY;
   shard.shard_state_flags &= ~LOCK_WARMCOPY_RECORD_SHARD_TOMBSTONE;
@@ -700,8 +780,9 @@ bool record_bitmap_set_locked(
   shard.journal_cursor = journal_cursor;
   shard.last_applied_journal_seq = journal_cursor;
   normalize_record_bitmap(&shard.normalized_bitmap, shard.key.n_bits);
-  update_record_shard_rolling_fingerprint_locked(&shard, 3, heap_no, digest,
-                                                 heap_offset);
+  update_record_shard_rolling_fingerprint_locked(
+      &shard, 3, heap_no, compact_stable_page ? nullptr : digest,
+      compact_stable_page ? heap_no : heap_offset);
   return true;
 }
 
@@ -730,7 +811,7 @@ bool record_bitmap_reset_locked(uint64_t target_id,
   if (was_set && !had_digest && shard.missing_record_image_count > 0) {
     --shard.missing_record_image_count;
   }
-  shard.record_images.erase(heap_no);
+  record_image_erase_locked(&shard, heap_no);
   shard.shard_state_flags |= LOCK_WARMCOPY_RECORD_SHARD_DIRTY;
   refresh_missing_record_image_flag(&shard);
   ++shard.mutation_generation;
@@ -762,8 +843,12 @@ bool record_lock_discard_locked(uint64_t target_id,
   shard.set_bit_count = 0;
   shard.missing_record_image_count = 0;
   shard.forced_invalid = false;
+  const uint32_t payload_mode_flags =
+      shard.shard_state_flags &
+      LOCK_WARMCOPY_RECORD_SHARD_COMPACT_STABLE_PAGE;
   shard.shard_state_flags = LOCK_WARMCOPY_RECORD_SHARD_DIRTY |
-                            LOCK_WARMCOPY_RECORD_SHARD_TOMBSTONE;
+                            LOCK_WARMCOPY_RECORD_SHARD_TOMBSTONE |
+                            payload_mode_flags;
   shard.last_diagnostic_reason = "record_lock_discard";
   ++shard.mutation_generation;
   add_record_shard_journal_bytes_locked(&shard, journal_delta);
@@ -823,7 +908,7 @@ bool apply_record_journal_delta_locked(
       if (bit_was_set && !had_digest && shard.missing_record_image_count > 0) {
         --shard.missing_record_image_count;
       }
-      shard.record_images[heap_no] = entry;
+      record_image_upsert_locked(&shard, heap_no, entry);
       shard.shard_state_flags |= LOCK_WARMCOPY_RECORD_SHARD_DIRTY;
       shard.shard_state_flags &= ~LOCK_WARMCOPY_RECORD_SHARD_TOMBSTONE;
       refresh_missing_record_image_flag(&shard);
@@ -861,7 +946,7 @@ bool apply_record_journal_delta_locked(
       shard.normalized_bitmap[byte_pos] = static_cast<unsigned char>(
           shard.normalized_bitmap[byte_pos] &
           static_cast<unsigned char>(~bit_mask));
-      shard.record_images.erase(heap_no);
+      record_image_erase_locked(&shard, heap_no);
       shard.shard_state_flags |= LOCK_WARMCOPY_RECORD_SHARD_DIRTY |
                                  LOCK_WARMCOPY_RECORD_SHARD_TOMBSTONE;
       refresh_missing_record_image_flag(&shard);
@@ -948,8 +1033,11 @@ bool append_record_payload_entry_locked(
   const uint32_t set_bits = record_bitmap_set_bit_count(bitmap);
   if (set_bits == 0) return true;
 
+  const bool compact_stable_page =
+      record_shard_uses_compact_stable_page(shard);
   if ((shard.shard_state_flags & LOCK_WARMCOPY_RECORD_SHARD_INVALID) != 0 ||
-      shard.missing_record_image_count != 0) {
+      shard.missing_record_image_count != 0 ||
+      (compact_stable_page && !shard.record_images.empty())) {
     return false;
   }
 
@@ -961,13 +1049,17 @@ bool append_record_payload_entry_locked(
         static_cast<unsigned char>(1U << (heap_no % 8U));
     if ((bitmap[byte_pos] & bit_mask) == 0) continue;
 
-    const auto image_it = shard.record_images.find(heap_no);
-    if (image_it == shard.record_images.end() ||
-        image_it->second.encoded_record_image.empty()) {
-      return false;
+    if (compact_stable_page) {
+      append_u32_le(&heap_offsets, heap_no);
+    } else {
+      const auto image_it = shard.record_images.find(heap_no);
+      if (image_it == shard.record_images.end() ||
+          image_it->second.encoded_record_image.empty()) {
+        return false;
+      }
+      append_u32_le(&heap_offsets, image_it->second.heap_offset);
+      record_images.append(image_it->second.encoded_record_image);
     }
-    append_u32_le(&heap_offsets, image_it->second.heap_offset);
-    record_images.append(image_it->second.encoded_record_image);
   }
 
   if (heap_offsets.size() != static_cast<size_t>(set_bits) * 4) return false;
@@ -1119,6 +1211,34 @@ bool record_store_fence_for_target_locked(
                                                 nullptr, nullptr);
 }
 
+bool record_store_compare_token_for_target_locked(
+    uint64_t target_id,
+    lock_warmcopy_record_store_compare_token_t *token) {
+  if (token == nullptr) return false;
+  *token = lock_warmcopy_record_store_compare_token_t{};
+  const auto &partition = record_store_partition_for_target(target_id);
+  const lock_warmcopy_record_shard_map_t *store =
+      record_store_for_target_if_exists_locked(target_id);
+  token->epoch = lock_warmcopy_epoch.load(std::memory_order_acquire);
+  token->target_id = target_id;
+  (void)record_target_u64_value_locked(
+      partition.baseline_generation_by_target, target_id,
+      &token->baseline_generation);
+  token->journal_sequence_present = record_target_u64_value_locked(
+      partition.journal_sequence_by_target, target_id,
+      &token->journal_sequence);
+  token->expected_delta_sequence_present = record_target_u64_value_locked(
+      partition.expected_delta_sequence_by_target, target_id,
+      &token->expected_delta_sequence);
+  token->journal_bytes_present = record_target_u64_value_locked(
+      partition.journal_bytes_by_target, target_id, &token->journal_bytes);
+  token->store_present = store != nullptr;
+  record_target_invalid_state_locked(
+      partition, target_id, &token->target_invalid,
+      token->invalid_reason_digest);
+  return record_store_fence_for_target_locked(store, &token->store_fence);
+}
+
 bool record_shard_key_from_lock(const lock_t *lock,
                                 lock_warmcopy_record_shard_key_t *key) {
   if (lock == nullptr || key == nullptr ||
@@ -1137,11 +1257,20 @@ bool record_shard_key_from_lock(const lock_t *lock,
 }
 }
 
+struct lock_warmcopy_record_store_candidate_t {
+  std::shared_ptr<void> detached_store;
+  lock_warmcopy_record_store_fence_t store_fence;
+  uint32_t record_lock_count{0};
+  std::atomic<bool> consumed{false};
+};
+
 struct lock_warmcopy_prepare_guard_t {
   locksys::Global_exclusive_latch_guard guard;
 };
 
-void lock_warmcopy_open_epoch(uint64_t epoch, uint64_t max_journal_bytes) {
+void lock_warmcopy_open_epoch(
+    uint64_t epoch, uint64_t max_journal_bytes,
+    lock_warmcopy_record_payload_mode_t record_payload_mode) {
   /*
     Epoch zero means hooks are disabled. A non-zero epoch admits lightweight
     record-hook bookkeeping; target selection and final seal still decide
@@ -1149,11 +1278,27 @@ void lock_warmcopy_open_epoch(uint64_t epoch, uint64_t max_journal_bytes) {
   */
   lock_warmcopy_max_journal_bytes.store(max_journal_bytes,
                                         std::memory_order_release);
-  lock_warmcopy_epoch.store(epoch == 0 ? 1 : epoch, std::memory_order_release);
+  const uint64_t effective_epoch = epoch == 0 ? 1 : epoch;
+  lock_warmcopy_compact_stable_page_epoch.store(
+      record_payload_mode ==
+              lock_warmcopy_record_payload_mode_t::COMPACT_STABLE_PAGE
+          ? effective_epoch
+          : 0,
+      std::memory_order_release);
+  lock_warmcopy_epoch.store(effective_epoch, std::memory_order_release);
 }
 
 void lock_warmcopy_close_epoch() {
   lock_warmcopy_epoch.store(0, std::memory_order_release);
+  lock_warmcopy_compact_stable_page_epoch.store(0,
+                                                 std::memory_order_release);
+}
+
+bool lock_warmcopy_record_compact_stable_page_enabled() {
+  const uint64_t epoch = lock_warmcopy_epoch.load(std::memory_order_acquire);
+  return epoch != 0 &&
+         lock_warmcopy_compact_stable_page_epoch.load(
+             std::memory_order_acquire) == epoch;
 }
 
 void lock_warmcopy_record_hook_event() {
@@ -1256,6 +1401,18 @@ bool lock_warmcopy_record_note_bulk_mutation_for_lock(
     case lock_warmcopy_record_bulk_mutation_t::INHERIT:
       break;
   }
+  lock->trx->lock.lock_warmcopy_coordinate_generation.fetch_add(
+      1, std::memory_order_relaxed);
+  lock_warmcopy_observed_hook_events.fetch_add(1, std::memory_order_relaxed);
+  return true;
+}
+
+bool lock_warmcopy_record_note_wait_request_for_lock(const lock_t *lock) {
+  if (!lock_warmcopy_record_compact_stable_page_enabled() || lock == nullptr ||
+      lock->trx == nullptr) {
+    return false;
+  }
+
   lock->trx->lock.lock_warmcopy_coordinate_generation.fetch_add(
       1, std::memory_order_relaxed);
   lock_warmcopy_observed_hook_events.fetch_add(1, std::memory_order_relaxed);
@@ -1454,6 +1611,15 @@ bool lock_warmcopy_record_bitmap_reset_for_unit_test(
                                     heap_no);
 }
 
+#ifndef DBUG_OFF
+bool lock_warmcopy_record_discard_for_target_for_unit_test(
+    uint64_t target_id, const lock_warmcopy_record_shard_key_t &key) {
+  std::lock_guard<std::mutex> guard(
+      record_store_partition_for_target(target_id).mutex);
+  return record_lock_discard_locked(target_id, key);
+}
+#endif  // DBUG_OFF
+
 bool lock_warmcopy_record_journal_upsert_for_target_for_unit_test(
     uint64_t target_id, uint64_t journal_sequence,
     const lock_warmcopy_record_shard_key_t &key, uint32_t heap_no,
@@ -1602,6 +1768,11 @@ bool lock_warmcopy_record_store_seed_payload_for_target(
   std::lock_guard<std::mutex> guard(
       record_store_partition_for_target(target_id).mutex);
   auto &partition = record_store_partition_for_target(target_id);
+  /* Legacy-only targets do not allocate bounded compare metadata. */
+  if (!advance_record_baseline_generation_if_present_locked(target_id)) {
+    if (lock_count != nullptr) *lock_count = 0;
+    return false;
+  }
   const bool had_preexisting_state =
       partition.target_invalid_reason_by_target.find(target_id) !=
           partition.target_invalid_reason_by_target.end() ||
@@ -1632,11 +1803,15 @@ void lock_warmcopy_record_store_clear_for_target(uint64_t target_id) {
   std::lock_guard<std::mutex> guard(
       record_store_partition_for_target(target_id).mutex);
   auto &partition = record_store_partition_for_target(target_id);
+  (void)advance_record_baseline_generation_if_present_locked(target_id);
   partition.store_by_target.erase(target_id);
   partition.journal_sequence_by_target.erase(target_id);
   partition.expected_delta_sequence_by_target.erase(target_id);
   partition.journal_bytes_by_target.erase(target_id);
   partition.target_invalid_reason_by_target.erase(target_id);
+  if (lock_warmcopy_epoch.load(std::memory_order_acquire) == 0) {
+    partition.baseline_generation_by_target.erase(target_id);
+  }
 }
 
 bool lock_warmcopy_record_store_fence_for_target(
@@ -1646,6 +1821,125 @@ bool lock_warmcopy_record_store_fence_for_target(
   const lock_warmcopy_record_shard_map_t *store =
       record_store_for_target_if_exists_locked(target_id);
   return record_store_fence_for_target_locked(store, fence);
+}
+
+bool lock_warmcopy_record_store_compare_token_for_target(
+    uint64_t target_id,
+    lock_warmcopy_record_store_compare_token_t *token) {
+  if (token == nullptr) return false;
+  std::lock_guard<std::mutex> guard(
+      record_store_partition_for_target(target_id).mutex);
+  return record_store_compare_token_for_target_locked(target_id, token);
+}
+
+bool lock_warmcopy_record_store_head_for_target(
+    uint64_t target_id, lock_warmcopy_record_store_head_t *head) {
+  if (head == nullptr) return false;
+  *head = lock_warmcopy_record_store_head_t{};
+  std::lock_guard<std::mutex> guard(
+      record_store_partition_for_target(target_id).mutex);
+  const auto &partition = record_store_partition_for_target(target_id);
+  head->epoch = lock_warmcopy_epoch.load(std::memory_order_acquire);
+  head->target_id = target_id;
+  (void)record_target_u64_value_locked(
+      partition.baseline_generation_by_target, target_id,
+      &head->baseline_generation);
+  head->store_present =
+      record_store_for_target_if_exists_locked(target_id) != nullptr;
+  head->target_invalid =
+      partition.target_invalid_reason_by_target.find(target_id) !=
+      partition.target_invalid_reason_by_target.end();
+  return true;
+}
+
+lock_warmcopy_record_store_snapshot_status_t
+lock_warmcopy_record_store_snapshot_candidate_for_target(
+    uint64_t target_id, uint64_t expected_epoch,
+    uint64_t expected_baseline_generation, uint32_t max_lock_count,
+    uint64_t max_payload_bytes, std::string *payload, uint32_t *lock_count,
+    lock_warmcopy_record_store_compare_token_t *token) {
+  if (payload == nullptr || lock_count == nullptr || token == nullptr ||
+      expected_epoch == 0 || expected_baseline_generation == 0 ||
+      max_lock_count == 0 || max_payload_bytes == 0) {
+    return lock_warmcopy_record_store_snapshot_status_t::INVALID_ARGUMENT;
+  }
+  payload->clear();
+  *lock_count = 0;
+  *token = lock_warmcopy_record_store_compare_token_t{};
+
+  try {
+    std::lock_guard<std::mutex> guard(
+        record_store_partition_for_target(target_id).mutex);
+    const auto &partition = record_store_partition_for_target(target_id);
+    if (lock_warmcopy_epoch.load(std::memory_order_acquire) !=
+        expected_epoch) {
+      return lock_warmcopy_record_store_snapshot_status_t::EPOCH_MISMATCH;
+    }
+    uint64_t baseline_generation = 0;
+    if (!record_target_u64_value_locked(
+            partition.baseline_generation_by_target, target_id,
+            &baseline_generation) ||
+        baseline_generation != expected_baseline_generation) {
+      return lock_warmcopy_record_store_snapshot_status_t::BASELINE_MISMATCH;
+    }
+    const lock_warmcopy_record_shard_map_t *store =
+        record_store_for_target_if_exists_locked(target_id);
+    if (store == nullptr) {
+      return lock_warmcopy_record_store_snapshot_status_t::STORE_NOT_PRESENT;
+    }
+    if (partition.target_invalid_reason_by_target.find(target_id) !=
+        partition.target_invalid_reason_by_target.end()) {
+      return lock_warmcopy_record_store_snapshot_status_t::STORE_INVALID;
+    }
+    if (!export_record_payload_from_store_locked(target_id, store, payload,
+                                                 lock_count, nullptr)) {
+      payload->clear();
+      *lock_count = 0;
+      return lock_warmcopy_record_store_snapshot_status_t::STORE_INVALID;
+    }
+    if (*lock_count > max_lock_count || payload->size() > max_payload_bytes) {
+      payload->clear();
+      *lock_count = 0;
+      return lock_warmcopy_record_store_snapshot_status_t::RESOURCE_EXHAUSTED;
+    }
+    if (!record_store_compare_token_for_target_locked(target_id, token)) {
+      payload->clear();
+      *lock_count = 0;
+      return lock_warmcopy_record_store_snapshot_status_t::RESOURCE_EXHAUSTED;
+    }
+    return lock_warmcopy_record_store_snapshot_status_t::CAPTURED;
+  } catch (const std::bad_alloc &) {
+    payload->clear();
+    *lock_count = 0;
+    *token = lock_warmcopy_record_store_compare_token_t{};
+    return lock_warmcopy_record_store_snapshot_status_t::RESOURCE_EXHAUSTED;
+  } catch (...) {
+    payload->clear();
+    *lock_count = 0;
+    *token = lock_warmcopy_record_store_compare_token_t{};
+    return lock_warmcopy_record_store_snapshot_status_t::RESOURCE_EXHAUSTED;
+  }
+}
+
+bool lock_warmcopy_record_store_compare_token_equal(
+    const lock_warmcopy_record_store_compare_token_t &lhs,
+    const lock_warmcopy_record_store_compare_token_t &rhs) {
+  return lhs.epoch == rhs.epoch &&
+         lhs.target_id == rhs.target_id &&
+         lhs.baseline_generation == rhs.baseline_generation &&
+         lhs.journal_sequence == rhs.journal_sequence &&
+         lhs.expected_delta_sequence == rhs.expected_delta_sequence &&
+         lhs.journal_bytes == rhs.journal_bytes &&
+         lhs.store_present == rhs.store_present &&
+         lhs.target_invalid == rhs.target_invalid &&
+         lhs.journal_sequence_present == rhs.journal_sequence_present &&
+         lhs.expected_delta_sequence_present ==
+             rhs.expected_delta_sequence_present &&
+         lhs.journal_bytes_present == rhs.journal_bytes_present &&
+         std::memcmp(lhs.invalid_reason_digest, rhs.invalid_reason_digest,
+                     sizeof(lhs.invalid_reason_digest)) == 0 &&
+         lock_warmcopy_record_store_fence_equal(lhs.store_fence,
+                                                rhs.store_fence);
 }
 
 bool seed_record_payload_entry_into_store(
@@ -1705,6 +1999,9 @@ bool seed_record_payload_entry_into_store(
   const uint32_t set_bits = record_bitmap_set_bit_count(normalized_bitmap);
   if (set_bits == 0 || heap_offsets_len != set_bits * 4U) return false;
   const bool compact_stable_page_payload = record_images.empty();
+  const bool compact_stable_page_store =
+      compact_stable_page_payload &&
+      lock_warmcopy_record_compact_stable_page_enabled();
 
   std::map<uint32_t, lock_warmcopy_record_image_entry_t>
       parsed_record_images;
@@ -1760,7 +2057,10 @@ bool seed_record_payload_entry_into_store(
     shard.page_lsn = page_lsn;
     shard.page_n_heap = page_n_heap;
     shard.set_bit_count = set_bits;
-    shard.shard_state_flags = 0;
+    shard.shard_state_flags =
+        compact_stable_page_store
+            ? LOCK_WARMCOPY_RECORD_SHARD_COMPACT_STABLE_PAGE
+            : 0;
     shard.missing_record_image_count = 0;
     shard.forced_invalid = false;
     shard.mutation_generation = 1;
@@ -1834,13 +2134,157 @@ bool seed_record_payload_into_store(const std::string &payload,
   for (auto &shard_entry : *store) {
     lock_warmcopy_record_shard_state_t &shard = shard_entry.second;
     for (uint64_t &word : shard.rolling_fingerprint) word = 0;
-    for (const auto &record_entry : shard.record_images) {
-      update_record_shard_rolling_fingerprint_locked(
-          &shard, 8, record_entry.second.heap_no, &record_entry.second.digest,
-          record_entry.second.heap_offset);
+    if (record_shard_uses_compact_stable_page(shard)) {
+      for (uint32_t heap_no = 0; heap_no < shard.key.n_bits; ++heap_no) {
+        if (record_bitmap_bit_is_set(shard, heap_no)) {
+          update_record_shard_rolling_fingerprint_locked(
+              &shard, 8, heap_no, nullptr, heap_no);
+        }
+      }
+    } else {
+      for (const auto &record_entry : shard.record_images) {
+        update_record_shard_rolling_fingerprint_locked(
+            &shard, 8, record_entry.second.heap_no,
+            &record_entry.second.digest, record_entry.second.heap_offset);
+      }
     }
   }
   return true;
+}
+
+lock_warmcopy_record_candidate_status_t
+lock_warmcopy_record_store_plan_candidate(
+    const std::string &payload,
+    lock_warmcopy_record_candidate_plan_t *plan) {
+  if (plan == nullptr) {
+    return lock_warmcopy_record_candidate_status_t::INVALID_ARGUMENT;
+  }
+  *plan = {};
+  plan->payload_bytes = static_cast<uint64_t>(payload.size());
+
+  const auto checked_add = [](uint64_t value, uint64_t *total) {
+    if (value > UINT64_MAX - *total) return false;
+    *total += value;
+    return true;
+  };
+  const auto checked_mul = [](uint64_t left, uint64_t right,
+                              uint64_t *product) {
+    if (right != 0 && left > UINT64_MAX / right) return false;
+    *product = left * right;
+    return true;
+  };
+
+  uint64_t retained_bytes = sizeof(lock_warmcopy_record_store_candidate_t) +
+                            sizeof(lock_warmcopy_record_shard_map_t) +
+                            8 * sizeof(void *);
+  uint64_t max_parse_scratch = 0;
+  uint64_t offset = 0;
+  uint32_t entry_count = 0;
+  if (!payload.empty()) {
+    size_t parse_offset = 0;
+    if (!read_u32_le_from_payload(payload, &parse_offset, &entry_count) ||
+        entry_count == 0) {
+      return lock_warmcopy_record_candidate_status_t::INVALID_PAYLOAD;
+    }
+    offset = parse_offset;
+  }
+
+  uint64_t total_lock_count = 0;
+  const uint64_t map_node_bytes =
+      sizeof(lock_warmcopy_record_shard_map_t::value_type) +
+      4 * sizeof(void *);
+  for (uint32_t index = 0; index < entry_count; ++index) {
+    size_t parse_offset = static_cast<size_t>(offset);
+    uint64_t ignored_u64 = 0;
+    uint32_t ignored_u32 = 0;
+    uint32_t n_bits = 0;
+    uint32_t page_n_heap = 0;
+    uint32_t heap_offsets_len = 0;
+    uint32_t record_images_len = 0;
+    uint32_t bitmap_len = 0;
+    if (!read_u64_le_from_payload(payload, &parse_offset, &ignored_u64) ||
+        !read_u64_le_from_payload(payload, &parse_offset, &ignored_u64) ||
+        !read_u32_le_from_payload(payload, &parse_offset, &ignored_u32) ||
+        !read_u32_le_from_payload(payload, &parse_offset, &ignored_u32) ||
+        !read_u32_le_from_payload(payload, &parse_offset, &ignored_u32) ||
+        !read_u32_le_from_payload(payload, &parse_offset, &n_bits) ||
+        !read_u64_le_from_payload(payload, &parse_offset, &ignored_u64) ||
+        !read_u32_le_from_payload(payload, &parse_offset, &page_n_heap) ||
+        !read_u32_le_from_payload(payload, &parse_offset,
+                                  &heap_offsets_len) ||
+        !read_u32_le_from_payload(payload, &parse_offset,
+                                  &record_images_len) ||
+        !read_u32_le_from_payload(payload, &parse_offset, &bitmap_len) ||
+        n_bits == 0 || page_n_heap == 0 || record_images_len != 0 ||
+        bitmap_len == 0 || bitmap_len != record_bitmap_len(n_bits)) {
+      return lock_warmcopy_record_candidate_status_t::INVALID_PAYLOAD;
+    }
+    uint64_t slices_bytes = 0;
+    if (!checked_add(heap_offsets_len, &slices_bytes) ||
+        !checked_add(record_images_len, &slices_bytes) ||
+        !checked_add(bitmap_len, &slices_bytes) ||
+        parse_offset > payload.size() ||
+        slices_bytes > payload.size() - parse_offset) {
+      return lock_warmcopy_record_candidate_status_t::INVALID_PAYLOAD;
+    }
+
+    const size_t bitmap_offset =
+        parse_offset + heap_offsets_len + record_images_len;
+    uint32_t set_bits = 0;
+    for (uint32_t byte_index = 0; byte_index < bitmap_len; ++byte_index) {
+      unsigned char value = static_cast<unsigned char>(
+          payload[bitmap_offset + byte_index]);
+      while (value != 0) {
+        set_bits += static_cast<uint32_t>(value & 1U);
+        value = static_cast<unsigned char>(value >> 1U);
+      }
+    }
+    const uint32_t trailing_bits = n_bits % 8U;
+    if (trailing_bits != 0) {
+      const unsigned char valid_mask =
+          static_cast<unsigned char>((1U << trailing_bits) - 1U);
+      const unsigned char last =
+          static_cast<unsigned char>(payload[bitmap_offset + bitmap_len - 1]);
+      if ((last & static_cast<unsigned char>(~valid_mask)) != 0) {
+        return lock_warmcopy_record_candidate_status_t::INVALID_PAYLOAD;
+      }
+    }
+    uint64_t expected_heap_bytes = 0;
+    if (set_bits == 0 ||
+        !checked_mul(set_bits, 4, &expected_heap_bytes) ||
+        expected_heap_bytes != heap_offsets_len ||
+        !checked_add(set_bits, &total_lock_count) ||
+        total_lock_count > UINT32_MAX ||
+        !checked_add(map_node_bytes, &retained_bytes) ||
+        !checked_add(bitmap_len, &retained_bytes)) {
+      return lock_warmcopy_record_candidate_status_t::INVALID_PAYLOAD;
+    }
+    uint64_t parse_scratch = heap_offsets_len;
+    uint64_t bitmap_copies = 0;
+    if (!checked_mul(bitmap_len, 2, &bitmap_copies) ||
+        !checked_add(bitmap_copies, &parse_scratch)) {
+      return lock_warmcopy_record_candidate_status_t::RESOURCE_EXHAUSTED;
+    }
+    max_parse_scratch = std::max(max_parse_scratch, parse_scratch);
+    offset = parse_offset + slices_bytes;
+  }
+  if (offset != payload.size()) {
+    return lock_warmcopy_record_candidate_status_t::INVALID_PAYLOAD;
+  }
+
+  uint64_t fence_scratch = 0;
+  uint64_t fence_entry_bytes = 0;
+  if (!checked_mul(entry_count, 108, &fence_entry_bytes) ||
+      !checked_add(8, &fence_entry_bytes)) {
+    return lock_warmcopy_record_candidate_status_t::RESOURCE_EXHAUSTED;
+  }
+  fence_scratch = fence_entry_bytes;
+  plan->retained_logical_bytes = retained_bytes;
+  plan->scratch_logical_bytes =
+      std::max(max_parse_scratch, fence_scratch);
+  plan->entry_count = entry_count;
+  plan->record_lock_count = static_cast<uint32_t>(total_lock_count);
+  return lock_warmcopy_record_candidate_status_t::PREPARED;
 }
 
 bool lock_warmcopy_record_store_fence_equal(
@@ -1851,6 +2295,148 @@ bool lock_warmcopy_record_store_fence_equal(
          lhs.dirty_generation == rhs.dirty_generation &&
          std::memcmp(lhs.canonical_fingerprint, rhs.canonical_fingerprint,
                      sizeof(lhs.canonical_fingerprint)) == 0;
+}
+
+lock_warmcopy_record_candidate_status_t
+lock_warmcopy_record_store_prepare_candidate(
+    const std::string &payload,
+    std::shared_ptr<lock_warmcopy_record_store_candidate_t> *candidate,
+    uint32_t *record_lock_count) {
+  if (candidate == nullptr) {
+    if (record_lock_count != nullptr) *record_lock_count = 0;
+    return lock_warmcopy_record_candidate_status_t::INVALID_ARGUMENT;
+  }
+  candidate->reset();
+  if (record_lock_count != nullptr) *record_lock_count = 0;
+
+  try {
+    auto detached_store =
+        std::make_shared<lock_warmcopy_record_shard_map_t>();
+    uint32_t local_lock_count = 0;
+    if (!seed_record_payload_into_store(payload, detached_store.get(),
+                                        &local_lock_count)) {
+      return lock_warmcopy_record_candidate_status_t::INVALID_PAYLOAD;
+    }
+    lock_warmcopy_record_store_fence_t candidate_fence;
+    if (!record_store_fence_for_target_locked(detached_store.get(),
+                                               &candidate_fence)) {
+      return lock_warmcopy_record_candidate_status_t::INVALID_PAYLOAD;
+    }
+
+    auto prepared =
+        std::make_shared<lock_warmcopy_record_store_candidate_t>();
+    prepared->detached_store = std::move(detached_store);
+    prepared->store_fence = candidate_fence;
+    prepared->record_lock_count = local_lock_count;
+    *candidate = std::move(prepared);
+    if (record_lock_count != nullptr) *record_lock_count = local_lock_count;
+    return lock_warmcopy_record_candidate_status_t::PREPARED;
+  } catch (const std::bad_alloc &) {
+    return lock_warmcopy_record_candidate_status_t::RESOURCE_EXHAUSTED;
+  } catch (...) {
+    return lock_warmcopy_record_candidate_status_t::RESOURCE_EXHAUSTED;
+  }
+}
+
+bool lock_warmcopy_record_store_compare_and_install_candidate(
+    uint64_t target_id,
+    const lock_warmcopy_record_store_compare_token_t &expected,
+    const std::shared_ptr<lock_warmcopy_record_store_candidate_t> &candidate,
+    lock_warmcopy_record_install_result_t *result) {
+  if (result == nullptr) return false;
+  const lock_warmcopy_record_store_compare_token_t expected_copy = expected;
+  *result = lock_warmcopy_record_install_result_t{};
+  if (candidate == nullptr || candidate->detached_store == nullptr) {
+    result->status = lock_warmcopy_record_install_status_t::INVALID_ARGUMENT;
+    return true;
+  }
+  if (expected_copy.epoch == 0 || expected_copy.target_id != target_id) {
+    result->status = lock_warmcopy_record_install_status_t::COMPARE_MISMATCH;
+    return true;
+  }
+
+  auto *candidate_store = static_cast<lock_warmcopy_record_shard_map_t *>(
+      candidate->detached_store.get());
+  {
+    std::lock_guard<std::mutex> guard(
+        record_store_partition_for_target(target_id).mutex);
+    lock_warmcopy_record_store_compare_token_t current;
+    try {
+      if (!record_store_compare_token_for_target_locked(target_id, &current)) {
+        return false;
+      }
+    } catch (...) {
+      return false;
+    }
+    if (current.epoch == 0 ||
+        !lock_warmcopy_record_store_compare_token_equal(expected_copy,
+                                                        current)) {
+      result->status =
+          lock_warmcopy_record_install_status_t::COMPARE_MISMATCH;
+      return true;
+    }
+    if (candidate->consumed.load(std::memory_order_acquire)) {
+      result->status =
+          lock_warmcopy_record_install_status_t::CANDIDATE_CONSUMED;
+      return true;
+    }
+
+    auto &partition = record_store_partition_for_target(target_id);
+    bool inserted_store = false;
+    bool inserted_generation = false;
+    try {
+      inserted_store =
+          partition.store_by_target.emplace(
+              target_id, lock_warmcopy_record_shard_map_t{})
+              .second;
+      inserted_generation =
+          partition.baseline_generation_by_target.emplace(target_id, 0)
+              .second;
+    } catch (...) {
+      if (inserted_store) partition.store_by_target.erase(target_id);
+      if (inserted_generation)
+        partition.baseline_generation_by_target.erase(target_id);
+      return false;
+    }
+    if (candidate->consumed.exchange(true, std::memory_order_acq_rel)) {
+      if (inserted_store) partition.store_by_target.erase(target_id);
+      if (inserted_generation)
+        partition.baseline_generation_by_target.erase(target_id);
+      result->status =
+          lock_warmcopy_record_install_status_t::CANDIDATE_CONSUMED;
+      return true;
+    }
+    const uint64_t publication_token =
+        next_record_baseline_generation_for_target_locked(target_id);
+    if (publication_token == 0) {
+      candidate->consumed.store(false, std::memory_order_release);
+      if (inserted_store) partition.store_by_target.erase(target_id);
+      if (inserted_generation)
+        partition.baseline_generation_by_target.erase(target_id);
+      return false;
+    }
+
+    lock_warmcopy_record_store_compare_token_t installed_token;
+    installed_token.epoch = expected_copy.epoch;
+    installed_token.target_id = target_id;
+    installed_token.baseline_generation = publication_token;
+    installed_token.store_present = true;
+    installed_token.store_fence = candidate->store_fence;
+
+    auto installed = partition.store_by_target.find(target_id);
+    installed->second.swap(*candidate_store);
+    partition.journal_sequence_by_target.erase(target_id);
+    partition.expected_delta_sequence_by_target.erase(target_id);
+    partition.journal_bytes_by_target.erase(target_id);
+    partition.target_invalid_reason_by_target.erase(target_id);
+
+    result->status = lock_warmcopy_record_install_status_t::INSTALLED;
+    result->publication_token = publication_token;
+    result->record_lock_count = candidate->record_lock_count;
+    result->installed_token = installed_token;
+  }
+  candidate_store->clear();
+  return true;
 }
 
 bool lock_warmcopy_record_store_seal_for_target(
@@ -2171,6 +2757,7 @@ void lock_warmcopy_record_store_reset_for_unit_test() {
   for (auto &partition : lock_warmcopy_record_store_partitions) {
     std::lock_guard<std::mutex> guard(partition.mutex);
     partition.store_by_target.clear();
+    partition.baseline_generation_by_target.clear();
     partition.journal_sequence_by_target.clear();
     partition.expected_delta_sequence_by_target.clear();
     partition.journal_bytes_by_target.clear();

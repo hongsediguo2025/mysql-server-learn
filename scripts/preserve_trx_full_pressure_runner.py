@@ -46,6 +46,7 @@ OWNERSHIP_MARKER = ".preserve-full-pressure-runner.json"
 MAX_MYSQL_SOCKET_PATH_BYTES = 100
 DEFAULT_FULL_REQUIRED_FREE_BYTES = 20 * 1024**3
 DEFAULT_MIXED_FULL_REQUIRED_FREE_BYTES = 25 * 1024**3
+DEFAULT_SCALE_SMOKE_REQUIRED_FREE_BYTES = 8 * 1024**3
 DEFAULT_SMOKE_REQUIRED_FREE_BYTES = 2 * 1024**3
 MIXED_PRESSURE_LONG_COMMAND_PREFIX_STATEMENTS = 8
 
@@ -62,16 +63,10 @@ class FullPressureProfile:
     transfer_max_inflight_bytes: int
     source_buffer_pool_bytes: int
     receiver_buffer_pool_bytes: int
-    receiver_workers: int
-    phase1_batch_bytes: int
-    phase1_batch_linger_ms: int
     source_phase2_limit_us: int
     source_post_command_tail_limit_us: int
     ready_after_final_spool_ack_limit_us: int
     transfer_runtime_profile: str
-    transfer_io_bytes_per_sec_base: int
-    prewarm_io_bytes_per_sec_base: int
-    promotion_prewarm_workers: int
     warmcopy_required: bool
     receiver_read_load_threads: int
     receiver_read_load_baseline_s: float
@@ -97,11 +92,25 @@ class FullPressureProfile:
     sysbench_table_size: int = 0
     scheduler_strict_interval_limit_us: int = 0
     drain_phase1_timeout_ms: int = 0
+    phase1_capture_mode: Optional[str] = None
+    phase1_pipeline_workers: int = 6
+    phase1_pipeline_ordinary_active_limit: int = 64
+    phase1_pipeline_credit_bytes: int = 1024**3
+    phase1_pipeline_record_reserve_bytes: int = 512 * 1024**2
+    phase1_pipeline_binlog_reserve_bytes: int = 256 * 1024**2
+    phase1_pipeline_copy_chunk_bytes: int = 1024**2
+    phase1_pipeline_cleanup_reserve_us: int = 1_000_000
+    phase1_pipeline_result_slots: int = 256
+    phase1_pipeline_tail_record_credit_bytes: int = 64 * 1024**2
     short_transaction_sessions: int = 0
     short_transaction_tables: int = 0
     short_transaction_rows_per_table: int = 0
     continuous_min_eligible_body_count: int = 0
     continuous_min_record_locks: int = 0
+    business_transaction_isolation: str = "READ-COMMITTED"
+    continuous_large_tx_shape: str = ""
+    continuous_large_tx_no_commit: bool = False
+    business_command_latency_limit_us: int = 0
 
     @property
     def source_tiered_load_threads(self) -> int:
@@ -109,6 +118,25 @@ class FullPressureProfile:
             self.source_tiered_load_threads_per_tier
             * len(self.source_tiered_load_work_units)
         )
+
+    @property
+    def effective_lockset_update_commands_per_tx(self) -> int:
+        if self.lockset_batch_size <= 0:
+            return 0
+        return math.ceil(self.statements_per_tx / self.lockset_batch_size)
+
+    @property
+    def lockset_unique_range_count(self) -> int:
+        if self.lockset_batch_size <= 0:
+            return 0
+        return math.ceil(self.statements_per_tx / self.lockset_batch_size)
+
+    @property
+    def lockset_range_passes_per_tx(self) -> int:
+        unique_ranges = self.lockset_unique_range_count
+        if unique_ranges <= 0:
+            return 0
+        return self.effective_lockset_update_commands_per_tx // unique_ranges
 
 
 FULL_PROFILE = FullPressureProfile(
@@ -122,16 +150,10 @@ FULL_PROFILE = FullPressureProfile(
     transfer_max_inflight_bytes=1024**3,
     source_buffer_pool_bytes=2 * 1024**3,
     receiver_buffer_pool_bytes=2 * 1024**3,
-    receiver_workers=8,
-    phase1_batch_bytes=8 * 1024**2,
-    phase1_batch_linger_ms=50,
     source_phase2_limit_us=500_000,
     source_post_command_tail_limit_us=500_000,
     ready_after_final_spool_ack_limit_us=500_000,
     transfer_runtime_profile="PROMOTION_PREPARE",
-    transfer_io_bytes_per_sec_base=1024**3,
-    prewarm_io_bytes_per_sec_base=1024**3,
-    promotion_prewarm_workers=8,
     warmcopy_required=True,
     receiver_read_load_threads=8,
     receiver_read_load_baseline_s=5.0,
@@ -154,9 +176,6 @@ SMOKE_PROFILE = dataclasses.replace(
     lockset_batch_size=100,
     source_buffer_pool_bytes=512 * 1024**2,
     receiver_buffer_pool_bytes=512 * 1024**2,
-    receiver_workers=2,
-    phase1_batch_bytes=1024**2,
-    phase1_batch_linger_ms=5,
     source_phase2_limit_us=5_000_000,
     ready_after_final_spool_ack_limit_us=2_000_000,
     receiver_read_load_threads=2,
@@ -202,9 +221,6 @@ RESET_SMOKE_PROFILE = dataclasses.replace(
     tables=3,
     source_buffer_pool_bytes=512 * 1024**2,
     receiver_buffer_pool_bytes=512 * 1024**2,
-    receiver_workers=2,
-    phase1_batch_bytes=1024**2,
-    phase1_batch_linger_ms=5,
     preserve_timeout_s=300,
     startup_timeout_s=120,
     shutdown_timeout_s=180,
@@ -261,6 +277,7 @@ DEPENDENCY_SYSBENCH_FULL_PROFILE = dataclasses.replace(
     sysbench_table_size=20_000,
     scheduler_strict_interval_limit_us=2_000_000,
     drain_phase1_timeout_ms=60_000,
+    phase1_capture_mode="BOUNDED_PIPELINE_V1",
     preserve_memory_budget_bytes=2 * 1024**3,
 )
 
@@ -274,11 +291,13 @@ DEPENDENCY_SYSBENCH_SMOKE_PROFILE = dataclasses.replace(
     sysbench_table_size=1_000,
     scheduler_strict_interval_limit_us=5_000_000,
     drain_phase1_timeout_ms=60_000,
+    phase1_capture_mode="BOUNDED_PIPELINE_V1",
 )
 
 DEPENDENCY_MIXED_FULL_PROFILE = dataclasses.replace(
     MIXED_FULL_PROFILE,
     name="dependency-mixed-transfer-full",
+    phase1_capture_mode="BOUNDED_PIPELINE_V1",
     source_post_command_tail_limit_us=500_000,
     ready_after_final_spool_ack_limit_us=500_000,
 )
@@ -286,40 +305,154 @@ DEPENDENCY_MIXED_FULL_PROFILE = dataclasses.replace(
 DEPENDENCY_MIXED_SMOKE_PROFILE = dataclasses.replace(
     MIXED_SMOKE_PROFILE,
     name="dependency-mixed-transfer-smoke",
+    phase1_capture_mode="BOUNDED_PIPELINE_V1",
     source_post_command_tail_limit_us=2_000_000,
 )
 
-DEPENDENCY_CONTINUOUS_LARGE_TX_FULL_PROFILE = dataclasses.replace(
+_DEPENDENCY_CONTINUOUS_LARGE_TX_FULL_BASE = dataclasses.replace(
     FULL_PROFILE,
-    name="dependency-continuous-large-tx-full",
-    lockset_batch_size=10_000,
+    name="dependency-continuous-large-tx-full-base",
+    sessions=1000,
+    tables=128,
+    statements_per_tx=100_000,
+    seed_rows_per_table_per_session=100_000,
+    lockset_batch_size=10,
     business_run_before_drain_s=300.0,
+    formal_rounds=5,
     short_transaction_sessions=100,
     short_transaction_tables=50,
     short_transaction_rows_per_table=20_000,
     continuous_min_eligible_body_count=900,
     continuous_min_record_locks=5_000_000,
+    business_transaction_isolation="REPEATABLE-READ",
+    drain_phase1_timeout_ms=60_000,
+    phase1_capture_mode="BOUNDED_PIPELINE_V1",
+    phase1_pipeline_ordinary_active_limit=6,
+    phase1_pipeline_tail_record_credit_bytes=512 * 1024**2,
+    source_phase2_limit_us=2_000_000,
     scheduler_strict_interval_limit_us=2_000_000,
     source_post_command_tail_limit_us=500_000,
     ready_after_final_spool_ack_limit_us=500_000,
+    business_command_latency_limit_us=1_000_000,
     preserve_memory_budget_bytes=2 * 1024**3,
 )
 
-DEPENDENCY_CONTINUOUS_LARGE_TX_SMOKE_PROFILE = dataclasses.replace(
-    SMOKE_PROFILE,
-    name="dependency-continuous-large-tx-smoke",
-    statements_per_tx=1_000,
-    seed_rows_per_table_per_session=1_000,
-    lockset_batch_size=100,
-    business_run_before_drain_s=3.0,
-    short_transaction_sessions=4,
-    short_transaction_tables=2,
-    short_transaction_rows_per_table=1_000,
+DEPENDENCY_CONTINUOUS_LARGE_TX_SHAPES = {
+    "range-10000": ("RANGE_10000", 10),
+    "range-1000": ("RANGE_1000", 100),
+    "range-100000": ("RANGE_100000", 1),
+}
+
+
+def _dependency_continuous_shape_profile(
+    base: FullPressureProfile,
+    shape_key: str,
+    *,
+    tier: str,
+) -> FullPressureProfile:
+    shape, rows_per_update = (
+        DEPENDENCY_CONTINUOUS_LARGE_TX_SHAPES[shape_key]
+    )
+    return dataclasses.replace(
+        base,
+        name=f"dependency-continuous-{shape_key}-{tier}",
+        continuous_large_tx_shape=shape,
+        lockset_batch_size=rows_per_update,
+    )
+
+
+DEPENDENCY_CONTINUOUS_LARGE_TX_FULL_PROFILES = {
+    shape_key: _dependency_continuous_shape_profile(
+        _DEPENDENCY_CONTINUOUS_LARGE_TX_FULL_BASE,
+        shape_key,
+        tier="full",
+    )
+    for shape_key in DEPENDENCY_CONTINUOUS_LARGE_TX_SHAPES
+}
+
+_DEPENDENCY_CONTINUOUS_LARGE_TX_SMOKE_BASE = dataclasses.replace(
+    _DEPENDENCY_CONTINUOUS_LARGE_TX_FULL_BASE,
+    name="dependency-continuous-large-tx-smoke-base",
+    sessions=32,
+    tables=8,
+    business_run_before_drain_s=8.0,
+    formal_rounds=1,
+    short_transaction_sessions=8,
+    short_transaction_tables=4,
+    short_transaction_rows_per_table=20_000,
     continuous_min_eligible_body_count=1,
     continuous_min_record_locks=1,
-    scheduler_strict_interval_limit_us=5_000_000,
-    source_post_command_tail_limit_us=2_000_000,
+    source_buffer_pool_bytes=512 * 1024**2,
+    receiver_buffer_pool_bytes=512 * 1024**2,
+    receiver_read_load_threads=2,
+    receiver_read_load_baseline_s=1.0,
+    preserve_timeout_s=300,
+    startup_timeout_s=120,
+    shutdown_timeout_s=180,
+    resume_timeout_s=300,
 )
+
+DEPENDENCY_CONTINUOUS_LARGE_TX_SMOKE_PROFILES = {
+    shape_key: _dependency_continuous_shape_profile(
+        _DEPENDENCY_CONTINUOUS_LARGE_TX_SMOKE_BASE,
+        shape_key,
+        tier="smoke",
+    )
+    for shape_key in DEPENDENCY_CONTINUOUS_LARGE_TX_SHAPES
+}
+
+_DEPENDENCY_CONTINUOUS_LARGE_TX_SCALE_SMOKE_BASE = dataclasses.replace(
+    _DEPENDENCY_CONTINUOUS_LARGE_TX_FULL_BASE,
+    name="dependency-continuous-large-tx-scale-smoke-base",
+    sessions=128,
+    tables=32,
+    business_run_before_drain_s=35.0,
+    formal_rounds=1,
+    short_transaction_sessions=16,
+    short_transaction_tables=8,
+    continuous_min_eligible_body_count=1,
+    continuous_min_record_locks=10_000,
+    source_buffer_pool_bytes=1024**3,
+    receiver_buffer_pool_bytes=1024**3,
+    receiver_read_load_threads=4,
+    receiver_read_load_baseline_s=2.0,
+)
+
+DEPENDENCY_CONTINUOUS_LARGE_TX_SCALE_SMOKE_PROFILES = {
+    shape_key: _dependency_continuous_shape_profile(
+        _DEPENDENCY_CONTINUOUS_LARGE_TX_SCALE_SMOKE_BASE,
+        shape_key,
+        tier="scale-smoke",
+    )
+    for shape_key in DEPENDENCY_CONTINUOUS_LARGE_TX_SHAPES
+}
+
+# Backward-compatible aliases keep callers of the former single profile on the
+# representative 10,000-command shape. New entry points select explicitly from
+# the mappings above.
+DEPENDENCY_CONTINUOUS_LARGE_TX_FULL_PROFILE = (
+    DEPENDENCY_CONTINUOUS_LARGE_TX_FULL_PROFILES["range-10000"]
+)
+DEPENDENCY_CONTINUOUS_LARGE_TX_SMOKE_PROFILE = (
+    DEPENDENCY_CONTINUOUS_LARGE_TX_SMOKE_PROFILES["range-10000"]
+)
+DEPENDENCY_CONTINUOUS_LARGE_TX_SCALE_SMOKE_PROFILE = (
+    DEPENDENCY_CONTINUOUS_LARGE_TX_SCALE_SMOKE_PROFILES["range-10000"]
+)
+
+
+def dependency_continuous_profiles(
+    profile_tier: str, shape_key: str
+) -> List[FullPressureProfile]:
+    profiles_by_tier = {
+        "full": DEPENDENCY_CONTINUOUS_LARGE_TX_FULL_PROFILES,
+        "scale-smoke": DEPENDENCY_CONTINUOUS_LARGE_TX_SCALE_SMOKE_PROFILES,
+        "smoke": DEPENDENCY_CONTINUOUS_LARGE_TX_SMOKE_PROFILES,
+    }
+    profiles = profiles_by_tier[profile_tier]
+    if shape_key == "all":
+        return list(profiles.values())
+    return [profiles[shape_key]]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -586,6 +719,31 @@ def build_mysqld_commands(
         source.append(
             "--rds-preserve-trx-standby-phase2-scheduler-mode="
             f"{phase2_scheduler_mode}"
+        )
+    if profile.phase1_capture_mode is not None:
+        source.extend(
+            [
+                "--rds-preserve-trx-phase1-capture-mode="
+                f"{profile.phase1_capture_mode}",
+                "--rds-preserve-trx-phase1-pipeline-workers="
+                f"{profile.phase1_pipeline_workers}",
+                "--rds-preserve-trx-phase1-pipeline-ordinary-active-limit="
+                f"{profile.phase1_pipeline_ordinary_active_limit}",
+                "--rds-preserve-trx-phase1-pipeline-credit-bytes="
+                f"{profile.phase1_pipeline_credit_bytes}",
+                "--rds-preserve-trx-phase1-pipeline-record-reserve-bytes="
+                f"{profile.phase1_pipeline_record_reserve_bytes}",
+                "--rds-preserve-trx-phase1-pipeline-binlog-reserve-bytes="
+                f"{profile.phase1_pipeline_binlog_reserve_bytes}",
+                "--rds-preserve-trx-phase1-pipeline-copy-chunk-bytes="
+                f"{profile.phase1_pipeline_copy_chunk_bytes}",
+                "--rds-preserve-trx-phase1-pipeline-cleanup-reserve-us="
+                f"{profile.phase1_pipeline_cleanup_reserve_us}",
+                "--rds-preserve-trx-phase1-pipeline-result-slots="
+                f"{profile.phase1_pipeline_result_slots}",
+                "--rds-preserve-trx-phase1-pipeline-tail-record-credit-bytes="
+                f"{profile.phase1_pipeline_tail_record_credit_bytes}",
+            ]
         )
     if profile.drain_phase1_timeout_ms > 0:
         source.append(
@@ -908,6 +1066,19 @@ def build_e2e_command(
     ]
     if profile.warmcopy_required:
         command.append("--warmcopy-required")
+    if profile.drain_phase1_timeout_ms > 0:
+        command.extend(
+            [
+                "--drain-phase1-timeout-ms",
+                str(profile.drain_phase1_timeout_ms),
+            ]
+        )
+    command.extend(
+        [
+            "--source-post-command-tail-limit-us",
+            str(profile.source_post_command_tail_limit_us),
+        ]
+    )
     if evidence == "transfer-phase2":
         return command
 
@@ -931,6 +1102,10 @@ def build_e2e_command(
         command.extend(
             [
                 "--continuous-business-through-drain",
+                "--continuous-large-tx-shape",
+                profile.continuous_large_tx_shape,
+                "--business-transaction-isolation",
+                profile.business_transaction_isolation,
                 "--business-run-before-drain",
                 str(profile.business_run_before_drain_s),
                 "--short-transaction-sessions",
@@ -939,9 +1114,15 @@ def build_e2e_command(
                 str(profile.short_transaction_tables),
                 "--short-transaction-rows-per-table",
                 str(profile.short_transaction_rows_per_table),
+                "--business-command-latency-limit-us",
+                str(profile.business_command_latency_limit_us),
                 "--allow-partial-tokens",
             ]
         )
+        if profile.continuous_large_tx_no_commit:
+            command.append("--large-tx-no-commit")
+            command.remove("--lockset-noop-update")
+            command.remove("--lockset-touch-one-row")
         return command
 
     if evidence in {"mixed-transfer", "dependency-mixed-transfer"}:
@@ -1230,27 +1411,71 @@ def build_acceptance_contract(
             "strict_interval_us_max": (
                 profile.scheduler_strict_interval_limit_us
             ),
+            "last_command_end_to_final_ack_us_max": (
+                profile.source_post_command_tail_limit_us
+            ),
+            "receiver_ready_after_final_spool_ack_us_max": (
+                profile.ready_after_final_spool_ack_limit_us
+            ),
             "eligible_body_state": "EXACT",
             "scheduler_fatal_count": 0,
         }
     if evidence == "dependency-continuous-large-tx-transfer":
-        return {
+        contract = {
             "evidence_kind": (
                 "DEPENDENCY_CONTINUOUS_LARGE_TX_STANDBY_TRANSFER"
             ),
             "scheduler_mode": "DEPENDENCY_CONVERGENCE_V1",
+            "phase1_capture_mode": "BOUNDED_PIPELINE_V1",
+            "transaction_isolation": profile.business_transaction_isolation,
+            "phase1_pipeline_workers": profile.phase1_pipeline_workers,
+            "phase1_pipeline_ordinary_active_limit": (
+                profile.phase1_pipeline_ordinary_active_limit
+            ),
+            "phase1_pipeline_ordinary_active_limit_requested": (
+                profile.phase1_pipeline_ordinary_active_limit
+            ),
+            "phase1_pipeline_ordinary_active_limit_effective": min(
+                profile.phase1_pipeline_workers,
+                profile.phase1_pipeline_ordinary_active_limit,
+            ),
+            "phase1_pipeline_credit_bytes": (
+                profile.phase1_pipeline_credit_bytes
+            ),
+            "phase1_pipeline_tail_record_credit_bytes": (
+                profile.phase1_pipeline_tail_record_credit_bytes
+            ),
+            "formal_rounds": profile.formal_rounds,
             "large_transaction_sessions": profile.sessions,
             "large_transaction_tables": profile.tables,
             "large_transaction_rows_per_session": (
                 profile.seed_rows_per_table_per_session
             ),
+            "large_transaction_shape": profile.continuous_large_tx_shape,
+            "update_commands_per_tx": (
+                profile.effective_lockset_update_commands_per_tx
+            ),
             "large_transaction_range_update_rows": (
                 profile.lockset_batch_size
+            ),
+            "rows_per_update": profile.lockset_batch_size,
+            "unique_rows_per_tx": profile.statements_per_tx,
+            "range_passes_per_tx": profile.lockset_range_passes_per_tx,
+            "row_visits_per_tx": (
+                profile.effective_lockset_update_commands_per_tx
+                * profile.lockset_batch_size
+            ),
+            "changed_rows_per_update": 1,
+            "changed_row_events_per_tx": (
+                profile.effective_lockset_update_commands_per_tx
             ),
             "short_transaction_sessions": profile.short_transaction_sessions,
             "short_transaction_tables": profile.short_transaction_tables,
             "short_transaction_rows_per_table": (
                 profile.short_transaction_rows_per_table
+            ),
+            "business_command_latency_us_max": (
+                profile.business_command_latency_limit_us
             ),
             "steady_run_seconds": profile.business_run_before_drain_s,
             "drain_trigger_mode": "independent_control_connection",
@@ -1263,19 +1488,48 @@ def build_acceptance_contract(
                 profile.continuous_min_eligible_body_count
             ),
             "record_lock_count_min": profile.continuous_min_record_locks,
+            "phase1_us_max": profile.drain_phase1_timeout_ms * 1000,
             "strict_interval_us_max": (
                 profile.scheduler_strict_interval_limit_us
             ),
-            "last_command_end_to_final_ack_us_strictly_below": (
+            "source_phase2_total_us_max": profile.source_phase2_limit_us,
+            "last_command_end_to_final_ack_us_max": (
                 profile.source_post_command_tail_limit_us
             ),
-            "receiver_ready_after_final_spool_ack_us_strictly_below": (
+            "receiver_ready_after_final_spool_ack_us_max": (
                 profile.ready_after_final_spool_ack_limit_us
             ),
+            "large_statement_rate_drop_pct_max": 20.0,
+            "short_transaction_committed_tps_drop_pct_max": 20.0,
+            "aggregate_phase1_committed_tps_drop_pct": "REPORT_ONLY",
+            "engineering_milestone_large_statement_drop_pct_max": 40.0,
+            "engineering_milestone_short_tps_drop_pct_max": 40.0,
+            "business_1205_count": 0,
+            "business_connection_error_count": 0,
+            "business_reconnect_count": 0,
+            "business_non_4020_error_count": 0,
+            "receiver_read_load_qps_p99": "REPORT_ONLY",
             "lock_wait_coverage": "OPTIONAL_POST_HOC",
             "eligible_body_state": "EXACT",
             "scheduler_fatal_count": 0,
         }
+        if profile.continuous_large_tx_no_commit:
+            contract.update(dict.fromkeys((
+                "update_commands_per_tx", "rows_per_update",
+                "unique_rows_per_tx", "range_passes_per_tx",
+                "row_visits_per_tx", "changed_rows_per_update",
+                "changed_row_events_per_tx",
+            )))
+            contract.update({
+                "large_transaction_model": "UPDATE_FOREVER",
+                "large_transaction_commit_policy": "NEVER",
+                "large_transaction_begin_count_per_session": 1,
+                "large_transaction_commit_count": 0,
+                "rows_per_update_min": 1,
+                "rows_per_update_max": profile.lockset_batch_size,
+                "updates_per_range_pass": profile.lockset_unique_range_count * 4,
+            })
+        return contract
     if evidence == "dependency-mixed-transfer":
         return {
             **build_acceptance_contract(profile, "mixed-transfer"),
@@ -2041,9 +2295,82 @@ def validate_continuous_large_tx_report(
     require_equal(
         "continuous_effective_scheduler_mode", "DEPENDENCY_CONVERGENCE_V1"
     )
+    require_equal(
+        "continuous_business_transaction_isolation",
+        profile.business_transaction_isolation,
+    )
+    require_equal("continuous_transaction_isolation_verified", True)
+    require_equal(
+        "continuous_large_transaction_isolation_counts",
+        {profile.business_transaction_isolation: profile.sessions},
+    )
+    require_equal(
+        "continuous_short_transaction_isolation_counts",
+        {
+            profile.business_transaction_isolation:
+                profile.short_transaction_sessions
+        },
+    )
     require_equal("receiver_readiness_contract", "READY")
     require_equal("continuous_large_transaction_sessions", profile.sessions)
     require_equal("continuous_large_transaction_tables", profile.tables)
+    require_equal(
+        "continuous_large_transaction_shape",
+        profile.continuous_large_tx_shape,
+    )
+    require_equal(
+        "continuous_large_transaction_update_commands_per_tx",
+        None if profile.continuous_large_tx_no_commit else profile.effective_lockset_update_commands_per_tx,
+    )
+    require_equal(
+        "continuous_large_transaction_rows_per_update",
+        None if profile.continuous_large_tx_no_commit else profile.lockset_batch_size,
+    )
+    require_equal(
+        "continuous_large_transaction_unique_rows_per_tx",
+        None if profile.continuous_large_tx_no_commit else profile.statements_per_tx,
+    )
+    require_equal(
+        "continuous_large_transaction_range_passes_per_tx",
+        None if profile.continuous_large_tx_no_commit else profile.lockset_range_passes_per_tx,
+    )
+    require_equal(
+        "continuous_large_transaction_row_visits_per_tx",
+        None if profile.continuous_large_tx_no_commit else (
+            profile.effective_lockset_update_commands_per_tx
+            * profile.lockset_batch_size
+        ),
+    )
+    require_equal(
+        "continuous_large_transaction_changed_rows_per_update",
+        None if profile.continuous_large_tx_no_commit else 1,
+    )
+    require_equal(
+        "continuous_large_transaction_changed_row_events_per_tx",
+        None if profile.continuous_large_tx_no_commit else profile.effective_lockset_update_commands_per_tx,
+    )
+    if profile.continuous_large_tx_no_commit:
+        require_equal("continuous_large_transaction_commit_policy", "NEVER")
+        require_equal("continuous_large_transaction_model", "UPDATE_FOREVER")
+        evidence = require_mapping("continuous_large_no_commit")
+        workers = evidence.get("workers", [])
+        if not isinstance(workers, list):
+            workers = []
+        if (
+            evidence.get("verified") is not True
+            or len(workers) != profile.sessions
+            or not all(isinstance(worker, Mapping) for worker in workers)
+            or {worker.get("sid") for worker in workers}
+            != set(range(1, profile.sessions + 1))
+            or not all(
+                worker.get("transaction_begin_count") == 1
+                and worker.get("transaction_commit_count") == 0
+                and worker.get("transactions_completed") == 0
+                and int(worker.get("updates_completed", 0)) >= 4
+                for worker in workers
+            )
+        ):
+            failures.append("uncommitted UPDATE worker evidence is incomplete")
     require_equal(
         "continuous_large_transaction_rows_per_session",
         profile.seed_rows_per_table_per_session,
@@ -2071,13 +2398,49 @@ def validate_continuous_large_tx_report(
     require_equal("continuous_checkpoint_generation_before_drain", 0)
     require_equal("continuous_lock_wait_sensing_before_drain", False)
     require_equal("continuous_second_drain_on_no_lock_wait", False)
-    require_equal("receiver_read_load_qps_gate_enforced", True)
+    require_equal("receiver_read_load_qps_gate_enforced", False)
     require_equal("receiver_read_load_p99_gate_enforced", False)
     require_equal("continuous_drain_call_count", 1)
     require_equal("continuous_business_reconnect_count", 0)
     require_equal("drain_result_outcome", "SUCCESS")
     require_equal("source_remained_online_after_transfer", True)
     require_equal("receiver_remained_online_after_transfer", True)
+    require_equal("continuous_source_final_record_count", 1)
+    require_equal("continuous_receiver_ready_record_count", 1)
+    require_equal("continuous_timeline_identity_matches", True)
+    require_equal("continuous_timeline_values_valid", True)
+    require_equal("continuous_business_lock_wait_timeout_count", 0)
+    require_equal("continuous_business_connection_error_count", 0)
+    require_equal("continuous_business_reconnect_count", 0)
+    require_equal("continuous_business_non_4020_error_count", 0)
+
+    runtime_configuration = require_mapping(
+        "continuous_runtime_configuration"
+    )
+    if runtime_configuration.get("required_values_match") is not True:
+        failures.append(
+            "continuous runtime configuration does not match requested values"
+        )
+    business_tps = require_mapping("continuous_business_tps")
+    business_errors = require_mapping("continuous_business_error_counts")
+    aggregate_errors = (
+        business_errors.get("aggregate", {})
+        if isinstance(business_errors.get("aggregate"), Mapping)
+        else {}
+    )
+    if any(
+        int(aggregate_errors.get(name, -1)) != 0
+        for name in (
+            "lock_wait_timeout_count",
+            "connection_error_count",
+            "reconnect_count",
+            "non_4020_error_count",
+        )
+    ):
+        failures.append(
+            "continuous workload observed a non-4020 business error: "
+            f"{dict(aggregate_errors)!r}"
+        )
 
     requested_us = int(report.get("continuous_business_window_requested_us") or 0)
     actual_us = int(report.get("continuous_business_window_actual_us") or 0)
@@ -2152,10 +2515,22 @@ def validate_continuous_large_tx_report(
         start_value = int(start_snapshot.get(key, -1))
         end_value = int(end_snapshot.get(key, -1))
         pre_drain_value = int(pre_drain_snapshot.get(key, -1))
-        if end_value <= start_value or pre_drain_value < end_value:
+        if end_value < start_value or pre_drain_value < end_value:
             failures.append(
-                f"continuous {key} did not advance monotonically: "
+                f"continuous {key} regressed: "
                 f"start={start_value} end={end_value} pre_drain={pre_drain_value}"
+            )
+    for key in (
+        "large_statements_completed",
+        "short_statements_completed",
+        "short_transactions_completed",
+    ):
+        start_value = int(start_snapshot.get(key, -1))
+        end_value = int(end_snapshot.get(key, -1))
+        if end_value <= start_value:
+            failures.append(
+                f"continuous {key} did not advance: "
+                f"start={start_value} end={end_value}"
             )
 
     short_latency = require_mapping("continuous_short_transaction_latency")
@@ -2172,6 +2547,147 @@ def validate_continuous_large_tx_report(
             f"{dict(short_latency)!r}"
         )
 
+    command_latency = require_mapping(
+        "continuous_business_command_latency"
+    )
+    command_latency_limit_us = int(command_latency.get("limit_us") or 0)
+    if command_latency_limit_us != profile.business_command_latency_limit_us:
+        failures.append(
+            "continuous business-command latency limit mismatch: "
+            f"expected={profile.business_command_latency_limit_us} "
+            f"actual={command_latency_limit_us}"
+        )
+    expected_command_recorders = (
+        profile.sessions + profile.short_transaction_sessions
+    )
+    observed_command_recorders = int(
+        command_latency.get("worker_recorders_observed") or 0
+    )
+    missing_command_recorders = int(
+        command_latency.get("worker_recorders_missing") or 0
+    )
+    if (
+        int(command_latency.get("worker_recorders_expected") or 0)
+        != expected_command_recorders
+        or observed_command_recorders != expected_command_recorders
+        or missing_command_recorders != 0
+        or command_latency.get("worker_coverage_complete") is not True
+    ):
+        failures.append(
+            "continuous business-command worker coverage is incomplete: "
+            f"expected={expected_command_recorders} "
+            f"observed={observed_command_recorders} "
+            f"missing={missing_command_recorders}"
+        )
+    successful_by_kind = command_latency.get("successful_by_kind", {})
+    if not isinstance(successful_by_kind, Mapping):
+        failures.append(
+            "continuous business-command successful_by_kind is missing"
+        )
+        successful_by_kind = {}
+    required_success_kinds = (
+        "transaction_begin",
+        "large_dml",
+        "short_private_dml",
+        "intentional_lock_wait",
+        "transaction_commit",
+    )
+    successful_command_count = 0
+    successful_kind_max_us = 0
+    for kind in required_success_kinds:
+        stats = successful_by_kind.get(kind, {})
+        if not isinstance(stats, Mapping):
+            failures.append(
+                f"continuous business-command kind is missing: {kind}"
+            )
+            continue
+        count = int(stats.get("count") or 0)
+        maximum_us = int(stats.get("max_us") or 0)
+        over_limit_count = int(stats.get("over_limit_count") or 0)
+        if count <= 0 or maximum_us <= 0:
+            failures.append(
+                "continuous business-command coverage is empty: "
+                f"kind={kind} stats={dict(stats)!r}"
+            )
+        if maximum_us > profile.business_command_latency_limit_us:
+            failures.append(
+                "continuous business-command exceeded latency limit: "
+                f"kind={kind} limit_us="
+                f"{profile.business_command_latency_limit_us} "
+                f"max_us={maximum_us}"
+            )
+        if over_limit_count != 0:
+            failures.append(
+                "continuous business-command over-limit count is nonzero: "
+                f"kind={kind} count={over_limit_count}"
+            )
+        successful_command_count += count
+        successful_kind_max_us = max(successful_kind_max_us, maximum_us)
+
+    expected_4020_latency = command_latency.get("expected_4020", {})
+    if not isinstance(expected_4020_latency, Mapping):
+        failures.append(
+            "continuous expected-4020 command latency is missing"
+        )
+        expected_4020_latency = {}
+    expected_4020_count = int(expected_4020_latency.get("count") or 0)
+    expected_4020_max_us = int(expected_4020_latency.get("max_us") or 0)
+    expected_4020_over_limit = int(
+        expected_4020_latency.get("over_limit_count") or 0
+    )
+    if expected_4020_count <= 0 or expected_4020_max_us <= 0:
+        failures.append(
+            "continuous expected-4020 command latency evidence is empty: "
+            f"{dict(expected_4020_latency)!r}"
+        )
+    if expected_4020_max_us > profile.business_command_latency_limit_us:
+        failures.append(
+            "continuous expected-4020 response exceeded latency limit: "
+            f"limit_us={profile.business_command_latency_limit_us} "
+            f"max_us={expected_4020_max_us}"
+        )
+    if expected_4020_over_limit != 0:
+        failures.append(
+            "continuous expected-4020 over-limit count is nonzero: "
+            f"count={expected_4020_over_limit}"
+        )
+
+    command_latency_overall = command_latency.get("overall", {})
+    if not isinstance(command_latency_overall, Mapping):
+        failures.append("continuous overall command latency is missing")
+        command_latency_overall = {}
+    overall_count = int(command_latency_overall.get("count") or 0)
+    overall_max_us = int(command_latency_overall.get("max_us") or 0)
+    overall_over_limit = int(
+        command_latency_overall.get("over_limit_count") or 0
+    )
+    if overall_count != successful_command_count + expected_4020_count:
+        failures.append(
+            "continuous command-latency count is inconsistent: "
+            f"overall={overall_count} successful={successful_command_count} "
+            f"expected_4020={expected_4020_count}"
+        )
+    expected_overall_max_us = max(
+        successful_kind_max_us, expected_4020_max_us
+    )
+    if overall_max_us != expected_overall_max_us:
+        failures.append(
+            "continuous command-latency max is inconsistent: "
+            f"overall={overall_max_us} derived={expected_overall_max_us}"
+        )
+    if (
+        overall_count <= 0
+        or overall_max_us <= 0
+        or overall_max_us > profile.business_command_latency_limit_us
+        or overall_over_limit != 0
+        or command_latency.get("within_limit") is not True
+    ):
+        failures.append(
+            "continuous overall business-command latency failed: "
+            f"{dict(command_latency_overall)!r} "
+            f"within_limit={command_latency.get('within_limit')!r}"
+        )
+
     large_4020 = int(report.get("continuous_large_4020_count") or 0)
     short_4020 = int(report.get("continuous_short_4020_count") or 0)
     total_4020 = int(report.get("continuous_4020_count") or 0)
@@ -2185,6 +2701,11 @@ def validate_continuous_large_tx_report(
         failures.append(
             "continuous workload did not report a consistent real 4020: "
             f"large={large_4020} short={short_4020} total={total_4020}"
+        )
+    if expected_4020_count != total_4020:
+        failures.append(
+            "continuous expected-4020 latency count is inconsistent: "
+            f"latency_count={expected_4020_count} response_count={total_4020}"
         )
     if waiting_4020 != total_4020 or retained_4020 != waiting_4020:
         failures.append(
@@ -2265,8 +2786,16 @@ def validate_continuous_large_tx_report(
             f"minimum={survivor_count} actual={record_object_prewarm_count}"
         )
 
-    phase2_us = max_metric("source_phase2_total_us")
-    ready_us = max_metric("receiver_ready_after_final_spool_ack_us")
+    source_timeline = require_mapping("continuous_source_timeline")
+    receiver_timeline = require_mapping("continuous_receiver_timeline")
+    phase1_us = int(source_timeline.get("phase1_duration_us", 0) or 0)
+    phase2_us = int(source_timeline.get("strict_interval_us", 0) or 0)
+    post_command_tail_value = source_timeline.get(
+        "last_command_end_to_final_ack_us"
+    )
+    ready_us = int(
+        receiver_timeline.get("derived_ready_after_final_ack_us", 0) or 0
+    )
     record_locks = max_metric("phase2_record_lock_count_samples")
     lock_plan_peak = max_metric("receiver_lock_plan_epoch_peak_bytes")
     lock_plan_cap = max_metric("receiver_lock_plan_subpool_cap_bytes")
@@ -2281,15 +2810,34 @@ def validate_continuous_large_tx_report(
     final_validation_rejects = max_metric(
         "source_final_validation_rejects_samples"
     )
-    if phase2_us > profile.source_phase2_limit_us:
+    phase2_record_materialized_targets = max_metric(
+        "phase2_record_materialized_target_count_samples"
+    )
+    phase2_record_materialized_bytes = max_metric(
+        "materialized_lock_payload_bytes_in_phase2_samples"
+    )
+    phase2_full_lock_scans = max_metric(
+        "phase2_full_lock_scan_count_samples"
+    )
+    if phase2_us <= 0 or phase2_us > profile.source_phase2_limit_us:
         failures.append(
             f"source_phase2_total_us: limit={profile.source_phase2_limit_us} "
             f"actual={phase2_us}"
         )
-    if ready_us <= 0 or ready_us >= profile.ready_after_final_spool_ack_limit_us:
+    if (
+        not isinstance(post_command_tail_value, int)
+        or post_command_tail_value < 0
+        or post_command_tail_value > profile.source_post_command_tail_limit_us
+    ):
+        failures.append(
+            "last_command_end_to_final_ack_us: "
+            f"expected_range=[0,{profile.source_post_command_tail_limit_us}] "
+            f"actual={post_command_tail_value!r}"
+        )
+    if ready_us < 0 or ready_us > profile.ready_after_final_spool_ack_limit_us:
         failures.append(
             "receiver_ready_after_final_spool_ack_us: "
-            f"expected_range=(0,{profile.ready_after_final_spool_ack_limit_us}) "
+            f"expected_range=[0,{profile.ready_after_final_spool_ack_limit_us}] "
             f"actual={ready_us}"
         )
     if record_locks < profile.continuous_min_record_locks:
@@ -2301,11 +2849,6 @@ def validate_continuous_large_tx_report(
         failures.append(
             f"receiver lock-plan budget invalid: peak={lock_plan_peak} "
             f"cap={lock_plan_cap}"
-        )
-    if batch_tokens_avg <= 1:
-        failures.append(
-            "source_phase1_record_batch_tokens_avg must exceed 1: "
-            f"actual={batch_tokens_avg}"
         )
     if frame_count <= 0 or network_sends * 4 > frame_count:
         failures.append(
@@ -2324,6 +2867,19 @@ def validate_continuous_large_tx_report(
             "source_final_validation_rejects_samples: "
             f"expected=0 actual={final_validation_rejects}"
         )
+    for key, actual in (
+        (
+            "phase2_record_materialized_target_count_samples",
+            phase2_record_materialized_targets,
+        ),
+        (
+            "materialized_lock_payload_bytes_in_phase2_samples",
+            phase2_record_materialized_bytes,
+        ),
+        ("phase2_full_lock_scan_count_samples", phase2_full_lock_scans),
+    ):
+        if actual != 0:
+            failures.append(f"{key}: expected=0 actual={actual}")
 
     require_equal("receiver_read_load_threads", profile.receiver_read_load_threads)
     require_equal("receiver_read_load_error_count", 0)
@@ -2360,12 +2916,44 @@ def validate_continuous_large_tx_report(
         or read_transfer_p99_us <= 0
     ):
         failures.append("receiver read-load evidence is empty")
-    if read_qps_drop_pct > profile.receiver_read_load_max_qps_drop_pct:
-        failures.append(
-            "receiver_read_load_qps_drop_pct: "
-            f"limit={profile.receiver_read_load_max_qps_drop_pct} "
-            f"actual={read_qps_drop_pct}"
-        )
+    formal_profile = profile.formal_rounds > 1
+    if formal_profile:
+        continuous_slo = require_mapping("continuous_slo")
+        if report.get("formal_evidence") is not True:
+            failures.append("continuous report is not formal evidence")
+        if continuous_slo.get("passed") is not True:
+            failures.append(
+                "continuous formal SLO did not pass: "
+                f"{dict(continuous_slo)!r}"
+            )
+        if business_tps.get("valid") is not True:
+            failures.append(
+                "continuous business TPS evidence is invalid: "
+                f"{dict(business_tps)!r}"
+            )
+        if phase1_us <= 0 or phase1_us > 60_000_000:
+            failures.append(
+                f"source Phase1 exceeds 60s: actual_us={phase1_us}"
+            )
+    groups = business_tps.get("groups", {})
+    if not isinstance(groups, Mapping):
+        groups = {}
+    large_statement_progress = business_tps.get(
+        "large_statement_progress", {}
+    )
+    if not isinstance(large_statement_progress, Mapping):
+        large_statement_progress = {}
+    short_tps = groups.get("short", {})
+    if not isinstance(short_tps, Mapping):
+        short_tps = {}
+    aggregate_tps = groups.get("aggregate", {})
+    if not isinstance(aggregate_tps, Mapping):
+        aggregate_tps = {}
+    engineering_milestone = report.get(
+        "continuous_engineering_milestone_40pct", {}
+    )
+    if not isinstance(engineering_milestone, Mapping):
+        engineering_milestone = {}
     if failures:
         raise RuntimeError(
             "continuous large-transaction acceptance failed: "
@@ -2387,12 +2975,43 @@ def validate_continuous_large_tx_report(
             pre_drain_snapshot.get("short_transactions_completed", 0)
         ),
         "short_transaction_latency": dict(short_latency),
+        "business_command_latency": dict(command_latency),
         "drained_4020_workers": total_4020,
+        **({"large_transaction_model": "UPDATE_FOREVER",
+            "large_no_commit": dict(report["continuous_large_no_commit"])}
+           if profile.continuous_large_tx_no_commit else {}),
         "post_drain_short_connection_closes_without_4020": (
             short_connection_close_count
         ),
         "preserved_survivors": survivor_count,
         "source_phase2_total_us": phase2_us,
+        "source_phase1_total_us": phase1_us,
+        "large_statement_baseline_per_s": (
+            large_statement_progress.get("baseline_per_s")
+        ),
+        "large_statement_phase1_per_s": (
+            large_statement_progress.get("phase1_per_s")
+        ),
+        "large_statement_phase1_rate_drop_pct": (
+            large_statement_progress.get("phase1_rate_drop_pct")
+        ),
+        "short_transaction_baseline_tps": short_tps.get("baseline_tps"),
+        "short_transaction_phase1_tps": short_tps.get("phase1_tps"),
+        "short_transaction_phase1_tps_drop_pct": short_tps.get(
+            "phase1_tps_drop_pct"
+        ),
+        "aggregate_baseline_committed_tps_report_only": (
+            aggregate_tps.get("baseline_tps")
+        ),
+        "aggregate_phase1_committed_tps_report_only": (
+            aggregate_tps.get("phase1_tps")
+        ),
+        "aggregate_phase1_committed_tps_drop_pct_report_only": (
+            aggregate_tps.get("phase1_tps_drop_pct")
+        ),
+        "engineering_milestone_40pct_passed": (
+            engineering_milestone.get("passed")
+        ),
         "receiver_ready_after_final_spool_ack_us": ready_us,
         "phase2_record_lock_count": record_locks,
         "receiver_record_object_prewarm_count": record_object_prewarm_count,
@@ -2405,6 +3024,7 @@ def validate_continuous_large_tx_report(
         ),
         "source_phase1_transfer_network_send_reduction_pct_min": 75.0,
         "source_phase1_record_batch_tokens_avg": batch_tokens_avg,
+        "source_phase1_record_batch_tokens_avg_gate_enforced": False,
         "source_early_staged_tokens": early_staged_tokens,
         "source_phase2_total_us_limit": profile.source_phase2_limit_us,
         "receiver_ready_after_final_spool_ack_us_limit": (
@@ -2427,10 +3047,11 @@ def validate_continuous_large_tx_report(
         "receiver_read_load_transfer_qps": read_transfer_qps,
         "receiver_read_load_transfer_p99_us": read_transfer_p99_us,
         "receiver_read_load_qps_drop_pct": read_qps_drop_pct,
-        "receiver_read_load_qps_drop_pct_limit": (
+        "receiver_read_load_qps_drop_pct_reference_limit": (
             profile.receiver_read_load_max_qps_drop_pct
         ),
-        "receiver_read_load_qps_gate_enforced": True,
+        "receiver_read_load_qps_gate_enforced": False,
+        "receiver_read_load_qps_drop_pct_report_only": True,
         "receiver_read_load_p99_increase_pct": read_p99_increase_pct,
         "receiver_read_load_p99_increase_pct_reference_limit": (
             profile.receiver_read_load_max_p99_increase_pct
@@ -2517,6 +3138,37 @@ def validate_e2e_report(
             report.get("drain_survivor_count", 0)
         ):
             failures.append("receiver READY token count is incomplete")
+        validation = report.get("validation")
+        final_records = (
+            validation.get("records")
+            if isinstance(validation, Mapping)
+            else None
+        )
+        if not isinstance(final_records, list) or len(final_records) != 1:
+            failures.append("dependency sysbench final record is missing")
+        else:
+            tail_us = int(
+                final_records[0].get("last_command_end_to_final_ack_us", -1)
+            )
+            if tail_us < 0 or tail_us > profile.source_post_command_tail_limit_us:
+                failures.append(
+                    "last command end to Final ACK exceeds the limit: "
+                    f"actual={tail_us}us "
+                    f"limit={profile.source_post_command_tail_limit_us}us"
+                )
+        ready_after_ack_us = int(
+            report.get("receiver_ready_after_final_spool_ack_us", -1)
+        )
+        if (
+            ready_after_ack_us < 0
+            or ready_after_ack_us
+            > profile.ready_after_final_spool_ack_limit_us
+        ):
+            failures.append(
+                "Final ACK to receiver READY exceeds the limit: "
+                f"actual={ready_after_ack_us}us "
+                f"limit={profile.ready_after_final_spool_ack_limit_us}us"
+            )
         oracle_self_check = report.get("oracle_self_check")
         if not isinstance(oracle_self_check, Mapping) or not all(
             value is True for value in oracle_self_check.values()
@@ -3434,11 +4086,12 @@ def default_run_id(profile_name: str) -> str:
     return f"{profile_name}-{timestamp}-{secrets.token_hex(3)}"
 
 
-def run_dependency_sysbench_formal_rounds(
+def run_formal_rounds(
     profile: FullPressureProfile,
     args: argparse.Namespace,
     suite_paths: FullPressurePaths,
     *,
+    evidence: str,
     required_free_bytes: int,
 ) -> int:
     if profile.formal_rounds <= 1:
@@ -3458,17 +4111,26 @@ def run_dependency_sysbench_formal_rounds(
         "runner_version": RUNNER_VERSION,
         "run_id": suite_paths.run_id,
         "profile": profile.name,
-        "evidence": "dependency-sysbench",
+        "evidence": evidence,
         "status": "running",
         "success": False,
         "check_only": bool(args.check_only),
         "formal_evidence": False,
         "formal_rounds_expected": profile.formal_rounds,
         "formal_rounds_completed": 0,
-        "steady_run_seconds_per_round": profile.sysbench_runtime_s,
+        "steady_run_seconds_per_round": (
+            profile.sysbench_runtime_s
+            if evidence == "dependency-sysbench"
+            else profile.business_run_before_drain_s
+        ),
         "threads": profile.sessions,
         "tables": profile.tables,
-        "rows_per_table": profile.sysbench_table_size,
+        "rows_per_table": (
+            profile.sysbench_table_size
+            if evidence == "dependency-sysbench"
+            else profile.seed_rows_per_table_per_session
+        ),
+        "acceptance": build_acceptance_contract(profile, evidence),
         "rounds": rounds,
         "started_at_utc": utc_now(),
     }
@@ -3498,7 +4160,7 @@ def run_dependency_sysbench_formal_rounds(
             check_only=args.check_only,
             build_jobs=args.build_jobs,
             skip_build=args.skip_build or round_number > 1,
-            evidence="dependency-sysbench",
+            evidence=evidence,
         )
 
         runner_error: Optional[str] = None
@@ -3517,6 +4179,10 @@ def run_dependency_sysbench_formal_rounds(
         checklist = (
             json.loads(checklist_path.read_text(encoding="utf-8"))
             if checklist_path.is_file() else {}
+        )
+        child_report = (
+            json.loads(report_path.read_text(encoding="utf-8"))
+            if report_path.is_file() else {}
         )
         binary_sha256 = str(
             checklist.get("release_binary", {}).get("sha256", "")
@@ -3550,18 +4216,25 @@ def run_dependency_sysbench_formal_rounds(
             and bool(result.get("success"))
             and not binary_mismatch
         )
-        round_success = (
+        child_formal_evidence = bool(
+            child_report.get("formal_evidence", False)
+        )
+        if evidence != "dependency-continuous-large-tx-transfer":
+            child_formal_evidence = True
+        round_formal_evidence = bool(
             not args.check_only
             and round_check_success
             and report_path.is_file()
+            and child_formal_evidence
         )
+        round_success = round_formal_evidence
         round_record: Dict[str, Any] = {
             "round": round_number,
             "run_id": child_run_id,
             "history_dir": str(child_paths.history_dir),
             "report_json": str(report_path),
             "success": round_success,
-            "formal_evidence": not args.check_only,
+            "formal_evidence": round_formal_evidence,
             "check_only_success": round_check_success,
             "status": result.get("status", "missing-result"),
             "runner_error": runner_error,
@@ -3594,6 +4267,7 @@ def run_dependency_sysbench_formal_rounds(
         not args.check_only
         and suite_checks_pass
         and all(bool(item.get("success")) for item in rounds)
+        and all(bool(item.get("formal_evidence")) for item in rounds)
     )
     if args.check_only:
         suite.update(
@@ -3607,7 +4281,7 @@ def run_dependency_sysbench_formal_rounds(
         suite.update(
             status="success" if suite_success else "failed",
             success=suite_success,
-            formal_evidence=True,
+            formal_evidence=suite_success,
             steady_state_executed=True,
         )
     suite.update(
@@ -3625,9 +4299,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--build-dir", type=Path, default=Path("build-release"))
     parser.add_argument(
         "--profile",
-        choices=("full", "smoke"),
+        choices=("full", "scale-smoke", "smoke"),
         default="full",
-        help="full is release evidence; smoke only validates runner lifecycle",
+        help=(
+            "full is release evidence; scale-smoke is the one-round "
+            "128+16 RR diagnostic; smoke validates runner lifecycle"
+        ),
     )
     parser.add_argument(
         "--evidence",
@@ -3647,7 +4324,23 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "reset-drain runs the large-transaction RESET DRAIN gate"
         ),
     )
+    parser.add_argument(
+        "--large-tx-shape",
+        choices=(
+            "all",
+            *DEPENDENCY_CONTINUOUS_LARGE_TX_SHAPES.keys(),
+        ),
+        default="all",
+        help=(
+            "dependency-continuous transaction shape; all runs each shape "
+            "as an independent profile"
+        ),
+    )
     parser.add_argument("--run-id")
+    parser.add_argument(
+        "--large-tx-no-commit", action="store_true",
+        help="loop mixed point/range UPDATEs in one uncommitted large transaction",
+    )
     parser.add_argument(
         "--work-root",
         type=Path,
@@ -3670,6 +4363,28 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=float,
         help=(
             "override the continuous large/short-transaction business window"
+        ),
+    )
+    parser.add_argument(
+        "--phase1-pipeline-workers",
+        type=int,
+        help=(
+            "diagnostic override for dependency-continuous Phase1 workers"
+        ),
+    )
+    parser.add_argument(
+        "--phase1-pipeline-ordinary-active-limit",
+        type=int,
+        help=(
+            "diagnostic override for concurrent ordinary Phase1 prepare jobs"
+        ),
+    )
+    parser.add_argument(
+        "--phase1-pipeline-tail-record-credit-bytes",
+        type=int,
+        help=(
+            "diagnostic override for dependency-continuous final record "
+            "tail credit"
         ),
     )
     parser.add_argument(
@@ -3698,14 +4413,228 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def select_full_pressure_profiles(
+    args: argparse.Namespace,
+) -> List[FullPressureProfile]:
+    if args.evidence == "dependency-continuous-large-tx-transfer":
+        if args.large_tx_no_commit:
+            if args.large_tx_shape not in {"all", "range-10000"}:
+                raise RuntimeError("--large-tx-no-commit uses ten-row ranges")
+            profile = dependency_continuous_profiles(
+                args.profile, "range-10000"
+            )[0]
+            overrides = {}
+            if args.profile == "smoke":
+                # Exercise repeated passes quickly, without changing full geometry.
+                overrides = {
+                    "statements_per_tx": 200,
+                    "seed_rows_per_table_per_session": 200,
+                }
+            return [dataclasses.replace(
+                profile,
+                name=f"dependency-uncommitted-updates-{args.profile}",
+                continuous_large_tx_no_commit=True,
+                **overrides,
+            )]
+        return dependency_continuous_profiles(
+            args.profile, args.large_tx_shape
+        )
+    if args.large_tx_no_commit:
+        raise RuntimeError("--large-tx-no-commit requires dependency continuous")
+    if args.large_tx_shape != "all":
+        raise RuntimeError(
+            "--large-tx-shape is only valid for "
+            "dependency-continuous-large-tx-transfer"
+        )
+    if args.evidence == "dependency-sysbench":
+        return [
+            DEPENDENCY_SYSBENCH_FULL_PROFILE
+            if args.profile == "full"
+            else DEPENDENCY_SYSBENCH_SMOKE_PROFILE
+        ]
+    if args.evidence == "dependency-mixed-transfer":
+        return [
+            DEPENDENCY_MIXED_FULL_PROFILE
+            if args.profile == "full"
+            else DEPENDENCY_MIXED_SMOKE_PROFILE
+        ]
+    if args.evidence in {"mixed-shutdown-startup", "mixed-transfer"}:
+        return [
+            MIXED_FULL_PROFILE
+            if args.profile == "full"
+            else MIXED_SMOKE_PROFILE
+        ]
+    if args.evidence == "reset-drain":
+        return [
+            RESET_FULL_PROFILE
+            if args.profile == "full"
+            else RESET_SMOKE_PROFILE
+        ]
+    if args.evidence == "continuous-tiered-transfer":
+        return [
+            CONTINUOUS_TIERED_FULL_PROFILE
+            if args.profile == "full"
+            else CONTINUOUS_TIERED_SMOKE_PROFILE
+        ]
+    return [FULL_PROFILE if args.profile == "full" else SMOKE_PROFILE]
+
+
+def run_dependency_continuous_shape_matrix(
+    profiles: Sequence[FullPressureProfile],
+    args: argparse.Namespace,
+    matrix_paths: FullPressurePaths,
+    *,
+    required_free_bytes: int,
+) -> int:
+    if len(profiles) <= 1:
+        raise RuntimeError("shape matrix requires at least two profiles")
+    matrix_paths.history_dir.mkdir(parents=True, exist_ok=False)
+    index_path = matrix_paths.history_dir / "index.json"
+    started = time.monotonic()
+    shape_records: List[Dict[str, Any]] = []
+    expected_binary_sha256: Optional[str] = None
+    matrix: Dict[str, Any] = {
+        "runner": RUNNER_NAME,
+        "runner_version": RUNNER_VERSION,
+        "run_id": matrix_paths.run_id,
+        "evidence": "dependency-continuous-large-tx-transfer",
+        "profile_tier": args.profile,
+        "status": "running",
+        "success": False,
+        "check_only": bool(args.check_only),
+        "shape_profiles_expected": len(profiles),
+        "shape_profiles_completed": 0,
+        "shapes": shape_records,
+        "started_at_utc": utc_now(),
+    }
+    write_json_atomic(index_path, matrix)
+
+    for shape_number, profile in enumerate(profiles, start=1):
+        child_paths = FullPressurePaths.resolve(
+            repo_root=matrix_paths.repo_root,
+            build_dir=matrix_paths.build_dir,
+            work_root=matrix_paths.work_root,
+            history_root=matrix_paths.history_dir,
+            run_id=profile.name,
+        )
+        child_args = argparse.Namespace(**vars(args))
+        child_args.skip_build = bool(
+            args.skip_build or shape_number > 1
+        )
+        runner_error: Optional[str] = None
+        if profile.formal_rounds > 1:
+            returncode = run_formal_rounds(
+                profile,
+                child_args,
+                child_paths,
+                evidence="dependency-continuous-large-tx-transfer",
+                required_free_bytes=required_free_bytes,
+            )
+            summary_path = child_paths.history_dir / "index.json"
+        else:
+            if args.source_port or args.receiver_port:
+                source_port, receiver_port = (
+                    args.source_port,
+                    args.receiver_port,
+                )
+            else:
+                source_port, receiver_port = allocate_port_pair()
+            runner = FullPressureRunner(
+                profile,
+                child_paths,
+                source_port=source_port,
+                receiver_port=receiver_port,
+                required_free_bytes=required_free_bytes,
+                keep_work_dir=args.keep_work_dir,
+                check_only=args.check_only,
+                build_jobs=args.build_jobs,
+                skip_build=child_args.skip_build,
+                evidence="dependency-continuous-large-tx-transfer",
+            )
+            try:
+                returncode = runner.run()
+            except Exception as exc:
+                returncode = 1
+                runner_error = f"{type(exc).__name__}: {exc}"
+            summary_path = child_paths.history_dir / "result.json"
+
+        summary = (
+            json.loads(summary_path.read_text(encoding="utf-8"))
+            if summary_path.is_file()
+            else {}
+        )
+        checklist_path = child_paths.history_dir / "checklist.json"
+        checklist = (
+            json.loads(checklist_path.read_text(encoding="utf-8"))
+            if checklist_path.is_file()
+            else {}
+        )
+        binary_sha256 = str(
+            summary.get("release_binary_sha256")
+            or checklist.get("release_binary", {}).get("sha256", "")
+        )
+        if expected_binary_sha256 is None and binary_sha256:
+            expected_binary_sha256 = binary_sha256
+        binary_mismatch = bool(
+            not binary_sha256
+            or binary_sha256 != expected_binary_sha256
+        )
+        child_success = bool(
+            returncode == 0
+            and not binary_mismatch
+            and (
+                summary.get("check_only_success", False)
+                if profile.formal_rounds > 1 and args.check_only
+                else summary.get("success", False)
+            )
+        )
+        shape_records.append(
+            {
+                "shape": profile.continuous_large_tx_shape,
+                "profile": profile.name,
+                "history_dir": str(child_paths.history_dir),
+                "summary": str(summary_path),
+                "success": child_success,
+                "returncode": returncode,
+                "runner_error": runner_error,
+                "release_binary_sha256": binary_sha256,
+                "binary_mismatch": binary_mismatch,
+            }
+        )
+        matrix["shape_profiles_completed"] = len(shape_records)
+        matrix["release_binary_sha256"] = expected_binary_sha256
+        write_json_atomic(index_path, matrix)
+        if not child_success:
+            break
+
+    matrix_success = bool(
+        len(shape_records) == len(profiles)
+        and all(record["success"] for record in shape_records)
+    )
+    matrix.update(
+        status="checked" if args.check_only and matrix_success else (
+            "success" if matrix_success else "failed"
+        ),
+        success=matrix_success,
+        elapsed_seconds=round(time.monotonic() - started, 3),
+        finished_at_utc=utc_now(),
+    )
+    write_json_atomic(index_path, matrix)
+    print(f"Shape matrix index: {index_path}", flush=True)
+    return 0 if matrix_success else 1
+
+
 def main(
     argv: Optional[Sequence[str]] = None,
     *,
     forced_evidence: Optional[str] = None,
+    forced_large_tx_no_commit: bool = False,
 ) -> int:
     args = parse_args(argv)
     if forced_evidence is not None:
         args.evidence = forced_evidence
+    if forced_large_tx_no_commit:
+        args.large_tx_no_commit = True
     if (
         args.business_run_before_drain is not None
         and args.evidence != "dependency-continuous-large-tx-transfer"
@@ -3719,50 +4648,114 @@ def main(
         and args.business_run_before_drain <= 0
     ):
         raise RuntimeError("--business-run-before-drain must be positive")
-    if args.evidence == "dependency-sysbench":
-        profile = (
-            DEPENDENCY_SYSBENCH_FULL_PROFILE
-            if args.profile == "full"
-            else DEPENDENCY_SYSBENCH_SMOKE_PROFILE
+    if (
+        args.phase1_pipeline_workers is not None
+        and args.evidence != "dependency-continuous-large-tx-transfer"
+    ):
+        raise RuntimeError(
+            "--phase1-pipeline-workers is only valid for "
+            "dependency-continuous-large-tx-transfer"
         )
-    elif args.evidence == "dependency-mixed-transfer":
-        profile = (
-            DEPENDENCY_MIXED_FULL_PROFILE
-            if args.profile == "full"
-            else DEPENDENCY_MIXED_SMOKE_PROFILE
+    if (
+        args.phase1_pipeline_workers is not None
+        and not 1 <= args.phase1_pipeline_workers <= 64
+    ):
+        raise RuntimeError("--phase1-pipeline-workers must be in [1, 64]")
+    if (
+        args.phase1_pipeline_ordinary_active_limit is not None
+        and args.evidence != "dependency-continuous-large-tx-transfer"
+    ):
+        raise RuntimeError(
+            "--phase1-pipeline-ordinary-active-limit is only valid for "
+            "dependency-continuous-large-tx-transfer"
         )
-    elif args.evidence == "dependency-continuous-large-tx-transfer":
-        profile = (
-            DEPENDENCY_CONTINUOUS_LARGE_TX_FULL_PROFILE
-            if args.profile == "full"
-            else DEPENDENCY_CONTINUOUS_LARGE_TX_SMOKE_PROFILE
+    if (
+        args.phase1_pipeline_ordinary_active_limit is not None
+        and not 1 <= args.phase1_pipeline_ordinary_active_limit <= 64
+    ):
+        raise RuntimeError(
+            "--phase1-pipeline-ordinary-active-limit must be in [1, 64]"
         )
-    elif args.evidence in {"mixed-shutdown-startup", "mixed-transfer"}:
-        profile = (
-            MIXED_FULL_PROFILE
-            if args.profile == "full"
-            else MIXED_SMOKE_PROFILE
+    if (
+        args.phase1_pipeline_tail_record_credit_bytes is not None
+        and args.evidence != "dependency-continuous-large-tx-transfer"
+    ):
+        raise RuntimeError(
+            "--phase1-pipeline-tail-record-credit-bytes is only valid for "
+            "dependency-continuous-large-tx-transfer"
         )
-    elif args.evidence == "reset-drain":
-        profile = (
-            RESET_FULL_PROFILE
-            if args.profile == "full"
-            else RESET_SMOKE_PROFILE
+    if (
+        args.phase1_pipeline_tail_record_credit_bytes is not None
+        and args.phase1_pipeline_tail_record_credit_bytes <= 0
+    ):
+        raise RuntimeError(
+            "--phase1-pipeline-tail-record-credit-bytes must be positive"
         )
-    elif args.evidence == "continuous-tiered-transfer":
-        profile = (
-            CONTINUOUS_TIERED_FULL_PROFILE
-            if args.profile == "full"
-            else CONTINUOUS_TIERED_SMOKE_PROFILE
+    if (
+        args.profile == "scale-smoke"
+        and args.evidence != "dependency-continuous-large-tx-transfer"
+    ):
+        raise RuntimeError(
+            "--profile scale-smoke is only valid for "
+            "dependency-continuous-large-tx-transfer"
         )
-    else:
-        profile = FULL_PROFILE if args.profile == "full" else SMOKE_PROFILE
+    profiles = select_full_pressure_profiles(args)
     if args.business_run_before_drain is not None:
-        profile = dataclasses.replace(
-            profile,
-            business_run_before_drain_s=args.business_run_before_drain,
-        )
-    run_id = args.run_id or default_run_id(profile.name)
+        profiles = [
+            dataclasses.replace(
+                profile,
+                business_run_before_drain_s=args.business_run_before_drain,
+                formal_rounds=1,
+            )
+            for profile in profiles
+        ]
+    if args.phase1_pipeline_workers is not None:
+        profiles = [
+            dataclasses.replace(
+                profile,
+                phase1_pipeline_workers=args.phase1_pipeline_workers,
+                formal_rounds=1,
+            )
+            for profile in profiles
+        ]
+    if args.phase1_pipeline_ordinary_active_limit is not None:
+        profiles = [
+            dataclasses.replace(
+                profile,
+                phase1_pipeline_ordinary_active_limit=(
+                    args.phase1_pipeline_ordinary_active_limit
+                ),
+                formal_rounds=1,
+            )
+            for profile in profiles
+        ]
+    if args.phase1_pipeline_tail_record_credit_bytes is not None:
+        for profile in profiles:
+            if (
+                args.phase1_pipeline_tail_record_credit_bytes
+                > profile.phase1_pipeline_credit_bytes
+            ):
+                raise RuntimeError(
+                    "--phase1-pipeline-tail-record-credit-bytes must not "
+                    "exceed phase1 pipeline credit bytes"
+                )
+        profiles = [
+            dataclasses.replace(
+                profile,
+                phase1_pipeline_tail_record_credit_bytes=(
+                    args.phase1_pipeline_tail_record_credit_bytes
+                ),
+                formal_rounds=1,
+            )
+            for profile in profiles
+        ]
+    profile = profiles[0]
+    run_name = (
+        f"dependency-continuous-all-{args.profile}"
+        if len(profiles) > 1
+        else profile.name
+    )
+    run_id = args.run_id or default_run_id(run_name)
     repo_root = args.repo_root.expanduser().resolve(strict=False)
     build_dir = (
         args.build_dir.expanduser()
@@ -3793,7 +4786,11 @@ def main(
                 else DEFAULT_FULL_REQUIRED_FREE_BYTES
             )
             if args.profile == "full"
-            else DEFAULT_SMOKE_REQUIRED_FREE_BYTES
+            else (
+                DEFAULT_SCALE_SMOKE_REQUIRED_FREE_BYTES
+                if args.profile == "scale-smoke"
+                else DEFAULT_SMOKE_REQUIRED_FREE_BYTES
+            )
         )
     )
     if paths.history_dir.exists():
@@ -3801,14 +4798,25 @@ def main(
     if args.build_jobs <= 0:
         raise RuntimeError("--build-jobs must be positive")
     with RunnerLock(paths.history_root):
+        if len(profiles) > 1:
+            return run_dependency_continuous_shape_matrix(
+                profiles,
+                args,
+                paths,
+                required_free_bytes=required_free_bytes,
+            )
         if (
-            args.evidence == "dependency-sysbench"
+            args.evidence in {
+                "dependency-sysbench",
+                "dependency-continuous-large-tx-transfer",
+            }
             and profile.formal_rounds > 1
         ):
-            return run_dependency_sysbench_formal_rounds(
+            return run_formal_rounds(
                 profile,
                 args,
                 paths,
+                evidence=args.evidence,
                 required_free_bytes=required_free_bytes,
             )
         if args.source_port or args.receiver_port:

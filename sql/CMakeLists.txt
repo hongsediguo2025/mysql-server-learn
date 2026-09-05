@@ -442,6 +442,11 @@ SET(SQL_SHARED_SOURCES
   preserve_trx.cc
   preserve_trx_drain.cc
   preserve_trx_lock_warmcopy.cc
+  preserve_trx_phase1_pipeline.cc
+  preserve_trx_phase1_binlog_adapter.cc
+  preserve_trx_phase1_owner.cc
+  preserve_trx_phase1_record_adapter.cc
+  preserve_trx_phase1_publication.cc
   preserve_trx_promotion.cc
   preserve_trx_promotion_prepared.cc
   preserve_trx_resource.cc
