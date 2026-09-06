@@ -13,6 +13,7 @@ import dataclasses
 import json
 import math
 import re
+import signal
 import shutil
 import socket
 import subprocess
@@ -28,9 +29,11 @@ FINAL_MARKER = "PRESERVE_PHASE2_FINAL_V1"
 SUMMARY_MARKER = "PRESERVE_PHASE2_SCHED_V1"
 EXPECTED_MODE = "DEPENDENCY_CONVERGENCE_V1"
 SYSBENCH_REPORT_RE = re.compile(
-    r"^\[\s*(\d+)s\s*\]\s+thds:\s*(\d+).*?"
+    r"^\[\s*(\d+)s\s*\]\s+thds:\s*(\d+)\s+"
+    r"tps:\s*([0-9.]+)\s+qps:\s*([0-9.]+).*?"
     r"err/s:\s*([0-9.]+)\s+reconn/s:\s*([0-9.]+)"
 )
+SYSBENCH_4020_HOLD_RE = re.compile(r"PRESERVE_4020_HOLD tid=(\d+)")
 
 INTEGER_FIELDS = (
     "attempt_id",
@@ -998,6 +1001,22 @@ def _wait_for_sysbench_connections(
     )
 
 
+def _read_sysbench_connection_ids(runner: Any) -> Tuple[int, ...]:
+    connection = runner._source_ha_control_connection()
+    try:
+        rows = runner.runtime.execute(
+            connection,
+            "SELECT PROCESSLIST_ID FROM performance_schema.threads "
+            "WHERE TYPE='FOREGROUND' "
+            "AND PROCESSLIST_USER='sysbench' "
+            "ORDER BY PROCESSLIST_ID",
+            fetch=True,
+        )
+    finally:
+        connection.close()
+    return tuple(int(row[0]) for row in rows)
+
+
 def _start_sysbench_reader(
     process: subprocess.Popen[str], log_path: Path
 ) -> Tuple[threading.Thread, threading.Condition, Dict[str, Any]]:
@@ -1005,6 +1024,8 @@ def _start_sysbench_reader(
     state: Dict[str, Any] = {
         "lines": [],
         "reports": [],
+        "held_thread_ids": set(),
+        "fatal_lines": [],
         "threads_started": False,
         "done": False,
     }
@@ -1017,6 +1038,9 @@ def _start_sysbench_reader(
                 output.flush()
                 print(f"SYSBENCH {line}", end="", flush=True)
                 report_match = SYSBENCH_REPORT_RE.match(line.rstrip("\n"))
+                hold_matches = list(
+                    SYSBENCH_4020_HOLD_RE.finditer(line.rstrip("\n"))
+                )
                 with condition:
                     state["lines"].append(line.rstrip("\n"))
                     if "Threads started!" in line:
@@ -1026,14 +1050,22 @@ def _start_sysbench_reader(
                             {
                                 "elapsed_s": int(report_match.group(1)),
                                 "threads": int(report_match.group(2)),
-                                "errors_per_s": float(report_match.group(3)),
+                                "tps": float(report_match.group(3)),
+                                "qps": float(report_match.group(4)),
+                                "errors_per_s": float(report_match.group(5)),
                                 "reconnects_per_s": float(
-                                    report_match.group(4)
+                                    report_match.group(6)
                                 ),
                                 "observed_monotonic_ns": time.monotonic_ns(),
                                 "line": line.rstrip("\n"),
                             }
                         )
+                    for hold_match in hold_matches:
+                        state["held_thread_ids"].add(
+                            int(hold_match.group(1))
+                        )
+                    if "FATAL:" in line:
+                        state["fatal_lines"].append(line.rstrip("\n"))
                     condition.notify_all()
         with condition:
             state["done"] = True
@@ -1336,6 +1368,7 @@ def _run_sysbench_write_only_drain(args: argparse.Namespace) -> Dict[str, Any]:
             f"--threads={args.sysbench_threads}",
             f"--time={max(args.sysbench_runtime_seconds + 300, 600)}",
             f"--report-interval={args.report_interval_seconds}",
+            "--mysql-ignore-errors=1213,1020,1205,4020",
             "run",
         ]
         process = subprocess.Popen(
@@ -1435,15 +1468,11 @@ def _run_sysbench_write_only_drain(args: argparse.Namespace) -> Dict[str, Any]:
                 "DRAIN would start before the full post-ready runtime: "
                 f"{post_ready_runtime_us}us"
             )
-        pre_drain_connections = _mysql_scalar(
-            runner.runtime,
-            "SELECT COUNT(*) FROM performance_schema.threads "
-            "WHERE TYPE='FOREGROUND' AND PROCESSLIST_USER='sysbench'",
-        )
-        if pre_drain_connections != args.sysbench_threads:
+        pre_drain_connection_ids = _read_sysbench_connection_ids(runner)
+        if len(pre_drain_connection_ids) != args.sysbench_threads:
             raise RuntimeError(
                 "sysbench connection count changed before DRAIN: "
-                f"{pre_drain_connections}"
+                f"{len(pre_drain_connection_ids)}"
             )
 
         drain_log_offset = args.source_error_log.stat().st_size
@@ -1472,16 +1501,79 @@ def _run_sysbench_write_only_drain(args: argparse.Namespace) -> Dict[str, Any]:
         if survivor_count <= 0:
             raise RuntimeError("DRAIN returned no survivor transaction")
 
+        assert capture_state is not None
+        assert condition is not None
+        expected_held_thread_ids = set(range(args.sysbench_threads))
+        _wait_sysbench_state(
+            process,
+            condition,
+            capture_state,
+            lambda: capture_state["held_thread_ids"]
+            == expected_held_thread_ids,
+            timeout_s=30.0,
+            description="all sysbench workers to hold after 4020",
+        )
+        with condition:
+            held_thread_ids = set(capture_state["held_thread_ids"])
+        post_drain_connection_ids = _read_sysbench_connection_ids(runner)
+        original_connection_ids_retained = bool(
+            pre_drain_connection_ids == post_drain_connection_ids
+        )
+        connections_retained_after_4020 = len(post_drain_connection_ids)
+        hold_verification_passed = bool(
+            held_thread_ids == expected_held_thread_ids
+            and original_connection_ids_retained
+        )
         sysbench_rc = _stop_sysbench(process)
         process = None
         if reader is not None:
             reader.join(timeout=30.0)
             if reader.is_alive():
                 raise RuntimeError("sysbench output reader did not stop")
-        assert capture_state is not None
+        with condition:
+            fatal_line_count = len(capture_state["fatal_lines"])
+            reports_observed_while_drain_active = [
+                dict(value)
+                for value in capture_state["reports"]
+                if drain_started_ns
+                <= int(value["observed_monotonic_ns"])
+                <= drain_completed_ns
+            ]
+        controlled_stop_after_hold_verification = bool(
+            hold_verification_passed
+            and sysbench_rc == -signal.SIGTERM
+            and fatal_line_count == 0
+        )
+        if not controlled_stop_after_hold_verification:
+            raise RuntimeError(
+                "sysbench HOLD verification failed: "
+                f"held={len(held_thread_ids)}/{args.sysbench_threads} "
+                f"connection_ids_retained={original_connection_ids_retained} "
+                f"fatal_lines={fatal_line_count} rc={sysbench_rc}"
+            )
         transactions, queries = _parse_sysbench_totals(capture_state["lines"])
-        cutoff_4020_observed = any(
-            "4020" in line for line in capture_state["lines"]
+        cutoff_4020_observed = bool(held_thread_ids)
+        steady_tps_values = [float(value["tps"]) for value in steady_reports]
+        steady_qps_values = [float(value["qps"]) for value in steady_reports]
+        steady_tps_avg = sum(steady_tps_values) / len(steady_tps_values)
+        steady_qps_avg = sum(steady_qps_values) / len(steady_qps_values)
+        drain_tps_values = [
+            float(value["tps"])
+            for value in reports_observed_while_drain_active
+        ]
+        drain_qps_values = [
+            float(value["qps"])
+            for value in reports_observed_while_drain_active
+        ]
+        drain_tps_avg = (
+            sum(drain_tps_values) / len(drain_tps_values)
+            if drain_tps_values
+            else None
+        )
+        drain_qps_avg = (
+            sum(drain_qps_values) / len(drain_qps_values)
+            if drain_qps_values
+            else None
         )
 
         warmcopy_metrics = runner.read_latest_warmcopy_metrics_since(
@@ -1557,11 +1649,58 @@ def _run_sysbench_write_only_drain(args: argparse.Namespace) -> Dict[str, Any]:
                 "steady_reports": steady_reports,
                 "steady_window_us": steady_window_us,
                 "post_ready_runtime_us": post_ready_runtime_us,
+                "steady_tps_avg": steady_tps_avg,
+                "steady_tps_min": min(steady_tps_values),
+                "steady_tps_max": max(steady_tps_values),
+                "steady_qps_avg": steady_qps_avg,
+                "steady_qps_min": min(steady_qps_values),
+                "steady_qps_max": max(steady_qps_values),
+                "steady_transactions_estimate": int(
+                    round(
+                        sum(steady_tps_values)
+                        * args.report_interval_seconds
+                    )
+                ),
+                "steady_queries_estimate": int(
+                    round(
+                        sum(steady_qps_values)
+                        * args.report_interval_seconds
+                    )
+                ),
+                "reports_observed_while_drain_active": (
+                    reports_observed_while_drain_active
+                ),
+                "drain_active_tps_avg": drain_tps_avg,
+                "drain_active_qps_avg": drain_qps_avg,
+                "drain_active_tps_drop_pct_report_only": (
+                    None
+                    if drain_tps_avg is None or steady_tps_avg <= 0
+                    else max(
+                        0.0,
+                        (steady_tps_avg - drain_tps_avg)
+                        * 100.0
+                        / steady_tps_avg,
+                    )
+                ),
                 "reconnect": False,
                 "transactions": transactions,
                 "queries": queries,
                 "returncode_after_drain": sysbench_rc,
                 "cutoff_4020_observed": cutoff_4020_observed,
+                "cutoff_4020_hold_count": len(held_thread_ids),
+                "cutoff_4020_held_thread_ids": sorted(held_thread_ids),
+                "pre_drain_connection_ids": list(pre_drain_connection_ids),
+                "post_drain_connection_ids": list(post_drain_connection_ids),
+                "original_connection_ids_retained": (
+                    original_connection_ids_retained
+                ),
+                "connections_retained_after_4020": (
+                    connections_retained_after_4020
+                ),
+                "fatal_line_count": fatal_line_count,
+                "controlled_stop_after_hold_verification": (
+                    controlled_stop_after_hold_verification
+                ),
                 "raw_log": str(sysbench_log),
             },
         }

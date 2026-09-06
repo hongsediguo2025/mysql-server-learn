@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -35,7 +36,9 @@
 #endif
 
 #include "my_sys.h"
+#include "mysql/components/services/log_builtins.h"
 #include "mysqld_error.h"
+#include "scope_guard.h"
 #include "sql/preserve_trx.h"
 #include "sql/preserve_trx_lock_warmcopy.h"
 #include "sql/mysqld.h"
@@ -117,22 +120,54 @@ class Preserve_resource_manager {
   }
 
   bool acquire_native_binlog(const std::string &token, uint64_t memory_bytes,
-                             uint64_t fd_count, uint64_t tmpdir_bytes) {
+                             uint64_t fd_count, uint64_t tmpdir_bytes,
+                             bool growing = false) {
+    /* Pair the external snapshot with the pending ledger. Settlement must not
+       reduce that ledger between an old free-space sample and admission. */
+    std::lock_guard<std::mutex> guard(m_mutex);
     Preserve_trx_external_resource_limits limits;
 #ifndef NDEBUG
-    {
-      std::lock_guard<std::mutex> guard(m_mutex);
-      if (m_external_limits_override) {
-        limits = m_external_limits;
-        return acquire_native_binlog_locked(token, memory_bytes, fd_count,
-                                            tmpdir_bytes, limits);
-      }
+    if (m_external_limits_override) {
+      limits = m_external_limits;
+      return acquire_native_binlog_locked(token, memory_bytes, fd_count,
+                                          tmpdir_bytes, limits, growing);
     }
 #endif
-    if (!preserve_trx_capture_external_resource_limits(&limits)) return false;
-    std::lock_guard<std::mutex> guard(m_mutex);
+    if (fd_count != 0 || tmpdir_bytes != 0) {
+      if (!preserve_trx_capture_external_resource_limits(&limits)) return false;
+    } else {
+      DBUG_EXECUTE_IF("preserve_trx_native_binlog_resource_trace", {
+        preserve_trx_capture_external_resource_limits(&limits);
+      });
+    }
+    DBUG_EXECUTE_IF("preserve_trx_native_binlog_tmpdir_3m", {
+      limits.tmpdir_free_bytes = std::min<uint64_t>(
+          limits.tmpdir_free_bytes, (1ULL << 30) + (3ULL << 20));
+    });
+    DBUG_EXECUTE_IF("preserve_trx_native_binlog_tmpdir_1m", {
+      limits.tmpdir_free_bytes = std::min<uint64_t>(
+          limits.tmpdir_free_bytes, (1ULL << 30) + (1ULL << 20));
+    });
+    DBUG_EXECUTE_IF("preserve_trx_native_binlog_tmpdir_memory_only", {
+      if (growing && memory_bytes > 0 && fd_count == 0 && tmpdir_bytes == 0)
+        limits.tmpdir_free_bytes = std::min<uint64_t>(
+            limits.tmpdir_free_bytes, (1ULL << 30) - 1);
+    });
     return acquire_native_binlog_locked(token, memory_bytes, fd_count,
-                                        tmpdir_bytes, limits);
+                                        tmpdir_bytes, limits, growing);
+  }
+
+  void settle_native_binlog_tmpdir(const std::string &token, uint64_t written,
+                                   uint64_t *settled) {
+    std::lock_guard<std::mutex> guard(m_mutex);
+    const auto it = m_native_tmpdir_by_token.find(token);
+    const uint64_t bytes = written - *settled;
+    DBUG_ASSERT(it != m_native_tmpdir_by_token.end() && it->second >= bytes);
+    if (it == m_native_tmpdir_by_token.end() || it->second < bytes) return;
+    it->second -= bytes;
+    m_reserved_native_tmpdir_bytes -= bytes;
+    *settled = written;
+    /* Keep a zero record: it still belongs to a live native lease. */
   }
 
   void release_native_binlog(const std::string &token, uint64_t memory_bytes,
@@ -162,11 +197,76 @@ class Preserve_resource_manager {
     m_reserved_native_tmpdir_bytes -=
         std::min(m_reserved_native_tmpdir_bytes, released_tmpdir);
     if (tmp_it != m_native_tmpdir_by_token.end()) {
-      if (released_tmpdir >= tmp_it->second)
+      if (released_tmpdir >= tmp_it->second &&
+          m_native_fd_by_token.find(token) == m_native_fd_by_token.end())
         m_native_tmpdir_by_token.erase(tmp_it);
       else
         tmp_it->second -= released_tmpdir;
     }
+  }
+
+  bool rebind_native_binlog(const std::string &from, const std::string &to,
+                            uint64_t memory, uint64_t fds, uint64_t tmpdir) {
+    if (to.empty()) return false;
+    if (from == to) return true;
+    const Token_kind_key old_kind{
+        from, Preserve_trx_memory_kind::PROMOTION_BINLOG_NATIVE_CACHE};
+    const Token_kind_key new_kind{
+        to, Preserve_trx_memory_kind::PROMOTION_BINLOG_NATIVE_CACHE};
+    std::lock_guard<std::mutex> guard(m_mutex);
+    auto source = m_by_token.find(from);
+    auto source_kind = m_by_token_kind.find(old_kind);
+    auto source_fd = m_native_fd_by_token.find(from);
+    auto source_tmp = m_native_tmpdir_by_token.find(from);
+    if (source == m_by_token.end() || source->second < memory ||
+        source_kind == m_by_token_kind.end() || source_kind->second < memory ||
+        source_fd == m_native_fd_by_token.end() || source_fd->second < fds ||
+        source_tmp == m_native_tmpdir_by_token.end() || source_tmp->second < tmpdir)
+      return false;
+    const auto target = m_by_token.find(to);
+    const uint64_t used = target == m_by_token.end() ? 0 : target->second;
+    if (memory > preserve_trx_memory_per_token_bytes ||
+        used > preserve_trx_memory_per_token_bytes - memory) return false;
+    /* Allocate all destination records before changing accounting. No global
+       bytes/FDs are reacquired, and the final token cap includes its lock plan. */
+    bool changed = false;
+    bool new_token = false, new_kind_record = false;
+    bool new_fd = false, new_tmp = false;
+    auto remove_empty_destination = create_scope_guard([&] {
+      if (changed) return;
+      if (new_token) m_by_token.erase(to);
+      if (new_kind_record) m_by_token_kind.erase(new_kind);
+      if (new_fd) m_native_fd_by_token.erase(to);
+      if (new_tmp) m_native_tmpdir_by_token.erase(to);
+    });
+    const auto token_insert = m_by_token.emplace(to, 0);
+    new_token = token_insert.second;
+    const auto kind_insert = m_by_token_kind.emplace(new_kind, 0);
+    new_kind_record = kind_insert.second;
+    const auto fd_insert = m_native_fd_by_token.emplace(to, 0);
+    new_fd = fd_insert.second;
+    const auto tmp_insert = m_native_tmpdir_by_token.emplace(to, 0);
+    new_tmp = tmp_insert.second;
+    auto dest = token_insert.first;
+    auto dest_kind = kind_insert.first;
+    auto dest_fd = fd_insert.first;
+    auto dest_tmp = tmp_insert.first;
+    changed = true;
+    dest->second += memory;
+    dest_kind->second += memory;
+    dest_fd->second += fds;
+    dest_tmp->second += tmpdir;
+    source->second -= memory;
+    source_kind->second -= memory;
+    source_fd->second -= fds;
+    source_tmp->second -= tmpdir;
+    if (source->second == 0) m_by_token.erase(source);
+    if (source_kind->second == 0) m_by_token_kind.erase(source_kind);
+    if (source_fd->second == 0) {
+      m_native_fd_by_token.erase(source_fd);
+      if (source_tmp->second == 0) m_native_tmpdir_by_token.erase(source_tmp);
+    }
+    return true;
   }
 
 #ifndef NDEBUG
@@ -190,7 +290,8 @@ class Preserve_resource_manager {
 
  private:
   bool acquire_memory_locked(const std::string &token,
-                             Preserve_trx_memory_kind kind, uint64_t bytes) {
+                             Preserve_trx_memory_kind kind, uint64_t bytes,
+                             bool growing = false) {
     const size_t kind_index = preserve_memory_kind_index(kind);
     if (token.empty() || kind_index >= kPreserveMemoryKindCount) return false;
     /*
@@ -207,12 +308,24 @@ class Preserve_resource_manager {
     if (bytes > kind_cap || m_by_kind[kind_index] > kind_cap - bytes) {
       return false;
     }
-    const uint64_t token_bytes = m_by_token[token];
+    /* Construct allocating keys before changing any grow accounting. */
+    const Token_kind_key token_kind{token, kind};
+    const auto existing_token = m_by_token.find(token);
+    const auto existing_kind = m_by_token_kind.find(token_kind);
+    if (growing && (existing_token == m_by_token.end() ||
+                    existing_kind == m_by_token_kind.end())) return false;
+    const uint64_t token_bytes =
+        growing ? existing_token->second : m_by_token[token];
     if (token_bytes > per_token_budget - bytes) return false;
     m_current_bytes += bytes;
     m_peak_bytes = std::max(m_peak_bytes, m_current_bytes);
-    m_by_token[token] = token_bytes + bytes;
-    m_by_token_kind[{token, kind}] += bytes;
+    if (growing) {
+      existing_token->second += bytes;
+      existing_kind->second += bytes;
+    } else {
+      m_by_token[token] = token_bytes + bytes;
+      m_by_token_kind[token_kind] += bytes;
+    }
     m_by_kind[kind_index] += bytes;
     return true;
   }
@@ -252,41 +365,68 @@ class Preserve_resource_manager {
   bool acquire_native_binlog_locked(
       const std::string &token, uint64_t memory_bytes, uint64_t fd_count,
       uint64_t tmpdir_bytes,
-      const Preserve_trx_external_resource_limits &limits) {
-    if (token.empty() || memory_bytes == 0 || fd_count == 0 ||
-        !limits.snapshots_available || limits.open_files_limit == 0) {
+      const Preserve_trx_external_resource_limits &limits, bool growing) {
+    if (token.empty() || (!growing && (memory_bytes == 0 || fd_count == 0)) ||
+        ((fd_count != 0 || tmpdir_bytes != 0) &&
+         (!limits.snapshots_available || limits.open_files_limit == 0))) {
       return false;
     }
+    const auto existing_fd = m_native_fd_by_token.find(token);
+    const auto existing_tmpdir = m_native_tmpdir_by_token.find(token);
+    if (growing && (existing_fd == m_native_fd_by_token.end() ||
+                    existing_tmpdir == m_native_tmpdir_by_token.end()))
+      return false;
     const uint64_t fd_headroom =
         std::max<uint64_t>(64, limits.open_files_limit / 10);
-    if (limits.current_open_files > limits.open_files_limit ||
-        m_reserved_native_fds >
-            limits.open_files_limit - limits.current_open_files ||
-        fd_count > limits.open_files_limit - limits.current_open_files -
-                       m_reserved_native_fds ||
-        fd_headroom > limits.open_files_limit - limits.current_open_files -
-                          m_reserved_native_fds - fd_count) {
+    if (fd_count != 0 &&
+        (limits.current_open_files > limits.open_files_limit ||
+         m_reserved_native_fds >
+             limits.open_files_limit - limits.current_open_files ||
+         fd_count > limits.open_files_limit - limits.current_open_files -
+                        m_reserved_native_fds ||
+         fd_headroom > limits.open_files_limit - limits.current_open_files -
+                           m_reserved_native_fds - fd_count)) {
       return false;
     }
     const uint64_t tmpdir_headroom = std::max<uint64_t>(
         1ULL * 1024ULL * 1024ULL * 1024ULL,
         limits.tmpdir_free_bytes / 10);
-    if (m_reserved_native_tmpdir_bytes > limits.tmpdir_free_bytes ||
-        tmpdir_bytes >
-            limits.tmpdir_free_bytes - m_reserved_native_tmpdir_bytes ||
-        tmpdir_headroom > limits.tmpdir_free_bytes -
-                              m_reserved_native_tmpdir_bytes - tmpdir_bytes) {
+    DBUG_EXECUTE_IF("preserve_trx_native_binlog_resource_trace", {
+      char message[384];
+      snprintf(message, sizeof(message),
+               "PRESERVE: native binlog admission growing=%u memory=%llu "
+               "fds=%llu tmpdir=%llu reserved=%llu free=%llu headroom=%llu",
+               static_cast<unsigned>(growing),
+               static_cast<unsigned long long>(memory_bytes),
+               static_cast<unsigned long long>(fd_count),
+               static_cast<unsigned long long>(tmpdir_bytes),
+               static_cast<unsigned long long>(m_reserved_native_tmpdir_bytes),
+               static_cast<unsigned long long>(limits.tmpdir_free_bytes),
+               static_cast<unsigned long long>(tmpdir_headroom));
+      LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG, message);
+    });
+    if (tmpdir_bytes != 0 &&
+        (m_reserved_native_tmpdir_bytes > limits.tmpdir_free_bytes ||
+         tmpdir_bytes >
+             limits.tmpdir_free_bytes - m_reserved_native_tmpdir_bytes ||
+         tmpdir_headroom > limits.tmpdir_free_bytes -
+                               m_reserved_native_tmpdir_bytes - tmpdir_bytes)) {
       return false;
     }
     if (!acquire_memory_locked(
             token, Preserve_trx_memory_kind::PROMOTION_BINLOG_NATIVE_CACHE,
-            memory_bytes)) {
+            memory_bytes, growing)) {
       return false;
     }
     m_reserved_native_fds += fd_count;
     m_reserved_native_tmpdir_bytes += tmpdir_bytes;
-    m_native_fd_by_token[token] += fd_count;
-    m_native_tmpdir_by_token[token] += tmpdir_bytes;
+    if (growing) {
+      existing_fd->second += fd_count;
+      existing_tmpdir->second += tmpdir_bytes;
+    } else {
+      m_native_fd_by_token[token] += fd_count;
+      m_native_tmpdir_by_token[token] += tmpdir_bytes;
+    }
     return true;
   }
 
@@ -352,6 +492,7 @@ class Preserve_resource_manager {
   std::map<Token_kind_key, uint64_t> m_by_token_kind;
   std::array<uint64_t, kPreserveMemoryKindCount> m_by_kind{};
   uint64_t m_reserved_native_fds{0};
+  /* Pending writes only; completed file writes are already in statvfs usage. */
   uint64_t m_reserved_native_tmpdir_bytes{0};
   std::map<std::string, uint64_t> m_native_fd_by_token;
   std::map<std::string, uint64_t> m_native_tmpdir_by_token;
@@ -1206,10 +1347,12 @@ Preserve_native_binlog_resource_lease::
       m_memory_bytes(other.m_memory_bytes),
       m_fd_count(other.m_fd_count),
       m_tmpdir_bytes(other.m_tmpdir_bytes),
+      m_tmpdir_written_bytes(other.m_tmpdir_written_bytes),
       m_acquired(other.m_acquired) {
   other.m_memory_bytes = 0;
   other.m_fd_count = 0;
   other.m_tmpdir_bytes = 0;
+  other.m_tmpdir_written_bytes = 0;
   other.m_acquired = false;
 }
 
@@ -1222,10 +1365,12 @@ Preserve_native_binlog_resource_lease::operator=(
   m_memory_bytes = other.m_memory_bytes;
   m_fd_count = other.m_fd_count;
   m_tmpdir_bytes = other.m_tmpdir_bytes;
+  m_tmpdir_written_bytes = other.m_tmpdir_written_bytes;
   m_acquired = other.m_acquired;
   other.m_memory_bytes = 0;
   other.m_fd_count = 0;
   other.m_tmpdir_bytes = 0;
+  other.m_tmpdir_written_bytes = 0;
   other.m_acquired = false;
   return *this;
 }
@@ -1238,11 +1383,52 @@ Preserve_native_binlog_resource_lease::
 void Preserve_native_binlog_resource_lease::release() {
   if (!m_acquired) return;
   g_preserve_resource_manager.release_native_binlog(
-      m_token, m_memory_bytes, m_fd_count, m_tmpdir_bytes);
+      m_token, m_memory_bytes, m_fd_count,
+      m_tmpdir_bytes - m_tmpdir_written_bytes);
   m_memory_bytes = 0;
   m_fd_count = 0;
   m_tmpdir_bytes = 0;
+  m_tmpdir_written_bytes = 0;
   m_acquired = false;
+}
+
+bool Preserve_native_binlog_resource_lease::grow(
+    uint64_t memory_bytes, uint64_t fd_count, uint64_t tmpdir_bytes) {
+  if (!m_acquired) return false;
+  memory_bytes = std::max(memory_bytes, m_memory_bytes);
+  fd_count = std::max(fd_count, m_fd_count);
+  tmpdir_bytes = std::max(tmpdir_bytes, m_tmpdir_bytes);
+  if (memory_bytes == m_memory_bytes && fd_count == m_fd_count &&
+      tmpdir_bytes == m_tmpdir_bytes) return true;
+  if (!g_preserve_resource_manager.acquire_native_binlog(
+          m_token, memory_bytes - m_memory_bytes, fd_count - m_fd_count,
+          tmpdir_bytes - m_tmpdir_bytes, true)) return false;
+  m_memory_bytes = memory_bytes;
+  m_fd_count = fd_count;
+  m_tmpdir_bytes = tmpdir_bytes;
+  return true;
+}
+
+void Preserve_native_binlog_resource_lease::settle_tmpdir_writes(
+    uint64_t written_prefix_bytes) {
+  if (!m_acquired) return;
+  /* Native IO_CACHE may shrink its memory buffer. Never settle more credit
+     than this lease acquired, even if that caused an earlier spill. */
+  written_prefix_bytes = std::min(written_prefix_bytes, m_tmpdir_bytes);
+  if (written_prefix_bytes <= m_tmpdir_written_bytes) return;
+  g_preserve_resource_manager.settle_native_binlog_tmpdir(
+      m_token, written_prefix_bytes, &m_tmpdir_written_bytes);
+}
+
+bool Preserve_native_binlog_resource_lease::rebind_token(const std::string &token) {
+  if (!m_acquired) return false;
+  std::string destination = token;
+  if (!g_preserve_resource_manager.rebind_native_binlog(
+          m_token, destination, m_memory_bytes, m_fd_count,
+          m_tmpdir_bytes - m_tmpdir_written_bytes))
+    return false;
+  m_token.swap(destination);
+  return true;
 }
 
 Preserve_native_binlog_resource_lease

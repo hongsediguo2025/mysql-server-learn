@@ -793,6 +793,7 @@ bool ensure_lock_warmcopy_spill_dir(uint64_t epoch, uint64_t thread_id,
 
 bool atomic_write_spill_segment(const std::string &dir,
                                 const std::string &payload,
+                                bool process_local_artifacts,
                                 std::string *path_out) {
   if (path_out == nullptr) return false;
   const std::string final_path = join_path(dir, "segment-000001.dat");
@@ -812,12 +813,12 @@ bool atomic_write_spill_segment(const std::string &dir,
                                  payload.data()),
                        payload.size());
   }
-  if (!error) {
+  if (!error && !process_local_artifacts) {
     DBUG_EXECUTE_IF(
         "preserve_trx_lock_warmcopy_spill_segment_fsync_failure",
         { error = true; });
+    if (!error && my_sync(file, MYF(0))) error = true;
   }
-  if (!error && my_sync(file, MYF(0))) error = true;
   if (my_close(file, MYF(0))) error = true;
   if (!error) {
     DBUG_EXECUTE_IF(
@@ -827,11 +828,11 @@ bool atomic_write_spill_segment(const std::string &dir,
   if (!error && my_rename(tmp_path.c_str(), final_path.c_str(), MYF(0))) {
     error = true;
   }
-  if (!error) {
+  if (!error && !process_local_artifacts) {
     DBUG_EXECUTE_IF("preserve_trx_lock_warmcopy_spill_parent_dir_fsync_failure",
                     { error = true; });
+    if (!error && !sync_directory(dir)) error = true;
   }
-  if (!error && !sync_directory(dir)) error = true;
   if (error) {
     (void)my_delete(tmp_path.c_str(), MYF(0));
     (void)my_delete(final_path.c_str(), MYF(0));
@@ -843,6 +844,7 @@ bool atomic_write_spill_segment(const std::string &dir,
 
 bool atomic_write_spill_manifest(const std::string &dir,
                                  const std::string &payload,
+                                 bool process_local_artifacts,
                                  std::string *path_out) {
   if (path_out == nullptr) return false;
   const std::string final_path = join_path(dir, "manifest");
@@ -862,12 +864,12 @@ bool atomic_write_spill_manifest(const std::string &dir,
                                  payload.data()),
                        payload.size());
   }
-  if (!error) {
+  if (!error && !process_local_artifacts) {
     DBUG_EXECUTE_IF(
         "preserve_trx_lock_warmcopy_spill_manifest_fsync_failure",
         { error = true; });
+    if (!error && my_sync(file, MYF(0))) error = true;
   }
-  if (!error && my_sync(file, MYF(0))) error = true;
   if (my_close(file, MYF(0))) error = true;
   if (!error) {
     DBUG_EXECUTE_IF(
@@ -877,12 +879,12 @@ bool atomic_write_spill_manifest(const std::string &dir,
   if (!error && my_rename(tmp_path.c_str(), final_path.c_str(), MYF(0))) {
     error = true;
   }
-  if (!error) {
+  if (!error && !process_local_artifacts) {
     DBUG_EXECUTE_IF(
         "preserve_trx_lock_warmcopy_spill_manifest_parent_dir_fsync_failure",
         { error = true; });
+    if (!error && !sync_directory(dir)) error = true;
   }
-  if (!error && !sync_directory(dir)) error = true;
   if (error) {
     (void)my_delete(tmp_path.c_str(), MYF(0));
     (void)my_delete(final_path.c_str(), MYF(0));
@@ -1078,6 +1080,7 @@ bool materialize_spilled_artifact_payloads(
 
 bool spill_artifact_to_file(Preserve_trx_lock_warmcopy_artifact *artifact,
                             uint64_t epoch, uint64_t thread_id,
+                            bool process_local_artifacts,
                             std::vector<std::string> *spill_paths) {
   if (artifact == nullptr || spill_paths == nullptr) return false;
   std::string dir;
@@ -1085,13 +1088,16 @@ bool spill_artifact_to_file(Preserve_trx_lock_warmcopy_artifact *artifact,
   const std::string serialized =
       serialize_spill_artifact(*artifact, epoch, thread_id);
   std::string segment_path;
-  if (!atomic_write_spill_segment(dir, serialized, &segment_path)) return false;
+  if (!atomic_write_spill_segment(dir, serialized, process_local_artifacts,
+                                  &segment_path))
+    return false;
 
   const std::string manifest =
       serialize_spill_manifest(epoch, thread_id, serialized.size(),
                                fnv1a64(serialized));
   std::string manifest_path;
-  if (!atomic_write_spill_manifest(dir, manifest, &manifest_path)) {
+  if (!atomic_write_spill_manifest(dir, manifest, process_local_artifacts,
+                                   &manifest_path)) {
     (void)my_delete(segment_path.c_str(), MYF(0));
     return false;
   }
@@ -2286,6 +2292,7 @@ bool Preserve_trx_lock_warmcopy_drain_participant::phase2_preflight(
                       { spill_failed = true; });
       if (!spill_failed &&
           !spill_artifact_to_file(&artifact, m_epoch, thread_id,
+                                  m_options.process_local_artifacts,
                                   &m_spill_paths))
         spill_failed = true;
       if (spill_failed) {
@@ -2520,8 +2527,11 @@ bool Preserve_trx_lock_warmcopy_drain_participant::
   }
 
   std::unique_ptr<Preserved_trx_warm_external_blob_carrier> carrier =
-      create_preserved_trx_default_warm_external_blob_carrier(
-          m_options.preserve_dir);
+      m_options.process_local_artifacts
+          ? create_preserved_trx_process_local_warm_external_blob_carrier(
+                m_options.preserve_dir)
+          : create_preserved_trx_default_warm_external_blob_carrier(
+                m_options.preserve_dir);
   if (carrier == nullptr) return false;
 
   std::string warmcopy_id =
@@ -2790,8 +2800,11 @@ void Preserve_trx_lock_warmcopy_drain_participant::
   }
   if (!warmcopy_ids.empty() && !m_options.preserve_dir.empty()) {
     std::unique_ptr<Preserved_trx_warm_external_blob_carrier> carrier =
-        create_preserved_trx_default_warm_external_blob_carrier(
-            m_options.preserve_dir);
+        m_options.process_local_artifacts
+            ? create_preserved_trx_process_local_warm_external_blob_carrier(
+                  m_options.preserve_dir)
+            : create_preserved_trx_default_warm_external_blob_carrier(
+                  m_options.preserve_dir);
     if (carrier != nullptr) {
       (void)carrier->remove_warm_external_blobs(
           warmcopy_ids, kPreservedTrxBlobRecordLocks);
@@ -2834,8 +2847,11 @@ void Preserve_trx_lock_warmcopy_drain_participant::
   if (!m_retired_phase1_record_blob_ids.empty() &&
       !m_options.preserve_dir.empty()) {
     std::unique_ptr<Preserved_trx_warm_external_blob_carrier> carrier =
-        create_preserved_trx_default_warm_external_blob_carrier(
-            m_options.preserve_dir);
+        m_options.process_local_artifacts
+            ? create_preserved_trx_process_local_warm_external_blob_carrier(
+                  m_options.preserve_dir)
+            : create_preserved_trx_default_warm_external_blob_carrier(
+                  m_options.preserve_dir);
     if (carrier != nullptr) {
       (void)carrier->remove_warm_external_blobs(
           m_retired_phase1_record_blob_ids, kPreservedTrxBlobRecordLocks);
@@ -3014,8 +3030,11 @@ Preserve_trx_lock_warmcopy_drain_participant::
   discard_phase1_record_blob(target);
 
   std::unique_ptr<Preserved_trx_warm_external_blob_carrier> carrier =
-      create_preserved_trx_default_warm_external_blob_carrier(
-          m_options.preserve_dir);
+      m_options.process_local_artifacts
+          ? create_preserved_trx_process_local_warm_external_blob_carrier(
+                m_options.preserve_dir)
+          : create_preserved_trx_default_warm_external_blob_carrier(
+                m_options.preserve_dir);
   if (carrier == nullptr) {
     return Preserve_trx_lock_warmcopy_record_blob_status::INVALID;
   }

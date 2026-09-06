@@ -3298,8 +3298,9 @@ Local_file_preserved_trx_carrier::remove_warm_external_blob(
       return Preserved_trx_carrier_status::IO_ERROR;
     }
   }
-  return fsync_directory(m_dir) ? Preserved_trx_carrier_status::IO_ERROR
-                                : Preserved_trx_carrier_status::OK;
+  return !m_write_options.defer_directory_fsync && fsync_directory(m_dir)
+             ? Preserved_trx_carrier_status::IO_ERROR
+             : Preserved_trx_carrier_status::OK;
 }
 
 Preserved_trx_carrier_status

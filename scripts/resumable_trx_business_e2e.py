@@ -45,6 +45,11 @@ from preserve_trx_phase2_scheduler_e2e import (
 
 LOG = logging.getLogger("resumable_trx_business_e2e")
 
+
+class ReceiverReadinessSloExceeded(AssertionError):
+    """A published ACK/READY interval cannot improve by polling again."""
+
+
 WARMCOPY_TAIL_BUDGET_BYTES = 1024 * 1024
 COM_PRESERVE_TRX_TRANSFER = 33
 TRANSFER_FRAME_MAGIC = b"PTRXOFR1"
@@ -905,6 +910,7 @@ class HarnessConfig:
                 "RANGE_10000",
                 "RANGE_1000",
                 "RANGE_100000",
+                "LOCKSET",
             }:
                 raise ValueError(
                     "unknown continuous large transaction shape"
@@ -944,7 +950,15 @@ class HarnessConfig:
                     "continuous large transactions require an exact integral "
                     "partition of the configured logical rows"
                 )
-            if self.short_transaction_sessions <= 0:
+            lockset_only = self.continuous_large_tx_shape == "LOCKSET"
+            if lockset_only and any((
+                self.short_transaction_sessions,
+                self.short_transaction_table_count,
+                self.short_transaction_rows_per_table,
+                self.continuous_large_tx_no_commit,
+            )):
+                raise ValueError("continuous LOCKSET requires committing workers without short workers")
+            if not lockset_only and self.short_transaction_sessions <= 0:
                 raise ValueError("short_transaction_sessions must be positive")
             if self.short_transaction_sessions % 2 != 0:
                 raise ValueError("short_transaction_sessions must be even")
@@ -956,7 +970,7 @@ class HarnessConfig:
                     "short_transaction_table_count must be half of "
                     "short_transaction_sessions"
                 )
-            if self.short_transaction_rows_per_table < 8:
+            if not lockset_only and self.short_transaction_rows_per_table < 8:
                 raise ValueError(
                     "short_transaction_rows_per_table must be at least 8"
                 )
@@ -1596,6 +1610,7 @@ class ReceiverPrewarmMetrics:
     lock_plan_epoch_peak_bytes: int = 0
     lock_plan_subpool_cap_bytes: int = 0
     resource_admission_open_failed_count: int = 0
+    prepared_registry_counts: Optional[Dict[str, int]] = None
     phase2_transfer_bulk_bytes: int = 0
     phase2_final_metadata_fsync_count: int = 0
     phase2_transfer_final_metadata_ack_us: int = 0
@@ -5346,6 +5361,7 @@ class BusinessWorker(threading.Thread):
         self.unexpected_errors = 0
         self.rollback_errors = 0
         self.transaction_isolation: Optional[str] = None
+        self.original_connection_id = 0
         self.command_latency = (
             ContinuousCommandLatencyRecorder(
                 self.plan.config.business_command_latency_limit_us
@@ -5358,6 +5374,9 @@ class BusinessWorker(threading.Thread):
         conn = None
         try:
             conn = self.runtime.connect(database=True, autocommit=False)
+            if self.plan.config.continuous_large_tx_shape == "LOCKSET":
+                # The handshake identity is local; do not add business-side SQL.
+                self.original_connection_id = int(conn.connection_id)
             self._configure_connection(conn)
             self._initialize_temp_table(conn)
             tx_id = 0
@@ -8440,6 +8459,8 @@ class BusinessE2ERunner:
                     expected_standby_pending=expected_standby_pending
                 )
                 return
+            except ReceiverReadinessSloExceeded:
+                raise
             except AssertionError as exc:
                 last_error = exc
 
@@ -9087,6 +9108,9 @@ class BusinessE2ERunner:
                         receiver_prewarm_metrics
                         .resource_admission_open_failed_count
                     ),
+                    "receiver_prepared_registry_counts": (
+                        receiver_prewarm_metrics.prepared_registry_counts
+                    ),
                     "receiver_record_lock_required_residency_bytes": (
                         receiver_prewarm_metrics.record_lock_required_residency_bytes
                     ),
@@ -9381,7 +9405,7 @@ class BusinessE2ERunner:
         ready_lag_us = max(0, ready_us - final_ack_us)
         max_lag_ms = self.config.max_receiver_ready_after_phase2_ms
         if max_lag_ms > 0 and ready_lag_us > max_lag_ms * 1000:
-            raise AssertionError(
+            raise ReceiverReadinessSloExceeded(
                 "receiver readiness lag exceeded threshold after final spool ACK: "
                 f"receiver_ready_after_final_spool_ack_us={ready_lag_us} "
                 f"max_ms={max_lag_ms}"
@@ -11305,6 +11329,9 @@ END
             ),
             "sampler_error": self._continuous_business_progress_error,
         }
+        if self.config.continuous_large_tx_shape == "LOCKSET":
+            # Keep evidence even when source/client clock mapping is invalid.
+            result["raw_progress_samples"] = samples
         timeline = dict(getattr(self, "continuous_source_timeline", {}))
         phase1_started_us = int(timeline.get("phase1_started_us", 0) or 0)
         t0_us = int(
@@ -11639,7 +11666,7 @@ END
         }
         if int(groups["aggregate"]["baseline_committed"]) <= 0:
             invalid_reasons.append("aggregate baseline committed count is zero")
-        if int(groups["short"]["baseline_committed"]) <= 0:
+        if self.config.short_transaction_sessions > 0 and int(groups["short"]["baseline_committed"]) <= 0:
             invalid_reasons.append(
                 "short-transaction baseline committed count is zero"
             )
@@ -11733,6 +11760,7 @@ END
         )
         command_latency_overall = dict(command_latency.get("overall", {}))
         phase1_us = int(source_timeline.get("phase1_duration_us", 0) or 0)
+        phase1_limit_us = self.config.drain_phase1_timeout_ms * 1000
         phase2_us = int(source_timeline.get("strict_interval_us", 0) or 0)
         last_command_to_final_ack_us = int(
             source_timeline.get("last_command_end_to_final_ack_us", 0) or 0
@@ -11841,7 +11869,7 @@ END
             "timeline_values_valid": bool(
                 getattr(self, "continuous_timeline_values_valid", False)
             ),
-            "phase1_within_60s": 0 < phase1_us <= 60_000_000,
+            "phase1_within_configured_limit": 0 < phase1_us <= phase1_limit_us,
             "t0_to_source_phase2_end_within_2s": (
                 0 < phase2_us <= 2_000_000
             ),
@@ -11912,6 +11940,14 @@ END
                 and float(short_drop) <= engineering_drop_limit
             ),
         }
+        if self.config.continuous_large_tx_shape == "LOCKSET":
+            # Throughput impact is measured, not a workload-correctness gate.
+            for name in (
+                "short_transaction_tps_drop_within_20pct",
+                "large_statement_rate_drop_within_20pct",
+                "all_business_command_responses_within_limit",
+            ):
+                checks.pop(name)
         if self.config.continuous_large_tx_no_commit:
             checks["large_transactions_never_committed"] = (
                 self.continuous_large_no_commit_report()["verified"]
@@ -11920,7 +11956,7 @@ END
             "passed": all(checks.values()),
             "checks": checks,
             "limits": {
-                "phase1_us": 60_000_000,
+                "phase1_us": phase1_limit_us,
                 "t0_to_source_phase2_end_us": 2_000_000,
                 "last_command_end_to_final_ack_us": (
                     self.config.source_post_command_tail_limit_us
@@ -11964,7 +12000,8 @@ END
                     )
                 ),
             },
-            "engineering_milestone_40pct": {
+            "engineering_milestone_40pct": {"applicable": False}
+            if self.config.continuous_large_tx_shape == "LOCKSET" else {
                 "passed": all(engineering_checks.values()),
                 "checks": engineering_checks,
                 "limits": {
@@ -12057,6 +12094,9 @@ END
         )
 
     def _wait_for_continuous_4020_observation(self) -> None:
+        if self.config.continuous_large_tx_shape == "LOCKSET":
+            self._verify_lockset_original_connections_held()
+            return
         deadline = time.monotonic() + min(5.0, self.config.resume_timeout_s)
         all_workers = [*self.workers, *self.short_workers]
         while True:
@@ -12070,6 +12110,45 @@ END
                     "after DRAIN"
                 )
             time.sleep(min(0.01, remaining))
+
+    def _verify_lockset_original_connections_held(self) -> None:
+        deadline = time.monotonic() + min(30.0, self.config.resume_timeout_s)
+        workers = self.workers
+        while True:
+            self._raise_worker_error_if_any()
+            if all(worker.is_alive() and worker.waiting_after_4020.is_set()
+                   and worker.connection_retained_while_waiting
+                   for worker in workers):
+                break
+            if time.monotonic() >= deadline:
+                raise AssertionError("not all original LOCKSET connections reached 4020 HOLD")
+            time.sleep(0.01)
+        identities = sorted(worker.original_connection_id for worker in workers)
+        if (len(identities) != self.config.sessions or identities[0] <= 0
+                or len(set(identities)) != self.config.sessions
+                or any(worker.reconnects or worker.connection_errors for worker in workers)):
+            raise AssertionError("LOCKSET original connection identities are incomplete")
+        conn = self._source_ha_control_connection()
+        try:
+            rows = self.runtime.execute(
+                conn,
+                "SELECT PROCESSLIST_ID FROM performance_schema.threads "
+                "WHERE PROCESSLIST_ID IN ("
+                + ",".join(str(identity) for identity in identities) + ")",
+                fetch=True,
+            )
+        finally:
+            conn.close()
+        observed = sorted(int(row[0]) for row in rows)
+        self.continuous_original_connection_hold = {
+            "verified": observed == identities,
+            "verified_before_cleanup_monotonic_us": time.monotonic_ns() // 1000,
+            "worker_sids": sorted(worker.sid for worker in workers),
+            "original_connection_ids": identities,
+            "observed_server_connection_ids": observed,
+        }
+        if observed != identities:
+            raise AssertionError("a LOCKSET original connection disappeared before cleanup")
 
     def mixed_pressure_readiness_snapshot(self) -> Dict[str, object]:
         operation_counts: Counter = Counter()
@@ -12366,9 +12445,9 @@ END
         verified = bool(
             expected
             and large_workers
-            and short_workers
+            and len(short_workers) == self.config.short_transaction_sessions
             and large_counts == {expected: len(large_workers)}
-            and short_counts == {expected: len(short_workers)}
+            and short_counts == ({expected: len(short_workers)} if short_workers else {})
         )
         return {
             "continuous_business_transaction_isolation": expected,
@@ -12457,6 +12536,18 @@ END
         }
 
     def continuous_formal_workload_identity_matches(self) -> bool:
+        if self.config.continuous_large_tx_shape == "LOCKSET":
+            return bool(
+                self.config.continuous_business_through_drain
+                and self.config.sessions == 1000
+                and self.config.table_count == 100
+                and self.config.statements_per_tx == 100_000
+                and self.config.seed_rows_per_table_per_session == 100_000
+                and self.config.lockset_batch_size == 100_000
+                and self.config.business_run_before_drain_s == 300.0
+                and self.config.short_transaction_sessions == 0
+                and not self.config.continuous_large_tx_no_commit
+            )
         expected_batch_sizes = {
             "RANGE_10000": 10,
             "RANGE_1000": 100,
@@ -12576,6 +12667,9 @@ END
         )
         return {
             "continuous_business_through_drain": True,
+            **({"continuous_original_connection_hold": dict(
+                getattr(self, "continuous_original_connection_hold", {})
+            )} if self.config.continuous_large_tx_shape == "LOCKSET" else {}),
             **self.continuous_transaction_isolation_report(),
             **self.continuous_large_transaction_identity(),
             **({"continuous_large_no_commit": self.continuous_large_no_commit_report()}
@@ -13623,6 +13717,13 @@ END
         *,
         connection_factory: Optional[Callable[[], object]] = None,
     ) -> Optional[ReceiverPrewarmMetrics]:
+        prepared_count_fields = {
+            name: f"Preserve_trx_promotion_prepared_{name}_tokens"
+            for name in (
+                "registered", "ready", "prewarm_pending", "tainted",
+                "adopting", "adopted",
+            )
+        }
         fields = {
             "Preserve_trx_transfer_receiver_auto_prewarm_last_status",
             "Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens",
@@ -13702,6 +13803,7 @@ END
             "Preserve_trx_transfer_receiver_strict_ibuf_merges",
             "Preserve_trx_transfer_receiver_strict_target_local_redo_bytes",
         }
+        fields.update(prepared_count_fields.values())
         quoted_fields = ", ".join(f"'{field}'" for field in sorted(fields))
         sql = (
             "SELECT VARIABLE_NAME, VARIABLE_VALUE "
@@ -13735,6 +13837,10 @@ END
 
         try:
             return ReceiverPrewarmMetrics(
+                prepared_registry_counts={
+                    name: metric(field)
+                    for name, field in prepared_count_fields.items()
+                },
                 auto_prewarm_tokens=metric(
                     "Preserve_trx_transfer_receiver_auto_prewarm_tokens"
                 ),
@@ -15930,7 +16036,7 @@ command is used after each DRAIN command shuts that server down.
     parser.add_argument("--drain-ready-timeout", dest="drain_ready_timeout_s", type=float, default=0.0, help="harness watchdog while workers finish their current transaction and pause before DRAIN; 0 keeps the legacy resume-timeout fallback")
     parser.add_argument("--business-run-before-drain", dest="business_run_before_drain_s", type=float, default=0.0, help="seconds to let workers run real business DML before issuing DRAIN directly; 0 keeps the deterministic pre-paused mode")
     parser.add_argument("--continuous-business-through-drain", action="store_true", help="run independent large and paired short transactions continuously until the time-driven control DRAIN cuts them off")
-    parser.add_argument("--continuous-large-tx-shape", choices=("RANGE_10000", "RANGE_1000", "RANGE_100000"), default="", help="identity of the dependency-continuous large transaction shape")
+    parser.add_argument("--continuous-large-tx-shape", choices=("RANGE_10000", "RANGE_1000", "RANGE_100000", "LOCKSET"), default="", help="identity of the continuous transaction shape")
     parser.add_argument("--large-tx-no-commit", action="store_true", help="keep each large transaction open while looping point/range UPDATEs")
     parser.add_argument("--business-transaction-isolation", choices=("READ-COMMITTED", "REPEATABLE-READ"), help="explicit transaction isolation for business workers; continuous dependency pressure defaults to REPEATABLE-READ")
     parser.add_argument("--business-command-latency-limit-us", type=int, default=1_000_000, help="maximum client-observed server response latency for each command included by the continuous dependency workload")

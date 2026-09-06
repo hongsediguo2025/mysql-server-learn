@@ -9,10 +9,26 @@ local ffi = require("ffi")
 ffi.cdef[[int usleep(unsigned int usec);]]
 
 local oltp_thread_init = thread_init
+local oltp_before_restart_event = sysbench.hooks.before_restart_event
+local preserve_4020_held = false
 
 function thread_init()
    ffi.C.usleep(sysbench.tid * 5000)
    oltp_thread_init()
+end
+
+function sysbench.hooks.before_restart_event(errdesc)
+   if errdesc.sql_errno == 4020 then
+      if not preserve_4020_held then
+         preserve_4020_held = true
+         print(string.format("PRESERVE_4020_HOLD tid=%d", sysbench.tid))
+      end
+      return
+   end
+
+   if oltp_before_restart_event ~= nil then
+      oltp_before_restart_event(errdesc)
+   end
 end
 
 function prepare_statements()
@@ -27,6 +43,12 @@ function prepare_statements()
 end
 
 function event()
+   if preserve_4020_held then
+      while true do
+         ffi.C.usleep(1000000)
+      end
+   end
+
    if not sysbench.opt.skip_trx then
       begin()
    end

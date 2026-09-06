@@ -1,0 +1,7 @@
+--let $prefix_replace= 0
+--let $prefix_fail= 0
+--let $prefix_resize= 0
+--let $prefix_copy_fault= 0
+--let $prefix_rebuild= 0
+--let $prefix_inflight= 0
+--source suite/preserve_trx/include/receiver_binlog_prefix_prewarm.inc

@@ -273,9 +273,15 @@ die "source-owns handoff resolution must fail-stop if guarded restore exits inco
 die "receiver-owned resolution must retain the active attempt; only source-owned resolution may archive it\n"
   unless $preserve =~
          /RECEIVER_FENCED_SOURCE_OWNS[\s\S]*?g_active_drain_attempt\.reset\(\);[\s\S]*?g_last_resolved_drain_attempt\s*=\s*std::move\(attempt\);/s;
-die "RESET must not send receiver ABORT after source restore ownership wins\n"
-  unless $preserve =~
-         /auto abort_batch_transfer_epoch[\s\S]{0,800}preserve_trx_active_drain_reset_requested\(active_drain_attempt\)[\s\S]{0,120}return;/s;
+# SOURCE_RESTORE_PENDING also covers ordinary pre-send failure, which must
+# still ABORT the receiver epoch. Only RESET_REQUESTED defers this cleanup to
+# the existing RESET completion path.
+$preserve =~ /auto abort_batch_transfer_epoch\b[\s\S]*?^  \};/m
+  or die "could not isolate abort_batch_transfer_epoch\n";
+my $abort_batch_transfer_epoch = $&;
+die "RESET_REQUESTED must defer ordinary receiver ABORT to RESET cleanup\n"
+  unless $abort_batch_transfer_epoch =~
+         /if\s*\(\s*active_drain_attempt\s*!=\s*nullptr\s*&&\s*active_drain_attempt->ownership\.state\(\)\s*==\s*Preserve_trx_drain_terminal::RESET_REQUESTED\s*\)\s*\{\s*return;\s*\}[\s\S]*batch_transfer_source_session->abort_epoch\(/s;
 die "post-ACK RESET context must be published before terminal manager handoff\n"
   unless $preserve =~
          /quarantined_items\s*=\s*std::move\(preserved_batch_items\)[\s\S]{0,500}source_restore_context_ready\.store[\s\S]{0,1200}TRANSFER_HANDOFF_COMPLETE/s;

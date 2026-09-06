@@ -20,6 +20,7 @@
 #include "storage/innobase/include/lock0preserve_plan.h"
 
 class Mysql_binlog_preserve_payload_reader;
+class Mysql_binlog_preserve_payload_builder;
 class Mysql_binlog_preserve_prepared_cache_handle;
 class Preserve_memory_lease;
 struct Preserved_trx_bundle;
@@ -298,6 +299,7 @@ class Preserve_trx_prepared_token_resources {
   bool has_record_lock_plan() const;
   bool has_semantic_bundle() const;
   bool has_native_binlog_handle() const;
+  bool native_binlog_file_backed() const;
   bool has_resurrection_entry() const;
   void reset() noexcept;
   Preserve_trx_prepared_status install_record_lock_plan(
@@ -316,7 +318,8 @@ class Preserve_trx_prepared_token_resources {
   Mysql_binlog_preserve_cache_status
   prepare_native_binlog_handle_for_receiver(
       const Mysql_binlog_preserve_cache_facts &facts,
-      Mysql_binlog_preserve_payload_reader *reader);
+      Mysql_binlog_preserve_payload_reader *reader,
+      Mysql_binlog_preserve_payload_builder *payload = nullptr);
 
  private:
   class Impl;
@@ -534,6 +537,9 @@ class Preserve_trx_prepared_token_registry {
   Preserve_trx_prepared_status update_epoch_prepare_deadline(
       const std::string &epoch_scope, const std::string &epoch_id,
       size_t expected_token_count, uint64_t deadline_monotonic_us);
+  Preserve_trx_prepared_status update_selected_prepare_deadline(
+      const std::vector<Preserve_trx_prepared_token_key> &keys,
+      uint64_t deadline_monotonic_us);
   Preserve_trx_prepared_status pin_epoch_for_physical_promotion(
       const std::vector<Preserve_trx_prepared_token_key> &keys,
       uint64_t now_monotonic_us,
@@ -603,6 +609,10 @@ class Preserve_trx_prepared_token_registry {
   size_t discard_all_for_process_shutdown();
 
  private:
+  Preserve_trx_prepared_status update_prepare_deadline(
+      const std::string &epoch_scope, const std::string &epoch_id,
+      size_t expected_token_count, uint64_t deadline_monotonic_us,
+      const std::vector<Preserve_trx_prepared_token_key> *selected_keys);
   std::shared_ptr<Preserve_trx_prepared_registry_state> m_state;
 };
 

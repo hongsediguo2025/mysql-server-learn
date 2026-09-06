@@ -125,6 +125,12 @@ class Preserve_native_binlog_resource_lease {
   uint64_t memory_bytes() const { return m_memory_bytes; }
   uint64_t fd_count() const { return m_fd_count; }
   uint64_t tmpdir_bytes() const { return m_tmpdir_bytes; }
+  /* Grow to these totals atomically; failure leaves the existing lease intact. */
+  bool grow(uint64_t memory_bytes, uint64_t fd_count, uint64_t tmpdir_bytes);
+  /* Successful append-only file writes no longer need future-write credit.
+     The IO_CACHE memory suffix remains reserved; this is not a durability fence. */
+  void settle_tmpdir_writes(uint64_t written_prefix_bytes);
+  bool rebind_token(const std::string &token);
   void release();
 
  private:
@@ -137,6 +143,7 @@ class Preserve_native_binlog_resource_lease {
   uint64_t m_memory_bytes{0};
   uint64_t m_fd_count{0};
   uint64_t m_tmpdir_bytes{0};
+  uint64_t m_tmpdir_written_bytes{0};
   bool m_acquired{false};
 
   friend Preserve_native_binlog_resource_lease

@@ -1,0 +1,23 @@
+# Exercise real baseline/append SEAL and native READY, not a source-shape proxy.
+--let $prefix_replace= 0
+--let $prefix_fail= 0
+--let $prefix_resize= 0
+--let $prefix_copy_fault= 0
+--let $prefix_rebuild= 0
+--let $prefix_inflight= 0
+--source suite/preserve_trx/include/receiver_binlog_prefix_prewarm.inc
+
+--perl
+my $path = "$ENV{MYSQLTEST_VARDIR}/log/mysqld.1.err";
+open my $fh, '<', $path or die "open $path: $!";
+my $suffix_reads = 0;
+while (<$fh>) {
+  if (/^CURRENT_TEST:/) { $suffix_reads = 0; next; }
+  next unless /binlog prefix seal prefix_bytes=(\d+) read_bytes=(\d+) total_bytes=(\d+)/;
+  my ($prefix, $read, $total) = ($1, $2, $3);
+  die "SEAL did not read the exact suffix" unless $read == $total - $prefix;
+  ++$suffix_reads if $prefix > 0 && $read > 0;
+}
+die "no verified suffix-only binlog SEAL observed" unless $suffix_reads > 0;
+print "protocol_seal_reads_only_new_suffix\n1\n";
+EOF

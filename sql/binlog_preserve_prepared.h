@@ -71,6 +71,7 @@ class Preserve_trx_internal_operation_capability {
       uint64_t);
 #endif
   friend class Mysql_binlog_preserve_prepared_cache_handle;
+  friend class Mysql_binlog_preserve_payload_builder;
   friend class Mysql_binlog_preserve_attach_journal;
   friend class Preserve_trx_prepared_token_resources;
   friend Mysql_binlog_preserve_cache_status
@@ -155,6 +156,7 @@ class Mysql_binlog_preserve_prepared_cache_handle final {
 
   bool sealed() const;
   uint64_t cache_length() const;
+  uint64_t native_memory_bytes() const;
   bool file_backed() const;
   const void *native_manager_identity() const;
   const std::string &facts_digest() const;
@@ -187,7 +189,34 @@ class Mysql_binlog_preserve_prepared_cache_handle final {
   friend Mysql_binlog_preserve_cache_status
   mysql_binlog_preserve_commit_detached_cache_attach(
       class Mysql_binlog_preserve_attach_journal *);
+  friend class Mysql_binlog_preserve_payload_builder;
   friend class Mysql_binlog_preserve_attach_journal;
+};
+
+/* Receiver-local bytes only. No transaction state or attach capability exists
+   until finalize validates the final facts and transfers the same manager. */
+class Mysql_binlog_preserve_payload_builder final {
+ public:
+  explicit Mysql_binlog_preserve_payload_builder(
+      Preserve_native_binlog_resource_lease resource_lease);
+  ~Mysql_binlog_preserve_payload_builder();
+  Mysql_binlog_preserve_payload_builder(
+      const Mysql_binlog_preserve_payload_builder &) = delete;
+  Mysql_binlog_preserve_payload_builder &operator=(
+      const Mysql_binlog_preserve_payload_builder &) = delete;
+
+  uint64_t cache_length() const;
+  Mysql_binlog_preserve_cache_status append(
+      Mysql_binlog_preserve_payload_reader *reader, uint64_t total_length,
+      const std::array<unsigned char, kPreservedTrxSha256Length> &digest);
+  Mysql_binlog_preserve_cache_status finalize(
+      const Preserve_trx_internal_operation_capability &capability,
+      const Mysql_binlog_preserve_cache_facts &facts,
+      std::unique_ptr<Mysql_binlog_preserve_prepared_cache_handle> *out,
+      const std::string &resource_token = {});
+
+ private:
+  std::unique_ptr<Mysql_binlog_preserve_prepared_cache_handle> m_handle;
 };
 
 class Mysql_binlog_preserve_attach_journal final {

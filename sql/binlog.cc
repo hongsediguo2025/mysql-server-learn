@@ -1508,10 +1508,17 @@ struct Mysql_binlog_preserve_prepared_cache_handle::Impl {
   uint64_t cache_length{0};
   bool file_backed{false};
   bool sealed{false};
+  SHA256_CTX payload_context{};
+  std::array<unsigned char, kPreservedTrxSha256Length> payload_digest{};
+  bool payload_valid{false};
+  bool payload_failed{false};
+  const uint64_t payload_cache_size{binlog_cache_size};
+  const uint64_t payload_stmt_cache_size{binlog_stmt_cache_size};
 };
 
-uint64_t mysql_binlog_preserve_native_memory_bytes_required(
-    const Mysql_binlog_preserve_cache_facts &facts) {
+static uint64_t preserve_native_memory_bytes_required(
+    const Mysql_binlog_preserve_cache_facts &facts, uint64_t trx_cache_size,
+    uint64_t stmt_cache_size) {
   uint64_t result = sizeof(binlog_cache_mngr) +
                     kPreserveBinlogNativeDynamicOverheadBytes;
   if (facts.cache_states.capacity() >
@@ -1523,8 +1530,8 @@ uint64_t mysql_binlog_preserve_native_memory_bytes_required(
     return 0;
   }
   const std::array<uint64_t, 12> dynamic_bytes{
-      static_cast<uint64_t>(binlog_cache_size),
-      static_cast<uint64_t>(binlog_stmt_cache_size),
+      trx_cache_size,
+      stmt_cache_size,
       static_cast<uint64_t>(facts.cache_states.capacity()) *
           sizeof(Mysql_binlog_preserve_cache_state),
       static_cast<uint64_t>(facts.cache_states.size()) *
@@ -1543,6 +1550,12 @@ uint64_t mysql_binlog_preserve_native_memory_bytes_required(
     result += bytes;
   }
   return result;
+}
+
+uint64_t mysql_binlog_preserve_native_memory_bytes_required(
+    const Mysql_binlog_preserve_cache_facts &facts) {
+  return preserve_native_memory_bytes_required(facts, binlog_cache_size,
+                                               binlog_stmt_cache_size);
 }
 
 uint64_t mysql_binlog_preserve_native_fd_count_required(
@@ -1588,6 +1601,10 @@ uint64_t Mysql_binlog_preserve_prepared_cache_handle::cache_length() const {
 
 bool Mysql_binlog_preserve_prepared_cache_handle::file_backed() const {
   return m_impl != nullptr && m_impl->file_backed;
+}
+
+uint64_t Mysql_binlog_preserve_prepared_cache_handle::native_memory_bytes() const {
+  return m_impl == nullptr ? 0 : m_impl->resource_lease.memory_bytes();
 }
 
 const void *
@@ -1716,33 +1733,79 @@ mysql_binlog_preserve_prepare_detached_cache(
     return Mysql_binlog_preserve_cache_status::RESOURCE_EXHAUSTED;
   }
 
-  auto handle =
-      std::make_unique<Mysql_binlog_preserve_prepared_cache_handle>();
-  auto impl =
+  Mysql_binlog_preserve_payload_builder payload(std::move(resource_lease));
+  const auto status = payload.append(reader, facts.cache_length,
+                                     facts.payload_sha256);
+  if (status != Mysql_binlog_preserve_cache_status::OK) return status;
+  return payload.finalize(capability, facts, out);
+}
+
+Mysql_binlog_preserve_payload_builder::Mysql_binlog_preserve_payload_builder(
+    Preserve_native_binlog_resource_lease resource_lease)
+    : m_handle(std::make_unique<Mysql_binlog_preserve_prepared_cache_handle>()) {
+  m_handle->m_impl =
       std::make_unique<Mysql_binlog_preserve_prepared_cache_handle::Impl>();
-  impl->facts = facts;
-  impl->resource_lease = std::move(resource_lease);
+  m_handle->m_impl->resource_lease = std::move(resource_lease);
+}
 
-  auto *const manager_memory = static_cast<binlog_cache_mngr *>(my_malloc(
-      key_memory_binlog_cache_mngr, sizeof(binlog_cache_mngr),
-      MYF(MY_ZEROFILL)));
-  if (manager_memory == nullptr)
+Mysql_binlog_preserve_payload_builder::~Mysql_binlog_preserve_payload_builder() =
+    default;
+
+uint64_t Mysql_binlog_preserve_payload_builder::cache_length() const {
+  return m_handle == nullptr ? 0 : m_handle->cache_length();
+}
+
+Mysql_binlog_preserve_cache_status Mysql_binlog_preserve_payload_builder::append(
+    Mysql_binlog_preserve_payload_reader *reader, uint64_t total_length,
+    const std::array<unsigned char, kPreservedTrxSha256Length> &expected_digest) {
+  if (reader == nullptr || m_handle == nullptr)
+    return Mysql_binlog_preserve_cache_status::INVALID_ARGUMENT;
+  if (total_length == 0 ||
+      total_length > static_cast<uint64_t>(std::numeric_limits<my_off_t>::max()) ||
+      total_length > max_binlog_cache_size)
+    return Mysql_binlog_preserve_cache_status::INVALID_ARGUMENT;
+  if (!preserve_trx_is_enabled())
+    return Mysql_binlog_preserve_cache_status::FEATURE_DISABLED;
+  if (!opt_bin_log || !preserve_binlog_runtime_is_open())
+    return Mysql_binlog_preserve_cache_status::BINLOG_DISABLED;
+  auto *impl = m_handle->m_impl.get();
+  if (impl->sealed || impl->payload_failed || total_length < impl->cache_length)
+    return Mysql_binlog_preserve_cache_status::INVALID_STATE;
+  /* A failed append is not a reusable prefix, even if some bytes were written. */
+  impl->payload_failed = true;
+  Mysql_binlog_preserve_cache_facts payload_facts;
+  payload_facts.cache_length = total_length;
+  const uint64_t memory =
+      preserve_native_memory_bytes_required(payload_facts,
+          impl->payload_cache_size, impl->payload_stmt_cache_size);
+  if (memory == 0 || !impl->resource_lease.grow(
+          memory, mysql_binlog_preserve_native_fd_count_required(payload_facts),
+          total_length > impl->payload_cache_size ? total_length : 0))
     return Mysql_binlog_preserve_cache_status::RESOURCE_EXHAUSTED;
-  impl->manager = new (manager_memory) binlog_cache_mngr(
-      &impl->detached_stmt_cache_use, &impl->detached_stmt_cache_disk_use,
-      &impl->detached_trx_cache_use, &impl->detached_trx_cache_disk_use);
-  if (impl->manager->init()) {
-    impl->manager->~binlog_cache_mngr();
-    my_free(impl->manager);
-    impl->manager = nullptr;
-    return Mysql_binlog_preserve_cache_status::RESOURCE_EXHAUSTED;
+
+  if (impl->manager == nullptr) {
+    auto *const manager_memory = static_cast<binlog_cache_mngr *>(my_malloc(
+        key_memory_binlog_cache_mngr, sizeof(binlog_cache_mngr),
+        MYF(MY_ZEROFILL)));
+    if (manager_memory == nullptr)
+      return Mysql_binlog_preserve_cache_status::RESOURCE_EXHAUSTED;
+    impl->manager = new (manager_memory) binlog_cache_mngr(
+        &impl->detached_stmt_cache_use, &impl->detached_stmt_cache_disk_use,
+        &impl->detached_trx_cache_use, &impl->detached_trx_cache_disk_use);
+    if (impl->manager->stmt_cache.open(impl->payload_stmt_cache_size,
+                                       max_binlog_stmt_cache_size) ||
+        impl->manager->trx_cache.open(impl->payload_cache_size,
+                                       max_binlog_cache_size)) {
+      impl->manager->~binlog_cache_mngr();
+      my_free(impl->manager);
+      impl->manager = nullptr;
+      return Mysql_binlog_preserve_cache_status::RESOURCE_EXHAUSTED;
+    }
+    if (SHA256_Init(&impl->payload_context) != 1)
+      return Mysql_binlog_preserve_cache_status::WRITE_ERROR;
   }
-
-  SHA256_CTX digest_context;
-  if (SHA256_Init(&digest_context) != 1)
-    return Mysql_binlog_preserve_cache_status::WRITE_ERROR;
   std::array<unsigned char, kPreserveBinlogPrepareBufferBytes> buffer{};
-  uint64_t total_bytes = 0;
+  uint64_t total_bytes = impl->cache_length;
   for (;;) {
     size_t bytes_read = 0;
     const auto read_status =
@@ -1755,26 +1818,104 @@ mysql_binlog_preserve_prepare_detached_cache(
       break;
     }
     if (bytes_read == 0 || bytes_read > buffer.size() ||
-        bytes_read > facts.cache_length ||
-        total_bytes > facts.cache_length - bytes_read) {
+        bytes_read > total_length ||
+        total_bytes > total_length - bytes_read) {
       return Mysql_binlog_preserve_cache_status::LENGTH_MISMATCH;
     }
-    if (SHA256_Update(&digest_context, buffer.data(), bytes_read) != 1)
+    DBUG_EXECUTE_IF("preserve_trx_receiver_prefix_copy_bad_digest", {
+      if (total_bytes == impl->cache_length) {
+        buffer.front() ^= 1;
+        const char action[] = "now SIGNAL receiver_prefix_bad_digest_injected";
+        DBUG_ASSERT(!debug_sync_set_action(current_thd, STRING_WITH_LEN(action)));
+      }
+    });
+    if (SHA256_Update(&impl->payload_context, buffer.data(), bytes_read) != 1)
       return Mysql_binlog_preserve_cache_status::WRITE_ERROR;
     if (impl->manager->get_trx_cache()->write(
             buffer.data(), static_cast<my_off_t>(bytes_read))) {
       return Mysql_binlog_preserve_cache_status::WRITE_ERROR;
     }
     total_bytes += bytes_read;
+    DBUG_EXECUTE_IF("preserve_trx_receiver_prefix_delta_read_error", {
+      if (impl->cache_length != 0) {
+        const char action[] = "now SIGNAL receiver_prefix_delta_error_injected";
+        DBUG_ASSERT(!debug_sync_set_action(current_thd, STRING_WITH_LEN(action)));
+        return Mysql_binlog_preserve_cache_status::READ_ERROR;
+      }
+    });
   }
-  if (total_bytes != facts.cache_length)
+  if (total_bytes != total_length)
     return Mysql_binlog_preserve_cache_status::LENGTH_MISMATCH;
   std::array<unsigned char, kPreservedTrxSha256Length> digest{};
+  SHA256_CTX digest_context = impl->payload_context;
   if (SHA256_Final(digest.data(), &digest_context) != 1)
     return Mysql_binlog_preserve_cache_status::WRITE_ERROR;
-  if (digest != facts.payload_sha256)
+  if (digest != expected_digest)
     return Mysql_binlog_preserve_cache_status::DIGEST_MISMATCH;
 
+  impl->resource_lease.settle_tmpdir_writes(static_cast<uint64_t>(
+      impl->manager->get_trx_cache()->preserve_written_prefix_bytes()));
+  impl->cache_length = total_bytes;
+  impl->payload_digest = digest;
+  impl->payload_valid = true;
+  impl->payload_failed = false;
+  DBUG_EXECUTE_IF("preserve_trx_native_binlog_resource_trace", {
+    char message[192];
+    snprintf(message, sizeof(message),
+             "PRESERVE: native binlog payload completed length=%llu "
+             "disk_writes=%llu",
+             static_cast<unsigned long long>(total_bytes),
+             static_cast<unsigned long long>(
+                 impl->manager->get_trx_cache()->disk_writes()));
+    LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG, message);
+  });
+  return Mysql_binlog_preserve_cache_status::OK;
+}
+
+Mysql_binlog_preserve_cache_status
+Mysql_binlog_preserve_payload_builder::finalize(
+    const Preserve_trx_internal_operation_capability &capability,
+    const Mysql_binlog_preserve_cache_facts &facts,
+    std::unique_ptr<Mysql_binlog_preserve_prepared_cache_handle> *out,
+    const std::string &resource_token) {
+  if (m_handle == nullptr || out == nullptr || *out != nullptr)
+    return Mysql_binlog_preserve_cache_status::INVALID_ARGUMENT;
+  if (!preserve_trx_is_enabled())
+    return Mysql_binlog_preserve_cache_status::FEATURE_DISABLED;
+  if (!preserve_binlog_cache_facts_are_well_formed(facts))
+    return Mysql_binlog_preserve_cache_status::INVALID_ARGUMENT;
+  if (capability.m_operation !=
+          Preserve_trx_internal_operation::PREPARE_BINLOG_CACHE ||
+      !preserve_binlog_identity_is_valid(capability.m_identity) ||
+      capability.m_binlog_incarnation == 0 || capability.m_key_generation == 0)
+    return Mysql_binlog_preserve_cache_status::CAPABILITY_REJECTED;
+  if (!capability.permits(Preserve_trx_internal_operation::PREPARE_BINLOG_CACHE,
+                          facts.identity, facts.binlog_incarnation,
+                          facts.key_generation))
+    return Mysql_binlog_preserve_cache_status::INCARNATION_MISMATCH;
+  if (!opt_bin_log || !preserve_binlog_runtime_is_open())
+    return Mysql_binlog_preserve_cache_status::BINLOG_DISABLED;
+  if (!facts.option_bin_log || !facts.session_sql_log_bin)
+    return Mysql_binlog_preserve_cache_status::MODE_MISMATCH;
+  auto *impl = m_handle->m_impl.get();
+  if (!impl->payload_valid || impl->payload_failed || impl->sealed)
+    return Mysql_binlog_preserve_cache_status::INVALID_STATE;
+  if (impl->cache_length != facts.cache_length)
+    return Mysql_binlog_preserve_cache_status::LENGTH_MISMATCH;
+  if (impl->payload_digest != facts.payload_sha256)
+    return Mysql_binlog_preserve_cache_status::DIGEST_MISMATCH;
+  const uint64_t memory = preserve_native_memory_bytes_required(
+      facts, impl->payload_cache_size, impl->payload_stmt_cache_size);
+  if (memory == 0 || !impl->resource_lease.grow(
+          memory, mysql_binlog_preserve_native_fd_count_required(facts),
+          facts.cache_length > impl->payload_cache_size ? facts.cache_length : 0))
+    return Mysql_binlog_preserve_cache_status::RESOURCE_EXHAUSTED;
+
+  if (!resource_token.empty() && !impl->resource_lease.rebind_token(resource_token))
+    return Mysql_binlog_preserve_cache_status::RESOURCE_EXHAUSTED;
+  /* Imports may allocate. A partial final-state import is never reusable. */
+  impl->payload_failed = true;
+  impl->facts = facts;
   impl->manager->trx_cache.preserve_import_state(facts.snapshot);
   impl->manager->trx_cache.preserve_import_prev_position(facts.snapshot);
   for (const auto &state : facts.cache_states)
@@ -1783,11 +1924,9 @@ mysql_binlog_preserve_prepare_detached_cache(
       facts.cache_length) {
     return Mysql_binlog_preserve_cache_status::LENGTH_MISMATCH;
   }
-  impl->cache_length = total_bytes;
   impl->file_backed = impl->manager->get_trx_cache()->disk_writes() != 0;
   impl->sealed = true;
-  handle->m_impl = std::move(impl);
-  *out = std::move(handle);
+  *out = std::move(m_handle);
   return Mysql_binlog_preserve_cache_status::OK;
 }
 

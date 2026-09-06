@@ -42,6 +42,7 @@ GRANT SESSION_VARIABLES_ADMIN ON *.*
 --enable_result_log
 --let $restart_parameters=
 --disable_query_log
+--let _PHASE1_CAPTURE_MODE= `SELECT @@GLOBAL.rds_preserve_trx_phase1_capture_mode`
 
 CREATE TABLE t_phase2_scheduler_innodb(
   id INT PRIMARY KEY,
@@ -198,13 +199,17 @@ die "exact tail is not self-consistent"
          $field{'last_command_end_to_final_ack_us'} ==
          $field{'final_ack_us'} - $field{'last_body_exit_us'};
 die "duplicate-shard waiter did not retain a complete transfer path"
-  unless ($warmcopy{'phase1_record_prebuilt_target_count'} // 0) == 4 &&
+  # BOUNDED final capture installs the deferred waiter through the same
+  # candidate map; the observation includes it as well as the four baselines.
+  unless ($warmcopy{'phase1_record_prebuilt_target_count'} // 0) ==
+             (($ENV{'_PHASE1_CAPTURE_MODE'} // '') eq 'BOUNDED_PIPELINE_V1' ? 5 : 4) &&
          ($warmcopy{'phase2_record_prebuilt_target_count'} // 0) +
              ($warmcopy{'phase2_record_materialized_target_count'} // 0) == 3 &&
          ($warmcopy{'phase2_full_lock_scan_count'} // 1) == 0 &&
          ($warmcopy{'phase2_record_lock_count'} // 0) == 5;
 EOF
 --let _PHASE2_FINAL_LOG=
+--let _PHASE1_CAPTURE_MODE=
 
 --connection innodb_receiver
 SELECT VARIABLE_VALUE=1 AS one_epoch_accepted

@@ -281,6 +281,10 @@ class Preserve_trx_phase1_owner::Impl {
   Preserve_trx_phase1_owner_pump_status submit_record_impl(
       uint32_t budget, bool final_generation) {
     if (m_failed) return Preserve_trx_phase1_owner_pump_status::FAILED;
+    if (!final_generation && m_ordinary_submissions_finished)
+      return record_baselines_complete()
+                 ? Preserve_trx_phase1_owner_pump_status::COMPLETE
+                 : Preserve_trx_phase1_owner_pump_status::IDLE;
     bool progressed = false;
     for (uint32_t submitted = 0; submitted < budget; ++submitted) {
       Entry *entry = next_ready_entry(final_generation);
@@ -296,6 +300,11 @@ class Preserve_trx_phase1_owner::Impl {
       }
       if (status == Preserve_trx_phase1_pipeline_submit_status::NO_SLOT ||
           status == Preserve_trx_phase1_pipeline_submit_status::NO_CREDIT) {
+        break;
+      }
+      if (!final_generation &&
+          status == Preserve_trx_phase1_pipeline_submit_status::DEADLINE) {
+        finish_ordinary_submissions();
         break;
       }
       fail(status == Preserve_trx_phase1_pipeline_submit_status::DEADLINE
@@ -339,6 +348,18 @@ class Preserve_trx_phase1_owner::Impl {
     }
   }
 #endif
+
+  void finish_ordinary_submissions() {
+    m_ordinary_submissions_finished = true;
+    for (auto &item : m_entries) {
+      Entry &entry = item.second;
+      if (!entry.descriptor.final_generation &&
+          (entry.state == Entry_state::READY ||
+           entry.state == Entry_state::RETRY_WAIT)) {
+        defer_to_final(&entry);
+      }
+    }
+  }
 
   bool record_baselines_complete() const {
     if (m_failed) return false;
@@ -1041,7 +1062,10 @@ class Preserve_trx_phase1_owner::Impl {
         retry_reason = result.reason;
       }
     } else if (result.status ==
-               Preserve_trx_phase1_pipeline_result_status::DEFERRED_TO_FINAL) {
+                   Preserve_trx_phase1_pipeline_result_status::DEFERRED_TO_FINAL ||
+               (!entry.descriptor.final_generation &&
+                result.status ==
+                    Preserve_trx_phase1_pipeline_result_status::DEADLINE)) {
       entry.state = Entry_state::DEFERRED_TO_FINAL;
       ++m_record_deferred_to_final;
       if (entry.descriptor.final_generation) {
@@ -1129,7 +1153,8 @@ class Preserve_trx_phase1_owner::Impl {
       fail("owner_capture_generation_overflow");
       return;
     }
-    if (!entry->descriptor.final_generation && entry->retry_streak >= 1) {
+    if (!entry->descriptor.final_generation &&
+        (m_ordinary_submissions_finished || entry->retry_streak >= 1)) {
       defer_to_final(entry);
       return;
     }
@@ -1200,6 +1225,7 @@ class Preserve_trx_phase1_owner::Impl {
 #ifndef DBUG_OFF
   bool m_debug_retry_injected{false};
 #endif
+  bool m_ordinary_submissions_finished{false};
   bool m_failed{false};
   std::string m_failure_reason;
 };
@@ -1233,6 +1259,10 @@ Preserve_trx_phase1_owner::submit_final_record(uint32_t budget) {
 
 bool Preserve_trx_phase1_owner::record_baselines_complete() const {
   return m_impl->record_baselines_complete();
+}
+
+void Preserve_trx_phase1_owner::finish_ordinary_submissions() {
+  m_impl->finish_ordinary_submissions();
 }
 
 bool Preserve_trx_phase1_owner::prepare_final_record_targets(

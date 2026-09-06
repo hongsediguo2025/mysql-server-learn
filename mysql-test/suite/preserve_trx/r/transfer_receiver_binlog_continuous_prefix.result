@@ -1,0 +1,18 @@
+business_updates_completed
+1
+receiver_prefix_grew_during_phase1
+1
+receiver_bytes_are_exact_source_prefix
+1
+receiver_prefix_matches_source_ack
+1
+no_epoch_accepted_before_cutoff
+1
+final_receiver_contains_all_updates
+1
+both_transactions_ready
+1
+no_failed_tokens
+1
+ERROR HY000: Preserve drain is active; this command was not executed
+ERROR HY000: Preserve drain is active; this command was not executed

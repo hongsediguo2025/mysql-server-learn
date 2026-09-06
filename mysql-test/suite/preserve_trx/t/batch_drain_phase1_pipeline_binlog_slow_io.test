@@ -1,0 +1,105 @@
+# A successful ordinary binlog preparation may take more than one second.
+--source include/have_debug.inc
+--source include/have_log_bin.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+--disable_query_log
+--disable_result_log
+
+--let $credential_file= $MYSQL_TMP_DIR/phase1-binlog-slow.secret
+--write_file $credential_file
+phase1-binlog-slow-secret
+EOF
+--exec chmod 600 $credential_file
+--connect(slow_receiver,127.0.0.1,root,,test,$SERVER_MYPORT_2,)
+CREATE USER preserve_trx_ha_admin@localhost IDENTIFIED BY 'phase1-binlog-slow-secret';
+GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+GRANT PROCESS ON *.* TO preserve_trx_ha_admin@localhost;
+
+--connection default
+CREATE USER preserve_trx_ha_admin@localhost IDENTIFIED BY 'phase1-binlog-slow-secret';
+GRANT SHUTDOWN, SYSTEM_VARIABLES_ADMIN, PRESERVE_TRX_TRANSFER_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+GRANT PROCESS ON *.* TO preserve_trx_ha_admin@localhost;
+CREATE USER slow_binlog_app@localhost;
+GRANT SELECT, UPDATE ON test.* TO slow_binlog_app@localhost;
+
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$SERVER_MYPORT_2 --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=phase1_binlog_slow --rds-preserve-trx-transfer-credential-secret-file=$credential_file --rds-preserve-trx-phase1-capture-mode=BOUNDED_PIPELINE_V1 --rds-preserve-trx-drain-phase1-timeout-ms=5000 --rds-preserve-trx-drain-phase2-timeout-ms=30000 --log-error-verbosity=3
+--source include/restart_mysqld.inc
+--let $restart_parameters=
+--disable_query_log
+--disable_result_log
+--source suite/preserve_trx/include/assert_phase2_dependency_mode.inc
+SET GLOBAL binlog_format=ROW;
+CREATE TABLE t_binlog_slow(id INT PRIMARY KEY, v INT, payload VARBINARY(4096)) ENGINE=InnoDB;
+INSERT INTO t_binlog_slow VALUES(1,10,REPEAT('a',4096)),(2,20,REPEAT('b',4096));
+--connect(slow_control,localhost,preserve_trx_ha_admin,phase1-binlog-slow-secret,test)
+--connect(slow_app,localhost,slow_binlog_app,,test)
+--let $app_id= query_get_value(SELECT CONNECTION_ID() AS id, id, 1)
+START TRANSACTION;
+UPDATE t_binlog_slow SET v=v+7, payload=REPEAT('c',4096);
+
+--connection slow_app
+--enable_result_log
+--eval SELECT CONNECTION_ID()=$app_id AS original_connection, ROW_COUNT()=2 AS original_updates
+--disable_result_log
+
+--connection default
+SET GLOBAL debug='+d,preserve_trx_phase1_binlog_slow_prepare';
+DRAIN TRANSACTIONS PRESERVE;
+--connection slow_receiver
+--enable_result_log
+SELECT VARIABLE_VALUE=1 AS one_accepted_epoch FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs';
+--disable_result_log
+--connection slow_app
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT * FROM t_binlog_slow;
+
+--let SLOW_BINLOG_LOG= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--perl
+use strict;
+use warnings;
+open(my $fh, '<', $ENV{'SLOW_BINLOG_LOG'}) or die "cannot read source log: $!";
+my ($current, $baseline, $slow, $stopped) = (0, 0, 0, 0);
+while (my $line = <$fh>) {
+  if ($line =~ /CURRENT_TEST:\s+preserve_trx\.(\S+)/) {
+    $current = $1 eq 'batch_drain_phase1_pipeline_binlog_slow_io';
+    next;
+  }
+  next unless $current;
+  $baseline = 1 if $line =~ /PRESERVE_PHASE1_BINLOG_ADAPTER_V1 / &&
+    $line =~ /event=BASELINE_COMPLETE/ && $line =~ /prepared=1\b/;
+  next unless $line =~ /PRESERVE_PHASE1_PIPELINE_V1 / && $line =~ /event=STOPPED/;
+  $slow = 1 if $line =~ /ordinary_binlog_slow_operations=[1-9][0-9]*/ &&
+    $line =~ /operation_budget_overruns=0\b/;
+  $stopped = 1 if $line =~ /admitted=0\b/ && $line =~ /inflight=0\b/ &&
+    $line =~ /active_operation_permits=0\b/ && $line =~ /credit_in_use_bytes=0\b/;
+}
+close($fh);
+die "successful slow binlog baseline was not observed" unless $baseline && $slow;
+die "pipeline did not stop drained" unless $stopped;
+EOF
+--let SLOW_BINLOG_LOG=
+
+# Native shutdown/restart cleanup; no RESET DRAIN races are involved.
+--connection slow_control
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+SHUTDOWN;
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+--disable_query_log
+--disable_result_log
+--connect(slow_cleanup,localhost,root,,test)
+DROP TABLE t_binlog_slow;
+DROP USER preserve_trx_ha_admin@localhost, slow_binlog_app@localhost;
+--connection slow_receiver
+DROP USER preserve_trx_ha_admin@localhost;
+--connection slow_cleanup
+--remove_file $credential_file
+--enable_result_log
+--enable_query_log

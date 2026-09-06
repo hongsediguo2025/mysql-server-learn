@@ -1,0 +1,177 @@
+# An ACKed transaction keeps streaming while another baseline is still busy.
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/have_log_bin.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+--disable_query_log
+--let $credential_file= $MYSQL_TMP_DIR/continuous-prefix.secret
+--write_file $credential_file
+continuous-prefix-secret
+EOF
+--exec chmod 600 $credential_file
+CREATE USER preserve_trx_ha_admin@'127.0.0.1'
+ IDENTIFIED BY 'continuous-prefix-secret';
+GRANT SHUTDOWN, PROCESS, SYSTEM_VARIABLES_ADMIN,
+ PRESERVE_TRX_TRANSFER_ADMIN ON *.* TO preserve_trx_ha_admin@'127.0.0.1';
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@'127.0.0.1';
+CREATE USER continuous_app@localhost;
+GRANT SELECT, UPDATE ON test.* TO continuous_app@localhost;
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$SERVER_MYPORT_1 --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=continuous_prefix --rds-preserve-trx-transfer-credential-secret-file=$credential_file --rds-preserve-trx-drain-phase1-timeout-ms=60000 --rds-preserve-trx-drain-phase2-timeout-ms=30000
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--let $restart_parameters=
+--disable_query_log
+--source suite/preserve_trx/include/assert_phase2_dependency_mode.inc
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=PROMOTION_PREPARE;
+SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=OFF;
+SET GLOBAL rds_preserve_trx_token_retention_timeout_ms=120000;
+CALL mtr.add_suppression(
+ 'PRESERVE: rolled back prepared transaction without snapshot during recovery');
+CREATE TABLE t_continuous_prefix(id INT PRIMARY KEY, v INT, payload MEDIUMBLOB)
+ ENGINE=InnoDB;
+INSERT INTO t_continuous_prefix VALUES
+ (1,10,REPEAT('a',1048593)),(2,10,REPEAT('a',1048593));
+--connect(continuous_a,localhost,continuous_app,,test)
+--let CONTINUOUS_A= query_get_value(SELECT CONNECTION_ID() AS id,id,1)
+START TRANSACTION;
+UPDATE t_continuous_prefix SET v=17,payload=REPEAT('b',1048593) WHERE id=1;
+--connect(continuous_b,localhost,continuous_app,,test)
+--let CONTINUOUS_B= query_get_value(SELECT CONNECTION_ID() AS id,id,1)
+START TRANSACTION;
+UPDATE t_continuous_prefix SET v=17,payload=REPEAT('b',1048593) WHERE id=2;
+--connect(continuous_control,127.0.0.1,preserve_trx_ha_admin,continuous-prefix-secret,test,$SERVER_MYPORT_1,)
+--connection default
+SET GLOBAL debug='+d,preserve_trx_phase1_hold_second_binlog_baseline';
+SET DEBUG_SYNC='preserve_trx_phase1_binlog_baseline_acked SIGNAL continuous_first_acked';
+SET DEBUG_SYNC='preserve_trx_phase1_binlog_progress_opportunity SIGNAL continuous_probe WAIT_FOR continuous_probe_continue';
+SET DEBUG_SYNC='preserve_trx_batch_after_final_transfer_catchup SIGNAL continuous_final WAIT_FOR continuous_final_continue';
+--send DRAIN TRANSACTIONS PRESERVE
+--connection continuous_control
+SET DEBUG_SYNC='now WAIT_FOR continuous_baseline_held TIMEOUT 30';
+SET DEBUG_SYNC='now WAIT_FOR continuous_first_acked TIMEOUT 30';
+# Source ACK proves publication; wait separately for receiver apply/prewarm.
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_object_prewarm_count')>0 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_worker_active')=0 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_queued_bytes')=0
+--source include/wait_condition.inc
+--perl
+use strict;
+use warnings;
+use File::Find;
+my @parts;
+find({no_chdir=>1, wanted=>sub {
+  push @parts,$File::Find::name if m{/\.transfer/[^/]+/\d+/binlog_cache\.part$} && -f $_;
+}}, "$ENV{MYSQLTEST_VARDIR}/mysqld.1/data/preserve/.transfer");
+die "expected one source-ACKed receiver baseline" unless @parts==1;
+my ($token)=$parts[0]=~m{/([0-9]+)/binlog_cache\.part$};
+my $row=$token==$ENV{CONTINUOUS_A} ? 1 : $token==$ENV{CONTINUOUS_B} ? 2 : 0;
+die "receiver token does not belong to a business connection" unless $row;
+open(my $meta,'>',"$ENV{MYSQL_TMP_DIR}/continuous-prefix.meta") or die $!;
+print $meta "$parts[0]\n",(-s $parts[0]),"\n$token\n";
+close($meta);
+open(my $inc,'>',"$ENV{MYSQL_TMP_DIR}/continuous-prefix-select.inc") or die $!;
+print $inc "--connection continuous_",($row==1 ? 'a':'b'),"\n--let \$continuous_row= $row\n";
+close($inc);
+EOF
+--source $MYSQL_TMP_DIR/continuous-prefix-select.inc
+--let $updates= 6
+while ($updates)
+{
+  --eval UPDATE t_continuous_prefix SET v=v+1,payload=REPEAT(CHAR(99+MOD(v,10)),1048593) WHERE id=$continuous_row
+  --dec $updates
+}
+--eval SELECT v=23 AS business_updates_completed FROM t_continuous_prefix WHERE id=$continuous_row FOR UPDATE
+--connection continuous_control
+SET GLOBAL debug='+d,preserve_trx_phase1_binlog_progress_probe';
+SET DEBUG_SYNC='now WAIT_FOR continuous_probe TIMEOUT 30';
+--let CONTINUOUS_ACK_SIGNALS= query_get_value(SELECT @@debug_sync AS signals,signals,1)
+# This checkpoint follows owner submit/consume opportunities and has exactly
+# the held ordinary job left: no queued result or unacknowledged publication.
+# Check actual bytes, not an append-signal timeout or mere file existence.
+--perl
+use strict;
+use warnings;
+use Digest::SHA qw(sha256_hex);
+open(my $meta,'<',"$ENV{MYSQL_TMP_DIR}/continuous-prefix.meta") or die $!;
+chomp(my $part=<$meta>); chomp(my $before=<$meta>); chomp(my $token=<$meta>);
+close($meta);
+my @mirrors=glob("$ENV{MYSQLTEST_VARDIR}/mysqld.1/data/preserve/warmcopy_*_${token}.binlog_cache.warm.*");
+@mirrors=grep { -f $_ && /\.warm\.\d+$/ } @mirrors;
+die "expected one current live mirror" unless @mirrors==1;
+open(my $remote,'<:raw',$part) or die $!;
+local $/; my $bytes=<$remote>; close($remote);
+open(my $source,'<:raw',$mirrors[0]) or die $!;
+my $live=<$source>; close($source);
+die "business did not extend the live mirror" unless length($live)>$before;
+my $grew=length($bytes)>$before ? 1 : 0;
+my $exact=length($bytes)<=length($live) &&
+  sha256_hex($bytes) eq sha256_hex(substr($live,0,length($bytes))) ? 1 : 0;
+print "receiver_prefix_grew_during_phase1\n$grew\n";
+print "receiver_bytes_are_exact_source_prefix\n$exact\n";
+my $acked=($ENV{CONTINUOUS_ACK_SIGNALS}=~
+  /continuous_ack_${token}_(\d+)_([0-9a-f]{64})/ &&
+  $1==length($bytes) && $1>$before && $2 eq sha256_hex($bytes)) ? 1 : 0;
+print "receiver_prefix_matches_source_ack\n$acked\n";
+open(my $expected,'>',"$ENV{MYSQL_TMP_DIR}/continuous-prefix-final.meta") or die $!;
+print $expected "$part\n",length($live),"\n",sha256_hex($live),"\n";
+close($expected);
+EOF
+SELECT VARIABLE_VALUE=0 AS no_epoch_accepted_before_cutoff
+ FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs';
+SET GLOBAL debug='-d,preserve_trx_phase1_binlog_progress_probe,preserve_trx_phase1_hold_second_binlog_baseline';
+SET DEBUG_SYNC='now SIGNAL continuous_probe_continue';
+SET DEBUG_SYNC='now SIGNAL continuous_baseline_continue';
+SET DEBUG_SYNC='now WAIT_FOR continuous_final TIMEOUT 30';
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_worker_active')=0 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_queued_bytes')=0
+--source include/wait_condition.inc
+# Inspect final bytes before COMMIT/READY legitimately reclaims staging files.
+--perl
+use strict;
+use warnings;
+use Digest::SHA qw(sha256_hex);
+open(my $meta,'<',"$ENV{MYSQL_TMP_DIR}/continuous-prefix-final.meta") or die $!;
+chomp(my $part=<$meta>); chomp(my $size=<$meta>); chomp(my $digest=<$meta>);
+close($meta);
+open(my $in,'<:raw',$part) or die $!;
+local $/; my $bytes=<$in>; close($in);
+my $ok=length($bytes)==$size && sha256_hex($bytes) eq $digest ? 1 : 0;
+print "final_receiver_contains_all_updates\n$ok\n";
+EOF
+SET DEBUG_SYNC='now SIGNAL continuous_final_continue';
+--connection default
+--disable_result_log
+--reap
+--enable_result_log
+--connection continuous_control
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens')=2
+--source include/wait_condition.inc
+SELECT VARIABLE_VALUE=2 AS both_transactions_ready
+ FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens';
+SELECT VARIABLE_VALUE=0 AS no_failed_tokens
+ FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens';
+--connection continuous_a
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT * FROM t_continuous_prefix;
+--connection continuous_b
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT * FROM t_continuous_prefix;
+--connection continuous_control
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+SHUTDOWN;
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+--disable_query_log
+--connect(continuous_cleanup,localhost,root,,test)
+DROP TABLE t_continuous_prefix;
+DROP USER continuous_app@localhost, preserve_trx_ha_admin@'127.0.0.1';
+--remove_file $credential_file
+--remove_file $MYSQL_TMP_DIR/continuous-prefix.meta
+--remove_file $MYSQL_TMP_DIR/continuous-prefix-final.meta
+--remove_file $MYSQL_TMP_DIR/continuous-prefix-select.inc
+--enable_query_log

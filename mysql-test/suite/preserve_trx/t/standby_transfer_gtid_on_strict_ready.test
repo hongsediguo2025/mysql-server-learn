@@ -49,14 +49,18 @@ DROP TABLE IF EXISTS t_standby_transfer_gtid_on;
 --enable_warnings
 CREATE TABLE t_standby_transfer_gtid_on(
   id INT PRIMARY KEY,
-  v INT NOT NULL
+  v INT NOT NULL,
+  payload MEDIUMBLOB NOT NULL
 ) ENGINE=InnoDB;
-INSERT INTO t_standby_transfer_gtid_on VALUES(1,10),(2,20);
+# A spilled cache with a non-aligned tail exercises multi-chunk native prepare.
+INSERT INTO t_standby_transfer_gtid_on
+  VALUES(1,10,REPEAT('a',1048593)),(2,20,'b');
 
 --connect(standby_transfer_gtid_logged,localhost,standby_transfer_gtid_app,,test)
 --let $logged_id= query_get_value(SELECT CONNECTION_ID() AS id, id, 1)
 START TRANSACTION;
-UPDATE t_standby_transfer_gtid_on SET v=11 WHERE id=1;
+UPDATE t_standby_transfer_gtid_on SET v=11,payload=REPEAT('c',1048593)
+ WHERE id=1;
 
 --connect(standby_transfer_gtid_nocache,localhost,standby_transfer_gtid_app,,test)
 --let $nocache_id= query_get_value(SELECT CONNECTION_ID() AS id, id, 1)

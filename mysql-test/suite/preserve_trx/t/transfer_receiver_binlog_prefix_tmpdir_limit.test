@@ -1,0 +1,34 @@
+--let $prefix_replace= 0
+--let $prefix_fail= 1
+--let $prefix_resize= 0
+--let $prefix_copy_fault= 0
+--let $prefix_rebuild= 0
+--let $prefix_inflight= 0
+--let $prefix_io_budget= 0
+--let $prefix_resource_debug= preserve_trx_native_binlog_tmpdir_1m
+--source suite/preserve_trx/include/receiver_binlog_prefix_prewarm.inc
+
+--perl
+my $path = "$ENV{MYSQLTEST_VARDIR}/log/mysqld.1.err";
+open my $fh, '<', $path or die "open $path: $!";
+my ($in_test, $written, $append, $memory, $limited) = (0, 0, 0, 0, 0);
+while (<$fh>) {
+  if (/^CURRENT_TEST:\s+(\S+)/) {
+    $in_test = $1 eq 'preserve_trx.transfer_receiver_binlog_prefix_tmpdir_limit';
+    ($written, $append, $memory, $limited) = (0, 0, 0, 0) if $in_test;
+    next;
+  }
+  next unless $in_test;
+  if (/native binlog payload completed length=(\d+) disk_writes=(\d+)/) {
+    $written = 1 if $1 > (2 << 20) && $2 > 0;
+  }
+  next unless /native binlog admission growing=(\d+) memory=(\d+) fds=(\d+) tmpdir=(\d+) reserved=(\d+) free=(\d+) headroom=(\d+)/;
+  my ($grow, $mem, $fds, $tmp, $reserved, $free, $headroom) = ($1,$2,$3,$4,$5,$6,$7);
+  $append = 1 if $grow && $tmp > (2 << 20) && $free == (1 << 30) + (3 << 20);
+  $memory = 1 if $grow && $mem > 0 && !$fds && !$tmp && $free < $headroom;
+  $limited = 1 if $tmp > (1 << 20) && $free == (1 << 30) + (1 << 20);
+}
+die "no real spilled native prefix" unless $written;
+die "no positive request above remaining capacity" unless $limited;
+print "positive_disk_growth_still_rejected\n1\n";
+EOF

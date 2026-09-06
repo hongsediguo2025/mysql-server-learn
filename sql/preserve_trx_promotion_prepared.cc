@@ -957,6 +957,11 @@ bool Preserve_trx_prepared_token_resources::has_native_binlog_handle() const {
   return m_impl != nullptr && m_impl->native_binlog_handle != nullptr;
 }
 
+bool Preserve_trx_prepared_token_resources::native_binlog_file_backed() const {
+  return has_native_binlog_handle() &&
+         m_impl->native_binlog_handle->file_backed();
+}
+
 bool Preserve_trx_prepared_token_resources::has_resurrection_entry() const {
   return m_impl != nullptr && m_impl->resurrection_entry != nullptr;
 }
@@ -1050,8 +1055,10 @@ Preserve_trx_prepared_token_resources::prepare_native_binlog_handle(
 Mysql_binlog_preserve_cache_status
 Preserve_trx_prepared_token_resources::prepare_native_binlog_handle_for_receiver(
     const Mysql_binlog_preserve_cache_facts &facts,
-    Mysql_binlog_preserve_payload_reader *reader) {
-  if (m_impl == nullptr || !m_impl->acquired || reader == nullptr ||
+    Mysql_binlog_preserve_payload_reader *reader,
+    Mysql_binlog_preserve_payload_builder *payload) {
+  if (m_impl == nullptr || !m_impl->acquired ||
+      (reader == nullptr && payload == nullptr) ||
       m_impl->key.epoch_scope != facts.identity.epoch_scope ||
       m_impl->key.epoch_id != facts.identity.epoch_id ||
       m_impl->key.token != facts.identity.token ||
@@ -1067,6 +1074,27 @@ Preserve_trx_prepared_token_resources::prepare_native_binlog_handle_for_receiver
   capability.m_identity = facts.identity;
   capability.m_binlog_incarnation = facts.binlog_incarnation;
   capability.m_key_generation = facts.key_generation;
+  if (payload != nullptr) {
+    if (reader != nullptr || m_impl->native_binlog_handle != nullptr ||
+        m_impl->native_binlog_resources.acquired())
+      return Mysql_binlog_preserve_cache_status::INVALID_STATE;
+    bool inject_open_failure = false;
+    DBUG_EXECUTE_IF("preserve_trx_fail_native_binlog_prepare_open",
+                    inject_open_failure = true;);
+    const auto status = inject_open_failure
+        ? Mysql_binlog_preserve_cache_status::RESOURCE_EXHAUSTED
+        : payload->finalize(capability, facts, &m_impl->native_binlog_handle,
+                             prepared_resource_token(m_impl->key));
+    if (status == Mysql_binlog_preserve_cache_status::RESOURCE_EXHAUSTED)
+      preserved_trx_promotion_prepared_note_resource_open_failure();
+    if (status != Mysql_binlog_preserve_cache_status::OK) {
+      m_impl->acquired = false;
+    } else {
+      m_impl->native_binlog_bytes =
+          m_impl->native_binlog_handle->native_memory_bytes();
+    }
+    return status;
+  }
   return prepare_native_binlog_handle(capability, facts, reader);
 }
 
@@ -1580,22 +1608,70 @@ Preserve_trx_prepared_status
 Preserve_trx_prepared_token_registry::update_epoch_prepare_deadline(
     const std::string &epoch_scope, const std::string &epoch_id,
     size_t expected_token_count, uint64_t deadline_monotonic_us) {
+  return update_prepare_deadline(epoch_scope, epoch_id, expected_token_count,
+                                 deadline_monotonic_us, nullptr);
+}
+
+Preserve_trx_prepared_status
+Preserve_trx_prepared_token_registry::update_selected_prepare_deadline(
+    const std::vector<Preserve_trx_prepared_token_key> &keys,
+    uint64_t deadline_monotonic_us) {
+  if (keys.empty()) return Preserve_trx_prepared_status::INVALID_ARGUMENT;
+  return update_prepare_deadline(keys.front().epoch_scope,
+                                 keys.front().epoch_id, keys.size(),
+                                 deadline_monotonic_us, &keys);
+}
+
+Preserve_trx_prepared_status
+Preserve_trx_prepared_token_registry::update_prepare_deadline(
+    const std::string &epoch_scope, const std::string &epoch_id,
+    size_t expected_token_count, uint64_t deadline_monotonic_us,
+    const std::vector<Preserve_trx_prepared_token_key> *selected_keys) {
   if (epoch_scope.empty() || epoch_id.empty() || expected_token_count == 0 ||
       deadline_monotonic_us == 0) {
     return Preserve_trx_prepared_status::INVALID_ARGUMENT;
   }
 
   std::vector<std::shared_ptr<Preserve_trx_prepared_token_entry>> entries;
+  std::vector<const Preserve_trx_prepared_token_key *> ordered_keys;
   std::vector<std::unique_lock<std::mutex>> entry_guards;
   std::vector<std::shared_ptr<const Preserve_trx_prepared_token_publication>>
       publications;
   try {
     std::lock_guard<std::mutex> registry_guard(m_state->mutex);
     entries.reserve(expected_token_count);
-    for (const auto &item : m_state->entries) {
-      if (item.first.epoch_scope == epoch_scope &&
-          item.first.epoch_id == epoch_id) {
-        entries.push_back(item.second);
+    if (selected_keys == nullptr) {
+      for (const auto &item : m_state->entries) {
+        if (item.first.epoch_scope == epoch_scope &&
+            item.first.epoch_id == epoch_id) {
+          entries.push_back(item.second);
+        }
+      }
+    } else {
+      ordered_keys.reserve(selected_keys->size());
+      for (const auto &key : *selected_keys) {
+        if (!prepared_token_key_is_valid(key) ||
+            key.epoch_scope != epoch_scope || key.epoch_id != epoch_id) {
+          return Preserve_trx_prepared_status::INVALID_ARGUMENT;
+        }
+        ordered_keys.push_back(&key);
+      }
+      std::sort(ordered_keys.begin(), ordered_keys.end(), [](const auto *left,
+                                                             const auto *right) {
+        return left->token < right->token;
+      });
+      if (std::adjacent_find(ordered_keys.begin(), ordered_keys.end(),
+                             [](const auto *left, const auto *right) {
+                               return left->token == right->token;
+                             }) != ordered_keys.end()) {
+        return Preserve_trx_prepared_status::INVALID_ARGUMENT;
+      }
+      for (const auto *key : ordered_keys) {
+        const auto found = m_state->entries.find(
+            {key->epoch_scope, key->epoch_id, key->token});
+        if (found == m_state->entries.end())
+          return Preserve_trx_prepared_status::NOT_FOUND;
+        entries.push_back(found->second);
       }
     }
     if (entries.size() != expected_token_count) {
@@ -1605,7 +1681,8 @@ Preserve_trx_prepared_token_registry::update_epoch_prepare_deadline(
     entry_guards.reserve(entries.size());
     for (const auto &entry : entries) entry_guards.emplace_back(entry->mutex);
     publications.reserve(entries.size());
-    for (const auto &entry : entries) {
+    for (size_t index = 0; index < entries.size(); ++index) {
+      const auto &entry = entries[index];
       const auto state = entry->state.load(std::memory_order_acquire);
       if (entry->retired_from_registry ||
           (state != Preserve_trx_prepared_token_state::
@@ -1616,7 +1693,10 @@ Preserve_trx_prepared_token_registry::update_epoch_prepare_deadline(
       const auto current = std::atomic_load_explicit(
           &entry->publication, std::memory_order_acquire);
       if (current == nullptr || current->key.epoch_scope != epoch_scope ||
-          current->key.epoch_id != epoch_id) {
+          current->key.epoch_id != epoch_id ||
+          (selected_keys != nullptr &&
+           (!prepared_token_keys_match(entry->key, *ordered_keys[index]) ||
+            !prepared_token_keys_match(current->key, *ordered_keys[index])))) {
         return Preserve_trx_prepared_status::STALE_GENERATION;
       }
       if (current->facts.epoch_prepare_deadline_us == deadline_monotonic_us &&

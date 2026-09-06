@@ -1,0 +1,31 @@
+# Reused native payload must not reserve a second full binlog read budget.
+--let $prefix_replace= 0
+--let $prefix_fail= 0
+--let $prefix_resize= 0
+--let $prefix_copy_fault= 0
+--let $prefix_rebuild= 0
+--let $prefix_inflight= 0
+--let $prefix_io_budget= 1
+--source suite/preserve_trx/include/receiver_binlog_prefix_prewarm.inc
+
+--perl
+my $path = "$ENV{MYSQLTEST_VARDIR}/log/mysqld.1.err";
+open my $fh, '<', $path or die "open $path: $!";
+my $staged = 0;
+my $in_test = 0;
+while (<$fh>) {
+  if (/^CURRENT_TEST:\s+(\S+)/) {
+    $in_test = $1 eq 'preserve_trx.transfer_receiver_binlog_prefix_io_budget';
+    $staged = 0 if $in_test;
+    next;
+  }
+  next unless $in_test;
+  die "native reuse unexpectedly used staged raw fallback"
+    if /staged raw binlog file-read budget/;
+  next unless /staged token file-read budget bytes=(\d+)/;
+  die "reused binlog charged $1 staged read bytes" unless $1 == 0;
+  ++$staged;
+}
+die "no staged read budget observed" unless $staged > 0;
+print "native_reuse_has_no_duplicate_read_budget\n1\n";
+EOF

@@ -39,6 +39,8 @@ class Preserve_trx_phase1_binlog_provider_port {
   virtual Preserve_trx_phase1_binlog_provider_status prepare_prefix(
       THD *target, const Preserve_trx_phase1_work_descriptor &descriptor,
       uint64_t copy_chunk_bytes, PrebuiltBinlogCacheBlob *prefix) = 0;
+  virtual bool sample_prefix(THD *target,
+                             PrebuiltBinlogCacheBlob *prefix) = 0;
   virtual const std::string &artifact_dir() const = 0;
 };
 
@@ -51,7 +53,8 @@ class Preserve_trx_phase1_binlog_publisher_port {
       const Preserve_trx_transfer_phase1_blob_request &request) = 0;
   virtual Preserve_trx_transfer_status flush() = 0;
   virtual bool remember_acked(uint64_t target_thread_id,
-                              const PrebuiltBinlogCacheBlob &blob) = 0;
+                              const PrebuiltBinlogCacheBlob &blob,
+                              bool owns_cleanup) = 0;
 };
 
 struct Preserve_trx_phase1_binlog_adapter_control {
@@ -84,6 +87,7 @@ Preserve_trx_phase1_pipeline_result_status
 preserve_trx_phase1_binlog_adapter_owner_revalidate(
     const Preserve_trx_phase1_work_descriptor &descriptor,
     const Preserve_trx_phase1_binlog_prepared_handle &payload,
+    Preserve_trx_phase1_binlog_provider_port *provider,
     Preserve_trx_transfer_phase1_blob_request *request,
     std::string *reason);
 
@@ -111,6 +115,8 @@ struct Preserve_trx_phase1_binlog_owner_config {
   uint64_t attempt_id{0};
   uint64_t drain_generation{0};
   uint64_t initial_credit_bytes{0};
+  uint64_t minimum_delta_bytes{1};
+  uint64_t wire_chunk_bytes{0};
 };
 
 class Preserve_trx_phase1_binlog_owner {
@@ -131,10 +137,12 @@ class Preserve_trx_phase1_binlog_owner {
   bool reconcile_targets(THD *drain_owner,
                          const std::vector<uint64_t> &declared_target_ids);
   bool consume_result(const Preserve_trx_phase1_prepared_result &result);
+  void finish_ordinary_submissions();
   Preserve_trx_phase1_binlog_owner_pump_status pump_completions(
       uint32_t budget);
   Preserve_trx_phase1_binlog_owner_pump_status submit(uint32_t budget);
   bool captures_complete() const;
+  bool initial_baselines_complete() const;
   bool baselines_complete() const;
   bool flush_publications();
   bool close_publication_tracking();

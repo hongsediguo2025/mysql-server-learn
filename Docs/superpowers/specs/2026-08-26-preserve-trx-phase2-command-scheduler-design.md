@@ -2,11 +2,13 @@
 
 > 状态：本功能唯一权威设计稿。当前实现仍在验证中，尚未签署；此前未签署的 WIP 已隔离备份，不是本文的实现基线。代码只有逐条满足本文并通过新鲜回归后才能视为符合设计。
 >
-> 范围：只改变 standby-transfer source 在既有 Phase1 readiness 到 `WARMCOPY_CLOSING` 接缝中的命令准入，并输出由 owner/deadline/proof/identity/invariant 决定的 scheduler terminal result。scheduler 作为现有 drain owner wait loop 内的一种 readiness policy 运行，不成为新的顶层流程。除 2.5.1 的 pre-HARD 可丢弃 Phase1 候选刷新，以及 3.1 为保持同一旧事务身份而对 dependency batch target predicate 做的窄对齐外，成功路径唯一允许产生的行为变化是 `HELD / PERMIT / 4020 / HARD`。2.5.2 是另行批准、与 scheduler mode 无关的 source orchestration 优化：它不属于调度算法，也不改变 transfer/receiver 协议、参数、authority 或 ACK 语义。
+> 2026-09-07 提交前核对：scheduler 已在 `bb870f402075741a4e37c65e41d44d177b592e9c` 落地，后续独立 Phase1 主干基线为 `ae016ff650bc07269fb1ae401485ddbb2acde6bc`。当前 500 个常规 MTR 与 18 个 big-test 已有适用模式通过记录，不表示全部在 dependency 下执行。Release 性能 SLO 尚未全部达成；独立 source lint 仍报告 scheduler integration/protected-pipeline 冻结边界差异，ZERO_DIFF 尚未签署。本次提交不刷新冻结哈希，也不以保存代码代替验收。
+>
+> 范围：只改变 standby-transfer source 在既有 Phase1 readiness 到 `WARMCOPY_CLOSING` 接缝中的命令准入，并输出由 owner/deadline/proof/identity/invariant 决定的 scheduler terminal result。scheduler 作为现有 drain owner wait loop 内的一种 readiness policy 运行，不成为新的顶层流程。除 3.1 为保持同一旧事务身份而对 dependency batch target predicate 做的窄对齐外，成功路径唯一允许产生的行为变化是 `HELD / PERMIT / 4020 / HARD`。
 >
 > 前置基线：`9c6e6b1f193dcf44ad1dad8f285baabe90aab088`。该基线的 `sql/preserve_trx_transfer.cc` SHA256 为 `f1766d499c0dee109fc63bf3c675b76779b5a5d647d233598d6d1b53bc1f171f`，`unittest/gunit/preserve_trx-t.cc` SHA256 为 `2572412329284d0920d788dac509a1d6c8ed3d2a05e17e578580f0927e0997bd`；本功能必须保持二者不变，也不新增或修改 Unit/GUnit。
 >
-> 文档关系：此前同主题的旧设计或实施计划均不得作为施工依据；当前分支只保留本文这一份设计。本文对应的从属施工清单为 `Docs/superpowers/plans/2026-08-30-preserve-trx-phase2-command-scheduler-implementation-plan.md`；计划只能展开本文，若二者冲突一律以本文为准，不能引用旧状态机、旧行号或旧测试门禁。
+> 文档关系：此前同主题的旧设计均不得作为 scheduler 施工依据；当前分支只保留本文这一份 scheduler 设计。`Docs/superpowers/plans/2026-08-30-preserve-trx-phase2-command-scheduler-implementation-plan.md` 中曾以 scheduler stable-boundary hint 驱动 Phase1 candidate refresh、enqueue/flush 或 CLOSING source ordering 的条目已经失效，不得继续施工。Phase1 性能优化由独立的 `Docs/superpowers/specs/2026-09-02-preserve-trx-phase1-bounded-pipeline-design.md` 定义；该流水线不得读取 scheduler facts。
 
 ---
 
@@ -79,7 +81,7 @@ dependency scheduler 只拥有 command admission：
 必须保持不变的内容包括：
 
 - target/survivor 选择、token identity、source authority、detach 和 source restore；
-- warmcopy current-record-store、最终 seal、fallback 和 prewarm 的执行者与节奏；只允许 2.5.1 的 owner-local Phase1 候选刷新，以及 2.5.2 明确列出的 mode-independent source ordering；
+- warmcopy current-record-store、最终 seal、fallback 和 prewarm 的执行者与节奏；
 - early staging 的启动时机、worker 并行度和 command-boundary enqueue；
 - active/pending progress 的参数、minimum delta、idle/final-HWM 分类；
 - batching threshold、batch 聚合、flush、ACK、publication 和 retry；
@@ -98,7 +100,7 @@ scheduler 不得直接或间接：
 - 改变 worker 数量、batch cadence、seal/fallback/prewarm 或 receiver lifecycle；
 - 让下游模块反向查询 scheduler ledger 或以 scheduler mode 选择不同算法。
 
-这里的“scheduler 不得调用”约束仍然成立：2.5.1 只允许 scheduler core 发布不含 lock/token/transfer 状态的稳定边界提示；真正的候选刷新仍由现有 drain owner 调用现有 Phase1 API。任何把 HELD、support、permit 或 lock graph 直接变成 transfer target/progress 参数的实现仍属越权。
+这里的“scheduler 不得调用”也包括间接触发：scheduler core 不发布供 Phase1 candidate refresh、enqueue、flush 或 staging 使用的稳定边界提示。任何把 command sequence、HELD、support、permit、lock graph 或 scheduler terminal 变成 warmcopy/transfer target、cadence 或 progress 参数的实现都属越权。
 
 `LEGACY_READINESS_THEN_CLOSING` 和 OFF 路径必须保持前置基线的 caller 参数和调用顺序。共享 caller 不能因为新增 dependency 分支而改变 legacy 行为。
 
@@ -113,26 +115,28 @@ Phase1 既有 prepare / manifest / flush
        * DEPENDENCY：每 5ms 调用一次有界 scheduler tick
        * 两种模式：原 active-binlog progress 仍由 owner
          在原调用点、以原参数和原 50ms cadence 推进
-       * DEPENDENCY：owner 在 tick 前消费已退出 BODY 的稳定边界提示，
-         以既有 Phase1 API 合并刷新可丢弃 record candidate
+       * 若独立 Phase1 capture mode 已启用：仅在 dependency tick
+         返回 RUNNING 后，由 owner 按独立预算消费 pipeline 结果
   -> readiness/scheduler 返回 terminal result
   -> 原 reset/owner/progress-failure 分支
   -> 原样发布 WARMCOPY_CLOSING
   -> 原样形成 authoritative target set
+  -> 若独立 Phase1 capture mode 已启用：owner 以该 exact target set
+     在固定接缝完成 capture-owned finalization barrier
   -> 原样执行 pending observer、early workers、preserve、transfer、receiver
 ```
 
-这里没有 scheduler 自己的阻塞式 owner loop，也没有 scheduler callback 去驱动 progress。现有 drain owner 每个 iteration 独立检查 progress 与 readiness/scan budget；每轮最多先执行一次原 active progress，再执行至多一个 scheduler tick 或 legacy sample，最后进行有界 poll wait。即使一次 progress callback 自身超过 50ms，也不能在同一 iteration 里循环调用 progress 而饿死 scheduler；下一次 progress 仍由后续 owner iteration处理。scheduler 只返回自己的状态，progress failure 仍由 owner 沿原分支处理。
+这里没有 scheduler 自己的阻塞式 owner loop，也没有 scheduler callback 去驱动 progress 或 Phase1 pipeline。现有 drain owner 每个 iteration 独立检查 progress 与 readiness/scan budget；每轮最多先执行一次原 active progress，再执行至多一个 scheduler tick 或 legacy sample。若独立 Phase1 capture mode 已启用且本次 dependency tick 返回 `RUNNING`，owner 才可按该设计自己的 item/time budget 消费 immutable result，然后进行有界 poll wait；pipeline pump 不接收 scheduler handle/fact，也不调用 flush。即使一次 progress callback 自身超过 50ms，也不能在同一 iteration 里循环调用 progress 而饿死 scheduler；下一次 progress 仍由后续 owner iteration 处理。scheduler 只返回自己的状态，progress/capture failure 仍由 owner 沿各自原分支处理。
 
-本文所谓“原 50ms cadence 不变”是指原 caller、50ms minimum interval、时间戳更新点、参数和错误出口均不变，不承诺同步 callback 在过载时仍能形成精确 50ms 墙钟周期。scheduler 允许的唯一附加调度延迟是一次 owner iteration 中至多一个 `2000us` tick；它必须进入严格 2 秒区间和 deadline-cross telemetry，不能通过 mode-specific progress 参数把这段开销转移到下游。
+本文所谓“原 50ms cadence 不变”是指原 caller、50ms minimum interval、时间戳更新点、参数和错误出口均不变，不承诺同步 callback 在过载时仍能形成精确 50ms 墙钟周期。scheduler 自身允许的唯一附加调度延迟是一次 owner iteration 中至多一个 `2000us` tick；它必须进入严格 2 秒区间和 deadline-cross telemetry，不能通过 mode-specific progress 参数把这段开销转移到下游。独立 Phase1 pump 的预算、耗时和门禁归其自己的设计与 telemetry，不得记入 scheduler scan 成本或反过来改变 tick budget。
 
-到达接缝后先按 attempt 已冻结的 mode 分支。`LEGACY_READINESS_THEN_CLOSING` 立即以原参数调用原 helper；调用点不增加外层 reset/killed/deadline precheck，不发布 route/T0，也不改变原 helper 内 `DEBUG_SYNC` 的相对顺序。只在 `DEPENDENCY_CONVERGENCE_V1` 分支执行下面的 first-winner 协议：进入 wait loop 前先检查 existing reset、owner killed 和 absolute deadline，再发布 handle/T0；pre-T0 已过期时沿原 deadline 结果返回，不创建 scheduler attempt。被动的 final-record 时间采样可以紧邻分支，但不能参与 legacy 决策。
+到达接缝后先按 attempt 已冻结的 mode 分支。`LEGACY_READINESS_THEN_CLOSING` 立即以原参数调用原 helper；调用点不增加外层 reset/killed/deadline precheck，不发布 route/T0，也不改变原 helper 内 `DEBUG_SYNC` 的相对顺序。只在 `DEPENDENCY_CONVERGENCE_V1` 分支执行下面的 first-winner 协议：先检查 existing reset 和 owner killed，再以实际 T0 加 attempt-frozen Phase2 timeout 建立 scheduler absolute deadline，发布 handle/T0。Phase1 到期只停止普通准备续派，允许当前小轮在 T0 前收尾，不能因旧 Phase1 deadline 已过期而跳过 scheduler。被动的 final-record 时间采样可以紧邻分支，但不能参与 legacy 决策。
 
-dependency 的 T0 没有 executing/pre-gate/admission 时直接正常 HARD，不额外调用 progress。等待期间每轮依次检查 reset/owner killed/absolute deadline、到期的原 progress、到期的 scheduler tick，再决定 terminal 或 bounded wait。这样 dependency 不改变既有控制错误的优先级，也不会让空集合多推进一次 transfer progress。
+dependency 的 T0 没有 executing/pre-gate/admission 时直接正常 HARD，不额外调用 progress 或 Phase1 pump。等待期间每轮依次检查 reset/owner killed/absolute deadline、到期的原 progress、到期的 scheduler tick；tick 仍为 `RUNNING` 时才可执行独立的有界 Phase1 pump，随后进入 bounded wait。这样 dependency 不改变既有控制错误的优先级，也不会让空集合多推进一次 transfer progress。
 
-Phase1 participants 在整个 dependency 收敛期间继续保持原生命周期，mutation hook、current-record-store 和既有 active-binlog progress 持续工作；scheduler core 不 seal、rebuild、flush 或发布任何对象。现有 owner 只可执行 2.5.1 的可丢弃候选刷新。scheduler terminal 后，代码直接回到原有 CLOSING 续点，不允许为了 dependency mode 提前 CLOSING、提前 authoritative collection、提前 preserve，或把下游权威步骤搬进 wait loop。2.5.2 发生在既有 CLOSING worker scope 内，对 legacy 与 dependency 使用完全相同的条件和顺序。
+Phase1 participants 在整个 dependency 收敛期间继续保持原生命周期，mutation hook、current-record-store 和既有 active-binlog progress 持续工作；scheduler core 不 seal、rebuild、flush、发布对象或驱动 candidate refresh。scheduler terminal 后，代码回到既有 drain owner，先原样发布 CLOSING 并完成 authoritative counter/exact-pin；独立 capture mode 只能在该固定接缝按自己的设计完成 mode-local finalization barrier，再进入原有后续 pipeline。该 barrier 由 capture lifecycle 驱动，不读取 scheduler terminal 内容，也不改变 counter/pin 输入。不得为了 dependency mode 提前 CLOSING、提前 authoritative collection、提前 preserve，或把下游权威步骤搬进 scheduler tick。
 
-若严格 2 秒或 mixed 双 500ms 未通过，scheduler 本身仍只能优化采样、证明、ledger、owner-wait 开销及 2.5.1 的候选刷新聚合。压力证据已证明主要长尾来自 Final-HWM sender 与 external staging 争用同一 source epoch session，因此另行批准 2.5.2 的 mode-independent source orchestration 优化；关闭 scheduler mode 时它同样生效，并须单独证明兼容性。除 2.5.2 外，不得再改变 CLOSING 后 preserve/transfer/receiver cadence 来补偿。
+若严格 2 秒或 mixed 双 500ms 未通过，scheduler 本身仍只能优化采样、证明、ledger 和 owner-wait 开销。Phase1 捕获、Final-HWM、external staging、transfer 或 receiver 的性能问题必须在各自独立设计中解决，不能以 scheduler mode、ledger 或 callback 为输入，也不能改变 CLOSING 后 preserve/transfer/receiver cadence 来补偿。
 
 command capture 与 active scheduler handle 是两层不同的事实。启动期固定的 `source_capture_enabled` 只由 Preserve ON、dependency mode、standby-transfer artifact 以及启动期只读的 outbound source-role 配置决定；不依赖当前 attempt、瞬时 credential readiness 或 receiver runtime state。它必须在 source 接收业务命令时就以独立紧凑 POD 记录 aggregate command sequence/stage，否则 T0 无法区分 Phase2 前已进入 BODY 的命令。OFF、legacy、local carrier 和 receiver 在启动期缓存布尔的第一分支直接返回；不取 scheduler mutex，也不改写现有 legacy depth/sequence 的含义。
 
@@ -140,62 +144,11 @@ active scheduler handle 只在 dependency owner 到达本次 readiness 接缝时
 
 从 `WARMCOPY_CLOSING` 开始，preserve、warmcopy、transfer、receiver 的执行逻辑中不得出现以 dependency mode 或 scheduler state 选择流程/参数的分支。唯一允许跨过该边界的是上述 command-response release handoff、为其前置的 owner-local exact target lifetime-pin guard、attempt 自身的 callback lifetime 引用，以及 HARD terminal publication 时冻结的 owner-local、diagnostics-only snapshot。pin guard 只保证 counter 已选中 THD 在 4020 可见后不会先于既有 pipeline teardown，不改变 target 集合、target state 或任何 downstream 参数；response-release 本身不携带或读取 target 集合，只表达“既有 non-survivor prune 已成功返回，可以暴露早已确定的 4020”。snapshot 只能含 `attempt_id`、frozen attempt `mode`、`generation`、scheduler terminal/timing、eligible BODY count/digest/last key/last timestamp/coverage state 和守恒计数，不含 ledger、support、permit、target 或任何 callback，跨过 CLOSING 后也不再更新。`mode` 只用于 final-record 验收证明本次实际运行的策略，不能被下游读取或用于分支。整个 snapshot 只供 summary/final-record logger 读取，preserve、warmcopy、transfer、receiver 及其错误处理均不得读取或据此决策。
 
-### 2.5.1 pre-HARD 可丢弃 Phase1 候选刷新
+### 2.5.1 Phase1 性能流水线与 scheduler 完全分离
 
-压力证据表明，初始 Phase1 已建立的 record candidate 会被 T0 后尚在 BODY 的命令继续修改；最终 fence 因而正确拒绝旧候选，survivor 又集中在 HARD 后现场物化。正确优化不是放松 fence，也不是提前 transfer authority，而是在 T0 已处于原生命令边界，或命令退出 BODY 后旧事务仍 active 时尽早刷新候选，使大部分工作与其它命令的收敛重叠。
+Phase1 record capture、candidate refresh、对象发布、enqueue/flush、Final-HWM 和 external staging 都不属于命令调度。它们不得由 T0 command sequence、BODY exit hint、HELD、support、permit、lock graph 或 scheduler terminal 触发，也不得反过来延迟正常 HARD。
 
-```text
-T0 观察到 idle-active 旧事务，或 command BODY 原生退出且旧事务仍 active
-  -> scheduler ledger 按 connection incarnation 合并一条稳定边界提示
-  -> 同一 drain owner 在下一次 tick 前取走一批提示
-  -> 重新 pin 并复核 incarnation、Phase1 declared token 和存活状态
-  -> 调用既有 prepare_phase1_record_scan_target()
-  -> 通过窄 candidate API 记录同一时点的 live fence
-  -> 通过既有 Phase1 batch sender 合并发送，并在本批结束时 flush
-  -> 继续原 scheduler tick；满足条件才发布 HARD
-```
-
-这条窄路径必须同时满足：
-
-- 提示只含 `connection_incarnation + command_sequence + thread_id projection`，不含 HELD/support/permit、blocker、token 状态或 receiver 状态；T0 idle-active 提示的 command sequence 为 0，只表示采样时已经位于原生命令边界；同一连接只保留最新提示；新 BODY 开始会使旧提示失效，下一次 BODY exit 再生成新提示；
-- 不增加线程、第二 owner、专用 transfer queue 或新协议；本地候选构建及发送均复用本 attempt 已打开的 Phase1 participant/source session/batch sender，保持原 batch options；
-- warmcopy 实现只允许新增一个 candidate-local setter：把刚采样的 record live fence 写回同一 Phase1 prebuilt candidate，并复用既有 `attach_record_store_contract()`；owner 同时通过现有只读 API 传入该 token 已 presealed 的 publication generation，setter 沿用既有 replacement 规则，必要时推进到 `old+1`，绝不以相同 generation 发送不同 descriptor。该 setter 不 seal、不读取 scheduler、不改变旧调用者；legacy/OFF 不调用它。除这个明确命名的加法接口外，warmcopy 原有方法、分支、参数和调用次序仍受 ZERO_DIFF 约束；
-- 每批对同一 token 最多产生一个 replacement，并在允许下一批重建同名 warm blob 前完成该批 flush，避免 queued descriptor 与被替换文件错配；
-- candidate 仍是可丢弃优化。任何 pin、采样或 freshness 复核未命中都只落回既有 HARD 后 final-fence/live fallback；不得降低最终 fence，也不得改变 authoritative survivor。未消费的 stable-boundary hint 也不得延迟 `HARD_QUIESCENT`：owner 每轮尽力消费，HARD 发布时直接丢弃剩余 hint；
-- transport/enqueue/flush 的真实失败继续走现有 `PROGRESS_FAILED`/source restore 分类，不得伪装成 scheduler `SAFETY_ABORT`；
-- 不执行 detach、snapshot、token terminal/abort、final metadata、FINAL ACK、receiver bind/READY；不改变原 active progress 的 `(false,false,false)` 参数、50ms cadence及 CLOSING 后任何调用点；
-- owner iteration 保持 `原 active progress -> boundary refresh -> scheduler tick`。T0 collector 在同一 attempt mutex 内完成 idle-active 事务登记后发布初始 hint；command exit 在同一 mutex 内先发布后续 hint、再把 command stage 置为 `IDLE`。任何命令进入 BODY 都先删除该连接的旧 hint；owner 取提示时还要排除 `ADMISSION_INFLIGHT/T0_CLAIMED_PRE_GATE/PERMIT_RESERVED/EXECUTING` 等非稳定 stage。normal tick 若看到 `EXECUTING=0` 但仍有未消费 hint，必须返回 `RUNNING`，让同一 owner 再完成一次 boundary refresh 后才可发布 HARD。absolute deadline 仍具有最高优先级，不等待候选刷新；刷新耗时计入同一个 deadline 和严格 SLO。HARD 发布后不再接受或消费提示，后续完全回到原流水。
-
-因此这不是把 transfer pipeline 搬进 scheduler，而是让现有 Phase1 的 speculative candidate 在最后一批业务 BODY 退出后仍有机会保持新鲜。正确性只依赖原 final fence；性能收益才依赖候选命中率。
-
-### 2.5.2 mode-independent Final-HWM 与 external staging 去争用
-
-full-pressure RED 已把严格尾部分成 `BODY→HARD=127ms` 与 `HARD→FINAL_ACK=2.109s`；CLOSING worker 中 external staging 的聚合等待占主导。根因是 worker 已把 final-HWM 放入既有 batch sender 后，立即执行逐对象同步 staging；sender 与 staging 在同一个 source epoch session 上相互排队。这里不新增算法；worker 仍逐 token 尽早产出 candidate，现有 coordinator 把当前已完成的一批 candidate 作为一个 wave，依次执行两道 barrier：
-
-```text
-某批既有 worker：preserve/capture candidate，并 enqueue final-HWM
-  -> existing coordinator 对当前 completed-candidate wave 做第一次 flush
-  -> 逐 candidate 验证 exact descriptor，并发布已 ACK 的 HWM fact
-  -> 对该 wave 执行既有 external-object staging
-  -> existing sender 对该 wave 做第二次 flush，并发布已 ACK 的 prewarm LSN fact
-  -> 该 wave 标记 staged；其余 BODY 未结束时继续形成下一 wave
-  -> 全部 target 完成后，沿用原 final fence、candidate finalize、epoch commit、FINAL ACK
-```
-
-这项优化必须同时满足：
-
-- 不读取 scheduler mode、attempt、HELD/support/permit 或 lock graph；legacy 与 dependency 在相同 authoritative input 下进入完全相同的两道 barrier；
-- 只调整 `sql/preserve_trx.cc` 既有 early-pipeline worker/coordinator 的 source ordering；`sql/preserve_trx_transfer.cc/.h`、receiver、wire protocol、batch options、inflight 上限、chunk size、ACK 分类及 authority 状态机保持逐字不变；
-- 第一批 flush 失败、descriptor 不匹配或 publication 失败时，绝不开始 external staging；external staging 或第二批 flush 失败时继续走原 fail-closed epoch cleanup；
-- 不得等待全部 worker join 才处理第一批 candidate；一个 token 完成两道 barrier 后，原 `early object sealed before another BODY boundary` 能力和 DEBUG_SYNC 含义必须保持；
-- candidate 在第二批 flush 以及 `token_prewarm_lsn_fact()` 成功前不得成为 `external_objects_staged`，finalize 仍拒绝任何未完整 staging 的 candidate；
-- pending final-HWM descriptor 在第一次 flush 与 exact preseal 验证后继续存活，必须传给该 candidate 的 external staging，且只能在 staging 成功后清除；
-- RESET 或任一 barrier 失败必须先 cancel/abort sender，再释放 sender；不得让析构路径 flush 未确认的 seed；
-- 不提前 detach、authoritative target collection、final metadata、epoch commit 或 FINAL ACK；不改变原 final fence、dirty replacement 和 token-local failure 规则；
-- source-shape 门禁把这一个 ordering span 作为独立批准例外规范化；不得用更新整文件哈希掩盖 span 以外的漂移；
-- 先用已有 mixed full-pressure 保留 RED→GREEN，再在同一 release binary 上分别验证 legacy/dependency，最后执行五轮 300 秒 dependency sysbench。短烟测只用于快速否定，不得签署 500ms 门禁。
-
-它解决的是既有 source pipeline 的锁队列争用，不是让 scheduler 接管 transfer。即使 dependency 模式关闭，优化仍保持相同，因此 scheduler facts 不会经由别名、参数或时序分支流入下游。
+已批准的 Phase1 分层捕获与有界流水线由独立设计 `2026-09-02-preserve-trx-phase1-bounded-pipeline-design.md` 定义。该流水线由既有 drain owner/Phase1 participant 驱动，并由独立的 Phase1 capture mode 启用；它有自己的 generation、fence、队列、backpressure 和错误出口，不读取 scheduler mode 或 ledger。scheduler 文档不授权任何 source ordering、sender、receiver 或 warmcopy 优化。
 
 ### 2.6 “能力不丢失”是约束，不是第二套实现
 
@@ -203,7 +156,7 @@ full-pressure RED 已把严格尾部分成 `BODY→HARD=127ms` 与 `HARD→FINAL
 
 | 既有 owner | 必须保持的能力 | scheduler 允许做什么 |
 |---|---|---|
-| drain participants | `open_phase1`、continuous capture、late prepare、`close_phase1`、ready/preflight、finalize/abort/failed-shutdown cleanup | 只发布稳定边界提示；2.5.1 的刷新仍由既有 owner 执行 |
+| drain participants | `open_phase1`、continuous capture、late prepare、`close_phase1`、ready/preflight、finalize/abort/failed-shutdown cleanup | 无；scheduler 只返回 readiness terminal result |
 | per-target preserve | validation、binlog/lock/temp-table preflight、UNDO prepare、detach、snapshot、record register、失败 reattach/rollback/taint | 只提供该连接的命令准入结果 |
 | transfer source | epoch/target/object declare、record/binlog stream、batch/flush/publication、preseal/final-HWM、final metadata、`COMMIT_EPOCH`、FINAL ACK | 无 |
 | source ownership | `RUNNING/HANDOFF_PENDING/COMMIT_UNKNOWN/COMMITTED_HANDOFF`、`NOT_COMMITTED_CLEAN` restore、quarantine/HA resolution | 无 |
@@ -229,10 +182,9 @@ scheduler mode / HELD 集合
 正确边界：
 scheduler mode / HELD / support / permit
   -> 只到 command gate 与只读诊断
-command-exit 稳定边界提示（不含上述策略事实）
-  -> 既有 owner 刷新可丢弃 Phase1 candidate
-  -> 原 final fence 决定采用或 fallback
-  -> 完全既有的 CLOSING 与下游流水
+Phase1 capture / candidate / sender / receiver
+  -> 由独立 Phase1 设计和既有 owner 驱动
+  -> 不读取 scheduler fact，也不反向阻塞 normal HARD
 ```
 
 因此，后续 review 必须执行“传递污染检查”：从 scheduler mode、handle、HELD、support、permit 和 terminal result 出发，枚举其全部直接和间接消费者。除 command gate、command lifecycle 薄钩子、owner readiness tick 和 diagnostics-only 字段外，只要它们影响 target/cohort、progress 参数或 cadence、worker/queue、token、seal/rebuild、batch/flush/ACK、receiver/READY 或 cleanup，设计立即判定越界，不接受“只是复用 callback”“只改共享 caller”或“协议格式未变”的解释。
@@ -263,7 +215,7 @@ protocol bypass 必须是 exact enum，而不是“status/control”泛化：ord
 
 调度器启动时的瞬间称为 T0。T0 会：
 
-1. 冻结 generation、owner 和现有 readiness absolute deadline；
+1. 冻结 generation、owner 和从实际 T0 加 attempt-frozen Phase2 timeout 得到的 absolute deadline；
 2. 确认当前 attempt 的 scheduler handle 已发布；
 3. pin 并登记当时仍活跃的旧事务；
 4. 按 exact `connection_incarnation + command_sequence` 登记尚未结束的 aggregate business command；`thread_id` 只作可读诊断字段；
@@ -594,7 +546,7 @@ T0 registration 已完成且 pending exit facts == 0
 
 这里延迟的是错误响应，不是 CUTOFF 决策：命令已经不可进入 BODY。若 HARD 当场广播，约千条 HELD 命令可在原 authoritative target counter 之前同时收到 4020、断连并回滚，使 scheduler 间接改写 survivor 输入；这既破坏既有 accepted-packet 线性化，也会把大量 Phase1 非 survivor cleanup 和 transfer-token abort 推入 CLOSING 尾部。
 
-HARD 是 private command-admission terminal，不负责启动任何下游流程。owner 收到正常 HARD 后只回到既有续点，依次执行原 reset check、发布 `WARMCOPY_CLOSING`、authoritative target collection 和后续 pipeline。如果 T0 没有任何正在执行的命令，可以在完成 T0 登记和不变量检查后直接正常 HARD。
+HARD 是 private command-admission terminal，不负责启动任何下游流程。owner 收到正常 HARD 后回到既有续点，依次执行原 reset check、发布 `WARMCOPY_CLOSING`、authoritative target counter/exact-pin，然后才可在独立 capture mode 的固定接缝完成 capture-owned finalization barrier，最后进入既有后续 pipeline。该 barrier 不由 HARD 内容触发，不能改写 authoritative target set。如果 T0 没有任何正在执行的命令，可以在完成 T0 登记和不变量检查后直接正常 HARD，不额外运行 progress 或 regular pipeline pump。
 
 private HARD 到既有 CLOSING command gate 的交接必须是 **publish-before-retire**，不能出现两个 gate 都不负责的窗口：
 
@@ -602,8 +554,9 @@ private HARD 到既有 CLOSING command gate 的交接必须是 **publish-before-
 2. existing drain owner 按原顺序把 manager 发布为 `WARMCOPY_CLOSING`，再以 release store 发布现有 `closing_command_gate_published` 事实；
 3. owner 持有原 `g_closing_target_classification_mutex`，原样运行一次 `Preserve_batch_target_counter`；scheduler 不读取 counter，也不改变其输入或结果；此后仍保持该 mutex；
 4. owner 在同一 classification barrier 内对 authoritative transaction-target 集合运行原 existing target-pin collector；只有 exact target 全部取得 external lifetime pin 才释放 mutex 并继续，任一缺失都按原 owner failure 收敛，不得先释放 4020；
-5. counter 与 exact target pin 只建立“以后可以安全返回 4020”的资格；owner 释放 classification mutex 后继续运行原有 CLOSING pipeline，scheduler response latch 与 active route 仍保持，不向客户端暴露 4020；
-6. owner 原样调用既有 `abort_phase1_transfer_targets_not_quiesced()`，只有该调用成功返回后，才调用一次 response-release/route-retire handoff：先在 attempt mutex 下广播已冻结的 4020，释放 attempt mutex 后再在 route mutex 下清空 active routing handle，两把 mutex 永不嵌套。无 quiesced target 的既有分支遵守同一顺序；prune 失败则走原 owner failure/cleanup 出口，由 native-admission-restore 打开 latch，不伪装成正常 handoff。attempt 仍单独持有不含 THD pin 的只读 callback/lifetime handle，不把它传给下游；owner-local pins 则原样 move 给既有 worker scope 或保持到 drain 退出。
+5. counter 与 exact target pin 只建立“以后可以安全返回 4020”的资格；owner 释放 classification mutex 后，若独立 Phase1 capture mode 已启用，只能把这组 exact pinned targets 作为输入完成其 finalization barrier。barrier 期间 scheduler response latch 与 active route 仍保持，不能新增/删除/reclassify target，也不向客户端暴露 4020；deadline/abort 路径不执行 normal-HARD final discovery；
+6. barrier 完成或 capture mode 为 legacy/no-op 后，owner 继续运行原有 CLOSING pipeline；
+7. owner 原样调用既有 `abort_phase1_transfer_targets_not_quiesced()`，只有该调用成功返回后，才调用一次 response-release/route-retire handoff：先在 attempt mutex 下广播已冻结的 4020，释放 attempt mutex 后再在 route mutex 下清空 active routing handle，两把 mutex 永不嵌套。无 quiesced target 的既有分支遵守同一顺序；prune 失败则走原 owner failure/cleanup 出口，由 native-admission-restore 打开 latch，不伪装成正常 handoff。attempt 仍单独持有不含 THD pin 的只读 callback/lifetime handle，不把它传给下游；owner-local pins 则原样 move 给既有 worker scope 或保持到 drain 退出。
 
 gate 交接按两类命令各自线性化：已进入 scheduler gate 的命令由 HARD 裁决为 CUTOFF；CLOSING 发布后才进入 native gate 的有响应 ordinary command 也得到 native 4020 裁决。两类命令都先完成非 BODY 的 command exit、清除 inflight marker，并让本次 `dispatch_command()` 完整返回；只有在下一次 command-read 入口的真实 idle boundary 才发布 idle/quiesce、等待同一个 response latch 并发送延迟的 4020。这里既不能在 gate 内等待，也不能在旧 dispatch 栈中伪造 idle：前者会让既有 target wait 与 command exit 互等，后者会允许 preserve worker 提前接管仍由旧命令使用的 THD。accepted-before-CLOSING packet 的初始分类仍原样使用 classification mutex，不改变既有语义。response-release 先发生，route retirement 后发生；二者之间新命令仍看到旧 route，但 latch 已开，因此可立即返回 4020。读到 retirement 后空 route 的命令必然由 existing CLOSING gate 拦截，并通过 release/acquire 观察到此前的 CLOSING publication、已完成的初始 target classification、target lifetime ownership和已完成的 non-survivor prune。两个 gate 短暂重叠是允许的，准入空窗和 response 时序空窗都不允许，已经被 HARD 裁决的命令也不能因交接而重新进入 BODY。这个交接只控制 command response visibility，不增加下游 target collection 或 token operation 次数，不向 scheduler 传递 target/token 数据，也不改变 preserve、transfer 或 receiver 的任何决策。
 
@@ -674,7 +627,7 @@ attempt handle 保留到：
 
 ## 9. 时间口径与 2 秒 SLO
 
-调度器复用现有 `phase1_readiness_deadline_us` 作为 absolute deadline。这个 deadline 从更早的 Phase1 readiness 预算派生；若 Phase1 准备本身耗时较长，过小配置可能导致调度器启动时预算已经过期。因此正式 1000 并发验收把 Phase1 readiness timeout 配为 60 秒，用来避免把 Phase1 准备时间误当成 scheduler 超时；这不放宽下面的 2 秒门禁。
+调度器的 absolute deadline 从实际 T0 加 attempt-frozen Phase2 timeout 计算，不再复用 `phase1_readiness_deadline_us`。Phase1 timeout 限制普通准备续派；到期后等待当前小轮和已开始 publication 归还，实际 Phase1 可以略超过参数值，耗时如实报告。随后必须真正发布 T0；这既不能跳过 scheduler，也不放宽下面包含 T0 的 2 秒门禁。正式 profile 的 Phase1 配置仍为 60 秒，不能靠增大它掩盖慢 I/O 或收尾问题。
 
 三个指标必须分清：
 
@@ -799,21 +752,21 @@ runner 新增 `phase2_scheduler_allowed_integration_surface_lint` 与 `phase2_sc
 
 硬边界：
 
-- `sql/preserve_trx_transfer.cc/.h`：本功能及 2.5.2 均 ZERO_DIFF；
+- `sql/preserve_trx_transfer.cc/.h`：本功能 ZERO_DIFF；Phase1 流水线的后续 Stage 2 必须另行评审，不能据本文修改；
 - `sql/preserve_trx_lock_warmcopy.cc/.h` 及既有 preserve/warmcopy pipeline：本功能 ZERO_DIFF；
 - `storage/innobase/include/lock0warmcopy.h`、`storage/innobase/lock/lock0warmcopy.cc`：本功能 ZERO_DIFF；
 - receiver、promotion、wire protocol：ZERO_DIFF；
 - `preserve_trx_drain.*`、temp-table、transaction coordinator：ZERO_DIFF；
 - `sql/sql_class.cc` 和 `sql/sql_prepare.cc/.h`：ZERO_DIFF；
-- active/pending progress 的 caller 参数、batch options、flush/ACK 语义、final-HWM 内容和 token lifecycle：ZERO_DIFF；仅 2.5.2 明确的 source worker/coordinator ordering span允许改变；
+- active/pending progress 的 caller 参数、batch options、flush/ACK 语义、final-HWM 内容和 token lifecycle：ZERO_DIFF；
 - InnoDB `lock0lock.cc`、`lock0wait.cc` 等 acquire/release 热路径：ZERO_DIFF；
 - Unit/GUnit 与 Python unit tests：ZERO_DIFF。
 
-这里的 ZERO_DIFF 同时约束 dependency 和 legacy/OFF。不能以“只修改了共享 caller”或“wire 未变化”为理由接受未列明的行为漂移。2.5.2 是唯一批准的独立 CLOSING source-ordering 例外，必须脱离 scheduler mode 并单独验证；3.1 的 predicate 对齐仍是唯一 target-membership 例外。除这两项外，以 authoritative target set 已确定为边界，后续 preserve/warmcopy/transfer/receiver 仍必须满足 ZERO_DIFF。
+这里的 ZERO_DIFF 同时约束 dependency 和 legacy/OFF。不能以“只修改了共享 caller”或“wire 未变化”为理由接受未列明的行为漂移。3.1 的 predicate 对齐是唯一 target-membership 例外；以 authoritative target set 已确定为边界，后续 preserve/warmcopy/transfer/receiver 仍必须满足 ZERO_DIFF。独立 Phase1 流水线不得成为扩大 scheduler 允许修改面的理由。
 
 ### 10.3 实施规模约束
 
-当前基线没有 scheduler `.cc/.h`、七组 scheduler MTR 或 scheduler Python E2E，因此不存在可称为“当前实现代码量”的数字。此前 WIP 的 3,790 行 scheduler、`preserve_trx.cc +3,001/-198` 以及配套大体量测试只是已拒绝的过度设计证据，不能作为目标或被重新搬回。
+原始前置基线 `9c6e6b1f193dcf44ad1dad8f285baabe90aab088` 不含 scheduler `.cc/.h`、七组 scheduler MTR 或 scheduler Python E2E；本节保留当时的实施估算，不作为当前实现代码量。此前 WIP 的 3,790 行 scheduler、`preserve_trx.cc +3,001/-198` 以及配套大体量测试只是已拒绝的过度设计证据，不能作为目标或被重新搬回。
 
 基于前置 HEAD 的逐接缝源码审计，生产源码的中心估算为约 `3,020` 行，承诺区间为 `2,820–3,220`（±200）：新 scheduler `.h/.cc` 约 2,080 行，`preserve_trx.cc/.h` owner/facade/teardown 约 400 行，`sql_class.h`/`sql_parse.cc`/sysvar/CMake 约 90 行，MDL/InnoDB proof 约 450 行。主体新文件约占 69%。低于约 2,500 行时必须复核 support 双向索引、partial-round generation、T0 pending facts 和 callback lifetime 是否遗漏；高于 3,220 行时必须检查是否重新引入 owner loop、stmt-close 等待、重型 telemetry 或 downstream adapter。
 
@@ -960,18 +913,19 @@ HARD 后 sysbench 新命令收到 4020 并被 sysbench 视为 fatal，是设计�
 
 ### 11.5 持续大事务 full-pressure：方案 A
 
-这个场景专门回答一个问题：1000 个持续大事务连接叠加 100 个存在单向 lock wait 的持续短事务连接，在全部业务都不知道维护时刻的情况下，dependency scheduler 能否完成命令收敛，并保持既有 standby transfer 与 receiver READY 能力。它是既有 Python E2E 的一种新 workload/profile，不是新的 DRAIN 流程，也不授权修改内核、preserve、warmcopy、transfer 或 receiver。
+这个场景专门回答一个问题：1000 个持续大事务连接叠加 100 个存在单向 lock wait 的持续短事务连接，在全部业务都不知道维护时刻的情况下，dependency scheduler 能否完成命令收敛，并保持既有 standby transfer 与 receiver READY 能力。它是既有 Python E2E 的一种新 workload/profile，不是新的 DRAIN 流程，也不授权以 scheduler 名义修改内核、preserve、warmcopy、transfer 或 receiver。独立 Phase1 capture mode 的实现和验收只由 `2026-09-02-preserve-trx-phase1-bounded-pipeline-design.md` 授权。
 
-full profile 固定为：
+full profile 固定为三种彼此独立运行的大事务形态。三种形态使用相同的
+100000 行会话私有工作集和相同的 1000+100 并发，只改变 range UPDATE
+的命令深度；不能把三种大事务混在同一轮中，否则不能判断退化来自宽范围
+锁处理还是命令深度。
 
 ```text
 artifact mode                    : STANDBY_TRANSFER_SAVE
 scheduler mode                   : DEPENDENCY_CONVERGENCE_V1
 large-transaction sessions       : 1000
-large-transaction tables         : 100
+large-transaction tables         : 128
 logical rows per session         : 100000
-rows per range UPDATE            : 10000
-range UPDATE commands per tx     : 10
 short-transaction sessions       : 100
 short-transaction lock pairs     : 50
 short-transaction tables         : 50（与大事务表完全不同）
@@ -981,29 +935,46 @@ eligible BODY minimum             : 900
 preserved record-lock minimum     : 5000000
 ```
 
-每个连接只操作分配给自己的表分片和主键范围。一个事务连续执行十条 10000 行 range UPDATE，累计覆盖 100000 行后立即 `COMMIT`，然后在同一连接上开始下一事务。range UPDATE 继续使用既有 minimal table、no-op range lock 与每批首行真实更新语义：压力来自并发命令、事务内累计锁和持续事务循环，不通过人为制造热点锁等待放大结果。
+三种形态为：
 
-在这 1000 个大事务连接之外，场景再启动 100 个短事务连接。短事务使用另一组 50 张表，表名、数据和主键空间均不与大事务表重叠，因此两组 workload 之间不会形成锁依赖。100 个连接组成 50 个相互独立的 peer pair；每一对只共享本对表内的一行 gate row，不与其它 pair 共享锁。pair 内两个连接每轮都先更新 gate row，先取得它的连接自然成为本轮 blocker，另一连接自然成为 waiter；下一轮角色可以互换。两个连接在竞争 gate row 之前都不持有其它行锁，取得 gate row 后只访问各自的私有行，所以所有事务都遵守“共享 gate row 在前、私有行在后”的同一锁顺序，wait-for graph 没有反向边和环，不会构造死锁。
+| 形态 | 每事务 UPDATE 数 | 每条 UPDATE 范围 | 范围轮数 | 每事务 row visits | 每事务真实变更行事件 |
+|---|---:|---:|---:|---:|---:|
+| `RANGE_10000` | 10000 | 10 行 | 1 | 100000 | 10000 |
+| `RANGE_1000` | 1000 | 100 行 | 1 | 100000 | 1000 |
+| `RANGE_100000` | 100000 | 1 行 | 1 | 100000 | 100000 |
 
-每个短事务沿用 sysbench `oltp_write_only` 的量级和基本形态：`BEGIN`、先按主键 UPDATE gate row、再更新本连接私有行的非索引列、DELETE、INSERT、`COMMIT`。pair 内没有 coordinator、角色通知或 DRAIN generation；不查询 `performance_schema.data_lock_waits` 来决定何时提交，不加入人工 sleep，也不把事务停住等待 DRAIN。拿到 gate row 的连接立即执行余下短 DML 并提交，等待者获锁后立即完成同一量级的短事务；两者随后直接进入下一轮。因此 lock wait 来自 100 个持续短事务的自然竞争，等待时间由另一个 sysbench 量级短事务的剩余执行时间决定，而不是由测试注入的长暂停决定。
+每个连接只操作分配给自己的表分片和主键范围。三档都恰好完整遍历一次
+100000 行私有工作集，因此 record-lock footprint 可直接横向比较；区别只在
+SQL 命令粒度。继续沿用既有 minimal table、no-op range lock 与每批首行真实
+更新语义：100 行档与 10 行档的每条命令只真实更新范围首行，但持有范围内
+全部行锁；1 行档每条 UPDATE 匹配并真实更新 1 行。因此三档分别形成 1000、
+10000、100000 次命令调度和真实变更事件，同时保持相同的 100000 行锁集合，
+无需循环范围或扩张 seed。
+每档完成其全部 UPDATE 后立即 `COMMIT`，随后在同一连接开始下一事务；
+100000 条档在 300 秒内没有完成一次事务不是失败，但必须证明每个 worker
+持续推进，DRAIN 时存在真实 active transaction。
+
+在这 1000 个大事务连接之外，场景再启动 100 个短事务连接。短事务使用另一组 50 张表，表名、数据和主键空间均不与大事务表重叠，因此两组 workload 之间不会形成锁依赖。100 个连接组成 50 个相互独立的 peer pair；每一对只共享本对表内的一行 gate row，不与其它 pair 共享锁。每个连接先完成自己私有主键范围内的四条点 DML，最后才请求 gate row；先取得 gate row 的连接立即 `COMMIT`，另一连接只在该 gate row 上等待。
+
+这个顺序不会制造死锁。pair 内两个连接的私有主键范围互不相交，任何连接都不会请求对方已经持有的私有锁；唯一共享对象是最后请求的 gate row，因此 wait-for graph 只有 waiter 指向当前 gate holder 的单向边，没有反向边或环。每个短事务保持 sysbench `oltp_write_only` 的量级：`BEGIN`、私有行 UPDATE、非索引列 UPDATE、DELETE、INSERT、gate-row UPDATE、`COMMIT`。pair 内没有 coordinator、角色通知或 DRAIN generation；不查询 `performance_schema.data_lock_waits` 来决定何时提交，不加入人工 sleep，也不把事务停住等待 DRAIN。这样仍由持续业务自然产生 lock wait，但 gate holder 不再拿着共享锁执行其余四条 DML，等待时间只覆盖紧邻的提交路径。
 
 业务计时必须遵守下面的严格顺序：
 
 ```text
 完成 source/receiver 启动、schema、credential 和 receiver baseline
   -> 启动 1000 个大事务连接和 100 个短事务连接
-  -> 等待每个大事务连接至少完成第一条 10000 行 range UPDATE
+  -> 等待每个大事务连接至少完成本档第一条 range UPDATE
   -> 等待每个短事务连接至少完成一个短事务
   -> 记录业务窗口起点 T_business
   -> 连续运行业务 business_run_before_drain_s
   -> 独立控制连接直接执行一次 DRAIN TRANSACTIONS PRESERVE
 ```
 
-`business_run_before_drain_s` 是“大事务连接全部完成至少一条 10000 行 range UPDATE，并且短事务连接全部完成至少一个短事务之后”的完整运行时间，不包含建库、seed、连接建立、receiver baseline 或线程爬坡。full 默认 300 秒；smoke 可以使用较短参数，但不能作为正式性能证据。计时窗口内 harness 只能被动检查线程存活和错误，不能调用 `request_drain_checkpoint()`、`pause_for_drain_if_requested()`、transaction-start hold、预 DRAIN、RESET DRAIN，不能要求任何业务连接到达预设 checkpoint，也不能在业务连接上发送控制 SQL。预先建立的 receiver read-load 可以继续运行，因为它不接触 source 业务连接或 coordinator；它的 baseline 建立必须在 `T_business` 以前完成，且计时窗口内不能再启动新的 source tiered probe 或其它主动压力编排。
+`business_run_before_drain_s` 是“大事务连接全部完成本档至少一条 range UPDATE，并且短事务连接全部完成至少一个短事务之后”的完整运行时间，不包含建库、seed、连接建立、receiver baseline 或线程爬坡。full 默认 300 秒；smoke 可以使用较短参数，但不能作为正式性能证据。计时窗口内 harness 只能被动检查线程存活和错误，不能调用 `request_drain_checkpoint()`、`pause_for_drain_if_requested()`、transaction-start hold、预 DRAIN、RESET DRAIN，不能要求任何业务连接到达预设 checkpoint，也不能在业务连接上发送控制 SQL。预先建立的 receiver read-load 可以继续运行，因为它不接触 source 业务连接或 coordinator；它的 baseline 建立必须在 `T_business` 以前完成，且计时窗口内不能再启动新的 source tiered probe 或其它主动压力编排。
 
 时间到达后，现有独立 HA control connection 必须立即主动调用一次 DRAIN。控制模块不读取 `performance_schema.data_lock_waits`，不查询当前 blocker/waiter 数量，不等待某个锁图形状，不延迟到“更合适”的业务时刻，也不因第一次没有命中 lock wait 而重试 DRAIN。大事务和短事务线程都不接收通知、不停止发 SQL，也不根据计时器改变事务节奏。DRAIN 已经开始后，尚未被内核截断的业务连接继续执行。某个连接收到 `ER_PRESERVE_TRX_SESSION_DRAINED`（4020）时，只停止在该连接上继续发送 SQL，并在原连接对象仍存活的情况下等待 transfer 完成；它不能重连、不能退出并让其它连接代替。没有收到 4020 的连接继续施压。最终 cleanup 只能在 DRAIN/receiver 验证结束、harness 发布 stop 后关闭这些连接。
 
-这个场景允许 DRAIN 瞬间少量连接正好位于事务边界，因此不以“1100 个连接必须全部成为 survivor”制造脆弱门禁，也不沿用旧 pre-paused full profile 的“1000 token/一亿锁”断言。正式证据改用以下事实共同证明压力真实存在：全部 1000 个大事务连接在 `T_business` 前至少完成一条 range UPDATE，全部 100 个短事务连接至少完成一个短事务；到 DRAIN 调用前 1100 个 worker 全部仍存活，两类 workload 的 completed transaction/statement 计数都继续增长；dependency final record 的 `eligible_body_count>=900`；最终 preserved record-lock 总数不小于 5000000；survivor 数大于零，receiver READY 数等于 survivor 数，NOT_READY 为零。新 profile 必须开启 partial-token 接受，只放宽“恰好 1100 survivor”这一项，不放宽 receiver 完整性或错误门禁。
+这个场景允许 DRAIN 瞬间少量连接正好位于事务边界，因此不以“1100 个连接必须全部成为 survivor”制造脆弱门禁，也不沿用旧 pre-paused full profile 的“1000 token/一亿锁”断言。正式证据改用以下事实共同证明压力真实存在：全部 1000 个大事务连接在 `T_business` 前至少完成本档一条 range UPDATE，全部 100 个短事务连接至少完成一个短事务；到 DRAIN 调用前 1100 个 worker 全部仍存活，两类 workload 的 completed transaction/statement 计数都继续增长；报告明确记录本档配置的 UPDATE 数、每条范围、范围轮数、row visits、真实变更行事件，以及 DRAIN 时每个大事务的当前命令进度；dependency final record 的 `eligible_body_count>=900`；最终 preserved record-lock 总数不小于 5000000；survivor 数大于零，receiver READY 数等于 survivor 数，NOT_READY 为零。新 profile 必须开启 partial-token 接受，只放宽“恰好 1100 survivor”这一项，不放宽 receiver 完整性或错误门禁。三种形态分别连续运行五轮并逐轮满足同一 SLO；不能把某一形态的 GREEN 代替另一形态。
 
 正式运行还必须同时满足：
 
@@ -1013,9 +984,10 @@ preserved record-lock minimum     : 5000000
 4. `DRAIN TRANSACTIONS PRESERVE` 成功，source/receiver 均在线，terminal ownership 与 epoch bind/READY 沿用原成功路径；
 5. DRAIN 后报告必须记录 scheduler 的 exact InnoDB proof/ledger 事实，包括是否观察到 lock wait、waiter/blocker 数和 support-edge 数。若观察到 edge，则每条 edge 都必须通过现有 exact identity/proof/invariant 校验；若该随机时刻没有命中 lock wait，则记录 `lock_wait_coverage=NOT_OBSERVED` 和零 edge，这不是功能 RED、不是性能 RED，也不触发第二次 DRAIN。只有报告声称观察到 edge 但 exact proof/identity 不成立、计数不守恒或 scheduler 出现 fatal 时才判 RED；
 6. 至少一个业务连接真实收到 4020；报告生成时，每个收到 4020 的 worker 都仍处于“持有原连接等待 transfer 完成”状态；
-7. dependency strict interval 不大于 2000000us，exact last-command-end 到 FINAL ACK 小于 500000us，FINAL ACK 到 receiver READY 小于 500000us；
-8. 既有 memory、batch reduction、prewarm、zero NOT_READY 和 cleanup 门禁继续生效；receiver read-load 仍要求 8 个线程、零查询错误且 QPS drop `<=5%`，但本场景中的 P99 increase 只作为报告指标，不参与 PASS/RED。报告必须同时输出 baseline/transfer 的 duration、query count、QPS、P99、变化率、参考阈值及各门禁是否启用，不能因为某项不判 RED 就省略实际数据。不能为了让本场景通过而调整 transfer/receiver 参数；
-9. 不新增 RESET DRAIN 场景，不新增 Unit/GUnit，不修改既有 MTR 的业务语义。
+7. 每条纳入统计的业务命令，从客户端实际开始协议调用到成功响应或服务端错误响应到达，必须不大于 1000000us。纳入范围是成功的 `START TRANSACTION`、大事务 UPDATE、短事务四条私有 DML、短事务 gate-row UPDATE、`COMMIT`，以及所有返回 4020 的命令尝试。schema/seed、harness `SET @...` 的成功响应、DRAIN/RESUME/transfer 控制命令和收到 4020 后在客户端等待 transfer 完成的时间不纳入；但 `SET @...` 若返回 4020，该错误响应仍纳入 4020 类，保证与总 4020 计数闭环。报告按 transaction begin、large DML、short private DML、intentional lock-wait candidate、transaction commit 和 expected 4020 分项输出 count、total、average、min、max、over-limit count 与最坏命令身份；同时输出应有、实有和缺失的 worker recorder 数，任何 worker recorder 缺失都必须使门禁失败，不能由其它 worker 的非空样本掩盖。每个成功类别和 4020 类都必须非空，所有 over-limit count 为零，overall max 不大于 1000000us。gate-row 命令是否在 DRAIN 瞬间真的处于 lock wait 仍由第 5 条的 post-hoc coverage 表达，不能据此豁免单命令时延门禁；
+8. dependency strict interval 不大于 2000000us，exact last-command-end 到 FINAL ACK 小于 500000us，FINAL ACK 到 receiver READY 小于 500000us；
+9. 既有 memory、batch reduction、prewarm、zero NOT_READY 和 cleanup 门禁继续生效；receiver read-load 仍要求 8 个线程、零查询错误且 QPS drop `<=5%`，但本场景中的 P99 increase 只作为报告指标，不参与 PASS/RED。报告必须同时输出 baseline/transfer 的 duration、query count、QPS、P99、变化率、参考阈值及各门禁是否启用，不能因为某项不判 RED 就省略实际数据。不能为了让本场景通过而调整 transfer/receiver 参数；
+10. 不新增 RESET DRAIN 场景，不新增 Unit/GUnit，不修改既有 MTR 的业务语义。
 
 实施边界必须保持很窄：新增一个专用 Python E2E 入口；在既有 full-pressure runner 中增加 profile、300 秒默认值及可覆盖参数；在既有 business E2E 中只增加“持续业务直至控制连接 DRAIN”的测试编排开关、独立的 100-session short-transaction pair workload、两类业务的启动/进度/时间事实、中性的 standby-transfer survivor 字段和报告字段。短事务 worker 不能读取 DRAIN generation、deadline、scheduler state 或 lock-wait instrumentation。这个开关不得改变其它 profile；不能复用只在 mixed 模式赋值的 survivor 变量来判断本场景。`sql/`、`storage/innobase/`、`preserve_trx_transfer.*`、receiver 及其参数均不在本场景的修改范围内。
 
@@ -1039,13 +1011,13 @@ preserved record-lock minimum     : 5000000
 - LONG_DATA 只在既有 CLOSING/session-drained 已使后续 EXECUTE 不可逆 cutoff 后静默 drop；COM_STMT_CLOSE 在 scheduler 控制的 SOFT、private HARD→CLOSING 和 abort 窗口执行原生 cleanup，scheduler 退休后仍服从既有 session-drained 语义；
 - 已进入 BODY 的命令绝不返回 4020；
 - T0 claim、BODY commit 与 cutoff 使用同一线性化协议；normal HARD 前 body-capable admission、executing、reserved、proof 和 support 全部归零；
-- normal/deadline HARD 只让 existing pre-CLOSING wait loop 返回；随后才按原顺序发布 `WARMCOPY_CLOSING` 和形成 authoritative target set；
+- normal/deadline HARD 只让 existing pre-CLOSING wait loop 返回；随后才按原顺序发布 `WARMCOPY_CLOSING` 和形成 authoritative target set；若独立 capture mode 已启用，其 finalization barrier 只能位于 exact counter/pin 之后、既有后续 pipeline 之前；
 - HARD 立即冻结 CUTOFF；authoritative counter 与 exact transaction-target pin 只建立响应安全资格，客户端必须在既有 non-survivor prune 成功返回后才能看到 4020；
 - HARD gate 必须保持到 existing CLOSING gate release/acquire 可见；CUTOFF command 必须先退休 command/inflight 状态并完整退出本次 native dispatch，下一次 command-read 入口才可发布真实 idle/quiesce、等待 latch 并发送上一条 4020；不得在 gate 内等待，也不得在旧 dispatch 栈内提前写 idle；post-CLOSING native 4020 使用同一 hook，而 accepted-before-CLOSING packet 的初始分类仍只等待原 target-classification mutex；response-release 与 route retirement 不嵌套两把 mutex，交接无准入或响应空窗；
 - owner/progress 外部失败和 SAFETY_ABORT 都先原子停止 permit、撤销 reserved、冻结未进 BODY 命令并退休 support，再由原 owner以原错误分类执行 pre-CLOSING cleanup；只有 `native_admission_restored` 后才重走原生准入；
 - HARD 不替代后续 per-target `QUIESCED` 或 timeout exclusion；
 - dependency RESET 在 `request_reset()` 前返回 unsupported；
-- 相同 CLOSING authoritative input facts 满足相同 preserve/warmcopy/transfer/receiver normalized pipeline contract；源码 fingerprint/def-use 与运行时既有 outcome/数值门禁共同证明，既有并发 worker 交错不作逐事件等同；
+- 相同 capture mode、相同 CLOSING authoritative input facts 满足相同 preserve/warmcopy/transfer/receiver normalized pipeline contract；源码 fingerprint/def-use 与运行时既有 outcome/数值门禁共同证明，既有并发 worker 交错不作逐事件等同；
 - pre-CLOSING active progress 与 CLOSING pending progress 各自在原调用点按原参数、原 50ms cadence 和原错误分类推进；
 - scheduler tick 服从 2ms budget 与 500us probe-start reserve，同时不能被超长 progress callback 饿死；`tick_crossed_unserviced_progress_deadline` 保留为诊断，正式成败由 progress error、scheduler safety fatal 与端到端 SLO 决定；
 - scheduler ledger 不进入 authoritative target/session-only/token/collision/exclusion 输入；
@@ -1072,7 +1044,8 @@ preserved record-lock minimum     : 5000000
   -> 只扫描还在执行的命令并精确证明 blocker
   -> 让对应 blocker 继续运行到事务边界
 同时：原 Phase1 participants 与 50ms active progress 持续原样运行
-  -> scheduler terminal 后回到原 CLOSING 续点
+  -> scheduler terminal 后回到 owner，原样发布 CLOSING 并形成 target set
+  -> 独立 capture mode 如已启用，只在此固定接缝完成自身 barrier
 然后：原 target observer / early workers / preserve / transfer / receiver
   -> 按原调用顺序运行，不产生第二套流程
 ```

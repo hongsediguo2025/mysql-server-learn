@@ -1,4 +1,5 @@
 --source include/have_debug.inc
+--source include/have_log_bin.inc
 --source include/not_windows.inc
 
 SELECT @@GLOBAL.rds_preserve_trx_transfer_artifact_mode AS artifact_mode,

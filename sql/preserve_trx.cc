@@ -5686,7 +5686,7 @@ preserve_trx_wait_for_phase1_readiness(
 
 static Preserve_trx_phase1_readiness_result
 preserve_trx_wait_for_dependency_phase2_readiness(
-    THD *owner, ulonglong phase1_deadline_us,
+    THD *owner, uint phase2_timeout_ms,
     const std::shared_ptr<Preserve_trx_drain_attempt> &active_drain_attempt,
     Preserve_trx_phase1_readiness_metrics *metrics,
     const std::function<bool()> &progress,
@@ -5703,10 +5703,9 @@ preserve_trx_wait_for_dependency_phase2_readiness(
   if (owner->killed) return Preserve_trx_phase1_readiness_result::OWNER_KILLED;
 
   const ulonglong policy_started_us = preserve_trx_monotonic_us();
-  if (preserve_trx_monotonic_deadline_expired_at(phase1_deadline_us,
-                                                 policy_started_us)) {
-    return Preserve_trx_phase1_readiness_result::DEADLINE;
-  }
+  const ulonglong scheduler_deadline_us =
+      preserve_trx_monotonic_deadline_after_ms(policy_started_us,
+                                               phase2_timeout_ms);
 
   preserve_trx_phase2_scheduler::Owner_config config;
   config.attempt_id = active_drain_attempt == nullptr
@@ -5717,7 +5716,7 @@ preserve_trx_wait_for_dependency_phase2_readiness(
                           : active_drain_attempt->generation;
   config.owner_thread_id = owner->thread_id();
   config.policy_started_us = policy_started_us;
-  config.absolute_deadline_us = phase1_deadline_us;
+  config.absolute_deadline_us = scheduler_deadline_us;
   *attempt_out =
       preserve_trx_phase2_scheduler::publish_and_register_t0(owner, config);
   if (*attempt_out == nullptr) {
@@ -5757,7 +5756,7 @@ preserve_trx_wait_for_dependency_phase2_readiness(
 
     const ulonglong now_us = preserve_trx_monotonic_us();
     const bool deadline = preserve_trx_monotonic_deadline_expired_at(
-        phase1_deadline_us, now_us);
+        scheduler_deadline_us, now_us);
     bool progress_failed = false;
     if (!deadline && progress) {
       progress_failed = progress();
@@ -5773,9 +5772,9 @@ preserve_trx_wait_for_dependency_phase2_readiness(
             ? ULLONG_MAX
             : tick_started_us + 2000;
     ulonglong tick_stop_us =
-        phase1_deadline_us == 0
+        scheduler_deadline_us == 0
             ? tick_budget_end
-            : std::min(tick_budget_end, phase1_deadline_us);
+            : std::min(tick_budget_end, scheduler_deadline_us);
     bool tick_stop_is_progress_deadline = false;
     if (next_progress_due_us) {
       const ulonglong progress_due_us = next_progress_due_us();
@@ -7369,6 +7368,10 @@ class Warmcopy_batch_blob_provider final : public PreserveBinlogBlobProvider {
             m_max_entry_bytes, &m_total_bytes, m_max_total_bytes,
             m_reservation_chunk_bytes, copy_chunk_bytes, &session, nullptr,
             nullptr, true);
+    DBUG_EXECUTE_IF("preserve_trx_phase1_binlog_partial_prepare", {
+      if (step_status == Mysql_binlog_warmcopy_begin_step_status::MORE)
+        std::this_thread::sleep_for(std::chrono::milliseconds(3500));
+    });
     const bool prefix_failed =
         step_status == Mysql_binlog_warmcopy_begin_step_status::READY &&
         mysql_binlog_preserve_warmcopy_prefix_blob(thd, session, prefix,
@@ -7436,6 +7439,50 @@ class Warmcopy_batch_blob_provider final : public PreserveBinlogBlobProvider {
     }
     return rebuild_stale_target(thd, epoch) &&
            prepare_blob_for_thd_if_present(thd, epoch);
+  }
+
+  // Owner-only, after all ordinary pipeline results have been settled.
+  // MORE retains a preparing session, but no worker will advance it now.
+  bool finish_bounded_preparations(uint64_t attempt_id) {
+    std::vector<Entry> unfinished;
+    {
+      std::lock_guard<std::mutex> guard(m_mutex);
+      if (m_error || m_carrier == nullptr) return false;
+      for (const auto &item : m_entries) {
+        const Entry &entry = item.second;
+        if (entry.bounded_attempt_id == attempt_id && entry.preparing &&
+            (entry.session == nullptr || entry.rebuilding || entry.finalizing))
+          return false;
+      }
+      try {
+        unfinished.reserve(m_entries.size());
+      } catch (const std::bad_alloc &) {
+        return false;
+      }
+      for (auto it = m_entries.begin(); it != m_entries.end();) {
+        if (it->second.bounded_attempt_id != attempt_id ||
+            !it->second.preparing) {
+          ++it;
+          continue;
+        }
+        unfinished.push_back(std::move(it->second));
+        it = m_entries.erase(it);
+      }
+      m_condition.notify_all();
+    }
+    bool clean = true;
+    for (auto &entry : unfinished) {
+      mysql_binlog_preserve_warmcopy_abort_session(entry.session);
+      if (entry.reserved_size != 0)
+        (void)warmcopy_retain_entry_reservation(&m_total_bytes, 0,
+                                                &entry.reserved_size);
+      const Preserved_trx_carrier_status status =
+          m_carrier->remove_warm_external_blob(
+              entry.warmcopy_id, kPreservedTrxBlobBinlogCache);
+      clean = (status == Preserved_trx_carrier_status::OK ||
+               status == Preserved_trx_carrier_status::NOT_FOUND) && clean;
+    }
+    return clean;
   }
 
   bool has_blob_for_thd(const THD *thd) const override {
@@ -10072,6 +10119,11 @@ class Existing_phase1_binlog_provider_port final
                : Preserve_trx_phase1_binlog_provider_status::IDENTITY_STALE;
   }
 
+  bool sample_prefix(THD *target, PrebuiltBinlogCacheBlob *prefix) override {
+    return m_provider != nullptr &&
+           m_provider->phase1_prefix_blob_for_thd(target, prefix);
+  }
+
   const std::string &artifact_dir() const override { return m_dir; }
 
  private:
@@ -10093,9 +10145,13 @@ class Existing_phase1_binlog_publisher_port final
 
   Preserve_trx_transfer_status enqueue(
       const Preserve_trx_transfer_phase1_blob_request &request) override {
-    return m_sender == nullptr
-               ? Preserve_trx_transfer_status::INVALID_ARGUMENT
-               : m_sender->enqueue(request);
+    if (m_sender == nullptr) return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+    try {
+      return m_sender->enqueue(request);
+    } catch (...) {
+      /* A synchronous callback may already have reached the receiver. */
+      return Preserve_trx_transfer_status::ACK_UNCERTAIN;
+    }
   }
 
   Preserve_trx_transfer_status flush() override {
@@ -10105,13 +10161,14 @@ class Existing_phase1_binlog_publisher_port final
   }
 
   bool remember_acked(uint64_t target_thread_id,
-                      const PrebuiltBinlogCacheBlob &blob) override {
+                      const PrebuiltBinlogCacheBlob &blob,
+                      bool owns_cleanup) override {
     if (m_provider == nullptr || target_thread_id == 0 ||
         target_thread_id > std::numeric_limits<my_thread_id>::max()) {
       return false;
     }
     m_provider->remember_phase1_blob(
-        static_cast<my_thread_id>(target_thread_id), blob);
+        static_cast<my_thread_id>(target_thread_id), blob, owns_cleanup);
     return true;
   }
 
@@ -12845,8 +12902,8 @@ static bool delete_preserved_snapshot_files_and_sidecars_or_log(
     const std::string &dir, const std::string &token,
     const Preserve_snapshot_metadata *metadata,
     Temp_sidecar_cleanup_mode temp_sidecar_cleanup_mode =
-        Temp_sidecar_cleanup_mode::METADATA_AWARE) {
-  Preserve_snapshot_remove_options remove_options;
+        Temp_sidecar_cleanup_mode::METADATA_AWARE,
+    Preserve_snapshot_remove_options remove_options = {}) {
   if (metadata != nullptr && !metadata->temp_table_manifest_payload.empty() &&
       temp_sidecar_cleanup_mode == Temp_sidecar_cleanup_mode::METADATA_AWARE) {
     /*
@@ -13264,6 +13321,13 @@ static void preserved_trx_expired_reaper_scan_once() {
     const uint64_t now_us = preserve_trx_monotonic_us();
     preserve_trx_transfer_receiver_reaper_scan_once(now_us);
     (void)preserved_trx_strict_prepared_token_registry().expire_once(now_us);
+    DBUG_EXECUTE_IF("preserve_trx_receiver_partial_expiry_probe", {
+      if (preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens_status()
+          != 0) {
+        LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
+               "PRESERVE: partial selection prepared expiry pass completed");
+      }
+    });
   } catch (...) {
     LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
            "PRESERVE: strict receiver resource reaper pass failed");
@@ -13578,8 +13642,12 @@ static void preserve_trx_kill_connection(THD *thd) {
 
 static bool restore_batch_record_semantics_to_original_thd(
     THD *thd, const Preserve_trx_batch_item &item,
-    Preserve_trx_batch_reset_cleanup *deferred_cleanup) {
+    Preserve_trx_batch_reset_cleanup *deferred_cleanup,
+    bool process_local_artifacts = false) {
   if (thd == nullptr || item.token.empty()) return true;
+
+  Preserve_snapshot_remove_options remove_options;
+  remove_options.defer_directory_fsync = process_local_artifacts;
 
   Preserved_trx_record record;
   if (!preserved_trx_take_record(item.token, &record)) return true;
@@ -13630,7 +13698,8 @@ static bool restore_batch_record_semantics_to_original_thd(
     bool cleanup_failed = rollback_status != DB_SUCCESS;
     if (rollback_status == DB_SUCCESS) {
       cleanup_failed = delete_preserved_snapshot_files_and_sidecars_or_log(
-          preserve_trx_default_dir(), item.token, &record.metadata);
+          preserve_trx_default_dir(), item.token, &record.metadata,
+          Temp_sidecar_cleanup_mode::METADATA_AWARE, remove_options);
     } else {
       record.state = Preserved_trx_lifecycle_state::FAILED;
       record.resumable = false;
@@ -13757,7 +13826,8 @@ static bool restore_batch_record_semantics_to_original_thd(
   }
 
   const Preserve_snapshot_delete_status delete_status =
-      delete_snapshot_files_with_status(preserve_trx_default_dir(), item.token);
+      delete_snapshot_files_with_status(preserve_trx_default_dir(), item.token,
+                                         remove_options);
   if (delete_status ==
       Preserve_snapshot_delete_status::ERROR_BEFORE_SNAPSHOT_DELETE) {
     log_preserved_trx_cleanup_failure(item.token,
@@ -13905,7 +13975,8 @@ static bool restore_preserved_batch_items_to_original_thds(
     Preserve_trx_batch_reset_cleanup cleanup;
     if (restore_batch_record_semantics_to_original_thd(
             targets[i - 1].thd, items[i - 1],
-            deferred_cleanup == nullptr ? nullptr : &cleanup)) {
+            deferred_cleanup == nullptr ? nullptr : &cleanup,
+            active_drain_attempt != nullptr)) {
       return true;
     }
     if (deferred_cleanup != nullptr)
@@ -14268,7 +14339,8 @@ static bool reattach_current_batch_preserve_failure_to_original_thd(
     bool has_logged_binlog_cache = false,
     const Mysql_binlog_preserve_snapshot *binlog_snapshot = nullptr,
     const std::vector<Preserved_trx_external_blob_descriptor>
-        *blob_descriptors = nullptr) {
+        *blob_descriptors = nullptr,
+    Preserve_snapshot_remove_options remove_options = {}) {
   if (thd == nullptr || trx == nullptr || token.empty()) return true;
   if (cleanup_failed != nullptr) *cleanup_failed = false;
   if (left_preserved != nullptr) *left_preserved = false;
@@ -14307,8 +14379,8 @@ static bool reattach_current_batch_preserve_failure_to_original_thd(
     Preserve_snapshot_delete_status delete_status =
         Preserve_snapshot_delete_status::OK;
     if (snapshot_files_may_exist) {
-      delete_status =
-          delete_snapshot_files_with_status(preserve_trx_default_dir(), token);
+      delete_status = delete_snapshot_files_with_status(
+          preserve_trx_default_dir(), token, remove_options);
     }
     if (delete_status ==
         Preserve_snapshot_delete_status::ERROR_BEFORE_SNAPSHOT_DELETE) {
@@ -16765,6 +16837,10 @@ bool preserve_trx_kernel_preserve_attached_transaction(
 
   const Preserve_trx_transfer_artifact_decision artifact_decision =
       preserve_trx_transfer_artifact_decision();
+  Preserve_snapshot_remove_options source_remove_options;
+  source_remove_options.defer_directory_fsync =
+      artifact_decision ==
+      Preserve_trx_transfer_artifact_decision::STANDBY_TRANSFER_SAVE;
   if (artifact_decision ==
       Preserve_trx_transfer_artifact_decision::UNSUPPORTED) {
     return reject_unsupported_for_delivery(
@@ -17843,7 +17919,7 @@ bool preserve_trx_kernel_preserve_attached_transaction(
             thd, trx, token, true, effective_snapshot_files_may_exist, false,
             &cleanup_failed, &left_preserved, &metadata,
             has_logged_binlog_cache, &rollback_binlog_snapshot,
-            &blob_descriptors)) {
+            &blob_descriptors, source_remove_options)) {
       if (left_preserved) {
         reset_thd_after_preserve_detach(thd);
         cleanup_original_binlog_cache_after_detach(thd, has_logged_binlog_cache);
@@ -17886,7 +17962,8 @@ bool preserve_trx_kernel_preserve_attached_transaction(
     if (cleanup_artifacts_may_exist) {
       const bool delete_failed =
           delete_preserved_snapshot_files_and_sidecars_or_log(
-              preserve_trx_default_dir(), token, &metadata);
+              preserve_trx_default_dir(), token, &metadata,
+              Temp_sidecar_cleanup_mode::METADATA_AWARE, source_remove_options);
       if (delete_failed) {
         auto store =
             create_preserved_trx_default_store(preserve_trx_default_dir());
@@ -18277,7 +18354,8 @@ bool preserve_trx_kernel_preserve_attached_transaction(
             thd, trx, token, true, true,
             durable_snapshot_may_exist || local_authority_committed,
             &cleanup_failed, &left_preserved, &metadata,
-            has_logged_binlog_cache, &binlog_snapshot, &blob_descriptors)) {
+            has_logged_binlog_cache, &binlog_snapshot, &blob_descriptors,
+            source_remove_options)) {
       if (left_preserved) {
         reset_thd_after_preserve_detach(thd);
         cleanup_original_binlog_cache_after_detach(thd, has_logged_binlog_cache);
@@ -18294,7 +18372,8 @@ bool preserve_trx_kernel_preserve_attached_transaction(
     if (result != nullptr && rollback_status != DB_SUCCESS)
       result->cleanup_failed_after_reattach = true;
     (void)delete_preserved_snapshot_files_and_sidecars_or_log(
-        preserve_trx_default_dir(), token, &metadata);
+        preserve_trx_default_dir(), token, &metadata,
+        Temp_sidecar_cleanup_mode::METADATA_AWARE, source_remove_options);
     reset_thd_after_preserve_detach(thd);
     cleanup_original_binlog_cache_after_detach(thd, has_logged_binlog_cache);
     preserve_trx_kill_connection(thd);
@@ -18631,6 +18710,8 @@ bool Preserve_trx_drain_service::execute(
     Preserve_trx_lock_warmcopy_options lock_warmcopy_options =
         preserve_trx_lock_warmcopy_current_options();
     lock_warmcopy_options.preserve_dir = preserve_trx_default_dir();
+    lock_warmcopy_options.process_local_artifacts =
+        standby_transfer_streaming_enabled;
     lock_warmcopy_options.compact_stable_page_record_store =
         bounded_pipeline_capture_requested;
     lock_warmcopy_participant =
@@ -19545,6 +19626,11 @@ bool Preserve_trx_drain_service::execute(
         binlog_config.initial_credit_bytes = std::max<uint64_t>(
             1, phase1_pipeline_config.binlog_reserve_bytes /
                    owner_parallelism);
+        binlog_config.minimum_delta_bytes = std::max<uint64_t>(
+            1, batch_transfer_phase1_options.max_batch_bytes /
+                   std::max<size_t>(1, phase1_declared_target_ids().size()));
+        binlog_config.wire_chunk_bytes =
+            transfer_runtime_policy.transfer_chunk_bytes;
         phase1_binlog_owner =
             std::make_unique<Preserve_trx_phase1_binlog_owner>(
                 binlog_config, phase1_pipeline.get(),
@@ -19586,7 +19672,21 @@ bool Preserve_trx_drain_service::execute(
     if (phase1_pipeline == nullptr || deadline_us == 0) return false;
     bool binlog_flushed = phase1_binlog_owner == nullptr ||
                           phase1_binlog_owner->baselines_complete();
+    bool finishing_ordinary = false;
+    bool ordinary_deadline_reached = false;
+#ifndef DBUG_OFF
+    uint64_t debug_progress_probe_started_us = 0;
+#endif
     for (;;) {
+      if (thd->killed || reset_requested()) return false;
+      if (!finishing_ordinary && preserve_trx_monotonic_us() >= deadline_us) {
+        finishing_ordinary = true;
+        ordinary_deadline_reached = true;
+        if (phase1_record_owner != nullptr)
+          phase1_record_owner->finish_ordinary_submissions();
+        if (phase1_binlog_owner != nullptr)
+          phase1_binlog_owner->finish_ordinary_submissions();
+      }
       bool progressed = false;
       if (phase1_binlog_owner != nullptr) {
         const Preserve_trx_phase1_binlog_owner_pump_status status =
@@ -19625,6 +19725,17 @@ bool Preserve_trx_drain_service::execute(
         settle_popped_result.commit();
       }
 
+      if (!finishing_ordinary &&
+          (phase1_record_owner == nullptr ||
+           phase1_record_owner->record_baselines_complete()) &&
+          (phase1_binlog_owner == nullptr ||
+           phase1_binlog_owner->initial_baselines_complete())) {
+        finishing_ordinary = true;
+        if (phase1_record_owner != nullptr)
+          phase1_record_owner->finish_ordinary_submissions();
+        if (phase1_binlog_owner != nullptr)
+          phase1_binlog_owner->finish_ordinary_submissions();
+      }
       if (phase1_record_owner != nullptr) {
         const Preserve_trx_phase1_owner_pump_status status =
             phase1_record_owner->submit_record(
@@ -19654,23 +19765,74 @@ bool Preserve_trx_drain_service::execute(
         }
       }
 
+      DBUG_EXECUTE_IF("preserve_trx_phase1_binlog_progress_probe", {
+        const uint64_t probe_now_us = preserve_trx_monotonic_us();
+        if (debug_progress_probe_started_us == 0)
+          debug_progress_probe_started_us = probe_now_us;
+        const auto probe = phase1_pipeline->snapshot();
+        if (probe_now_us - debug_progress_probe_started_us >= 100000 &&
+            probe.admitted == 1 && probe.inflight == 1 && probe.queued == 0 &&
+            probe.result_count == 0 && probe.active_operation_permits == 0) {
+          for (const uint64_t id : phase1_declared_target_ids()) {
+            Find_thd_with_id finder(static_cast<my_thread_id>(id));
+            THD *target = Global_THD_manager::get_instance()->find_thd(&finder);
+            if (target == nullptr) continue;
+            PrebuiltBinlogCacheBlob acked;
+            const bool found = batch_transfer_binlog_blob_provider != nullptr &&
+                batch_transfer_binlog_blob_provider->phase1_blob_for_thd(
+                    target, &acked);
+            mysql_mutex_unlock(&target->LOCK_thd_data);
+            if (!found) continue;
+            Preserve_trx_transfer_object_descriptor object;
+            object.object_id = acked.name;
+            object.kind = Preserve_trx_transfer_object_kind::EXTERNAL_BLOB;
+            object.total_size = acked.size;
+            object.digest = acked.digest;
+            if (!batch_transfer_source_session->object_presealed_for_token(
+                    id, object)) continue;
+            const char hex[] = "0123456789abcdef";
+            std::string digest;
+            for (const auto byte : acked.digest) {
+              digest += hex[byte >> 4];
+              digest += hex[byte & 15];
+            }
+            const std::string action = "now SIGNAL continuous_ack_" +
+                std::to_string(id) + "_" + std::to_string(acked.size) + "_" +
+                digest;
+            DBUG_ASSERT(!debug_sync_set_action(thd, action.data(),
+                                               action.size()));
+          }
+          DEBUG_SYNC(thd, "preserve_trx_phase1_binlog_progress_opportunity");
+        }
+      });
+
       const bool record_complete =
           phase1_record_owner == nullptr ||
           phase1_record_owner->record_baselines_complete();
       const bool binlog_complete =
           phase1_binlog_owner == nullptr ||
           phase1_binlog_owner->baselines_complete();
-      if (record_complete && binlog_complete) return true;
+      if (record_complete && binlog_complete) {
+        if (warmcopy_participant != nullptr &&
+            !warmcopy_participant->provider()->finish_bounded_preparations(
+                phase1_pipeline_config.attempt_id)) {
+          return false;
+        }
+        if (ordinary_deadline_reached && phase1_binlog_owner != nullptr)
+          phase1_binlog_owner->log_event("ORDINARY_GRACE_DRAINED");
+        return true;
+      }
 
       const uint64_t now_us = preserve_trx_monotonic_us();
-      if (now_us >= deadline_us) return false;
       if (!progressed) {
         const Preserve_trx_phase1_pipeline_snapshot current =
             phase1_pipeline->snapshot();
         uint64_t ignored_revision = 0;
         (void)phase1_pipeline->wait_for_change(
             current.event_revision,
-            std::min<uint64_t>(deadline_us - now_us, 1000ULL),
+            now_us < deadline_us
+                ? std::min<uint64_t>(deadline_us - now_us, 1000ULL)
+                : 1000ULL,
             &ignored_revision);
       }
     }
@@ -19906,7 +20068,7 @@ bool Preserve_trx_drain_service::execute(
     const Preserve_trx_phase1_readiness_result readiness_result =
         dependency_phase2_scheduler_enabled
             ? preserve_trx_wait_for_dependency_phase2_readiness(
-                  thd, phase1_readiness_deadline_us, active_drain_attempt,
+                  thd, phase2_timeout_ms, active_drain_attempt,
                   &readiness_metrics, active_binlog_progress,
                   active_binlog_progress_next_due_us,
                   &dependency_phase2_attempt)

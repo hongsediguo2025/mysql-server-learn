@@ -49,6 +49,8 @@ my $lock_path = File::Spec->catfile($source_root, 'storage', 'innobase',
 my $lock_preserve_path = File::Spec->catfile($source_root, 'storage',
                                              'innobase', 'lock',
                                              'lock0preserve.cc');
+my $lock_preserve_capture_header_path = File::Spec->catfile(
+  $source_root, 'storage', 'innobase', 'include', 'lock0preserve_capture.h');
 my $lock_header_path = File::Spec->catfile($source_root, 'storage', 'innobase',
                                            'include', 'lock0lock.h');
 my $lock_priv_ic_path = File::Spec->catfile($source_root, 'storage',
@@ -135,6 +137,7 @@ my $resurrection_index = read_source($resurrection_index_path);
 my $resurrection_index_header = read_source($resurrection_index_header_path);
 my $lock = read_source($lock_path);
 my $lock_preserve = read_source($lock_preserve_path);
+my $lock_preserve_capture_header = read_source($lock_preserve_capture_header_path);
 my $lock_header = read_source($lock_header_path);
 my $lock_priv_ic = read_source($lock_priv_ic_path);
 my $lock_warmcopy = read_source($lock_warmcopy_path);
@@ -647,19 +650,41 @@ $binlog_warmcopy =~
   /bool begin\s*\(\s*bool\s*\*\s*has_blob\s*\)\s*\{[\s\S]*?^  \}/m
   or die "could not isolate Mysql_binlog_warmcopy_session::begin\n";
 my $binlog_warmcopy_session_begin = $&;
-die "active binlog mirror install must run the complete source eligibility check and only relax in-flight statement state\n"
+$binlog_warmcopy =~
+  /Mysql_binlog_warmcopy_begin_step_status begin_step\s*\(\s*bool\s*\*\s*has_blob\s*\)\s*\{[\s\S]*?^  \}/m
+  or die "could not isolate Mysql_binlog_warmcopy_session::begin_step\n";
+my $binlog_warmcopy_session_begin_step = $&;
+$binlog_warmcopy =~
+  /Mysql_binlog_warmcopy_begin_step_status initialize_begin\s*\(\s*\)\s*\{[\s\S]*?^  \}/m
+  or die "could not isolate Mysql_binlog_warmcopy_session::initialize_begin\n";
+my $binlog_warmcopy_session_initialize = $&;
+die "both binlog mirror entry points must initialize eligibility before copying the prefix\n"
   unless $binlog_warmcopy_session_begin =~
+           /status\s*=\s*initialize_begin\(\)[\s\S]*copy_initial_prefix_step/s &&
+         $binlog_warmcopy_session_begin_step =~
+           /m_begin_initialized\s*\?\s*Mysql_binlog_warmcopy_begin_step_status::MORE\s*:\s*initialize_begin\(\)[\s\S]*copy_initial_prefix_step/s;
+die "active binlog mirror install must run the complete source eligibility check and only relax in-flight statement state\n"
+  unless $binlog_warmcopy_session_initialize =~
            /mysql_binlog_warmcopy_source_eligible\s*\([\s\S]*m_allow_inflight_statement\s*\)/s;
+die "ineligible binlog sources must be rejected before creating or installing a mirror\n"
+  unless $binlog_warmcopy_session_initialize =~
+           /mysql_binlog_warmcopy_source_eligible[\s\S]*if\s*\(\s*!source_eligible\s*\)\s*return\s+Mysql_binlog_warmcopy_begin_step_status::NOT_ELIGIBLE\s*;[\s\S]*create_warm_external_blob_writer[\s\S]*mysql_binlog_warmcopy_source_install_mirror/s;
 die "active binlog mirror install must not bypass source eligibility\n"
-  if $binlog_warmcopy_session_begin =~
+  if $binlog_warmcopy_session_initialize =~
        /if\s*\(\s*!\s*m_allow_inflight_statement\s*\)[\s\S]*mysql_binlog_warmcopy_source_eligible/s;
 
 $lock_preserve =~ /static dberr_t lock_preserve_import_record_lock[\s\S]*?^}/m
   or die "could not isolate lock_preserve_import_record_lock\n";
 my $preserve_import_record_lock = $&;
+$lock_preserve_capture_header =~
+  /struct\s+lock_preserve_phase1_record_entry\s*\{[\s\S]*?^\};/m
+  or die "could not isolate lock_preserve_phase1_record_entry\n";
+my $preserve_record_lock_entry = $&;
 die "preserved record-lock entry must cache bitmap set-bit stats for startup import; full lock-heavy recovery cannot repeatedly rescan each page bitmap\n"
   unless $lock_preserve =~
-         /struct\s+Preserve_record_lock_entry\s*\{[\s\S]*set_bits[\s\S]*first_set_heap_no[\s\S]*max_set_heap_no[\s\S]*\};/s;
+           /using\s+Preserve_record_lock_entry\s*=\s*lock_preserve_phase1_record_entry\s*;/s &&
+         $preserve_record_lock_entry =~
+           /\bset_bits\b[\s\S]*\bfirst_set_heap_no\b[\s\S]*\bmax_set_heap_no\b/s;
 die "preserved record-lock import must fail closed when intention-lock resurrect sees an incompatible table lock\n"
   unless $preserve_import_record_lock =~
          /lock_preserve_create_table_lock_for_import[\s\S]*if\s*\(\s*table_err\s*!=\s*DB_SUCCESS\s*\)[\s\S]*return\s+table_err/s;
@@ -2459,15 +2484,18 @@ die "Slice 2 committed sidecars must not be deleted before the main snapshot unl
 die "Slice 2 SQL success cleanup must not directly delete temp-table sidecars after store removal\n"
   unless $delete_snapshot !~
          /preserve_trx_temp_table_remove_token_sidecars/s;
+$preserve =~ /auto reject_after_snapshot_failure\b[\s\S]*?^  \};/m
+  or die "could not isolate reject_after_snapshot_failure\n";
+my $reject_after_snapshot_failure = $&;
 die "Slice 2 snapshot-failure cleanup must use unified token removal, not direct temp sidecar deletion\n"
-  unless $preserve =~
-         /reject_after_snapshot_failure[\s\S]*delete_preserved_snapshot_files_and_sidecars_or_log\s*\(\s*preserve_trx_default_dir\(\)\s*,\s*token\s*,\s*&metadata\s*\)/s &&
-         $preserve =~
-         /reject_after_snapshot_failure[\s\S]*store->mark_tainted\s*\(\s*token\s*,\s*"[^"]+"\s*\)/s &&
-         $preserve !~
-         /reject_after_snapshot_failure[\s\S]*write_failure_delete_status\s*==\s*Preserve_snapshot_delete_status::OK[\s\S]*delete_snapshot_files/s &&
-         $preserve !~
-         /reject_after_snapshot_failure[\s\S]*delete_preserved_temp_table_sidecars_by_token_or_log/s;
+  unless $reject_after_snapshot_failure =~
+         /delete_preserved_snapshot_files_and_sidecars_or_log\s*\(\s*preserve_trx_default_dir\(\)\s*,\s*token\s*,\s*&metadata\s*,\s*Temp_sidecar_cleanup_mode::METADATA_AWARE\s*,\s*source_remove_options\s*\)/s &&
+         $reject_after_snapshot_failure =~
+         /store->mark_tainted\s*\(\s*token\s*,\s*"[^"]+"\s*\)/s &&
+         $reject_after_snapshot_failure !~
+         /write_failure_delete_status\s*==\s*Preserve_snapshot_delete_status::OK[\s\S]*delete_snapshot_files/s &&
+         $reject_after_snapshot_failure !~
+         /delete_preserved_temp_table_sidecars_by_token_or_log/s;
 die "Slice 2 bootstrap temp orphan cleanup must route through Preserved_trx_store remove_with_status\n"
   unless $preserve =~
          /delete_orphan_temp_table_sidecars_or_log[\s\S]*Preserved_trx_store\s*&store[\s\S]*store\.remove_with_status/s &&
@@ -2936,7 +2964,7 @@ die "binlog warmcopy lease publication and lock-free reads must use atomic share
          $binlog_ostream =~ /atomic_store_explicit\s*\(\s*&m_warmcopy_lease/s;
 die "lock warmcopy must pass the journal budget into phase1 admission\n"
   unless $sql_lock_warmcopy =~
-         /lock_warmcopy_open_epoch\s*\(\s*m_epoch\s*,\s*m_options\.max_journal_bytes\s*\)/s;
+         /lock_warmcopy_open_epoch\s*\(\s*m_epoch\s*,\s*m_options\.max_journal_bytes\s*,\s*m_options\.compact_stable_page_record_store\s*\?\s*lock_warmcopy_record_payload_mode_t::COMPACT_STABLE_PAGE\s*:\s*lock_warmcopy_record_payload_mode_t::IMAGE_IDENTITY\s*\)/s;
 die "record mirror mutation must reserve journal bytes before allocating a shard\n"
   unless $lock_warmcopy =~
          /record_bitmap_set_locked[\s\S]*record_target_admit_journal_delta_locked[\s\S]*find_or_create_record_shard/s;
@@ -3436,6 +3464,16 @@ my @rds_preserve_parameters = qw(
   rds_preserve_trx_transfer_runtime_profile
   rds_preserve_trx_transfer_prewarm_paused
   rds_preserve_trx_transfer_max_inflight_bytes
+  rds_preserve_trx_phase1_capture_mode
+  rds_preserve_trx_phase1_pipeline_workers
+  rds_preserve_trx_phase1_pipeline_ordinary_active_limit
+  rds_preserve_trx_phase1_pipeline_credit_bytes
+  rds_preserve_trx_phase1_pipeline_record_reserve_bytes
+  rds_preserve_trx_phase1_pipeline_binlog_reserve_bytes
+  rds_preserve_trx_phase1_pipeline_copy_chunk_bytes
+  rds_preserve_trx_phase1_pipeline_cleanup_reserve_us
+  rds_preserve_trx_phase1_pipeline_result_slots
+  rds_preserve_trx_phase1_pipeline_tail_record_credit_bytes
 );
 for my $parameter (@rds_preserve_parameters) {
   die "missing product parameter $parameter\n"
@@ -3445,8 +3483,8 @@ for my $parameter (@rds_preserve_parameters) {
 my @registered_rds_parameters =
   $sys_vars =~
     /static\s+Sys_var_[A-Za-z0-9_]+\s+Sys_[A-Za-z0-9_]+\s*\(\s*"(rds_preserve_trx_[a-z0-9_]+)"/sg;
-die "Preserve product parameter surface must contain exactly 17 rds_ names\n"
-  unless @registered_rds_parameters == 17;
+die "Preserve product parameter surface must contain exactly 27 rds_ names\n"
+  unless @registered_rds_parameters == @rds_preserve_parameters;
 die "legacy Preserve sysvar registrations must be removed\n"
   if $sys_vars =~
     /static\s+Sys_var_[A-Za-z0-9_]+\s+Sys_[A-Za-z0-9_]+\s*\(\s*"preserve_trx_[a-z0-9_]+"/s;

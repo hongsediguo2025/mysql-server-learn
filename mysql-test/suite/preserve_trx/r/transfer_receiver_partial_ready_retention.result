@@ -1,0 +1,15 @@
+one_held_one_running
+1
+both_resources_prepared_before_deadline
+1
+include/wait_for_pattern_in_file.inc [PRESERVE: partial selection prepared expiry pass completed]
+selected_ready_token
+1
+deadline_failed_token
+1
+selected_ready_resources_retained
+1
+late_result_does_not_change_selection
+1
+selected_resources_still_retained
+1

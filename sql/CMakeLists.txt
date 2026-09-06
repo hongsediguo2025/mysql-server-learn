@@ -449,6 +449,7 @@ SET(SQL_SHARED_SOURCES
   preserve_trx_phase1_publication.cc
   preserve_trx_promotion.cc
   preserve_trx_promotion_prepared.cc
+  preserve_trx_receiver_binlog_prewarm.cc
   preserve_trx_resource.cc
   preserve_trx_resurrection_index.cc
   preserve_trx_rewrite.cc

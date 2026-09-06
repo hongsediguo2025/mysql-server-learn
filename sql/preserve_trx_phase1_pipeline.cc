@@ -16,6 +16,7 @@
 #include "sql/preserve_trx_phase1_pipeline.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <condition_variable>
@@ -32,6 +33,7 @@
 #include "mysql/components/services/log_builtins.h"
 #include "mysqld_error.h"
 #include "sql/current_thd.h"
+#include "sql/debug_sync.h"
 #include "sql/preserve_trx.h"
 #include "sql/preserve_trx_phase1_binlog_adapter.h"
 #include "sql/preserve_trx_phase1_publication.h"
@@ -367,7 +369,10 @@ class Preserve_trx_phase1_pipeline::Impl {
         status = Preserve_trx_phase1_pipeline_credit_status::NOT_ADMITTED;
       } else if (!work_still_valid_locked(*slot)) {
         status = Preserve_trx_phase1_pipeline_credit_status::CANCELLED;
-      } else if (deadline_reached_locked()) {
+      } else if (deadline_reached_locked() &&
+                 (slot->descriptor.final_generation ||
+                  slot->descriptor.family !=
+                      Preserve_trx_phase1_pipeline_family::BINLOG_CACHE)) {
         ++m_submit_deadline;
         status = Preserve_trx_phase1_pipeline_credit_status::DEADLINE;
       } else if (required_total_bytes <= slot->credit_bytes) {
@@ -536,7 +541,9 @@ class Preserve_trx_phase1_pipeline::Impl {
       if (m_lifecycle != Preserve_trx_phase1_pipeline_lifecycle::RUNNING ||
           m_phase2_deadline_published || !m_wait_permit_admission_open ||
           stage_started_us < m_config.phase1_started_us ||
-          stage_started_us >= m_stage_deadline_us || stage_started_us > now_us ||
+          stage_started_us > now_us || m_active_jobs != 0 ||
+          ordinary_outstanding_locked() != 0 ||
+          m_active_operation_permits != 0 || m_no_wait_active_operations != 0 ||
           !budget_addition_valid ||
           stage_deadline_us > maximum_stage_deadline_us ||
           !deadline_has_cleanup_reserve(stage_deadline_us)) {
@@ -724,6 +731,7 @@ class Preserve_trx_phase1_pipeline::Impl {
     result.operation_permit_budget_rejected =
         m_operation_permit_budget_rejected;
     result.operation_budget_overruns = m_operation_budget_overruns;
+    result.ordinary_binlog_slow_operations = m_ordinary_binlog_slow_operations;
     result.final_record_capture_operation_samples =
         m_final_record_capture_operation_samples;
     result.final_record_capture_operation_us_total =
@@ -902,9 +910,8 @@ class Preserve_trx_phase1_pipeline::Impl {
     note_family_demand(Preserve_trx_phase1_pipeline_family::BINLOG_CACHE, false);
 
     /*
-      Keep one ordinary descriptor queued while the owner publishes the T0
-      cutoff.  Publication must cancel the descriptor in the same critical
-      section that closes ordinary dequeue; begin_finalizing() is too late.
+      T0 must reject outstanding ordinary work without changing its deadline
+      or revision. The owner first drains that batch, then publishes T0.
     */
     {
       std::lock_guard<std::mutex> guard(m_mutex);
@@ -928,18 +935,29 @@ class Preserve_trx_phase1_pipeline::Impl {
       passed = passed &&
                !publish_stage_deadline(phase2_started_us, final_deadline + 1);
     }
-    passed = passed &&
-             publish_stage_deadline(phase2_started_us, final_deadline);
+    const auto before_cutoff = snapshot();
     passed = passed &&
              !publish_stage_deadline(phase2_started_us, final_deadline);
     const Preserve_trx_phase1_pipeline_snapshot after_cutoff = snapshot();
-    passed = passed && after_cutoff.queued == 0 &&
-             after_cutoff.result_count == 1 &&
+    passed = passed && after_cutoff.queued == before_cutoff.queued &&
+             after_cutoff.cancel_revision == before_cutoff.cancel_revision &&
+             after_cutoff.operation_cutoff_us ==
+                 before_cutoff.operation_cutoff_us &&
              after_cutoff.invariant_failures == 0;
+    {
+      std::lock_guard<std::mutex> guard(m_mutex);
+      m_debug_prepare_results = true;
+      m_debug_hold_executors = false;
+      advance_revision_locked();
+    }
+    m_condition.notify_all();
     passed = passed && drop_debug_results(1, kDebugExerciseTimeoutUs);
+    passed = passed && publish_stage_deadline(phase2_started_us, final_deadline);
+    passed = passed && !publish_stage_deadline(phase2_started_us, final_deadline);
     passed = passed && begin_finalizing();
     {
       std::lock_guard<std::mutex> guard(m_mutex);
+      m_debug_prepare_results = false;
       m_debug_hold_executors = false;
       advance_revision_locked();
     }
@@ -1129,9 +1147,7 @@ class Preserve_trx_phase1_pipeline::Impl {
         m_config.no_wait_worst_case_us > m_config.cleanup_reserve_us ||
         m_config.record_store_snapshot_worst_case_us >
             m_config.cleanup_reserve_us ||
-        m_config.stage_deadline_us <= m_config.phase1_started_us ||
-        m_config.stage_deadline_us - m_config.phase1_started_us <=
-            m_config.cleanup_reserve_us) {
+        m_config.stage_deadline_us <= m_config.phase1_started_us) {
       return false;
     }
     if (m_config.record_reserve_bytes > m_config.credit_bytes ||
@@ -1159,8 +1175,7 @@ class Preserve_trx_phase1_pipeline::Impl {
       return false;
     }
     m_stage_deadline_us = m_config.stage_deadline_us;
-    m_operation_cutoff_us =
-        m_config.stage_deadline_us - m_config.cleanup_reserve_us;
+    m_operation_cutoff_us = m_config.stage_deadline_us;
     return true;
   }
 
@@ -1229,7 +1244,8 @@ class Preserve_trx_phase1_pipeline::Impl {
       started_us = monotonic_us();
       if (worst_case_us == 0 || m_operation_cutoff_us == 0 ||
           started_us >= m_operation_cutoff_us ||
-          worst_case_us > m_operation_cutoff_us - started_us) {
+          (final_generation &&
+           worst_case_us > m_operation_cutoff_us - started_us)) {
         ++m_operation_permit_budget_rejected;
         advance_revision_locked();
         status = Phase1_pipeline_operation_status::DEADLINE;
@@ -1309,8 +1325,17 @@ class Preserve_trx_phase1_pipeline::Impl {
         note_final_record_operation_locked(stage, final_generation,
                                            elapsed_us, overrun);
         if (overrun) {
-          ++m_operation_budget_overruns;
-          enter_canceling_locked();
+          // Synchronous prefix I/O has no hard wall-time bound. A slow
+          // ordinary prepare is not corruption; cancellation still wins.
+          if (finished_us >= started_us && !final_generation &&
+              kind == Preserve_trx_phase1_pipeline_operation_kind::
+                          NATIVE_WAIT_CAPABLE &&
+              stage == Phase1_pipeline_operation_stage::BINLOG_PREPARE) {
+            ++m_ordinary_binlog_slow_operations;
+          } else {
+            ++m_operation_budget_overruns;
+            enter_canceling_locked();
+          }
         }
       }
       advance_revision_locked();
@@ -1553,6 +1578,12 @@ class Preserve_trx_phase1_pipeline::Impl {
         }
       }
 
+      DBUG_EXECUTE_IF("preserve_trx_phase1_record_handoff_delay", {
+        if (!final_generation &&
+            capture_outcome.status ==
+                Preserve_trx_phase1_pipeline_result_status::PREPARED)
+          std::this_thread::sleep_for(std::chrono::milliseconds(3500));
+      });
       {
         std::lock_guard<std::mutex> guard(m_mutex);
         note_record_capture_latch_locked(capture_outcome);
@@ -1737,7 +1768,9 @@ class Preserve_trx_phase1_pipeline::Impl {
             context.admission_id = token;
             context.cancel_revision = revision;
             Preserve_trx_phase1_binlog_adapter_control control;
-            control.deadline_us = operation_deadline_us;
+            // Admission is bounded by Phase1. Finish this immutable prefix
+            // after expiry, but keep all chunk cancellation checks active.
+            control.deadline_us = 0;
             control.copy_chunk_bytes = m_config.copy_chunk_bytes;
             control.cancel_probe = &Impl::adapter_cancel_probe;
             control.cancel_context = &context;
@@ -1753,10 +1786,30 @@ class Preserve_trx_phase1_pipeline::Impl {
               preserve_trx_phase1_binlog_adapter_prepare(
                   worker_thd, descriptor, m_binlog_provider, control,
                   &binlog_prepare_outcome);
+              if (binlog_prepare_outcome.status ==
+                  Preserve_trx_phase1_pipeline_result_status::PREPARED) {
+                DBUG_EXECUTE_IF("preserve_trx_phase1_binlog_slow_prepare", {
+                  std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+                });
+              }
             }
           }
         }
       }
+
+      DBUG_EXECUTE_IF("preserve_trx_phase1_hold_second_binlog_baseline", {
+        if (family == Preserve_trx_phase1_pipeline_family::BINLOG_CACHE &&
+            !descriptor.binlog_prefix_progress &&
+            binlog_prepare_outcome.status ==
+                Preserve_trx_phase1_pipeline_result_status::PREPARED &&
+            m_debug_prepared_binlog_count.fetch_add(1) == 1) {
+          const char action[] =
+              "now SIGNAL continuous_baseline_held "
+              "WAIT_FOR continuous_baseline_continue TIMEOUT 60";
+          DBUG_ASSERT(!debug_sync_set_action(worker_thd,
+                                             STRING_WITH_LEN(action)));
+        }
+      });
 
       {
         std::lock_guard<std::mutex> guard(m_mutex);
@@ -1877,6 +1930,14 @@ class Preserve_trx_phase1_pipeline::Impl {
          descriptor.family !=
              Preserve_trx_phase1_pipeline_family::RECORD_LOCK ||
          descriptor.expected_store_baseline_generation == 0)) {
+      return false;
+    }
+    if (descriptor.binlog_prefix_progress &&
+        (final_generation || descriptor.family !=
+             Preserve_trx_phase1_pipeline_family::BINLOG_CACHE ||
+         descriptor.binlog_prefix_size == 0 ||
+         descriptor.binlog_minimum_delta_bytes == 0 ||
+         descriptor.binlog_wire_chunk_bytes == 0)) {
       return false;
     }
     return !final_generation ||
@@ -2491,6 +2552,8 @@ class Preserve_trx_phase1_pipeline::Impl {
             << current.operation_permit_budget_rejected
             << " operation_budget_overruns="
             << current.operation_budget_overruns
+            << " ordinary_binlog_slow_operations="
+            << current.ordinary_binlog_slow_operations
             << " final_record_capture_operation_samples="
             << current.final_record_capture_operation_samples
             << " final_record_capture_operation_us_total="
@@ -2599,6 +2662,10 @@ class Preserve_trx_phase1_pipeline::Impl {
   uint64_t m_operation_permits_started{0};
   uint64_t m_operation_permit_budget_rejected{0};
   uint64_t m_operation_budget_overruns{0};
+  uint64_t m_ordinary_binlog_slow_operations{0};
+#ifndef DBUG_OFF
+  std::atomic<uint32_t> m_debug_prepared_binlog_count{0};
+#endif
   uint64_t m_final_record_capture_operation_samples{0};
   uint64_t m_final_record_capture_operation_us_total{0};
   uint64_t m_final_record_capture_operation_us_max{0};

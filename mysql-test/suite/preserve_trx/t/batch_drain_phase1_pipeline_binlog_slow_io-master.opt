@@ -1,0 +1,2 @@
+--rds-preserve-trx-standby-phase2-scheduler-mode=DEPENDENCY_CONVERGENCE_V1
+--rds-preserve-trx-phase1-capture-mode=BOUNDED_PIPELINE_V1

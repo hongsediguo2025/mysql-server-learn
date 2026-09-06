@@ -1,0 +1,81 @@
+--source include/have_debug.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+
+--disable_query_log
+--disable_result_log
+--let $credential_file= $MYSQL_TMP_DIR/source-scratch-no-fsync.secret
+--write_file $credential_file
+source-scratch-no-fsync-secret
+EOF
+--exec chmod 600 $credential_file
+
+--connect(scratch_receiver,127.0.0.1,root,,test,$SERVER_MYPORT_2,)
+CREATE USER preserve_trx_ha_admin@localhost IDENTIFIED BY 'source-scratch-no-fsync-secret';
+GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+GRANT PROCESS ON *.* TO preserve_trx_ha_admin@localhost;
+
+--connection default
+CREATE USER preserve_trx_ha_admin@localhost IDENTIFIED BY 'source-scratch-no-fsync-secret';
+GRANT SHUTDOWN, SYSTEM_VARIABLES_ADMIN, PRESERVE_TRX_TRANSFER_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+GRANT PROCESS ON *.* TO preserve_trx_ha_admin@localhost;
+CREATE USER scratch_app@localhost;
+GRANT SELECT, UPDATE ON test.* TO scratch_app@localhost;
+
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$SERVER_MYPORT_2 --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=source_scratch --rds-preserve-trx-transfer-credential-secret-file=$credential_file --rds-preserve-trx-phase1-capture-mode=BOUNDED_PIPELINE_V1 --log-error-verbosity=3
+--source include/restart_mysqld.inc
+--let $restart_parameters=
+--disable_query_log
+--disable_result_log
+
+CREATE TABLE t_source_scratch(id INT PRIMARY KEY, v INT NOT NULL) ENGINE=InnoDB;
+INSERT INTO t_source_scratch VALUES(1,10),(2,20),(3,30),(4,40);
+--connect(scratch_control,localhost,preserve_trx_ha_admin,source-scratch-no-fsync-secret,test)
+--connect(scratch_source,localhost,scratch_app,,test)
+START TRANSACTION;
+UPDATE t_source_scratch SET v=v+7 WHERE id BETWEEN 1 AND 4;
+
+--connection default
+# Fail only the real warm-body fsync branch. An otherwise identical transfer
+# must still preserve the source transaction and be accepted by the receiver.
+SET GLOBAL debug='+d,preserve_trx_fail_warmcopy_blob_close_sync';
+SET SESSION debug='+d,preserve_trx_fail_warmcopy_blob_close_sync';
+DRAIN TRANSACTIONS PRESERVE;
+
+--connection scratch_receiver
+--enable_result_log
+SELECT VARIABLE_VALUE=1 AS one_accepted_epoch
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs';
+--disable_result_log
+
+--connection scratch_source
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT * FROM t_source_scratch;
+--connection scratch_control
+--enable_result_log
+SELECT 1 AS source_connection_retained;
+--disable_result_log
+
+# Restart clears the injected debug setting.
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+SHUTDOWN;
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+--disable_query_log
+--disable_result_log
+
+--connect(scratch_cleanup,localhost,root,,test)
+DROP TABLE t_source_scratch;
+DROP USER preserve_trx_ha_admin@localhost, scratch_app@localhost;
+--connection scratch_receiver
+DROP USER preserve_trx_ha_admin@localhost;
+--connection scratch_cleanup
+--remove_file $credential_file
+--enable_result_log
+--enable_query_log

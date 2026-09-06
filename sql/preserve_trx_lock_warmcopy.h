@@ -50,6 +50,8 @@ class MDL_context;
 struct Preserve_trx_lock_warmcopy_options {
   bool enabled{true};
   bool fallback_to_live_export{true};
+  /* Source transfer scratch is not a restart-recoverable local snapshot. */
+  bool process_local_artifacts{false};
   /* Bounded Phase1 keeps record identity as page plus native heap bitmap. */
   bool compact_stable_page_record_store{false};
   /*

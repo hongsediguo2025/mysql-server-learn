@@ -116,6 +116,14 @@ class IO_CACHE_binlog_cache_storage : public Truncatable_ostream {
      Returns the count of calling temporary file's write()
   */
   size_t disk_writes() const;
+  /* Detached Preserve builder only: call after successful sequential writes,
+     before any read/truncate. Excludes the still-buffered IO_CACHE suffix. */
+  my_off_t preserve_written_prefix_bytes() const {
+    return m_io_cache.type == WRITE_CACHE && m_io_cache.file >= 0 &&
+                   m_io_cache.error == 0
+               ? m_io_cache.pos_in_file
+               : 0;
+  }
 
   /**
      Initializes binlog cache for reading and returns the data at the begin.
@@ -226,6 +234,9 @@ class Binlog_cache_storage : public Basic_ostream {
      Returns the count of disk writes
   */
   size_t disk_writes() const { return m_file.disk_writes(); }
+  my_off_t preserve_written_prefix_bytes() const {
+    return m_file.preserve_written_prefix_bytes();
+  }
   /**
      Returns the name of the temporary file.
   */

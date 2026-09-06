@@ -111,6 +111,7 @@ class FullPressureProfile:
     continuous_large_tx_shape: str = ""
     continuous_large_tx_no_commit: bool = False
     business_command_latency_limit_us: int = 0
+    receiver_transfer_max_inflight_bytes: Optional[int] = None
 
     @property
     def source_tiered_load_threads(self) -> int:
@@ -178,6 +179,43 @@ SMOKE_PROFILE = dataclasses.replace(
     receiver_buffer_pool_bytes=512 * 1024**2,
     source_phase2_limit_us=5_000_000,
     ready_after_final_spool_ack_limit_us=2_000_000,
+    receiver_read_load_threads=2,
+    receiver_read_load_baseline_s=1.0,
+    preserve_timeout_s=300,
+    startup_timeout_s=120,
+    shutdown_timeout_s=180,
+    resume_timeout_s=300,
+)
+
+# Only the ordinary transfer entry point changes; static/tiered callers retain
+# FULL_PROFILE and its deterministic lockset contract.
+TRANSFER_FULL_PROFILE = dataclasses.replace(
+    FULL_PROFILE,
+    name="continuous-lockset-full",
+    business_run_before_drain_s=300.0,
+    continuous_large_tx_shape="LOCKSET",
+    business_transaction_isolation="REPEATABLE-READ",
+    # Match the existing transfer harness values explicitly in the checklist.
+    drain_phase1_timeout_ms=600_000,
+    business_command_latency_limit_us=1_000_000,
+    phase1_capture_mode="BOUNDED_PIPELINE_V1",
+    scheduler_strict_interval_limit_us=2_000_000,
+    source_phase2_limit_us=2_000_000,
+)
+
+TRANSFER_SMOKE_PROFILE = dataclasses.replace(
+    TRANSFER_FULL_PROFILE,
+    name="continuous-lockset-smoke",
+    sessions=8,
+    tables=4,
+    statements_per_tx=10_000,
+    seed_rows_per_table_per_session=10_000,
+    lockset_batch_size=10_000,
+    business_run_before_drain_s=5.0,
+    source_buffer_pool_bytes=SMOKE_PROFILE.source_buffer_pool_bytes,
+    receiver_buffer_pool_bytes=SMOKE_PROFILE.receiver_buffer_pool_bytes,
+    source_phase2_limit_us=5_000_000,
+    scheduler_strict_interval_limit_us=5_000_000,
     receiver_read_load_threads=2,
     receiver_read_load_baseline_s=1.0,
     preserve_timeout_s=300,
@@ -810,6 +848,13 @@ def build_mysqld_commands(
         f"--log-bin={paths.receiver_root / 'mysql-bin'}",
         f"--innodb-buffer-pool-size={profile.receiver_buffer_pool_bytes}",
     ]
+    if profile.receiver_transfer_max_inflight_bytes is not None:
+        option = "--rds-preserve-trx-transfer-max-inflight-bytes="
+        receiver = [
+            f"{option}{profile.receiver_transfer_max_inflight_bytes}"
+            if arg.startswith(option) else arg
+            for arg in receiver
+        ]
     return source, receiver
 
 
@@ -1080,6 +1125,15 @@ def build_e2e_command(
         ]
     )
     if evidence == "transfer-phase2":
+        if profile.continuous_large_tx_shape == "LOCKSET":
+            command.extend([
+                "--continuous-business-through-drain",
+                "--continuous-large-tx-shape", "LOCKSET",
+                "--business-transaction-isolation", profile.business_transaction_isolation,
+                "--business-run-before-drain", str(profile.business_run_before_drain_s),
+                "--business-command-latency-limit-us", str(profile.business_command_latency_limit_us),
+                "--allow-partial-tokens",
+            ])
         return command
 
     if evidence == "continuous-tiered-transfer":
@@ -1406,6 +1460,11 @@ def build_acceptance_contract(
             "steady_run_seconds": profile.sysbench_runtime_s,
             "workload": "oltp_write_only",
             "reconnect": False,
+            "cutoff_behavior": "HOLD_ORIGINAL_CONNECTION",
+            "all_workers_must_hold_after_4020": True,
+            "original_connection_ids_must_match": True,
+            "controlled_stop_signal": "SIGTERM",
+            "sysbench_fatal_line_count": 0,
             "drain_success_required": True,
             "receiver_epoch_required": True,
             "strict_interval_us_max": (
@@ -1634,7 +1693,7 @@ def build_acceptance_contract(
                 / profile.mixed_min_started_sessions
             ),
         }
-    return {
+    contract = {
         "source_phase2_total_us_max": profile.source_phase2_limit_us,
         "receiver_readiness_contract": "READY",
         "receiver_epoch_storage": "PROCESS_LOCAL",
@@ -1666,6 +1725,26 @@ def build_acceptance_contract(
             profile.receiver_read_load_max_p99_increase_pct
         ),
     }
+    if profile.continuous_large_tx_shape == "LOCKSET":
+        for field in (
+            "ready_tokens", "record_lock_count_min",
+            "receiver_read_load_qps_drop_pct_max",
+            "receiver_read_load_p99_increase_pct_max",
+        ):
+            contract.pop(field)
+        contract.update({
+            "business_window_seconds": profile.business_run_before_drain_s,
+            "transaction_commit_policy": "COMMIT_AND_RESTART",
+            "harness_checkpoint_before_drain": False,
+            "ready_tokens": "all structured DRAIN survivors",
+            "record_lock_count": "observed; not a fixed survivor-independent minimum",
+            "cutoff_behavior": "HOLD_ALL_ORIGINAL_CONNECTIONS",
+            "business_tps_and_receiver_read_impact": "report_only",
+            "phase1_batch_efficiency": "report_only; transaction lifetimes are dynamic",
+            "strict_interval_us_max": profile.scheduler_strict_interval_limit_us,
+            "last_command_end_to_final_ack_us_strictly_below": profile.source_post_command_tail_limit_us,
+        })
+    return contract
 
 
 def build_checklist(
@@ -3114,6 +3193,54 @@ def validate_e2e_report(
             failures.append("a steady report did not retain all threads")
         if any(float(item.get("reconnects_per_s", -1)) != 0.0 for item in reports):
             failures.append("a steady report observed reconnects")
+        if any(
+            float(item.get("tps", 0.0)) <= 0.0
+            or float(item.get("qps", 0.0)) <= 0.0
+            for item in reports
+        ):
+            failures.append("a steady report is missing positive TPS/QPS")
+        if (
+            float(workload.get("steady_tps_avg", 0.0)) <= 0.0
+            or float(workload.get("steady_qps_avg", 0.0)) <= 0.0
+            or int(workload.get("steady_transactions_estimate", 0)) <= 0
+            or int(workload.get("steady_queries_estimate", 0)) <= 0
+        ):
+            failures.append("sysbench steady throughput summary is empty")
+        hold_count = int(workload.get("cutoff_4020_hold_count", -1))
+        retained_count = int(
+            workload.get("connections_retained_after_4020", -1)
+        )
+        expected_thread_ids = list(range(profile.sessions))
+        held_thread_ids = workload.get("cutoff_4020_held_thread_ids")
+        pre_drain_connection_ids = workload.get("pre_drain_connection_ids")
+        post_drain_connection_ids = workload.get("post_drain_connection_ids")
+        if workload.get("cutoff_4020_observed") is not True:
+            failures.append("no 4020 cutoff was observed")
+        if hold_count != profile.sessions:
+            failures.append(
+                "not all sysbench workers held after 4020: "
+                f"expected={profile.sessions} actual={hold_count}"
+            )
+        if held_thread_ids != expected_thread_ids:
+            failures.append("4020 HOLD worker identities are incomplete")
+        if retained_count != hold_count:
+            failures.append(
+                "4020 workers did not retain their original connections: "
+                f"held={hold_count} retained={retained_count}"
+            )
+        if (
+            workload.get("original_connection_ids_retained") is not True
+            or pre_drain_connection_ids != post_drain_connection_ids
+        ):
+            failures.append("original sysbench connection IDs were not retained")
+        if int(workload.get("fatal_line_count", -1)) != 0:
+            failures.append("sysbench emitted a FATAL line")
+        if workload.get("controlled_stop_after_hold_verification") is not True:
+            failures.append("sysbench was not stopped after HOLD verification")
+        if int(workload.get("returncode_after_drain", 0)) != -signal.SIGTERM:
+            failures.append(
+                "sysbench did not exit through the controlled SIGTERM path"
+            )
         if int(workload.get("steady_window_us", 0)) < int(
             profile.sysbench_runtime_s * 950_000
         ):
@@ -3189,6 +3316,14 @@ def validate_e2e_report(
             "runtime_seconds": profile.sysbench_runtime_s,
             "transactions": int(workload.get("transactions", 0)),
             "queries": int(workload.get("queries", 0)),
+            "steady_transactions_estimate": int(
+                workload.get("steady_transactions_estimate", 0)
+            ),
+            "steady_queries_estimate": int(
+                workload.get("steady_queries_estimate", 0)
+            ),
+            "steady_tps_avg": float(workload.get("steady_tps_avg", 0.0)),
+            "steady_qps_avg": float(workload.get("steady_qps_avg", 0.0)),
             "receiver_epoch_delta": int(report.get("receiver_epoch_delta", 0)),
         }
     if evidence == "dependency-mixed-transfer":
@@ -3248,8 +3383,13 @@ def validate_e2e_report(
         profile.seed_rows_per_table_per_session,
     )
     require_equal("workload_lockset_batch_size", profile.lockset_batch_size)
-    require_equal("standby_tokens", profile.sessions)
-    require_equal("receiver_ready_tokens", profile.sessions)
+    continuous_lockset = profile.continuous_large_tx_shape == "LOCKSET"
+    expected_tokens = profile.sessions
+    if continuous_lockset:
+        validate_continuous_lockset_report(profile, report)
+        expected_tokens = int(report["standby_transfer_survivor_count"])
+    require_equal("standby_tokens", expected_tokens)
+    require_equal("receiver_ready_tokens", expected_tokens)
     require_equal("receiver_not_ready_tokens", 0)
     require_equal("receiver_record_cold_gets", 0)
     require_equal("receiver_prewarm_backlog_at_phase2_end", 0)
@@ -3261,9 +3401,10 @@ def validate_e2e_report(
     require_equal("receiver_epoch_fact_count", 0)
     require_equal("receiver_epoch_commit_count", 0)
     require_equal("receiver_epoch_ready_bind_attempts", 1)
-    require_equal("receiver_seal_prewarm_tokens", profile.sessions)
-    require_equal("receiver_seal_prewarm_success_tokens", profile.sessions)
-    require_equal("receiver_record_object_prewarm_count", profile.sessions)
+    if not continuous_lockset:
+        require_equal("receiver_seal_prewarm_tokens", profile.sessions)
+        require_equal("receiver_seal_prewarm_success_tokens", profile.sessions)
+        require_equal("receiver_record_object_prewarm_count", profile.sessions)
     require_equal("receiver_record_lock_page_count", 0)
     require_equal("receiver_record_lock_resident_pages", 0)
     require_equal("receiver_record_lock_required_residency_bytes", 0)
@@ -3338,7 +3479,7 @@ def validate_e2e_report(
             f"actual={ready_us}"
         )
     expected_record_locks = profile.sessions * profile.lockset_batch_size
-    if record_locks < expected_record_locks:
+    if not continuous_lockset and record_locks < expected_record_locks:
         failures.append(
             "phase2_record_lock_count_samples: "
             f"minimum={expected_record_locks} actual={record_locks}"
@@ -3352,11 +3493,13 @@ def validate_e2e_report(
         failures.append(
             f"receiver lock-plan budget exceeded: peak={lock_plan_peak} cap={lock_plan_cap}"
         )
-    if batch_tokens_avg <= 1:
+    if not continuous_lockset and batch_tokens_avg <= 1:
         failures.append(
             f"source_phase1_record_batch_tokens_avg must exceed 1: actual={batch_tokens_avg}"
         )
-    if frame_count <= 0 or network_sends * 4 > frame_count:
+    if frame_count <= 0:
+        failures.append("phase1 transfer frame evidence is empty")
+    elif not continuous_lockset and network_sends * 4 > frame_count:
         failures.append(
             "phase1 network-send reduction is below 75%: "
             f"network_sends={network_sends} frame_count={frame_count}"
@@ -3365,7 +3508,7 @@ def validate_e2e_report(
         failures.append(
             f"completed_stmt_total is too small: minimum={profile.sessions} actual={completed_statements}"
         )
-    if early_staged_tokens != profile.sessions:
+    if not continuous_lockset and early_staged_tokens != profile.sessions:
         failures.append(
             "source_early_staged_tokens_samples: "
             f"expected={profile.sessions} actual={early_staged_tokens}"
@@ -3392,13 +3535,13 @@ def validate_e2e_report(
             f"queries={read_transfer_queries} qps={read_transfer_qps} "
             f"p99_us={read_transfer_p99_us}"
         )
-    if read_qps_drop_pct > profile.receiver_read_load_max_qps_drop_pct:
+    if not continuous_lockset and read_qps_drop_pct > profile.receiver_read_load_max_qps_drop_pct:
         failures.append(
             "receiver_read_load_qps_drop_pct: "
             f"limit={profile.receiver_read_load_max_qps_drop_pct} "
             f"actual={read_qps_drop_pct}"
         )
-    if read_p99_increase_pct > profile.receiver_read_load_max_p99_increase_pct:
+    if not continuous_lockset and read_p99_increase_pct > profile.receiver_read_load_max_p99_increase_pct:
         failures.append(
             "receiver_read_load_p99_increase_pct: "
             f"limit={profile.receiver_read_load_max_p99_increase_pct} "
@@ -3422,6 +3565,8 @@ def validate_e2e_report(
         "receiver_lock_plan_subpool_cap_bytes": lock_plan_cap,
         "source_phase1_transfer_network_send_count": network_sends,
         "source_phase1_transfer_frame_count": frame_count,
+        "source_phase1_record_batch_tokens_avg": batch_tokens_avg,
+        "source_phase1_batch_efficiency_gate_enforced": not continuous_lockset,
         "source_early_staged_tokens": early_staged_tokens,
         "source_command_boundary_to_enqueue_us_max": boundary_to_enqueue_us,
         "source_final_fast_scan_us": final_fast_scan_us,
@@ -3440,6 +3585,75 @@ def validate_e2e_report(
             "receiver_strict_target_local_redo_bytes"
         ),
     }
+
+
+def validate_continuous_lockset_report(
+    profile: FullPressureProfile, report: Mapping[str, Any]
+) -> None:
+    """Check the live workload; the caller validates transfer/READY metrics."""
+    expected = {
+        "continuous_business_through_drain": True,
+        "continuous_large_transaction_shape": "LOCKSET",
+        "continuous_effective_scheduler_mode": "DEPENDENCY_CONVERGENCE_V1",
+        "continuous_transaction_isolation_verified": True,
+        "continuous_business_transaction_isolation": profile.business_transaction_isolation,
+        "continuous_drain_call_count": 1,
+        "continuous_drain_trigger_mode": "independent_control_connection",
+        "continuous_harness_checkpoint_before_drain": False,
+        "continuous_checkpoint_generation_at_window_start": 0,
+        "continuous_checkpoint_generation_before_drain": 0,
+        "continuous_timeline_identity_matches": True,
+        "continuous_timeline_values_valid": True,
+        "continuous_4020_count": profile.sessions,
+        "continuous_workers_waiting_after_4020": profile.sessions,
+        "continuous_workers_retaining_original_connection": profile.sessions,
+        "continuous_business_lock_wait_timeout_count": 0,
+        "continuous_business_connection_error_count": 0,
+        "continuous_business_reconnect_count": 0,
+        "continuous_business_non_4020_error_count": 0,
+        "drain_result_outcome": "SUCCESS",
+    }
+    failures = [f"{key}: expected={value!r} actual={report.get(key)!r}"
+                for key, value in expected.items() if report.get(key) != value]
+    requested = int(math.ceil(profile.business_run_before_drain_s * 1_000_000))
+    start = int(report.get("continuous_business_window_start_monotonic_us", 0))
+    drain = int(report.get("continuous_drain_call_start_monotonic_us", 0))
+    if (report.get("continuous_business_window_requested_us") != requested
+            or start <= 0 or drain - start < requested
+            or report.get("continuous_business_window_actual_us") != drain - start
+            or report.get("continuous_business_window_deadline_monotonic_us") != start + requested):
+        failures.append("continuous LOCKSET DRAIN did not follow the requested business window")
+    snapshot = report.get("continuous_pre_drain_snapshot", {})
+    if (snapshot.get("large_alive_count") != profile.sessions
+            or snapshot.get("large_ready_count") != profile.sessions
+            or int(snapshot.get("large_transactions_completed", 0)) <= 0):
+        failures.append("continuous LOCKSET did not keep all committing workers running")
+    window_start = report.get("continuous_business_start_snapshot", {})
+    window_end = report.get("continuous_business_end_snapshot", {})
+    for counter in ("large_statements_completed", "large_transactions_completed"):
+        if int(window_end.get(counter, 0)) <= int(window_start.get(counter, 0)):
+            failures.append(f"continuous LOCKSET has no business-window progress: {counter}")
+    hold = report.get("continuous_original_connection_hold", {})
+    original_ids = hold.get("original_connection_ids", [])
+    if (hold.get("verified") is not True
+            or hold.get("worker_sids") != list(range(1, profile.sessions + 1))
+            or len(original_ids) != profile.sessions
+            or len(set(original_ids)) != profile.sessions
+            or any(identity <= 0 for identity in original_ids)
+            or hold.get("observed_server_connection_ids") != original_ids
+            or int(hold.get("verified_before_cleanup_monotonic_us", 0)) < drain):
+        failures.append("continuous LOCKSET lacks live original-connection HOLD evidence")
+    survivor_ids = [row["source_connection_id"] for row in report.get("drain_result_rows", [])
+                    if row.get("token_role") == "SURVIVOR"]
+    if (not survivor_ids or len(set(survivor_ids)) != len(survivor_ids)
+            or not set(survivor_ids).issubset(original_ids)
+            or report.get("standby_transfer_survivor_count") != len(survivor_ids)):
+        failures.append("continuous LOCKSET survivor identities do not match the business cohort")
+    tps = report.get("continuous_business_tps", {})
+    if not isinstance(tps.get("raw_progress_samples"), list) or not tps["raw_progress_samples"]:
+        failures.append("continuous LOCKSET raw business progress was not retained")
+    if failures:
+        raise RuntimeError("continuous LOCKSET validation failed: " + "; ".join(failures))
 
 
 def validate_continuous_tiered_load_report(
@@ -3818,7 +4032,7 @@ class FullPressureRunner:
             "dependency-sysbench",
             "dependency-mixed-transfer",
             "dependency-continuous-large-tx-transfer",
-        }
+        } or self.profile.continuous_large_tx_shape == "LOCKSET"
         source_command, receiver_command = build_mysqld_commands(
             self.profile,
             self.paths,
@@ -3928,6 +4142,7 @@ class FullPressureRunner:
                         tail_limit_us=(
                             self.profile.source_post_command_tail_limit_us
                             if self.evidence in {
+                                "transfer-phase2",
                                 "dependency-mixed-transfer",
                                 "dependency-continuous-large-tx-transfer",
                             }
@@ -4362,7 +4577,20 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--business-run-before-drain",
         type=float,
         help=(
-            "override the continuous large/short-transaction business window"
+            "override the continuous transfer or large/short-transaction business window"
+        ),
+    )
+    parser.add_argument(
+        "--drain-phase1-timeout-ms",
+        type=int,
+        help="diagnostic Phase1 preparation limit for dependency-continuous",
+    )
+    parser.add_argument(
+        "--receiver-transfer-max-inflight-bytes",
+        type=int,
+        help=(
+            "override receiver epoch-retained object capacity only; "
+            "source sender and pipeline credits remain unchanged"
         ),
     )
     parser.add_argument(
@@ -4476,7 +4704,7 @@ def select_full_pressure_profiles(
             if args.profile == "full"
             else CONTINUOUS_TIERED_SMOKE_PROFILE
         ]
-    return [FULL_PROFILE if args.profile == "full" else SMOKE_PROFILE]
+    return [TRANSFER_FULL_PROFILE if args.profile == "full" else TRANSFER_SMOKE_PROFILE]
 
 
 def run_dependency_continuous_shape_matrix(
@@ -4635,19 +4863,43 @@ def main(
         args.evidence = forced_evidence
     if forced_large_tx_no_commit:
         args.large_tx_no_commit = True
+    if args.drain_phase1_timeout_ms is not None:
+        if args.evidence != "dependency-continuous-large-tx-transfer":
+            raise RuntimeError(
+                "--drain-phase1-timeout-ms is only valid for "
+                "dependency-continuous-large-tx-transfer"
+            )
+        if not 1 <= args.drain_phase1_timeout_ms < 2**32:
+            raise RuntimeError(
+                "--drain-phase1-timeout-ms must be in [1, 2**32-1]"
+            )
     if (
-        args.business_run_before_drain is not None
+        args.receiver_transfer_max_inflight_bytes is not None
         and args.evidence != "dependency-continuous-large-tx-transfer"
     ):
         raise RuntimeError(
-            "--business-run-before-drain is only valid for "
+            "--receiver-transfer-max-inflight-bytes is only valid for "
             "dependency-continuous-large-tx-transfer"
         )
     if (
-        args.business_run_before_drain is not None
-        and args.business_run_before_drain <= 0
+        args.receiver_transfer_max_inflight_bytes is not None
+        and not 1 <= args.receiver_transfer_max_inflight_bytes < 2**64
     ):
-        raise RuntimeError("--business-run-before-drain must be positive")
+        raise RuntimeError(
+            "--receiver-transfer-max-inflight-bytes must be in [1, 2**64-1]"
+        )
+    if (
+        args.business_run_before_drain is not None
+        and args.evidence not in {"dependency-continuous-large-tx-transfer", "transfer-phase2"}
+    ):
+        raise RuntimeError(
+            "--business-run-before-drain is only valid for continuous transfer workloads"
+        )
+    if args.business_run_before_drain is not None and (
+        not math.isfinite(args.business_run_before_drain)
+        or args.business_run_before_drain <= 0
+    ):
+        raise RuntimeError("--business-run-before-drain must be positive and finite")
     if (
         args.phase1_pipeline_workers is not None
         and args.evidence != "dependency-continuous-large-tx-transfer"
@@ -4700,6 +4952,26 @@ def main(
             "dependency-continuous-large-tx-transfer"
         )
     profiles = select_full_pressure_profiles(args)
+    if args.drain_phase1_timeout_ms is not None:
+        profiles = [
+            dataclasses.replace(
+                profile,
+                drain_phase1_timeout_ms=args.drain_phase1_timeout_ms,
+                formal_rounds=1,
+            )
+            for profile in profiles
+        ]
+    if args.receiver_transfer_max_inflight_bytes is not None:
+        profiles = [
+            dataclasses.replace(
+                profile,
+                receiver_transfer_max_inflight_bytes=(
+                    args.receiver_transfer_max_inflight_bytes
+                ),
+                formal_rounds=1,
+            )
+            for profile in profiles
+        ]
     if args.business_run_before_drain is not None:
         profiles = [
             dataclasses.replace(

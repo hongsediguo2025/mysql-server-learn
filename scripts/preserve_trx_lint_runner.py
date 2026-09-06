@@ -30,6 +30,7 @@ LEGACY_LINT_RULE_IDS: Sequence[str] = (
     "batch_drain_context_switch_guard_lint",
     "batch_drain_drained_session_command_matrix_lint",
     "batch_drain_nonidle_autocommit_no_token_lint",
+    "batch_drain_phase1_pipeline_lint",
     "batch_drain_unknown_query_quiesce_boundary_lint",
     "batch_drain_lock_warmcopy_hook_coverage_lint",
     "batch_drain_lock_warmcopy_no_partial_fallback_lint",

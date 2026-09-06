@@ -24,6 +24,7 @@
 #include "mysql/components/services/log_builtins.h"
 #include "sql/binlog_warmcopy.h"
 #include "sql/current_thd.h"
+#include "sql/debug_sync.h"
 #include "sql/mysqld_thd_manager.h"
 #include "sql/preserve_trx.h"
 #include "sql/preserve_trx_bundle.h"
@@ -34,6 +35,9 @@
 struct Preserve_trx_phase1_binlog_prepared_payload {
   Preserve_trx_phase1_work_descriptor descriptor;
   PrebuiltBinlogCacheBlob blob;
+  std::string live_warmcopy_id;
+  std::string inline_payload;
+  bool append_prefix{false};
   mutable std::mutex cleanup_mutex;
   mutable std::unique_ptr<Preserved_trx_warm_external_blob_carrier>
       cleanup_carrier;
@@ -110,6 +114,13 @@ bool descriptors_equal(const Preserve_trx_phase1_work_descriptor &left,
              right.expected_store_baseline_generation &&
          left.expected_lock_coordinate_generation ==
              right.expected_lock_coordinate_generation &&
+         left.binlog_prefix_progress == right.binlog_prefix_progress &&
+         left.binlog_prefix_size == right.binlog_prefix_size &&
+         left.binlog_prefix_truncate_generation ==
+             right.binlog_prefix_truncate_generation &&
+         left.binlog_prefix_digest == right.binlog_prefix_digest &&
+         left.binlog_minimum_delta_bytes == right.binlog_minimum_delta_bytes &&
+         left.binlog_wire_chunk_bytes == right.binlog_wire_chunk_bytes &&
          left.family == right.family &&
          left.final_generation == right.final_generation &&
          left.use_record_store_snapshot == right.use_record_store_snapshot;
@@ -158,6 +169,19 @@ bool exact_transaction_identity(
          identity.raw_cookie == descriptor.source_object_cookie &&
          identity.immutable_trx_id == descriptor.expected_immutable_trx_id &&
          identity.trx_version == descriptor.expected_trx_version;
+}
+
+bool prefix_still_current(
+    THD *target, Preserve_trx_phase1_binlog_provider_port *provider,
+    const PrebuiltBinlogCacheBlob &prefix, const std::string &live_id) {
+  PrebuiltBinlogCacheBlob current;
+  return provider != nullptr && provider->sample_prefix(target, &current) &&
+         current.warmcopy_id == live_id && current.name == prefix.name &&
+         current.warmcopy_epoch == prefix.warmcopy_epoch &&
+         current.phase1_truncate_generation ==
+             prefix.phase1_truncate_generation &&
+         current.size >= prefix.size &&
+         (current.size != prefix.size || current.digest == prefix.digest);
 }
 
 bool reserve_credit(
@@ -438,6 +462,98 @@ void preserve_trx_phase1_binlog_adapter_prepare(
   }
 
   PrebuiltBinlogCacheBlob live_prefix;
+  if (descriptor.binlog_prefix_progress) {
+    if (!provider->sample_prefix(pin.thd(), &live_prefix) ||
+        live_prefix.warmcopy_epoch != descriptor.warmcopy_epoch) {
+      outcome->status = Preserve_trx_phase1_pipeline_result_status::RETRYABLE;
+      outcome->reason = "binlog_progress_sample_unavailable";
+      return;
+    }
+    const bool append = live_prefix.phase1_truncate_generation ==
+                        descriptor.binlog_prefix_truncate_generation;
+    if (append && (live_prefix.size < descriptor.binlog_prefix_size ||
+        (live_prefix.size == descriptor.binlog_prefix_size &&
+         live_prefix.digest != descriptor.binlog_prefix_digest))) {
+      outcome->status = Preserve_trx_phase1_pipeline_result_status::RETRYABLE;
+      outcome->reason = "binlog_progress_prefix_stale";
+      return;
+    }
+    const uint64_t start = append ? descriptor.binlog_prefix_size : 0;
+    const uint64_t bytes = live_prefix.size - start;
+    if (bytes == 0 || (append && bytes < descriptor.binlog_minimum_delta_bytes)) {
+      outcome->status = Preserve_trx_phase1_pipeline_result_status::NO_PROGRESS;
+      return;
+    }
+    /* Cover inline, codec and chunk copies before allocating the range. */
+    if (control.copy_chunk_bytes == 0 ||
+        descriptor.binlog_wire_chunk_bytes == 0 ||
+        bytes > std::numeric_limits<size_t>::max()) {
+      outcome->status = Preserve_trx_phase1_pipeline_result_status::UNSUPPORTED;
+      outcome->reason = "binlog_progress_size_invalid";
+      return;
+    }
+    const uint64_t frames = bytes / descriptor.binlog_wire_chunk_bytes +
+        (bytes % descriptor.binlog_wire_chunk_bytes != 0 ? 1 : 0);
+    if (frames > UINT64_MAX / 4096 - 3 ||
+        bytes > (UINT64_MAX - 4096 * (frames + 3)) / 12) {
+      outcome->status = Preserve_trx_phase1_pipeline_result_status::UNSUPPORTED;
+      outcome->reason = "binlog_progress_credit_overflow";
+      return;
+    }
+    const uint64_t credit = 12 * bytes + 4096 * (frames + 3);
+    if (!reserve_credit(control, credit, outcome)) return;
+    try {
+      auto prepared =
+          std::make_shared<Preserve_trx_phase1_binlog_prepared_payload>();
+      prepared->inline_payload.reserve(static_cast<size_t>(bytes));
+      auto carrier = create_preserved_trx_process_local_warm_external_blob_carrier(
+          provider->artifact_dir());
+      for (uint64_t offset = start; offset < live_prefix.size;) {
+        if (cancelled(control) || deadline_reached(control)) {
+          set_copy_cutoff(control, outcome, "binlog_progress_copy_cutoff");
+          return;
+        }
+        const uint64_t length = std::min<uint64_t>(
+            live_prefix.size - offset, control.copy_chunk_bytes);
+        std::string chunk;
+        if (carrier == nullptr ||
+            carrier->read_active_warm_external_blob_range(
+                live_prefix.warmcopy_id, live_prefix.name,
+                live_prefix.warmcopy_epoch, offset, length,
+                control.copy_chunk_bytes, &chunk) !=
+                Preserved_trx_carrier_status::OK || chunk.size() != length) {
+          outcome->status = Preserve_trx_phase1_pipeline_result_status::RETRYABLE;
+          outcome->reason = "binlog_progress_copy_failed";
+          return;
+        }
+        prepared->inline_payload.append(chunk);
+        offset += length;
+      }
+      if (!exact_transaction_identity(pin.thd(), descriptor)) {
+        outcome->status = Preserve_trx_phase1_pipeline_result_status::IDENTITY_STALE;
+        outcome->reason = "binlog_progress_transaction_changed";
+        return;
+      }
+      if (!prefix_still_current(pin.thd(), provider, live_prefix,
+                                live_prefix.warmcopy_id)) {
+        outcome->status = Preserve_trx_phase1_pipeline_result_status::RETRYABLE;
+        outcome->reason = "binlog_progress_final_fence_failed";
+        return;
+      }
+      prepared->descriptor = descriptor;
+      prepared->live_warmcopy_id = live_prefix.warmcopy_id;
+      prepared->blob = std::move(live_prefix);
+      prepared->append_prefix = append;
+      outcome->logical_bytes = bytes;
+      outcome->required_credit_bytes = credit;
+      outcome->prepared_payload = std::move(prepared);
+      outcome->status = Preserve_trx_phase1_pipeline_result_status::PREPARED;
+    } catch (...) {
+      outcome->status = Preserve_trx_phase1_pipeline_result_status::RESOURCE_EXHAUSTED;
+      outcome->reason = "binlog_progress_allocation_failed";
+    }
+    return;
+  }
   const Preserve_trx_phase1_binlog_provider_status provider_status =
       provider->prepare_prefix(pin.thd(), descriptor, control.copy_chunk_bytes,
                                &live_prefix);
@@ -505,23 +621,19 @@ void preserve_trx_phase1_binlog_adapter_prepare(
   immutable.warmcopy_id = transfer_warmcopy_id;
   pin = {};
   const Exact_pin_status final_pin_status = pin_exact_target(descriptor, &pin);
-  uint64_t current_length = 0;
-  uint64_t current_generation = 0;
-  bool current_has_blob = false;
-  const bool current =
+  const bool identity_current =
       final_pin_status == Exact_pin_status::PINNED &&
-      exact_transaction_identity(pin.thd(), descriptor) &&
-      !mysql_binlog_preserve_warmcopy_cache_length(
-          pin.thd(), &current_length, &current_has_blob) &&
-      current_has_blob && current_length >= immutable.size &&
-      !mysql_binlog_warmcopy_source_truncate_generation(
-          pin.thd(), &current_generation) &&
-      current_generation == immutable.phase1_truncate_generation;
+      exact_transaction_identity(pin.thd(), descriptor);
+  const bool current = identity_current &&
+      prefix_still_current(pin.thd(), provider, immutable,
+                            live_prefix.warmcopy_id);
   pin = {};
   if (!current || cancelled(control) || deadline_reached(control)) {
     outcome->status =
-        !current
+        !identity_current
             ? Preserve_trx_phase1_pipeline_result_status::IDENTITY_STALE
+            : !current
+                  ? Preserve_trx_phase1_pipeline_result_status::RETRYABLE
             : cancelled(control)
                   ? Preserve_trx_phase1_pipeline_result_status::CANCELLED
                   : Preserve_trx_phase1_pipeline_result_status::DEADLINE;
@@ -535,6 +647,7 @@ void preserve_trx_phase1_binlog_adapter_prepare(
     auto prepared =
         std::make_shared<Preserve_trx_phase1_binlog_prepared_payload>();
     prepared->descriptor = descriptor;
+    prepared->live_warmcopy_id = live_prefix.warmcopy_id;
     prepared->blob = std::move(immutable);
     prepared->cleanup_carrier = std::move(carrier);
     prepared->cleanup_armed = true;
@@ -556,6 +669,7 @@ Preserve_trx_phase1_pipeline_result_status
 preserve_trx_phase1_binlog_adapter_owner_revalidate(
     const Preserve_trx_phase1_work_descriptor &descriptor,
     const Preserve_trx_phase1_binlog_prepared_handle &payload,
+    Preserve_trx_phase1_binlog_provider_port *provider,
     Preserve_trx_transfer_phase1_blob_request *request,
     std::string *reason) {
   if (request != nullptr) *request = {};
@@ -571,15 +685,8 @@ preserve_trx_phase1_binlog_adapter_owner_revalidate(
     if (reason != nullptr) *reason = "binlog_owner_target_stale";
     return Preserve_trx_phase1_pipeline_result_status::IDENTITY_STALE;
   }
-  uint64_t current_length = 0;
-  uint64_t current_generation = 0;
-  bool current_has_blob = false;
-  if (mysql_binlog_preserve_warmcopy_cache_length(
-          pin.thd(), &current_length, &current_has_blob) ||
-      !current_has_blob || current_length < payload->blob.size ||
-      mysql_binlog_warmcopy_source_truncate_generation(
-          pin.thd(), &current_generation) ||
-      current_generation != payload->blob.phase1_truncate_generation) {
+  if (!prefix_still_current(pin.thd(), provider, payload->blob,
+                             payload->live_warmcopy_id)) {
     if (reason != nullptr) *reason = "binlog_owner_prefix_stale";
     return Preserve_trx_phase1_pipeline_result_status::RETRYABLE;
   }
@@ -589,6 +696,16 @@ preserve_trx_phase1_binlog_adapter_owner_revalidate(
   request->warmcopy_epoch = payload->blob.warmcopy_epoch;
   request->size = payload->blob.size;
   request->digest = payload->blob.digest;
+  try {
+    request->inline_payload = payload->inline_payload;
+  } catch (...) {
+    if (reason != nullptr) *reason = "binlog_owner_payload_allocation_failed";
+    return Preserve_trx_phase1_pipeline_result_status::RESOURCE_EXHAUSTED;
+  }
+  if (payload->append_prefix) {
+    request->preserved_prefix_size = descriptor.binlog_prefix_size;
+    request->preserved_prefix_digest = descriptor.binlog_prefix_digest;
+  }
   return Preserve_trx_phase1_pipeline_result_status::PREPARED;
 }
 
@@ -616,6 +733,7 @@ class Preserve_trx_phase1_binlog_owner::Impl {
       Preserve_trx_phase1_publication_registry *publication_registry)
       : m_config(config),
         m_pipeline(pipeline),
+        m_provider(provider),
         m_publisher(publisher),
         m_publication_registry(publication_registry) {
     if (m_config.attempt_id == 0 || m_config.drain_generation == 0 ||
@@ -661,6 +779,7 @@ class Preserve_trx_phase1_binlog_owner::Impl {
         found->second.retire_after_busy = false;
         if (found->second.state == Entry_state::ABSENT) {
           found->second.state = Entry_state::READY;
+          found->second.baseline_resolved = false;
           found->second.next_retry_us = 0;
         }
         continue;
@@ -731,6 +850,18 @@ class Preserve_trx_phase1_binlog_owner::Impl {
         m_debug_identity_stale_injected = true;
       }
     });
+    if (result_status == Preserve_trx_phase1_pipeline_result_status::NO_PROGRESS &&
+        entry.descriptor.binlog_prefix_progress) {
+      if (!m_pipeline->settle_result(
+              result.admission_id,
+              Preserve_trx_phase1_pipeline_result_disposition::DROP)) {
+        fail("binlog_progress_settle_failed");
+        return false;
+      }
+      entry.state = Entry_state::PUBLISHED;
+      entry.next_retry_us = monotonic_us() + 50000ULL;
+      return finish_busy(found);
+    }
     if (result_status ==
         Preserve_trx_phase1_pipeline_result_status::ABSENT) {
       if (!m_pipeline->settle_result(
@@ -740,6 +871,7 @@ class Preserve_trx_phase1_binlog_owner::Impl {
         return false;
       }
       entry.state = Entry_state::ABSENT;
+      entry.baseline_resolved = true;
       ++m_absent;
       return finish_busy(found);
     }
@@ -749,7 +881,8 @@ class Preserve_trx_phase1_binlog_owner::Impl {
       std::string reason;
       const Preserve_trx_phase1_pipeline_result_status validated =
           preserve_trx_phase1_binlog_adapter_owner_revalidate(
-              entry.descriptor, result.binlog_payload, &request, &reason);
+              entry.descriptor, result.binlog_payload, m_provider, &request,
+              &reason);
       if (validated ==
           Preserve_trx_phase1_pipeline_result_status::PREPARED) {
         Preserve_trx_phase1_publication_handle publication_handle;
@@ -852,6 +985,10 @@ class Preserve_trx_phase1_binlog_owner::Impl {
       return false;
     }
     if (!retryable) {
+      if (result_status == Preserve_trx_phase1_pipeline_result_status::DEADLINE) {
+        defer_to_final(found, false);
+        return !m_failed;
+      }
       fail(result.reason.empty() ? "binlog_result_terminal" : result.reason);
       return false;
     }
@@ -913,7 +1050,8 @@ class Preserve_trx_phase1_binlog_owner::Impl {
         return Preserve_trx_phase1_binlog_owner_pump_status::FAILED;
       }
       if (!m_publisher->remember_acked(entry.descriptor.target_thread_id,
-                                       *blob)) {
+                                       *blob,
+                                       !entry.descriptor.binlog_prefix_progress)) {
         discard_payload(entry.payload);
         (void)m_pipeline->settle_publication(
             completion.admission_id,
@@ -928,11 +1066,21 @@ class Preserve_trx_phase1_binlog_owner::Impl {
         fail("binlog_publication_settle_failed");
         return Preserve_trx_phase1_binlog_owner_pump_status::FAILED;
       }
+      entry.descriptor.binlog_prefix_size = blob->size;
+      entry.descriptor.binlog_prefix_digest = blob->digest;
+      entry.descriptor.binlog_prefix_truncate_generation =
+          blob->phase1_truncate_generation;
       entry.payload.reset();
       entry.admission_id = 0;
       entry.state = Entry_state::PUBLISHED;
+      entry.baseline_resolved = true;
+      entry.next_retry_us = monotonic_us() + 50000ULL;
       m_pending_admissions.erase(pending);
-      ++m_published;
+      if (entry.descriptor.binlog_prefix_progress)
+        ++m_prefix_published;
+      else
+        ++m_published;
+      DEBUG_SYNC(current_thd, "preserve_trx_phase1_binlog_baseline_acked");
       if (!finish_busy(found))
         return Preserve_trx_phase1_binlog_owner_pump_status::FAILED;
     }
@@ -944,6 +1092,10 @@ class Preserve_trx_phase1_binlog_owner::Impl {
 
   Preserve_trx_phase1_binlog_owner_pump_status submit(uint32_t budget) {
     if (m_failed) return Preserve_trx_phase1_binlog_owner_pump_status::FAILED;
+    if (m_ordinary_submissions_finished)
+      return baselines_complete()
+                 ? Preserve_trx_phase1_binlog_owner_pump_status::COMPLETE
+                 : Preserve_trx_phase1_binlog_owner_pump_status::IDLE;
     bool progressed = false;
     for (uint32_t count = 0; count < budget; ++count) {
       Entry *entry = next_ready_entry();
@@ -960,6 +1112,10 @@ class Preserve_trx_phase1_binlog_owner::Impl {
           status == Preserve_trx_phase1_pipeline_submit_status::NO_CREDIT) {
         break;
       }
+      if (status == Preserve_trx_phase1_pipeline_submit_status::DEADLINE) {
+        finish_ordinary_submissions();
+        break;
+      }
       fail("binlog_submit_rejected");
       return Preserve_trx_phase1_binlog_owner_pump_status::FAILED;
     }
@@ -967,6 +1123,16 @@ class Preserve_trx_phase1_binlog_owner::Impl {
       return Preserve_trx_phase1_binlog_owner_pump_status::COMPLETE;
     return progressed ? Preserve_trx_phase1_binlog_owner_pump_status::PROGRESS
                       : Preserve_trx_phase1_binlog_owner_pump_status::IDLE;
+  }
+
+  void finish_ordinary_submissions() {
+    m_ordinary_submissions_finished = true;
+    for (auto it = m_entries.begin(); it != m_entries.end(); ++it) {
+      if (it->second.state == Entry_state::READY ||
+          it->second.state == Entry_state::RETRY_WAIT) {
+        defer_to_final(it, false);
+      }
+    }
   }
 
   bool captures_complete() const {
@@ -993,6 +1159,13 @@ class Preserve_trx_phase1_binlog_owner::Impl {
     return true;
   }
 
+  bool initial_baselines_complete() const {
+    if (m_failed) return false;
+    for (const auto &item : m_entries)
+      if (!item.second.baseline_resolved) return false;
+    return true;
+  }
+
   bool flush_publications() {
     if (m_failed) return false;
     const Preserve_trx_transfer_status status = m_publisher->flush();
@@ -1006,7 +1179,7 @@ class Preserve_trx_phase1_binlog_owner::Impl {
   }
 
   bool close_publication_tracking() {
-    return !m_failed && baselines_complete() &&
+    return !m_failed && baselines_complete() && flush_publications() &&
            m_publication_registry->close_tracking_after_flush();
   }
 
@@ -1055,6 +1228,7 @@ class Preserve_trx_phase1_binlog_owner::Impl {
             << " retries=" << m_retries
             << " retired=" << m_retired
             << " stale_results=" << m_stale_results
+            << " prefix_published=" << m_prefix_published
             << " inflight=" << m_pending_admissions.size()
             << " failed=" << (m_failed ? 1 : 0)
             << " reason=" << (m_failure_reason.empty() ? "NONE"
@@ -1084,6 +1258,7 @@ class Preserve_trx_phase1_binlog_owner::Impl {
     uint64_t admission_id{0};
     bool replacement_pending{false};
     bool retire_after_busy{false};
+    bool baseline_resolved{false};
   };
 
   static bool busy(const Entry &entry) {
@@ -1111,6 +1286,8 @@ class Preserve_trx_phase1_binlog_owner::Impl {
     entry.descriptor.expected_trx_version = binding.trx_version;
     entry.descriptor.capture_generation = 1;
     entry.descriptor.estimated_credit_bytes = m_config.initial_credit_bytes;
+    entry.descriptor.binlog_minimum_delta_bytes = m_config.minimum_delta_bytes;
+    entry.descriptor.binlog_wire_chunk_bytes = m_config.wire_chunk_bytes;
     entry.descriptor.family =
         Preserve_trx_phase1_pipeline_family::BINLOG_CACHE;
     return m_entries.emplace(binding.thread_id, std::move(entry)).second;
@@ -1118,11 +1295,29 @@ class Preserve_trx_phase1_binlog_owner::Impl {
 
   Entry *next_ready_entry() {
     const uint64_t now_us = monotonic_us();
-    for (auto &item : m_entries) {
-      Entry &entry = item.second;
-      if ((entry.state == Entry_state::READY ||
-           entry.state == Entry_state::RETRY_WAIT) &&
-          entry.next_retry_us <= now_us) {
+    /* Alternate baseline and prefix work, with a fair cursor within each. */
+    for (unsigned pass = 0; pass != 2; ++pass) {
+      const bool progress = pass == 0 ? m_prefer_progress : !m_prefer_progress;
+      auto it = m_entries.upper_bound(m_submit_cursor[progress ? 1 : 0]);
+      for (size_t visited = 0; visited != m_entries.size(); ++visited, ++it) {
+        if (it == m_entries.end()) it = m_entries.begin();
+        Entry &entry = it->second;
+        if (entry.baseline_resolved != progress ||
+            entry.next_retry_us > now_us ||
+            (entry.state != Entry_state::READY &&
+             entry.state != Entry_state::RETRY_WAIT &&
+             entry.state != Entry_state::PUBLISHED)) continue;
+        if (entry.state == Entry_state::PUBLISHED) {
+          if (entry.descriptor.capture_generation == UINT64_MAX) {
+            fail("binlog_capture_generation_overflow");
+            return nullptr;
+          }
+          ++entry.descriptor.capture_generation;
+          entry.descriptor.binlog_prefix_progress = true;
+          entry.state = Entry_state::RETRY_WAIT;
+        }
+        m_submit_cursor[progress ? 1 : 0] = it->first;
+        m_prefer_progress = !progress;
         return &entry;
       }
     }
@@ -1137,7 +1332,8 @@ class Preserve_trx_phase1_binlog_owner::Impl {
     }
     ++entry->descriptor.capture_generation;
     entry->state = Entry_state::RETRY_WAIT;
-    entry->next_retry_us = monotonic_us() + 1000ULL;
+    entry->next_retry_us = monotonic_us() +
+        (entry->descriptor.binlog_prefix_progress ? 50000ULL : 1000ULL);
     ++m_retries;
   }
 
@@ -1166,6 +1362,10 @@ class Preserve_trx_phase1_binlog_owner::Impl {
       m_entries.erase(found);
       return true;
     }
+    if (m_ordinary_submissions_finished) {
+      defer_to_final(found, false);
+      return !m_failed;
+    }
     if (!refresh) {
       schedule_retry(&found->second);
       return !m_failed;
@@ -1183,6 +1383,7 @@ class Preserve_trx_phase1_binlog_owner::Impl {
     discard_payload(found->second.payload);
     found->second.payload.reset();
     found->second.state = Entry_state::DEFERRED_TO_FINAL;
+    found->second.baseline_resolved = true;
     found->second.next_retry_us = 0;
     found->second.admission_id = 0;
     found->second.replacement_pending = false;
@@ -1206,6 +1407,7 @@ class Preserve_trx_phase1_binlog_owner::Impl {
 
   Preserve_trx_phase1_binlog_owner_config m_config;
   Preserve_trx_phase1_pipeline *m_pipeline{nullptr};
+  Preserve_trx_phase1_binlog_provider_port *m_provider{nullptr};
   Preserve_trx_phase1_binlog_publisher_port *m_publisher{nullptr};
   Preserve_trx_phase1_publication_registry *m_publication_registry{nullptr};
   std::map<uint64_t, Entry> m_entries;
@@ -1215,6 +1417,9 @@ class Preserve_trx_phase1_binlog_owner::Impl {
   uint64_t m_submitted{0};
   uint64_t m_results{0};
   uint64_t m_published{0};
+  uint64_t m_prefix_published{0};
+  std::array<uint64_t, 2> m_submit_cursor{};
+  bool m_prefer_progress{false};
   uint64_t m_absent{0};
   uint64_t m_retries{0};
   uint64_t m_deferred_to_final{0};
@@ -1224,6 +1429,7 @@ class Preserve_trx_phase1_binlog_owner::Impl {
 #ifndef DBUG_OFF
   bool m_debug_identity_stale_injected{false};
 #endif
+  bool m_ordinary_submissions_finished{false};
   bool m_failed{false};
   std::string m_failure_reason;
 };
@@ -1260,8 +1466,16 @@ Preserve_trx_phase1_binlog_owner::submit(uint32_t budget) {
   return m_impl->submit(budget);
 }
 
+bool Preserve_trx_phase1_binlog_owner::initial_baselines_complete() const {
+  return m_impl->initial_baselines_complete();
+}
+
 bool Preserve_trx_phase1_binlog_owner::captures_complete() const {
   return m_impl->captures_complete();
+}
+
+void Preserve_trx_phase1_binlog_owner::finish_ordinary_submissions() {
+  m_impl->finish_ordinary_submissions();
 }
 
 bool Preserve_trx_phase1_binlog_owner::baselines_complete() const {

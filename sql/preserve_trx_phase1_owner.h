@@ -54,6 +54,7 @@ class Preserve_trx_phase1_owner {
 
   bool reconcile_record_targets(THD *drain_owner);
   bool consume_result(Preserve_trx_phase1_prepared_result result);
+  void finish_ordinary_submissions();
   Preserve_trx_phase1_owner_pump_status submit_record(uint32_t budget);
   Preserve_trx_phase1_owner_pump_status submit_final_record(uint32_t budget);
   bool record_baselines_complete() const;

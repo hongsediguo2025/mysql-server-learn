@@ -18,6 +18,7 @@
 
 #include <stdint.h>
 
+#include <array>
 #include <memory>
 #include <string>
 
@@ -86,6 +87,7 @@ enum class Preserve_trx_phase1_pipeline_publication_status : uint8_t {
 enum class Preserve_trx_phase1_pipeline_result_status : uint8_t {
   PREPARED,
   ABSENT,
+  NO_PROGRESS,
   DEFERRED_TO_FINAL,
   RETRYABLE,
   IDENTITY_STALE,
@@ -141,10 +143,17 @@ struct Preserve_trx_phase1_work_descriptor {
   uint64_t estimated_credit_bytes{0};
   uint64_t expected_store_baseline_generation{0};
   uint64_t expected_lock_coordinate_generation{0};
+  /* Last acknowledged binlog prefix; never a locally queued watermark. */
+  uint64_t binlog_prefix_size{0};
+  uint64_t binlog_prefix_truncate_generation{0};
+  std::array<unsigned char, 32> binlog_prefix_digest{};
+  uint64_t binlog_minimum_delta_bytes{0};
+  uint64_t binlog_wire_chunk_bytes{0};
   Preserve_trx_phase1_pipeline_family family{
       Preserve_trx_phase1_pipeline_family::RECORD_LOCK};
   bool final_generation{false};
   bool use_record_store_snapshot{false};
+  bool binlog_prefix_progress{false};
 };
 
 struct Preserve_trx_phase1_prepared_result {
@@ -183,6 +192,7 @@ struct Preserve_trx_phase1_pipeline_snapshot {
   uint64_t operation_permits_started{0};
   uint64_t operation_permit_budget_rejected{0};
   uint64_t operation_budget_overruns{0};
+  uint64_t ordinary_binlog_slow_operations{0};
   uint64_t final_record_capture_operation_samples{0};
   uint64_t final_record_capture_operation_us_total{0};
   uint64_t final_record_capture_operation_us_max{0};
