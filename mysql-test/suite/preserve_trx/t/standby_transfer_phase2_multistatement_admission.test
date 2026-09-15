@@ -1,0 +1,48 @@
+--source suite/preserve_trx/include/phase2_multistatement_setup.inc
+--connect(multi_business,localhost,phase2_multi_app,,test)
+BEGIN;
+UPDATE t_phase2_multi SET v=10 WHERE id=1;
+# Installing the action in the first SQL pauses capture of the SECOND SQL,
+# not initial packet reception. Reuse the existing admission sync point.
+delimiter ||;
+--send
+SET DEBUG_SYNC='phase2_sched_after_admission_published SIGNAL multi_gap WAIT_FOR multi_gap_continue TIMEOUT 30';
+UPDATE t_phase2_multi SET v=900 WHERE id=3; COMMIT||
+delimiter ;||
+--connection default
+SET DEBUG_SYNC='now WAIT_FOR multi_gap TIMEOUT 5';
+--let $sync_warnings= `SELECT @@warning_count`
+if ($sync_warnings)
+{
+  --die second statement did not publish its own admission
+}
+SET DEBUG_SYNC='phase2_sched_after_hard_published SIGNAL multi_gap_hard';
+--send DRAIN TRANSACTIONS PRESERVE
+--connection multi_ha
+SET DEBUG_SYNC='now WAIT_FOR multi_gap_hard TIMEOUT 10';
+--let $sync_warnings= `SELECT @@warning_count`
+if ($sync_warnings)
+{
+  --die HARD could not freeze the inter-statement admission
+}
+SET DEBUG_SYNC='now SIGNAL multi_gap_continue';
+--connection multi_business
+--enable_result_log
+--enable_info
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+--reap
+--disable_info
+--disable_result_log
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT 1;
+--connection default
+--reap
+--connection multi_ha
+--let $data_ok= `SELECT (SELECT v=0 FROM t_phase2_multi WHERE id=1) AND (SELECT v=0 FROM t_phase2_multi WHERE id=3)`
+if (!$data_ok)
+{
+  --die a statement crossed HARD using the preceding SQL admission
+}
+--source suite/preserve_trx/include/phase2_multistatement_cleanup.inc
+--enable_result_log
+--echo multi_statement_admission_frozen_before_body

@@ -1,0 +1,2 @@
+--let $prefix_share_count=256
+--source suite/preserve_trx/include/phase2_page_prefix_probe.inc

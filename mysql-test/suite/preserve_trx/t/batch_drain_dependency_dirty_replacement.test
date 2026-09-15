@@ -26,9 +26,10 @@ GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.*
 CREATE USER closing_early_dirty_app@localhost;
 GRANT SELECT, UPDATE ON test.* TO closing_early_dirty_app@localhost;
 
---let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$MASTER_MYPORT --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=closing_early_dirty --rds-preserve-trx-transfer-credential-secret-file=$credential_file
+--let $restart_parameters= restart: --rds-preserve-trx-standby-phase2-scheduler-mode=DEPENDENCY_CONVERGENCE_V1 --rds-preserve-trx-phase1-capture-mode=BOUNDED_PIPELINE_V1 --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$MASTER_MYPORT --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=closing_early_dirty --rds-preserve-trx-transfer-credential-secret-file=$credential_file
 --disable_result_log
 --source include/restart_mysqld.inc
+--source suite/preserve_trx/include/assert_standby_transfer_source.inc
 --enable_result_log
 --let $restart_parameters=
 --disable_query_log
@@ -163,9 +164,10 @@ SELECT v AS value_after_final_scan_reject FROM t_closing_early_dirty;
 --connection default
 # The failed self-transfer may retain target-local prepared handles until
 # teardown; restart only after both source transactions have committed.
---let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$MASTER_MYPORT --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=closing_early_dirty --rds-preserve-trx-transfer-credential-secret-file=$credential_file
+--let $restart_parameters= restart: --rds-preserve-trx-standby-phase2-scheduler-mode=DEPENDENCY_CONVERGENCE_V1 --rds-preserve-trx-phase1-capture-mode=BOUNDED_PIPELINE_V1 --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$MASTER_MYPORT --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=closing_early_dirty --rds-preserve-trx-transfer-credential-secret-file=$credential_file
 --disable_result_log
---source include/restart_mysqld.inc
+--source suite/preserve_trx/include/standby_source_sigkill_restart.inc
+--source suite/preserve_trx/include/assert_standby_transfer_source.inc
 --enable_result_log
 --let $restart_parameters=
 --disable_query_log

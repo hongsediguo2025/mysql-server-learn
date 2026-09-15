@@ -2197,6 +2197,7 @@ lock_warmcopy_record_store_plan_candidate(
     size_t parse_offset = static_cast<size_t>(offset);
     uint64_t ignored_u64 = 0;
     uint32_t ignored_u32 = 0;
+    uint32_t type_mode = 0;
     uint32_t n_bits = 0;
     uint32_t page_n_heap = 0;
     uint32_t heap_offsets_len = 0;
@@ -2206,7 +2207,7 @@ lock_warmcopy_record_store_plan_candidate(
         !read_u64_le_from_payload(payload, &parse_offset, &ignored_u64) ||
         !read_u32_le_from_payload(payload, &parse_offset, &ignored_u32) ||
         !read_u32_le_from_payload(payload, &parse_offset, &ignored_u32) ||
-        !read_u32_le_from_payload(payload, &parse_offset, &ignored_u32) ||
+        !read_u32_le_from_payload(payload, &parse_offset, &type_mode) ||
         !read_u32_le_from_payload(payload, &parse_offset, &n_bits) ||
         !read_u64_le_from_payload(payload, &parse_offset, &ignored_u64) ||
         !read_u32_le_from_payload(payload, &parse_offset, &page_n_heap) ||
@@ -2230,6 +2231,7 @@ lock_warmcopy_record_store_plan_candidate(
 
     const size_t bitmap_offset =
         parse_offset + heap_offsets_len + record_images_len;
+    plan->insert_intention_present |= (type_mode & LOCK_INSERT_INTENTION) != 0;
     uint32_t set_bits = 0;
     for (uint32_t byte_index = 0; byte_index < bitmap_len; ++byte_index) {
       unsigned char value = static_cast<unsigned char>(

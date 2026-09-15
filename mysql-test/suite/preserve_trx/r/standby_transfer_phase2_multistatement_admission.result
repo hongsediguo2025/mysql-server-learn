@@ -1,0 +1,3 @@
+affected rows: 0
+ERROR HY000: Preserve drain is active; this command was not executed
+multi_statement_admission_frozen_before_body

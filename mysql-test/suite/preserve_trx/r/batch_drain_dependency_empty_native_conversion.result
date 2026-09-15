@@ -1,0 +1,35 @@
+include/assert.inc [bounded pipeline is selected]
+include/assert.inc [insert really waits on the delete-marked successor]
+include/assert.inc [granted insert intention remains after INSERT completes]
+actual INSERT wait completed; granted intention remains
+include/assert.inc [native purge stop and resume metrics are enabled]
+include/assert.inc [detached target still has its original insert intention]
+native purge remains stopped until final validation
+ERROR HY000: Statement aborted because lock(s) could not be acquired immediately and NOWAIT is set.
+include/assert.inc [real implicit conversion added an ordinary record lock]
+candidate validation rejected; original transaction restored
+include/assert.inc [validation failure keeps the original application connection]
+id	v
+1	10
+2	20
+id	v
+10	100
+20	200
+40	400
+50	500
+id	v
+1	10
+2	20
+id	v
+10	100
+40	400
+50	500
+id	v
+1	10
+2	20
+id	v
+10	100
+40	400
+50	500
+include/assert.inc [DRAIN waited for its own native purge stop before T0]
+include/assert.inc [DRAIN did not resume purge on return]

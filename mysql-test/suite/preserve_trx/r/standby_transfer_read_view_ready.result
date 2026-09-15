@@ -1,0 +1,20 @@
+dependency_standby_mode
+1
+initial_value
+10
+repeatable_value
+10
+generation	outcome	source_connection_id	token_role	reason	closing_started_us	closing_deadline_us
+GENERATION	SUCCESS	READ_VIEW_ID	SURVIVOR	NONE	CLOSING_STARTED_US	CLOSING_DEADLINE_US
+HAS_READ_VIEW	source_has_read_view_limit
+YES	1
+read_view_token_ready
+1
+no_not_ready_tokens
+1
+one_accepted_epoch
+1
+id	v
+1	20
+2	200
+ERROR HY000: Preserve drain is active; this command was not executed

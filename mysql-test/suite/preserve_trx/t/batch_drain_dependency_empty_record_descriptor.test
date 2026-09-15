@@ -1,0 +1,6 @@
+--let $purge_before_fence= 0
+--let $ii_with_background_lock= 0
+--let $ii_purge_at_bind= 1
+--let $ii_expect_failure= 1
+--let $ii_empty_test_debug= preserve_trx_empty_record_descriptor
+--source suite/preserve_trx/include/final_insert_intention_purge.inc

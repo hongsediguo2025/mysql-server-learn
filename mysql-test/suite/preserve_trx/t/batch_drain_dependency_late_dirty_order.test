@@ -1,0 +1,152 @@
+# Two real transactions: replacement of a later candidate must not jump over
+# an earlier candidate's queued final metadata. No RESET and no forged fence.
+--source include/have_debug.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+--disable_query_log
+--let $credential_file= $MYSQL_TMP_DIR/late-dirty-order.secret
+--write_file $credential_file
+late-dirty-order-secret
+EOF
+--exec chmod 600 $credential_file
+CREATE USER preserve_trx_ha_admin@'127.0.0.1'
+  IDENTIFIED BY 'late-dirty-order-secret';
+GRANT SHUTDOWN, PROCESS, SYSTEM_VARIABLES_ADMIN,
+      PRESERVE_TRX_TRANSFER_ADMIN ON *.*
+  TO preserve_trx_ha_admin@'127.0.0.1';
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@'127.0.0.1';
+GRANT SELECT ON test.* TO preserve_trx_ha_admin@'127.0.0.1';
+CREATE USER late_dirty_app@localhost;
+GRANT SELECT, UPDATE ON test.* TO late_dirty_app@localhost;
+
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-standby-phase2-scheduler-mode=DEPENDENCY_CONVERGENCE_V1 --rds-preserve-trx-phase1-capture-mode=BOUNDED_PIPELINE_V1 --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$SERVER_MYPORT_1 --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=late_dirty_order --rds-preserve-trx-transfer-credential-secret-file=$credential_file --gtid-mode=ON --enforce-gtid-consistency=ON --log-error-verbosity=3
+--disable_result_log
+--source include/restart_mysqld.inc
+--source suite/preserve_trx/include/assert_standby_transfer_source.inc
+--enable_result_log
+--let $restart_parameters=
+--disable_query_log
+--source suite/preserve_trx/include/assert_phase2_dependency_mode.inc
+CALL mtr.add_suppression(
+  "PRESERVE: rolled back prepared transaction without snapshot during recovery");
+SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=OFF;
+SET GLOBAL rds_preserve_trx_token_retention_timeout_ms=120000;
+CREATE TABLE t_late_dirty(id INT PRIMARY KEY, v INT NOT NULL) ENGINE=InnoDB;
+INSERT INTO t_late_dirty VALUES(1,10),(2,20),(3,30);
+UPDATE t_late_dirty SET v=v+1;
+--connect(late_ha,127.0.0.1,preserve_trx_ha_admin,late-dirty-order-secret,test,$SERVER_MYPORT_1,)
+SET @unknown_before=(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME='Preserve_trx_transfer_source_commit_unknown_epochs');
+--connect(late_app1,localhost,late_dirty_app,,test)
+--let _LATE_APP1_ID= `SELECT CONNECTION_ID()`
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+UPDATE t_late_dirty SET v=v+10 WHERE id=1;
+UPDATE t_late_dirty SET v=v+100 WHERE id=1;
+--let $assert_text= first transaction owns its uncommitted changes
+--let $assert_cond= `SELECT v=121 FROM t_late_dirty WHERE id=1`
+--source include/assert.inc
+--connect(late_app2,localhost,late_dirty_app,,test)
+--let _LATE_APP2_ID= `SELECT CONNECTION_ID()`
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+UPDATE t_late_dirty SET v=v+20 WHERE id=2;
+UPDATE t_late_dirty SET v=v+200 WHERE id=2;
+--let $assert_text= second transaction owns its uncommitted changes
+--let $assert_cond= `SELECT v=241 FROM t_late_dirty WHERE id=2`
+--source include/assert.inc
+
+--connection default
+SET GLOBAL debug='+d,preserve_trx_early_force_second_dirty';
+--disable_result_log
+DRAIN TRANSACTIONS PRESERVE;
+--let _LATE_DRAIN_ERRNO= $mysql_errno
+--enable_result_log
+--let _LATE_ERROR_LOG= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--perl
+use strict;
+use warnings;
+open(my $fh, '<', $ENV{'_LATE_ERROR_LOG'}) or die "cannot read source log: $!";
+my ($force, $declare, $final);
+while (my $line = <$fh>) {
+  if ($line =~ /CURRENT_TEST: preserve_trx\.batch_drain_dependency_late_dirty_order/) {
+    ($force, $declare, $final) = (undef, undef, undef);
+  }
+  $force = $line if $line =~ /PRESERVE_LATE_DIRTY_TEST force /;
+  if (defined($force) && !defined($declare) &&
+      $line =~ /PRESERVE_LATE_DIRTY_TEST declare /) {
+    my %f = ($force =~ /([a-z0-9_]+)=([^\s]+)/g);
+    my %d = ($line =~ /([a-z0-9_]+)=([^\s]+)/g);
+    $declare = $line if defined($d{'token'}) && defined($f{'second'}) &&
+      $d{'token'} eq $f{'second'};
+  }
+  $final = $line if $line =~ /PRESERVE_PHASE2_FINAL_V1 /;
+}
+close($fh);
+die "missing second-candidate fault or actual replacement DECLARE" unless $force && $declare;
+my %f = ($force =~ /([a-z0-9_]+)=([^\s]+)/g);
+my %d = ($declare =~ /([a-z0-9_]+)=([^\s]+)/g);
+for my $field (qw(first second first_finalized)) {
+  die "missing or invalid force field $field: $force"
+    unless defined($f{$field}) && $f{$field} =~ /^\d+$/;
+}
+for my $field (qw(token sequence pending_count pending_first_sequence pending_first_token)) {
+  die "missing or invalid declare field $field: $declare"
+    unless defined($d{$field}) && $d{$field} =~ /^\d+$/;
+}
+my @actual = sort {$a <=> $b} ($f{'first'}, $f{'second'});
+my @wanted = sort {$a <=> $b} ($ENV{'_LATE_APP1_ID'}, $ENV{'_LATE_APP2_ID'});
+die "fault did not target the two real transactions" unless "@actual" eq "@wanted";
+if ($d{'pending_count'} != 0) {
+  die "unexpected pending state: $force$declare" unless
+    $f{'first_finalized'} == 1 && $d{'pending_first_sequence'} < $d{'sequence'} &&
+    $d{'pending_first_token'} eq $f{'first'};
+  die "ORDER GAP drain_errno=$ENV{'_LATE_DRAIN_ERRNO'}: $force$declare";
+}
+die "first candidate was finalized before all replacements" unless $f{'first_finalized'} == 0;
+die "DRAIN did not succeed: $ENV{'_LATE_DRAIN_ERRNO'}" unless $ENV{'_LATE_DRAIN_ERRNO'} == 0;
+die "missing final record" unless $final;
+my %final = ($final =~ /([a-z0-9_]+)=([^\s]+)/g);
+die "handoff not committed" unless $final{'source_terminal_status'} eq 'COMMITTED_HANDOFF' &&
+  $final{'first_failure_stage'} eq 'NONE';
+print "late replacement preserves sequence order\n";
+EOF
+
+--connection late_ha
+SET GLOBAL debug='-d,preserve_trx_early_force_second_dirty';
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_tokens')=2 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_worker_active')=0 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_queued_bytes')=0
+--source include/wait_condition.inc
+SELECT
+  (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_early_staged_tokens')=2 AS two_staged,
+  (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_final_dirty_tokens')=1 AS one_dirty,
+  (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_final_replacement_tokens')=1 AS one_replacement,
+  (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_final_validation_rejects')=0 AS no_reject,
+  (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens')=2 AS two_ready,
+  (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens')=0 AS none_not_ready,
+  (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')=1 AS one_epoch,
+  (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_source_commit_unknown_epochs')=@unknown_before AS no_commit_unknown;
+SELECT id,v FROM t_late_dirty ORDER BY id;
+--connection late_app1
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT 1;
+--connection late_app2
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT 1;
+
+# HA retires the stopped source after accepted transfer, not RESET recovery.
+--connection late_ha
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--shutdown_server 0
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+--exec echo "restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+--disable_query_log
+--connect(late_cleanup,localhost,root,,test)
+SELECT id,v FROM t_late_dirty ORDER BY id;
+DROP TABLE t_late_dirty;
+DROP USER late_dirty_app@localhost;
+DROP USER preserve_trx_ha_admin@'127.0.0.1';
+--remove_file $credential_file
+--enable_query_log

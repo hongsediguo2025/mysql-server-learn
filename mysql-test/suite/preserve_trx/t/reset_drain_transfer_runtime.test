@@ -32,9 +32,10 @@ CREATE USER reset_drain_app@localhost;
 GRANT SELECT, UPDATE ON test.* TO reset_drain_app@localhost;
 GRANT SESSION_VARIABLES_ADMIN ON *.* TO reset_drain_app@localhost;
 
---let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$MASTER_MYPORT --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=reset_drain_mtr --rds-preserve-trx-transfer-credential-secret-file=$credential_file
+--let $restart_parameters= restart: --rds-preserve-trx-standby-phase2-scheduler-mode=DEPENDENCY_CONVERGENCE_V1 --rds-preserve-trx-phase1-capture-mode=BOUNDED_PIPELINE_V1 --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$MASTER_MYPORT --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=reset_drain_mtr --rds-preserve-trx-transfer-credential-secret-file=$credential_file
 --disable_result_log
 --source include/restart_mysqld.inc
+--source suite/preserve_trx/include/assert_standby_transfer_source.inc
 --enable_result_log
 --let $restart_parameters=
 --disable_query_log
@@ -98,8 +99,6 @@ SET DEBUG_SYNC=
 SET DEBUG_SYNC=
   'preserve_trx_batch_before_target_preserve_pins SIGNAL reset_runtime_target_pins_ready WAIT_FOR reset_runtime_target_pins_release';
 SET DEBUG_SYNC=
-  'preserve_trx_batch_final_attach_observed_rejection_inflight SIGNAL reset_runtime_attach_observed_busy';
-SET DEBUG_SYNC=
   'preserve_trx_after_final_metadata_accepted_local SIGNAL reset_runtime_final_metadata_local WAIT_FOR reset_runtime_final_metadata_release';
 --send DRAIN TRANSACTIONS PRESERVE WITH USER VARS
 
@@ -143,6 +142,9 @@ SET DEBUG_SYNC='now WAIT_FOR reset_runtime_phase2_entered TIMEOUT 30';
 
 --connection reset_runtime_ha
 SET DEBUG_SYNC='now SIGNAL reset_runtime_phase2_release';
+# Dependency cutoff responses are released after the quiesced-target barrier.
+SET DEBUG_SYNC='now WAIT_FOR reset_runtime_targets_quiesced TIMEOUT 30';
+SET DEBUG_SYNC='now SIGNAL reset_runtime_targets_release';
 
 --disable_result_log
 --connection reset_runtime_app_2
@@ -153,20 +155,21 @@ SET DEBUG_SYNC='now SIGNAL reset_runtime_phase2_release';
 --reap
 
 --connection reset_runtime_ha
-SET DEBUG_SYNC='now WAIT_FOR reset_runtime_targets_quiesced TIMEOUT 30';
-SET DEBUG_SYNC='now SIGNAL reset_runtime_targets_release';
 SET DEBUG_SYNC='now WAIT_FOR reset_runtime_target_pins_ready TIMEOUT 30';
+--let $reset_runtime_pins_wait_warnings= `SELECT @@warning_count`
 
 # Hold one post-CLOSING command after its packet made the target non-idle but
-# before the protocol gate sends 4020. Final attach must serialize with this
-# rejection response instead of dropping the otherwise valid transaction.
+# before the protocol gate sends 4020. The early-preserved transaction must
+# reach final metadata while this rejection packet remains blocked.
 --connection reset_runtime_app_1
 --send SELECT 1
 
 --connection reset_runtime_ha
 SET DEBUG_SYNC='now WAIT_FOR reset_runtime_rejection_packet_read TIMEOUT 30';
+--let $reset_runtime_packet_wait_warnings= `SELECT @@warning_count`
 SET DEBUG_SYNC='now SIGNAL reset_runtime_target_pins_release';
-SET DEBUG_SYNC='now WAIT_FOR reset_runtime_attach_observed_busy TIMEOUT 30';
+SET DEBUG_SYNC='now WAIT_FOR reset_runtime_final_metadata_local TIMEOUT 60';
+--let $reset_runtime_metadata_wait_warnings= `SELECT @@warning_count`
 SET DEBUG_SYNC='now SIGNAL reset_runtime_rejection_packet_release';
 
 --connection reset_runtime_app_1
@@ -175,7 +178,6 @@ SET DEBUG_SYNC='now SIGNAL reset_runtime_rejection_packet_release';
 --enable_result_log
 
 --connection reset_runtime_ha
-SET DEBUG_SYNC='now WAIT_FOR reset_runtime_final_metadata_local TIMEOUT 60';
 
 --disable_result_log
 --connection reset_runtime_app_1
@@ -353,13 +355,23 @@ SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
 
 --connection reset_runtime_ha
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
-SHUTDOWN;
+--shutdown_server 0
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
---exec echo "restart: --rds-preserve-trx-enable=ON --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
 --disable_query_log
+
+# Let native standby startup retire transfer artifacts before the LOCAL test.
+--connect(reset_runtime_local_setup,localhost,root,,test)
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=LOCAL_CARRIER --skip-log-bin
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--let $restart_parameters=
+--disable_query_log
+--disconnect reset_runtime_local_setup
 
 --connect(reset_runtime_local_ha,localhost,preserve_trx_ha_admin,reset-drain-mtr-secret,test)
 --connect(reset_runtime_local_owner,localhost,root,,test)
@@ -396,5 +408,18 @@ DROP USER reset_drain_app@localhost;
 SET DEBUG_SYNC='RESET';
 --remove_file $credential_file
 --disconnect reset_runtime_cleanup
+
+if ($reset_runtime_pins_wait_warnings)
+{
+  --die early-preserve completion barrier was not reached
+}
+if ($reset_runtime_packet_wait_warnings)
+{
+  --die post-preserve rejection packet was not blocked
+}
+if ($reset_runtime_metadata_wait_warnings)
+{
+  --die final metadata did not progress while the rejection packet was blocked
+}
 
 --enable_query_log

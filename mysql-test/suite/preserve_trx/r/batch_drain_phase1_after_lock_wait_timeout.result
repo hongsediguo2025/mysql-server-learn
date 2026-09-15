@@ -1,0 +1,32 @@
+CREATE TABLE t_phase1_timeout_lock(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+CREATE TABLE t_phase1_timeout_data(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO t_phase1_timeout_lock VALUES(1,10);
+include/assert.inc [timeout rolls back the statement, not the transaction]
+BEGIN;
+UPDATE t_phase1_timeout_lock SET v=11 WHERE id=1;
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+SET SESSION innodb_lock_wait_timeout=1;
+BEGIN;
+INSERT INTO t_phase1_timeout_data VALUES(1,17);
+include/assert.inc [inserted business row has no explicit record lock]
+UPDATE t_phase1_timeout_lock SET v=12 WHERE id=1;
+ERROR HY000: Lock wait timeout exceeded; try restarting transaction
+ROLLBACK;
+include/assert.inc [native lock counter remains nonzero after statement timeout]
+include/assert.inc [cancelled request left no explicit record lock]
+real timeout: active transaction, nonzero native counter, no record lock
+DRAIN TRANSACTIONS PRESERVE;
+include/assert.inc [DRAIN succeeds after a native statement timeout]
+DRAIN succeeded after a native statement timeout
+receiver has one ready transaction
+SELECT 1;
+ERROR HY000: Preserve drain is active; this command was not executed
+SELECT v AS committed_value FROM t_phase1_timeout_lock;
+committed_value
+10
+SELECT COUNT(*) AS rolled_back_source_rows FROM t_phase1_timeout_data;
+rolled_back_source_rows
+0
+DROP TABLE t_phase1_timeout_lock,t_phase1_timeout_data;
+DROP USER phase1_timeout_app@localhost;
+DROP USER preserve_trx_ha_admin@'127.0.0.1';

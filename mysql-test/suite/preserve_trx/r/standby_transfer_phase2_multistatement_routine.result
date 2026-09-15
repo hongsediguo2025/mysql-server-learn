@@ -1,0 +1,10 @@
+procedure_first
+11
+affected rows: 1
+procedure_second
+22
+affected rows: 1
+affected rows: 0
+affected rows: 0
+ERROR HY000: Preserve drain is active; this command was not executed
+multi_statement_same_transaction_call_preserved_all_results

@@ -1,0 +1,9 @@
+include/assert.inc [real waiter exists before DRAIN]
+include/assert.inc [partial native collection reached budget exhaustion]
+include/assert.inc [partial proof did not grant a command permit]
+include/assert.inc [fresh complete proof succeeds on retry]
+include/assert.inc [held command enters BODY after complete proof]
+include/assert.inc [blocker DML committed exactly once]
+include/assert.inc [exactly one receiver token is ready]
+include/assert.inc [no receiver token remains not ready]
+partial proof discarded; fresh complete proof released blocker; receiver ready

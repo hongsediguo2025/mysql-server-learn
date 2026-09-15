@@ -72,6 +72,8 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "pars0pars.h"
 #include "que0que.h"
 #include "row0mysql.h"
+#include "row0purge.h"
+#include "sql/debug_sync.h"
 #include "sql_thd_internal_api.h"
 #include "srv0mon.h"
 
@@ -2893,6 +2895,12 @@ static bool srv_task_execute(void) {
   mutex_exit(&srv_sys->tasks_mutex);
 
   if (thr != nullptr) {
+    DBUG_EXECUTE_IF("syncpoint_purge_worker_task_ready", {
+      const auto *node = static_cast<purge_node_t *>(thr->child);
+      if (node->recs != nullptr && !node->recs->empty()) {
+        CONDITIONAL_SYNC_POINT("purge_worker_task_ready");
+      }
+    });
     que_run_threads(thr);
 
     os_atomic_inc_ulint(&purge_sys->pq_mutex, &purge_sys->n_completed, 1);

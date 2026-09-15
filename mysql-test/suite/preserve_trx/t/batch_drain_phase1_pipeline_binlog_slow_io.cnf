@@ -4,6 +4,8 @@ gtid-mode=ON
 enforce-gtid-consistency=ON
 
 [mysqld.2]
+rds-preserve-trx-standby-phase2-scheduler-mode=DEPENDENCY_CONVERGENCE_V1
+rds-preserve-trx-phase1-capture-mode=BOUNDED_PIPELINE_V1
 server_id=2
 rds-preserve-trx-enable=ON
 gtid-mode=ON

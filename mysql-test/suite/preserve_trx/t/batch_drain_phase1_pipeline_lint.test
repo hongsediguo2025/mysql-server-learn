@@ -56,7 +56,11 @@ die "record count-domain repair must retain fail-closed presence checks\n"
   unless $record_adapter =~ /record_store_snapshot_presence_mismatch/s &&
          $record_adapter =~ /record_capture_presence_mismatch/s &&
          $lock_participant =~
-           /seal_result\.record_lock_count\s*==\s*0.{0,180}SEAL_FENCE_CHANGED/s;
+           /\(seal_result\.record_lock_count\s*==\s*0\)\s*!=\s*absent_candidate
+            \s*\|\|\s*\(absent_candidate\s*&&\s*seal_result\.status\s*!=\s*
+            lock_warmcopy_record_seal_status_t::EMPTY\)\)\s*\{\s*
+            return\s+reject_candidate\(\s*
+            Preserve_trx_lock_warmcopy_reason::SEAL_FENCE_CHANGED\)/sx;
 
 die "business E2E must accept the attempt Phase1 timeout\n"
   unless $business =~ /drain_phase1_timeout_ms:\s*int\s*=\s*600_000/s &&

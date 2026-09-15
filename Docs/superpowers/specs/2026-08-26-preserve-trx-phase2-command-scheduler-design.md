@@ -1,14 +1,16 @@
 # Preserve/Resume Phase2 锁依赖命令调度设计
 
-> 状态：本功能唯一权威设计稿。当前实现仍在验证中，尚未签署；此前未签署的 WIP 已隔离备份，不是本文的实现基线。代码只有逐条满足本文并通过新鲜回归后才能视为符合设计。
+> 状态（2026-09-15）：本文是命令调度主设计，scheduler 已实现；后续多语句、已执行 CALL、退出交接和有界 probe 修正已落地。历史 WIP 不作为施工基线。已实现、定向回归通过与完整性能验收分别记录，当前 SLO 尚未全部达成。
 >
-> 2026-09-07 提交前核对：scheduler 已在 `bb870f402075741a4e37c65e41d44d177b592e9c` 落地，后续独立 Phase1 主干基线为 `ae016ff650bc07269fb1ae401485ddbb2acde6bc`。当前 500 个常规 MTR 与 18 个 big-test 已有适用模式通过记录，不表示全部在 dependency 下执行。Release 性能 SLO 尚未全部达成；独立 source lint 仍报告 scheduler integration/protected-pipeline 冻结边界差异，ZERO_DIFF 尚未签署。本次提交不刷新冻结哈希，也不以保存代码代替验收。
+> 历史核对（2026-09-07；以下数量及审计状态只属于当时快照）：scheduler 已在 `bb870f402075741a4e37c65e41d44d177b592e9c` 落地，后续独立 Phase1 主干基线为 `ae016ff650bc07269fb1ae401485ddbb2acde6bc`。当时 500 个常规 MTR 与 18 个 big-test 已有适用模式通过记录，不表示全部在 dependency 下执行。Release 性能 SLO 尚未全部达成；独立 source lint 仍报告 scheduler integration/protected-pipeline 冻结边界差异，ZERO_DIFF 尚未签署。该历史记录不代表当前构建全量回归结论，保存代码不代替验收。
 >
 > 范围：只改变 standby-transfer source 在既有 Phase1 readiness 到 `WARMCOPY_CLOSING` 接缝中的命令准入，并输出由 owner/deadline/proof/identity/invariant 决定的 scheduler terminal result。scheduler 作为现有 drain owner wait loop 内的一种 readiness policy 运行，不成为新的顶层流程。除 3.1 为保持同一旧事务身份而对 dependency batch target predicate 做的窄对齐外，成功路径唯一允许产生的行为变化是 `HELD / PERMIT / 4020 / HARD`。
 >
-> 前置基线：`9c6e6b1f193dcf44ad1dad8f285baabe90aab088`。该基线的 `sql/preserve_trx_transfer.cc` SHA256 为 `f1766d499c0dee109fc63bf3c675b76779b5a5d647d233598d6d1b53bc1f171f`，`unittest/gunit/preserve_trx-t.cc` SHA256 为 `2572412329284d0920d788dac509a1d6c8ed3d2a05e17e578580f0927e0997bd`；本功能必须保持二者不变，也不新增或修改 Unit/GUnit。
+> scheduler 初始切片的前置基线：`9c6e6b1f193dcf44ad1dad8f285baabe90aab088`。该基线的 `sql/preserve_trx_transfer.cc` SHA256 为 `f1766d499c0dee109fc63bf3c675b76779b5a5d647d233598d6d1b53bc1f171f`，`unittest/gunit/preserve_trx-t.cc` SHA256 为 `2572412329284d0920d788dac509a1d6c8ed3d2a05e17e578580f0927e0997bd`；这些哈希保留为 scheduler 初始切片的审计基线，不因后续工作而改写。scheduler 本身不得改动二者；后续独立批准的 ReadView 准入及现有 GUnit 断言适配见 [CALL 补充设计](2026-09-10-phase2-running-call-transaction-boundary-design.md) 第 9.1 节。不能用初始全文件哈希声称当前整棵工作树 ZERO_DIFF；没有授权新增 Unit/GUnit。
 >
 > 文档关系：此前同主题的旧设计均不得作为 scheduler 施工依据；当前分支只保留本文这一份 scheduler 设计。`Docs/superpowers/plans/2026-08-30-preserve-trx-phase2-command-scheduler-implementation-plan.md` 中曾以 scheduler stable-boundary hint 驱动 Phase1 candidate refresh、enqueue/flush 或 CLOSING source ordering 的条目已经失效，不得继续施工。Phase1 性能优化由独立的 `Docs/superpowers/specs/2026-09-02-preserve-trx-phase1-bounded-pipeline-design.md` 定义；该流水线不得读取 scheduler facts。
+
+> 当前补充关系：[已执行 CALL](2026-09-10-phase2-running-call-transaction-boundary-design.md) 只修正命令身份和退出交接；[T0 前 purge 停止](2026-09-14-pre-t0-purge-pause-and-rollback-review.md) 是独立 owner 前置动作；[100ms record 重试](../plans/2026-09-15-phase1-record-consistency-retry.md) 只作用于 Phase1 普通捕获。它们均不授权 scheduler 接管 preserve、warmcopy、transfer 或 receiver。ReadView、PS LEX 等独立修正也不应笼统算作调度算法新增行为。
 
 ---
 
@@ -57,7 +59,7 @@ rds_preserve_trx_standby_phase2_scheduler_mode =
 - 产品默认：`DEPENDENCY_CONVERGENCE_V1`；
 - 运行中不可修改，DRAIN 开始时冻结；
 - 只在 `preserve_trx_enable=ON` 且 artifact mode 为 `STANDBY_TRANSFER_SAVE` 的 source 创建调度器；
-- Preserve MTR suite 默认显式钉在 `LEGACY_READINESS_THEN_CLOSING`，只有新增调度器用例逐例 opt-in；
+- suite 公共 `my.cnf` 仍保留 legacy/local 基线；standby-transfer 回归由逐例配置或公共 include 显式选择新模式，不再只由 scheduler 专项 opt-in。执行时须核对实际参数，不能仅凭 suite 默认值判断覆盖；
 - OFF、legacy、local carrier、receiver 和 promotion 保持原行为。
 
 ### 2.2 唯一允许的行为变化
@@ -233,7 +235,7 @@ T0 对每个当时已经 active 的旧事务——无论连接正在执行命令
 
 同一事实必须在 dependency 模式的 authoritative batch boundary 保持一致：只要 `in_active_multi_stmt_transaction()` 为真且 option 为 `OPTION_BEGIN` 或 `OPTION_NOT_AUTOCOMMIT`，该连接都仍是 transaction target，pending command 退出时发布 `QUIESCED`，不能发布 `DRAINED_NO_TRANSACTION`。否则 scheduler 已登记的真实 `autocommit=0` 旧事务会在 HARD 后被 batch 层误当成 session-only，而现存 handlerton participant 又会使 session-only 校验失败并返回 4013。实现只能在新 scheduler 文件提供这个 mode-gated predicate，并由既有 target counter、pending-boundary publisher、QUIESCED/ATTACHING validation 薄调用；Legacy/OFF 仍使用原 `preserve_trx_has_explicit_active_transaction()`。它不改变 target 之外的 session-only 规则，不忽略 participant，不修改 token、warmcopy、transfer 或 receiver 算法。
 
-旧事务 lineage 另有且只有一个真正的 late-adoption 例外：某 exact `T0_EXECUTING` sequence 在 T0 枚举时尚无 active engine transaction（例如 `autocommit=0` DML 已过 BODY gate但尚未在 InnoDB start trx），其 slot 记为 `PENDING_T0_BODY_FIRST_TX`。只有该同一 sequence 的 exact engine sample 或 command-exit callback 可以原子创建它在本 BODY 内产生的第一份 old ordinal；任何 T0 后新 command 都不能据此创建 ordinal。sequence 退出仍无事务就把 slot 关闭为 no-transaction；观察到第二个不同 engine identity则 fail-closed。必须区分“封印 T0 已预留 ordinal”和“为 T0 BODY 首事务 late-adopt 新 ordinal”。
+对普通命令，旧事务 lineage 只有下面这一项 late-adoption 例外；T0 已执行 CALL 另按 [CALL 补充设计](2026-09-10-phase2-running-call-transaction-boundary-design.md) 处理，不把中间事务套入本规则：某 exact `T0_EXECUTING` sequence 在 T0 枚举时尚无 active engine transaction（例如 `autocommit=0` DML 已过 BODY gate但尚未在 InnoDB start trx），其 slot 记为 `PENDING_T0_BODY_FIRST_TX`。只有该同一 sequence 的 exact engine sample 或 command-exit callback 可以原子创建它在本 BODY 内产生的第一份 old ordinal；任何 T0 后新 command 都不能据此创建 ordinal。sequence 退出仍无事务就把 slot 关闭为 no-transaction；观察到第二个不同 engine identity则 fail-closed。必须区分“封印 T0 已预留 ordinal”和“为 T0 BODY 首事务 late-adopt 新 ordinal”。
 
 T0 是 existing pre-CLOSING owner wait loop 的一次初始化，不是新的 phase。登记完成后，同一 owner 立即做首轮 scheduler tick，并在后续 wait iteration 中按 5ms deadline 再调用 tick；只有 scheduler 返回 terminal result 后，原代码才继续发布 `WARMCOPY_CLOSING`。
 
@@ -303,7 +305,9 @@ T0 登记完成后立即把首个 scheduler tick 标为 due；但它仍服从同
 
 tick 必须是有界单步：不 sleep、不等待下游、不做阻塞式 native lock 获取。existing owner 仍独占原 active-progress 时间戳和调用决定；owner 只用下一次 progress 最早允许时间收窄本轮 `tick_stop_us`，并告知 scheduler 该 stop 是否由 progress due 截断。scheduler 不读取、更新或重新计算 progress 状态。不能靠推迟 progress 或放大 timeout 掩盖 scan overrun。
 
-固定预算如下：scan period 为 `5000us`，单次 tick 的 wall budget 为 `2000us`，单个 native wait queue 最多复制 256 个 predecessor。未启用 active progress 时 due time 视为无穷大；否则，若下一次 active progress 的最早允许时间落在本 tick 内，`tick_stop_us = min(tick_started_us + 2000us, next_active_progress_due_us)`。每个 exact probe 前都要复验预算，剩余不足 `500us` 时返回 partial round；已经取得 native latch 的 queue snapshot 不在中途切开，实际越过 `tick_stop_us` 记为 overrun。这里的 50ms 是原 callback 的 minimum interval，不是硬实时 deadline；owner 返回后仍按原 callback 条件决定是否执行。tick 先优先重新 probe 已有 fresh support 对应的 live waiter，再从 candidate cursor 继续本轮；“优先”不延长租约：InnoDB edge 只能由新的 COMPLETE exact snapshot 续期，MDL demand refresh 也不能自动续 MDL edge，后者必须由 blocker gate 再做 owner-local proof。预算耗尽就保存 cursor并返回 owner，不增加线程。单个 exact snapshot 超过 predecessor 上限或无法在一次 native snapshot 中完整复制时返回 `UNKNOWN_INCOMPLETE`，不得返回部分正向证明。
+固定预算如下：scan period 为 `5000us`，单次 tick 的 wall budget 为 `2000us`，每个 InnoDB request 最多输出 256 个去重后的真实 blocker；table queue 仍保留 256 个 predecessor 上限。未启用 active progress 时 due time 视为无穷大；否则，若下一次 active progress 的最早允许时间落在本 tick 内，`tick_stop_us = min(tick_started_us + 2000us, next_active_progress_due_us)`。每个 exact probe 前都要复验预算，剩余不足 `500us` 时返回 partial round。InnoDB probe 直接接收该绝对截止时间，沿原生 hash 顺序扫描 record queue；每 32 个原始节点（包括其他页的 hash 碰撞节点）以及相关 blocker 处理前后检查时间。预算耗尽就释放 native latch、丢弃本次全部局部结果并返回 `RETRYABLE_BUDGET_EXHAUSTED`，下轮重新取得完整快照，不保存跨轮 native 指针或拼接部分证明。已经得到的真实身份/容量错误仍按原规则处理。检查是协作式的，mutex 等待、OS 调度及最终有界复制仍可能越过 `tick_stop_us`，此时记 overrun；不宣称硬实时。
+
+这里的 50ms 是原 callback 的 minimum interval，不是硬实时 deadline；owner 返回后仍按原 callback 条件决定是否执行。InnoDB edge 只能由新的 COMPLETE exact snapshot 续期；MDL demand refresh 也不能自动续 MDL edge，后者必须由 blocker gate 再做 owner-local proof。预算重试沿现有 candidate cursor 继续并归还 THD borrow，完整一轮结束后才安排下一轮，不增加线程，也不延长旧 support。真实 blocker 超容量、table predecessor 超限或其它无法证明完整性的异常仍返回 `UNKNOWN_INCOMPLETE`，不得返回部分正向证明。
 
 每轮带 `round_id`、candidate cursor 和 `complete`。round 开始时在 scheduler mutex 下把当时的 `T0_EXECUTING/EXECUTING` exact `Command_key` 按稳定顺序复制到可复用 snapshot；cursor 只遍历这份不再变化的成员集，新进入 BODY 的 command 留到下一轮，已经退出的 key 在 merge 时 stale-discard。只有整份 snapshot 走完才是 complete，不能在 mutable container 上用 index 推断完整轮。只有 InnoDB waiter 的完整 exact snapshot 才能原子替换其 InnoDB outgoing edge set；MDL 使用 4.2 的 demand-generation 规则。只有整轮 `complete` 后，才能用“本轮未出现”删除旧的 domain fact。partial round、try-lock 失败或 stale-discard 都不能撤销尚未访问 waiter 的 support。`scan_overrun` 与历史命名的 `tick_crossed_unserviced_progress_deadline` 都是 diagnostics-only：后者只记录 tick 返回时已经越过 progress 最早允许时间的次数，不包含越界时长，不能单独作为成功/失败条件。真实 progress failure、scheduler safety fatal 与正式端到端 SLO 仍是门禁。
 
@@ -362,11 +366,11 @@ InnoDB 原生 wait 判定会检查 waiter 之前的请求，其中可能包含�
 - identity 或 release class 无法证明；
 - 队列遍历超预算或结果被截断。
 
-其中明确不支持的事实为 `UNSUPPORTED`；快照不完整或身份不确定为 `UNKNOWN`，后者使本 attempt 停止新 permit 并走 fail-closed。
+其中明确不支持的事实为 `UNSUPPORTED`；InnoDB 本次时间预算不足为 `RETRYABLE_BUDGET_EXHAUSTED`，不发布或续期 support，下轮重新探测；真实容量越限、其它完整性异常或身份不确定为 `UNKNOWN`，后者使本 attempt 停止新 permit 并走 fail-closed。
 
 release-class 使用 exact v1 allowlist：RR/SERIALIZABLE 的 ordinary record `S/X`，以及与 isolation 无关、非 AUTO_INC 的 table `IS/IX/S/X`，可以继续做 holder/identity 证明；RC/RU ordinary record `S/X`、`LOCK_AUTO_INC`、未知 mode/flag 和未单独证明的 `PREDICATE/PRDT_PAGE` 一律返回 `UNSUPPORTED_RELEASE_CLASS`。`row_unlock_for_mysql()` 可能释放 RC/RU 两种 record mode，而现有 lock object 没有保存该具体 lock 是 statement-duration 还是 transaction-duration 的 provenance；v1 不为此在 acquire/release 热路径新增字段。`UNSUPPORTED` 只表示本次不授权：waiter BODY 保持原生执行并在后续轮重试，直到事实变化或 absolute deadline；它不等同于 `UNKNOWN`，也不立即 safety-abort。
 
-InnoDB 映射是 request 级 all-or-none：只要任一不兼容 predecessor 是 waiting、任一 granted holder 不属于可精确映射的 T0 old transaction、任一 identity/release class 不支持，或遍历不完整，本 request 都不得发布其余 holder 子集。256 上限统计 8.0.22 原生 queue-prefix 遍历中的每一个 predecessor，包括 compatible predecessor，而不是只统计输出 blocker：record queue 从 `lock_rec_get_first_on_page_addr()` 走到 `wait_lock`，table queue 从 `UT_LIST_GET_FIRST(table->locks)` 走到 `wait_lock`；不引入其它版本才有的 iterator API。
+InnoDB 映射是 request 级 all-or-none：只要任一不兼容 predecessor 是 waiting、任一 granted holder 不属于可精确映射的 T0 old transaction、任一 identity/release class 不支持，或遍历不完整，本 request 都不得发布其余 holder 子集。record queue 在同一次 native latch 下沿 8.0.22 原生 hash 链走到 `wait_lock`，按 page、heap bitmap、冲突关系及事务身份依次过滤；同页其他记录锁或同事务重复对象不占用真实 blocker 的 256 个输出位置，整个遍历受上述时间预算约束。table queue 仍从 `UT_LIST_GET_FIRST(table->locks)` 走到 `wait_lock`，最多 256 个前驱对象。原生 iterator 和锁 acquire/release 热路径不变。
 
 ### 4.2 MDL
 
@@ -499,7 +503,7 @@ DDL 只在 `PERMIT_RESERVED -> EXECUTING` 的 BODY CAS 赢得后才不可撤销�
 - `COM_QUIT` 直接走原生连接退出；
 - `COM_STMT_CLOSE` 是不需要 support 的原生 cleanup；SOFT、HARD→CLOSING 交接、既有 CLOSING 和 scheduler abort 窗口都真实执行 `mysqld_stmt_close()`，不得 HELD、延迟或静默丢弃；
 - `COM_STMT_SEND_LONG_DATA` 不进入事务 BODY，也不需要 support：SOFT、private HARD→CLOSING 交接、SAFETY_ABORT 和 OWNER_CANCEL 中都沿原生路径追加 prepared-statement parameter buffer；只有既有 CLOSING 已发布或 session 已永久 drained 时，才沿既有规则静默 drop。能够完成 classic-protocol 解码的后续 EXECUTE 在 BODY 前返回 4020；若客户端只携带对已 drop long-data buffer 的引用而没有可解码的 inline value，8.0.22 原生 `Protocol_classic::parse_packet()` 会在 command capture/dispatch 以前先返回 `ER_MALFORMED_PACKET`（1835）。这类 pre-dispatch 原生错误不执行 DML，也不授权 scheduler 侵入或重排协议解码热路径；
-- multi-statement、`CALL`、CHAIN、XA 和无法精确分类的命令不在 v1 白名单。
+- 多语句 COM_QUERY 按每条顶层 SQL 重新准入，不能笼统视为不支持。尚未进入 BODY 的 `CALL` 仍非白名单；T0 已执行 CALL 按 [CALL 补充设计](2026-09-10-phase2-running-call-transaction-boundary-design.md) 运行到外层命令结束。CHAIN、XA 和无法精确分类的命令仍不在 v1 白名单。
 
 因此不能出现“LONG_DATA 已静默丢弃，scheduler 随后 abort 并恢复原生 admission，EXECUTE 又使用残缺参数执行”的路径。`COM_STMT_CLOSE` 与 `COM_STMT_SEND_LONG_DATA` 这两类 no-response packet 不消费 permit，也不创建伪 BODY sequence；其 gate action 只与 HARD/CLOSING/restore publication 排序，不伪造错误包。
 

@@ -1,0 +1,51 @@
+--source suite/preserve_trx/include/phase2_multistatement_setup.inc
+--connect(multi_autocommit,localhost,phase2_multi_app,,test)
+SET autocommit=1;
+# Allocate/reuse the engine context without leaving an active transaction.
+SELECT v FROM t_phase2_multi WHERE id=1;
+SET DEBUG_SYNC='phase2_sched_after_execution_entered SIGNAL multi_auto_body WAIT_FOR multi_auto_continue TIMEOUT 30';
+delimiter ||;
+--send
+UPDATE t_phase2_multi SET v=10 WHERE id=1;
+UPDATE t_phase2_multi SET v=900 WHERE id=2; SELECT 1||
+delimiter ;||
+--connect(multi_survivor,localhost,phase2_multi_app,,test)
+BEGIN;
+UPDATE t_phase2_multi SET v=40 WHERE id=4;
+--connection default
+SET DEBUG_SYNC='now WAIT_FOR multi_auto_body TIMEOUT 5';
+--let $sync_warnings= `SELECT @@warning_count`
+if ($sync_warnings)
+{
+  --die autocommit UPDATE did not enter BODY before T0
+}
+SET DEBUG_SYNC='phase2_sched_after_t0_registration SIGNAL multi_auto_t0';
+--send DRAIN TRANSACTIONS PRESERVE
+--connection multi_ha
+SET DEBUG_SYNC='now WAIT_FOR multi_auto_t0 TIMEOUT 15';
+--let $sync_warnings= `SELECT @@warning_count`
+if ($sync_warnings)
+{
+  --die autocommit packet did not reach T0 registration
+}
+SET DEBUG_SYNC='now SIGNAL multi_auto_continue';
+--connection multi_autocommit
+--enable_result_log
+--enable_info
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+--reap
+--disable_info
+--disable_result_log
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT 1;
+--connection default
+--reap
+--connection multi_ha
+--let $data_ok= `SELECT (SELECT v=10 FROM t_phase2_multi WHERE id=1) AND (SELECT v=0 FROM t_phase2_multi WHERE id=2)`
+if (!$data_ok)
+{
+  --die autocommit first SQL or subsequent transaction cutoff was violated
+}
+--source suite/preserve_trx/include/phase2_multistatement_cleanup.inc
+--enable_result_log
+--echo multi_statement_autocommit_first_update_kept_next_update_cut_off

@@ -1,0 +1,8 @@
+include/assert.inc [DRAIN outcome matches the consistency policy]
+ERROR HY000: Preserve drain is active; this command was not executed
+ERROR HY000: Preserve drain is active; this command was not executed
+both transactions READY; source connections remain held
+committed_value
+10
+healthy_committed_sum
+50

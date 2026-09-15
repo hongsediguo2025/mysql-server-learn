@@ -1,0 +1,26 @@
+include/assert.inc [bounded pipeline is selected]
+own_rows	own_sum
+4	527
+include/assert.inc [target has two distinct granted intentions on the same successor]
+include/assert.inc [ordinary background row lock remains beside duplicate intentions]
+committed_rows	committed_sum
+2	300
+own_rows	own_sum
+4	527
+include/assert.inc [target has two distinct granted intentions on the same successor]
+include/assert.inc [ordinary background row lock remains beside duplicate intentions]
+committed_rows	committed_sum
+2	300
+real duplicate intention reached late replacement
+one_dirty	one_replacement	no_reject
+1	1	1
+committed_rows	committed_sum
+2	300
+committed_rows	committed_sum
+2	300
+ERROR HY000: Preserve drain is active; this command was not executed
+ERROR HY000: Preserve drain is active; this command was not executed
+committed_rows	committed_sum
+2	300
+committed_rows	committed_sum
+2	300

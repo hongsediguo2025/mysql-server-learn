@@ -54,6 +54,8 @@ struct Preserve_trx_lock_warmcopy_options {
   bool process_local_artifacts{false};
   /* Bounded Phase1 keeps record identity as page plus native heap bitmap. */
   bool compact_stable_page_record_store{false};
+  /* Standby exports omit granted II; native locks and counts are unchanged. */
+  bool omit_granted_insert_intentions{false};
   /*
     Debug/test equivalence validation compares live export with the warm artifact
     after canonicalization. It is not required for production routing because a
@@ -354,7 +356,7 @@ class Preserve_trx_lock_warmcopy_drain_participant final
       const lock_warmcopy_record_store_compare_token_t &installed_token,
       const lock_warmcopy_trx_lock_fence_t &captured_live_fence,
       const std::string &serialized_payload, uint32_t record_lock_count,
-      bool active_scan, PrebuiltRecordLocksBlob *blob);
+      bool active_scan, PrebuiltRecordLocksBlob *blob, bool store_refresh_safe);
   bool bounded_phase1_record_candidate_current(
       const Preserve_trx_phase1_final_record_candidate &candidate) const;
   bool reconcile_bounded_final_record_candidates(
@@ -440,6 +442,8 @@ class Preserve_trx_lock_warmcopy_drain_participant final
     lock_warmcopy_trx_lock_fence_t record_live_seal_fence;
     bool record_locks_candidate_valid{false};
     bool record_locks_seeded_in_phase1{false};
+    /* A presence-only store cannot replay removal of duplicate native bits. */
+    bool phase1_record_store_refresh_safe{true};
     uint64_t phase1_record_target_incarnation{0};
     uint64_t phase1_record_capture_generation{0};
     uint64_t phase1_record_publication_token{0};

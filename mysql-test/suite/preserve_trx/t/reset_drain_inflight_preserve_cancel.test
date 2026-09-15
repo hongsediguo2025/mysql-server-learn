@@ -1,7 +1,7 @@
-# RESET must be observed by a phase-2 worker already inside the single-token
-# Preserve kernel. Each scenario pauses at a distinct ownership boundary,
-# publishes RESET, then verifies that the original connection and transaction
-# continue without waiting for receiver cleanup.
+# Active-route RESET is rejected at each single-token Preserve boundary.
+# The owner must continue after the rejection. A separate pre-COMMIT-send
+# failure then restores the original connection and transaction; RESET itself
+# does not cancel DRAIN in dependency mode.
 --source include/have_debug.inc
 --source include/have_debug_sync.inc
 --source include/not_windows.inc
@@ -31,15 +31,18 @@ CREATE USER reset_drain_app@localhost;
 GRANT SELECT, UPDATE ON test.* TO reset_drain_app@localhost;
 GRANT SESSION_VARIABLES_ADMIN ON *.* TO reset_drain_app@localhost;
 
---let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$MASTER_MYPORT --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=reset_drain_inflight_cancel_mtr --rds-preserve-trx-transfer-credential-secret-file=$credential_file
+--let $restart_parameters= restart: --rds-preserve-trx-standby-phase2-scheduler-mode=DEPENDENCY_CONVERGENCE_V1 --rds-preserve-trx-phase1-capture-mode=BOUNDED_PIPELINE_V1 --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$MASTER_MYPORT --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=reset_drain_inflight_cancel_mtr --rds-preserve-trx-transfer-credential-secret-file=$credential_file
 --disable_result_log
 --source include/restart_mysqld.inc
+--source suite/preserve_trx/include/assert_standby_transfer_source.inc
 --enable_result_log
 --let $restart_parameters=
 --disable_query_log
 
 CALL mtr.add_suppression(
   "PRESERVE: rolled back prepared transaction without snapshot during recovery");
+CALL mtr.add_suppression(
+  "PRESERVE: standby transfer source epoch commit failed status=9");
 
 SET GLOBAL rds_preserve_trx_enable=ON;
 SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=ON;
@@ -66,10 +69,11 @@ START TRANSACTION;
 UPDATE t_reset_inflight_cancel SET v=v+1 WHERE id=1;
 SET DEBUG_SYNC=
   'preserve_trx_before_undo_prepare SIGNAL cancel_before_prepare_waiting WAIT_FOR cancel_before_prepare_release';
-SET DEBUG_SYNC=
-  'preserve_trx_batch_cancel_before_prepare SIGNAL cancel_before_prepare_observed';
 
 --connect(reset_cancel_before_prepare_owner,localhost,root,,test)
+SET SESSION debug='+d,preserve_trx_transfer_fail_commit_before_send_once';
+SET DEBUG_SYNC=
+  'preserve_trx_transfer_commit_before_send_failed SIGNAL cancel_before_prepare_unsent WAIT_FOR cancel_before_prepare_unsent_continue';
 --send DRAIN TRANSACTIONS PRESERVE WITH USER VARS
 
 --connection reset_cancel_control
@@ -80,21 +84,32 @@ if ($sync_warning_count)
   --die before-prepare pause point was not reached
 }
 --connect(reset_cancel_before_prepare_reset,localhost,preserve_trx_ha_admin,reset-drain-inflight-cancel-secret,test)
---send RESET DRAIN
+SET @reset_wins_before=(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME='Preserve_trx_reset_drain_wins');
+--disable_result_log
+--error ER_PRESERVE_TRX_UNSUPPORTED
+RESET DRAIN;
+--enable_result_log
+--let $assert_text= before_prepare RESET rejection did not change ownership
+--let $assert_cond= `SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_reset_drain_wins')=@reset_wins_before`
+--source include/assert.inc
+
 --connection reset_cancel_control
---let $wait_timeout= 10
---let $wait_condition= SELECT COUNT(*)=1 FROM performance_schema.threads WHERE PROCESSLIST_INFO='RESET DRAIN'
---source include/wait_condition.inc
 SET DEBUG_SYNC='now SIGNAL cancel_before_prepare_release';
-SET DEBUG_SYNC='now WAIT_FOR cancel_before_prepare_observed TIMEOUT 3';
+SET DEBUG_SYNC='now WAIT_FOR cancel_before_prepare_unsent TIMEOUT 30';
 --let $sync_warning_count= `SELECT @@warning_count`
 if ($sync_warning_count)
 {
-  --die before-prepare RESET was not observed
+  --die DRAIN did not continue after the before_prepare RESET rejection
 }
-
---connection reset_cancel_before_prepare_reset
+SET DEBUG_SYNC='now SIGNAL cancel_before_prepare_unsent_continue';
+--connection reset_cancel_before_prepare_owner
+--disable_result_log
+--error ER_PRESERVE_TRX_UNSUPPORTED
 --reap
+--enable_result_log
+SET SESSION debug='-d,preserve_trx_transfer_fail_commit_before_send_once';
+SET DEBUG_SYNC='RESET';
 --connection reset_cancel_before_prepare_app
 --enable_query_log
 SELECT 'before_prepare' AS scenario,
@@ -102,11 +117,6 @@ SELECT 'before_prepare' AS scenario,
 --disable_query_log
 UPDATE t_reset_inflight_cancel SET v=v+10 WHERE id=1;
 COMMIT;
---connection reset_cancel_before_prepare_owner
---disable_result_log
---error 4021
---reap
---enable_result_log
 --connection reset_cancel_control
 --let $wait_timeout= 30
 --let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')=@receiver_active_before
@@ -124,10 +134,11 @@ START TRANSACTION;
 UPDATE t_reset_inflight_cancel SET v=v+1 WHERE id=2;
 SET DEBUG_SYNC=
   'preserve_trx_after_undo_prepared SIGNAL cancel_after_prepare_waiting WAIT_FOR cancel_after_prepare_release';
-SET DEBUG_SYNC=
-  'preserve_trx_batch_cancel_after_prepare SIGNAL cancel_after_prepare_observed';
 
 --connect(reset_cancel_after_prepare_owner,localhost,root,,test)
+SET SESSION debug='+d,preserve_trx_transfer_fail_commit_before_send_once';
+SET DEBUG_SYNC=
+  'preserve_trx_transfer_commit_before_send_failed SIGNAL cancel_after_prepare_unsent WAIT_FOR cancel_after_prepare_unsent_continue';
 --send DRAIN TRANSACTIONS PRESERVE WITH USER VARS
 
 --connection reset_cancel_control
@@ -138,21 +149,32 @@ if ($sync_warning_count)
   --die after-prepare pause point was not reached
 }
 --connect(reset_cancel_after_prepare_reset,localhost,preserve_trx_ha_admin,reset-drain-inflight-cancel-secret,test)
---send RESET DRAIN
+SET @reset_wins_before=(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME='Preserve_trx_reset_drain_wins');
+--disable_result_log
+--error ER_PRESERVE_TRX_UNSUPPORTED
+RESET DRAIN;
+--enable_result_log
+--let $assert_text= after_prepare RESET rejection did not change ownership
+--let $assert_cond= `SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_reset_drain_wins')=@reset_wins_before`
+--source include/assert.inc
+
 --connection reset_cancel_control
---let $wait_timeout= 10
---let $wait_condition= SELECT COUNT(*)=1 FROM performance_schema.threads WHERE PROCESSLIST_INFO='RESET DRAIN'
---source include/wait_condition.inc
 SET DEBUG_SYNC='now SIGNAL cancel_after_prepare_release';
-SET DEBUG_SYNC='now WAIT_FOR cancel_after_prepare_observed TIMEOUT 3';
+SET DEBUG_SYNC='now WAIT_FOR cancel_after_prepare_unsent TIMEOUT 30';
 --let $sync_warning_count= `SELECT @@warning_count`
 if ($sync_warning_count)
 {
-  --die after-prepare RESET was not observed
+  --die DRAIN did not continue after the after_prepare RESET rejection
 }
-
---connection reset_cancel_after_prepare_reset
+SET DEBUG_SYNC='now SIGNAL cancel_after_prepare_unsent_continue';
+--connection reset_cancel_after_prepare_owner
+--disable_result_log
+--error ER_PRESERVE_TRX_UNSUPPORTED
 --reap
+--enable_result_log
+SET SESSION debug='-d,preserve_trx_transfer_fail_commit_before_send_once';
+SET DEBUG_SYNC='RESET';
 --connection reset_cancel_after_prepare_app
 --enable_query_log
 SELECT 'after_prepare' AS scenario,
@@ -160,11 +182,6 @@ SELECT 'after_prepare' AS scenario,
 --disable_query_log
 UPDATE t_reset_inflight_cancel SET v=v+10 WHERE id=2;
 COMMIT;
---connection reset_cancel_after_prepare_owner
---disable_result_log
---error 4021
---reap
---enable_result_log
 --connection reset_cancel_control
 --let $wait_timeout= 30
 --let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')=@receiver_active_before
@@ -182,10 +199,11 @@ START TRANSACTION;
 UPDATE t_reset_inflight_cancel SET v=v+1 WHERE id=3;
 SET DEBUG_SYNC=
   'preserve_trx_after_detach_before_claim SIGNAL cancel_after_detach_waiting WAIT_FOR cancel_after_detach_release';
-SET DEBUG_SYNC=
-  'preserve_trx_batch_cancel_after_detach SIGNAL cancel_after_detach_observed';
 
 --connect(reset_cancel_after_detach_owner,localhost,root,,test)
+SET SESSION debug='+d,preserve_trx_transfer_fail_commit_before_send_once';
+SET DEBUG_SYNC=
+  'preserve_trx_transfer_commit_before_send_failed SIGNAL cancel_after_detach_unsent WAIT_FOR cancel_after_detach_unsent_continue';
 --send DRAIN TRANSACTIONS PRESERVE WITH USER VARS
 
 --connection reset_cancel_control
@@ -196,21 +214,32 @@ if ($sync_warning_count)
   --die after-detach pause point was not reached
 }
 --connect(reset_cancel_after_detach_reset,localhost,preserve_trx_ha_admin,reset-drain-inflight-cancel-secret,test)
---send RESET DRAIN
+SET @reset_wins_before=(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME='Preserve_trx_reset_drain_wins');
+--disable_result_log
+--error ER_PRESERVE_TRX_UNSUPPORTED
+RESET DRAIN;
+--enable_result_log
+--let $assert_text= after_detach RESET rejection did not change ownership
+--let $assert_cond= `SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_reset_drain_wins')=@reset_wins_before`
+--source include/assert.inc
+
 --connection reset_cancel_control
---let $wait_timeout= 10
---let $wait_condition= SELECT COUNT(*)=1 FROM performance_schema.threads WHERE PROCESSLIST_INFO='RESET DRAIN'
---source include/wait_condition.inc
 SET DEBUG_SYNC='now SIGNAL cancel_after_detach_release';
-SET DEBUG_SYNC='now WAIT_FOR cancel_after_detach_observed TIMEOUT 3';
+SET DEBUG_SYNC='now WAIT_FOR cancel_after_detach_unsent TIMEOUT 30';
 --let $sync_warning_count= `SELECT @@warning_count`
 if ($sync_warning_count)
 {
-  --die after-detach RESET was not observed
+  --die DRAIN did not continue after the after_detach RESET rejection
 }
-
---connection reset_cancel_after_detach_reset
+SET DEBUG_SYNC='now SIGNAL cancel_after_detach_unsent_continue';
+--connection reset_cancel_after_detach_owner
+--disable_result_log
+--error ER_PRESERVE_TRX_UNSUPPORTED
 --reap
+--enable_result_log
+SET SESSION debug='-d,preserve_trx_transfer_fail_commit_before_send_once';
+SET DEBUG_SYNC='RESET';
 --connection reset_cancel_after_detach_app
 --enable_query_log
 SELECT 'after_detach' AS scenario,
@@ -218,11 +247,6 @@ SELECT 'after_detach' AS scenario,
 --disable_query_log
 UPDATE t_reset_inflight_cancel SET v=v+10 WHERE id=3;
 COMMIT;
---connection reset_cancel_after_detach_owner
---disable_result_log
---error 4021
---reap
---enable_result_log
 --connection reset_cancel_control
 --let $wait_timeout= 30
 --let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')=@receiver_active_before
@@ -240,10 +264,11 @@ START TRANSACTION;
 UPDATE t_reset_inflight_cancel SET v=v+1 WHERE id=4;
 SET DEBUG_SYNC=
   'preserve_trx_before_artifact_publish SIGNAL cancel_before_publish_waiting WAIT_FOR cancel_before_publish_release';
-SET DEBUG_SYNC=
-  'preserve_trx_batch_cancel_before_publish SIGNAL cancel_before_publish_observed';
 
 --connect(reset_cancel_before_publish_owner,localhost,root,,test)
+SET SESSION debug='+d,preserve_trx_transfer_fail_commit_before_send_once';
+SET DEBUG_SYNC=
+  'preserve_trx_transfer_commit_before_send_failed SIGNAL cancel_before_publish_unsent WAIT_FOR cancel_before_publish_unsent_continue';
 --send DRAIN TRANSACTIONS PRESERVE WITH USER VARS
 
 --connection reset_cancel_control
@@ -254,21 +279,32 @@ if ($sync_warning_count)
   --die before-publish pause point was not reached
 }
 --connect(reset_cancel_before_publish_reset,localhost,preserve_trx_ha_admin,reset-drain-inflight-cancel-secret,test)
---send RESET DRAIN
+SET @reset_wins_before=(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME='Preserve_trx_reset_drain_wins');
+--disable_result_log
+--error ER_PRESERVE_TRX_UNSUPPORTED
+RESET DRAIN;
+--enable_result_log
+--let $assert_text= before_publish RESET rejection did not change ownership
+--let $assert_cond= `SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_reset_drain_wins')=@reset_wins_before`
+--source include/assert.inc
+
 --connection reset_cancel_control
---let $wait_timeout= 10
---let $wait_condition= SELECT COUNT(*)=1 FROM performance_schema.threads WHERE PROCESSLIST_INFO='RESET DRAIN'
---source include/wait_condition.inc
 SET DEBUG_SYNC='now SIGNAL cancel_before_publish_release';
-SET DEBUG_SYNC='now WAIT_FOR cancel_before_publish_observed TIMEOUT 3';
+SET DEBUG_SYNC='now WAIT_FOR cancel_before_publish_unsent TIMEOUT 30';
 --let $sync_warning_count= `SELECT @@warning_count`
 if ($sync_warning_count)
 {
-  --die before-publish RESET was not observed
+  --die DRAIN did not continue after the before_publish RESET rejection
 }
-
---connection reset_cancel_before_publish_reset
+SET DEBUG_SYNC='now SIGNAL cancel_before_publish_unsent_continue';
+--connection reset_cancel_before_publish_owner
+--disable_result_log
+--error ER_PRESERVE_TRX_UNSUPPORTED
 --reap
+--enable_result_log
+SET SESSION debug='-d,preserve_trx_transfer_fail_commit_before_send_once';
+SET DEBUG_SYNC='RESET';
 --connection reset_cancel_before_publish_app
 --enable_query_log
 SELECT 'before_publish' AS scenario,
@@ -276,11 +312,6 @@ SELECT 'before_publish' AS scenario,
 --disable_query_log
 UPDATE t_reset_inflight_cancel SET v=v+10 WHERE id=4;
 COMMIT;
---connection reset_cancel_before_publish_owner
---disable_result_log
---error 4021
---reap
---enable_result_log
 --connection reset_cancel_control
 --let $wait_timeout= 30
 --let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')=@receiver_active_before
@@ -303,4 +334,12 @@ DROP USER reset_drain_app@localhost;
 SET DEBUG_SYNC='RESET';
 --remove_file $credential_file
 
+--enable_query_log
+
+# The restored source still holds DRAIN's purge stop until process retirement.
+--connection default
+--disable_query_log
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE
+--source suite/preserve_trx/include/standby_source_sigkill_restart.inc
+--let $restart_parameters=
 --enable_query_log

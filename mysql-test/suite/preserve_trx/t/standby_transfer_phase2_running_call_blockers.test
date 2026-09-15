@@ -1,0 +1,2 @@
+--let $all_call_blockers= 0
+--source suite/preserve_trx/include/phase2_running_call_blockers.inc

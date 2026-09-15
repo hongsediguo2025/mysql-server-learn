@@ -1,0 +1,2 @@
+--let $live_purge_control= 1
+--source suite/preserve_trx/include/live_record_gap_purge.inc

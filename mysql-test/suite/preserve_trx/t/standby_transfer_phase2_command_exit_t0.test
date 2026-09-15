@@ -1,0 +1,37 @@
+--source suite/preserve_trx/include/phase2_multistatement_setup.inc
+--connect(exit_app,localhost,phase2_multi_app,,test)
+BEGIN;
+UPDATE t_phase2_multi SET v=10 WHERE id=1;
+# This SET itself reaches the exit hook before a scheduler exists.
+--send SET DEBUG_SYNC='phase2_sched_after_callback_hint_empty SIGNAL exit_hint WAIT_FOR exit_continue TIMEOUT 30'
+--connection default
+SET DEBUG_SYNC='now WAIT_FOR exit_hint TIMEOUT 5';
+--let $warnings= `SELECT @@warning_count`
+if ($warnings)
+{
+  --die command exit did not obtain the empty callback hint
+}
+SET DEBUG_SYNC='phase2_sched_after_t0_registration SIGNAL exit_t0 WAIT_FOR exit_owner_continue TIMEOUT 30';
+--send DRAIN TRANSACTIONS PRESERVE
+--connection multi_ha
+SET DEBUG_SYNC='now WAIT_FOR exit_t0 TIMEOUT 15';
+--let $warnings= `SELECT @@warning_count`
+if ($warnings)
+{
+  --die T0 did not register the retiring command
+}
+SET DEBUG_SYNC='now SIGNAL exit_continue';
+--connection exit_app
+--reap
+--connection multi_ha
+SET DEBUG_SYNC='now SIGNAL exit_owner_continue';
+--connection default
+--reap
+--connection multi_ha
+--source suite/preserve_trx/include/phase2_running_call_assert.inc
+--connection exit_app
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT 1;
+--source suite/preserve_trx/include/phase2_multistatement_cleanup.inc
+--enable_result_log
+--echo command_exit_t0_handoff_preserves_native_exit

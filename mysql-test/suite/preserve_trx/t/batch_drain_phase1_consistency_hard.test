@@ -1,0 +1,3 @@
+--let $retry_fault= preserve_trx_phase1_presence_conflict_ordinary,preserve_trx_phase1_presence_conflict_final
+--let $expected_drain_errno= 4013
+--source suite/preserve_trx/include/phase1_consistency_retry.inc

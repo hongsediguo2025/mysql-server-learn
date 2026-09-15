@@ -1,0 +1,86 @@
+--source suite/preserve_trx/include/phase2_multistatement_setup.inc
+
+# Apply the runtime pause before sending any transfer work. The startup option
+# alone does not invoke the update hook that controls receiver workers.
+--connection multi_receiver
+SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=ON;
+
+# START alone has no preservable engine state. Keep a separate real transaction
+# so this case tests INSERT cutoff, not the empty-transaction support boundary.
+--connect(multi_survivor,localhost,phase2_multi_app,,test)
+START TRANSACTION;
+UPDATE t_phase2_multi SET v=100 WHERE id=4;
+
+--connect(multi_business,localhost,phase2_multi_app,,test)
+--disable_reconnect
+--let $business_id= `SELECT CONNECTION_ID()`
+# First hit is START admission; second is INSERT admission. Do not send any
+# business SQL between installing this action and the exact two-SQL packet.
+SET DEBUG_SYNC='phase2_sched_after_admission_published SIGNAL begin_insert_admission WAIT_FOR begin_insert_continue TIMEOUT 30 EXECUTE 2';
+--send START TRANSACTION; INSERT INTO t_phase2_multi VALUES(5,50,REPEAT('e',512))
+
+--connection default
+SET DEBUG_SYNC='now WAIT_FOR begin_insert_admission TIMEOUT 5';
+--let $sync_warnings= `SELECT @@warning_count`
+if ($sync_warnings)
+{
+  --die START did not publish its admission
+}
+SET DEBUG_SYNC='now SIGNAL begin_insert_continue';
+SET DEBUG_SYNC='now WAIT_FOR begin_insert_admission TIMEOUT 5';
+--let $sync_warnings= `SELECT @@warning_count`
+if ($sync_warnings)
+{
+  --die INSERT did not publish its own second admission
+}
+SET DEBUG_SYNC='phase2_sched_after_hard_published SIGNAL begin_insert_hard';
+--send DRAIN TRANSACTIONS PRESERVE
+
+--connection multi_ha
+SET DEBUG_SYNC='now WAIT_FOR begin_insert_hard TIMEOUT 10';
+--let $sync_warnings= `SELECT @@warning_count`
+if ($sync_warnings)
+{
+  --die HARD did not freeze the INSERT admission
+}
+SET DEBUG_SYNC='now SIGNAL begin_insert_continue';
+--connection multi_business
+--enable_result_log
+--enable_info
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+--reap
+--disable_info
+--disable_result_log
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT 1;
+--connection default
+--reap
+--connection multi_ha
+--let $data_ok= `SELECT COUNT(*)=0 FROM t_phase2_multi WHERE id=5`
+if (!$data_ok)
+{
+  --die INSERT crossed HARD using the START admission
+}
+--let $still_connected= `SELECT COUNT(*)=1 FROM performance_schema.threads WHERE PROCESSLIST_ID=$business_id`
+if (!$still_connected)
+{
+  --die admission cutoff disconnected the business connection
+}
+--connection multi_receiver
+# Prewarm is paused in this two-datadir fixture. Verify the accepted epoch,
+# not SAVED_ONLINE/READY, which require receiver prewarm completion.
+--let $accepted= `SELECT VARIABLE_VALUE=1 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs'`
+if (!$accepted)
+{
+  --die receiver did not accept the transferred epoch
+}
+# Before prewarm the one final token remains RECEIVING. ABORTED phase1
+# candidates are legitimately excluded from the accepted epoch/token count.
+--let $one_pending_token= `SELECT VARIABLE_VALUE=1 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens'`
+if (!$one_pending_token)
+{
+  --die receiver did not retain exactly one final staged transaction
+}
+--source suite/preserve_trx/include/phase2_multistatement_cleanup.inc
+--enable_result_log
+--echo single_com_query_begin_ok_insert_cut_off_before_body

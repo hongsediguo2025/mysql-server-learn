@@ -1,0 +1,17 @@
+include/assert.inc [bounded pipeline is selected]
+first insert actually waited for the blocker
+second insert actually waited for the blocker
+own_rows	own_sum
+4	530
+include/assert.inc [both inserts belong to the same uncommitted transaction]
+include/assert.inc [both real lock waits are finished]
+include/assert.inc [two distinct granted insert intentions cover the same successor]
+committed_rows	committed_sum
+2	300
+repeated insert waits preserve successfully
+receiver has one ready transaction
+committed_rows	committed_sum
+2	300
+ERROR HY000: Preserve drain is active; this command was not executed
+committed_rows	committed_sum
+2	300

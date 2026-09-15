@@ -1,0 +1,86 @@
+--source suite/preserve_trx/include/phase2_multistatement_setup.inc
+--connection multi_receiver
+SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=ON;
+--connection default
+delimiter ||;
+CREATE PROCEDURE p_running_ps_inner()
+BEGIN
+  COMMIT;
+  START TRANSACTION;
+  UPDATE t_phase2_multi SET v=30 WHERE id=3;
+END||
+CREATE PROCEDURE p_running_ps_call()
+BEGIN
+  UPDATE t_phase2_multi SET v=20 WHERE id=2;
+  CALL p_running_ps_inner();
+END||
+delimiter ;||
+--let $ps_ready= $MYSQLTEST_VARDIR/tmp/call_ps_ready
+--let $ps_go= $MYSQLTEST_VARDIR/tmp/call_ps_go
+--let $ps_done= $MYSQLTEST_VARDIR/tmp/call_ps_done
+--let $ps_release= $MYSQLTEST_VARDIR/tmp/call_ps_release
+--let $ps_output= $MYSQLTEST_VARDIR/tmp/call_ps.out
+--exec echo starting > $ps_output
+--exec_in_background perl $MYSQL_TEST_DIR/suite/preserve_trx/include/phase2_scheduler_raw_protocol_client.pl $SERVER_MYSOCK_1 running_call $ps_ready $ps_go $ps_done $ps_release > $ps_output 2>&1
+--let $grep_file= $ps_output
+--let $grep_pattern= ps_call_prepared
+--let $wait_timeout= 10
+--source include/wait_for_pattern_in_file.inc
+--exec echo execute > $ps_go
+SET DEBUG_SYNC='now WAIT_FOR ps_call_body TIMEOUT 5';
+--let $warnings= `SELECT @@warning_count`
+if ($warnings)
+{
+  --die binary CALL did not enter its outer BODY
+}
+--connect(ps_waiter,localhost,phase2_multi_app,,test)
+SET DEBUG_SYNC='lock_wait_will_wait SIGNAL ps_call_wait';
+--send UPDATE t_phase2_multi SET v=v+1 WHERE id=1
+--connection default
+SET DEBUG_SYNC='now WAIT_FOR ps_call_wait TIMEOUT 5';
+--let $warnings= `SELECT @@warning_count`
+if ($warnings)
+{
+  --die binary CALL has no native waiter
+}
+SET DEBUG_SYNC='phase2_sched_after_probe_merged SIGNAL ps_call_proved';
+--send DRAIN TRANSACTIONS PRESERVE
+--connection multi_ha
+SET DEBUG_SYNC='now WAIT_FOR ps_call_proved TIMEOUT 15';
+--let $warnings= `SELECT @@warning_count`
+if ($warnings)
+{
+  --die binary CALL was not recognized as a running blocker
+}
+SET DEBUG_SYNC='now SIGNAL ps_call_continue';
+--connection ps_waiter
+--reap
+--connection default
+--reap
+--source suite/preserve_trx/include/phase2_running_call_assert.inc
+--let $grep_file= $ps_output
+--let $grep_pattern= ps_call_returned
+--let $wait_timeout= 10
+--source include/wait_for_pattern_in_file.inc
+--connection multi_ha
+--let $data_ok= `SELECT (SELECT v=11 FROM t_phase2_multi WHERE id=1) AND (SELECT v=20 FROM t_phase2_multi WHERE id=2) AND (SELECT v=0 FROM t_phase2_multi WHERE id=3)`
+if (!$data_ok)
+{
+  --die binary nested CALL lost its native transaction outcomes
+}
+--connection multi_receiver
+--let $one_token= `SELECT VARIABLE_VALUE=1 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens'`
+if (!$one_token)
+{
+  --die binary CALL final transaction was not received
+}
+--exec echo handoff_done > $ps_release
+--let $grep_file= $ps_output
+--let $grep_pattern= binary_call_complete_and_connection_held
+--let $wait_timeout= 10
+--source include/wait_for_pattern_in_file.inc
+--source suite/preserve_trx/include/phase2_multistatement_cleanup.inc
+DROP PROCEDURE p_running_ps_call;
+DROP PROCEDURE p_running_ps_inner;
+--enable_result_log
+--echo binary_prepared_nested_call_final_transaction_transferred

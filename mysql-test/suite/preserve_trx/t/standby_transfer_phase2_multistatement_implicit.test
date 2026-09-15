@@ -1,0 +1,54 @@
+--source suite/preserve_trx/include/phase2_multistatement_setup.inc
+--connect(multi_blocker,localhost,phase2_multi_app,,test)
+SET autocommit=0;
+SET SESSION completion_type=CHAIN;
+UPDATE t_phase2_multi SET v=10 WHERE id=1;
+--connect(multi_waiter,localhost,phase2_multi_app,,test)
+BEGIN;
+SET DEBUG_SYNC='lock_wait_will_wait SIGNAL multi_implicit_wait';
+--send UPDATE t_phase2_multi SET v=v+1 WHERE id=1
+--connection default
+SET DEBUG_SYNC='now WAIT_FOR multi_implicit_wait TIMEOUT 5';
+--let $sync_warnings= `SELECT @@warning_count`
+if ($sync_warnings)
+{
+  --die implicit transaction has no confirmed waiter
+}
+SET DEBUG_SYNC='phase2_sched_after_innodb_support_registered SIGNAL multi_implicit_support';
+--send DRAIN TRANSACTIONS PRESERVE
+--connection multi_ha
+SET DEBUG_SYNC='now WAIT_FOR multi_implicit_support TIMEOUT 10';
+--let $sync_warnings= `SELECT @@warning_count`
+if ($sync_warnings)
+{
+  --die implicit old transaction was not supported
+}
+--connection multi_blocker
+# NO CHAIN overrides completion_type, and autocommit=0 must not make the
+# following implicit transaction inherit the old transaction's permission.
+delimiter ||;
+--send
+UPDATE t_phase2_multi SET v=v+1 WHERE id=2;
+COMMIT AND NO CHAIN; UPDATE t_phase2_multi SET v=900 WHERE id=3||
+delimiter ;||
+--enable_result_log
+--enable_info
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+--reap
+--disable_info
+--disable_result_log
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT 1;
+--connection multi_waiter
+--reap
+--connection default
+--reap
+--connection multi_ha
+--let $data_ok= `SELECT (SELECT v=10 FROM t_phase2_multi WHERE id=1) AND (SELECT v=1 FROM t_phase2_multi WHERE id=2) AND (SELECT v=0 FROM t_phase2_multi WHERE id=3)`
+if (!$data_ok)
+{
+  --die implicit transaction or NO CHAIN boundary was violated
+}
+--source suite/preserve_trx/include/phase2_multistatement_cleanup.inc
+--enable_result_log
+--echo multi_statement_implicit_transaction_no_chain_passed

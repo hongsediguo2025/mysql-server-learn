@@ -1,0 +1,5 @@
+affected rows: 1
+info: Rows matched: 1  Changed: 1  Warnings: 0
+ERROR 23000: Duplicate entry '1' for key 't_phase2_multi.PRIMARY'
+ERROR 42S21: Duplicate column name 'id'
+multi_statement_native_errors_kept_and_packet_remainder_not_run

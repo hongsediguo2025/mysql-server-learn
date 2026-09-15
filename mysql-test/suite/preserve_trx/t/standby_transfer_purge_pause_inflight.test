@@ -1,0 +1,2 @@
+--let $purge_kill_owner= 0
+--source suite/preserve_trx/include/pre_t0_purge_inflight.inc

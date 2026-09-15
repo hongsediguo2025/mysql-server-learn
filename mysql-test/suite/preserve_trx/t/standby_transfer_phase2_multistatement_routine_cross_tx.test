@@ -1,0 +1,84 @@
+--source suite/preserve_trx/include/phase2_multistatement_setup.inc
+--connection multi_receiver
+SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=ON;
+--connection default
+# One native CALL changes transaction identity inside its own BODY. Only
+# its final uncommitted transaction belongs to the standby handoff.
+delimiter ||;
+CREATE PROCEDURE p_phase2_cross_tx()
+BEGIN
+  UPDATE t_phase2_multi SET v=v+1 WHERE id=2;
+  COMMIT;
+  START TRANSACTION;
+  UPDATE t_phase2_multi SET v=30 WHERE id=3;
+  SELECT v AS procedure_new_transaction FROM t_phase2_multi WHERE id=3;
+END||
+delimiter ;||
+--connect(multi_blocker,localhost,phase2_multi_app,,test)
+BEGIN;
+UPDATE t_phase2_multi SET v=10 WHERE id=1;
+SET DEBUG_SYNC='phase2_sched_after_execution_entered SIGNAL multi_cross_body WAIT_FOR multi_cross_continue TIMEOUT 30';
+delimiter ||;
+--send
+CALL p_phase2_cross_tx()||
+delimiter ;||
+--connect(multi_waiter,localhost,phase2_multi_app,,test)
+SET DEBUG_SYNC='lock_wait_will_wait SIGNAL multi_cross_wait';
+--send UPDATE t_phase2_multi SET v=v+1 WHERE id=1
+--connection default
+SET DEBUG_SYNC='now WAIT_FOR multi_cross_body TIMEOUT 5';
+--let $sync_warnings= `SELECT @@warning_count`
+if ($sync_warnings)
+{
+  --die cross-transaction CALL did not enter BODY before T0
+}
+SET DEBUG_SYNC='now WAIT_FOR multi_cross_wait TIMEOUT 5';
+--let $sync_warnings= `SELECT @@warning_count`
+if ($sync_warnings)
+{
+  --die cross-transaction CALL has no confirmed waiter
+}
+SET DEBUG_SYNC='phase2_sched_after_probe_merged SIGNAL multi_cross_support';
+--send DRAIN TRANSACTIONS PRESERVE
+--connection multi_ha
+SET DEBUG_SYNC='now WAIT_FOR multi_cross_support TIMEOUT 10';
+--let $sync_warnings= `SELECT @@warning_count`
+if ($sync_warnings)
+{
+  --die CALL blocker proof was not processed
+}
+SET DEBUG_SYNC='now SIGNAL multi_cross_continue';
+--connection default
+--reap
+--connection multi_ha
+--source suite/preserve_trx/include/phase2_running_call_assert.inc
+--connection multi_blocker
+--enable_result_log
+--reap
+--disable_result_log
+--connection multi_waiter
+--reap
+--connection multi_blocker
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT 1;
+--connection multi_ha
+--let $data_ok= `SELECT (SELECT v=11 FROM t_phase2_multi WHERE id=1) AND (SELECT v=1 FROM t_phase2_multi WHERE id=2) AND (SELECT v=0 FROM t_phase2_multi WHERE id=3)`
+if (!$data_ok)
+{
+  --die CALL did not commit T1 and preserve uncommitted T2
+}
+--connection multi_receiver
+--let $accepted= `SELECT VARIABLE_VALUE=1 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs'`
+--let $one_token= `SELECT VARIABLE_VALUE=1 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens'`
+if (!$accepted)
+{
+  --die receiver did not accept the CALL epoch
+}
+if (!$one_token)
+{
+  --die receiver did not accept exactly the final CALL transaction
+}
+--source suite/preserve_trx/include/phase2_multistatement_cleanup.inc
+DROP PROCEDURE p_phase2_cross_tx;
+--enable_result_log
+--echo cross_transaction_call_final_transaction_transferred

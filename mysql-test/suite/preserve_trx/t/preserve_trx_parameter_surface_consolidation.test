@@ -1,4 +1,5 @@
 --echo # Preserve/Resume product parameter surface is exactly 27 rds_ names.
+--source suite/preserve_trx/include/assert_standby_transfer_source.inc
 
 SELECT COUNT(*) AS rds_parameter_count
   FROM performance_schema.global_variables

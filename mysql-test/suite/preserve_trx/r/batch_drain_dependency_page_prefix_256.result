@@ -1,0 +1,13 @@
+include/assert.inc [bounded pipeline is selected]
+include/assert.inc [independent shared lock objects exist on the other record]
+include/assert.inc [all target record locks use the same space and page]
+include/assert.inc [only the real blocker conflicts with the waiter]
+same-page shared lock objects: 256
+same-page unrelated locks do not cancel drain
+all surviving write transactions are ready
+committed_sum
+301
+committed_pad_sum
+0
+ERROR HY000: Preserve drain is active; this command was not executed
+ERROR HY000: Preserve drain is active; this command was not executed

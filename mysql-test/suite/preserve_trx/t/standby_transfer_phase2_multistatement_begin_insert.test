@@ -1,0 +1,66 @@
+--source suite/preserve_trx/include/phase2_multistatement_setup.inc
+
+# Apply the runtime pause before sending any transfer work. The startup option
+# alone does not invoke the update hook that controls receiver workers.
+--connection multi_receiver
+SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=ON;
+
+--connect(multi_business,localhost,phase2_multi_app,,test)
+--disable_reconnect
+--let $business_id= `SELECT CONNECTION_ID()`
+# The directive consumes the entire line: exactly one CLIENT_MULTI_STATEMENTS
+# COM_QUERY containing START TRANSACTION and INSERT, with no intervening request.
+--send START TRANSACTION; INSERT INTO t_phase2_multi VALUES(5,50,REPEAT('e',512))
+--enable_result_log
+--enable_info
+--reap
+--disable_info
+--disable_result_log
+--connection multi_ha
+# Observe from the control connection. A business-side consistent SELECT would
+# add a read view, changing the requested START/INSERT-only transaction shape.
+--let $active_insert= `SELECT COUNT(*)=1 FROM information_schema.innodb_trx WHERE trx_mysql_thread_id=$business_id AND trx_rows_modified=1`
+if (!$active_insert)
+{
+  --die packet INSERT did not leave an active modified transaction
+}
+--let $uncommitted= `SELECT COUNT(*)=0 FROM t_phase2_multi WHERE id=5`
+if (!$uncommitted)
+{
+  --die START TRANSACTION did not keep the packet INSERT uncommitted
+}
+
+--connection default
+DRAIN TRANSACTIONS PRESERVE;
+--connection multi_business
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT 1;
+--connection multi_ha
+--let $still_connected= `SELECT COUNT(*)=1 FROM performance_schema.threads WHERE PROCESSLIST_ID=$business_id`
+if (!$still_connected)
+{
+  --die business connection was lost instead of receiving 4020
+}
+--let $uncommitted= `SELECT COUNT(*)=0 FROM t_phase2_multi WHERE id=5`
+if (!$uncommitted)
+{
+  --die DRAIN unexpectedly committed the packet INSERT
+}
+--connection multi_receiver
+# Prewarm is paused in this two-datadir fixture. Verify the accepted epoch,
+# not SAVED_ONLINE/READY, which require receiver prewarm completion.
+--let $accepted= `SELECT VARIABLE_VALUE=1 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs'`
+if (!$accepted)
+{
+  --die receiver did not accept the transferred epoch
+}
+# Before prewarm the one final token remains RECEIVING. ABORTED phase1
+# candidates are legitimately excluded from the accepted epoch/token count.
+--let $one_pending_token= `SELECT VARIABLE_VALUE=1 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens'`
+if (!$one_pending_token)
+{
+  --die receiver did not retain exactly one final staged transaction
+}
+--source suite/preserve_trx/include/phase2_multistatement_cleanup.inc
+--enable_result_log
+--echo single_com_query_begin_insert_preserved_by_dependency_standby_transfer

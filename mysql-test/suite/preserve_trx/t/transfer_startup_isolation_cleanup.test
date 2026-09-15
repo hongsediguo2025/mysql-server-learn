@@ -34,8 +34,9 @@ CALL mtr.add_suppression("PRESERVE: transfer startup cleanup incomplete");
 --exec printf corrupt > "$KNOWN_SNAPSHOT"
 --exec printf staged > "$TRANSFER_OBJECT"
 
---let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --skip-log-bin
+--let $restart_parameters= restart: --rds-preserve-trx-standby-phase2-scheduler-mode=DEPENDENCY_CONVERGENCE_V1 --rds-preserve-trx-phase1-capture-mode=BOUNDED_PIPELINE_V1 --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --skip-log-bin
 --source include/restart_mysqld.inc
+--source suite/preserve_trx/include/assert_standby_transfer_source.inc
 --let $restart_parameters=
 
 --exec test -d "$PRESERVE_TRX_DIR"

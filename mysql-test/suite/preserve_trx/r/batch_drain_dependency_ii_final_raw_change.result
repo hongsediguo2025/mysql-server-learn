@@ -1,0 +1,19 @@
+include/assert.inc [bounded pipeline is selected]
+include/assert.inc [two actual waits left intentions on distinct deleted successors]
+include/assert.inc [DRAIN pause protects both deleted successors]
+include/assert.inc [one ordinary bit and two intention bits remain before conversion]
+ERROR HY000: Statement aborted because lock(s) could not be acquired immediately and NOWAIT is set.
+include/assert.inc [implicit conversion reused the original ordinary lock object]
+include/assert.inc [ordinary bitmap changed while both intentions remain]
+strict final fence rejects the changed native lock state
+include/assert.inc [original application connection and transaction were restored]
+id	v
+10	107
+20	200
+40	400
+45	450
+60	600
+id	v
+10	100
+40	400
+60	600

@@ -1,0 +1,70 @@
+--source suite/preserve_trx/include/phase2_multistatement_setup.inc
+
+--connect(multi_blocker,localhost,phase2_multi_app,,test)
+SET SESSION transaction_isolation='REPEATABLE-READ';
+START TRANSACTION;
+UPDATE t_phase2_multi SET v=1 WHERE id=1;
+# Retire each SQL only after its native statement cleanup. The first
+# statement is already EXECUTING when DRAIN registers the old transaction.
+SET DEBUG_SYNC='phase2_sched_after_execution_entered SIGNAL multi_packet_entered WAIT_FOR multi_packet_continue TIMEOUT 30';
+delimiter ||;
+--send
+UPDATE t_phase2_multi SET v=v+1 WHERE id=2;
+COMMIT; BEGIN; UPDATE t_phase2_multi SET v=900 WHERE id=3||
+delimiter ;||
+
+--connection default
+SET DEBUG_SYNC='now WAIT_FOR multi_packet_entered TIMEOUT 5';
+--let $sync_warnings= `SELECT @@warning_count`
+if ($sync_warnings)
+{
+  --die multi-statement packet did not enter execution before DRAIN
+}
+--connect(multi_waiter,localhost,phase2_multi_app,,test)
+START TRANSACTION;
+SET DEBUG_SYNC='lock_wait_will_wait SIGNAL multi_boundary_waiting';
+--send UPDATE t_phase2_multi SET v=v+10 WHERE id=1
+
+--connection default
+SET DEBUG_SYNC='now WAIT_FOR multi_boundary_waiting TIMEOUT 5';
+--let $sync_warnings= `SELECT @@warning_count`
+if ($sync_warnings)
+{
+  --die boundary waiter did not enter InnoDB lock wait
+}
+SET DEBUG_SYNC='phase2_sched_after_innodb_support_registered SIGNAL multi_boundary_support';
+--send DRAIN TRANSACTIONS PRESERVE
+
+--connection multi_ha
+SET DEBUG_SYNC='now WAIT_FOR multi_boundary_support TIMEOUT 10';
+--let $sync_warnings= `SELECT @@warning_count`
+if ($sync_warnings)
+{
+  --die scheduler did not seal the old blocker identity
+}
+SET DEBUG_SYNC='now SIGNAL multi_packet_continue';
+
+# The UPDATE and COMMIT results precede the error for BEGIN in the SAME
+# packet. The later transaction must never inherit the old BODY admission.
+--connection multi_blocker
+--enable_result_log
+--enable_info
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+--reap
+--disable_info
+--disable_result_log
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT 1;
+--connection multi_waiter
+--reap
+--connection default
+--reap
+--connection multi_ha
+--let $data_ok= `SELECT (SELECT v=1 FROM t_phase2_multi WHERE id=2) AND (SELECT v=0 FROM t_phase2_multi WHERE id=3)`
+if (!$data_ok)
+{
+  --die old transaction commit or later transaction cutoff was violated
+}
+--source suite/preserve_trx/include/phase2_multistatement_cleanup.inc
+--enable_result_log
+--echo multi_statement_old_commit_kept_and_new_transaction_cut_off

@@ -1,0 +1,28 @@
+include/assert.inc [bounded pipeline is selected]
+include/assert.inc [insert really waits on the delete-marked successor]
+include/assert.inc [granted insert intention remains after INSERT completes]
+actual INSERT wait completed; granted intention remains
+include/assert.inc [native purge stop and resume metrics are enabled]
+include/assert.inc [detached target still has its original insert intention]
+include/assert.inc [releasing the fixture pause cannot release DRAIN's pause]
+DRAIN keeps the native intention stable before final validation
+DRAIN succeeded
+receiver has one ready transaction
+id	v
+1	10
+2	20
+id	v
+10	100
+40	400
+50	500
+ERROR HY000: Preserve drain is active; this command was not executed
+include/assert.inc [original insert intention is still present before SIGKILL]
+id	v
+1	10
+2	20
+id	v
+10	100
+40	400
+50	500
+include/assert.inc [DRAIN waited for its own native purge stop before T0]
+include/assert.inc [DRAIN did not resume purge on return]

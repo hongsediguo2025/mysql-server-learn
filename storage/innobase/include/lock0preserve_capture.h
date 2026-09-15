@@ -14,8 +14,10 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include "db0err.h"
 
 struct trx_t;
+struct lock_warmcopy_trx_lock_fence_t;
 class THD;
 
 enum class lock_preserve_phase1_record_capture_status : uint8_t {
@@ -129,6 +131,26 @@ lock_preserve_phase1_plan_record_values(
     const lock_preserve_phase1_record_snapshot &snapshot,
     bool stable_page_only,
     lock_preserve_phase1_record_resolve_plan *plan);
+
+/** Remove exact duplicate granted insert intentions from an unresolved copy.
+    Call only after validating and reserving the original snapshot's workset.
+    Native transaction counts and fences are not changed. */
+bool lock_preserve_phase1_deduplicate_insert_intentions(
+    lock_preserve_phase1_record_snapshot *snapshot);
+
+/** Validate first, then omit granted II from a reserved export copy only. */
+bool lock_preserve_filter_granted_insert_intentions(
+    lock_preserve_phase1_record_snapshot *snapshot, bool *removed);
+
+/** Explicit standby-only export; the generic export contract is unchanged. */
+dberr_t lock_preserve_export_standby_record_locks(
+    trx_t *trx, std::string *payload, uint32_t max_lock_count,
+    bool stable_page_only);
+
+/** Prove an empty standby record export against the same preserved fence. */
+bool lock_preserve_has_only_granted_insert_intentions(
+    trx_t *trx, const lock_warmcopy_trx_lock_fence_t &expected,
+    uint32_t max_lock_count);
 
 /**
   Capture a target-granular, pointer-free record-lock snapshot. The caller

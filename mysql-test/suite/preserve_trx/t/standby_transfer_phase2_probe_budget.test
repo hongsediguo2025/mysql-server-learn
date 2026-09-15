@@ -1,0 +1,90 @@
+--source suite/preserve_trx/include/phase2_multistatement_setup.inc
+
+# READY requires matching physical pages. Reuse this fixture's actors, but
+# transfer over TCP to the source instance, as in the page-prefix READY test.
+# This does not claim a two-process physical promotion.
+GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-standby-phase2-scheduler-mode=DEPENDENCY_CONVERGENCE_V1 --rds-preserve-trx-phase1-capture-mode=BOUNDED_PIPELINE_V1 --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$SERVER_MYPORT_1 --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=phase2_multistatement --rds-preserve-trx-transfer-credential-secret-file=$credential_file --rds-preserve-trx-drain-phase1-timeout-ms=10000 --rds-preserve-trx-drain-phase2-timeout-ms=10000 --log-error-verbosity=3
+--source include/restart_mysqld.inc
+--source suite/preserve_trx/include/assert_standby_transfer_source.inc
+--let $restart_parameters=
+--disable_query_log
+--disable_result_log
+CALL mtr.add_suppression('PRESERVE: rolled back prepared transaction without snapshot during recovery');
+SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=OFF;
+--disconnect multi_ha
+--connect(multi_ha,localhost,preserve_trx_ha_admin,phase2-multistatement-secret,test)
+
+--connect(probe_blocker,localhost,phase2_multi_app,,test)
+SET SESSION transaction_isolation='REPEATABLE-READ';
+BEGIN;
+UPDATE t_phase2_multi SET v=1 WHERE id=1;
+SET DEBUG_SYNC='phase2_sched_after_command_held SIGNAL probe_blocker_held';
+SET DEBUG_SYNC='phase2_sched_after_execution_entered SIGNAL probe_blocker_body';
+
+--connect(probe_waiter,localhost,phase2_multi_app,,test)
+SET SESSION transaction_isolation='REPEATABLE-READ';
+BEGIN;
+SET DEBUG_SYNC='lock_wait_will_wait SIGNAL probe_waiting';
+--send UPDATE t_phase2_multi SET v=v+10 WHERE id=1
+
+--connection default
+SET DEBUG_SYNC='now WAIT_FOR probe_waiting TIMEOUT 5';
+--let $assert_text= real waiter exists before DRAIN
+--let $assert_cond= `SELECT @@warning_count=0`
+--source include/assert.inc
+# One-shot fault expires time only after collecting a real blocker, not at
+# entry. The synchronization point is outside all native/scheduler locks.
+SET SESSION debug='+d,phase2_sched_probe_budget_after_blocker_once';
+SET DEBUG_SYNC='phase2_sched_after_probe_budget_exhausted SIGNAL probe_budget_spent WAIT_FOR probe_retry';
+SET DEBUG_SYNC='phase2_sched_after_innodb_support_registered SIGNAL probe_complete';
+--send DRAIN TRANSACTIONS PRESERVE
+
+--connection multi_ha
+SET DEBUG_SYNC='now WAIT_FOR probe_budget_spent TIMEOUT 5';
+--let $assert_text= partial native collection reached budget exhaustion
+--let $assert_cond= `SELECT @@warning_count=0`
+--source include/assert.inc
+--connection probe_blocker
+--send UPDATE t_phase2_multi SET v=v+2 WHERE id=2
+--connection multi_ha
+SET DEBUG_SYNC='now WAIT_FOR probe_blocker_held TIMEOUT 5';
+--let $assert_text= partial proof did not grant a command permit
+--let $assert_cond= `SELECT @@warning_count=0`
+--source include/assert.inc
+SET DEBUG_SYNC='now SIGNAL probe_retry';
+SET DEBUG_SYNC='now WAIT_FOR probe_complete TIMEOUT 5';
+--let $assert_text= fresh complete proof succeeds on retry
+--let $assert_cond= `SELECT @@warning_count=0`
+--source include/assert.inc
+SET DEBUG_SYNC='now WAIT_FOR probe_blocker_body TIMEOUT 5';
+--let $assert_text= held command enters BODY after complete proof
+--let $assert_cond= `SELECT @@warning_count=0`
+--source include/assert.inc
+--connection probe_blocker
+--reap
+COMMIT;
+--connection probe_waiter
+--reap
+--connection default
+--reap
+--source suite/preserve_trx/include/phase2_running_call_assert.inc
+
+--connection probe_waiter
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT 1;
+--connection multi_ha
+--let $assert_text= blocker DML committed exactly once
+--let $assert_cond= `SELECT SUM(v)=3 FROM t_phase2_multi`
+--source include/assert.inc
+--let $wait_condition= SELECT VARIABLE_VALUE=1 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens'
+--source include/wait_condition.inc
+--let $assert_text= exactly one receiver token is ready
+--let $assert_cond= `SELECT VARIABLE_VALUE=1 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens'`
+--source include/assert.inc
+--let $assert_text= no receiver token remains not ready
+--let $assert_cond= `SELECT VARIABLE_VALUE=0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens'`
+--source include/assert.inc
+--source suite/preserve_trx/include/phase2_multistatement_cleanup.inc
+--enable_result_log
+--echo partial proof discarded; fresh complete proof released blocker; receiver ready

@@ -13,6 +13,7 @@ EOF
 --exec chmod 600 $credential_file
 
 --connect(control_unsent_receiver,127.0.0.1,root,,test,$SERVER_MYPORT_2,)
+--source suite/preserve_trx/include/assert_standby_transfer_modes.inc
 --disable_warnings
 DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
 --enable_warnings
@@ -40,8 +41,9 @@ GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
 CREATE USER control_unsent_app@localhost;
 GRANT SELECT, UPDATE ON test.* TO control_unsent_app@localhost;
 
---let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$SERVER_MYPORT_2 --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=control_only_unsent --rds-preserve-trx-transfer-credential-secret-file=$credential_file
+--let $restart_parameters= restart: --rds-preserve-trx-standby-phase2-scheduler-mode=DEPENDENCY_CONVERGENCE_V1 --rds-preserve-trx-phase1-capture-mode=BOUNDED_PIPELINE_V1 --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$SERVER_MYPORT_2 --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=control_only_unsent --rds-preserve-trx-transfer-credential-secret-file=$credential_file
 --source include/restart_mysqld.inc
+--source suite/preserve_trx/include/assert_standby_transfer_source.inc
 --let $restart_parameters=
 --disable_query_log
 --disable_result_log
@@ -109,6 +111,10 @@ DROP USER preserve_trx_ha_admin@localhost;
 
 --connection default
 --remove_file $credential_file
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE
+--source suite/preserve_trx/include/standby_source_sigkill_restart.inc
+--let $restart_parameters=
+--disable_query_log
 --enable_result_log
 SELECT 'ok' AS control_only_unsent_ack_restore;
 --enable_query_log

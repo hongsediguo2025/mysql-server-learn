@@ -6938,9 +6938,6 @@ preserve_trx_transfer_validate_strict_eligibility(
   if (!preserve_snapshot_gtid_state_is_strict_transfer_safe(metadata)) {
     return Preserve_trx_transfer_strict_eligibility_status::GTID_PRESENT;
   }
-  if (metadata.has_read_view || !metadata.read_view_payload.empty()) {
-    return Preserve_trx_transfer_strict_eligibility_status::READ_VIEW_PRESENT;
-  }
   if (predicate_lock_present || !metadata.predicate_locks_payload.empty()) {
     return Preserve_trx_transfer_strict_eligibility_status::
         PREDICATE_LOCK_PRESENT;
@@ -11538,6 +11535,25 @@ Preserve_trx_transfer_source_epoch_session::emit_frame_locked(
     ++m_next_sequence;
     return Preserve_trx_transfer_status::OK;
   }
+  DBUG_EXECUTE_IF("preserve_trx_early_force_second_dirty", {
+    if (frame.type == Preserve_trx_transfer_frame_type::DECLARE_OBJECT &&
+        frame.object_id == kPreservedTrxBlobRecordLocks) {
+      const auto *pending = m_pending_final_metadata_frames.empty()
+                                ? nullptr
+                                : &m_pending_final_metadata_frames.front();
+      LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
+             ("PRESERVE_LATE_DIRTY_TEST declare token=" +
+              std::to_string(frame.token) +
+              " sequence=" + std::to_string(frame.sequence) +
+              " pending_count=" +
+              std::to_string(m_pending_final_metadata_frames.size()) +
+              " pending_first_sequence=" +
+              std::to_string(pending == nullptr ? 0 : pending->sequence) +
+              " pending_first_token=" +
+              std::to_string(pending == nullptr ? 0 : pending->token))
+                 .c_str());
+    }
+  });
   std::string encoded_frame;
   Preserve_trx_transfer_status status =
       preserve_trx_transfer_encode_frame(frame, &encoded_frame);

@@ -1,0 +1,7 @@
+[mysqld.1]
+default_authentication_plugin=mysql_native_password
+general_log=ON
+rds-preserve-trx-enable=ON
+rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE
+rds-preserve-trx-standby-phase2-scheduler-mode=DEPENDENCY_CONVERGENCE_V1
+rds-preserve-trx-phase1-capture-mode=BOUNDED_PIPELINE_V1

@@ -1,0 +1,4 @@
+--let $purge_before_fence= 0
+--let $ii_with_background_lock= 1
+--let $ii_require_drain_purge_stop= 1
+--source suite/preserve_trx/include/final_insert_intention_purge.inc

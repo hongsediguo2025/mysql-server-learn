@@ -3,6 +3,13 @@ DEPENDENCY_CONVERGENCE_V1
 include/wait_for_pattern_in_file.inc [raw_abort_long_data_ready]
 include/wait_for_pattern_in_file.inc [raw_abort_soft_done]
 ERROR HY000: Resumable transactions across shutdown do not support this operation
+ERROR HY000: Preserve drain is active; this command was not executed
+ERROR HY000: Preserve drain is active; this command was not executed
+ERROR HY000: Preserve drain is active; this command was not executed
+late_abort_release_consumed
+1
+cutoff_responses_restored_without_replay
+1
 include/wait_for_pattern_in_file.inc [raw_abort_long_data_complete]
 native_admission_restored
 1
@@ -23,5 +30,12 @@ generation	outcome	source_connection_id	token_role	reason	closing_started_us	clo
 GENERATION	SUCCESS	SOURCE_ID	SURVIVOR	NONE	CLOSING_STARTED_US	CLOSING_DEADLINE_US
 GENERATION	SUCCESS	SOURCE_ID	SURVIVOR	NONE	CLOSING_STARTED_US	CLOSING_DEADLINE_US
 GENERATION	SUCCESS	SOURCE_ID	SURVIVOR	NONE	CLOSING_STARTED_US	CLOSING_DEADLINE_US
+ERROR HY000: Preserve drain is active; this command was not executed
+ERROR HY000: Preserve drain is active; this command was not executed
+ERROR HY000: Preserve drain is active; this command was not executed
+late_success_release_consumed
+1
+cutoff_responses_released_without_execution
+1
 one_epoch_accepted
 1

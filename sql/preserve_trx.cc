@@ -906,6 +906,8 @@ struct Preserve_trx_phase2_final_record_context {
   const char *mode{"NOT_TRACKED"};
   std::string transfer_epoch_id;
   ulonglong phase1_started_us{0};
+  ulonglong purge_stop_requested_us{0};
+  ulonglong purge_stopped_us{0};
   ulonglong pre_closing_policy_started_us{0};
   ulonglong closing_published_us{0};
   ulonglong phase2_end_monotonic_us{0};
@@ -1095,6 +1097,9 @@ void log_preserve_trx_phase2_final_record(
       (context.transfer_epoch_id.empty() ? "-" : context.transfer_epoch_id) +
       " phase1_started_us=" +
       std::to_string(context.phase1_started_us) +
+      " purge_stop_requested_us=" +
+      std::to_string(context.purge_stop_requested_us) +
+      " purge_stopped_us=" + std::to_string(context.purge_stopped_us) +
       " pre_closing_policy_started_us=" +
       std::to_string(context.pre_closing_policy_started_us) +
       " hard_published_us=" +
@@ -2423,7 +2428,6 @@ static bool preserve_trx_resurrection_metadata_is_strict(
          metadata.has_persistent_engine_state &&
          !metadata.has_temp_engine_state &&
          metadata.temp_table_manifest_payload.empty() &&
-         !metadata.has_read_view && metadata.read_view_payload.empty() &&
          metadata.predicate_locks_payload.empty() &&
          preserve_snapshot_gtid_state_is_strict_transfer_safe(metadata);
 }
@@ -5407,6 +5411,8 @@ bool preserve_trx_set_option_changes_transaction_semantics(LEX *lex) {
 bool preserve_trx_sql_command_may_create_trx_or_lock(
     LEX *lex, enum_sql_command sql_command) {
   if (sql_command == SQLCOM_PREPARE) return false;
+  // Protocol EXECUTE/FETCH has not installed the prepared statement LEX yet.
+  if (sql_command == SQLCOM_EXECUTE) return true;
 
   if (preserve_trx_select_uses_locking_read(lex))
     return true;
@@ -5428,7 +5434,6 @@ bool preserve_trx_sql_command_may_create_trx_or_lock(
     case SQLCOM_XA_PREPARE:
     case SQLCOM_XA_COMMIT:
     case SQLCOM_XA_ROLLBACK:
-    case SQLCOM_EXECUTE:
     case SQLCOM_CALL:
     case SQLCOM_LOCK_TABLES:
     case SQLCOM_LOCK_INSTANCE:
@@ -10241,6 +10246,12 @@ const char *preserve_trx_source_failure_reason_name(
 bool preserve_trx_early_lock_fence_matches(
     const lock_warmcopy_trx_lock_fence_t &initial,
     const lock_warmcopy_trx_lock_fence_t &current) {
+  if (preserve_trx_lock_warmcopy_current_options()
+          .omit_granted_insert_intentions) {
+    return !current.conversion_attempt_after_freeze &&
+           !current.conversion_unhandled_after_freeze &&
+           lock_warmcopy_trx_lock_fence_equal(initial, current);
+  }
   return !current.conversion_attempt_after_freeze &&
          !current.conversion_unhandled_after_freeze &&
          initial.trx_locks_version == current.trx_locks_version &&
@@ -10261,6 +10272,45 @@ Preserved_trx_external_blob *preserve_trx_deferred_record_lock_blob(
   return found == candidate->bundle.external_blobs.end() ? nullptr : &*found;
 }
 
+/* Validate the selected EMPTY bundle, not a previous warmcopy artifact. */
+bool preserve_trx_early_record_locks_empty(
+    Preserve_batch_target_execution &execution) {
+  auto &bundle = execution.deferred_candidate.bundle;
+  DBUG_EXECUTE_IF("preserve_trx_empty_record_tlv", {
+    bundle.tlvs.push_back({0x30, {}});
+    bundle.tlvs.push_back({0x30, {}});
+  });
+  DBUG_EXECUTE_IF("preserve_trx_empty_predicate_tlv", {
+    bundle.tlvs.push_back({0x32, {}});
+  });
+  DBUG_EXECUTE_IF("preserve_trx_empty_metadata_payload", {
+    bundle.metadata.predicate_locks_payload = "invalid";
+  });
+  DBUG_EXECUTE_IF("preserve_trx_empty_record_descriptor", {
+    bundle.blob_descriptors.push_back({kPreservedTrxBlobRecordLocks, 0, {}});
+    bundle.blob_descriptors.push_back({kPreservedTrxBlobRecordLocks, 0, {}});
+  });
+  DBUG_EXECUTE_IF("preserve_trx_empty_blob_descriptor", {
+    Preserved_trx_external_blob blob;
+    blob.descriptor.name = kPreservedTrxBlobRecordLocks;
+    bundle.external_blobs.push_back(std::move(blob));
+  });
+  if (!bundle.metadata.record_locks_payload.empty() ||
+      !bundle.metadata.predicate_locks_payload.empty())
+    return false;
+  for (const auto &tlv : bundle.tlvs)
+    if (tlv.tag == 0x30 || tlv.tag == 0x32) return false;
+  for (const auto &blob : bundle.external_blobs)
+    if (blob.name == kPreservedTrxBlobRecordLocks ||
+        blob.descriptor.name == kPreservedTrxBlobRecordLocks)
+      return false;
+  for (const auto &descriptor : bundle.blob_descriptors)
+    if (descriptor.name == kPreservedTrxBlobRecordLocks) return false;
+  return lock_preserve_has_only_granted_insert_intentions(
+      execution.result.preserved_trx, execution.initial_lock_fence,
+      preserve_trx_lock_warmcopy_current_options().max_lock_count);
+}
+
 bool preserve_trx_export_early_record_lock_blob(
     trx_t *trx, Preserved_trx_external_blob *blob,
     uint32_t *exported_record_lock_count) {
@@ -10268,8 +10318,13 @@ bool preserve_trx_export_early_record_lock_blob(
     return false;
 
   std::string combined_payload;
-  if (trx_preserve_export_record_locks_stable_page_only(
-          trx, &combined_payload, preserve_trx_max_lock_count) != DB_SUCCESS)
+  const bool omit_ii = preserve_trx_lock_warmcopy_current_options()
+                           .omit_granted_insert_intentions;
+  if ((omit_ii ? lock_preserve_export_standby_record_locks(
+                     trx, &combined_payload, preserve_trx_max_lock_count, true)
+               : trx_preserve_export_record_locks_stable_page_only(
+                     trx, &combined_payload, preserve_trx_max_lock_count)) !=
+      DB_SUCCESS)
     return false;
 
   Preserved_trx_external_blob stable_blob;
@@ -10312,7 +10367,11 @@ bool preserve_trx_bind_early_record_lock_blob(
   execution->final_record_lock_count = 0;
   execution->final_table_lock_count = table_lock_count;
   execution->final_mdl_descriptor_count = mdl_descriptor_count;
-  if (execution->initial_lock_fence.n_rec_locks == 0)
+  const bool omit_ii = preserve_trx_lock_warmcopy_current_options()
+                           .omit_granted_insert_intentions;
+  if (omit_ii && blob == nullptr)
+    return preserve_trx_early_record_locks_empty(*execution);
+  if (!omit_ii && execution->initial_lock_fence.n_rec_locks == 0)
     return blob == nullptr;
   if (blob == nullptr) return false;
   if (blob->prebuilt) {
@@ -10325,6 +10384,9 @@ bool preserve_trx_bind_early_record_lock_blob(
             Preserve_trx_lock_warmcopy_reason::OK &&
         artifact.has_prebuilt_record_locks_blob &&
         blob->name == kPreservedTrxBlobRecordLocks &&
+        (!omit_ii ||
+         (blob->warmcopy_id == artifact.prebuilt_record_locks_blob.warmcopy_id &&
+          blob->warmcopy_epoch == artifact.prebuilt_record_locks_blob.warmcopy_epoch)) &&
         blob->descriptor.size == artifact.prebuilt_record_locks_blob.size &&
         blob->descriptor.digest ==
             artifact.prebuilt_record_locks_blob.digest &&
@@ -11719,7 +11781,7 @@ preserve_trx_phase2_scheduler_observe_transaction(THD *thd) {
       (thd->variables.option_bits &
        (OPTION_BEGIN | OPTION_NOT_AUTOCOMMIT)) != 0;
   observation.isolation_level =
-      static_cast<uint32_t>(thd->variables.transaction_isolation);
+      static_cast<uint32_t>(thd->tx_isolation);
 
   trx_preserve_phase2_identity identity;
   switch (trx_preserve_phase2_owner_identity_snapshot(thd, &identity)) {
@@ -11751,6 +11813,7 @@ struct Preserve_trx_phase2_sql_classification {
   preserve_trx_phase2_scheduler::Command_class command_class{
       preserve_trx_phase2_scheduler::Command_class::DEFAULT_DENY};
   bool effective_no_chain{false};
+  bool outer_is_call{false};
 };
 
 static Preserve_trx_phase2_sql_classification
@@ -11759,11 +11822,13 @@ preserve_trx_phase2_scheduler_classify_sql_command(
   Preserve_trx_phase2_sql_classification classification;
   if (thd == nullptr || lex == nullptr || thd->in_sub_stmt != 0 ||
       thd->sp_runtime_ctx != nullptr ||
-      (thd->server_status & SERVER_MORE_RESULTS_EXISTS) != 0 ||
+      ((thd->server_status & SERVER_MORE_RESULTS_EXISTS) != 0 &&
+       thd->get_command() != COM_QUERY) ||
       !thd->get_transaction()->xid_state()->has_state(XID_STATE::XA_NOTR)) {
     return classification;
   }
 
+  classification.outer_is_call = sql_command == SQLCOM_CALL;
   switch (sql_command) {
     case SQLCOM_SELECT:
     case SQLCOM_INSERT:
@@ -11816,6 +11881,7 @@ preserve_trx_phase2_scheduler_gate_captured_command(
   request.command = command;
   request.command_class = classification.command_class;
   request.effective_no_chain = classification.effective_no_chain;
+  request.outer_is_call = classification.outer_is_call;
   request.transaction_observation =
       preserve_trx_phase2_scheduler_observe_transaction(thd);
   const preserve_trx_phase2_scheduler::Gate_action action =
@@ -12205,6 +12271,7 @@ void preserved_trx_phase2_finish_protocol_command(THD *thd) {
   preserve_trx_phase2_scheduler::Command_exit_fact fact;
   fact.command = command;
   fact.entered_body = stage == Preserve_trx_phase2_command_stage::EXECUTING;
+  fact.outer_is_call = thd->preserve_trx_phase2_outer_is_call;
   if (fact.entered_body) {
     fact.native_body_exit_us = preserve_trx_monotonic_us();
     fact.thread_id_projection = thd->thread_id();
@@ -17114,8 +17181,15 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   auto export_live_record_locks_preflight = [&]() -> const char * {
     record_locks_preflight_payload.clear();
     record_locks_preflight_count = 0;
-    if (trx_preserve_export_record_locks(thd, &record_locks_preflight_payload,
-                                         preserve_trx_max_lock_count) !=
+    const bool omit_ii = request.deferred_transfer_candidate != nullptr &&
+        preserve_trx_lock_warmcopy_current_options().omit_granted_insert_intentions;
+    if ((omit_ii ? lock_preserve_export_standby_record_locks(
+                      trx_preserve_current_thd_trx(thd),
+                      &record_locks_preflight_payload, preserve_trx_max_lock_count,
+                      false)
+                : trx_preserve_export_record_locks(
+                      thd, &record_locks_preflight_payload,
+                      preserve_trx_max_lock_count)) !=
         DB_SUCCESS) {
       const char *reason = preserve_trx_record_lock_export_failure_reason(
           "record_lock_preflight_failed");
@@ -18397,6 +18471,7 @@ bool preserve_trx_kernel_preserve_attached_transaction(
     cleanup_original_binlog_cache_after_detach(thd, has_logged_binlog_cache);
   audit_preserved_trx_event(thd, token, "preserve", "success");
   set_stage(Preserve_trx_preserve_stage::COMPLETE);
+  DEBUG_SYNC(thd, "preserve_trx_ii_preserved_before_bind");
   return false;
 }
 
@@ -20058,6 +20133,33 @@ bool Preserve_trx_drain_service::execute(
   };
   bool phase1_readiness_quiescent = !two_phase_enabled;
   if (two_phase_enabled) {
+    if (dependency_phase2_scheduler_enabled &&
+        bounded_pipeline_capture_requested) {
+      DEBUG_SYNC(thd, "preserve_trx_before_pre_t0_purge_stop");
+      if (thd->killed) {
+        abort_batch_transfer_epoch("owner_killed_before_purge_stop");
+        abort_drain_participants("owner_killed_before_purge_stop");
+        thd->send_kill_message();
+        return true;
+      }
+      phase2_final_record.purge_stop_requested_us = preserve_trx_monotonic_us();
+      /* The old source stays stopped until HA terminates it with SIGKILL. */
+      const auto purge_stop = trx_preserve_stop_purge_for_standby();
+      if (purge_stop == trx_preserve_purge_stop_result::STOPPED) {
+        phase2_final_record.purge_stopped_us = preserve_trx_monotonic_us();
+      } else if (purge_stop == trx_preserve_purge_stop_result::UNAVAILABLE) {
+        abort_batch_transfer_epoch("pre_t0_purge_state_invalid");
+        abort_drain_participants("pre_t0_purge_state_invalid");
+        return preserve_trx_reject_unsupported();
+      }
+      DEBUG_SYNC(thd, "preserve_trx_after_pre_t0_purge_stop");
+      if (thd->killed) {
+        abort_batch_transfer_epoch("owner_killed_during_purge_stop");
+        abort_drain_participants("owner_killed_during_purge_stop");
+        thd->send_kill_message();
+        return true;
+      }
+    }
     if (dependency_phase2_scheduler_enabled &&
         publish_phase1_pipeline_cutoff()) {
       abort_batch_transfer_epoch("phase1_pipeline_t0_cutoff_failed");
@@ -22688,6 +22790,19 @@ bool Preserve_trx_drain_service::execute(
       bool dirty = !preserve_trx_early_lock_fence_matches(
           execution.initial_lock_fence, current_fence);
       phase2_metrics.final_fast_scan_us += elapsed_since(stamp_started_us);
+      DBUG_EXECUTE_IF("preserve_trx_early_force_second_dirty", {
+        if (target_results.size() == 2 && &execution == &target_results[1]) {
+          dirty = true;
+          LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
+                 ("PRESERVE_LATE_DIRTY_TEST force first=" +
+                  std::to_string(target_results[0].target_thread_id) +
+                  " second=" + std::to_string(execution.target_thread_id) +
+                  " first_finalized=" +
+                  std::to_string(
+                      target_results[0].deferred_candidate.finalized))
+                     .c_str());
+        }
+      });
       if (debug_force_one_early_coordinate_drift && !dirty_injected) {
         if (current_fence.coordinate_generation ==
             std::numeric_limits<uint64_t>::max()) {
@@ -22717,6 +22832,10 @@ bool Preserve_trx_drain_service::execute(
         ++phase2_metrics.final_replacement_tokens;
         DEBUG_SYNC(thd, "preserve_trx_early_after_dirty_replacement");
       }
+    }
+    /* Replacements must precede sequence reservations for queued metadata. */
+    for (Preserve_batch_target_execution &execution : target_results) {
+      if (execution.error) continue;
       const ulonglong finalize_started_us = preserve_trx_monotonic_us();
       const bool inject_finalize_failure =
           debug_fail_early_candidate_finalize;
@@ -23231,10 +23350,11 @@ bool Preserve_trx_drain_service::execute(
     bool final_fence_changed = false;
     for (const Preserve_batch_target_execution &execution : target_results) {
       lock_warmcopy_trx_lock_fence_t current_fence;
-      if (!trx_preserve_sample_lock_warmcopy_fence(
-              execution.result.preserved_trx, &current_fence) ||
+      const bool fence_sampled = trx_preserve_sample_lock_warmcopy_fence(
+          execution.result.preserved_trx, &current_fence);
+      if (!fence_sampled ||
           !preserve_trx_early_lock_fence_matches(execution.initial_lock_fence,
-                                                 current_fence)) {
+                                                current_fence)) {
         final_fence_changed = true;
         break;
       }

@@ -38,6 +38,7 @@ struct Preserve_trx_phase1_record_prepared_payload {
   std::shared_ptr<lock_warmcopy_record_store_candidate_t> candidate;
   std::string serialized_payload;
   uint32_t record_lock_count{0};
+  bool store_refresh_safe{true};
   uint64_t resolve_credit_bytes{0};
   uint64_t candidate_credit_bytes{0};
 };
@@ -124,15 +125,25 @@ Exact_pin_status pin_exact_target(
   return Exact_pin_status::PINNED;
 }
 
+Preserve_trx_phase1_pipeline_result_status consistency_status(
+    Preserve_trx_phase1_pipeline_result_status legacy_status) {
+  return preserve_trx_lock_warmcopy_current_options()
+                 .omit_granted_insert_intentions
+             ? Preserve_trx_phase1_pipeline_result_status::CONSISTENCY_CONFLICT
+             : legacy_status;
+}
+
 Preserve_trx_phase1_pipeline_result_status map_capture_status(
     lock_preserve_phase1_record_capture_status status) {
   switch (status) {
     case lock_preserve_phase1_record_capture_status::OK:
       return Preserve_trx_phase1_pipeline_result_status::PREPARED;
     case lock_preserve_phase1_record_capture_status::RETRYABLE_LOCK_SYS_BUSY:
+      return Preserve_trx_phase1_pipeline_result_status::RETRYABLE;
     case lock_preserve_phase1_record_capture_status::
         RETRYABLE_LOCK_SET_CHANGED:
-      return Preserve_trx_phase1_pipeline_result_status::RETRYABLE;
+      return consistency_status(
+          Preserve_trx_phase1_pipeline_result_status::RETRYABLE);
     case lock_preserve_phase1_record_capture_status::
         RETRYABLE_STALE_IDENTITY:
       return Preserve_trx_phase1_pipeline_result_status::IDENTITY_STALE;
@@ -307,6 +318,9 @@ void preserve_trx_phase1_record_adapter_capture(
     return;
   }
 
+  const bool exact_record_presence =
+      preserve_trx_lock_warmcopy_current_options()
+          .omit_granted_insert_intentions;
   if (descriptor.use_record_store_snapshot) {
     trx_preserve_phase1_identity identity_before;
     lock_warmcopy_trx_lock_fence_t live_fence_before;
@@ -382,7 +396,9 @@ void preserve_trx_phase1_record_adapter_capture(
       outcome->reason = "record_store_snapshot_live_fence_changed";
       return;
     }
-    if ((live_fence_after.n_rec_locks == 0) != (record_lock_count == 0)) {
+    /* An empty mirror requires the native locked walk, not an approximate count. */
+    if ((exact_record_presence && record_lock_count == 0) ||
+        ((live_fence_after.n_rec_locks == 0) != (record_lock_count == 0))) {
       outcome->status =
           Preserve_trx_phase1_pipeline_result_status::STORE_FALLBACK;
       outcome->reason = "record_store_snapshot_presence_mismatch";
@@ -442,9 +458,28 @@ void preserve_trx_phase1_record_adapter_capture(
     outcome->reason = "record_capture_identity_changed";
     return;
   }
-  if ((snapshot.native_record_lock_count == 0) !=
-      (snapshot.exported_record_bits == 0)) {
-    outcome->status = Preserve_trx_phase1_pipeline_result_status::UNSUPPORTED;
+  /* Keep the approximate native count as a fence, not an emptiness proof. */
+  const bool record_locks_empty = exact_record_presence
+                                      ? snapshot.entries.empty()
+                                      : snapshot.native_record_lock_count == 0;
+  bool presence_mismatch =
+      record_locks_empty != (snapshot.exported_record_bits == 0);
+  /* Fault only the captured copy; the two-bit MTR control remains healthy. */
+  DBUG_EXECUTE_IF("preserve_trx_phase1_presence_conflict_twice", {
+    if (!descriptor.final_generation && descriptor.capture_generation <= 2 &&
+        snapshot.exported_record_bits == 1) presence_mismatch = true;
+  });
+  DBUG_EXECUTE_IF("preserve_trx_phase1_presence_conflict_ordinary", {
+    if (!descriptor.final_generation && snapshot.exported_record_bits == 1)
+      presence_mismatch = true;
+  });
+  DBUG_EXECUTE_IF("preserve_trx_phase1_presence_conflict_final", {
+    if (descriptor.final_generation && snapshot.exported_record_bits == 1)
+      presence_mismatch = true;
+  });
+  if (presence_mismatch) {
+    outcome->status = consistency_status(
+        Preserve_trx_phase1_pipeline_result_status::UNSUPPORTED);
     outcome->reason = "record_capture_presence_mismatch";
     return;
   }
@@ -452,9 +487,20 @@ void preserve_trx_phase1_record_adapter_capture(
   lock_warmcopy_record_store_compare_token_t store_s1;
   if (!lock_warmcopy_record_store_compare_token_for_target(
           descriptor.target_thread_id, &store_s1) ||
-      store_s1.epoch != descriptor.warmcopy_epoch ||
-      !lock_warmcopy_record_store_compare_token_equal(store_s0, store_s1)) {
+      store_s1.epoch != descriptor.warmcopy_epoch) {
     outcome->status = Preserve_trx_phase1_pipeline_result_status::RETRYABLE;
+    outcome->reason = "record_store_changed_during_capture";
+    return;
+  }
+  if (!lock_warmcopy_record_store_compare_token_equal(store_s0, store_s1)) {
+    outcome->status = consistency_status(
+        Preserve_trx_phase1_pipeline_result_status::RETRYABLE);
+    if (outcome->status ==
+            Preserve_trx_phase1_pipeline_result_status::CONSISTENCY_CONFLICT &&
+        trx_preserve_phase1_validate_record_lock_snapshot(pin.thd(), snapshot) ==
+            lock_preserve_phase1_record_identity_status::TRANSACTION_STALE) {
+      outcome->status = Preserve_trx_phase1_pipeline_result_status::IDENTITY_STALE;
+    }
     outcome->reason = "record_store_changed_during_capture";
     return;
   }
@@ -496,6 +542,9 @@ void preserve_trx_phase1_record_adapter_prepare(
   std::string serialized_payload;
   uint64_t resolved_snapshot_logical_bytes = 0;
   uint64_t resolve_required = 0;
+  bool store_refresh_safe = true;
+  const bool omit_ii = preserve_trx_lock_warmcopy_current_options()
+                           .omit_granted_insert_intentions;
   if (capture->from_record_store) {
     serialized_payload = std::move(capture->store_payload);
     resolve_required = static_cast<uint64_t>(serialized_payload.size());
@@ -530,6 +579,30 @@ void preserve_trx_phase1_record_adapter_prepare(
     if (!reserve_credit(control, resolve_required,
                         "record_resolve_credit_unavailable", outcome)) {
       return;
+    }
+
+    if (omit_ii) {
+      bool removed = false;
+      if (!lock_preserve_filter_granted_insert_intentions(&capture->snapshot,
+                                                         &removed)) {
+        outcome->status = Preserve_trx_phase1_pipeline_result_status::UNSUPPORTED;
+        outcome->reason = "record_insert_intention_invalid";
+        return;
+      }
+      store_refresh_safe = !removed;
+    } else {
+      store_refresh_safe =
+          !lock_preserve_phase1_deduplicate_insert_intentions(&capture->snapshot);
+    }
+    if (!store_refresh_safe) {
+      /* Keep the original peak credit: vector capacity has not been released. */
+      const auto status = lock_preserve_phase1_plan_record_values(
+          capture->snapshot, resolve_control.stable_page_only, &resolve_plan);
+      if (status != lock_preserve_phase1_record_resolve_status::OK) {
+        outcome->status = map_resolve_status(status);
+        outcome->reason = "record_deduplicated_plan_failed";
+        return;
+      }
     }
 
     lock_preserve_phase1_record_resolve_metrics metrics;
@@ -581,6 +654,12 @@ void preserve_trx_phase1_record_adapter_prepare(
                       "record_candidate_credit_unavailable", outcome)) {
     return;
   }
+  if (capture->from_record_store && omit_ii &&
+      candidate_plan.insert_intention_present) {
+    outcome->status = Preserve_trx_phase1_pipeline_result_status::STORE_FALLBACK;
+    outcome->reason = "record_store_insert_intention_requires_native_capture";
+    return;
+  }
 
   std::shared_ptr<lock_warmcopy_record_store_candidate_t> candidate;
   uint32_t record_lock_count = 0;
@@ -620,6 +699,7 @@ void preserve_trx_phase1_record_adapter_prepare(
     prepared->candidate = std::move(candidate);
     prepared->serialized_payload = std::move(serialized_payload);
     prepared->record_lock_count = record_lock_count;
+    prepared->store_refresh_safe = store_refresh_safe;
     prepared->resolve_credit_bytes = resolve_required;
     prepared->candidate_credit_bytes = candidate_required;
     outcome->logical_bytes = prepared->serialized_payload.size();
@@ -663,12 +743,13 @@ void preserve_trx_phase1_record_adapter_owner_install(
       trx_preserve_phase1_validate_record_lock_snapshot(
           pin.thd(), prepared->native_fence);
   if (identity_status != lock_preserve_phase1_record_identity_status::MATCH) {
-    result->status =
-        descriptor.use_record_store_snapshot &&
-                identity_status == lock_preserve_phase1_record_identity_status::
-                                       LOCK_FENCE_CHANGED
-            ? Preserve_trx_phase1_pipeline_result_status::STORE_FALLBACK
-            : Preserve_trx_phase1_pipeline_result_status::IDENTITY_STALE;
+    result->status = Preserve_trx_phase1_pipeline_result_status::IDENTITY_STALE;
+    if (identity_status ==
+        lock_preserve_phase1_record_identity_status::LOCK_FENCE_CHANGED) {
+      result->status = descriptor.use_record_store_snapshot
+                           ? Preserve_trx_phase1_pipeline_result_status::STORE_FALLBACK
+                           : consistency_status(result->status);
+    }
     result->reason = "record_install_native_fence_changed";
     return;
   }
@@ -714,6 +795,7 @@ void preserve_trx_phase1_record_adapter_owner_install(
                        : Preserve_trx_phase1_pipeline_result_status::PREPARED;
   result->publication_token = installed.publication_token;
   result->record_lock_count = installed.record_lock_count;
+  result->store_refresh_safe = prepared->store_refresh_safe;
   result->installed_token = installed.installed_token;
   result->captured_live_fence =
       live_fence_from_snapshot(prepared->native_fence);
@@ -740,7 +822,7 @@ void preserve_trx_phase1_record_adapter_owner_publish(
           descriptor.capture_generation, result->publication_token,
           result->installed_token, result->captured_live_fence,
           prepared->serialized_payload, result->record_lock_count, active_scan,
-          &blob)) {
+          &blob, result->store_refresh_safe)) {
     *result = {};
     result->status = Preserve_trx_phase1_pipeline_result_status::RETRYABLE;
     result->reason = "record_publish_participant_adopt_failed";

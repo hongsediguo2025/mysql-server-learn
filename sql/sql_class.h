@@ -1376,6 +1376,8 @@ class THD : public MDL_context_owner,
   */
   ulonglong preserve_trx_phase2_connection_incarnation{0};
   ulonglong preserve_trx_phase2_aggregate_sequence{0};
+  /** Outer SQL type, latched before BODY under LOCK_thd_data. */
+  bool preserve_trx_phase2_outer_is_call{false};
   std::atomic<Preserve_trx_phase2_command_stage>
       preserve_trx_phase2_command_stage{
           Preserve_trx_phase2_command_stage::IDLE};

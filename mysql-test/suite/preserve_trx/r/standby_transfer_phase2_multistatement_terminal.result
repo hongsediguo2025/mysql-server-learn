@@ -1,0 +1,5 @@
+affected rows: 0
+ERROR HY000: Preserve drain is active; this command was not executed
+affected rows: 0
+ERROR HY000: Preserve drain is active; this command was not executed
+multi_statement_commit_and_rollback_without_support_passed

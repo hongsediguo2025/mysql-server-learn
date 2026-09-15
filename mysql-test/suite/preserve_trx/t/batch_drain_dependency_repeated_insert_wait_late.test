@@ -1,0 +1,6 @@
+--let $ii_after_first= 1
+--let $ii_dirty= 0
+--let $ii_paused= 1
+--let $ii_restart_options=
+--let II_EXPECT_CAPTURE= 1
+--source suite/preserve_trx/include/repeated_insert_wait.inc

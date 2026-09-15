@@ -1,0 +1,31 @@
+include/assert.inc [bounded pipeline is selected]
+include/assert.inc [insert really waits on the delete-marked successor]
+include/assert.inc [granted insert intention remains after INSERT completes]
+actual INSERT wait completed; granted intention remains
+include/assert.inc [captured target still has its original insert intention]
+native purge remains stopped until final validation
+include/assert.inc [ordinary exclusive row lock is still present]
+record blob read rejected; original transaction remains active
+include/assert.inc [validation failure keeps the original application connection]
+id	v
+1	17
+2	20
+id	v
+10	100
+20	200
+40	400
+50	500
+id	v
+1	10
+2	20
+id	v
+10	100
+40	400
+50	500
+id	v
+1	10
+2	20
+id	v
+10	100
+40	400
+50	500

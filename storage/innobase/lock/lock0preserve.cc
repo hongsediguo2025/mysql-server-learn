@@ -27,6 +27,7 @@ as published by the Free Software Foundation.
 #include <functional>
 #include <limits>
 #include <memory>
+#include <new>
 #include <numeric>
 #include <set>
 #include <string>
@@ -50,6 +51,7 @@ as published by the Free Software Foundation.
 #include "lock0guards.h"
 #include "lock0preserve_capture.h"
 #include "lock0priv.h"
+#include "lock0warmcopy.h"
 #include "mach0data.h"
 #include "os0file.h"
 #include "row0sel.h"
@@ -171,7 +173,7 @@ bool lock_preserve_phase2_classify_lock(
 lock_preserve_phase2_probe_status lock_preserve_phase2_add_blocker(
     const lock_t *wait_lock, const lock_t *candidate,
     std::array<lock_preserve_phase2_blocker,
-               LOCK_PRESERVE_PHASE2_MAX_QUEUE_PREDECESSORS> *blockers,
+               LOCK_PRESERVE_PHASE2_MAX_BLOCKERS> *blockers,
     size_t *blocker_count) {
   if (wait_lock == nullptr || candidate == nullptr ||
       lock_get_type_low(wait_lock) != lock_get_type_low(candidate)) {
@@ -225,7 +227,7 @@ lock_preserve_phase2_probe_status lock_preserve_phase2_add_blocker(
 
 lock_preserve_phase2_probe_status lock_preserve_phase2_probe_wait(
     uint64_t raw_waiter_cookie, uint64_t expected_waiter_version,
-    uint64_t expected_owner_thd_cookie,
+    uint64_t expected_owner_thd_cookie, uint64_t probe_stop_us,
     lock_preserve_phase2_blocker *blockers, size_t blocker_capacity,
     lock_preserve_phase2_wait_snapshot *snapshot) {
   if (snapshot == nullptr || raw_waiter_cookie == 0 ||
@@ -234,6 +236,12 @@ lock_preserve_phase2_probe_status lock_preserve_phase2_probe_wait(
     return lock_preserve_phase2_probe_status::UNKNOWN_IDENTITY;
   }
   *snapshot = {};
+  const auto budget_exhausted = [&]() {
+    return static_cast<uint64_t>(ut_time_monotonic_us()) >= probe_stop_us;
+  };
+  if (budget_exhausted()) {
+    return lock_preserve_phase2_probe_status::RETRYABLE_BUDGET_EXHAUSTED;
+  }
 
   DBUG_EXECUTE_IF("phase2_sched_innodb_probe_lock_sys_busy", {
     return lock_preserve_phase2_probe_status::RETRYABLE_LOCK_SYS_BUSY;
@@ -241,6 +249,9 @@ lock_preserve_phase2_probe_status lock_preserve_phase2_probe_wait(
   locksys::Global_exclusive_try_latch lock_sys_latch;
   if (!lock_sys_latch.owns_lock()) {
     return lock_preserve_phase2_probe_status::RETRYABLE_LOCK_SYS_BUSY;
+  }
+  if (budget_exhausted()) {
+    return lock_preserve_phase2_probe_status::RETRYABLE_BUDGET_EXHAUSTED;
   }
 
   trx_t *waiter = reinterpret_cast<trx_t *>(
@@ -292,9 +303,12 @@ lock_preserve_phase2_probe_status lock_preserve_phase2_probe_wait(
     return lock_preserve_phase2_probe_status::RETRYABLE_STALE_IDENTITY;
   }
   local_snapshot.wait_type_mode = wait_lock->type_mode;
+  if (budget_exhausted()) {
+    return lock_preserve_phase2_probe_status::RETRYABLE_BUDGET_EXHAUSTED;
+  }
 
   std::array<lock_preserve_phase2_blocker,
-             LOCK_PRESERVE_PHASE2_MAX_QUEUE_PREDECESSORS>
+             LOCK_PRESERVE_PHASE2_MAX_BLOCKERS>
       local_blockers{};
   size_t local_blocker_count = 0;
   const lock_t *candidate = nullptr;
@@ -306,22 +320,40 @@ lock_preserve_phase2_probe_status lock_preserve_phase2_probe_wait(
     }
     const ulint bit_offset = heap_no / 8;
     const ulint bit_mask = static_cast<ulint>(1) << (heap_no % 8);
-    candidate = lock_rec_get_first_on_page_addr(
-        lock_hash_get(wait_lock->type_mode), wait_lock->rec_lock.page_id);
+    const auto page_id = wait_lock->rec_lock.page_id;
+    size_t visited = 0;
+    candidate = static_cast<const lock_t *>(HASH_GET_FIRST(
+        lock_hash_get(wait_lock->type_mode), lock_rec_hash(page_id)));
+    /* Match the native page iterator's order, but include hash collisions
+       in the time budget. Unrelated page locks do not consume output slots. */
     for (; candidate != nullptr && candidate != wait_lock;
-         candidate = lock_rec_get_next_on_page_const(candidate)) {
-      if (++local_snapshot.predecessor_count >
-          LOCK_PRESERVE_PHASE2_MAX_QUEUE_PREDECESSORS) {
-        return lock_preserve_phase2_probe_status::UNKNOWN_INCOMPLETE;
+         candidate = static_cast<const lock_t *>(HASH_GET_NEXT(hash, candidate))) {
+      if ((visited++ % 32) == 0 && budget_exhausted()) {
+        return lock_preserve_phase2_probe_status::RETRYABLE_BUDGET_EXHAUSTED;
       }
+      if (candidate->rec_lock.page_id != page_id) continue;
+      ++local_snapshot.predecessor_count;
       if (heap_no >= lock_rec_get_n_bits(candidate)) continue;
       const byte *bitmap = reinterpret_cast<const byte *>(&candidate[1]);
       if ((bitmap[bit_offset] & bit_mask) == 0) continue;
+      if (budget_exhausted()) {
+        return lock_preserve_phase2_probe_status::RETRYABLE_BUDGET_EXHAUSTED;
+      }
       const lock_preserve_phase2_probe_status status =
           lock_preserve_phase2_add_blocker(
               wait_lock, candidate, &local_blockers, &local_blocker_count);
       if (status != lock_preserve_phase2_probe_status::COMPLETE) {
         return status;
+      }
+      DBUG_EXECUTE_IF("phase2_sched_probe_budget_after_blocker_once", {
+        if (local_blocker_count != 0) {
+          DBUG_SET("-d,phase2_sched_probe_budget_after_blocker_once");
+          DBUG_SET("+d,phase2_sched_probe_budget_injected_once");
+          probe_stop_us = 0;
+        }
+      });
+      if (budget_exhausted()) {
+        return lock_preserve_phase2_probe_status::RETRYABLE_BUDGET_EXHAUSTED;
       }
     }
   } else if (lock_get_type_low(wait_lock) == LOCK_TABLE) {
@@ -332,11 +364,17 @@ lock_preserve_phase2_probe_status lock_preserve_phase2_probe_wait(
           LOCK_PRESERVE_PHASE2_MAX_QUEUE_PREDECESSORS) {
         return lock_preserve_phase2_probe_status::UNKNOWN_INCOMPLETE;
       }
+      if (budget_exhausted()) {
+        return lock_preserve_phase2_probe_status::RETRYABLE_BUDGET_EXHAUSTED;
+      }
       const lock_preserve_phase2_probe_status status =
           lock_preserve_phase2_add_blocker(
               wait_lock, candidate, &local_blockers, &local_blocker_count);
       if (status != lock_preserve_phase2_probe_status::COMPLETE) {
         return status;
+      }
+      if (budget_exhausted()) {
+        return lock_preserve_phase2_probe_status::RETRYABLE_BUDGET_EXHAUSTED;
       }
     }
   } else {
@@ -346,6 +384,9 @@ lock_preserve_phase2_probe_status lock_preserve_phase2_probe_wait(
   if (candidate != wait_lock || local_blocker_count == 0 ||
       local_blocker_count > blocker_capacity) {
     return lock_preserve_phase2_probe_status::UNKNOWN_INCOMPLETE;
+  }
+  if (budget_exhausted()) {
+    return lock_preserve_phase2_probe_status::RETRYABLE_BUDGET_EXHAUSTED;
   }
   for (size_t i = 0; i < local_blocker_count; ++i) {
     blockers[i] = local_blockers[i];
@@ -2412,6 +2453,95 @@ static bool lock_preserve_phase1_checked_mul(uint64_t left, uint64_t right,
   return true;
 }
 
+/* Validate even entries we will omit; an unsupported lock cannot disappear. */
+static bool lock_preserve_granted_ii_entry_valid(
+    const Preserve_record_lock_entry &entry) {
+  if (!lock_preserve_type_mode_is_valid(entry.type_mode)) return false;
+  if ((entry.type_mode & LOCK_INSERT_INTENTION) == 0) return true;
+  constexpr uint32_t allowed =
+      LOCK_TYPE_MASK | LOCK_MODE_MASK | LOCK_GAP | LOCK_INSERT_INTENTION;
+  return (entry.type_mode & ~allowed) == 0 &&
+         (entry.type_mode & LOCK_TYPE_MASK) == LOCK_REC &&
+         (entry.type_mode & LOCK_MODE_MASK) == LOCK_X &&
+         ((entry.type_mode & LOCK_GAP) != 0 ||
+          (entry.set_bits == 1 &&
+           entry.first_set_heap_no == PAGE_HEAP_NO_SUPREMUM));
+}
+
+bool lock_preserve_filter_granted_insert_intentions(
+    lock_preserve_phase1_record_snapshot *snapshot, bool *removed) {
+  if (snapshot == nullptr || removed == nullptr) return false;
+  *removed = false;
+  uint64_t bits = 0, bytes = 0;
+  for (auto &entry : snapshot->entries) {
+    if (!lock_preserve_refresh_bitmap_stats(&entry) ||
+        !lock_preserve_granted_ii_entry_valid(entry) ||
+        !entry.heap_offsets.empty() ||
+        !lock_preserve_phase1_checked_add(
+            sizeof(Preserve_record_lock_entry) + entry.bitmap.size() +
+                entry.record_images.size(), &bytes)) return false;
+    bits += entry.set_bits;
+  }
+  if (bits != snapshot->exported_record_bits ||
+      bytes != snapshot->captured_bytes) return false;
+  auto end = std::remove_if(
+      snapshot->entries.begin(), snapshot->entries.end(),
+      [&](const Preserve_record_lock_entry &entry) {
+        if ((entry.type_mode & LOCK_INSERT_INTENTION) == 0) return false;
+        snapshot->exported_record_bits -= entry.set_bits;
+        snapshot->captured_bytes -= sizeof(Preserve_record_lock_entry) +
+                                    entry.bitmap.size();
+        *removed = true;
+        return true;
+      });
+  snapshot->entries.erase(end, snapshot->entries.end());
+  /* Caller retains the original peak credit, including vector capacity. */
+  return true;
+}
+
+bool lock_preserve_phase1_deduplicate_insert_intentions(
+    lock_preserve_phase1_record_snapshot *snapshot) {
+  auto &entries = snapshot->entries;
+  const auto is_insert_intention = [](const Preserve_record_lock_entry &entry) {
+    return (entry.type_mode & LOCK_INSERT_INTENTION) != 0 &&
+           (entry.type_mode & (LOCK_WAIT | LOCK_PREDICATE | LOCK_PRDT_PAGE)) == 0;
+  };
+  if (std::count_if(entries.begin(), entries.end(), is_insert_intention) < 2)
+    return false;
+
+  /* No native locks or target-sized scratch allocation in this worker step. */
+  const auto key = [](const Preserve_record_lock_entry &entry) {
+    return std::tie(entry.table_id, entry.index_id, entry.space_id, entry.page_no,
+                    entry.type_mode, entry.n_bits, entry.bitmap);
+  };
+  const auto first = std::partition(
+      entries.begin(), entries.end(),
+      [&](const Preserve_record_lock_entry &entry) {
+        return !is_insert_intention(entry);
+      });
+  std::sort(first, entries.end(),
+            [&](const Preserve_record_lock_entry &left,
+                const Preserve_record_lock_entry &right) {
+              return key(left) < key(right);
+            });
+  size_t retained = static_cast<size_t>(first - entries.begin());
+  for (size_t i = retained; i < entries.size(); ++i) {
+    const auto &entry = entries[i];
+    ut_ad(entry.heap_offsets.empty() && entry.record_images.empty());
+    if (retained != 0 && is_insert_intention(entry) &&
+        key(entries[retained - 1]) == key(entry)) {
+      snapshot->exported_record_bits -= entry.set_bits;
+      snapshot->captured_bytes -= sizeof(entry) + entry.bitmap.size();
+      continue;
+    }
+    if (retained != i) entries[retained] = std::move(entries[i]);
+    ++retained;
+  }
+  const bool changed = retained != entries.size();
+  entries.resize(retained);
+  return changed;
+}
+
 lock_preserve_phase1_record_resolve_status
 lock_preserve_phase1_plan_record_values(
     const lock_preserve_phase1_record_snapshot &snapshot,
@@ -2762,7 +2892,7 @@ lock_preserve_phase1_resolve_record_values(
 
 static dberr_t lock_preserve_export_record_locks_low(
     trx_t *trx, std::string *payload, uint32_t max_lock_count,
-    bool stable_page_only) {
+    bool stable_page_only, bool omit_granted_ii = false) {
   lock_preserve_set_record_export_error(nullptr);
   if (trx == nullptr || payload == nullptr) {
     lock_preserve_set_record_export_error("record_lock_export_invalid_argument");
@@ -2782,15 +2912,22 @@ static dberr_t lock_preserve_export_record_locks_low(
 
   payload->clear();
 
-  std::vector<Preserve_record_lock_entry> entries;
+  lock_preserve_phase1_record_snapshot snapshot;
+  auto &entries = snapshot.entries;
   uint32_t exported_lock_count = 0;
   uint64_t captured_bytes = 0;
   {
     locksys::Global_exclusive_latch_guard guard{};
     trx_mutex_enter(trx);
-    const dberr_t capture_error = lock_preserve_capture_record_values_locked(
-        trx, max_lock_count, UINT64_MAX, &entries, &exported_lock_count,
-        &captured_bytes, nullptr);
+    dberr_t capture_error;
+    try {
+      capture_error = lock_preserve_capture_record_values_locked(
+          trx, max_lock_count, UINT64_MAX, &entries, &exported_lock_count,
+          &captured_bytes, nullptr);
+    } catch (...) {
+      trx_mutex_exit(trx);
+      throw;
+    }
     trx_mutex_exit(trx);
     if (capture_error != DB_SUCCESS) {
       payload->clear();
@@ -2798,6 +2935,16 @@ static dberr_t lock_preserve_export_record_locks_low(
     }
   }
 
+  if (omit_granted_ii) {
+    snapshot.exported_record_bits = exported_lock_count;
+    snapshot.captured_bytes = captured_bytes;
+    bool removed = false;
+    if (!lock_preserve_filter_granted_insert_intentions(&snapshot, &removed)) {
+      lock_preserve_set_record_export_error("record_insert_intention_invalid");
+      return DB_UNSUPPORTED;
+    }
+  }
+  DEBUG_SYNC(current_thd, "preserve_trx_live_export_captured");
   for (Preserve_record_lock_entry &entry : entries) {
     const dberr_t err =
         lock_preserve_capture_page_identity(trx, &entry, stable_page_only);
@@ -2812,6 +2959,13 @@ static dberr_t lock_preserve_export_record_locks_low(
   lock_preserve_serialize_record_entries(entries, payload);
 
   return DB_SUCCESS;
+}
+
+dberr_t lock_preserve_export_standby_record_locks(
+    trx_t *trx, std::string *payload, uint32_t max_lock_count,
+    bool stable_page_only) {
+  return lock_preserve_export_record_locks_low(trx, payload, max_lock_count,
+                                              stable_page_only, true);
 }
 
 dberr_t lock_preserve_export_record_locks(trx_t *trx, std::string *payload,
@@ -3175,6 +3329,46 @@ static dberr_t lock_preserve_parse_record_locks_payload(
   }
 
   return offset == payload.size() ? DB_SUCCESS : DB_ERROR;
+}
+
+bool lock_preserve_has_only_granted_insert_intentions(
+    trx_t *trx, const lock_warmcopy_trx_lock_fence_t &expected,
+    uint32_t max_lock_count) {
+  if (trx == nullptr || expected.conversion_attempt_after_freeze ||
+      expected.conversion_unhandled_after_freeze)
+    return false;
+  locksys::Global_exclusive_latch_guard guard{};
+  trx_mutex_enter(trx);
+  lock_warmcopy_trx_lock_fence_t current;
+  bool valid = trx->state == TRX_STATE_PRESERVED && trx->mysql_thd == nullptr &&
+               !trx->abort && trx->killed_by == 0 &&
+               lock_warmcopy_trx_lock_fence_sample(&trx->lock, &current) &&
+               lock_warmcopy_trx_lock_fence_equal(expected, current);
+  uint32_t count = 0;
+  constexpr uint32_t allowed =
+      LOCK_TYPE_MASK | LOCK_MODE_MASK | LOCK_GAP | LOCK_INSERT_INTENTION;
+  for (const lock_t *lock = UT_LIST_GET_FIRST(trx->lock.trx_locks);
+       valid && lock != nullptr; lock = UT_LIST_GET_NEXT(trx_locks, lock)) {
+    if (lock_get_type_low(lock) != LOCK_REC) continue;
+    if (lock->is_waiting() ||
+        !lock_preserve_type_mode_is_valid(lock->type_mode)) {
+      valid = false;
+      break;
+    }
+    const uint32_t bits = lock_preserve_count_live_record_bits(lock);
+    if (bits == 0) continue;
+    valid = (lock->type_mode & LOCK_INSERT_INTENTION) != 0 &&
+            (lock->type_mode & ~allowed) == 0 &&
+            (lock->type_mode & LOCK_MODE_MASK) == LOCK_X &&
+            ((lock->type_mode & LOCK_GAP) != 0 ||
+             (bits == 1 &&
+              lock_rec_find_set_bit(lock) == PAGE_HEAP_NO_SUPREMUM)) &&
+            bits <= max_lock_count - count;
+    if (valid) count += bits;
+  }
+  /* The complete locked walk is exact; n_rec_locks is only an approximate count. */
+  trx_mutex_exit(trx);
+  return valid;
 }
 
 static void lock_preserve_sort_record_lock_entries_for_import(

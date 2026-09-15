@@ -11,6 +11,7 @@ EOF
 --disable_query_log
 --disable_result_log
 --connect(pipeline_mode_receiver,127.0.0.1,root,,test,$SERVER_MYPORT_2,)
+--source suite/preserve_trx/include/assert_standby_transfer_modes.inc
 --disable_warnings
 DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
 --enable_warnings
@@ -39,9 +40,10 @@ GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
 GRANT PROCESS ON *.* TO preserve_trx_ha_admin@localhost;
 GRANT ALTER ON test.* TO preserve_trx_ha_admin@localhost;
 
---let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$SERVER_MYPORT_2 --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=phase1_pipeline_mode --rds-preserve-trx-transfer-credential-secret-file=$credential_file --rds-preserve-trx-phase1-capture-mode=BOUNDED_PIPELINE_V1 --rds-preserve-trx-phase1-pipeline-workers=2 --rds-preserve-trx-phase1-pipeline-ordinary-active-limit=1 --rds-preserve-trx-phase1-pipeline-credit-bytes=1048576 --rds-preserve-trx-phase1-pipeline-record-reserve-bytes=524288 --rds-preserve-trx-phase1-pipeline-binlog-reserve-bytes=524288 --rds-preserve-trx-phase1-pipeline-copy-chunk-bytes=65536 --rds-preserve-trx-phase1-pipeline-result-slots=2 --rds-preserve-trx-phase1-pipeline-tail-record-credit-bytes=262144 --rds-preserve-trx-drain-phase1-timeout-ms=5000 --rds-preserve-trx-drain-phase2-timeout-ms=30000
+--let $restart_parameters= restart: --rds-preserve-trx-standby-phase2-scheduler-mode=DEPENDENCY_CONVERGENCE_V1 --rds-preserve-trx-phase1-capture-mode=BOUNDED_PIPELINE_V1 --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$SERVER_MYPORT_2 --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=phase1_pipeline_mode --rds-preserve-trx-transfer-credential-secret-file=$credential_file --rds-preserve-trx-phase1-pipeline-workers=2 --rds-preserve-trx-phase1-pipeline-ordinary-active-limit=1 --rds-preserve-trx-phase1-pipeline-credit-bytes=1048576 --rds-preserve-trx-phase1-pipeline-record-reserve-bytes=524288 --rds-preserve-trx-phase1-pipeline-binlog-reserve-bytes=524288 --rds-preserve-trx-phase1-pipeline-copy-chunk-bytes=65536 --rds-preserve-trx-phase1-pipeline-result-slots=2 --rds-preserve-trx-phase1-pipeline-tail-record-credit-bytes=262144 --rds-preserve-trx-drain-phase1-timeout-ms=5000 --rds-preserve-trx-drain-phase2-timeout-ms=30000
 --disable_result_log
 --source include/restart_mysqld.inc
+--source suite/preserve_trx/include/assert_standby_transfer_source.inc
 --enable_result_log
 --let $restart_parameters=
 
@@ -52,6 +54,7 @@ SELECT @@GLOBAL.rds_preserve_trx_phase1_capture_mode AS capture_mode,
 
 --error ER_INCORRECT_GLOBAL_LOCAL_VAR
 SET GLOBAL rds_preserve_trx_phase1_capture_mode='LEGACY_SERIAL';
+--source suite/preserve_trx/include/assert_standby_transfer_source.inc
 --error ER_INCORRECT_GLOBAL_LOCAL_VAR
 SET GLOBAL rds_preserve_trx_phase1_pipeline_workers=3;
 --error ER_INCORRECT_GLOBAL_LOCAL_VAR

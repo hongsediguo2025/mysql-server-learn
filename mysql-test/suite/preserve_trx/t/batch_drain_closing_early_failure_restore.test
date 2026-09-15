@@ -1,6 +1,5 @@
-# Verify RESET restores source ownership after failures that occur only after
-# an early token has detached and staged receiver objects. DRAIN itself must
-# leave the source transaction fenced.
+# Verify finalization/replacement failure leaves source transactions fenced.
+# After source retirement, crash recovery must not commit their updates.
 --source include/have_debug.inc
 --source include/not_windows.inc
 --source include/not_log_bin.inc
@@ -26,9 +25,10 @@ GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.*
 CREATE USER closing_early_failure_app@localhost;
 GRANT SELECT, UPDATE ON test.* TO closing_early_failure_app@localhost;
 
---let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$MASTER_MYPORT --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=closing_early_failure --rds-preserve-trx-transfer-credential-secret-file=$credential_file
+--let $restart_parameters= restart: --rds-preserve-trx-standby-phase2-scheduler-mode=DEPENDENCY_CONVERGENCE_V1 --rds-preserve-trx-phase1-capture-mode=BOUNDED_PIPELINE_V1 --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$MASTER_MYPORT --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=closing_early_failure --rds-preserve-trx-transfer-credential-secret-file=$credential_file
 --disable_result_log
 --source include/restart_mysqld.inc
+--source suite/preserve_trx/include/assert_standby_transfer_source.inc
 --enable_result_log
 --let $restart_parameters=
 --disable_query_log
@@ -77,16 +77,17 @@ SELECT 1;
 UPDATE t_closing_early_failure SET v=v+10 WHERE id=1;
 
 # The source stays fenced after the ownership boundary; verify the failed
-# transaction was not applied twice only after a clean restart.
+# transaction was not applied twice after retiring and restarting the source.
 --disconnect closing_early_failure_app
 --disconnect closing_early_failure_owner
 --connection closing_early_failure_ha
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
-SHUTDOWN;
+--shutdown_server 0
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
---exec echo "restart: --rds-preserve-trx-enable=ON --skip-log-bin --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$MASTER_MYPORT --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=closing_early_failure --rds-preserve-trx-transfer-credential-secret-file=$credential_file" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-standby-phase2-scheduler-mode=DEPENDENCY_CONVERGENCE_V1 --rds-preserve-trx-phase1-capture-mode=BOUNDED_PIPELINE_V1 --rds-preserve-trx-enable=ON --skip-log-bin --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$MASTER_MYPORT --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=closing_early_failure --rds-preserve-trx-transfer-credential-secret-file=$credential_file" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
+--source suite/preserve_trx/include/assert_standby_transfer_source.inc
 --disable_reconnect
 --connect(closing_early_failure_check1,localhost,root,,test)
 --source suite/preserve_trx/include/assert_phase2_dependency_mode.inc
@@ -128,9 +129,9 @@ UPDATE t_closing_early_failure SET v=v+100 WHERE id=1;
 --disconnect closing_early_failure_owner
 --connection closing_early_failure_ha
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
-SHUTDOWN;
+--shutdown_server 0
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
---exec echo "restart: --rds-preserve-trx-enable=ON --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --rds-preserve-trx-enable=ON --skip-log-bin --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect

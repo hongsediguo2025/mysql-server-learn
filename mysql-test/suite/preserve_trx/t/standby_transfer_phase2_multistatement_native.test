@@ -1,0 +1,39 @@
+--source suite/preserve_trx/include/phase2_multistatement_setup.inc
+# No DRAIN: entering the source-capture mode must retain native multi-results,
+# statement errors, savepoints, rollback and DDL behavior.
+--source suite/preserve_trx/include/phase2_multistatement_native.inc
+--enable_result_log
+--echo dependency_native_multi_statement_checks_passed
+--disable_result_log
+
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-standby-phase2-scheduler-mode=LEGACY_READINESS_THEN_CLOSING --rds-preserve-trx-phase1-capture-mode=LEGACY_SERIAL
+--source include/restart_mysqld.inc
+--let $restart_parameters=
+--let $mode_ok= `SELECT @@GLOBAL.rds_preserve_trx_enable=1 AND @@GLOBAL.rds_preserve_trx_standby_phase2_scheduler_mode='LEGACY_READINESS_THEN_CLOSING' AND @@GLOBAL.rds_preserve_trx_phase1_capture_mode='LEGACY_SERIAL'`
+if (!$mode_ok)
+{
+  --die legacy native control did not activate its configured mode
+}
+--source suite/preserve_trx/include/phase2_multistatement_native.inc
+--enable_result_log
+--echo legacy_native_multi_statement_checks_passed
+--disable_result_log
+
+--let $restart_parameters= restart: --rds-preserve-trx-enable=OFF
+--source include/restart_mysqld.inc
+--let $restart_parameters=
+--let $mode_ok= `SELECT @@GLOBAL.rds_preserve_trx_enable=0`
+if (!$mode_ok)
+{
+  --die OFF native control did not disable preserve
+}
+--source suite/preserve_trx/include/phase2_multistatement_native.inc
+--enable_result_log
+--echo off_native_multi_statement_checks_passed
+--disable_result_log
+DROP TABLE t_phase2_multi;
+DROP USER phase2_multi_app@localhost;
+DROP USER preserve_trx_ha_admin@localhost;
+--connection multi_receiver
+DROP USER preserve_trx_ha_admin@localhost;
+--remove_file $credential_file

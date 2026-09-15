@@ -1,0 +1,53 @@
+--source include/not_windows.inc
+--disable_ps_protocol
+--disable_query_log
+--disable_result_log
+
+# No DRAIN is needed: the pre-execution risky marker runs on ordinary PS traffic.
+--let $mode_ok= `SELECT @@GLOBAL.rds_preserve_trx_enable=1 AND @@GLOBAL.rds_preserve_trx_standby_phase2_scheduler_mode='DEPENDENCY_CONVERGENCE_V1' AND @@GLOBAL.rds_preserve_trx_phase1_capture_mode='BOUNDED_PIPELINE_V1' AND @@GLOBAL.rds_preserve_trx_transfer_artifact_mode='STANDBY_TRANSFER_SAVE'`
+if (!$mode_ok)
+{
+  --die dependency standby mode was not enabled
+}
+CREATE TABLE t_protocol_ps_lex(id INT PRIMARY KEY, v INT NOT NULL,
+                             payload MEDIUMTEXT) ENGINE=InnoDB;
+INSERT INTO t_protocol_ps_lex VALUES(1,0,'seed'),(2,0,'seed');
+--let $ps_socket= `SELECT @@socket`
+--exec perl $MYSQL_TEST_DIR/suite/preserve_trx/include/protocol_ps_lex_lifetime_client.pl $ps_socket
+--enable_result_log
+--echo dependency PS lifetime checks passed
+SELECT id,v,payload FROM t_protocol_ps_lex ORDER BY id;
+--disable_result_log
+
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-standby-phase2-scheduler-mode=DEPENDENCY_CONVERGENCE_V1 --rds-preserve-trx-phase1-capture-mode=BOUNDED_PIPELINE_V1
+--source include/restart_mysqld.inc
+--let $restart_parameters=
+--disable_query_log
+--source suite/preserve_trx/include/assert_standby_transfer_source.inc
+--let $mode_ok= `SELECT @@GLOBAL.rds_preserve_trx_enable=1`
+if (!$mode_ok)
+{
+  --die restarted standby feature was not enabled
+}
+--exec perl $MYSQL_TEST_DIR/suite/preserve_trx/include/protocol_ps_lex_lifetime_client.pl $ps_socket
+--enable_result_log
+--echo restarted dependency PS lifetime checks passed
+SELECT id,v,payload FROM t_protocol_ps_lex ORDER BY id;
+--disable_result_log
+
+--let $restart_parameters= restart: --rds-preserve-trx-enable=OFF
+--source include/restart_mysqld.inc
+--source suite/preserve_trx/include/assert_standby_transfer_source.inc
+--let $restart_parameters=
+--disable_query_log
+--let $mode_ok= `SELECT @@GLOBAL.rds_preserve_trx_enable=0`
+if (!$mode_ok)
+{
+  --die preserve OFF control mode was not enabled
+}
+--exec perl $MYSQL_TEST_DIR/suite/preserve_trx/include/protocol_ps_lex_lifetime_client.pl $ps_socket
+--enable_result_log
+--echo OFF PS lifetime checks passed
+SELECT id,v,payload FROM t_protocol_ps_lex ORDER BY id;
+--disable_result_log
+DROP TABLE t_protocol_ps_lex;

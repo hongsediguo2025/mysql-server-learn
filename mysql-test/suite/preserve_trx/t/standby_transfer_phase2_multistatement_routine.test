@@ -1,0 +1,68 @@
+--source suite/preserve_trx/include/phase2_multistatement_setup.inc
+delimiter ||;
+CREATE PROCEDURE p_phase2_same_tx()
+BEGIN
+  UPDATE t_phase2_multi SET v=v+1 WHERE id=2;
+  SELECT 11 AS procedure_first;
+  SELECT 22 AS procedure_second;
+END||
+delimiter ;||
+--connect(multi_blocker,localhost,phase2_multi_app,,test)
+BEGIN;
+UPDATE t_phase2_multi SET v=10 WHERE id=1;
+SET DEBUG_SYNC='phase2_sched_after_execution_entered SIGNAL multi_call_body WAIT_FOR multi_call_continue TIMEOUT 30';
+delimiter ||;
+--send
+CALL p_phase2_same_tx(); COMMIT;
+UPDATE t_phase2_multi SET v=900 WHERE id=3||
+delimiter ;||
+--connect(multi_waiter,localhost,phase2_multi_app,,test)
+BEGIN;
+SET DEBUG_SYNC='lock_wait_will_wait SIGNAL multi_call_wait';
+--send UPDATE t_phase2_multi SET v=v+1 WHERE id=1
+--connection default
+SET DEBUG_SYNC='now WAIT_FOR multi_call_body TIMEOUT 5';
+--let $sync_warnings= `SELECT @@warning_count`
+if ($sync_warnings)
+{
+  --die CALL did not enter BODY before T0
+}
+SET DEBUG_SYNC='now WAIT_FOR multi_call_wait TIMEOUT 5';
+--let $sync_warnings= `SELECT @@warning_count`
+if ($sync_warnings)
+{
+  --die CALL transaction has no confirmed waiter
+}
+SET DEBUG_SYNC='phase2_sched_after_probe_merged SIGNAL multi_call_support';
+--send DRAIN TRANSACTIONS PRESERVE
+--connection multi_ha
+SET DEBUG_SYNC='now WAIT_FOR multi_call_support TIMEOUT 10';
+--let $sync_warnings= `SELECT @@warning_count`
+if ($sync_warnings)
+{
+  --die CALL blocker proof was not processed
+}
+SET DEBUG_SYNC='now SIGNAL multi_call_continue';
+--connection multi_blocker
+--enable_result_log
+--enable_info
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+--reap
+--disable_info
+--disable_result_log
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT 1;
+--connection multi_waiter
+--reap
+--connection default
+--reap
+--connection multi_ha
+--let $data_ok= `SELECT (SELECT v=10 FROM t_phase2_multi WHERE id=1) AND (SELECT v=1 FROM t_phase2_multi WHERE id=2) AND (SELECT v=0 FROM t_phase2_multi WHERE id=3)`
+if (!$data_ok)
+{
+  --die CALL results or outer statement cutoff was violated
+}
+--source suite/preserve_trx/include/phase2_multistatement_cleanup.inc
+DROP PROCEDURE p_phase2_same_tx;
+--enable_result_log
+--echo multi_statement_same_transaction_call_preserved_all_results

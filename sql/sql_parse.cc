@@ -1943,6 +1943,10 @@ bool dispatch_command(THD *thd, const COM_DATA *com_data,
         */
         const char *beginning_of_next_stmt = parser_state.m_lip.found_semicolon;
 
+        /* Retire this statement, not the still-active protocol packet. */
+        if (preserve_trx_standby_phase2_source_capture_enabled())
+          preserved_trx_phase2_finish_protocol_command(thd);
+
         /* Finalize server status flags after executing a statement. */
         thd->update_slow_query_status();
         thd->send_statement_status();
@@ -2005,6 +2009,8 @@ bool dispatch_command(THD *thd, const COM_DATA *com_data,
         thd->set_secondary_engine_optimization(
             Secondary_engine_optimization::PRIMARY_TENTATIVELY);
         /* TODO: set thd->lex->sql_command to SQLCOM_END here */
+        if (preserve_trx_standby_phase2_source_capture_enabled())
+          preserved_trx_phase2_begin_synthetic_protocol_command(thd, COM_QUERY);
         mysql_parse(thd, &parser_state);
 
         check_secondary_engine_statement(thd, &parser_state,

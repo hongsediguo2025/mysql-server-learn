@@ -1,0 +1,91 @@
+--source suite/preserve_trx/include/phase2_multistatement_setup.inc
+CREATE TABLE t_multi_error_ddl(id INT PRIMARY KEY) ENGINE=InnoDB;
+INSERT INTO t_multi_error_ddl VALUES(1),(2);
+--connect(multi_dml,localhost,phase2_multi_app,,test)
+BEGIN;
+UPDATE t_phase2_multi SET v=10 WHERE id=1;
+--connect(multi_ddl,localhost,phase2_multi_app,,test)
+BEGIN;
+UPDATE t_phase2_multi SET v=20 WHERE id=2;
+--connect(multi_waiter1,localhost,phase2_multi_app,,test)
+BEGIN;
+SET DEBUG_SYNC='lock_wait_will_wait SIGNAL multi_error_wait1';
+--send UPDATE t_phase2_multi SET v=v+1 WHERE id=1
+--connect(multi_waiter2,localhost,phase2_multi_app,,test)
+BEGIN;
+SET DEBUG_SYNC='lock_wait_will_wait SIGNAL multi_error_wait2';
+--send UPDATE t_phase2_multi SET v=v+1 WHERE id=2
+--connection default
+SET DEBUG_SYNC='now WAIT_FOR multi_error_wait1 TIMEOUT 5';
+--let $sync_warnings= `SELECT @@warning_count`
+if ($sync_warnings)
+{
+  --die DML blocker has no confirmed waiter
+}
+SET DEBUG_SYNC='now WAIT_FOR multi_error_wait2 TIMEOUT 5';
+--let $sync_warnings= `SELECT @@warning_count`
+if ($sync_warnings)
+{
+  --die failing DDL blocker has no confirmed waiter
+}
+SET DEBUG_SYNC='phase2_sched_after_innodb_support_registered SIGNAL multi_error_support';
+--send DRAIN TRANSACTIONS PRESERVE
+--connection multi_ha
+SET DEBUG_SYNC='now WAIT_FOR multi_error_support TIMEOUT 10';
+--let $sync_warnings= `SELECT @@warning_count`
+if ($sync_warnings)
+{
+  --die native error test has no confirmed support
+}
+--connection multi_dml
+delimiter ||;
+--send
+UPDATE t_phase2_multi SET v=30 WHERE id=3;
+INSERT INTO t_phase2_multi VALUES(1,123,'duplicate');
+COMMIT; UPDATE t_phase2_multi SET v=900 WHERE id=4||
+delimiter ;||
+--connection multi_ddl
+delimiter ||;
+--send
+ALTER TABLE t_multi_error_ddl ADD COLUMN id INT;
+UPDATE t_phase2_multi SET v=901 WHERE id=4||
+delimiter ;||
+--connection multi_dml
+--enable_result_log
+--enable_info
+--error ER_DUP_ENTRY
+--reap
+--disable_info
+--disable_result_log
+# The failed INSERT did not end its old transaction; native ROLLBACK must
+# still release its waiter. The packet's COMMIT must not have run.
+ROLLBACK;
+--connection multi_ddl
+--enable_result_log
+--error ER_DUP_FIELDNAME
+--reap
+--disable_result_log
+--connection multi_waiter1
+--reap
+--connection multi_waiter2
+--reap
+--connection default
+--reap
+--connection multi_dml
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT 1;
+--connection multi_ddl
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT 1;
+--connection multi_ha
+# Native ALTER pre-committed id=2 before detecting the duplicate column.
+# In contrast, native INSERT failure left id=3 available for rollback.
+--let $data_ok= `SELECT (SELECT v=0 FROM t_phase2_multi WHERE id=1) AND (SELECT v=20 FROM t_phase2_multi WHERE id=2) AND (SELECT v=0 FROM t_phase2_multi WHERE id=3) AND (SELECT v=0 FROM t_phase2_multi WHERE id=4)`
+if (!$data_ok)
+{
+  --die native error stop, DDL pre-commit or rollback semantics changed
+}
+--source suite/preserve_trx/include/phase2_multistatement_cleanup.inc
+DROP TABLE t_multi_error_ddl;
+--enable_result_log
+--echo multi_statement_native_errors_kept_and_packet_remainder_not_run

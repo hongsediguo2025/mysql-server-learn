@@ -1,0 +1,5 @@
+[mysqld.1]
+server-id=1
+
+[ENV]
+SERVER_MYPORT_1=@mysqld.1.port

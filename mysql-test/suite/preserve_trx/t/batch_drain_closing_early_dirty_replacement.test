@@ -26,9 +26,10 @@ GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.*
 CREATE USER closing_early_dirty_app@localhost;
 GRANT SELECT, UPDATE ON test.* TO closing_early_dirty_app@localhost;
 
---let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$MASTER_MYPORT --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=closing_early_dirty --rds-preserve-trx-transfer-credential-secret-file=$credential_file
+--let $restart_parameters= restart: --rds-preserve-trx-standby-phase2-scheduler-mode=DEPENDENCY_CONVERGENCE_V1 --rds-preserve-trx-phase1-capture-mode=BOUNDED_PIPELINE_V1 --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$MASTER_MYPORT --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=closing_early_dirty --rds-preserve-trx-transfer-credential-secret-file=$credential_file
 --disable_result_log
 --source include/restart_mysqld.inc
+--source suite/preserve_trx/include/assert_standby_transfer_source.inc
 --enable_result_log
 --let $restart_parameters=
 --disable_query_log
@@ -154,3 +155,11 @@ DROP TABLE t_closing_early_dirty;
 DROP USER closing_early_dirty_app@localhost;
 DROP USER preserve_trx_ha_admin@localhost;
 --remove_file $credential_file
+
+# The restored source still holds DRAIN's purge stop until process retirement.
+--connection default
+--disable_query_log
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE
+--source suite/preserve_trx/include/standby_source_sigkill_restart.inc
+--let $restart_parameters=
+--enable_query_log

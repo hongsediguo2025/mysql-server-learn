@@ -1,0 +1,10 @@
+include/assert.inc [DRAIN outcome matches the consistency policy]
+unchanged_transaction_value
+11
+healthy_transaction_sum
+55
+final inconsistency rejected; source transactions recoverable
+committed_value
+10
+healthy_committed_sum
+50

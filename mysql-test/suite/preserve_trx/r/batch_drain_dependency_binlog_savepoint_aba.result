@@ -1,4 +1,6 @@
-include/assert_grep.inc [drain owner rebuilt the stale token-local mirror]
+include/assert_grep.inc [acknowledged baseline was invalidated by the real cache reset]
+include/assert_grep.inc [stale binlog prefix was replaced by the complete final cache]
+include/assert_grep.inc [bounded final replacement avoided a second mirror rebuild]
 include/assert.inc [savepoint ABA source restore keeps the original transaction connection]
 include/assert.inc [savepoint ABA pre-COMMIT-send failure avoids COMMIT_UNKNOWN]
 include/assert.inc [savepoint ABA restore leaves no accepted receiver epoch]

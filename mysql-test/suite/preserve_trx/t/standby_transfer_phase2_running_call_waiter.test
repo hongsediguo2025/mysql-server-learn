@@ -1,0 +1,69 @@
+--source suite/preserve_trx/include/phase2_multistatement_setup.inc
+delimiter ||;
+CREATE PROCEDURE p_running_call_waiter()
+BEGIN
+  COMMIT;
+  START TRANSACTION;
+  UPDATE t_phase2_multi SET v=20 WHERE id=1;
+END||
+delimiter ;||
+--connect(call_blocker,localhost,phase2_multi_app,,test)
+BEGIN;
+UPDATE t_phase2_multi SET v=10 WHERE id=1;
+SET DEBUG_SYNC='phase2_sched_after_command_held SIGNAL call_blocker_held';
+--connect(call_app,localhost,phase2_multi_app,,test)
+BEGIN;
+UPDATE t_phase2_multi SET v=20 WHERE id=2;
+SET DEBUG_SYNC='lock_wait_will_wait SIGNAL call_t2_wait';
+SET DEBUG_SYNC='phase2_sched_after_execution_entered SIGNAL call_t1_body WAIT_FOR call_run_t2 TIMEOUT 30';
+--send CALL p_running_call_waiter()
+--connection default
+SET DEBUG_SYNC='now WAIT_FOR call_t1_body TIMEOUT 5';
+--let $warnings= `SELECT @@warning_count`
+if ($warnings)
+{
+  --die CALL did not enter BODY with T1
+}
+SET DEBUG_SYNC='phase2_sched_after_t0_registration SIGNAL call_waiter_t0 WAIT_FOR call_scan TIMEOUT 30';
+--send DRAIN TRANSACTIONS PRESERVE
+--connection multi_ha
+SET DEBUG_SYNC='now WAIT_FOR call_waiter_t0 TIMEOUT 15';
+--let $warnings= `SELECT @@warning_count`
+if ($warnings)
+{
+  --die missing CALL T0 registration
+}
+SET DEBUG_SYNC='now SIGNAL call_run_t2';
+SET DEBUG_SYNC='now WAIT_FOR call_t2_wait TIMEOUT 5';
+--let $warnings= `SELECT @@warning_count`
+if ($warnings)
+{
+  --die CALL T2 did not wait for the frozen blocker
+}
+--connection call_blocker
+--send UPDATE t_phase2_multi SET v=44 WHERE id=4; COMMIT
+--connection multi_ha
+SET DEBUG_SYNC='now WAIT_FOR call_blocker_held TIMEOUT 5';
+--let $warnings= `SELECT @@warning_count`
+if ($warnings)
+{
+  --die unsupported blocker DML was not held before scanning
+}
+SET DEBUG_SYNC='now SIGNAL call_scan';
+--connection call_blocker
+--reap
+--connection call_app
+--reap
+--connection default
+--reap
+--source suite/preserve_trx/include/phase2_running_call_assert.inc
+--connection multi_ha
+--let $data_ok= `SELECT (SELECT v=10 FROM t_phase2_multi WHERE id=1) AND (SELECT v=20 FROM t_phase2_multi WHERE id=2) AND (SELECT v=44 FROM t_phase2_multi WHERE id=4)`
+if (!$data_ok)
+{
+  --die CALL T2 support did not release the frozen blocker correctly
+}
+--source suite/preserve_trx/include/phase2_multistatement_cleanup.inc
+DROP PROCEDURE p_running_call_waiter;
+--enable_result_log
+--echo call_t2_wait_releases_supported_blocker

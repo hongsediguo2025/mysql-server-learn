@@ -1,0 +1,13 @@
+[mysqld.1]
+server_id=1
+max-connections=400
+
+[mysqld.2]
+rds-preserve-trx-standby-phase2-scheduler-mode=DEPENDENCY_CONVERGENCE_V1
+rds-preserve-trx-phase1-capture-mode=BOUNDED_PIPELINE_V1
+server_id=2
+rds-preserve-trx-enable=ON
+rds-preserve-trx-transfer-prewarm-paused=OFF
+
+[ENV]
+SERVER_MYPORT_2=@mysqld.2.port

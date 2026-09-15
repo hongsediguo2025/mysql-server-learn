@@ -454,7 +454,9 @@ class Preserve_trx_phase1_owner::Impl {
           entry->second.publication_token != 0 &&
           entry->second.published_live_fence_valid &&
           binding.live_fence_valid) {
-        if (binding.live_fence.coordinate_generation !=
+        if (!entry->second.published_store_refresh_safe) {
+          ++m_final_store_fallback_invalid;
+        } else if (binding.live_fence.coordinate_generation !=
                 entry->second.published_live_fence.coordinate_generation ||
             binding.live_fence.conversion_attempt_after_freeze ||
             binding.live_fence.conversion_unhandled_after_freeze) {
@@ -792,6 +794,7 @@ class Preserve_trx_phase1_owner::Impl {
     uint64_t publication_token{0};
     lock_warmcopy_trx_lock_fence_t published_live_fence;
     bool published_live_fence_valid{false};
+    bool published_store_refresh_safe{false};
   };
 
   bool reconcile_memberships(const std::vector<Membership> &memberships) {
@@ -994,6 +997,7 @@ class Preserve_trx_phase1_owner::Impl {
     Preserve_trx_phase1_pipeline_result_disposition disposition =
         Preserve_trx_phase1_pipeline_result_disposition::DROP;
     bool retry_same_binding = false;
+    bool consistency_conflict = false;
     bool refresh_binding = false;
     bool fallback_to_native = false;
     std::string retry_reason;
@@ -1021,6 +1025,8 @@ class Preserve_trx_phase1_owner::Impl {
         entry.publication_token = installed.publication_token;
         entry.published_live_fence = installed.captured_live_fence;
         entry.published_live_fence_valid = true;
+        entry.published_store_refresh_safe =
+            installed.store_refresh_safe;
         if (entry.descriptor.final_generation &&
             entry.descriptor.use_record_store_snapshot) {
           ++m_final_store_refreshed;
@@ -1042,7 +1048,11 @@ class Preserve_trx_phase1_owner::Impl {
       } else if (installed.status ==
                      Preserve_trx_phase1_pipeline_result_status::RETRYABLE ||
                  installed.status == Preserve_trx_phase1_pipeline_result_status::
+                                         CONSISTENCY_CONFLICT ||
+                 installed.status == Preserve_trx_phase1_pipeline_result_status::
                                          IDENTITY_STALE) {
+        consistency_conflict = installed.status ==
+            Preserve_trx_phase1_pipeline_result_status::CONSISTENCY_CONFLICT;
         refresh_binding =
             installed.status ==
             Preserve_trx_phase1_pipeline_result_status::IDENTITY_STALE;
@@ -1074,7 +1084,11 @@ class Preserve_trx_phase1_owner::Impl {
     } else if (result.status ==
                    Preserve_trx_phase1_pipeline_result_status::RETRYABLE ||
                result.status == Preserve_trx_phase1_pipeline_result_status::
+                                    CONSISTENCY_CONFLICT ||
+               result.status == Preserve_trx_phase1_pipeline_result_status::
                                     IDENTITY_STALE) {
+      consistency_conflict = result.status ==
+          Preserve_trx_phase1_pipeline_result_status::CONSISTENCY_CONFLICT;
       refresh_binding =
           result.status ==
           Preserve_trx_phase1_pipeline_result_status::IDENTITY_STALE;
@@ -1143,18 +1157,25 @@ class Preserve_trx_phase1_owner::Impl {
     if (retry_same_binding) {
       schedule_retry(&found->second,
                      retry_reason.empty() ? "record_retry_unknown"
-                                          : retry_reason);
+                                          : retry_reason,
+                     consistency_conflict);
     }
     return !m_failed;
   }
 
-  void schedule_retry(Entry *entry, const std::string &reason) {
+  void schedule_retry(Entry *entry, const std::string &reason,
+                      bool consistency_conflict = false) {
     if (entry == nullptr || entry->descriptor.capture_generation == UINT64_MAX) {
       fail("owner_capture_generation_overflow");
       return;
     }
+    if (consistency_conflict && entry->descriptor.final_generation) {
+      fail(reason);
+      return;
+    }
     if (!entry->descriptor.final_generation &&
-        (m_ordinary_submissions_finished || entry->retry_streak >= 1)) {
+        (m_ordinary_submissions_finished ||
+         (!consistency_conflict && entry->retry_streak >= 1))) {
       defer_to_final(entry);
       return;
     }
@@ -1164,13 +1185,17 @@ class Preserve_trx_phase1_owner::Impl {
                  entry->descriptor.capture_generation);
     entry->state = Entry_state::RETRY_WAIT;
     if (entry->retry_streak != UINT64_MAX) ++entry->retry_streak;
-    const uint64_t delay_us = k_record_retry_base_us;
+    const uint64_t delay_us =
+        consistency_conflict ? 100000ULL : k_record_retry_base_us;
     entry->next_retry_us = saturating_add(monotonic_us(), delay_us);
     m_retry_delay_total_us =
         saturating_add(m_retry_delay_total_us, delay_us);
     m_retry_delay_max_us = std::max(m_retry_delay_max_us, delay_us);
     ++m_record_retries;
     ++m_retry_reasons[reason.empty() ? "record_retry_unknown" : reason];
+    DBUG_EXECUTE_IF("preserve_trx_phase1_consistency_retry_trace", {
+      if (consistency_conflict) log_event("CONSISTENCY_RETRY_TEST");
+    });
   }
 
   void defer_to_final(Entry *entry) {

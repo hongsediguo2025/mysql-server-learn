@@ -1,0 +1,129 @@
+# RC releases a nonmatching UPDATE's temporary lock after the baseline.
+# The retained INSERT keeps the same transaction alive; no fabricated store.
+--source include/not_windows.inc
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/force_restart.inc
+--disable_query_log
+--let $credential_file= $MYSQL_TMP_DIR/phase1-empty-store.secret
+--write_file $credential_file
+phase1-empty-store-secret
+EOF
+--exec chmod 600 $credential_file
+CREATE USER preserve_trx_ha_admin@'127.0.0.1'
+  IDENTIFIED BY 'phase1-empty-store-secret';
+GRANT SHUTDOWN, PROCESS, SYSTEM_VARIABLES_ADMIN, PRESERVE_TRX_TRANSFER_ADMIN
+  ON *.* TO preserve_trx_ha_admin@'127.0.0.1';
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@'127.0.0.1';
+CREATE USER phase1_empty_app@localhost;
+GRANT SELECT, INSERT, UPDATE ON test.* TO phase1_empty_app@localhost;
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO phase1_empty_app@localhost;
+--let $binlog_startup=
+if (`SELECT @@GLOBAL.log_bin`)
+{
+  --let $binlog_startup= --binlog-format=ROW
+}
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-standby-phase2-scheduler-mode=DEPENDENCY_CONVERGENCE_V1 --rds-preserve-trx-phase1-capture-mode=BOUNDED_PIPELINE_V1 --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$MASTER_MYPORT --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=phase1_empty --rds-preserve-trx-transfer-credential-secret-file=$credential_file --gtid-mode=ON --enforce-gtid-consistency=ON $binlog_startup --log-error-verbosity=3
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--let $restart_parameters=
+--let $binlog_startup=
+--source suite/preserve_trx/include/assert_phase2_dependency_mode.inc
+--source suite/preserve_trx/include/assert_standby_transfer_source.inc
+CREATE TABLE t_phase1_empty_keep(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+CREATE TABLE t_phase1_empty_probe(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO t_phase1_empty_probe VALUES(1,10);
+--connect(empty_ha,127.0.0.1,preserve_trx_ha_admin,phase1-empty-store-secret,test,$MASTER_MYPORT,)
+--connect(empty_app,localhost,phase1_empty_app,,test)
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+SET SESSION optimizer_switch='index_condition_pushdown=off';
+BEGIN;
+INSERT INTO t_phase1_empty_keep VALUES(1,17);
+--let $app_id= `SELECT CONNECTION_ID()`
+SET DEBUG_SYNC='row_search_for_mysql_before_return SIGNAL probe_locked WAIT_FOR probe_return EXECUTE 1';
+--send UPDATE t_phase1_empty_probe SET v=v+1 WHERE v=-1
+--connection empty_ha
+SET DEBUG_SYNC='now WAIT_FOR probe_locked TIMEOUT 20';
+--let $app_thread= query_get_value(SELECT THREAD_ID AS id FROM performance_schema.threads WHERE PROCESSLIST_ID=$app_id, id, 1)
+--let $trx_before= query_get_value(SELECT trx_id AS id FROM information_schema.innodb_trx WHERE trx_mysql_thread_id=$app_id, id, 1)
+--let $assert_text= baseline contains the real temporary nonmatching row lock
+--let $assert_cond= `SELECT COUNT(*)=1 FROM performance_schema.data_locks WHERE THREAD_ID=$app_thread AND LOCK_TYPE='RECORD' AND OBJECT_NAME='t_phase1_empty_probe' AND LOCK_MODE='X,REC_NOT_GAP'`
+--source include/assert.inc
+--connection default
+SET DEBUG_SYNC='preserve_trx_transfer_after_phase1_binlog_stream SIGNAL baseline_done WAIT_FOR finish_empty';
+--send DRAIN TRANSACTIONS PRESERVE
+--connection empty_ha
+SET DEBUG_SYNC='now WAIT_FOR baseline_done TIMEOUT 20';
+SET DEBUG_SYNC='now SIGNAL probe_return';
+--connection empty_app
+--reap
+--let $assert_text= nonmatching UPDATE changed no rows
+--let $assert_cond= `SELECT ROW_COUNT()=0`
+--source include/assert.inc
+--connection empty_ha
+# INNODB_TRX caches rows for 100 ms; wait for its post-UPDATE observation.
+--let $wait_condition= SELECT COUNT(*)=1 FROM information_schema.innodb_trx WHERE trx_mysql_thread_id=$app_id AND trx_id='$trx_before' AND trx_rows_modified>0 AND trx_rows_locked=0
+--source include/wait_condition.inc
+--let $assert_text= same source transaction retains undo but no explicit record locks
+--let $assert_cond= `SELECT COUNT(*)=1 FROM information_schema.innodb_trx WHERE trx_mysql_thread_id=$app_id AND trx_id='$trx_before' AND trx_rows_modified>0 AND trx_rows_locked=0`
+--source include/assert.inc
+--let $assert_text= native record bitmap is now empty
+--let $assert_cond= `SELECT COUNT(*)=0 FROM performance_schema.data_locks WHERE THREAD_ID=$app_thread AND LOCK_TYPE='RECORD'`
+--source include/assert.inc
+SET DEBUG_SYNC='now SIGNAL finish_empty';
+--connection default
+--disable_result_log
+--reap
+--enable_result_log
+--connection empty_ha
+--let $wait_condition= SELECT VARIABLE_VALUE+0=1 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens'
+--source include/wait_condition.inc
+--echo DRAIN succeeded and receiver has one ready transaction
+--let EMPTY_STORE_LOG= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--perl
+use strict;
+use warnings;
+open(my $fh, '<', $ENV{'EMPTY_STORE_LOG'}) or die "cannot read source error log";
+my ($fallback, $stages, $current) = (0, 0, 0);
+while (my $line = <$fh>) {
+  if ($line =~ /CURRENT_TEST:\s+preserve_trx\.(\S+)/) {
+    $current = $1 eq 'batch_drain_phase1_empty_store_native_fallback';
+    next;
+  }
+  next unless $current;
+  $fallback = 1 if $line =~ /PRESERVE_PHASE1_OWNER_V1 event=FINAL_RECORD_RECONCILE_COMPLETE/ &&
+    $line =~ /targets=1 captured=1 store_refresh_targets=1 store_refreshed=0/ &&
+    $line =~ /store_fallback_invalid=0 store_fallback_coordinate=0 store_fallback_unavailable=1/ &&
+    $line =~ /deferred=0 exact=1 invalidated=0 failed=0/;
+  $stages = 1 if $line =~ /PRESERVE_PHASE1_PIPELINE_V1 event=STOPPED/ &&
+    $line =~ /final_record_store_snapshot_operation_samples=1/ &&
+    $line =~ /final_record_capture_operation_samples=1/ &&
+    $line =~ /final_record_prepare_operation_samples=1/ &&
+    $line =~ /invariant_failures=0/;
+}
+close($fh);
+die "empty store did not fall back to exact native capture" unless $fallback;
+die "expected one store attempt and one native capture" unless $stages;
+EOF
+--let EMPTY_STORE_LOG=
+--connection empty_app
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT 1;
+--disconnect empty_app
+--connection empty_ha
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--shutdown_server 0
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+--exec echo "restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+--connect(empty_cleanup,localhost,root,,test)
+SELECT v AS committed_value FROM t_phase1_empty_probe;
+SELECT COUNT(*) AS rolled_back_source_rows FROM t_phase1_empty_keep;
+DROP TABLE t_phase1_empty_probe,t_phase1_empty_keep;
+DROP USER phase1_empty_app@localhost;
+DROP USER preserve_trx_ha_admin@'127.0.0.1';
+--remove_file $credential_file
+--enable_query_log

@@ -28,15 +28,20 @@ CREATE USER closing_early_app@localhost;
 GRANT SELECT, UPDATE ON test.* TO closing_early_app@localhost;
 GRANT SESSION_VARIABLES_ADMIN ON *.* TO closing_early_app@localhost;
 
---let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$MASTER_MYPORT --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=closing_early_pipeline --rds-preserve-trx-transfer-credential-secret-file=$credential_file
+--let $restart_parameters= restart: --rds-preserve-trx-standby-phase2-scheduler-mode=DEPENDENCY_CONVERGENCE_V1 --rds-preserve-trx-phase1-capture-mode=BOUNDED_PIPELINE_V1 --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$MASTER_MYPORT --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=closing_early_pipeline --rds-preserve-trx-transfer-credential-secret-file=$credential_file
 --disable_result_log
 --source include/restart_mysqld.inc
+--source suite/preserve_trx/include/assert_standby_transfer_source.inc
 --enable_result_log
 --let $restart_parameters=
 --disable_query_log
 
+CALL mtr.add_suppression(
+  "PRESERVE: standby transfer source epoch commit failed status=9");
+
 SET GLOBAL rds_preserve_trx_enable=ON;
-SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms=60000;
+# Deliberately enter HARD with app2 still in BODY to exercise early Preserve.
+SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms=5000;
 SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=ON;
 
 CREATE TABLE t_closing_early_pipeline(
@@ -59,17 +64,16 @@ GRANT EXECUTE ON PROCEDURE test.p_closing_early_pipeline
 --connect(closing_early_app_1,localhost,closing_early_app,,test)
 START TRANSACTION;
 UPDATE t_closing_early_pipeline SET v=v+1 WHERE id=1;
+SET SESSION debug='+d,phase2_sched_observe_cutoff_response_wait';
 SET DEBUG_SYNC=
   'before_execute_sql_command SIGNAL closing_early_app_1_blocked WAIT_FOR closing_early_app_1_continue';
-SET DEBUG_SYNC=
-  'preserve_trx_closing_command_blocked_before_response SIGNAL closing_early_app_1_rejected WAIT_FOR closing_early_app_1_reject_continue';
 --send UPDATE t_closing_early_pipeline SET v=v+10 WHERE id=3
 
 --connect(closing_early_app_2,localhost,closing_early_app,,test)
 START TRANSACTION;
 UPDATE t_closing_early_pipeline SET v=v+1 WHERE id=2;
 SET DEBUG_SYNC=
-  'sp_lex_instr_before_exec_core SIGNAL closing_early_app_2_blocked WAIT_FOR closing_early_app_2_continue';
+  'before_single_update SIGNAL closing_early_app_2_blocked WAIT_FOR closing_early_app_2_continue';
 --send CALL p_closing_early_pipeline()
 
 # An in-flight ordinary command without an explicit transaction belongs to the
@@ -82,8 +86,23 @@ SET DEBUG_SYNC=
 
 --connection default
 SET DEBUG_SYNC='now WAIT_FOR closing_early_app_1_blocked TIMEOUT 10';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die closing_early_app_1_blocked was not reached
+}
 SET DEBUG_SYNC='now WAIT_FOR closing_early_app_2_blocked TIMEOUT 10';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die closing_early_app_2_blocked was not reached
+}
 SET DEBUG_SYNC='now WAIT_FOR closing_early_probe_blocked TIMEOUT 10';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die closing_early_probe_blocked was not reached
+}
 
 --connection closing_early_ha
 SET @accepted_before=(
@@ -91,14 +110,22 @@ SET @accepted_before=(
   WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs');
 
 --connect(closing_early_owner,localhost,root,,test)
+SET SESSION debug='+d,preserve_trx_transfer_fail_commit_before_send_once';
+SET DEBUG_SYNC=
+  'preserve_trx_transfer_commit_before_send_failed SIGNAL closing_early_unsent WAIT_FOR closing_early_unsent_continue';
 SET DEBUG_SYNC=
   'preserve_trx_warmcopy_after_closing_state_before_targets SIGNAL closing_early_entered';
 SET DEBUG_SYNC=
-  'preserve_trx_batch_after_one_target_preserved SIGNAL closing_early_first_staged';
+  'preserve_trx_batch_after_one_target_preserved SIGNAL closing_early_first_staged WAIT_FOR closing_early_stage_continue';
 --send DRAIN TRANSACTIONS PRESERVE
 
 --connection closing_early_ha
 SET DEBUG_SYNC='now WAIT_FOR closing_early_entered TIMEOUT 30';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die closing_early_entered was not reached
+}
 SET @last_object_seal_before=(
   SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
   WHERE VARIABLE_NAME=
@@ -110,16 +137,15 @@ SET DEBUG_SYNC='now SIGNAL closing_early_probe_continue';
 --reap
 --send SELECT 1
 
-# The command following the old in-flight command is admitted only far enough
-# to return 4020. The timeout-exclusion test owns the response-in-flight race;
-# this test keeps only the independent early-seal ordering contract.
+# The next command has been cut off, but its 4020 response waits for the
+# scheduler handoff. Observe the wait now and reap only after route retirement.
 --connection closing_early_ha
-SET DEBUG_SYNC='now WAIT_FOR closing_early_app_1_rejected TIMEOUT 10';
-SET DEBUG_SYNC='now SIGNAL closing_early_app_1_reject_continue';
-
---connection closing_early_app_1
---error ER_PRESERVE_TRX_SESSION_DRAINED
---reap
+SET DEBUG_SYNC='now WAIT_FOR phase2_cutoff_wait_entered TIMEOUT 10';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die phase2_cutoff_wait_entered was not reached
+}
 
 --connection closing_early_probe
 --reap
@@ -128,6 +154,11 @@ SET DEBUG_SYNC='now SIGNAL closing_early_app_1_reject_continue';
 # token 1 now instead of waiting for token 2 to reach its command boundary.
 --connection closing_early_ha
 SET DEBUG_SYNC='now WAIT_FOR closing_early_first_staged TIMEOUT 10';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die closing_early_first_staged was not reached
+}
 SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
         WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')
        - @accepted_before AS accepted_epoch_delta_before_final_ack;
@@ -138,23 +169,43 @@ SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
        AS early_object_sealed_before_second_boundary;
 
 --connect(closing_early_reset,localhost,preserve_trx_ha_admin,closing-early-pipeline-secret,test)
---send RESET DRAIN
+SET @reset_wins_before=(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME='Preserve_trx_reset_drain_wins');
+--disable_result_log
+--error ER_PRESERVE_TRX_UNSUPPORTED
+RESET DRAIN;
+--enable_result_log
+--let $assert_text= rejected RESET did not change the early-preserve owner
+--let $assert_cond= `SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_reset_drain_wins')=@reset_wins_before`
+--source include/assert.inc
 
 --connection closing_early_ha
 SET DEBUG_SYNC='now SIGNAL closing_early_app_2_continue';
+SET DEBUG_SYNC='now SIGNAL closing_early_stage_continue';
 
 --connection closing_early_app_2
 --reap
 
---connection closing_early_reset
+--connection closing_early_ha
+SET DEBUG_SYNC='now WAIT_FOR closing_early_unsent TIMEOUT 30';
+--let $sync_warning_count= `SELECT @@warning_count`
+if ($sync_warning_count)
+{
+  --die closing_early_unsent was not reached
+}
+--connection closing_early_app_1
+--error ER_PRESERVE_TRX_SESSION_DRAINED
 --reap
+--connection closing_early_ha
+SET DEBUG_SYNC='now SIGNAL closing_early_unsent_continue';
 
 --connection closing_early_owner
---error 4021
+--error ER_PRESERVE_TRX_UNSUPPORTED
 --reap
+SET SESSION debug='-d,preserve_trx_transfer_fail_commit_before_send_once';
 
-# RESET restores the early-preserved transaction to its original THD and
-# leaves the still-running old command on its original THD.
+# The independent unsent-COMMIT failure restores both source transactions.
+# Rejected RESET neither cancelled the owner nor changed the original data.
 --connection closing_early_app_1
 UPDATE t_closing_early_pipeline SET v=v+100 WHERE id=1;
 COMMIT;
@@ -182,5 +233,12 @@ DROP USER closing_early_app@localhost;
 DROP USER preserve_trx_ha_admin@localhost;
 SET GLOBAL rds_preserve_trx_enable=ON;
 SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=OFF;
-# force_restart.inc restores STANDBY_TRANSFER_SAVE at the test boundary.
 --remove_file $credential_file
+
+# The restored source still holds DRAIN's purge stop until process retirement.
+--connection default
+--disable_query_log
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE
+--source suite/preserve_trx/include/standby_source_sigkill_restart.inc
+--let $restart_parameters=
+--enable_query_log

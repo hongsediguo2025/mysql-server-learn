@@ -10,7 +10,7 @@ die "unsupported raw protocol mode: " . (defined($mode) ? $mode : '<undef>') .
     "\n"
   unless defined($mode) &&
          ($mode eq 'abort_long_data' || $mode eq 'hard_cutoff' ||
-          $mode eq 'ps_body_error');
+          $mode eq 'ps_body_error' || $mode eq 'running_call');
 
 use constant CLIENT_LONG_PASSWORD => 0x00000001;
 use constant CLIENT_LONG_FLAG => 0x00000004;
@@ -19,6 +19,7 @@ use constant CLIENT_PROTOCOL_41 => 0x00000200;
 use constant CLIENT_TRANSACTIONS => 0x00002000;
 use constant CLIENT_SECURE_CONNECTION => 0x00008000;
 use constant CLIENT_MULTI_RESULTS => 0x00020000;
+use constant CLIENT_PS_MULTI_RESULTS => 0x00040000;
 use constant CLIENT_PLUGIN_AUTH => 0x00080000;
 use constant CLIENT_CONNECT_ATTRS => 0x00100000;
 use constant MYSQL_TYPE_BLOB => 252;
@@ -138,9 +139,12 @@ my $flags = CLIENT_LONG_PASSWORD | CLIENT_LONG_FLAG | CLIENT_CONNECT_WITH_DB |
             CLIENT_PROTOCOL_41 | CLIENT_TRANSACTIONS |
             CLIENT_SECURE_CONNECTION | CLIENT_MULTI_RESULTS |
             CLIENT_PLUGIN_AUTH | CLIENT_CONNECT_ATTRS;
+$flags |= CLIENT_PS_MULTI_RESULTS if $mode eq 'running_call';
 $flags &= $server_capability;
+my $user = $mode eq 'running_call' ? 'phase2_multi_app' :
+                                   'phase2_scheduler_protocol_app';
 my $response = pack('VVC', $flags, 16 * 1024 * 1024, 33) . ("\0" x 23) .
-               "phase2_scheduler_protocol_app\0" . pack('C', 0) . "test\0";
+               "$user\0" . pack('C', 0) . "test\0";
 $response .= "$plugin\0" if $flags & CLIENT_PLUGIN_AUTH;
 $response .= "\0" if $flags & CLIENT_CONNECT_ATTRS;
 write_packet($socket, 1, $response);
@@ -157,7 +161,26 @@ if (length($authentication) && ord(substr($authentication, 0, 1)) == 0x01) {
 }
 expect_ok($authentication, 'authentication');
 
-if ($mode eq 'abort_long_data') {
+if ($mode eq 'running_call') {
+  # No result sets in this procedure: its final OK is the complete response.
+  query_ok($socket, 'START TRANSACTION');
+  query_ok($socket, 'UPDATE t_phase2_multi SET v=10 WHERE id=1');
+  my $call = prepare_statement($socket, 'CALL p_running_ps_call()');
+  query_ok($socket,
+           q{SET DEBUG_SYNC='phase2_sched_after_execution_entered SIGNAL ps_call_body WAIT_FOR ps_call_continue TIMEOUT 30'});
+  mark_file($ready_file, 'ps_call_prepared');
+  print "ps_call_prepared\n";
+  wait_for_file($soft_go_file, 'CALL execute');
+  expect_ok(command($socket, 0x17, pack('VCV', $call, 0, 1)),
+            'binary CALL execute');
+  mark_file($soft_done_file, 'ps_call_returned');
+  print "ps_call_returned\n";
+  # Keep the final T2 alive until DRAIN and receiver assertions finish.
+  wait_for_file($restore_go_file, 'CALL handoff verification');
+  expect_error_code(command($socket, 0x03, 'SELECT 1'), 4020,
+                    'binary CALL next command');
+  print "binary_call_complete_and_connection_held\n";
+} elsif ($mode eq 'abort_long_data') {
   query_ok($socket, 'START TRANSACTION');
   query_ok($socket,
            'UPDATE t_phase2_scheduler_protocol SET v=v WHERE id=5');

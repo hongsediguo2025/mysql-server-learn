@@ -49,6 +49,7 @@ struct Preserve_trx_phase1_record_adapter_install_result {
       Preserve_trx_phase1_pipeline_result_status::ADAPTER_NOT_INSTALLED};
   uint64_t publication_token{0};
   uint32_t record_lock_count{0};
+  bool store_refresh_safe{true};
   lock_warmcopy_record_store_compare_token_t installed_token;
   lock_warmcopy_trx_lock_fence_t captured_live_fence;
   std::string reason;

@@ -1,0 +1,6 @@
+include/assert.inc [first blocker still owns its uncommitted write]
+include/assert.inc [source commit and rollback retained their native effects]
+include/assert.inc [original waiter continues in its original transaction]
+include/assert.inc [waiter rollback did not commit its update]
+include/assert.inc [rejected proof did not accept a receiver epoch]
+257 distinct blockers fail closed without partial permit; source restored

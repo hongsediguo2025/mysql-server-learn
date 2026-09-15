@@ -79,6 +79,17 @@ static bool trx_preserve_token_to_xid(const char *token, XID *xid) {
 
 bool trx_preserve_feature_enabled() { return preserve_trx_is_enabled(); }
 
+trx_preserve_purge_stop_result trx_preserve_stop_purge_for_standby() {
+  const purge_state_t state = trx_purge_state();
+  if (state == PURGE_STATE_RUN || state == PURGE_STATE_STOP) {
+    trx_purge_stop();
+    return trx_preserve_purge_stop_result::STOPPED;
+  }
+  return state == PURGE_STATE_DISABLED
+             ? trx_preserve_purge_stop_result::DISABLED
+             : trx_preserve_purge_stop_result::UNAVAILABLE;
+}
+
 bool trx_preserve_xid_should_be_protected(const XID &xid) {
   return preserve_trx_magic_xid_should_be_protected(xid);
 }

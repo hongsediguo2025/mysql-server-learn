@@ -1,0 +1,134 @@
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+--disable_query_log
+--let $credential_file= $MYSQL_TMP_DIR/final-ii-purge.secret
+--write_file $credential_file
+final-ii-purge-secret
+EOF
+--exec chmod 600 $credential_file
+CREATE USER preserve_trx_ha_admin@'127.0.0.1'
+  IDENTIFIED BY 'final-ii-purge-secret';
+GRANT SHUTDOWN, PROCESS, SYSTEM_VARIABLES_ADMIN,
+      PRESERVE_TRX_TRANSFER_ADMIN ON *.*
+  TO preserve_trx_ha_admin@'127.0.0.1';
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@'127.0.0.1';
+GRANT SELECT ON test.* TO preserve_trx_ha_admin@'127.0.0.1';
+CREATE USER final_ii_app@localhost;
+GRANT SELECT, INSERT, UPDATE ON test.* TO final_ii_app@localhost;
+GRANT SESSION_VARIABLES_ADMIN ON *.* TO final_ii_app@localhost;
+
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-standby-phase2-scheduler-mode=DEPENDENCY_CONVERGENCE_V1 --rds-preserve-trx-phase1-capture-mode=BOUNDED_PIPELINE_V1 --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$SERVER_MYPORT_1 --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=final_ii_purge --rds-preserve-trx-transfer-credential-secret-file=$credential_file --gtid-mode=ON --enforce-gtid-consistency=ON --log-error-verbosity=3
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--let $restart_parameters=
+--disable_query_log
+--source suite/preserve_trx/include/assert_phase2_dependency_mode.inc
+--source suite/preserve_trx/include/assert_standby_transfer_source.inc
+--let $assert_text= bounded pipeline is selected
+--let $assert_cond= `SELECT @@global.rds_preserve_trx_phase1_capture_mode='BOUNDED_PIPELINE_V1'`
+--source include/assert.inc
+CALL mtr.add_suppression(
+  'PRESERVE: rolled back prepared transaction without snapshot during recovery');
+SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=OFF;
+SET GLOBAL rds_preserve_trx_token_retention_timeout_ms=120000;
+# Real ordinary conversion must still invalidate the candidate while II is stable.
+CREATE TABLE t_final_ii_gap(id INT PRIMARY KEY, v INT NOT NULL) ENGINE=InnoDB;
+INSERT INTO t_final_ii_gap VALUES(10,100),(30,300),(40,400),(50,500),(60,600);
+SET GLOBAL innodb_purge_stop_now=ON;
+DELETE FROM t_final_ii_gap WHERE id=30;
+--connect(final_ii_ha,127.0.0.1,preserve_trx_ha_admin,final-ii-purge-secret,test,$SERVER_MYPORT_1,)
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION WITH CONSISTENT SNAPSHOT;
+--connection default
+DELETE FROM t_final_ii_gap WHERE id=50;
+--connect(final_ii_blocker,localhost,final_ii_app,,test)
+--let $blocker_id= `SELECT CONNECTION_ID()`
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+--connect(final_ii_target,localhost,final_ii_app,,test)
+--let $target_id= `SELECT CONNECTION_ID()`
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+BEGIN;
+UPDATE t_final_ii_gap SET v=v+7 WHERE id=10;
+--connection final_ii_ha
+--let $target_thread= query_get_value(SELECT THREAD_ID AS id FROM performance_schema.threads WHERE PROCESSLIST_ID=$target_id, id, 1)
+--let $blocker_thread= query_get_value(SELECT THREAD_ID AS id FROM performance_schema.threads WHERE PROCESSLIST_ID=$blocker_id, id, 1)
+--let $insert_id= 20
+--let $lookup_id= 25
+--let $ii_remaining= 2
+while ($ii_remaining)
+{
+--connection final_ii_blocker
+BEGIN;
+--disable_result_log
+--eval SELECT * FROM t_final_ii_gap WHERE id=$lookup_id FOR UPDATE
+--enable_result_log
+--connection final_ii_target
+--send_eval INSERT INTO t_final_ii_gap VALUES($insert_id,$insert_id*10)
+--connection final_ii_ha
+--let $wait_condition= SELECT COUNT(*)=1 FROM performance_schema.data_lock_waits WHERE REQUESTING_THREAD_ID=$target_thread AND BLOCKING_THREAD_ID=$blocker_thread
+--source include/wait_condition.inc
+--connection final_ii_blocker
+COMMIT;
+--connection final_ii_target
+--reap
+--let $insert_id= 45
+--let $lookup_id= 47
+--dec $ii_remaining
+}
+--connection final_ii_ha
+--let $target_trx= query_get_value(SELECT DISTINCT ENGINE_TRANSACTION_ID AS id FROM performance_schema.data_locks WHERE THREAD_ID=$target_thread, id, 1)
+--let $assert_text= two actual waits left intentions on distinct deleted successors
+--let $assert_cond= `SELECT COUNT(*)=2 AND COUNT(DISTINCT LOCK_DATA)=2 FROM performance_schema.data_locks WHERE ENGINE_TRANSACTION_ID=$target_trx AND LOCK_MODE='X,GAP,INSERT_INTENTION' AND LOCK_STATUS='GRANTED' AND LOCK_DATA IN ('30','50')`
+--source include/assert.inc
+--connection default
+SET DEBUG_SYNC='preserve_trx_batch_before_target_preserve_pins SIGNAL ii_final WAIT_FOR ii_final_continue TIMEOUT 30';
+--send DRAIN TRANSACTIONS PRESERVE
+--connection final_ii_ha
+SET DEBUG_SYNC='now WAIT_FOR ii_final TIMEOUT 30';
+SET GLOBAL innodb_purge_run_now=ON;
+--let $assert_text= DRAIN pause protects both deleted successors
+--let $assert_cond= `SELECT COUNT(*)=2 FROM performance_schema.data_locks WHERE ENGINE_TRANSACTION_ID=$target_trx AND LOCK_MODE='X,GAP,INSERT_INTENTION' AND LOCK_DATA IN ('30','50')`
+--source include/assert.inc
+--let $assert_text= one ordinary bit and two intention bits remain before conversion
+--let $assert_cond= `SELECT COUNT(*)=3 FROM performance_schema.data_locks WHERE ENGINE_TRANSACTION_ID=$target_trx AND LOCK_TYPE='RECORD'`
+--source include/assert.inc
+--error ER_LOCK_NOWAIT
+SELECT id FROM t_final_ii_gap WHERE id=20 FOR SHARE NOWAIT;
+--let $assert_text= implicit conversion reused the original ordinary lock object
+--let $assert_cond= `SELECT COUNT(*)=2 AND COUNT(DISTINCT OBJECT_INSTANCE_BEGIN)=1 FROM performance_schema.data_locks WHERE ENGINE_TRANSACTION_ID=$target_trx AND LOCK_MODE='X,REC_NOT_GAP' AND LOCK_DATA IN ('10','20')`
+--source include/assert.inc
+COMMIT;
+--let $assert_text= ordinary bitmap changed while both intentions remain
+--let $assert_cond= `SELECT COUNT(*)=4 FROM performance_schema.data_locks WHERE ENGINE_TRANSACTION_ID=$target_trx AND LOCK_TYPE='RECORD'`
+--source include/assert.inc
+SET DEBUG_SYNC='now SIGNAL ii_final_continue';
+--connection default
+--disable_result_log
+--error ER_PRESERVE_TRX_UNSUPPORTED
+--reap
+--enable_result_log
+--echo strict final fence rejects the changed native lock state
+--connection final_ii_target
+--let $assert_text= original application connection and transaction were restored
+--let $assert_cond= `SELECT CONNECTION_ID()=$target_id`
+--source include/assert.inc
+SELECT id,v FROM t_final_ii_gap ORDER BY id;
+ROLLBACK;
+SELECT id,v FROM t_final_ii_gap ORDER BY id;
+--connection final_ii_ha
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--shutdown_server 0
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+--exec echo "restart: --rds-preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+--disable_query_log
+--connect(final_ii_cleanup,localhost,root,,test)
+DROP TABLE t_final_ii_gap;
+DROP USER final_ii_app@localhost;
+DROP USER preserve_trx_ha_admin@'127.0.0.1';
+--remove_file $credential_file
+--enable_query_log

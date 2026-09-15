@@ -1,6 +1,7 @@
 ERROR HY000: DRAIN TRANSACTIONS PRESERVE was reset before shutdown handoff
-stale_prebuilt_rejected	live_lock_list_fallback	early_token_staged
+final_store_candidate_valid	live_lock_list_fallback_avoided	early_token_staged
 1	1	1
+include/assert_grep.inc [bounded final reconciliation used the exact dirty store]
 preserved_count_after_reset
 0
 id	v

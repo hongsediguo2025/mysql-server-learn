@@ -1,0 +1,9 @@
+include/assert.inc [ordinary RR gap protects the deleted successor 30]
+native gap on 30 observed at the selected capture boundary
+include/assert.inc [purge removed old gap coordinate]
+before T0: native purge inherited the gap to 40
+DRAIN succeeded with the current native gap
+receiver has one ready transaction
+ERROR HY000: Preserve drain is active; this command was not executed
+recovered_committed_value
+10

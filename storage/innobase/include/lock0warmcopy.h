@@ -203,6 +203,7 @@ struct lock_warmcopy_record_candidate_plan_t {
   uint64_t payload_bytes{0};
   uint32_t entry_count{0};
   uint32_t record_lock_count{0};
+  bool insert_intention_present{false};
 };
 
 enum class lock_warmcopy_record_candidate_status_t : uint8_t {

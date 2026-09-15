@@ -1,0 +1,4 @@
+affected rows: 1
+info: Rows matched: 1  Changed: 1  Warnings: 0
+ERROR HY000: Preserve drain is active; this command was not executed
+multi_statement_autocommit_first_update_kept_next_update_cut_off

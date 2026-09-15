@@ -5648,11 +5648,13 @@ TEST(PreservedTrxTransfer, StrictEligibilityRejectsUnsupportedSemantics) {
   manifest.protocol_version = kPreserveTrxTransferProtocolVersion;
 
   metadata.has_read_view = true;
-  metadata.read_view_payload = "non-empty";
-  EXPECT_EQ(Preserve_trx_transfer_strict_eligibility_status::READ_VIEW_PRESENT,
+  metadata.rv_low_limit_no = 80;
+  metadata.read_view_payload = read_view_payload(100, 90, 95, 80, {90, 92});
+  EXPECT_EQ(Preserve_trx_transfer_strict_eligibility_status::OK,
             preserve_trx_transfer_validate_strict_eligibility(
                 manifest, metadata, false, false, 1));
   metadata.has_read_view = false;
+  metadata.rv_low_limit_no = 0;
   metadata.read_view_payload.clear();
 
   metadata.engine_shape = Preserve_snapshot_engine_shape::MIXED;

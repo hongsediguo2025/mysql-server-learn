@@ -22,6 +22,7 @@ struct dict_index_t;
 struct trx_t;
 
 constexpr size_t LOCK_PRESERVE_PHASE2_MAX_QUEUE_PREDECESSORS = 256;
+constexpr size_t LOCK_PRESERVE_PHASE2_MAX_BLOCKERS = 256;
 
 enum class lock_preserve_phase2_probe_status : uint8_t {
   NOT_WAITING = 0,
@@ -31,7 +32,8 @@ enum class lock_preserve_phase2_probe_status : uint8_t {
   UNSUPPORTED_PENDING_PREDECESSOR,
   UNSUPPORTED_RELEASE_CLASS,
   UNKNOWN_INCOMPLETE,
-  UNKNOWN_IDENTITY
+  UNKNOWN_IDENTITY,
+  RETRYABLE_BUDGET_EXHAUSTED
 };
 
 struct lock_preserve_phase2_identity {
@@ -63,11 +65,13 @@ struct lock_preserve_phase2_wait_snapshot {
 /** Try to copy the complete native queue prefix for one waiting transaction.
 The raw cookie is opaque outside this call and is dereferenced only while the
 exclusive lock_sys latch is owned. The caller-provided blocker array is
-published only for COMPLETE results. expected_waiter_version may be zero when
+published only for COMPLETE results. probe_stop_us is the caller's absolute
+steady-clock deadline; an exhausted budget discards the entire local snapshot.
+expected_waiter_version may be zero when
 the same native snapshot is responsible for sealing the T0 identity. */
 lock_preserve_phase2_probe_status lock_preserve_phase2_probe_wait(
     uint64_t raw_waiter_cookie, uint64_t expected_waiter_version,
-    uint64_t expected_owner_thd_cookie,
+    uint64_t expected_owner_thd_cookie, uint64_t probe_stop_us,
     lock_preserve_phase2_blocker *blockers, size_t blocker_capacity,
     lock_preserve_phase2_wait_snapshot *snapshot);
 

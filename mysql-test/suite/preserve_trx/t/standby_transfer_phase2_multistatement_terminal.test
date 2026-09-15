@@ -1,0 +1,77 @@
+--source suite/preserve_trx/include/phase2_multistatement_setup.inc
+
+--connect(multi_commit,localhost,phase2_multi_app,,test)
+BEGIN;
+UPDATE t_phase2_multi SET v=10 WHERE id=1;
+SET DEBUG_SYNC='phase2_sched_after_execution_entered SIGNAL multi_commit_body';
+--connect(multi_rollback,localhost,phase2_multi_app,,test)
+BEGIN;
+UPDATE t_phase2_multi SET v=20 WHERE id=2;
+SET DEBUG_SYNC='phase2_sched_after_execution_entered SIGNAL multi_rollback_body';
+--connect(multi_survivor,localhost,phase2_multi_app,,test)
+BEGIN;
+UPDATE t_phase2_multi SET v=30 WHERE id=4;
+
+# Keep the owner in SOFT while both old transactions issue their terminal
+# SQL. Neither transaction has a waiter/support edge.
+--connection default
+SET DEBUG_SYNC='phase2_sched_after_t0_registration SIGNAL multi_terminal_t0 WAIT_FOR multi_terminal_continue TIMEOUT 30';
+--send DRAIN TRANSACTIONS PRESERVE
+--connection multi_ha
+SET DEBUG_SYNC='now WAIT_FOR multi_terminal_t0 TIMEOUT 10';
+--let $sync_warnings= `SELECT @@warning_count`
+if ($sync_warnings)
+{
+  --die terminal test did not reach T0
+}
+--connection multi_commit
+delimiter ||;
+--send
+COMMIT; UPDATE t_phase2_multi SET v=901 WHERE id=3||
+delimiter ;||
+--connection multi_rollback
+delimiter ||;
+--send
+ROLLBACK; UPDATE t_phase2_multi SET v=902 WHERE id=3||
+delimiter ;||
+--connection multi_ha
+SET DEBUG_SYNC='now WAIT_FOR multi_commit_body TIMEOUT 5';
+--let $sync_warnings= `SELECT @@warning_count`
+if ($sync_warnings)
+{
+  --die old COMMIT was not admitted without support
+}
+SET DEBUG_SYNC='now WAIT_FOR multi_rollback_body TIMEOUT 5';
+--let $sync_warnings= `SELECT @@warning_count`
+if ($sync_warnings)
+{
+  --die old ROLLBACK was not admitted without support
+}
+SET DEBUG_SYNC='now SIGNAL multi_terminal_continue';
+
+--enable_result_log
+--enable_info
+--connection multi_commit
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+--reap
+--connection multi_rollback
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+--reap
+--disable_info
+--disable_result_log
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT 1;
+--connection multi_commit
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT 1;
+--connection default
+--reap
+--connection multi_ha
+--let $data_ok= `SELECT (SELECT v=10 FROM t_phase2_multi WHERE id=1) AND (SELECT v=0 FROM t_phase2_multi WHERE id=2) AND (SELECT v=0 FROM t_phase2_multi WHERE id=3)`
+if (!$data_ok)
+{
+  --die terminal SQL or subsequent-statement cutoff was violated
+}
+--source suite/preserve_trx/include/phase2_multistatement_cleanup.inc
+--enable_result_log
+--echo multi_statement_commit_and_rollback_without_support_passed

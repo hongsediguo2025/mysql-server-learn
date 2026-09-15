@@ -2418,6 +2418,8 @@ void trx_purge_stop(void) {
 
   rw_lock_x_unlock(&purge_sys->latch);
 
+  DEBUG_SYNC_C("trx_purge_stop_registered");
+
   if (state != PURGE_STATE_STOP) {
     /* Wait for purge coordinator to signal that it
     is suspended. */

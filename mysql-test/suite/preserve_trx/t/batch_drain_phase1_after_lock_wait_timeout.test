@@ -1,0 +1,2 @@
+--let $timeout_purge_stopped= 0
+--source suite/preserve_trx/include/phase1_after_lock_wait_timeout.inc

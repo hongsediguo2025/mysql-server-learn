@@ -65,12 +65,14 @@ struct Admission_request {
   Command_key command;
   Command_class command_class{Command_class::DEFAULT_DENY};
   bool effective_no_chain{false};
+  bool outer_is_call{false};
   Transaction_observation transaction_observation;
 };
 
 struct Command_exit_fact {
   Command_key command;
   bool entered_body{false};
+  bool outer_is_call{false};
   uint64_t native_body_exit_us{0};
   uint64_t thread_id_projection{0};
   Transaction_observation transaction_observation;

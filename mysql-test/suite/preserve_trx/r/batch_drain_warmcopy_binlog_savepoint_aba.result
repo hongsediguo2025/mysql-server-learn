@@ -1,4 +1,6 @@
-include/assert_grep.inc [drain owner rebuilt the stale token-local mirror]
+include/assert_grep.inc [acknowledged baseline was invalidated by the real cache reset]
+include/assert_grep.inc [stale binlog prefix was replaced by the complete final cache]
+include/assert_grep.inc [bounded final replacement avoided a second mirror rebuild]
 SELECT note FROM t_binlog_savepoint_aba WHERE id=1;
 note
 transfer-aba-B

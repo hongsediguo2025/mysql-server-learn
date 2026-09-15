@@ -1,0 +1,74 @@
+--source suite/preserve_trx/include/phase2_multistatement_setup.inc
+delimiter ||;
+CREATE PROCEDURE p_running_call_retire()
+BEGIN
+  COMMIT;
+  START TRANSACTION;
+  UPDATE t_phase2_multi SET v=30 WHERE id=3;
+END||
+delimiter ;||
+--connect(call_app,localhost,phase2_multi_app,,test)
+BEGIN;
+UPDATE t_phase2_multi SET v=10 WHERE id=1;
+SET DEBUG_SYNC='phase2_sched_after_execution_entered SIGNAL retire_call_body WAIT_FOR retire_call_run TIMEOUT 30';
+--send CALL p_running_call_retire()
+--connect(call_waiter,localhost,phase2_multi_app,,test)
+SET DEBUG_SYNC='phase2_sched_before_execution_retire SIGNAL retire_waiter_done WAIT_FOR retire_waiter_exit TIMEOUT 30';
+SET DEBUG_SYNC='lock_wait_will_wait SIGNAL retire_waiter_wait';
+--send UPDATE t_phase2_multi SET v=v+1 WHERE id=1
+--connection default
+SET DEBUG_SYNC='now WAIT_FOR retire_call_body TIMEOUT 5';
+--let $warnings= `SELECT @@warning_count`
+if ($warnings)
+{
+  --die CALL did not enter before T0
+}
+SET DEBUG_SYNC='now WAIT_FOR retire_waiter_wait TIMEOUT 5';
+--let $warnings= `SELECT @@warning_count`
+if ($warnings)
+{
+  --die waiter is not waiting for CALL T1
+}
+SET DEBUG_SYNC='phase2_sched_after_innodb_probe_before_merge SIGNAL retire_probe WAIT_FOR retire_merge TIMEOUT 30';
+SET DEBUG_SYNC='phase2_sched_after_call_retire_stale SIGNAL retire_revision_discard';
+--send DRAIN TRANSACTIONS PRESERVE
+--connection multi_ha
+SET DEBUG_SYNC='now WAIT_FOR retire_probe TIMEOUT 15';
+--let $warnings= `SELECT @@warning_count`
+if ($warnings)
+{
+  --die owner did not borrow a complete T1 lock snapshot
+}
+SET DEBUG_SYNC='now SIGNAL retire_call_run';
+--connection call_app
+--reap
+--connection multi_ha
+SET DEBUG_SYNC='now WAIT_FOR retire_waiter_done TIMEOUT 5';
+--let $warnings= `SELECT @@warning_count`
+if ($warnings)
+{
+  --die waiter did not retain its EXECUTING marker after native completion
+}
+SET DEBUG_SYNC='now SIGNAL retire_merge';
+SET DEBUG_SYNC='now WAIT_FOR retire_revision_discard TIMEOUT 5';
+--let $warnings= `SELECT @@warning_count`
+if ($warnings)
+{
+  --die old probe was not discarded by the CALL retirement revision
+}
+SET DEBUG_SYNC='now SIGNAL retire_waiter_exit';
+--connection call_waiter
+--reap
+--connection default
+--reap
+--source suite/preserve_trx/include/phase2_running_call_assert.inc
+--connection multi_ha
+--let $data_ok= `SELECT (SELECT v=11 FROM t_phase2_multi WHERE id=1) AND (SELECT v=0 FROM t_phase2_multi WHERE id=3)`
+if (!$data_ok)
+{
+  --die stale T1 probe changed final T2 ownership
+}
+--source suite/preserve_trx/include/phase2_multistatement_cleanup.inc
+DROP PROCEDURE p_running_call_retire;
+--enable_result_log
+--echo call_retirement_discards_probe_before_either_lock_domain_merge

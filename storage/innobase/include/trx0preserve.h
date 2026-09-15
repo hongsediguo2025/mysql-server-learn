@@ -49,6 +49,11 @@ struct trx_t;
 bool trx_preserve_feature_enabled();
 bool trx_preserve_xid_should_be_protected(const XID &xid);
 
+enum class trx_preserve_purge_stop_result { STOPPED, DISABLED, UNAVAILABLE };
+
+/** Stop purge synchronously for a retiring standby-transfer source. */
+trx_preserve_purge_stop_result trx_preserve_stop_purge_for_standby();
+
 struct Preserve_modified_table_name {
   std::string schema_name;
   std::string table_name;

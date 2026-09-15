@@ -1,0 +1,4 @@
+affected rows: 1
+info: Rows matched: 1  Changed: 1  Warnings: 0
+ERROR HY000: Preserve drain is active; this command was not executed
+multi_statement_waiter_next_sql_held_without_support

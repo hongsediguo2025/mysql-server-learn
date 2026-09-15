@@ -1,0 +1,121 @@
+# Both targets really own duplicate granted II, so THD enumeration order does
+# not decide whether the forced late replacement covers the regression.
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/force_restart.inc
+--disable_query_log
+--let $credential_file= $MYSQL_TMP_DIR/late-repeated-insert.secret
+--write_file $credential_file
+late-repeated-insert-secret
+EOF
+--exec chmod 600 $credential_file
+CREATE USER preserve_trx_ha_admin@'127.0.0.1'
+  IDENTIFIED BY 'late-repeated-insert-secret';
+GRANT SHUTDOWN, PROCESS, SYSTEM_VARIABLES_ADMIN,
+      PRESERVE_TRX_TRANSFER_ADMIN ON *.*
+  TO preserve_trx_ha_admin@'127.0.0.1';
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@'127.0.0.1';
+GRANT SELECT ON test.* TO preserve_trx_ha_admin@'127.0.0.1';
+CREATE USER late_ii_app@localhost;
+GRANT SELECT, INSERT, UPDATE ON test.* TO late_ii_app@localhost;
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-standby-phase2-scheduler-mode=DEPENDENCY_CONVERGENCE_V1 --rds-preserve-trx-phase1-capture-mode=BOUNDED_PIPELINE_V1 --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$SERVER_MYPORT_1 --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=late_repeated_insert --rds-preserve-trx-transfer-credential-secret-file=$credential_file --gtid-mode=ON --enforce-gtid-consistency=ON --log-error-verbosity=3
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--let $restart_parameters=
+--disable_query_log
+--source suite/preserve_trx/include/assert_phase2_dependency_mode.inc
+--source suite/preserve_trx/include/assert_standby_transfer_source.inc
+--let $assert_text= bounded pipeline is selected
+--let $assert_cond= `SELECT @@global.rds_preserve_trx_phase1_capture_mode='BOUNDED_PIPELINE_V1'`
+--source include/assert.inc
+CALL mtr.add_suppression(
+  'PRESERVE: rolled back prepared transaction without snapshot during recovery');
+SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=OFF;
+SET GLOBAL rds_preserve_trx_token_retention_timeout_ms=120000;
+CREATE TABLE t_late_ii1(id INT PRIMARY KEY, v INT NOT NULL) ENGINE=InnoDB;
+CREATE TABLE t_late_ii2 LIKE t_late_ii1;
+INSERT INTO t_late_ii1 VALUES(10,100),(20,200);
+INSERT INTO t_late_ii2 VALUES(10,100),(20,200);
+--connect(late_ii_ha,127.0.0.1,preserve_trx_ha_admin,late-repeated-insert-secret,test,$SERVER_MYPORT_1,)
+--connect(late_ii_blocker,localhost,late_ii_app,,test)
+--let $blocker_id= `SELECT CONNECTION_ID()`
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+--connection late_ii_ha
+--let $blocker_thread= query_get_value(SELECT THREAD_ID AS id FROM performance_schema.threads WHERE PROCESSLIST_ID=$blocker_id, id, 1)
+--connect(late_ii_target1,localhost,late_ii_app,,test)
+--let $ii_connection= late_ii_target1
+--let $ii_table= t_late_ii1
+--source suite/preserve_trx/include/late_repeated_insert_target.inc
+--let _LATE_II_TARGET1= $target_id
+--connect(late_ii_target2,localhost,late_ii_app,,test)
+--let $ii_connection= late_ii_target2
+--let $ii_table= t_late_ii2
+--source suite/preserve_trx/include/late_repeated_insert_target.inc
+--let _LATE_II_TARGET2= $target_id
+
+--connection default
+SET GLOBAL debug='+d,preserve_trx_early_force_second_dirty';
+--disable_result_log
+DRAIN TRANSACTIONS PRESERVE;
+--enable_result_log
+--let _LATE_II_LOG= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--perl
+use strict;
+use warnings;
+open(my $fh, '<', $ENV{'_LATE_II_LOG'}) or die "cannot read source log: $!";
+my ($force, $final, $excluded);
+while (my $line = <$fh>) {
+  if ($line =~ /CURRENT_TEST: preserve_trx\.batch_drain_dependency_late_repeated_insert/) {
+    ($force, $final, $excluded) = (undef, undef, undef);
+  }
+  $force = $line if $line =~ /PRESERVE_LATE_DIRTY_TEST force /;
+  $final = $line if $line =~ /PRESERVE_PHASE2_FINAL_V1 /;
+  $excluded = $line if $line =~ /source token excluded .*LOCK_PLAN_REPLACEMENT_FAILED/;
+}
+close($fh);
+die "missing forced replacement or committed final record" unless $force && $final;
+my %fields = ($force =~ /([a-z0-9_]+)=([^\s]+)/g);
+my @actual = sort {$a <=> $b} ($fields{'first'}, $fields{'second'});
+my @wanted = sort {$a <=> $b} ($ENV{'_LATE_II_TARGET1'}, $ENV{'_LATE_II_TARGET2'});
+die "replacement did not target the real transactions" unless "@actual" eq "@wanted";
+die "wrong finalize order" unless $fields{'first_finalized'} == 0;
+die "real duplicate intention replacement failed: $excluded" if $excluded;
+die "handoff not committed" unless
+  $final =~ /source_terminal_status=COMMITTED_HANDOFF(?:\s|$)/ &&
+  $final =~ /first_failure_stage=NONE(?:\s|$)/;
+print "real duplicate intention reached late replacement\n";
+EOF
+--connection late_ii_ha
+SET GLOBAL debug='-d,preserve_trx_early_force_second_dirty';
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens')=2 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens')=0
+--source include/wait_condition.inc
+SELECT
+  (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_final_dirty_tokens')=1 AS one_dirty,
+  (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_final_replacement_tokens')=1 AS one_replacement,
+  (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_final_validation_rejects')=0 AS no_reject;
+SELECT COUNT(*) AS committed_rows, SUM(v) AS committed_sum FROM t_late_ii1;
+SELECT COUNT(*) AS committed_rows, SUM(v) AS committed_sum FROM t_late_ii2;
+--connection late_ii_target1
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT 1;
+--connection late_ii_target2
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT 1;
+--connection late_ii_ha
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--shutdown_server 0
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+--exec echo "restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+--disable_query_log
+--connect(late_ii_cleanup,localhost,root,,test)
+SELECT COUNT(*) AS committed_rows, SUM(v) AS committed_sum FROM t_late_ii1;
+SELECT COUNT(*) AS committed_rows, SUM(v) AS committed_sum FROM t_late_ii2;
+DROP TABLE t_late_ii1,t_late_ii2;
+DROP USER late_ii_app@localhost;
+DROP USER preserve_trx_ha_admin@'127.0.0.1';
+--remove_file $credential_file
+--enable_query_log

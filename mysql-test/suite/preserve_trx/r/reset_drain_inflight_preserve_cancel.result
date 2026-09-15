@@ -1,15 +1,19 @@
+include/assert.inc [before_prepare RESET rejection did not change ownership]
 SELECT 'before_prepare' AS scenario,
 CONNECTION_ID()=@original_connection_id AS same_connection;
 scenario	same_connection
 before_prepare	1
+include/assert.inc [after_prepare RESET rejection did not change ownership]
 SELECT 'after_prepare' AS scenario,
 CONNECTION_ID()=@original_connection_id AS same_connection;
 scenario	same_connection
 after_prepare	1
+include/assert.inc [after_detach RESET rejection did not change ownership]
 SELECT 'after_detach' AS scenario,
 CONNECTION_ID()=@original_connection_id AS same_connection;
 scenario	same_connection
 after_detach	1
+include/assert.inc [before_publish RESET rejection did not change ownership]
 SELECT 'before_publish' AS scenario,
 CONNECTION_ID()=@original_connection_id AS same_connection;
 scenario	same_connection

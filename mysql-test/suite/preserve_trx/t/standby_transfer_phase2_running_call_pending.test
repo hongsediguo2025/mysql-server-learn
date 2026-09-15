@@ -1,0 +1,48 @@
+--source suite/preserve_trx/include/phase2_multistatement_setup.inc
+delimiter ||;
+CREATE PROCEDURE p_running_call_pending()
+BEGIN
+  COMMIT;
+  START TRANSACTION;
+  UPDATE t_phase2_multi SET v=30 WHERE id=3;
+  SET DEBUG_SYNC='phase2_sched_after_callback_hint_empty SIGNAL pending_exit_hint WAIT_FOR pending_call_exit TIMEOUT 30';
+END||
+delimiter ;||
+--connect(call_app,localhost,phase2_multi_app,,test)
+BEGIN;
+UPDATE t_phase2_multi SET v=10 WHERE id=1;
+--send CALL p_running_call_pending()
+--connection default
+SET DEBUG_SYNC='now WAIT_FOR pending_exit_hint TIMEOUT 5';
+--let $warnings= `SELECT @@warning_count`
+if ($warnings)
+{
+  --die outer CALL did not stop after its final native transaction
+}
+SET DEBUG_SYNC='phase2_sched_after_t0_executing_registered SIGNAL pending_registered WAIT_FOR pending_registration_finish TIMEOUT 30';
+--send DRAIN TRANSACTIONS PRESERVE
+--connection multi_ha
+SET DEBUG_SYNC='now WAIT_FOR pending_registered TIMEOUT 15';
+--let $warnings= `SELECT @@warning_count`
+if ($warnings)
+{
+  --die CALL was not registered while T0 remains incomplete
+}
+SET DEBUG_SYNC='now SIGNAL pending_call_exit';
+--connection call_app
+--reap
+--connection multi_ha
+SET DEBUG_SYNC='now SIGNAL pending_registration_finish';
+--connection default
+--reap
+--source suite/preserve_trx/include/phase2_running_call_assert.inc
+--connection multi_ha
+--let $data_ok= `SELECT (SELECT v=10 FROM t_phase2_multi WHERE id=1) AND (SELECT v=0 FROM t_phase2_multi WHERE id=3)`
+if (!$data_ok)
+{
+  --die pending exit did not preserve final CALL transaction
+}
+--source suite/preserve_trx/include/phase2_multistatement_cleanup.inc
+DROP PROCEDURE p_running_call_pending;
+--enable_result_log
+--echo running_call_exit_replayed_before_t0_registration_completes

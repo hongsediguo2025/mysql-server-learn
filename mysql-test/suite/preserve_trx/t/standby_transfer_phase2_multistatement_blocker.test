@@ -1,0 +1,76 @@
+--source suite/preserve_trx/include/phase2_multistatement_setup.inc
+
+--connect(multi_blocker,localhost,phase2_multi_app,,test)
+SET SESSION transaction_isolation='REPEATABLE-READ';
+START TRANSACTION;
+UPDATE t_phase2_multi SET v=v+1 WHERE id=1;
+SET DEBUG_SYNC='phase2_sched_after_command_held SIGNAL multi_blocker_held';
+SET DEBUG_SYNC='phase2_sched_after_execution_entered SIGNAL multi_blocker_body';
+
+--connect(multi_survivor,localhost,phase2_multi_app,,test)
+START TRANSACTION;
+UPDATE t_phase2_multi SET v=100 WHERE id=4;
+
+--connect(multi_waiter,localhost,phase2_multi_app,,test)
+START TRANSACTION;
+SET DEBUG_SYNC='lock_wait_will_wait SIGNAL multi_waiter_waiting';
+--send UPDATE t_phase2_multi SET v=v+10 WHERE id=1
+
+--connection default
+SET DEBUG_SYNC='now WAIT_FOR multi_waiter_waiting TIMEOUT 5';
+--let $sync_warnings= `SELECT @@warning_count`
+if ($sync_warnings)
+{
+  --die business UPDATE did not enter lock wait before DRAIN
+}
+SET DEBUG_SYNC='phase2_sched_after_innodb_support_registered SIGNAL multi_support_ready';
+--send DRAIN TRANSACTIONS PRESERVE
+
+--connection multi_ha
+SET DEBUG_SYNC='now WAIT_FOR multi_support_ready TIMEOUT 10';
+--let $sync_warnings= `SELECT @@warning_count`
+if ($sync_warnings)
+{
+  --die scheduler did not prove the blocker dependency
+}
+
+# mysqltest negotiates CLIENT_MULTI_STATEMENTS. This is one COM_QUERY,
+# not a pair of independently sent statements.
+--connection multi_blocker
+delimiter ||;
+--send
+UPDATE t_phase2_multi SET v=v+1 WHERE id=2; COMMIT||
+delimiter ;||
+
+--connection multi_ha
+SET DEBUG_SYNC='now WAIT_FOR multi_blocker_body TIMEOUT 3';
+--let $sync_warnings= `SELECT @@warning_count`
+if ($sync_warnings)
+{
+  --die proved blocker cannot enter its multi-statement UPDATE/COMMIT
+}
+--connection multi_blocker
+--reap
+--connection multi_waiter
+--reap
+--connection default
+--reap
+
+--connection multi_blocker
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT 1;
+--connection multi_ha
+--let $data_ok= `SELECT v=1 FROM t_phase2_multi WHERE id=2`
+if (!$data_ok)
+{
+  --die multi-statement blocker did not commit its UPDATE exactly once
+}
+--connection multi_receiver
+--let $accepted= `SELECT VARIABLE_VALUE=1 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs'`
+if (!$accepted)
+{
+  --die receiver did not accept the remaining transactions
+}
+--source suite/preserve_trx/include/phase2_multistatement_cleanup.inc
+--enable_result_log
+--echo multi_statement_blocker_committed_and_drain_succeeded

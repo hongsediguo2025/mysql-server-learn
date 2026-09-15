@@ -1,0 +1,8 @@
+include/assert.inc [DRAIN has registered stop but cannot complete while real purge work is blocked]
+include/assert.inc [purge completion and T0 have not been published]
+include/assert.inc [business commit remains visible before T0]
+include/assert.inc [stop still waits after the ordinary business commit]
+include/assert.inc [stop completed once and DRAIN never resumed purge]
+include/assert.inc [receiver accepted the epoch with exactly one final transaction]
+include/assert.inc [committed delete and business UPDATE survived source restart]
+real_purge_worker_joined_before_t0_without_resume

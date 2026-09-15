@@ -90,6 +90,7 @@ enum class Preserve_trx_phase1_pipeline_result_status : uint8_t {
   NO_PROGRESS,
   DEFERRED_TO_FINAL,
   RETRYABLE,
+  CONSISTENCY_CONFLICT,
   IDENTITY_STALE,
   STORE_FALLBACK,
   DEADLINE,

@@ -1,0 +1,109 @@
+--source suite/preserve_trx/include/phase2_multistatement_setup.inc
+CREATE TABLE t_probe_pad(id INT PRIMARY KEY, v INT NOT NULL) ENGINE=InnoDB;
+INSERT INTO t_probe_pad WITH RECURSIVE s(n) AS
+  (SELECT 1 UNION ALL SELECT n+1 FROM s WHERE n<257) SELECT n,0 FROM s;
+--let _PROBE_ACTORS= $MYSQL_TMP_DIR/probe-capacity-actors.inc
+--perl
+use strict;
+use warnings;
+open(my $fh, '>', $ENV{'_PROBE_ACTORS'}) or die "actors: $!";
+for my $i (1..257) {
+  print $fh "--connect(probe_s_$i,localhost,phase2_multi_app,,test)\n";
+  print $fh "SET SESSION transaction_isolation='REPEATABLE-READ';\nBEGIN;\n";
+  print $fh "UPDATE t_probe_pad SET v=1 WHERE id=$i;\n";
+  print $fh "SELECT id FROM t_phase2_multi WHERE id=1 FOR SHARE;\n";
+}
+close($fh);
+EOF
+--source $MYSQL_TMP_DIR/probe-capacity-actors.inc
+--remove_file $MYSQL_TMP_DIR/probe-capacity-actors.inc
+--connect(probe_waiter,localhost,phase2_multi_app,,test)
+--let $probe_waiter_id= `SELECT CONNECTION_ID()`
+SET SESSION transaction_isolation='REPEATABLE-READ';
+BEGIN;
+--send UPDATE t_phase2_multi SET v=10 WHERE id=1
+--connection default
+--let $probe_waiter_thread= query_get_value(SELECT THREAD_ID AS id FROM performance_schema.threads WHERE PROCESSLIST_ID=$probe_waiter_id, id, 1)
+--let $wait_condition= SELECT COUNT(DISTINCT BLOCKING_THREAD_ID)=257 FROM performance_schema.data_lock_waits WHERE REQUESTING_THREAD_ID=$probe_waiter_thread
+--source include/wait_condition.inc
+--error ER_PRESERVE_TRX_UNSUPPORTED
+DRAIN TRANSACTIONS PRESERVE;
+
+--let _PROBE_SOURCE_LOG= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--perl
+use strict;
+use warnings;
+open(my $fh, '<', $ENV{'_PROBE_SOURCE_LOG'}) or die "source log: $!";
+my ($summary,$final);
+while (my $line=<$fh>) {
+  ($summary,$final)=(undef,undef) if $line =~ /CURRENT_TEST:/;
+  $summary=$line if $line =~ /PRESERVE_PHASE2_SCHED_V1 /;
+  $final=$line if $line =~ /PRESERVE_PHASE2_FINAL_V1 /;
+}
+close($fh);
+die 'missing scheduler/final pair' unless $summary && $final;
+my %s=($summary =~ /([a-z0-9_]+)=([^\s]+)/g);
+my %f=($final =~ /([a-z0-9_]+)=([^\s]+)/g);
+for my $key (qw(attempt_id generation mode terminal_result lock_proof_unknown
+                support_edge_registered scan_positive_result permit_issued
+                lineage_unknown)) {
+  die "missing scheduler $key" unless defined($s{$key});
+}
+for my $key (qw(attempt_id generation mode first_failure_stage
+                hard_published_us source_terminal_status)) {
+  die "missing final $key" unless defined($f{$key});
+}
+for my $key (qw(attempt_id generation mode)) {
+  die "mismatched $key" unless $s{$key} eq $f{$key};
+}
+die 'capacity overflow did not fail closed' unless
+  $s{'mode'} eq 'DEPENDENCY_CONVERGENCE_V1' &&
+  $s{'terminal_result'} eq 'SAFETY_ABORT' && $s{'lock_proof_unknown'}==1 &&
+  $s{'support_edge_registered'}==0 && $s{'scan_positive_result'}==0 &&
+  $s{'permit_issued'}==0 && $s{'lineage_unknown'}==0 &&
+  $f{'first_failure_stage'} eq 'phase2_scheduler_safety_abort' &&
+  $f{'hard_published_us'}==0 && $f{'source_terminal_status'} eq 'RUNNING';
+EOF
+
+# Failure must leave original transactions usable, not falsely hand them off.
+--connection probe_s_1
+--let $assert_text= first blocker still owns its uncommitted write
+--let $assert_cond= `SELECT v=1 FROM t_probe_pad WHERE id=1`
+--source include/assert.inc
+COMMIT;
+--connection probe_s_2
+ROLLBACK;
+--connection default
+--let $assert_text= source commit and rollback retained their native effects
+--let $assert_cond= `SELECT SUM(v)=1 FROM t_probe_pad`
+--source include/assert.inc
+--let _PROBE_RELEASE= $MYSQL_TMP_DIR/probe-capacity-release.inc
+--perl
+use strict;
+use warnings;
+open(my $fh, '>', $ENV{'_PROBE_RELEASE'}) or die "release: $!";
+for my $i (3..257) {
+  print $fh "--connection probe_s_$i\nROLLBACK;\n";
+}
+close($fh);
+EOF
+--source $MYSQL_TMP_DIR/probe-capacity-release.inc
+--remove_file $MYSQL_TMP_DIR/probe-capacity-release.inc
+--connection probe_waiter
+--reap
+--let $assert_text= original waiter continues in its original transaction
+--let $assert_cond= `SELECT v=10 FROM t_phase2_multi WHERE id=1`
+--source include/assert.inc
+ROLLBACK;
+--connection default
+--let $assert_text= waiter rollback did not commit its update
+--let $assert_cond= `SELECT SUM(v)=0 FROM t_phase2_multi`
+--source include/assert.inc
+DROP TABLE t_probe_pad;
+--connection multi_receiver
+--let $assert_text= rejected proof did not accept a receiver epoch
+--let $assert_cond= `SELECT VARIABLE_VALUE=0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs'`
+--source include/assert.inc
+--source suite/preserve_trx/include/phase2_multistatement_cleanup.inc
+--enable_result_log
+--echo 257 distinct blockers fail closed without partial permit; source restored
