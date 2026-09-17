@@ -9,6 +9,9 @@ from pathlib import Path
 from unittest import mock
 
 from scripts.preserve_trx_full_pressure_runner import (
+    DEPENDENCY_CONTINUOUS_LARGE_TX_FULL_PROFILE,
+    DEPENDENCY_CONTINUOUS_LARGE_TX_SCALE_SMOKE_PROFILE,
+    DEPENDENCY_CONTINUOUS_LARGE_TX_SMOKE_PROFILE,
     MIXED_FULL_PROFILE,
     MIXED_SMOKE_PROFILE,
     FullPressurePaths,
@@ -764,6 +767,65 @@ class MixedPressureCommandTest(unittest.TestCase):
         self.assertNotIn("receiver_readiness_contract", local)
         self.assertEqual("READY", transfer["receiver_readiness_contract"])
         self.assertNotIn("sql_resume_max_us", transfer)
+
+    def test_dependency_continuous_profiles_and_command_require_repeatable_read(self):
+        profile = DEPENDENCY_CONTINUOUS_LARGE_TX_SMOKE_PROFILE
+        self.assertEqual("REPEATABLE-READ", profile.business_transaction_isolation)
+        self.assertEqual(2_000_000, profile.source_phase2_limit_us)
+        self.assertEqual(2_000_000, profile.scheduler_strict_interval_limit_us)
+        self.assertEqual(500_000, profile.source_post_command_tail_limit_us)
+        self.assertEqual(500_000, profile.ready_after_final_spool_ack_limit_us)
+        self.assertEqual(
+            "REPEATABLE-READ",
+            DEPENDENCY_CONTINUOUS_LARGE_TX_FULL_PROFILE.business_transaction_isolation,
+        )
+        scale = DEPENDENCY_CONTINUOUS_LARGE_TX_SCALE_SMOKE_PROFILE
+        self.assertEqual("REPEATABLE-READ", scale.business_transaction_isolation)
+        self.assertEqual((128, 16, 32, 8), (
+            scale.sessions,
+            scale.short_transaction_sessions,
+            scale.tables,
+            scale.short_transaction_tables,
+        ))
+        self.assertEqual((100_000, 10, 35.0, 1), (
+            scale.seed_rows_per_table_per_session,
+            scale.lockset_batch_size,
+            scale.business_run_before_drain_s,
+            scale.formal_rounds,
+        ))
+        self.assertEqual((32, 8, 100_000, 10), (
+            profile.sessions,
+            profile.short_transaction_sessions,
+            profile.statements_per_tx,
+            profile.lockset_batch_size,
+        ))
+
+        paths = self._paths()
+        source, receiver = build_mysqld_commands(
+            profile,
+            paths,
+            source_uuid="11111111-1111-1111-1111-111111111111",
+            receiver_uuid="22222222-2222-2222-2222-222222222222",
+            source_port=3511,
+            receiver_port=3512,
+            transfer_enabled=True,
+        )
+        command = build_e2e_command(
+            profile,
+            paths,
+            source_command=source,
+            receiver_command=receiver,
+            source_port=3511,
+            receiver_port=3512,
+            credential_secret="secret",
+            evidence="dependency-continuous-large-tx-transfer",
+        )
+        option = command.index("--business-transaction-isolation")
+        self.assertEqual("REPEATABLE-READ", command[option + 1])
+        contract = build_acceptance_contract(
+            profile, "dependency-continuous-large-tx-transfer"
+        )
+        self.assertEqual("REPEATABLE-READ", contract["transaction_isolation"])
 
     def test_transfer_command_uses_same_workload_over_tcp(self):
         paths = self._paths()

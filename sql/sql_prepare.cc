@@ -142,6 +142,7 @@ When one supplies long data for a placeholder:
 #include "sql/my_decimal.h"
 #include "sql/mysqld.h"     // opt_general_log
 #include "sql/opt_trace.h"  // Opt_trace_array
+#include "sql/preserve_trx.h"
 #include "sql/protocol.h"
 #include "sql/protocol_classic.h"
 #include "sql/psi_memory_key.h"
@@ -1962,6 +1963,8 @@ void mysql_sql_stmt_execute(THD *thd) {
 void mysqld_stmt_fetch(THD *thd, Prepared_statement *stmt, ulong num_rows) {
   DBUG_TRACE;
   thd->status_var.com_stmt_fetch++;
+  const auto cursor_count_guard = create_scope_guard(
+      [&]() { stmt->update_preserve_cursor_count(); });
 
   Server_side_cursor *cursor = stmt->cursor;
   if (cursor == nullptr || !cursor->is_open()) {
@@ -2030,8 +2033,10 @@ void mysqld_stmt_close(THD *thd, Prepared_statement *stmt) {
     in use is from within Dynamic SQL.
   */
   DBUG_ASSERT(!stmt->is_in_use());
+  DEBUG_SYNC(thd, "preserve_trx_before_stmt_close");
   MYSQL_DESTROY_PS(stmt->m_prepared_stmt);
   stmt->deallocate();
+  DEBUG_SYNC(thd, "preserve_trx_after_stmt_close");
   query_logger.general_log_print(thd, thd->get_command(), NullS);
 }
 
@@ -2293,6 +2298,22 @@ Prepared_statement::Prepared_statement(THD *thd_arg)
 void Prepared_statement::close_cursor() {
   if (cursor == nullptr) return;
   cursor->close();
+  update_preserve_cursor_count();
+}
+
+void Prepared_statement::update_preserve_cursor_count(bool opening) {
+  if (!preserve_trx_is_enabled()) return;
+  const bool counted = opening || (cursor != nullptr && cursor->is_open());
+  if (counted == m_preserve_cursor_counted) return;
+  if (counted) {
+    thd->preserve_trx_open_cursor_count.fetch_add(1, std::memory_order_release);
+  } else {
+    const auto previous = thd->preserve_trx_open_cursor_count.fetch_sub(
+        1, std::memory_order_release);
+    DBUG_ASSERT(previous != 0);
+    (void)previous;
+  }
+  m_preserve_cursor_counted = counted;
 }
 
 void Prepared_statement::setup_set_params() {
@@ -3285,6 +3306,7 @@ void Prepared_statement::swap_prepared_statement(Prepared_statement *copy) {
   std::swap(result, copy->result);
   // Need a new cursor, if requested
   std::swap(cursor, copy->cursor);
+  std::swap(m_preserve_cursor_counted, copy->m_preserve_cursor_counted);
 
   DBUG_ASSERT(thd == copy->thd);
 }
@@ -3424,6 +3446,12 @@ bool Prepared_statement::execute(String *expanded_query, bool open_cursor) {
   if (!error) {
     // Execute
     lex->clear_execution();
+    // An existing materialization may also be reused without open_cursor.
+    const bool track_cursor = open_cursor || cursor != nullptr;
+    if (track_cursor) update_preserve_cursor_count(true);
+    const auto cursor_count_guard = create_scope_guard([&]() {
+      if (track_cursor) update_preserve_cursor_count();
+    });
     if (open_cursor) {
       lex->safe_to_cache_query = false;
       /*

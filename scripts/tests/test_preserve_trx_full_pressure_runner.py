@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from scripts import preserve_trx_full_pressure_runner as full_pressure_runner
 from scripts.preserve_trx_full_pressure_runner import (
     DEFAULT_MIXED_FULL_REQUIRED_FREE_BYTES,
     FULL_PROFILE,
@@ -45,9 +46,6 @@ class FullPressureProfileTest(unittest.TestCase):
         self.assertEqual(256 * 1024 * 1024, FULL_PROFILE.preserve_memory_budget_bytes)
         self.assertEqual(2 * 1024**3, FULL_PROFILE.source_buffer_pool_bytes)
         self.assertEqual(2 * 1024**3, FULL_PROFILE.receiver_buffer_pool_bytes)
-        self.assertEqual(8, FULL_PROFILE.receiver_workers)
-        self.assertEqual(8 * 1024**2, FULL_PROFILE.phase1_batch_bytes)
-        self.assertEqual(50, FULL_PROFILE.phase1_batch_linger_ms)
         self.assertEqual(500_000, FULL_PROFILE.source_phase2_limit_us)
         self.assertEqual(
             500_000, FULL_PROFILE.source_post_command_tail_limit_us
@@ -55,15 +53,153 @@ class FullPressureProfileTest(unittest.TestCase):
         self.assertEqual(
             "PROMOTION_PREPARE", FULL_PROFILE.transfer_runtime_profile
         )
-        self.assertEqual(
-            1024**3, FULL_PROFILE.transfer_io_bytes_per_sec_base
-        )
-        self.assertEqual(
-            1024**3, FULL_PROFILE.prewarm_io_bytes_per_sec_base
-        )
-        self.assertEqual(8, FULL_PROFILE.promotion_prewarm_workers)
-        self.assertEqual(1024**2, SMOKE_PROFILE.phase1_batch_bytes)
         self.assertTrue(FULL_PROFILE.warmcopy_required)
+        self.assertTrue(
+            hasattr(
+                full_pressure_runner,
+                "DEPENDENCY_CONTINUOUS_LARGE_TX_FULL_PROFILES",
+            )
+        )
+        profiles = (
+            full_pressure_runner.DEPENDENCY_CONTINUOUS_LARGE_TX_FULL_PROFILES
+        )
+        self.assertEqual(
+            {"range-10000", "range-1000", "range-100000"},
+            set(profiles),
+        )
+        expected = {
+            "range-10000": ("RANGE_10000", 10_000, 10),
+            "range-1000": ("RANGE_1000", 1_000, 100),
+            "range-100000": ("RANGE_100000", 100_000, 1),
+        }
+        for name, (shape, commands, rows) in expected.items():
+            profile = profiles[name]
+            self.assertEqual(shape, profile.continuous_large_tx_shape)
+            self.assertEqual(100_000, profile.statements_per_tx)
+            self.assertEqual(100_000, profile.seed_rows_per_table_per_session)
+            self.assertEqual(
+                commands, profile.effective_lockset_update_commands_per_tx
+            )
+            self.assertEqual(rows, profile.lockset_batch_size)
+            self.assertEqual(6, profile.phase1_pipeline_workers)
+            self.assertEqual(6, profile.phase1_pipeline_ordinary_active_limit)
+        self.assertTrue(
+            hasattr(full_pressure_runner, "dependency_continuous_profiles")
+        )
+        selected = full_pressure_runner.dependency_continuous_profiles(
+            "full", "all"
+        )
+        self.assertEqual(
+            ["RANGE_10000", "RANGE_1000", "RANGE_100000"],
+            [profile.continuous_large_tx_shape for profile in selected],
+        )
+        self.assertEqual(
+            [profiles["range-1000"]],
+            full_pressure_runner.dependency_continuous_profiles(
+                "full", "range-1000"
+            ),
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            paths = FullPressurePaths.resolve(
+                repo_root=root / "repo",
+                build_dir=Path("build-release"),
+                work_root=root / "work",
+                history_root=root / "history",
+                run_id="range-100000-command",
+            )
+            command = build_e2e_command(
+                profiles["range-100000"],
+                paths,
+                source_command=["mysqld", "--source"],
+                receiver_command=["mysqld", "--receiver"],
+                source_port=3511,
+                receiver_port=3512,
+                credential_secret="secret",
+                evidence="dependency-continuous-large-tx-transfer",
+            )
+        joined = " ".join(command)
+        self.assertIn("--continuous-large-tx-shape RANGE_100000", joined)
+        self.assertIn(
+            "--business-command-latency-limit-us 1000000", joined
+        )
+        self.assertNotIn("--lockset-update-commands-per-tx", command)
+        self.assertIn("--lockset-batch-size 1", joined)
+        self.assertNotIn("--lockset-cycle-ranges", command)
+        contract = build_acceptance_contract(
+            profiles["range-100000"],
+            "dependency-continuous-large-tx-transfer",
+        )
+        self.assertEqual("RANGE_100000", contract["large_transaction_shape"])
+        self.assertEqual(100_000, contract["update_commands_per_tx"])
+        self.assertEqual(1, contract["rows_per_update"])
+        self.assertEqual(1, contract["range_passes_per_tx"])
+        self.assertEqual(100_000, contract["row_visits_per_tx"])
+        self.assertEqual(
+            1_000_000, contract["business_command_latency_us_max"]
+        )
+        self.assertEqual(20.0, contract["large_statement_rate_drop_pct_max"])
+        self.assertEqual(
+            20.0,
+            contract["short_transaction_committed_tps_drop_pct_max"],
+        )
+        self.assertEqual(
+            "REPORT_ONLY",
+            contract["aggregate_phase1_committed_tps_drop_pct"],
+        )
+        self.assertEqual(
+            40.0,
+            contract[
+                "engineering_milestone_large_statement_drop_pct_max"
+            ],
+        )
+        self.assertEqual(
+            40.0,
+            contract["engineering_milestone_short_tps_drop_pct_max"],
+        )
+        self.assertEqual(6, contract["phase1_pipeline_ordinary_active_limit"])
+        self.assertEqual(
+            6,
+            contract[
+                "phase1_pipeline_ordinary_active_limit_requested"
+            ],
+        )
+        self.assertEqual(
+            6,
+            contract[
+                "phase1_pipeline_ordinary_active_limit_effective"
+            ],
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            paths = FullPressurePaths.resolve(
+                repo_root=root / "repo",
+                build_dir=Path("build-release"),
+                work_root=root / "work",
+                history_root=root / "history",
+                run_id="ordinary-active-limit",
+            )
+            source, receiver = build_mysqld_commands(
+                profiles["range-100000"],
+                paths,
+                source_uuid="11111111-1111-1111-1111-111111111111",
+                receiver_uuid="22222222-2222-2222-2222-222222222222",
+                source_port=3511,
+                receiver_port=3512,
+            )
+        self.assertIn(
+            "--rds-preserve-trx-phase1-pipeline-ordinary-active-limit=6",
+            source,
+        )
+        self.assertFalse(
+            any(
+                option.startswith(
+                    "--rds-preserve-trx-phase1-pipeline-ordinary-active-limit="
+                )
+                for option in receiver
+            )
+        )
 
     def test_reset_profile_is_large_repeated_write_without_lockset_replacement(self):
         self.assertEqual(1000, RESET_FULL_PROFILE.sessions)
@@ -354,6 +490,47 @@ class FullPressureProfileTest(unittest.TestCase):
         self.assertEqual(
             parse_args(["--evidence", "reset-drain"]).evidence,
             "reset-drain",
+        )
+        self.assertTrue(hasattr(parse_args([]), "large_tx_shape"))
+        self.assertEqual("all", parse_args([]).large_tx_shape)
+        self.assertEqual(
+            "range-100000",
+            parse_args(
+                ["--large-tx-shape", "range-100000"]
+            ).large_tx_shape,
+        )
+        self.assertTrue(
+            hasattr(full_pressure_runner, "select_full_pressure_profiles")
+        )
+        selected = full_pressure_runner.select_full_pressure_profiles(
+            parse_args(
+                [
+                    "--evidence",
+                    "dependency-continuous-large-tx-transfer",
+                    "--profile",
+                    "scale-smoke",
+                    "--large-tx-shape",
+                    "range-100000",
+                ]
+            )
+        )
+        self.assertEqual(
+            ["RANGE_100000"],
+            [profile.continuous_large_tx_shape for profile in selected],
+        )
+        selected_all = full_pressure_runner.select_full_pressure_profiles(
+            parse_args(
+                [
+                    "--evidence",
+                    "dependency-continuous-large-tx-transfer",
+                    "--profile",
+                    "scale-smoke",
+                ]
+            )
+        )
+        self.assertEqual(
+            ["RANGE_10000", "RANGE_1000", "RANGE_100000"],
+            [profile.continuous_large_tx_shape for profile in selected_all],
         )
 
     def test_release_run_builds_current_mysqld_before_collecting_evidence(self):

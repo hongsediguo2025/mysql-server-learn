@@ -352,6 +352,7 @@ class Prepared_statement final {
 
   uint flags;
   bool with_log;
+  bool m_preserve_cursor_counted{false};
   LEX_CSTRING m_name; /* name for named prepared statements */
   /**
     Name of the current (default) database.
@@ -379,6 +380,7 @@ class Prepared_statement final {
   bool set_name(const LEX_CSTRING &name);
   const LEX_CSTRING &name() const { return m_name; }
   void close_cursor();
+  void update_preserve_cursor_count(bool opening = false);
   bool is_in_use() const { return flags & (uint)IS_IN_USE; }
   bool is_sql_prepare() const { return flags & (uint)IS_SQL_PREPARE; }
   void set_sql_prepare() { flags |= (uint)IS_SQL_PREPARE; }

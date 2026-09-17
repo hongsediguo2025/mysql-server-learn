@@ -1,16 +1,16 @@
+[mysqld]
+default-authentication-plugin=mysql_native_password
+
 [mysqld.1]
-server_id=1
-max-connections=400
+server-id=1
 
 [mysqld.2]
+server-id=2
+rds-preserve-trx-enable=ON
 rds-preserve-trx-standby-phase2-scheduler-mode=DEPENDENCY_CONVERGENCE_V1
 rds-preserve-trx-phase1-capture-mode=BOUNDED_PIPELINE_V1
-server_id=2
-rds-preserve-trx-enable=ON
-rds-preserve-trx-transfer-prewarm-paused=OFF
-
-[mysqltest]
-max-connections=400
+rds-preserve-trx-transfer-prewarm-paused=ON
 
 [ENV]
+SERVER_MYPORT_1=@mysqld.1.port
 SERVER_MYPORT_2=@mysqld.2.port

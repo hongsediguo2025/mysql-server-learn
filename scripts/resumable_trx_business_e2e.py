@@ -8638,6 +8638,9 @@ class BusinessE2ERunner:
             "status": status,
             "success": status == "success",
             "scenario": "standby_transfer_receiver_drain_metrics",
+            "standby_transfer_effective_modes": getattr(
+                self, "standby_transfer_effective_modes", {}
+            ),
             **_evidence_contract(EVIDENCE_KIND_STANDALONE_TRANSFER_E2E),
             **self.mixed_pressure_report_fields(),
             **self.continuous_business_report_fields(),
@@ -10528,6 +10531,37 @@ END
                 Path(str(receiver_rows[0][0] or "")) / "preserve"
             )
             mismatches = []
+            mode_names = (
+                "rds_preserve_trx_standby_phase2_scheduler_mode",
+                "rds_preserve_trx_phase1_capture_mode",
+            )
+            self.standby_transfer_effective_modes = {}
+            for endpoint, connection, command in (
+                ("source", source_conn, self.config.source_start_command),
+                ("receiver", receiver_conn, self.config.receiver_start_command),
+            ):
+                rows = self.runtime.execute(
+                    connection,
+                    "SELECT " + ",".join("@@GLOBAL." + name for name in mode_names),
+                    fetch=True,
+                )
+                observed = dict(zip(mode_names, map(str, rows[0]))) if rows else {}
+                requested = {
+                    name: self._command_sysvar_value(command, name)
+                    for name in mode_names
+                }
+                self.standby_transfer_effective_modes[endpoint] = {
+                    "requested": requested, "observed": observed,
+                }
+                for name in mode_names:
+                    actual, expected = observed.get(name), requested[name]
+                    if actual is None or (
+                        expected is not None and actual.upper() != expected.upper()
+                    ):
+                        mismatches.append(
+                            f"{endpoint}.{name}: requested={expected!r} "
+                            f"observed={actual!r}"
+                        )
             if source_artifact_mode != "STANDBY_TRANSFER_SAVE":
                 mismatches.append(
                     f"source artifact mode {source_artifact_mode!r} != "

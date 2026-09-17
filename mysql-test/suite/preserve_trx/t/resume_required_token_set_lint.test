@@ -37,7 +37,7 @@ die "session-only source eligibility helper is missing\n"
   unless defined $source_eligibility_body;
 die "session-only source eligibility must not allocate or inspect another THD's InnoDB trx\n"
   if $source_eligibility_body =~ /trx_preserve_thd_can_accept_preserved_trx/;
-die "final S eligibility must retain only a classified post-CLOSING command\n"
+die "session-only eligibility must retain the command packet CLOSING fence\n"
   unless $source_eligibility_body =~ /candidate->m_server_idle\s*\|\|[\s\S]{0,360}!candidate->preserve_trx_command_packet_before_closing\.load[\s\S]{0,180}command_classified/s;
 die "final S eligibility must exclude a decoded no-response cleanup packet\n"
   unless $source_eligibility_body =~ /candidate->preserve_trx_post_closing_cleanup_packet\.load[\s\S]{0,400}!disconnecting/s;
@@ -94,8 +94,8 @@ my $final_snapshot_call_count = () =
   $drain =~ /revalidate_session_only_thread_ids\(\)/g;
 die "both control-only and transaction COMMIT paths must revalidate S at the final boundary\n"
   unless $final_snapshot_call_count == 2;
-die "final S revalidation must intersect the planned IDs with live eligible THDs\n"
-  unless $drain =~ /Preserve_batch_session_only_final_snapshot[\s\S]{0,1600}m_planned_thread_ids\.count\(thread_id\)[\s\S]{0,900}preserve_trx_session_only_candidate_is_eligible_locked\(candidate,\s*true\)/s;
+die "final S revalidation must retain eligible planned IDs while reading a post-CLOSING packet\n"
+  unless $drain =~ /Preserve_batch_session_only_final_snapshot[\s\S]{0,1600}m_planned_thread_ids\.count\(thread_id\)[\s\S]{0,900}preserve_trx_session_only_candidate_is_eligible_locked\(candidate,\s*true,\s*true\)/s;
 
 die "receiver handoff snapshot must carry availability, membership, epoch, and generation\n"
   unless $transfer_h =~ /struct Preserve_trx_transfer_resume_handoff[\s\S]{0,500}available[\s\S]{0,120}session_only[\s\S]{0,120}transaction_claimed[\s\S]{0,160}epoch_id[\s\S]{0,160}generation/s;

@@ -419,8 +419,6 @@ class Prepared_statement_map {
   /** Erase all prepared statements (calls Prepared_statement destructor). */
   void erase(Prepared_statement *statement);
 
-  bool has_open_server_side_cursor() const;
-
   void claim_memory_ownership(bool claim);
 
   void reset();
@@ -1337,6 +1335,8 @@ class THD : public MDL_context_owner,
   uint dbug_sentry;  // watch out for memory corruption
 #endif
   bool is_killable;
+  /** Owner-maintained upper bound, including PS cursors being opened. */
+  std::atomic<uint32_t> preserve_trx_open_cursor_count{0};
   /**
     Preserve/drain command-boundary state, protected by LOCK_thd_data.
 
@@ -1345,8 +1345,8 @@ class THD : public MDL_context_owner,
     parse classification and for the packet marker between get_command() and
     dispatch. command_sequence and command_started_monotonic_us identify one
     admitted command for the Phase1 tail readiness observer.
-    command_packet_before_closing is atomic because the packet-header callback
-    publishes it before taking LOCK_thd_data; it records whether the current
+    command_packet_before_closing is published by the packet-header callback
+    under LOCK_thd_data and read atomically; it records whether the current
     classic-protocol packet reached the server before the drain closing gate
     became visible. post_closing_command_classified distinguishes an ordinary
     rejected command from a packet whose command byte is not decoded yet.

@@ -38,6 +38,7 @@ from scripts.resumable_trx_business_e2e import (
     ResetDrainCoordinator,
     ResetDrainWorker,
     ResumeCoordinator,
+    ShortTransactionWorker,
     SourceTransferOwnershipMetrics,
     StartupRecoveryMetrics,
     TransferFrameType,
@@ -56,6 +57,7 @@ from scripts.resumable_trx_business_e2e import (
     normalize_mysqlbinlog_table_events,
     validate_phase2_pause_samples,
     validate_receiver_read_load_report,
+    _continuous_command_latency_report,
     _expect_count_sum_row,
     _expect_exists_true,
     _expect_single_non_null_row,
@@ -2170,6 +2172,69 @@ class WorkloadPlanTest(unittest.TestCase):
         self.assertEqual(10070000, rows[(1, 0)].counter)
         self.assertEqual(0, rows[(1, 1)].counter)
 
+        point_cfg = HarnessConfig(
+            scenario="standby_transfer_receiver_drain_metrics",
+            sessions=2,
+            table_count=1,
+            statements_per_tx=100_000,
+            seed_rows_per_table_per_session=100_000,
+            cycles=1,
+            business_run_before_drain_s=1,
+            continuous_business_through_drain=True,
+            short_transaction_sessions=2,
+            short_transaction_table_count=1,
+            short_transaction_rows_per_table=8,
+            lockset_batch_size=1,
+            lockset_session_table_shards=True,
+            lockset_noop_update=True,
+            lockset_touch_one_row=True,
+            lockset_minimal_table=True,
+            strict_token_count=False,
+            receiver_unix_socket="/tmp/receiver.sock",
+            receiver_preserve_dir="/tmp/receiver-preserve",
+        ).validate()
+        point_plan = WorkloadPlan(point_cfg)
+
+        self.assertEqual(100_000, point_plan.bulk_lockset_operation_count())
+        first = point_plan.bulk_lockset_operation(sid=1, tx_id=1, stmt_no=0)
+        last = point_plan.bulk_lockset_operation(
+            sid=1, tx_id=1, stmt_no=99_999
+        )
+        self.assertIn("k >= 0 AND k < 1", first.sql)
+        self.assertIn("k >= 99999 AND k < 100000", last.sql)
+        self.assertNotEqual(first.sql, last.sql)
+
+    def test_continuous_lockset_forces_primary_range_access(self):
+        cfg = HarnessConfig(
+            scenario="standby_transfer_receiver_drain_metrics",
+            sessions=2,
+            table_count=1,
+            statements_per_tx=8,
+            seed_rows_per_table_per_session=8,
+            cycles=1,
+            business_run_before_drain_s=1,
+            continuous_business_through_drain=True,
+            short_transaction_sessions=2,
+            short_transaction_table_count=1,
+            short_transaction_rows_per_table=8,
+            lockset_batch_size=2,
+            lockset_session_table_shards=True,
+            lockset_noop_update=True,
+            lockset_touch_one_row=True,
+            lockset_minimal_table=True,
+            strict_token_count=False,
+            receiver_unix_socket="/tmp/receiver.sock",
+            receiver_preserve_dir="/tmp/receiver-preserve",
+        ).validate()
+
+        operations = WorkloadPlan(cfg).transaction_operations(1, 1)
+
+        self.assertTrue(operations)
+        self.assertTrue(
+            all(" FORCE INDEX (PRIMARY) SET " in op.sql for op in operations),
+            [op.sql for op in operations],
+        )
+
     def test_bulk_lockset_touch_one_row_requires_noop_update(self):
         with self.assertRaisesRegex(ValueError, "requires lockset_noop_update"):
             HarnessConfig(
@@ -2460,6 +2525,349 @@ class WorkloadPlanTest(unittest.TestCase):
             runtime.sql.index("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED"),
             runtime.sql.index("START TRANSACTION"),
         )
+
+    def test_continuous_workers_use_and_verify_repeatable_read(self):
+        class RepeatableReadRuntime(_FakeRuntime):
+            def execute(self, conn, sql, fetch=False):
+                self.sql.append(sql)
+                self.calls.append((sql, fetch))
+                if sql == "SELECT @@session.transaction_isolation":
+                    return [("REPEATABLE-READ",)]
+                return ()
+
+            def execute_command_without_connection_probe(self, conn, sql):
+                return self.execute(conn, sql)
+
+        cfg = HarnessConfig(
+            scenario="standby_transfer_receiver_drain_metrics",
+            sessions=2,
+            table_count=1,
+            statements_per_tx=100_000,
+            seed_rows_per_table_per_session=100_000,
+            cycles=1,
+            business_run_before_drain_s=1,
+            continuous_business_through_drain=True,
+            continuous_large_tx_shape="RANGE_10000",
+            short_transaction_sessions=2,
+            short_transaction_table_count=1,
+            short_transaction_rows_per_table=8,
+            lockset_batch_size=10,
+            lockset_session_table_shards=True,
+            lockset_noop_update=True,
+            lockset_touch_one_row=True,
+            lockset_minimal_table=True,
+            strict_token_count=False,
+            receiver_unix_socket="/tmp/receiver.sock",
+            receiver_preserve_dir="/tmp/receiver-preserve",
+        ).validate()
+        runtime = RepeatableReadRuntime()
+        plan = WorkloadPlan(cfg)
+        coordinator = ResumeCoordinator(cfg.sessions)
+        large = BusinessWorker(
+            1, plan, runtime, coordinator, threading.Event()
+        )
+        short = ShortTransactionWorker(
+            1, plan, runtime, coordinator, threading.Event()
+        )
+
+        large._configure_connection(_FakeConnection())
+        short._configure_connection(_FakeConnection())
+
+        self.assertEqual("REPEATABLE-READ", cfg.business_transaction_isolation)
+        self.assertEqual("REPEATABLE-READ", large.transaction_isolation)
+        self.assertEqual("REPEATABLE-READ", short.transaction_isolation)
+        self.assertEqual(
+            2,
+            runtime.sql.count(
+                "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ"
+            ),
+        )
+        self.assertEqual(
+            2,
+            runtime.sql.count("SELECT @@session.transaction_isolation"),
+        )
+        short_command_offset = len(runtime.sql)
+        short_connection = _FakeConnection()
+        short._run_transaction(short_connection, tx_id=1)
+        short_commands = runtime.sql[short_command_offset:]
+        self.assertEqual("START TRANSACTION", short_commands[0])
+        self.assertTrue(short_commands[-1].endswith("WHERE id=1"))
+        self.assertTrue(
+            all(
+                not sql.endswith("WHERE id=1")
+                for sql in short_commands[1:-1]
+            )
+        )
+        self.assertEqual(1, short_connection.commit_count)
+        self.assertEqual(
+            4,
+            short.command_latency.successful_by_kind[
+                "short_private_dml"
+            ].count,
+        )
+        self.assertEqual(
+            1,
+            short.command_latency.successful_by_kind[
+                "intentional_lock_wait"
+            ].count,
+        )
+        command_latency = _continuous_command_latency_report(
+            [large, short], cfg.business_command_latency_limit_us
+        )
+        self.assertEqual(2, command_latency["worker_recorders_expected"])
+        self.assertEqual(2, command_latency["worker_recorders_observed"])
+        self.assertEqual(0, command_latency["worker_recorders_missing"])
+        self.assertTrue(command_latency["worker_coverage_complete"])
+        short.command_latency = None
+        incomplete_latency = _continuous_command_latency_report(
+            [large, short], cfg.business_command_latency_limit_us
+        )
+        self.assertEqual(
+            1, incomplete_latency["worker_recorders_observed"]
+        )
+        self.assertEqual(1, incomplete_latency["worker_recorders_missing"])
+        self.assertFalse(incomplete_latency["worker_coverage_complete"])
+        self.assertFalse(incomplete_latency["within_limit"])
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = cfg
+        runner.plan = plan
+        runner.workers = [large]
+        runner.short_workers = [short]
+        self.assertEqual(
+            {
+                "continuous_business_transaction_isolation": "REPEATABLE-READ",
+                "continuous_large_transaction_isolation_counts": {
+                    "REPEATABLE-READ": 1
+                },
+                "continuous_short_transaction_isolation_counts": {
+                    "REPEATABLE-READ": 1
+                },
+                "continuous_transaction_isolation_verified": True,
+            },
+            runner.continuous_transaction_isolation_report(),
+        )
+        self.assertTrue(
+            hasattr(runner, "continuous_large_transaction_identity")
+        )
+        self.assertEqual(
+            {
+                "continuous_large_transaction_shape": "RANGE_10000",
+                "continuous_large_transaction_update_commands_per_tx": 10_000,
+                "continuous_large_transaction_rows_per_update": 10,
+                "continuous_large_transaction_unique_rows_per_tx": 100_000,
+                "continuous_large_transaction_range_passes_per_tx": 1,
+                "continuous_large_transaction_row_visits_per_tx": 100_000,
+                "continuous_large_transaction_changed_rows_per_update": 1,
+                "continuous_large_transaction_changed_row_events_per_tx": 10_000,
+            },
+            runner.continuous_large_transaction_identity(),
+        )
+        self.assertTrue(
+            hasattr(runner, "continuous_formal_workload_identity_matches")
+        )
+        formal_cfg = replace(
+            cfg,
+            sessions=1000,
+            table_count=128,
+            business_run_before_drain_s=300.0,
+            short_transaction_sessions=100,
+            short_transaction_table_count=50,
+            short_transaction_rows_per_table=20_000,
+        ).validate()
+        runner.config = formal_cfg
+        runner.plan = WorkloadPlan(formal_cfg)
+        self.assertTrue(runner.continuous_formal_workload_identity_matches())
+        runner.config = replace(formal_cfg, lockset_batch_size=2)
+        runner.plan = WorkloadPlan(runner.config)
+        self.assertFalse(runner.continuous_formal_workload_identity_matches())
+
+    def test_continuous_worker_keeps_server_progress_markers_out_of_transaction(self):
+        cfg = HarnessConfig(
+            scenario="standby_transfer_receiver_drain_metrics",
+            sessions=2,
+            table_count=1,
+            statements_per_tx=8,
+            seed_rows_per_table_per_session=8,
+            cycles=1,
+            business_run_before_drain_s=1,
+            continuous_business_through_drain=True,
+            short_transaction_sessions=2,
+            short_transaction_table_count=1,
+            short_transaction_rows_per_table=8,
+            lockset_batch_size=8,
+            lockset_session_table_shards=True,
+            lockset_noop_update=True,
+            lockset_touch_one_row=True,
+            lockset_minimal_table=True,
+            strict_token_count=False,
+            receiver_unix_socket="/tmp/receiver.sock",
+            receiver_preserve_dir="/tmp/receiver-preserve",
+        ).validate()
+        runtime = _FakeRuntime()
+        worker = BusinessWorker(
+            1,
+            WorkloadPlan(cfg),
+            runtime,
+            ResumeCoordinator(cfg.sessions),
+            threading.Event(),
+        )
+        conn = _FakeConnection()
+
+        returned = worker._record_statement_progress(conn, tx_id=1, stmt_index=0)
+
+        self.assertIs(returned, conn)
+        self.assertEqual([], runtime.sql)
+
+        legacy_cfg = HarnessConfig(sessions=1).validate()
+        legacy_runtime = _FakeRuntime()
+        legacy_worker = BusinessWorker(
+            1,
+            WorkloadPlan(legacy_cfg),
+            legacy_runtime,
+            ResumeCoordinator(legacy_cfg.sessions),
+            threading.Event(),
+        )
+        legacy_worker._record_statement_progress(conn, tx_id=1, stmt_index=0)
+        self.assertEqual(
+            ["SET @rtx_e2e_stmt_completed = 0"], legacy_runtime.sql
+        )
+
+    def test_continuous_worker_sends_no_result_commands_without_connector_ping(self):
+        class ProbeAwareRuntime(_FakeRuntime):
+            def __init__(self):
+                super().__init__()
+                self.direct_sql = []
+
+            def execute_command_without_connection_probe(self, conn, sql):
+                del conn
+                self.direct_sql.append(sql)
+
+        cfg = HarnessConfig(
+            scenario="standby_transfer_receiver_drain_metrics",
+            sessions=2,
+            table_count=1,
+            statements_per_tx=8,
+            seed_rows_per_table_per_session=8,
+            cycles=1,
+            business_run_before_drain_s=1,
+            continuous_business_through_drain=True,
+            short_transaction_sessions=2,
+            short_transaction_table_count=1,
+            short_transaction_rows_per_table=8,
+            lockset_batch_size=8,
+            lockset_session_table_shards=True,
+            lockset_noop_update=True,
+            lockset_touch_one_row=True,
+            lockset_minimal_table=True,
+            strict_token_count=False,
+            receiver_unix_socket="/tmp/receiver.sock",
+            receiver_preserve_dir="/tmp/receiver-preserve",
+        ).validate()
+        runtime = ProbeAwareRuntime()
+        worker = BusinessWorker(
+            1,
+            WorkloadPlan(cfg),
+            runtime,
+            ResumeCoordinator(cfg.sessions),
+            threading.Event(),
+        )
+        conn = _FakeConnection()
+
+        rows = worker._execute_business_command(
+            conn, "UPDATE `t` SET k=k+1 WHERE id=1", fetch=False
+        )
+
+        self.assertEqual((), rows)
+        self.assertEqual(
+            ["UPDATE `t` SET k=k+1 WHERE id=1"], runtime.direct_sql
+        )
+        self.assertEqual([], runtime.calls)
+
+        fetched = worker._execute_business_command(
+            conn, "SELECT k FROM `t` WHERE id=1", fetch=True
+        )
+        self.assertEqual([(1,)], fetched)
+        self.assertEqual(
+            [("SELECT k FROM `t` WHERE id=1", True)], runtime.calls
+        )
+
+    def test_continuous_worker_does_not_scan_after_each_committed_transaction(self):
+        class DirectRuntime(_FakeRuntime):
+            def __init__(self):
+                super().__init__()
+                self.direct_sql = []
+
+            def execute_command_without_connection_probe(self, conn, sql):
+                del conn
+                self.direct_sql.append(sql)
+
+        cfg = HarnessConfig(
+            scenario="standby_transfer_receiver_drain_metrics",
+            sessions=2,
+            table_count=1,
+            statements_per_tx=8,
+            seed_rows_per_table_per_session=8,
+            cycles=1,
+            business_run_before_drain_s=1,
+            continuous_business_through_drain=True,
+            short_transaction_sessions=2,
+            short_transaction_table_count=1,
+            short_transaction_rows_per_table=8,
+            lockset_batch_size=8,
+            lockset_session_table_shards=True,
+            lockset_noop_update=True,
+            lockset_touch_one_row=True,
+            lockset_minimal_table=True,
+            strict_token_count=False,
+            receiver_unix_socket="/tmp/receiver.sock",
+            receiver_preserve_dir="/tmp/receiver-preserve",
+        ).validate()
+        runtime = DirectRuntime()
+        worker = BusinessWorker(
+            1,
+            WorkloadPlan(cfg),
+            runtime,
+            ResumeCoordinator(cfg.sessions),
+            threading.Event(),
+        )
+
+        worker._run_transaction(_FakeConnection(), tx_id=1)
+
+        self.assertTrue(
+            any(sql.startswith("UPDATE ") for sql in runtime.direct_sql)
+        )
+        self.assertFalse(
+            any(sql.startswith("SELECT COUNT(*)") for sql in runtime.sql),
+            runtime.sql,
+        )
+        start_index = runtime.direct_sql.index("START TRANSACTION")
+        marker_indexes = [
+            index
+            for index, sql in enumerate(runtime.direct_sql)
+            if sql.startswith("SET @rtx_e2e_")
+        ]
+        self.assertEqual(4, len(marker_indexes))
+        self.assertTrue(
+            all(index < start_index for index in marker_indexes),
+            runtime.direct_sql,
+        )
+        self.assertEqual(
+            1,
+            worker.command_latency.successful_by_kind[
+                "transaction_begin"
+            ].count,
+        )
+        self.assertEqual(
+            1,
+            worker.command_latency.successful_by_kind["large_dml"].count,
+        )
+        self.assertEqual(
+            1,
+            worker.command_latency.successful_by_kind[
+                "transaction_commit"
+            ].count,
+        )
+        self.assertEqual(0, worker.command_latency.expected_4020.count)
 
     def test_bulk_lockset_marks_drainable_only_after_pause_threshold(self):
         cfg = HarnessConfig(
@@ -3222,6 +3630,59 @@ class WorkloadPlanTest(unittest.TestCase):
         completion.join()
 
         self.assertTrue(stop_event.is_set())
+
+        class ContinuousRuntime(_FakeRuntime):
+            def execute_command_without_connection_probe(self, conn, sql):
+                return self.execute(conn, sql)
+
+        continuous_cfg = HarnessConfig(
+            scenario="standby_transfer_receiver_drain_metrics",
+            sessions=1,
+            statements_per_tx=8,
+            seed_rows_per_table_per_session=8,
+            cycles=1,
+            continuous_business_through_drain=True,
+            business_run_before_drain_s=1,
+            continuous_large_tx_shape="RANGE_100000",
+            lockset_batch_size=1,
+            lockset_session_table_shards=True,
+            lockset_noop_update=True,
+            lockset_touch_one_row=True,
+            lockset_minimal_table=True,
+            strict_token_count=False,
+            short_transaction_sessions=2,
+            short_transaction_table_count=1,
+            short_transaction_rows_per_table=8,
+            receiver_preserve_dir="/tmp/receiver-preserve",
+            receiver_unix_socket="/tmp/receiver.sock",
+        )
+        continuous_stop = threading.Event()
+        continuous_worker = BusinessWorker(
+            1,
+            WorkloadPlan(continuous_cfg),
+            ContinuousRuntime(),
+            ResumeCoordinator(continuous_cfg.sessions),
+            stop_event=continuous_stop,
+        )
+        continuous_completion = threading.Timer(0.01, continuous_stop.set)
+        continuous_completion.start()
+        with mock.patch(
+            "scripts.resumable_trx_business_e2e.LOG.info"
+        ) as info_log, mock.patch(
+            "scripts.resumable_trx_business_e2e.LOG.debug"
+        ) as debug_log:
+            with self.assertRaisesRegex(
+                RuntimeError, "standby transfer drain completed"
+            ):
+                continuous_worker._run_transaction(
+                    PreserveRejectedCommitConnection(), tx_id=1
+                )
+        continuous_completion.join()
+        info_log.assert_not_called()
+        debug_log.assert_called_once()
+        self.assertEqual(
+            1, continuous_worker.command_latency.expected_4020.count
+        )
 
     def test_standby_receiver_worker_waits_for_transfer_completion_after_commit_disconnect(self):
         class DisconnectCommitConnection(_FakeConnection):

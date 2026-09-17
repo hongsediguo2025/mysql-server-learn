@@ -1766,15 +1766,6 @@ void Prepared_statement_map::erase(Prepared_statement *statement) {
   mysql_mutex_unlock(&LOCK_prepared_stmt_count);
 }
 
-bool Prepared_statement_map::has_open_server_side_cursor() const {
-  for (const auto &key_and_value : st_hash) {
-    const Prepared_statement *stmt = key_and_value.second.get();
-    if (stmt != nullptr && stmt->cursor != nullptr && stmt->cursor->is_open())
-      return true;
-  }
-  return false;
-}
-
 void Prepared_statement_map::claim_memory_ownership(bool claim) {
   for (const auto &key_and_value : st_hash) {
     my_claim(key_and_value.second.get(), claim);

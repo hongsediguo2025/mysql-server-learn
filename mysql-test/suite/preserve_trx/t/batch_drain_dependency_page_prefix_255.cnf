@@ -2,5 +2,8 @@
 server-id=1
 max-connections=400
 
+[mysqltest]
+max-connections=400
+
 [ENV]
 SERVER_MYPORT_1=@mysqld.1.port

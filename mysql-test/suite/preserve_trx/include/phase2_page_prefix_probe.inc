@@ -1,5 +1,5 @@
 # Real same-page, different-record locks. No injected probe result or RESET.
-# Diagnostic invocation requires MTR --max-connections=400 for mysqltest too.
+# Each test's .cnf provides the required server and mysqltest connection limits.
 --source include/have_debug.inc
 --source include/have_debug_sync.inc
 --source include/not_windows.inc

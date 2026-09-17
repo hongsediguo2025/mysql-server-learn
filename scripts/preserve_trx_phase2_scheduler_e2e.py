@@ -31,7 +31,7 @@ EXPECTED_MODE = "DEPENDENCY_CONVERGENCE_V1"
 SYSBENCH_REPORT_RE = re.compile(
     r"^\[\s*(\d+)s\s*\]\s+thds:\s*(\d+)\s+"
     r"tps:\s*([0-9.]+)\s+qps:\s*([0-9.]+).*?"
-    r"err/s:\s*([0-9.]+)\s+reconn/s:\s*([0-9.]+)"
+    r"err/s:?\s*([0-9.]+)\s+reconn/s:\s*([0-9.]+)"
 )
 SYSBENCH_4020_HOLD_RE = re.compile(r"PRESERVE_4020_HOLD tid=(\d+)")
 
@@ -1165,11 +1165,22 @@ def _run_sysbench_write_only_drain(args: argparse.Namespace) -> Dict[str, Any]:
         from resumable_trx_business_e2e import (  # type: ignore
             BusinessE2ERunner,
             HarnessConfig,
+            PRESERVE_TRX_HA_ADMIN_USER,
         )
     except Exception as exc:
         raise RuntimeError(
             "the existing Preserve/Transfer business E2E module is required"
         ) from exc
+
+    tpcc = None
+    tpcc_evidence: Dict[str, Any] = {}
+    if args.scenario == "sysbench-tpcc-drain":
+        from preserve_trx_tpcc_workload import TpccWorkload, disk_snapshot
+        if args.sysbench_skip_trx != "off" or args.sysbench_tables != 1:
+            raise RuntimeError("TPC-C requires explicit transactions and one table set")
+        tpcc = TpccWorkload(args.tpcc_script_dir, args.tpcc_warehouses,
+                            args.tpcc_prepare_threads)
+        tpcc_evidence = tpcc.identity()
 
     required_paths = {
         "source datadir": args.source_datadir,
@@ -1277,18 +1288,34 @@ def _run_sysbench_write_only_drain(args: argparse.Namespace) -> Dict[str, Any]:
             "--threads=1",
             "prepare",
         ]
-        _run_checked(
-            prepare_command,
-            timeout_s=float(args.sysbench_prepare_timeout_seconds),
-            output_path=prepare_log,
-        )
-        _verify_sysbench_seed(
-            runner.runtime,
-            database=args.database,
-            tables=args.sysbench_tables,
-            rows_per_table=args.sysbench_table_size,
-        )
+        if tpcc is not None:
+            tpcc_evidence["source_before_prepare"] = disk_snapshot(args.source_datadir)
+            tpcc_evidence["prepare"] = tpcc.prepare(sysbench, args, prepare_log, runner)
+            tpcc_evidence["seed"] = tpcc.verify_seed(runner, args.database)
+            tpcc_evidence["business_tables_after_seed"] = disk_snapshot(
+                args.source_datadir / args.database)
+            tpcc_evidence["source_after_seed"] = disk_snapshot(args.source_datadir)
+            source_bytes = tpcc_evidence["source_after_seed"]["allocated_bytes"]
+            if shutil.disk_usage(work_dir).free < source_bytes + 10 * 1024**3:
+                write_json(work_dir / "tpcc-seed.json", tpcc_evidence)
+                raise RuntimeError("TPC-C physical copy requires source size plus 10GiB free")
+            write_json(work_dir / "tpcc-seed.json", tpcc_evidence)
+        else:
+            _run_checked(
+                prepare_command,
+                timeout_s=float(args.sysbench_prepare_timeout_seconds),
+                output_path=prepare_log,
+            )
+            _verify_sysbench_seed(
+                runner.runtime,
+                database=args.database,
+                tables=args.sysbench_tables,
+                rows_per_table=args.sysbench_table_size,
+            )
         runner.materialize_receiver_physical_copy_before_drain()
+        if tpcc is not None:
+            tpcc_evidence["after_physical_copy"] = disk_snapshot(work_dir)
+            write_json(work_dir / "tpcc-seed.json", tpcc_evidence)
         runner.configure_standby_transfer_credentials()
         runner.configure_source_ha_control_credentials()
         runner.configure_preserve_globals()
@@ -1302,11 +1329,20 @@ def _run_sysbench_write_only_drain(args: argparse.Namespace) -> Dict[str, Any]:
         finally:
             source_connection.close()
         runner.validate_standby_transfer_endpoint_config()
-        _prewarm_sysbench_dictionary(runner, args.sysbench_tables)
+        if tpcc is not None:
+            tpcc.prewarm_dictionary(runner, args.database)
+        else:
+            _prewarm_sysbench_dictionary(runner, args.sysbench_tables)
 
         source_connection = runner.runtime.connect(database=False)
         try:
             for host in ("localhost", "127.0.0.1", "%"):
+                if args.sysbench_skip_trx == "on":
+                    runner.runtime.execute(
+                        source_connection,
+                        "GRANT PROCESS ON *.* TO "
+                        f"'{PRESERVE_TRX_HA_ADMIN_USER}'@'{host}'",
+                    )
                 runner.runtime.execute(
                     source_connection,
                     "CREATE USER IF NOT EXISTS "
@@ -1350,6 +1386,34 @@ def _run_sysbench_write_only_drain(args: argparse.Namespace) -> Dict[str, Any]:
             int(before_metrics.terminal_cas_wins)
             if before_metrics is not None else 0
         )
+        skip_trx = args.sysbench_skip_trx == "on"
+        ignore_errors = "1213,1020,1205,4020" + (",1062" if skip_trx else "")
+        duplicate_error_sql = (
+            "SELECT COALESCE(SUM(SUM_ERROR_RAISED),0) FROM "
+            "performance_schema.events_errors_summary_by_user_by_error "
+            "WHERE USER='sysbench' AND ERROR_NUMBER=1062"
+        )
+        duplicate_errors = {}
+        if skip_trx:
+            duplicate_errors["before_business"] = _mysql_scalar(
+                runner.runtime, duplicate_error_sql
+            )
+        control_commit_status = (
+            "Preserve_trx_transfer_recv_terminal_commit_admitted_mono_us"
+        )
+        before_control_commit = runner._read_status_int(
+            control_commit_status,
+            connection_factory=runner._receiver_admin_connection,
+        ) if skip_trx else 0
+        effective_business_config = {}
+        if skip_trx:
+            config_names = ("autocommit", "transaction_isolation", "log_bin",
+                            "binlog_format", "gtid_mode",
+                            "rds_preserve_trx_phase1_capture_mode")
+            effective_business_config = dict(zip(config_names, _mysql_strings(
+                runner.runtime,
+                "SELECT " + ",".join("@@GLOBAL." + name for name in config_names),
+            )))
         full_report_count = int(
             math.ceil(
                 args.sysbench_runtime_seconds / args.report_interval_seconds
@@ -1367,16 +1431,21 @@ def _run_sysbench_write_only_drain(args: argparse.Namespace) -> Dict[str, Any]:
             f"--table-size={args.sysbench_table_size}",
             f"--threads={args.sysbench_threads}",
             f"--time={max(args.sysbench_runtime_seconds + 300, 600)}",
+            f"--skip-trx={args.sysbench_skip_trx}",
             f"--report-interval={args.report_interval_seconds}",
-            "--mysql-ignore-errors=1213,1020,1205,4020",
+            f"--mysql-ignore-errors={ignore_errors}",
             "run",
         ]
+        if tpcc is not None:
+            sysbench_command = tpcc.command(sysbench, args)
+            tpcc_evidence["configuration"] = tpcc.verify_configuration(runner)
         process = subprocess.Popen(
             sysbench_command,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            **({"env": tpcc.environment()} if tpcc is not None else {}),
         )
         reader, condition, capture_state = _start_sysbench_reader(
             process, sysbench_log
@@ -1395,6 +1464,30 @@ def _run_sysbench_write_only_drain(args: argparse.Namespace) -> Dict[str, Any]:
             expected=args.sysbench_threads,
             timeout_s=float(args.startup_timeout_seconds),
         )
+        autocommit_verified_connections = 0
+        if skip_trx:
+            observed, enabled = _mysql_strings(
+                runner.runtime,
+                "SELECT COUNT(*), COALESCE(SUM(UPPER(v.VARIABLE_VALUE) "
+                "IN ('ON','1')),0) FROM performance_schema.variables_by_thread v "
+                "JOIN performance_schema.threads t ON t.THREAD_ID=v.THREAD_ID "
+                "WHERE v.VARIABLE_NAME='autocommit' "
+                "AND t.PROCESSLIST_USER='sysbench' AND t.TYPE='FOREGROUND'",
+            )
+            if int(observed) != ready_count or int(enabled) != ready_count:
+                raise RuntimeError(
+                    f"business autocommit mismatch: observed={observed} "
+                    f"enabled={enabled} expected={ready_count}"
+                )
+            autocommit_verified_connections = int(enabled)
+            print("SYSBENCH_AUTOCOMMIT_VERIFIED " + json.dumps({
+                "connections": int(enabled), "skip_trx": True,
+                "effective_globals": effective_business_config,
+            }, sort_keys=True), flush=True)
+        if tpcc is not None:
+            tpcc_evidence["configuration"] = tpcc.verify_configuration(
+                runner, expected_connections=ready_count)
+            write_json(work_dir / "tpcc-seed.json", tpcc_evidence)
         connections_ready_ns = time.monotonic_ns()
         with condition:
             reports_at_ready = len(capture_state["reports"])
@@ -1475,6 +1568,13 @@ def _run_sysbench_write_only_drain(args: argparse.Namespace) -> Dict[str, Any]:
                 f"{len(pre_drain_connection_ids)}"
             )
 
+        if skip_trx:
+            duplicate_errors["before_drain"] = _mysql_scalar(
+                runner.runtime, duplicate_error_sql
+            )
+            print("SYSBENCH_RETRYABLE_1062 " + json.dumps(duplicate_errors),
+                  flush=True)
+
         drain_log_offset = args.source_error_log.stat().st_size
         drain_started_ns = time.monotonic_ns()
         drain_connection = runner.runtime.connect(database=False)
@@ -1492,14 +1592,24 @@ def _run_sysbench_write_only_drain(args: argparse.Namespace) -> Dict[str, Any]:
         drain_completed_ns = time.monotonic_ns()
         decoded_rows = runner._decode_transfer_drain_result(drain_rows)
         runner.drain_result_rows = decoded_rows
-        runner.validate_standby_transfer_drain_result(
-            expected_survivor_count=None
-        )
         survivor_count = sum(
             row["token_role"] == "SURVIVOR" for row in decoded_rows
         )
-        if survivor_count <= 0:
-            raise RuntimeError("DRAIN returned no survivor transaction")
+        if skip_trx:
+            if (len(decoded_rows) != 1
+                    or decoded_rows[0]["token_role"] != "SUMMARY"
+                    or decoded_rows[0]["outcome"] != "NO_PRESERVABLE_TOKENS"
+                    or decoded_rows[0]["reason"] != "NONE"):
+                raise RuntimeError(
+                    f"autocommit DRAIN did not finish a clean session-only handoff: "
+                    f"{decoded_rows}"
+                )
+        else:
+            runner.validate_standby_transfer_drain_result(
+                expected_survivor_count=None
+            )
+            if survivor_count <= 0:
+                raise RuntimeError("DRAIN returned no survivor transaction")
 
         assert capture_state is not None
         assert condition is not None
@@ -1524,6 +1634,34 @@ def _run_sysbench_write_only_drain(args: argparse.Namespace) -> Dict[str, Any]:
             held_thread_ids == expected_held_thread_ids
             and original_connection_ids_retained
         )
+        if skip_trx:
+            connection = runner._source_ha_control_connection()
+            try:
+                active = runner.runtime.execute(
+                    connection,
+                    "SELECT COUNT(*) FROM information_schema.innodb_trx x "
+                    "JOIN performance_schema.threads t "
+                    "ON t.PROCESSLIST_ID=x.trx_mysql_thread_id "
+                    "WHERE t.PROCESSLIST_USER='sysbench'", fetch=True,
+                )
+                if int(active[0][0]) != 0:
+                    raise RuntimeError("autocommit left active InnoDB transactions")
+                errors = runner.runtime.execute(
+                    connection, duplicate_error_sql, fetch=True
+                )
+                duplicate_errors["after_hold"] = int(errors[0][0])
+                duplicate_errors["business_window"] = (
+                    duplicate_errors["before_drain"]
+                    - duplicate_errors["before_business"]
+                )
+                duplicate_errors["drain_to_hold_window"] = (
+                    duplicate_errors["after_hold"]
+                    - duplicate_errors["before_drain"]
+                )
+                print("SYSBENCH_RETRYABLE_1062 " + json.dumps(duplicate_errors),
+                      flush=True)
+            finally:
+                connection.close()
         sysbench_rc = _stop_sysbench(process)
         process = None
         if reader is not None:
@@ -1576,36 +1714,59 @@ def _run_sysbench_write_only_drain(args: argparse.Namespace) -> Dict[str, Any]:
             else None
         )
 
-        warmcopy_metrics = runner.read_latest_warmcopy_metrics_since(
-            drain_log_offset
-        )
-        if warmcopy_metrics is None or warmcopy_metrics.phase2_total_ms is None:
-            raise RuntimeError("source Phase2 metrics were not observed")
-        runner._record_warmcopy_drain_metrics(warmcopy_metrics)
-        after_metrics = _wait_receiver_epoch_advance(
-            runner,
-            before_wins=before_wins,
-            timeout_s=float(args.receiver_ready_timeout_seconds),
-        )
-        runner.wait_for_receiver_readiness(
-            expected_standby_pending=survivor_count,
-            timeout_s=float(args.receiver_ready_timeout_seconds),
-            connection_factory=runner._receiver_admin_connection,
-        )
-        after_metrics = runner.receiver_prewarm_metrics or after_metrics
+        source_phase2_total_us = None
+        if not skip_trx:
+            warmcopy_metrics = runner.read_latest_warmcopy_metrics_since(
+                drain_log_offset
+            )
+            if warmcopy_metrics is None or warmcopy_metrics.phase2_total_ms is None:
+                raise RuntimeError("source Phase2 metrics were not observed")
+            runner._record_warmcopy_drain_metrics(warmcopy_metrics)
+            source_phase2_total_us = int(round(warmcopy_metrics.phase2_total_ms * 1000))
+        control_commit_advanced = False
+        if skip_trx:
+            control_commit_advanced = runner._read_status_int(
+                control_commit_status,
+                connection_factory=runner._receiver_admin_connection,
+            ) > before_control_commit
+            after_metrics = runner.read_receiver_prewarm_metrics_from_status(
+                connection_factory=runner._receiver_admin_connection
+            )
+            if (not control_commit_advanced or after_metrics is None
+                    or after_metrics.auto_prewarm_tokens != 0
+                    or after_metrics.auto_prewarm_ready_tokens != 0
+                    or after_metrics.auto_prewarm_not_ready_tokens != 0):
+                raise RuntimeError("receiver session-only control commit is incomplete")
+        else:
+            after_metrics = _wait_receiver_epoch_advance(
+                runner,
+                before_wins=before_wins,
+                timeout_s=float(args.receiver_ready_timeout_seconds),
+            )
+            runner.wait_for_receiver_readiness(
+                expected_standby_pending=survivor_count,
+                timeout_s=float(args.receiver_ready_timeout_seconds),
+                connection_factory=runner._receiver_admin_connection,
+            )
+            after_metrics = runner.receiver_prewarm_metrics or after_metrics
 
         if not _tcp_endpoint_reachable(args.source_host, args.source_port):
             raise RuntimeError("source listener is not reachable after DRAIN")
         receiver_probe = runner._receiver_admin_connection()
         receiver_probe.close()
         report = {
-            "scenario": "sysbench-write-only-drain",
+            "scenario": args.scenario,
             "success": True,
             "drain_success": True,
             "drain_wall_us": (
                 drain_completed_ns - drain_started_ns
             ) // 1000,
             "drain_survivor_count": survivor_count,
+            "drain_outcome": decoded_rows[0]["outcome"],
+            "receiver_control_commit_advanced": control_commit_advanced,
+            "receiver_ready_applicable": not skip_trx,
+            "effective_business_config": effective_business_config,
+            "standby_transfer_effective_modes": runner.standby_transfer_effective_modes,
             "receiver_epoch_delta": (
                 int(after_metrics.terminal_cas_wins) - before_wins
             ),
@@ -1631,11 +1792,15 @@ def _run_sysbench_write_only_drain(args: argparse.Namespace) -> Dict[str, Any]:
             "effective_scheduler_mode": effective_mode,
             "effective_artifact_mode": artifact_mode,
             "effective_phase1_timeout_ms": int(phase1_timeout),
-            "source_phase2_total_us": int(
-                round(warmcopy_metrics.phase2_total_ms * 1000)
-            ),
+            "source_phase2_total_us": source_phase2_total_us,
             "source_log_window_offset": drain_log_offset,
             "sysbench": {
+                "skip_trx": skip_trx,
+                "command": sysbench_command,
+                "mysql_ignore_errors": ignore_errors,
+                "retryable_1062_server_counts": duplicate_errors,
+                "tps_unit": "completed_sysbench_events",
+                "autocommit_verified_connections": autocommit_verified_connections,
                 "threads": args.sysbench_threads,
                 "tables": args.sysbench_tables,
                 "table_size": args.sysbench_table_size,
@@ -1704,6 +1869,13 @@ def _run_sysbench_write_only_drain(args: argparse.Namespace) -> Dict[str, Any]:
                 "raw_log": str(sysbench_log),
             },
         }
+        if tpcc is not None:
+            tpcc_evidence["after_drain"] = disk_snapshot(work_dir)
+            report["tpcc"] = tpcc_evidence
+            report["sysbench"].update(workload="sysbench-tpcc",
+                                      warehouses=tpcc.warehouses,
+                                      table_count=9, table_sets=1)
+            report["sysbench"].pop("table_size", None)
         return report
     finally:
         if process is not None:
@@ -1721,6 +1893,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "mode-smoke",
             "lock-ddl-source-restore",
             "sysbench-write-only-drain",
+            "sysbench-tpcc-drain",
         ),
         default="validate-log",
     )
@@ -1747,9 +1920,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--sysbench-threads", type=int, default=0)
+    parser.add_argument("--tpcc-script-dir", type=Path)
+    parser.add_argument("--tpcc-warehouses", type=int, default=0)
+    parser.add_argument("--tpcc-prepare-threads", type=int, default=4)
     parser.add_argument("--sysbench-tables", type=int, default=0)
     parser.add_argument("--sysbench-table-size", type=int, default=0)
     parser.add_argument("--sysbench-runtime-seconds", type=int, default=0)
+    parser.add_argument("--sysbench-skip-trx", choices=("on", "off"), default="off")
     parser.add_argument("--report-interval-seconds", type=int, default=10)
     parser.add_argument(
         "--sysbench-prepare-timeout-seconds", type=int, default=1800
@@ -1779,7 +1956,7 @@ def _run_and_validate(args: argparse.Namespace, report: Dict[str, Any],
 
     log_offset = 0
     scenario_report: Mapping[str, Any] = {}
-    if args.scenario == "sysbench-write-only-drain":
+    if args.scenario in {"sysbench-write-only-drain", "sysbench-tpcc-drain"}:
         scenario_report = _run_sysbench_write_only_drain(args)
         report.update(scenario_report)
         log_offset = int(scenario_report.get("source_log_window_offset", 0))
@@ -1834,6 +2011,13 @@ def _run_and_validate(args: argparse.Namespace, report: Dict[str, Any],
         expected_mode=args.expected_mode,
         require_success=True,
     )
+    if args.scenario == "sysbench-write-only-drain" and args.sysbench_skip_trx == "on":
+        # The zero-token handoff has no legacy warmcopy metric; use this attempt's
+        # validated final record, including scheduler time, without a fallback.
+        if len(records) != 1:
+            raise FinalRecordError("autocommit DRAIN requires one final record")
+        report["source_phase2_total_us"] = records[0].integer("strict_interval_us")
+        report["source_phase2_timing_source"] = "PRESERVE_PHASE2_FINAL_V1.strict_interval_us"
     delegate_report: Optional[Mapping[str, Any]] = None
     if args.delegate_report_json is not None:
         delegate_report = json.loads(

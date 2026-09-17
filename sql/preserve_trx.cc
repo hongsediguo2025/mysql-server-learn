@@ -5279,7 +5279,17 @@ bool preserve_trx_is_unsupported_common_context(
   if (!thd->handler_tables_hash.empty()) {
     return true;
   }
-  if (thd->stmt_map.has_open_server_side_cursor()) {
+#if defined(ENABLED_DEBUG_SYNC)
+  if (unlikely(opt_debug_sync_timeout) && current_thd != nullptr &&
+      thd != current_thd &&
+      preserve_trx_manager_state_owner_snapshot().state ==
+          Preserve_trx_manager_state::WARMCOPY_CLOSING) {
+    const std::string point = "preserve_trx_cursor_eligibility_read_" +
+                              std::to_string(thd->thread_id());
+    debug_sync(current_thd, point.c_str(), point.size());
+  }
+#endif
+  if (thd->preserve_trx_open_cursor_count.load(std::memory_order_acquire) != 0) {
     return true;
   }
   if (!allow_inflight_command_context &&
@@ -5940,10 +5950,9 @@ class Preserve_batch_target_counter final : public Do_THD_Impl {
             m_session_only_thread_ids.push_back(candidate->thread_id());
           } else {
             /*
-              Design §2: a transiently unclassified post-CLOSING packet is a
-              provisional candidate, not an unsupported session.  Only a
-              genuinely unsupported server-side context fails the batch; the
-              final session-only snapshot removes still-unclassified members.
+              A post-CLOSING packet cannot execute business SQL. Receiving it
+              does not revoke session-only eligibility; the final snapshot
+              still excludes disconnected or classified COM_QUIT sessions.
               A lingering autocommit participant registration on an idle
               session is a scan-time artifact, not an open transaction: the
               eligibility check above already keeps such sessions out of S.
@@ -6087,9 +6096,13 @@ class Preserve_batch_session_only_final_snapshot final : public Do_THD_Impl {
     }
 
     mysql_mutex_lock(&candidate->LOCK_thd_data);
+    /*
+      CLOSING fences business execution. Receiving a partial post-CLOSING
+      packet must not revoke an otherwise eligible planned handoff.
+    */
     const bool eligible =
-        preserve_trx_session_only_candidate_is_eligible_locked(candidate,
-                                                                true);
+        preserve_trx_session_only_candidate_is_eligible_locked(candidate, true,
+                                                             true);
     mysql_mutex_unlock(&candidate->LOCK_thd_data);
     if (eligible) m_eligible_thread_ids.insert(thread_id);
   }
@@ -11662,15 +11675,26 @@ bool preserved_trx_end_idle_for_command_packet(THD *thd) {
     return was_idle;
   }
 
-  thd->preserve_trx_command_packet_before_closing.store(
-      !preserve_trx_closing_gate_allows_quiesced_command_read(),
-      std::memory_order_release);
-
   uint quiesced_wait_loops = 0;
+  bool packet_marked = false;
   for (;;) {
+    const auto sampled_manager = preserve_trx_manager_state_owner_snapshot();
     const bool allow_quiesced_read =
-        preserve_trx_closing_gate_allows_quiesced_command_read();
+        preserve_trx_closing_command_gate_active(sampled_manager.state);
+    DEBUG_SYNC(thd, "preserve_trx_header_after_closing_gate_sample");
     mysql_mutex_lock(&thd->LOCK_thd_data);
+    const auto current_manager = preserve_trx_manager_state_owner_snapshot();
+    if (current_manager.state != sampled_manager.state ||
+        current_manager.owner_thread_id != sampled_manager.owner_thread_id) {
+      mysql_mutex_unlock(&thd->LOCK_thd_data);
+      continue;
+    }
+    /* Publish once, under the same lock as the initial target scan. */
+    if (!packet_marked) {
+      thd->preserve_trx_command_packet_before_closing.store(
+          !allow_quiesced_read, std::memory_order_release);
+      packet_marked = true;
+    }
     if (allow_quiesced_read &&
         thd->preserve_trx_batch_state ==
             Preserve_trx_batch_thd_state::QUIESCED) {

@@ -1,0 +1,2 @@
+--let $packet_scenario= cursor-close
+--source suite/preserve_trx/include/session_only_packet_case.inc
