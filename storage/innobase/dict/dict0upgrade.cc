@@ -42,6 +42,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "ha_innopart.h"
 #include "row0sel.h"
 #include "srv0start.h"
+#include "trx0temp_preserve_id.h"
 
 /* This is used only during upgrade. We don't use ids
 from DICT_HDR during upgrade because unlike bootstrap case,
@@ -1342,6 +1343,14 @@ int dd_upgrade_logs(THD *thd) {
   mtr.start();
   dict_hdr_t *dict_hdr = dict_hdr_get(&mtr);
   table_id_t table_id = mach_read_from_8(dict_hdr + DICT_HDR_TABLE_ID);
+
+  if (preserve_trx_temp_id_namespace &&
+      table_id >= TRX_PRESERVE_TEMP_TABLE_ID_BEGIN - DICT_MAX_DD_TABLES) {
+    mtr.commit();
+    ib::error() << "Upgraded table IDs would overlap the configured "
+                  "temporary table ID namespace";
+    return 1;
+  }
 
   DBUG_EXECUTE_IF("dd_upgrade",
                   ib::info(ER_IB_MSG_265)

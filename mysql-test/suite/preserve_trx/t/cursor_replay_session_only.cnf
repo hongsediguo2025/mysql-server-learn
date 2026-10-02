@@ -1,0 +1,16 @@
+[mysqld.1]
+# Keep the receiver paused for wire inspection; exercise bounded cold fallback.
+rds-preserve-trx-drain-phase1-timeout-ms=1000
+server_id=1
+log_error_verbosity=3
+default_authentication_plugin=mysql_native_password
+log-bin=ps-dependency-free-bin
+binlog-format=ROW
+gtid-mode=ON
+enforce-gtid-consistency=ON
+rds-preserve-trx-enable=ON
+rds-preserve-trx-temp-id-namespace=ON
+rds-preserve-trx-result-capture-enable=ON
+
+[ENV]
+SERVER_MYPORT_2=@mysqld.1.port

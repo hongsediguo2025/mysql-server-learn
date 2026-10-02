@@ -1,0 +1,6 @@
+SELECT @@global.rds_preserve_trx_temp_id_namespace AS namespace_enabled;
+--let $capture_case= temporary source undo graph is built in bounded batches
+--let $capture_trace_name= temp_undo_graph_batch.trace
+--let $capture_fault= preserve_temp_import_source_undo_probe,preserve_temp_transfer_input_probe,preserve_temp_source_graph_batch_probe,preserve_temp_import_target_image_probe
+--let $capture_trace_pattern= (?s)temporary source graph cancellation phases=8 sticky_failure=1 quota_growth=1.*temporary source graph batches=[1-9][0-9]* records=146 pending_guard=1.*temporary source import prepared.*temporary receiver images checked.*temporary namespace requires standby transfer
+--source suite/preserve_trx/include/temp_table_capture_undo_failure.inc

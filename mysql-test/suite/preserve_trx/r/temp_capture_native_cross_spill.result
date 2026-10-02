@@ -1,0 +1,3 @@
+ordinary native candidate and DATA delta reused without final DATA writes
+production TEMP_ONLY temporary transfer: cursor passed
+standby receiver prepared temporary resources before READY

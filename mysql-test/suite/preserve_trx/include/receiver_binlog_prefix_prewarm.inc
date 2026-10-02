@@ -291,19 +291,15 @@ if ($prefix_seal_failure)
   SELECT VARIABLE_VALUE=0 AS corrupt_protocol_has_no_prepared_ready
    FROM performance_schema.global_status
    WHERE VARIABLE_NAME='Preserve_trx_promotion_prepared_ready_tokens';
-  SELECT VARIABLE_VALUE=1 AS source_commit_unknown_retains_authority_fence
+  SELECT VARIABLE_VALUE=0 AS source_commit_unknown_not_entered
    FROM performance_schema.global_status
    WHERE VARIABLE_NAME='Preserve_trx_transfer_source_commit_unknown_epochs';
-  # COMMIT was attempted: unlike a pre-send failure, source stays fenced.
+  # Protocol SEAL corruption is confirmed NOT_COMMITTED_CLEAN, so source resumes.
   --connection prefix_app
-  --disable_result_log
-  --error ER_PRESERVE_TRX_SESSION_DRAINED
-  SELECT v FROM t_binlog_prefix;
-  --error ER_PRESERVE_TRX_SESSION_DRAINED
+  SELECT v=23 AND OCTET_LENGTH(payload)=1048593 AND LEFT(payload,1)='c'
+   AS source_uncommitted_state_restored FROM t_binlog_prefix;
   UPDATE t_binlog_prefix SET v=29 WHERE id=1;
-  --enable_result_log
-  --echo source_commands_remain_fenced
-  --echo 1
+  SELECT v=29 AS source_commands_resumed FROM t_binlog_prefix;
   --connection prefix_control
 }
 

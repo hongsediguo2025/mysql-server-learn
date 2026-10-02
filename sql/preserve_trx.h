@@ -83,6 +83,7 @@ class Preserve_trx_external_thd_pin_handle {
 
 extern bool preserve_trx_enable;
 extern bool preserve_trx_temp_table_enable;
+extern bool preserve_trx_temp_id_namespace;
 extern const uint preserve_trx_recovery_max_count;
 extern const uint preserve_trx_recovery_grace_seconds;
 extern const ulonglong preserve_trx_max_snapshot_bytes;
@@ -159,6 +160,7 @@ ulonglong preserve_trx_warmcopy_durable_bytes_status();
 ulonglong preserve_trx_warmcopy_provider_full_copy_to_count_status();
 ulonglong preserve_trx_warmcopy_phase2_pause_us_status();
 ulonglong preserve_trx_phase2_total_us_status();
+ulonglong preserve_trx_phase2_command_boundary_wait_active_status();
 ulonglong preserve_trx_phase2_target_wait_us_status();
 ulonglong preserve_trx_phase1_readiness_samples_status();
 ulonglong preserve_trx_phase1_readiness_inflight_commands_status();
@@ -429,6 +431,7 @@ struct Preserve_trx_preserve_result {
   */
   std::string token;
   const char *failure_reason{nullptr};
+  bool resource_only{false};
   Preserve_trx_preserve_stage stage{
       Preserve_trx_preserve_stage::VALIDATION};
   /*
@@ -486,6 +489,7 @@ struct Preserve_trx_preserve_result {
   */
   trx_t *preserved_trx{nullptr};
   std::unique_ptr<Preserve_trx_source_rollback_image> source_rollback_image;
+  std::shared_ptr<const Preserve_trx_result_image> source_cursor_results;
 };
 
 /*
@@ -611,9 +615,11 @@ bool preserved_trx_preflight_read_failure_requires_startup_abort_for_unit_test(
 Preserve_snapshot_status preserved_trx_load_bundle_for_recover_or_prewarm(
     const std::string &dir, const std::string &token,
     Preserved_trx_recover_load_profile profile, Preserved_trx_bundle *bundle);
+class Preserve_trx_temp_receiver_work;
 Preserve_snapshot_status preserved_trx_dry_validate_loaded_bundle(
     const std::string &dir, const std::string &token,
-    const Preserved_trx_bundle &bundle, std::string *reason);
+    const Preserved_trx_bundle &bundle, std::string *reason,
+    const Preserve_trx_temp_receiver_work *temp_ready = nullptr);
 bool preserved_trx_expired_reaper_claim_releases_manager_state_for_unit_test(
     const std::string &token);
 bool preserved_trx_expired_reaper_empty_claim_keeps_manager_idle_for_unit_test(
@@ -634,6 +640,10 @@ bool preserved_trx_end_idle_for_command_packet(THD *thd);
 bool preserved_trx_end_command_read(THD *thd);
 bool preserved_trx_wait_if_batch_session_quiesced(THD *thd);
 bool preserved_trx_reject_if_batch_session_drained(THD *thd);
+/** Preserve rejection must not manufacture a reply for Classic PS packets
+whose native protocol has no response. Returns whether status was disabled. */
+bool preserved_trx_suppress_rejected_command_response(
+    THD *thd, enum enum_server_command command);
 void preserved_trx_classify_protocol_command(
     THD *thd, enum enum_server_command command);
 Preserve_trx_command_block_result preserved_trx_command_block_result(
@@ -664,8 +674,6 @@ bool preserved_trx_phase2_command_body_already_entered(THD *thd);
 void preserved_trx_phase2_begin_synthetic_protocol_command(
     THD *thd, enum enum_server_command command);
 Preserved_trx_view_rows preserved_trx_snapshot(THD *thd);
-size_t preserved_trx_record_count();
-bool preserved_trx_row_visible(THD *thd, const Preserved_trx_view_row &row);
 bool preserved_trx_row_visible_for_account(bool has_process_acl,
                                            LEX_CSTRING priv_user,
                                            LEX_CSTRING priv_host,
@@ -748,6 +756,8 @@ bool preserved_trx_import_reserved_bundle_for_promotion(
     Preserved_trx_promotion_ready_adopt_result *result,
     uint64_t deadline_us = 0);
 bool preserved_trx_start_expired_reaper();
+/** Read-only preflight; never restarts the executor during shutdown. */
+bool preserved_trx_expired_reaper_running();
 void preserved_trx_start_expired_reaper_if_ready();
 void preserved_trx_request_expired_reaper_scan();
 void preserved_trx_stop_expired_reaper();
@@ -758,8 +768,6 @@ bool preserved_trx_expired_reaper_starting_for_unit_test();
 bool preserved_trx_shutdown_requested();
 void preserved_trx_begin_external_thd_teardown(THD *thd);
 void preserved_trx_end_external_thd_teardown(THD *thd);
-void preserved_trx_wait_for_external_thd_use(THD *thd);
-bool preserved_trx_thd_has_external_use(THD *thd);
 bool preserve_trx_preserve_attached_transaction(
     THD *target_thd, const Preserve_trx_options &options,
     ulonglong timeout_seconds, Preserve_trx_preserve_result *result,

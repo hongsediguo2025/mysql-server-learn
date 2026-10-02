@@ -1,0 +1,4 @@
+ordinary undo pretransfer reached receiver
+production TEMP_ONLY temporary transfer: undo passed
+loopback receiver prepared temporary resources before READY
+strict SQL RESUME integration: success passed

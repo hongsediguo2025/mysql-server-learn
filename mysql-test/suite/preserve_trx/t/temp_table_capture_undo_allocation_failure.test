@@ -1,0 +1,6 @@
+# Source ownership claims must propagate failure from the real undo validator.
+--let $capture_fault= preserve_temp_import_oom
+--let $capture_trace_name= temp_capture_undo_allocation.trace
+--let $capture_trace_pattern= temporary undo import allocation fault
+--let $capture_case= undo validator allocation failure
+--source suite/preserve_trx/include/temp_table_capture_undo_failure.inc

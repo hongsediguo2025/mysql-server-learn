@@ -4385,10 +4385,18 @@ dberr_t lock_preserve_export_table_locks(trx_t *trx, std::string *payload,
   dberr_t export_status = DB_SUCCESS;
   {
     locksys::Global_shared_latch_guard guard{};
-    if (trx_reference(trx, true) == nullptr) {
+    trx_mutex_enter(trx);
+    // A sampled owner may have ended its transaction or disconnected. Native
+    // trx_reference() assumes a running transaction even when asking whether
+    // it committed. Validate and pin under the same mutex, as record capture
+    // does; a separate state check followed by trx_reference would race.
+    if (trx->state != TRX_STATE_ACTIVE && trx->state != TRX_STATE_PREPARED &&
+        trx->state != TRX_STATE_PRESERVED) {
+      trx_mutex_exit(trx);
       return DB_ERROR;
     }
-    trx_mutex_enter(trx);
+    ut_ad(trx->n_ref >= 0);
+    ++trx->n_ref;
 
     for (const lock_t *lock : trx->lock.table_locks) {
       if (lock == nullptr || lock->trx != trx ||

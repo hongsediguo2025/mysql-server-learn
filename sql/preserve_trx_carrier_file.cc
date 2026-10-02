@@ -936,8 +936,11 @@ Atomic_write_status atomic_write_file(
   bool error = !write_all(file, bytes);
   notify_step(options, Preserve_snapshot_io_step::WRITE_TEMP_FILE);
   if (!error && snapshot_file) {
-    DBUG_EXECUTE_IF("preserve_trx_fail_before_snapshot_fsync",
-                    error = true;);
+    DBUG_EXECUTE_IF("preserve_trx_fail_before_snapshot_fsync", {
+      DBUG_PRINT("preserve_temp_import",
+                 ("temporary snapshot fsync fault"));
+      error = true;
+    });
   }
   if (!error && !options.defer_file_fsync && my_sync(file, MYF(0)))
     error = true;
@@ -2027,7 +2030,11 @@ Local_file_preserved_trx_carrier::stage_snapshot_new(
 
   bool error = !write_all(file, snapshot_bytes);
   notify_step(m_write_options, Preserve_snapshot_io_step::WRITE_TEMP_FILE);
-  DBUG_EXECUTE_IF("preserve_trx_fail_before_snapshot_fsync", error = true;);
+  DBUG_EXECUTE_IF("preserve_trx_fail_before_snapshot_fsync", {
+    DBUG_PRINT("preserve_temp_import",
+               ("temporary snapshot fsync fault"));
+    error = true;
+  });
   if (!error && !m_write_options.defer_file_fsync && my_sync(file, MYF(0))) {
     error = true;
   }
@@ -2973,64 +2980,6 @@ Local_file_preserved_trx_carrier::adopt_warm_external_blob(
   return Preserved_trx_carrier_status::OK;
 }
 
-Preserved_trx_carrier_status
-Local_file_preserved_trx_carrier::
-    install_staged_external_blob_for_standby_projection(
-        const std::string &token, const std::string &blob_name,
-        const std::string &staged_path,
-        const Preserved_trx_external_blob_descriptor &descriptor) {
-  if (!token_is_filename_safe(token) ||
-      !prebuilt_external_blob_name_is_supported(blob_name) ||
-      descriptor.name != blob_name) {
-    return Preserved_trx_carrier_status::CORRUPT;
-  }
-  if (m_write_options.shard_generic_external_blobs &&
-      generic_external_blob_uses_shard(blob_name) &&
-      ensure_generic_external_blob_shard_dir(m_dir, token)) {
-    return Preserved_trx_carrier_status::IO_ERROR;
-  }
-
-  const std::string final_blob_path =
-      external_blob_path_for_new_write(m_dir, token, blob_name,
-                                       m_write_options);
-  MY_STAT stat_area;
-  if (file_exists(final_blob_path, &stat_area)) {
-    if (stat_area.st_size < 0 ||
-        static_cast<uint64_t>(stat_area.st_size) != descriptor.size) {
-      return Preserved_trx_carrier_status::CORRUPT;
-    }
-    return Preserved_trx_carrier_status::OK;
-  }
-  if (path_is_symlink(staged_path) || !file_exists(staged_path, &stat_area) ||
-      stat_area.st_size < 0 || !MY_S_ISREG(stat_area.st_mode) ||
-      static_cast<uint64_t>(stat_area.st_size) != descriptor.size) {
-    return Preserved_trx_carrier_status::CORRUPT;
-  }
-
-#ifdef _WIN32
-  if (CopyFile(staged_path.c_str(), final_blob_path.c_str(), TRUE)) {
-    return Preserved_trx_carrier_status::OK;
-  }
-  my_osmaperr(GetLastError());
-  if (my_errno() == EEXIST && file_exists(final_blob_path, &stat_area) &&
-      stat_area.st_size >= 0 &&
-      static_cast<uint64_t>(stat_area.st_size) == descriptor.size) {
-    return Preserved_trx_carrier_status::OK;
-  }
-  return Preserved_trx_carrier_status::IO_ERROR;
-#else
-  if (link(staged_path.c_str(), final_blob_path.c_str()) == 0) {
-    return Preserved_trx_carrier_status::OK;
-  }
-  set_my_errno(errno);
-  if (errno == EEXIST && file_exists(final_blob_path, &stat_area) &&
-      stat_area.st_size >= 0 &&
-      static_cast<uint64_t>(stat_area.st_size) == descriptor.size) {
-    return Preserved_trx_carrier_status::OK;
-  }
-  return Preserved_trx_carrier_status::IO_ERROR;
-#endif
-}
 
 Preserved_trx_carrier_status
 Local_file_preserved_trx_carrier::read_warm_external_blob(

@@ -120,6 +120,8 @@
 #include "sql/protocol.h"
 #include "sql/protocol_classic.h"
 #include "sql/preserve_trx.h"
+#include "sql/preserve_trx_command.h"
+#include "sql/preserve_trx_temp_metrics.h"
 #include "sql/preserve_trx_drain.h"
 #include "sql/preserve_trx_transfer.h"
 #include "sql/psi_memory_key.h"
@@ -159,6 +161,7 @@
 #include "sql/sql_lex.h"
 #include "sql/sql_list.h"
 #include "sql/sql_prepare.h"  // mysql_stmt_execute
+#include "sql/preserve_trx_result_restore.h"
 #include "sql/sql_profile.h"
 #include "sql/sql_query_rewrite.h"  // invoke_pre_parse_rewrite_plugins
 #include "sql/sql_reload.h"         // handle_reload_request
@@ -1199,6 +1202,7 @@ void bind_fields(Item *first) {
 
 bool do_command(THD *thd) {
   bool return_value;
+  bool command_packet_decoded = false;
   int rc = 0;
   NET *net = nullptr;
   enum enum_server_command command = COM_SLEEP;
@@ -1275,6 +1279,7 @@ bool do_command(THD *thd) {
   DEBUG_SYNC(thd, "preserve_trx_after_begin_before_command_read");
   if (!rc) {
     rc = thd->get_protocol()->get_command(&com_data, &command);
+    command_packet_decoded = rc == 0;
     if (!rc) preserved_trx_classify_protocol_command(thd, command);
     DEBUG_SYNC(thd, "preserve_trx_after_command_read_before_packet_marker");
     if (!rc) preserved_trx_mark_inflight_command_packet(thd, command);
@@ -1300,6 +1305,9 @@ bool do_command(THD *thd) {
 
     /* The error must be set. */
     DBUG_ASSERT(thd->is_error());
+    if (command_packet_decoded && rc > 0 &&
+        thd->get_stmt_da()->mysql_errno() == ER_PRESERVE_TRX_SESSION_DRAINED)
+      preserved_trx_suppress_rejected_command_response(thd, command);
     thd->send_statement_status();
 
     /* Mark the statement completed. */
@@ -1682,9 +1690,13 @@ bool dispatch_command(THD *thd, const COM_DATA *com_data,
       DBUG_ASSERT(false);
       goto done;
     case Preserve_trx_command_block_result::BLOCK_SESSION_DRAINED:
+      if (preserved_trx_suppress_rejected_command_response(thd, command))
+        goto done;
       my_error(ER_PRESERVE_TRX_SESSION_DRAINED, MYF(0));
       goto done;
     case Preserve_trx_command_block_result::BLOCK_CLOSING_DRAINED:
+      if (preserved_trx_suppress_rejected_command_response(thd, command))
+        goto done;
       if (command == COM_STMT_SEND_LONG_DATA) {
         // This protocol packet has no response. Drop it without extending the
         // prepared statement's parameter buffer; COM_STMT_EXECUTE returns 4020.
@@ -1695,6 +1707,8 @@ bool dispatch_command(THD *thd, const COM_DATA *com_data,
       my_error(ER_PRESERVE_TRX_SESSION_DRAINED, MYF(0));
       goto done;
     case Preserve_trx_command_block_result::BLOCK_DRAINING:
+      if (preserved_trx_suppress_rejected_command_response(thd, command))
+        goto done;
       my_error(ER_PRESERVE_TRX_UNSUPPORTED, MYF(0));
       goto done;
   }
@@ -1804,7 +1818,7 @@ bool dispatch_command(THD *thd, const COM_DATA *com_data,
       if (!mysql_stmt_precheck(thd, com_data, command, &stmt)) {
         if (!preserved_trx_phase2_command_is_captured(thd) ||
             !preserve_trx_sql_body_blocked(thd, stmt->lex,
-                                           stmt->lex->sql_command)) {
+                                          stmt->lex->sql_command)) {
           PS_PARAM *parameters = com_data->com_stmt_execute.parameters;
           mysqld_stmt_execute(
               thd, stmt, com_data->com_stmt_execute.has_new_types,
@@ -1882,6 +1896,17 @@ bool dispatch_command(THD *thd, const COM_DATA *com_data,
                       com_data->com_query.length))
         break;  // fatal error is set
 
+#ifndef DBUG_OFF
+      {
+        bool handled = false;
+        DBUG_EXECUTE_IF("preserve_cursor_test_command", {
+          handled = preserve_trx_cursor_test_command(
+              thd, thd->query().str, thd->query().length);
+        });
+        if (handled) break;
+      }
+#endif
+
       const char *packet_end = thd->query().str + thd->query().length;
 
       if (opt_general_log_raw) {
@@ -1943,8 +1968,9 @@ bool dispatch_command(THD *thd, const COM_DATA *com_data,
         */
         const char *beginning_of_next_stmt = parser_state.m_lip.found_semicolon;
 
-        /* Retire this statement, not the still-active protocol packet. */
-        if (preserve_trx_standby_phase2_source_capture_enabled())
+        /* Resource transfer keeps one admitted body for the complete packet. */
+        if (preserve_trx_standby_phase2_source_capture_enabled() &&
+            !preserve_trx_whole_query_packet(thd))
           preserved_trx_phase2_finish_protocol_command(thd);
 
         /* Finalize server status flags after executing a statement. */
@@ -2009,7 +2035,8 @@ bool dispatch_command(THD *thd, const COM_DATA *com_data,
         thd->set_secondary_engine_optimization(
             Secondary_engine_optimization::PRIMARY_TENTATIVELY);
         /* TODO: set thd->lex->sql_command to SQLCOM_END here */
-        if (preserve_trx_standby_phase2_source_capture_enabled())
+        if (preserve_trx_standby_phase2_source_capture_enabled() &&
+            !preserve_trx_whole_query_packet(thd))
           preserved_trx_phase2_begin_synthetic_protocol_command(thd, COM_QUERY);
         mysql_parse(thd, &parser_state);
 
@@ -2796,6 +2823,7 @@ static inline void binlog_gtid_end_transaction(THD *thd) {
 */
 
 int mysql_execute_command(THD *thd, bool first_level) {
+  Preserve_trx_temp_first_dml_timer preserve_first_dml(thd);
   int res = false;
   LEX *const lex = thd->lex;
   /* first SELECT_LEX (have special meaning for many of non-SELECTcommands) */
@@ -2824,7 +2852,7 @@ int mysql_execute_command(THD *thd, bool first_level) {
   if (thd->get_command() == COM_STMT_EXECUTE)
     preserve_trx_inflight_guard.mark(thd, lex->sql_command);
 
-  /* COM_STMT_EXECUTE passed the same native and scheduler gate in dispatch. */
+  /* PS execution and later clauses of an admitted packet retain their body. */
   if (!preserved_trx_phase2_command_body_already_entered(thd) &&
       preserve_trx_sql_body_blocked(thd, lex, lex->sql_command))
     return 1;
@@ -5045,6 +5073,8 @@ void mysql_parse(THD *thd, Parser_state *parser_state) {
     if (!err) err = invoke_post_parse_rewrite_plugins(thd, false);
 
     found_semicolon = parser_state->m_lip.found_semicolon;
+    if (found_semicolon != nullptr)
+      preserve_trx_note_multi_statement_packet(thd);
   }
 
   if (!err) {

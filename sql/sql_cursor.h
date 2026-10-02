@@ -31,6 +31,8 @@
 
 class Query_result;
 struct MEM_ROOT;
+class Preserve_trx_cursor_result;
+struct Preserve_trx_cursor_snapshot;
 
 /**
   @file
@@ -72,6 +74,12 @@ class Server_side_cursor {
   virtual bool open(THD *thd) = 0;
   virtual bool fetch(ulong num_rows) = 0;
   virtual void close() = 0;
+  virtual const Preserve_trx_cursor_result *preserved_result() const {
+    return nullptr;
+  }
+  virtual bool preserve_snapshot(Preserve_trx_cursor_snapshot *) const {
+    return false;
+  }
   virtual ~Server_side_cursor() { free_root(&mem_root, MYF(0)); }
   static void operator delete(void *ptr, size_t size);
   static void operator delete(
@@ -80,6 +88,7 @@ class Server_side_cursor {
 };
 
 bool mysql_open_cursor(THD *thd, Query_result *result,
-                       Server_side_cursor **res);
+                       Server_side_cursor **res,
+                       uint32_t preserve_statement_id = 0);
 
 #endif /* _sql_cusor_h_ */

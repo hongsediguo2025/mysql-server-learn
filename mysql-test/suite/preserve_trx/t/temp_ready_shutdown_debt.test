@@ -1,0 +1,3 @@
+# Internal fault coverage; the companion temp_ready_workload has no DBUG.
+--source include/have_debug.inc
+--source suite/preserve_trx/t/temp_ready_workload.test

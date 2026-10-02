@@ -122,6 +122,9 @@ bool Query_result_union::send_data(THD *thd,
   }
   // create_ondisk_from_heap will generate error if needed
   if (!table->file->is_ignorable_error(error)) {
+    MEM_ROOT *saved_root = thd->mem_root;
+    if (m_handler_mem_root != nullptr) thd->mem_root = m_handler_mem_root;
+    auto restore_root = create_scope_guard([&] { thd->mem_root = saved_root; });
     bool is_duplicate;
     if (create_ondisk_from_heap(thd, table, error, true, &is_duplicate))
       return true; /* purecov: inspected */

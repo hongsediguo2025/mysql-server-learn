@@ -1,0 +1,20 @@
+# captured external references: DYNAMIC
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SELECT COUNT(*)=30 AND SUM(id)=2451 AS captured_rows_ok FROM tmp_record_external;
+captured_rows_ok
+1
+SELECT COUNT(*)=32 AND SUM(id)=528 AND SUM(v IS NULL)=8
+AND SUM(v=REPEAT(CONCAT('old-',LPAD(id,3,'0')),4096))=24
+AND SUM(OCTET_LENGTH(v))=24*7*4096 AS rollback_contents_ok
+FROM tmp_record_external;
+rollback_contents_ok
+1
+SELECT COUNT(*)=32 AND SUM(v)=5280 AS persistent_rollback_ok FROM t_temp_external_base;
+persistent_rollback_ok
+1
+SELECT v=REPEAT('committed',4096) AS temporary_commit_ok FROM tmp_record_external WHERE id=1;
+temporary_commit_ok
+1
+SELECT v=777 AS persistent_commit_ok FROM t_temp_external_base WHERE id=1;
+persistent_commit_ok
+1

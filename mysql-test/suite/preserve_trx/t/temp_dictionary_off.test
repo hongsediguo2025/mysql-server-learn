@@ -1,0 +1,76 @@
+--source include/have_innodb_16k.inc
+--source include/force_restart.inc
+SELECT @@global.rds_preserve_trx_enable AS preserve_enabled;
+--disable_query_log
+SET SESSION innodb_strict_mode=ON;
+CREATE TABLE t_dictionary_off(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO t_dictionary_off
+  WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<32)
+  SELECT n,n*10 FROM seq;
+CREATE TEMPORARY TABLE tmp_dictionary_off(
+  id INT PRIMARY KEY, v VARCHAR(32), n INT, KEY(v), KEY(n)
+) ENGINE=InnoDB;
+INSERT INTO tmp_dictionary_off SELECT id,CONCAT('v',id),v FROM t_dictionary_off;
+START TRANSACTION;
+UPDATE t_dictionary_off SET v=v+1;
+UPDATE tmp_dictionary_off SET n=n+1;
+ROLLBACK;
+--enable_query_log
+SELECT COUNT(*)=32 AND SUM(v)=5280 AS persistent_ok FROM t_dictionary_off;
+SELECT COUNT(*)=32 AND SUM(n)=5280 AS temporary_ok FROM tmp_dictionary_off;
+--disable_query_log
+# Native strict rejection destroys an unpublished normalized index.
+CALL mtr.add_suppression("Cannot add field .*t_dictionary_too_big.* because after adding it, the row size is");
+--disable_result_log
+--error ER_TOO_BIG_ROWSIZE
+CREATE TABLE t_dictionary_too_big(
+  id INT PRIMARY KEY,
+  c1 CHAR(255),
+  c2 CHAR(255),
+  c3 CHAR(255),
+  c4 CHAR(255),
+  c5 CHAR(255),
+  c6 CHAR(255),
+  c7 CHAR(255),
+  c8 CHAR(255),
+  c9 CHAR(255),
+  c10 CHAR(255),
+  c11 CHAR(255),
+  c12 CHAR(255),
+  c13 CHAR(255),
+  c14 CHAR(255),
+  c15 CHAR(255),
+  c16 CHAR(255),
+  c17 CHAR(255),
+  c18 CHAR(255),
+  c19 CHAR(255),
+  c20 CHAR(255),
+  c21 CHAR(255),
+  c22 CHAR(255),
+  c23 CHAR(255),
+  c24 CHAR(255),
+  c25 CHAR(255),
+  c26 CHAR(255),
+  c27 CHAR(255),
+  c28 CHAR(255),
+  c29 CHAR(255),
+  c30 CHAR(255),
+  c31 CHAR(255),
+  c32 CHAR(255),
+  c33 CHAR(255),
+  c34 CHAR(255),
+  c35 CHAR(255),
+  c36 CHAR(255),
+  c37 CHAR(255),
+  c38 CHAR(255),
+  c39 CHAR(255),
+  c40 CHAR(255)
+) ENGINE=InnoDB ROW_FORMAT=COMPACT DEFAULT CHARSET=latin1;
+--enable_result_log
+--enable_query_log
+SELECT COUNT(*)=0 AS rejected_table_absent FROM information_schema.tables
+ WHERE table_schema=DATABASE() AND table_name='t_dictionary_too_big';
+--disable_query_log
+DROP TEMPORARY TABLE tmp_dictionary_off;
+DROP TABLE t_dictionary_off;
+--enable_query_log

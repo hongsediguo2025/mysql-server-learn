@@ -39,13 +39,21 @@ my ($freeze) =
 die "Preserve freeze must keep Undo ACTIVE and avoid native prepared accounting\n"
   unless $freeze =~ /ACTIVE_UNDO_V1/ &&
          $freeze !~ /trx_prepare_low|TRX_UNDO_PREPARED|n_prepared_trx|lock_trx_release_read_locks/;
+my ($freeze_current) = $preserve =~
+  /(^dberr_t\s+trx_preserve_freeze_current\s*\([^)]*\)\s*\{[\s\S]*?^\})/m
+  or die "could not isolate current transaction freeze bridge\n";
+my ($handler_freeze) = $handler =~
+  /(^dberr_t\s+innobase_preserve_freeze\s*\([^)]*\)\s*\{[\s\S]*?^\})/m
+  or die "could not isolate InnoDB Preserve freeze bridge\n";
 die "missing unified Preserve current-transaction freeze bridge\n"
   unless $preserve_h =~ /trx_preserve_freeze_current\s*\(/ &&
-         $preserve =~
-           /trx_preserve_freeze_current\s*\([^)]*\)[\s\S]{0,1200}innobase_preserve_freeze\s*\(\s*thd\s*\)/s;
+         $freeze_current =~ /innobase_preserve_freeze\s*\(\s*thd\s*,\s*read_context\s*\)/s;
 die "InnoDB Preserve handler must use the dedicated in-memory freeze\n"
-  unless $handler =~
-    /innobase_preserve_freeze\s*\([^)]*\)[\s\S]{0,1200}trx_freeze_for_preserve\s*\(\s*trx\s*\)/s;
+  unless $handler_freeze =~ /trx_freeze_for_preserve\s*\(\s*trx\s*,\s*read_context\s*\)/s;
+die "read-context freeze must remain gated and validated at each boundary\n"
+  unless $sql =~ /read_context\s*=\s*retained_standby_resources\s*&&\s*trx_preserve_current_thd_has_read_context\s*\(\s*thd\s*\)/s &&
+         $freeze_current =~ /read_context\s*\?\s*!trx_preserve_current_thd_has_read_context\s*\(\s*thd\s*\)\s*:\s*\(!redo_updated\s*&&\s*!temp_updated\)/s &&
+         $freeze =~ /trx_preserve_is_read_context\s*\(\s*trx\s*\)/s;
 die "removed Preserve prepare entry must not return\n"
   if $trx_h =~ /trx_prepare_for_preserve\s*\(/ ||
      $trx =~ /trx_prepare_for_preserve\s*\(/ ||

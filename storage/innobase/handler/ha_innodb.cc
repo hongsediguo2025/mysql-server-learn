@@ -171,6 +171,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "sql/json_dom.h"
 #include "sql/preserve_trx.h"
 #include "sql/preserve_trx_xid.h"
+#include "sql/preserve_trx_temp_history.h"
 #include "sql_base.h"
 #include "srv0tmp.h"
 #include "trx0preserve.h"
@@ -1754,6 +1755,11 @@ const char *thd_innodb_tmpdir(THD *thd) {
 @param[in,out]	thd	MySQL thread handler.
 @return reference to private handler */
 MY_ATTRIBUTE((warn_unused_result))
+innodb_session_t *trx_preserve_temp_existing_session(THD *thd) noexcept {
+  return thd == nullptr ? nullptr :
+      static_cast<innodb_session_t *>(*thd_ha_data(thd, innodb_hton_ptr));
+}
+
 innodb_session_t *&thd_to_innodb_session(THD *thd) {
   innodb_session_t *&innodb_session =
       *(innodb_session_t **)thd_ha_data(thd, innodb_hton_ptr);
@@ -11146,10 +11152,12 @@ inline MY_ATTRIBUTE((warn_unused_result)) int create_table_info_t::
       dict_mem_table_free(table);
     } else {
       /* Get a new table ID */
-      dict_table_assign_new_id(table, m_trx);
+      err = dict_table_assign_new_id(table, m_trx);
 
       /* Create temp tablespace if configured. */
-      err = dict_build_tablespace_for_table(table, m_trx);
+      if (err == DB_SUCCESS) {
+        err = dict_build_tablespace_for_table(table, m_trx);
+      }
 
       if (err == DB_SUCCESS) {
         /* Temp-table are maintained in memory and so
@@ -13586,6 +13594,10 @@ int innobase_basic_ddl::delete_impl(THD *thd, const char *name,
 
   innodb_session_t *&priv = thd_to_innodb_session(thd);
   dict_table_t *handler = priv->lookup_table_handler(norm_name);
+  const uint64_t preserved_temp_id = preserve_trx_enable &&
+      preserve_trx_temp_id_namespace && handler && handler->is_temporary()
+          ? handler->id : 0;
+  const uint32_t preserved_temp_space = preserved_temp_id ? handler->space : 0;
 
   if (handler != nullptr) {
     for (dict_index_t *index = UT_LIST_GET_FIRST(handler->indexes);
@@ -13602,12 +13614,23 @@ int innobase_basic_ddl::delete_impl(THD *thd, const char *name,
   if (handler != nullptr && handler->is_temporary() &&
       trx_preserve_temp_space_image_fil_space_adopted_by_space_id(
           handler->space)) {
+    // Prepare the handler key while the native table is still intact.
+    std::string stable_name;
+    try {
+      stable_name.assign(norm_name);
+    } catch (const std::bad_alloc &) {
+      return convert_error_code_to_mysql(DB_OUT_OF_MEMORY, 0, nullptr);
+    }
+    bool table_removed = false;
     error = trx_preserve_temp_space_image_drop_bound_table_by_space_id(
-        handler->space, handler);
-    if (error != DB_SUCCESS && error != DB_TABLESPACE_NOT_FOUND) {
+        handler->space, handler, &table_removed);
+    if (table_removed && preserved_temp_id)
+      preserve_trx_temp_table_confirm_native_drop(thd, preserved_temp_id,
+                                                 preserved_temp_space);
+    if (table_removed) priv->unregister_table_handler(stable_name);
+    if (error != DB_SUCCESS) {
       return (convert_error_code_to_mysql(error, 0, nullptr));
     }
-    priv->unregister_table_handler(norm_name);
     return 0;
   }
 
@@ -13659,7 +13682,13 @@ int innobase_basic_ddl::delete_impl(THD *thd, const char *name,
     }
   }
 
-  error = row_drop_table_for_mysql(norm_name, trx, true, handler);
+  table_id_t removed_temp_id = 0;
+  space_id_t removed_temp_space = 0;
+  error = row_drop_table_for_mysql(norm_name, trx, true, handler,
+                                  &removed_temp_id, &removed_temp_space);
+  if (removed_temp_id && preserve_trx_enable && preserve_trx_temp_id_namespace)
+    preserve_trx_temp_table_confirm_native_drop(thd, removed_temp_id,
+                                               removed_temp_space);
 
   if (handler != nullptr && error == DB_SUCCESS) {
     priv->unregister_table_handler(norm_name);
@@ -19197,7 +19226,7 @@ ulint innobase_get_at_most_n_mbchars(
 }
 
 /** Freeze the current InnoDB transaction for Preserve without XA prepare. */
-dberr_t innobase_preserve_freeze(THD *thd) {
+dberr_t innobase_preserve_freeze(THD *thd, bool read_context) {
   trx_t *trx = check_trx_exists(thd);
 
   if (trx->xid == nullptr || !xid_is_preserve_magic(*trx->xid)) {
@@ -19220,7 +19249,7 @@ dberr_t innobase_preserve_freeze(THD *thd) {
 
   ut_ad(trx_is_registered_for_2pc(trx));
 
-  const dberr_t err = trx_freeze_for_preserve(trx);
+  const dberr_t err = trx_freeze_for_preserve(trx, read_context);
   if (err == DB_FORCED_ABORT) {
     innobase_rollback(innodb_hton_ptr, thd, true);
   }

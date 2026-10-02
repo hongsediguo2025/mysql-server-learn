@@ -1,0 +1,6 @@
+# Source capture regression; no startup recovery or target RESUME.
+--let $capture_fault= preserve_trx_fail_before_snapshot_fsync
+--let $capture_trace_name= temp_capture_multi_page_undo.trace
+--let $capture_trace_pattern= temporary undo chain validated pages=([2-9][0-9]*|1[0-9]+)
+--let $capture_case= validated multi-page undo followed by snapshot write failure
+--source suite/preserve_trx/include/temp_table_capture_undo_failure.inc

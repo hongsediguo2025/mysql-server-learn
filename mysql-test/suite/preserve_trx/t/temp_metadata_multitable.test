@@ -1,0 +1,91 @@
+--source include/have_debug.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+--echo # Shared undo: empty binary key, two temporary tables and all record types
+--disable_query_log
+--let $saved_global_debug= `SELECT @@global.debug`
+--let $undo_trace= $MYSQLTEST_VARDIR/log/temp_metadata_multitable.trace
+--eval SET GLOBAL debug='d,preserve_temp_import,preserve_temp_import_source_undo_probe,preserve_temp_transfer_input_probe,preserve_temp_metadata_batch_probe,preserve_temp_import_target_image_probe:O,$undo_trace'
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
+CREATE TABLE t_undo_multi_base(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO t_undo_multi_base
+  WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<64)
+  SELECT n, n*10 FROM seq;
+--connect(undo_app,localhost,root,,test)
+CREATE TEMPORARY TABLE tmp_undo_key(
+  k VARBINARY(32) PRIMARY KEY, n INT NULL, v VARBINARY(128)
+) ENGINE=InnoDB ROW_FORMAT=REDUNDANT;
+CREATE TEMPORARY TABLE tmp_undo_aux(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO tmp_undo_key VALUES('',NULL,''),('b',2,0xff);
+INSERT INTO tmp_undo_aux SELECT id,id FROM t_undo_multi_base;
+START TRANSACTION;
+UPDATE tmp_undo_key SET n=1 WHERE k='';
+UPDATE tmp_undo_aux SET v=v+100;
+DELETE FROM tmp_undo_key WHERE k='b';
+INSERT INTO tmp_undo_key VALUES('c',3,0x00ff);
+# Cross the insert/update stream boundary, then link another update predecessor.
+UPDATE tmp_undo_key SET n=4 WHERE k='c';
+UPDATE tmp_undo_key SET n=3 WHERE k='c';
+DELETE FROM tmp_undo_aux WHERE id=2;
+INSERT INTO tmp_undo_aux VALUES(2,555);
+UPDATE t_undo_multi_base SET v=999 WHERE id=1;
+--connection default
+--error ER_PRESERVE_TRX_UNSUPPORTED
+DRAIN TRANSACTIONS PRESERVE;
+--let _TEMP_UNDO_TRACE= $undo_trace
+--perl
+use strict;
+use warnings;
+open(my $fh, '<', $ENV{'_TEMP_UNDO_TRACE'}) or die "missing undo trace: $!";
+my $trace = do { local $/; <$fh> };
+close($fh);
+die "impossible ownership count was not rejected before allocation\n"
+  unless $trace =~ /temporary manifest claim count exceeds payload/;
+die "two tables did not share one transferred image and undo\n"
+  unless $trace =~ /temporary transfer input checked objects=2 rejected=16 pinned_after_cleanup=1 replacement_checked=1 wrong_pin_checked=1/;
+die "transaction-level source import was not prepared\n"
+  unless $trace =~ /temporary source import prepared spaces=1 tables=2 undo_records=71 links=[1-9][0-9]* external=0 targets=0/;
+die "shared-space metadata was not prepared in bounded batches\n"
+  unless $trace =~ /temporary metadata batches=[6-9][0-9]* tables=2 pending_guard=1/;
+die "metadata cancellation or ownership checks failed\n"
+  unless $trace =~ /temporary metadata cancellation checked cases=6 quota=1 hidden=1/
+      && $trace =~ /temporary metadata failures checked cases=7 quota=1 sticky=1 owner=1/;
+die "receiver image preparation failed\n"
+  unless $trace =~ /temporary receiver images checked bytes=[1-9][0-9]* batches=[1-9][0-9]* cancel=0 fault=0/;
+die "standby scope gate was not reached\n"
+  unless $trace =~ /temporary namespace requires standby transfer/;
+EOF
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+--connection undo_app
+--enable_query_log
+SELECT COUNT(*)=2 AND SUM(k='' AND n=1 AND v='')=1
+  AND SUM(k='c' AND n=3 AND v=0x00ff)=1 AS captured_key_ok FROM tmp_undo_key;
+SELECT COUNT(*)=64 AND SUM(v)=8933 AS captured_aux_ok FROM tmp_undo_aux;
+--disable_query_log
+UPDATE tmp_undo_key SET v=0x1234 WHERE k='';
+DELETE FROM tmp_undo_aux WHERE id=64;
+ROLLBACK;
+--enable_query_log
+SELECT COUNT(*)=2 AND SUM(k='' AND n IS NULL AND v='')=1
+  AND SUM(k='b' AND n=2 AND v=0xff)=1 AS key_rollback_ok FROM tmp_undo_key;
+SELECT COUNT(*)=64 AND SUM(v)=2080 AS aux_rollback_ok FROM tmp_undo_aux;
+SELECT COUNT(*)=64 AND SUM(v)=20800 AS persistent_rollback_ok FROM t_undo_multi_base;
+--disable_query_log
+START TRANSACTION;
+UPDATE tmp_undo_key SET n=7 WHERE k='';
+UPDATE tmp_undo_aux SET v=7 WHERE id=1;
+UPDATE t_undo_multi_base SET v=7 WHERE id=1;
+COMMIT;
+--enable_query_log
+SELECT n=7 AND v='' AS key_commit_ok FROM tmp_undo_key WHERE k='';
+SELECT v=7 AS aux_commit_ok FROM tmp_undo_aux WHERE id=1;
+SELECT v=7 AS persistent_commit_ok FROM t_undo_multi_base WHERE id=1;
+--disable_query_log
+DROP TEMPORARY TABLE tmp_undo_key, tmp_undo_aux;
+--disconnect undo_app
+--connection default
+DROP TABLE t_undo_multi_base;
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+--eval SET GLOBAL debug='$saved_global_debug'
+--enable_query_log

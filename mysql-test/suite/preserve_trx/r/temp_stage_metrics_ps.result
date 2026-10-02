@@ -1,0 +1,4 @@
+TEMP metrics cover final debt/wall, first DML outcome and FETCH; bridge excludes physical stages
+production TEMP_ONLY temporary transfer: cursor passed
+loopback receiver prepared temporary resources before READY
+strict SQL RESUME integration: success passed

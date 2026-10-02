@@ -10,9 +10,11 @@ corrupt_protocol_object_not_ready
 1
 corrupt_protocol_has_no_prepared_ready
 1
-source_commit_unknown_retains_authority_fence
+source_commit_unknown_not_entered
 1
-source_commands_remain_fenced
+source_uncommitted_state_restored
+1
+source_commands_resumed
 1
 truncated_prefix_rejected_by_protocol_seal
 1

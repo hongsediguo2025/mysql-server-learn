@@ -1,0 +1,2 @@
+--let $layout_format= REDUNDANT
+--source suite/preserve_trx/include/temp_table_import_record_layout.inc

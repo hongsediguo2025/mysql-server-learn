@@ -1,0 +1,31 @@
+SELECT @@global.rds_preserve_trx_enable;
+@@global.rds_preserve_trx_enable
+0
+SET SESSION debug='+d,preserve_temp_physical_metrics_probe';
+SHOW PRESERVED TRANSACTIONS;
+SET SESSION debug='';
+CREATE TABLE t_w11_off(id INT PRIMARY KEY,v INT) ENGINE=InnoDB;
+CREATE TEMPORARY TABLE tmp_w11_off LIKE t_w11_off;
+BEGIN;
+INSERT INTO t_w11_off VALUES(1,10),(2,20);
+INSERT INTO tmp_w11_off SELECT * FROM t_w11_off;
+UPDATE tmp_w11_off SET v=v+1;
+DELETE FROM tmp_w11_off WHERE id=2;
+ROLLBACK;
+SELECT COUNT(*) FROM t_w11_off;
+COUNT(*)
+0
+SELECT COUNT(*) FROM tmp_w11_off;
+COUNT(*)
+0
+SELECT SUM(CAST(VARIABLE_VALUE AS UNSIGNED)) AS w11_off_calls
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME IN ('Preserve_trx_temp_stage_first_dml_calls',
+'Preserve_trx_temp_stage_physical_prepare_calls',
+'Preserve_trx_temp_stage_physical_resurrect_calls',
+'Preserve_trx_temp_stage_physical_adopt_calls',
+'Preserve_trx_temp_stage_final_tokens');
+w11_off_calls
+0
+DROP TEMPORARY TABLE tmp_w11_off;
+DROP TABLE t_w11_off;

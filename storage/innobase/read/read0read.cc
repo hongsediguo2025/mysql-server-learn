@@ -750,7 +750,12 @@ bool MVCC::preserve_export_view(ReadView *view,
   snapshot->up_limit_id = view->m_up_limit_id;
   snapshot->creator_trx_id = view->m_creator_trx_id;
   snapshot->low_limit_no = view->m_low_limit_no;
-  view->preserve_export_ids(&snapshot->ids);
+  try {
+    view->preserve_export_ids(&snapshot->ids);
+  } catch (const std::bad_alloc &) {
+    trx_sys_mutex_exit();
+    return false;
+  }
 
   trx_sys_mutex_exit();
 
@@ -758,7 +763,8 @@ bool MVCC::preserve_export_view(ReadView *view,
 }
 
 dberr_t MVCC::preserve_import_view(
-    ReadView *&view, const Preserve_read_view_snapshot &snapshot, trx_t *trx) {
+    ReadView *&view, const Preserve_read_view_snapshot &snapshot, trx_t *trx,
+    bool purge_latch_held) {
   if (trx == nullptr || view != nullptr ||
       snapshot.creator_trx_id != trx->id ||
       snapshot.creator_trx_id == 0 ||
@@ -768,9 +774,13 @@ dberr_t MVCC::preserve_import_view(
   }
 
   ut_a(purge_sys != nullptr);
-  const purge_state_t purge_state = trx_purge_state();
+  ut_ad(!purge_latch_held || rw_lock_own(&purge_sys->latch, RW_LOCK_S));
+  const purge_state_t purge_state =
+      purge_latch_held ? purge_sys->state : trx_purge_state();
   ut_a(purge_state == PURGE_STATE_INIT ||
-       purge_state == PURGE_STATE_DISABLED);
+       purge_state == PURGE_STATE_DISABLED ||
+       (purge_latch_held && purge_state == PURGE_STATE_STOP &&
+        purge_sys->n_stop > 0 && !purge_sys->running));
 
   if (!snapshot.ids.empty()) {
     if (snapshot.ids.front() != snapshot.up_limit_id) {

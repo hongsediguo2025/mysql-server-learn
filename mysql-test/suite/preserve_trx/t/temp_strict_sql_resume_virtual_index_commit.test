@@ -1,0 +1,10 @@
+--source include/have_debug.inc
+--source include/have_log_bin.inc
+--let $receiver_namespace= 1
+--let $contract_temporary= cursor
+--let $contract_loopback= 1
+--let $contract_engine= temp-only
+--let $contract_column_shapes= virtual-index
+--let $contract_commit_resume= 1
+--let $contract_resume= success
+--source suite/preserve_trx/include/temp_id_contract_source.inc

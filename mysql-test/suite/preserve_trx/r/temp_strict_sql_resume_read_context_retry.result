@@ -1,0 +1,3 @@
+production READ_CONTEXT temporary transfer: cursor-no-undo passed
+loopback receiver prepared temporary resources before READY
+strict SQL RESUME integration: result-stage passed

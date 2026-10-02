@@ -117,7 +117,7 @@ class MVCC {
   @return DB_SUCCESS or error */
   dberr_t preserve_import_view(ReadView *&view,
                                const Preserve_read_view_snapshot &snapshot,
-                               trx_t *trx);
+                               trx_t *trx, bool purge_latch_held = false);
 
  private:
   /**

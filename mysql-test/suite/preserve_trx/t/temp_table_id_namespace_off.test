@@ -1,0 +1,22 @@
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+SELECT @@global.rds_preserve_trx_temp_id_namespace AS namespace_enabled,
+  @@global.rds_preserve_trx_enable AS preserve_enabled;
+CREATE TABLE t_id_native(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO t_id_native VALUES(1,10),(2,20);
+CREATE TEMPORARY TABLE tmp_id_native(id INT PRIMARY KEY, v INT, KEY(v))
+  ENGINE=InnoDB;
+INSERT INTO tmp_id_native SELECT * FROM t_id_native;
+SELECT COUNT(*)=1 AND MAX(TABLE_ID)<9223372036854775808 AS native_ids
+  FROM information_schema.INNODB_TEMP_TABLE_INFO;
+START TRANSACTION;
+UPDATE tmp_id_native SET v=v+1;
+DELETE FROM tmp_id_native WHERE id=2;
+UPDATE t_id_native SET v=v+10;
+ROLLBACK;
+SELECT COUNT(*)=2 AND SUM(v)=30 AS temporary_rollback FROM tmp_id_native;
+SELECT COUNT(*)=2 AND SUM(v)=30 AS persistent_rollback FROM t_id_native;
+ALTER TABLE tmp_id_native ADD COLUMN extra INT DEFAULT 7;
+SELECT SUM(extra)=14 AS alter_ok FROM tmp_id_native;
+DROP TEMPORARY TABLE tmp_id_native;
+DROP TABLE t_id_native;

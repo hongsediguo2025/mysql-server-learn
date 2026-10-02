@@ -797,7 +797,9 @@ def build_mysqld_commands(
         source.extend(
             [
                 "--back-log=1400",
-                "--max-prepared-stmt-count=700000",
+                "--max-prepared-stmt-count=" + str(
+                    max(700000, profile.sessions * (9 * profile.tables + 2) + 1000)
+                    if profile.sysbench_workload == "oltp_read_write" else 700000),
                 "--table-open-cache=8192",
                 "--performance-schema=ON",
                 "--performance-schema-instrument=%=ON",
@@ -902,6 +904,7 @@ def build_e2e_command(
                 "preserve_trx_phase2_scheduler_e2e.py"),
             "--scenario",
             ("sysbench-tpcc-drain" if profile.sysbench_workload == "tpcc"
+             else "sysbench-read-write-drain" if profile.sysbench_workload == "oltp_read_write"
              else "sysbench-write-only-drain"),
             "--source-error-log",
             str(paths.source_error_log),
@@ -1484,7 +1487,7 @@ def build_acceptance_contract(
             "tables": profile.tables,
             "rows_per_table": profile.sysbench_table_size,
             "steady_run_seconds": profile.sysbench_runtime_s,
-            "workload": "oltp_write_only",
+            "workload": profile.sysbench_workload,
             "skip_trx": profile.sysbench_skip_trx,
             "mysql_ignore_errors": (
                 "1213,1020,1205,4020" +
@@ -1514,6 +1517,14 @@ def build_acceptance_contract(
             "eligible_body_state": "EXACT",
             "scheduler_fatal_count": 0,
         }
+        if profile.sysbench_skip_trx:
+            contract["autocommit_session_only_handoff"] = {
+                "survivors": 0,
+                "receiver_ready_tokens": 0,
+                "receiver_ready_applicable": False,
+                "drain_outcome": "NO_PRESERVABLE_TOKENS",
+                "receiver_not_ready_tokens": 0,
+            }
         if profile.sysbench_workload == "tpcc":
             contract.update(workload="sysbench-tpcc", certified_tpcc=False,
                             warehouses=profile.tpcc_warehouses, table_sets=1,
@@ -3039,7 +3050,7 @@ def validate_continuous_large_tx_report(
         or read_transfer_p99_us <= 0
     ):
         failures.append("receiver read-load evidence is empty")
-    formal_profile = profile.formal_rounds > 1
+    formal_profile = profile.name.endswith("-full")
     if formal_profile:
         continuous_slo = require_mapping("continuous_slo")
         if report.get("formal_evidence") is not True:
@@ -3196,6 +3207,7 @@ def validate_e2e_report(
         if report.get("success") is not True:
             raise RuntimeError("dependency sysbench report is not successful")
         scenario = ("sysbench-tpcc-drain" if profile.sysbench_workload == "tpcc"
+                    else "sysbench-read-write-drain" if profile.sysbench_workload == "oltp_read_write"
                     else "sysbench-write-only-drain")
         if report.get("scenario") != scenario:
             raise RuntimeError("dependency sysbench scenario identity is invalid")
@@ -3203,6 +3215,7 @@ def validate_e2e_report(
         if not isinstance(workload, Mapping):
             raise RuntimeError("dependency sysbench workload evidence is missing")
         expected = {
+            "workload": profile.sysbench_workload,
             "threads": profile.sessions,
             "tables": profile.tables,
             "table_size": profile.sysbench_table_size,
@@ -3226,15 +3239,17 @@ def validate_e2e_report(
                 )
         if bool(workload.get("skip_trx", False)) != profile.sysbench_skip_trx:
             raise RuntimeError("dependency sysbench skip_trx mode mismatch")
-        if profile.sysbench_skip_trx and (
-            int(workload.get("autocommit_verified_connections", 0))
-            != profile.sessions
-            or report.get("receiver_control_commit_advanced") is not True
-            or int(report.get("drain_survivor_count", -1)) != 0
-            or report.get("drain_outcome") != "NO_PRESERVABLE_TOKENS"
-            or report.get("receiver_ready_applicable") is not False
-        ):
-            raise RuntimeError("autocommit session-only handoff proof is incomplete")
+        if profile.sysbench_skip_trx:
+            if (int(workload.get("autocommit_verified_connections", 0))
+                    != profile.sessions):
+                raise RuntimeError("autocommit configuration proof is incomplete")
+            if (report.get("receiver_control_commit_advanced") is not True
+                    or int(report.get("drain_survivor_count", -1)) != 0
+                    or report.get("drain_outcome") != "NO_PRESERVABLE_TOKENS"
+                    or report.get("receiver_ready_applicable") is not False
+                    or int(report.get("receiver_ready_tokens", -1)) != 0
+                    or int(report.get("receiver_not_ready_tokens", -1)) != 0):
+                raise RuntimeError("autocommit session-only handoff proof is incomplete")
         interval_s = int(workload.get("report_interval_seconds", 0))
         expected_reports = int(
             math.ceil(profile.sysbench_runtime_s / interval_s)
@@ -3319,8 +3334,11 @@ def validate_e2e_report(
             failures.append("effective scheduler mode is not dependency V1")
         if report.get("effective_artifact_mode") != "STANDBY_TRANSFER_SAVE":
             failures.append("effective artifact mode is not standby transfer")
-        if int(report.get("effective_phase1_timeout_ms", 0)) != 60_000:
-            failures.append("effective Phase1 timeout is not 60000ms")
+        if int(report.get("effective_phase1_timeout_ms", 0)) != profile.drain_phase1_timeout_ms:
+            failures.append(
+                "effective Phase1 timeout does not match the profile: "
+                f"expected={profile.drain_phase1_timeout_ms}ms"
+            )
         if report.get("source_alive_after_drain") is not True:
             failures.append("source is not alive after DRAIN")
         if report.get("receiver_alive_after_drain") is not True:
@@ -4633,7 +4651,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--sysbench-rounds", type=int,
         help="dependency-sysbench: override the number of independent rounds",
     )
-    parser.add_argument("--sysbench-workload", choices=("oltp_write_only", "tpcc"),
+    parser.add_argument("--sysbench-workload", choices=("oltp_write_only", "oltp_read_write", "tpcc"),
                         default="oltp_write_only")
     parser.add_argument("--tpcc-warehouses", type=int)
     parser.add_argument("--tpcc-script-dir", type=Path)
@@ -4669,7 +4687,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--drain-phase1-timeout-ms",
         type=int,
-        help="diagnostic Phase1 preparation limit for dependency-continuous",
+        help="Phase1 preparation limit for dependency-continuous or dependency-sysbench",
     )
     parser.add_argument(
         "--receiver-transfer-max-inflight-bytes",
@@ -4949,16 +4967,19 @@ def main(
         args.evidence = forced_evidence
     if forced_large_tx_no_commit:
         args.large_tx_no_commit = True
-    if args.sysbench_skip_trx == "on" or args.sysbench_rounds is not None:
+    if (args.sysbench_skip_trx == "on" or args.sysbench_rounds is not None
+            or args.sysbench_workload != "oltp_write_only"):
         if args.evidence != "dependency-sysbench":
             raise RuntimeError("sysbench options require --evidence dependency-sysbench")
     if args.sysbench_rounds is not None and args.sysbench_rounds <= 0:
         raise RuntimeError("--sysbench-rounds must be positive")
     if args.drain_phase1_timeout_ms is not None:
-        if args.evidence != "dependency-continuous-large-tx-transfer":
+        if args.evidence not in {
+            "dependency-continuous-large-tx-transfer", "dependency-sysbench"
+        }:
             raise RuntimeError(
                 "--drain-phase1-timeout-ms is only valid for "
-                "dependency-continuous-large-tx-transfer"
+                "dependency-continuous-large-tx-transfer or dependency-sysbench"
             )
         if not 1 <= args.drain_phase1_timeout_ms < 2**32:
             raise RuntimeError(
@@ -5062,7 +5083,9 @@ def main(
     if args.evidence == "dependency-sysbench":
         profiles = [dataclasses.replace(
             profile,
-            name=profile.name + ("-autocommit" if args.sysbench_skip_trx == "on" else ""),
+            name=profile.name + ("-read-write" if args.sysbench_workload == "oltp_read_write" else "")
+                 + ("-autocommit" if args.sysbench_skip_trx == "on" else ""),
+            sysbench_workload=args.sysbench_workload,
             sysbench_skip_trx=args.sysbench_skip_trx == "on",
             formal_rounds=(args.sysbench_rounds
                            if args.sysbench_rounds is not None

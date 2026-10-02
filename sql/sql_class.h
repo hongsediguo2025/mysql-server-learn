@@ -22,6 +22,7 @@
 
 #ifndef SQL_CLASS_INCLUDED
 #define SQL_CLASS_INCLUDED
+#include "sql/preserve_trx_result_restore.h"
 
 /*
   This file contains the declaration of the THD class and classes which THD
@@ -387,6 +388,10 @@ class Prepared_statement;
 */
 
 class Prepared_statement_map {
+  friend class Preserve_trx_result_restore;
+  friend class Preserve_trx_result_pretransfer;
+  friend bool preserve_trx_result_transfer_capture(THD *, const std::string &,
+      std::string *, std::shared_ptr<const Preserve_trx_result_image> *);
  public:
   Prepared_statement_map();
 
@@ -1337,6 +1342,11 @@ class THD : public MDL_context_owner,
   bool is_killable;
   /** Owner-maintained upper bound, including PS cursors being opened. */
   std::atomic<uint32_t> preserve_trx_open_cursor_count{0};
+  // Unattached RESUME results must not be mistaken for an empty next handoff.
+  std::atomic<uint32_t> preserve_trx_pending_cursor_count{0};
+  std::unique_ptr<Preserve_trx_result_restore::Ready> preserve_trx_result_owner;
+  /** Owner-only instrumentation, armed by successful strict resource RESUME. */
+  bool preserve_trx_temp_first_dml_pending{false};
   /**
     Preserve/drain command-boundary state, protected by LOCK_thd_data.
 
@@ -1378,6 +1388,7 @@ class THD : public MDL_context_owner,
   ulonglong preserve_trx_phase2_aggregate_sequence{0};
   /** Outer SQL type, latched before BODY under LOCK_thd_data. */
   bool preserve_trx_phase2_outer_is_call{false};
+  bool preserve_trx_phase2_outer_is_multi_statement{false};
   std::atomic<Preserve_trx_phase2_command_stage>
       preserve_trx_phase2_command_stage{
           Preserve_trx_phase2_command_stage::IDLE};
@@ -1417,6 +1428,7 @@ class THD : public MDL_context_owner,
     session as a target just because the global manager is draining.
   */
   std::atomic<bool> preserve_trx_temp_table_batch_capture_epoch{false};
+  /** Ordinary PS sampling is requested only for a registered Phase 1 owner. */
   /**
     Sticky fail-closed marker for temp-table activity that could not be ordered
     in the participant journal. Preserve preflight rejects such sessions before

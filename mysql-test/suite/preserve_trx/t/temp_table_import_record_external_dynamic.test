@@ -1,0 +1,2 @@
+--let $layout_format= DYNAMIC
+--source suite/preserve_trx/include/temp_table_import_record_external.inc

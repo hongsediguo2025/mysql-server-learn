@@ -1,0 +1,6 @@
+SELECT @@global.rds_preserve_trx_temp_id_namespace AS namespace_enabled;
+--let $capture_case= receiver target dictionary preparation
+--let $capture_trace_name= temp_receiver_target_dictionary.trace
+--let $capture_fault= preserve_temp_import_source_undo_probe,preserve_temp_import_target_image_probe,preserve_temp_receiver_target_dictionary_probe
+--let $capture_trace_pattern= (?s)temporary receiver target dictionary checked tables=1 indexes=2 batches=[1-9][0-9]*.*temporary namespace requires standby transfer
+--source suite/preserve_trx/include/temp_table_capture_undo_failure.inc

@@ -1,0 +1,5 @@
+--let $capture_case= temporary capture protects source pool ownership
+--let $capture_trace_name= temp_capture_pool_lifetime.trace
+--let $capture_fault= preserve_temp_source_pool_probe,preserve_trx_fail_before_snapshot_fsync
+--let $capture_trace_pattern= temporary source pool capture isolated=1
+--source suite/preserve_trx/include/temp_table_capture_undo_failure.inc

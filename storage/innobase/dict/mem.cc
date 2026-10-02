@@ -143,7 +143,14 @@ void dict_mem_table_free(dict_table_t *table) /*!< in: table */
   }
 #endif /* !UNIV_HOTBACKUP */
 
+#if !defined(UNIV_HOTBACKUP) && !defined(UNIV_LIBRARY)
+  auto *preserve_memory = table->preserve_memory;
+#endif
   mem_heap_free(table->heap);
+#if !defined(UNIV_HOTBACKUP) && !defined(UNIV_LIBRARY)
+  if (preserve_memory != nullptr)
+    trx_preserve_temp_dictionary_memory_free(preserve_memory);
+#endif
 }
 
 /** System databases */
@@ -200,6 +207,9 @@ dict_table_t *dict_mem_table_create(
   ut_a(!(flags2 & DICT_TF2_UNUSED_BIT_MASK));
 #endif /* !UNIV_HOTBACKUP */
 
+  /* Classification can allocate strings. Finish it before native allocations
+  whose ownership cannot be returned if the classification throws. */
+  const bool is_system_table = dict_mem_table_is_system(name);
   heap = mem_heap_create(DICT_HEAP_SIZE);
 
   table = static_cast<dict_table_t *>(mem_heap_zalloc(heap, sizeof(*table)));
@@ -219,7 +229,7 @@ dict_table_t *dict_mem_table_create(
   table->flags = (unsigned int)flags;
   table->flags2 = (unsigned int)flags2;
   table->name.m_name = mem_strdup(name);
-  table->is_system_table = dict_mem_table_is_system(table->name.m_name);
+  table->is_system_table = is_system_table;
   table->space = (unsigned int)space;
   table->dd_space_id = dd::INVALID_OBJECT_ID;
   table->n_t_cols = (unsigned int)(n_cols + table->get_n_sys_cols());

@@ -33,6 +33,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -65,6 +66,11 @@ struct trx_preserve_temp_dict_column_binding {
   uint32_t len{0};
   /* Invisible/generated column shape must match before the sidecar is adopted. */
   bool visible{true};
+  /* Nonvirtual InnoDB column ordinals, in increasing order. SQL column order
+  in the enclosing binding determines virtual position; ordinary columns have
+  no dependency list. DATA_VIRTUAL is part of the persisted prtype contract. */
+  std::vector<uint32_t> base_columns;
+  bool is_virtual() const { return (prtype & 8192U) != 0; }
 };
 
 struct trx_preserve_temp_dict_index_field_binding {
@@ -84,6 +90,10 @@ struct trx_preserve_temp_dict_index_binding {
   uint32_t n_unique_fields{0};
   std::string name;
   std::vector<trx_preserve_temp_dict_index_field_binding> fields;
+  bool is_generated_cluster() const {
+    return clustered && !unique && n_unique_fields == 0 && fields.empty() &&
+           name == "GEN_CLUST_INDEX";
+  }
 };
 
 struct trx_preserve_temp_dict_table_binding {
@@ -94,11 +104,34 @@ struct trx_preserve_temp_dict_table_binding {
   /* Clustered root page and flags must match the rebuilt InnoDB dict object. */
   uint32_t clustered_root_page_no{0};
   uint32_t table_flags{0};
+  /* Native next allocation value; zero means no AUTO_INCREMENT column.
+  Captured at the command boundary, independently of the current row maximum. */
+  uint64_t autoinc_next{0};
   std::string schema_name;
   std::string table_name;
   std::vector<trx_preserve_temp_dict_column_binding> columns;
   std::vector<trx_preserve_temp_dict_index_binding> indexes;
+  bool virtual_columns_valid() const {
+    size_t stored = 0;
+    for (const auto &column : columns) stored += !column.is_virtual();
+    if (stored == 0) return false;
+    for (const auto &column : columns) {
+      if (!column.is_virtual() && !column.base_columns.empty()) return false;
+      uint32_t previous = 0;
+      bool first = true;
+      for (uint32_t base : column.base_columns) {
+        if (base >= stored || (!first && base <= previous)) return false;
+        first = false;
+        previous = base;
+      }
+    }
+    return true;
+  }
 };
+
+/** Compare rebuilt SQL expression dependencies to the imported native map.
+The TABLE is open but not exposed to the resumed session's next command. */
+bool trx_preserve_temp_virtual_columns_match(TABLE *table);
 
 struct trx_preserve_temp_bound_dict_index {
   uint64_t image_index_id{0};
@@ -118,7 +151,7 @@ struct trx_preserve_temp_bound_dict_column {
 
 struct trx_preserve_temp_dirty_page_image {
   /*
-    Last captured version of a changed page. capture_sequence records recency;
+    Version assigned while capturing the protected page, before TLS delivery;
     the vector stores one latest image per page and is not ordered by sequence.
   */
   uint32_t page_no{0};
@@ -150,6 +183,8 @@ struct trx_preserve_temp_no_redo_undo_page_image {
   trx_preserve_temp_no_redo_undo_page_kind kind{
       trx_preserve_temp_no_redo_undo_page_kind::UNDO_LOG};
   uint32_t page_no{0};
+  // Capture-only ordering; zero is an unversioned disk/serialized baseline.
+  uint64_t capture_sequence{0};
   std::vector<unsigned char> bytes;
 };
 
@@ -160,6 +195,7 @@ struct trx_preserve_temp_no_redo_undo_log_anchor {
   uint32_t hdr_offset{0};
   uint32_t last_page_no{0};
   uint32_t top_page_no{0};
+  /* Zero denotes a retained empty log, with top/last == header and undo_no=0. */
   uint32_t top_offset{0};
   uint64_t top_undo_no{0};
 };
@@ -205,6 +241,8 @@ struct trx_preserve_temp_space_image_descriptor {
   /* Physical image identity and format copied from the source temp tablespace. */
   uint32_t page_size{0};
   uint32_t space_flags{0};
+  /* Explicit undo-only input; never eligible for data-space attachment. */
+  bool undo_only{false};
   /* Durable physical image sidecar after baseline copy and page overlays. */
   uint64_t image_bytes{0};
   unsigned char image_digest[32]{};
@@ -212,7 +250,9 @@ struct trx_preserve_temp_space_image_descriptor {
   /* Phase-1 dirty-page stream state; not recoverable until sealed above. */
   uint64_t dirty_page_queue_limit_bytes{0};
   uint64_t dirty_page_bytes{0};
-  uint64_t dirty_page_next_sequence{1};
+  /* Runtime incarnation boundary, never serialized. A delayed TLS page from
+  an earlier registration cannot replace this stream's new baseline. */
+  uint64_t dirty_page_capture_floor{0};
   /*
     dirty_page_stream_armed reserves descriptor-local accounting; registered
     publishes the descriptor to page-write hooks.
@@ -220,6 +260,9 @@ struct trx_preserve_temp_space_image_descriptor {
   bool dirty_page_stream_armed{false};
   bool dirty_page_stream_registered{false};
   bool dirty_page_stream_degraded{false};
+  // Only ordinary prebuilds may discard a resource-exhausted candidate.
+  bool dirty_page_stream_optional{false};
+  bool dirty_page_stream_resource_exhausted{false};
   std::string dirty_page_stream_degraded_reason;
   Temp_table_warmcopy_participant *dirty_page_participant{nullptr};
   /*
@@ -229,8 +272,18 @@ struct trx_preserve_temp_space_image_descriptor {
   std::string dirty_page_resource_token;
   uint64_t dirty_page_memory_reserved_bytes{0};
   std::vector<trx_preserve_temp_dirty_page_image> dirty_pages;
+  /* Derived lookup; one slot per queued page, protected by the stream mutex.
+  It is discarded with the queue and is never serialized. */
+  std::map<uint32_t, size_t> dirty_page_index;
+  /* Versions survive nonterminal rounds: TLS delivery can be out of order. */
+  std::map<uint32_t, uint64_t> dirty_page_versions;
+  uint64_t dirty_page_version_memory_bytes{0};
+  uint64_t dirty_page_inflight_bytes{0};
+  bool dirty_page_round_active{false};
   /* True after queued latest-page images have been folded into the sidecar. */
   bool dirty_page_queue_durable{false};
+  /* Set only after every frozen terminal page reached the image writer. */
+  bool dirty_page_tail_complete{false};
   /*
     No-redo undo capture stores rseg identity, undo anchors, and classified
     pages. RSEG_HEADER and allocator pages are proof material: they are required
@@ -239,6 +292,7 @@ struct trx_preserve_temp_space_image_descriptor {
     memory.
   */
   bool no_redo_undo_capture_required{false};
+  uint64_t no_redo_undo_capture_floor{0};
   bool no_redo_undo_sidecar_sealed{false};
   bool no_redo_undo_capture_degraded{false};
   std::string no_redo_undo_capture_degraded_reason;
@@ -321,8 +375,6 @@ struct trx_preserve_temp_table_exported_metadata {
   trx_preserve_temp_dict_table_binding dict_binding;
 };
 
-bool trx_preserve_temp_space_image_preserves_source_space_id(
-    const trx_preserve_temp_space_image_descriptor &descriptor);
 
 bool trx_preserve_temp_space_image_reserve_space_id(
     const trx_preserve_temp_space_image_descriptor &descriptor);
@@ -333,10 +385,6 @@ bool trx_preserve_temp_space_image_reserve_or_keep_space_id(
 bool trx_preserve_temp_space_image_release_reserved_space_id(
     uint32_t source_space_id);
 
-dberr_t trx_preserve_temp_space_image_begin(
-    THD *thd, TABLE *source_table, uint32_t source_space_id,
-    uint32_t page_size, uint32_t space_flags,
-    trx_preserve_temp_space_image_descriptor *descriptor);
 
 dberr_t trx_preserve_temp_space_image_note_page(
     trx_preserve_temp_space_image_descriptor *descriptor, uint32_t page_no,
@@ -482,7 +530,8 @@ dberr_t trx_preserve_temp_space_image_release_no_redo_undo_reservations_from_sid
     size_t payload_length);
 
 dberr_t trx_preserve_temp_space_image_capture_no_redo_undo_from_trx(
-    trx_preserve_temp_space_image_descriptor *descriptor, const trx_t *trx);
+    trx_preserve_temp_space_image_descriptor *descriptor, const trx_t *trx,
+    bool standby_transfer = false);
 
 bool trx_preserve_temp_trx_has_no_redo_undo(const trx_t *trx);
 
@@ -502,7 +551,7 @@ dberr_t trx_preserve_temp_space_image_seal_no_redo_undo_sidecar(
 
 dberr_t trx_preserve_temp_space_image_build_no_redo_undo_sidecar_payload(
     const trx_preserve_temp_space_image_descriptor &descriptor,
-    std::string *payload);
+    std::string *payload, bool run_live_debug_probe = true);
 
 dberr_t trx_preserve_temp_space_image_cancel_no_redo_undo_capture(
     trx_preserve_temp_space_image_descriptor *descriptor);
@@ -523,8 +572,6 @@ trx_preserve_temp_space_image_no_redo_undo_capture_degraded_reason(
 bool trx_preserve_temp_space_image_no_redo_undo_pointers_reconnected(
     const trx_preserve_temp_space_image_descriptor &descriptor);
 
-size_t trx_preserve_temp_space_image_no_redo_undo_page_count(
-    const trx_preserve_temp_space_image_descriptor &descriptor);
 
 const trx_preserve_temp_no_redo_undo_page_image *
 trx_preserve_temp_space_image_no_redo_undo_page_at(
@@ -538,10 +585,6 @@ const trx_preserve_temp_no_redo_undo_log_anchor *
 trx_preserve_temp_space_image_no_redo_update_undo_anchor(
     const trx_preserve_temp_space_image_descriptor &descriptor);
 
-bool trx_preserve_temp_space_image_no_redo_undo_page_claim_slot(
-    const trx_preserve_temp_space_image_descriptor &descriptor,
-    const trx_preserve_temp_no_redo_undo_page_image &page,
-    uint32_t *undo_slot, bool *claim_page);
 
 /*
   Native-owned reconnect is allowed only after this step has made the restored
@@ -574,7 +617,8 @@ trx_preserve_temp_space_image_shadow_page_at(
 dberr_t trx_preserve_temp_space_image_arm_dirty_page_stream(
     trx_preserve_temp_space_image_descriptor *descriptor,
     Temp_table_warmcopy_participant *participant,
-    uint64_t queue_limit_bytes, const char *resource_token = nullptr);
+    uint64_t queue_limit_bytes, const char *resource_token = nullptr,
+    bool optional = false);
 
 dberr_t trx_preserve_temp_space_image_register_dirty_page_stream(
     trx_preserve_temp_space_image_descriptor *descriptor);
@@ -658,6 +702,11 @@ dberr_t trx_preserve_temp_space_image_bind_dict_table(
     trx_preserve_temp_space_image_descriptor *descriptor,
     const trx_preserve_temp_dict_table_binding &binding);
 
+/** Validate a DD binding without accessing the live dictionary or fil cache. */
+dberr_t trx_preserve_temp_space_image_validate_dict_binding(
+    const trx_preserve_temp_space_image_descriptor &descriptor,
+    const trx_preserve_temp_dict_table_binding &binding);
+
 /*
   Resume attachment API. adopt_preserved_fil_space attaches the physical image;
   bind/register exposes generated dictionary tables to the THD; drop/release
@@ -680,21 +729,33 @@ dberr_t trx_preserve_temp_space_image_unregister_dict_table_name_for_resume(
 dberr_t trx_preserve_temp_space_image_attach_to_thd(
     THD *thd, const trx_preserve_temp_space_image_descriptor &descriptor);
 
-dberr_t trx_preserve_temp_space_image_drop(
-    const trx_preserve_temp_space_image_descriptor &descriptor);
 
 dberr_t trx_preserve_temp_space_image_adopt_preserved_fil_space(
     trx_preserve_temp_space_image_descriptor *descriptor,
     const char *image_path);
 
+/** Revoke this exact descriptor's idle fil attachment, retaining its file and
+space ID reservation. No bound dictionary, session copy or connected legacy
+undo may remain. The caller exclusively owns the candidate until completion;
+failure retains the registry/descriptor responsibility for a later retry.
+Unlike legacy retry cleanup, this never destroys prepared dictionary/undo. */
+dberr_t trx_preserve_temp_space_image_forget_unbound_fil_space(
+    trx_preserve_temp_space_image_descriptor *descriptor);
+
+#ifndef NDEBUG
 dberr_t trx_preserve_temp_space_image_drop_preserved_fil_space(
     trx_preserve_temp_space_image_descriptor *descriptor);
+#endif
 
 dberr_t trx_preserve_temp_space_image_drop_preserved_fil_space_by_space_id(
     uint32_t source_space_id);
 
+/** Delete one idle native table under exclusive session ownership. Busy or
+invalid input leaves the binding intact. table_removed becomes true once the
+table is freed, even if subsequent fil/file cleanup fails; callers must then
+unregister their handler. A cleanup error does not restore SQL TABLE state. */
 dberr_t trx_preserve_temp_space_image_drop_bound_table_by_space_id(
-    uint32_t source_space_id, dict_table_t *table);
+    uint32_t source_space_id, dict_table_t *table, bool *table_removed = nullptr);
 
 bool trx_preserve_temp_space_image_fil_space_adopted_by_space_id(
     uint32_t source_space_id);

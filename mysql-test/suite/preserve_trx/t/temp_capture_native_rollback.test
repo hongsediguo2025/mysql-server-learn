@@ -1,0 +1,2 @@
+--let $contract_native_rollback= 1
+--source suite/preserve_trx/t/temp_capture_native_early.test

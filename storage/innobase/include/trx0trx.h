@@ -213,7 +213,7 @@ dberr_t trx_prepare_for_mysql(trx_t *trx);
 Prepare a transaction for Preserve without releasing transaction locks.
 @param[in,out] trx Transaction instance to prepare.
 @return DB_SUCCESS or error number. */
-dberr_t trx_freeze_for_preserve(trx_t *trx);
+dberr_t trx_freeze_for_preserve(trx_t *trx, bool read_context = false);
 
 /** This function is used to find number of prepared transactions and
  their transaction objects for a recovery.
@@ -878,6 +878,8 @@ enum class trx_preserve_undo_contract : uint8_t {
 };
 
 struct trx_t {
+  /** Optional private temporary-undo capture generation; never a raw owner. */
+  uint64_t preserve_temp_undo_cookie;
   enum isolation_level_t {
 
     /** dirty read: non-locking SELECTs are performed so that we

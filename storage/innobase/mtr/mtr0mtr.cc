@@ -47,6 +47,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #ifndef UNIV_HOTBACKUP
 #include "page0types.h"
 #include "trx0temp_preserve.h"
+#include "trx0temp_preserve_undo_capture.h"
 #include "trx0purge.h"
 #endif /* !UNIV_HOTBACKUP */
 
@@ -276,7 +277,7 @@ struct Add_dirty_blocks_to_flush_list {
                                   added to REDO by the MTR
   @param[in,out]	observer	flush observer */
   Add_dirty_blocks_to_flush_list(lsn_t start_lsn, lsn_t end_lsn,
-                                 FlushObserver *observer);
+                                 FlushObserver *observer, uint64_t undo_cookie);
 
   /** Add the modified page to the buffer flush list. */
   void add_dirty_page_to_flush_list(mtr_memo_slot_t *slot) const {
@@ -291,6 +292,10 @@ struct Add_dirty_blocks_to_flush_list {
       (void)trx_preserve_temp_space_image_stage_dirty_page(
           block->page.id.space(), block->page.id.page_no(), block->frame,
           UNIV_PAGE_SIZE);
+      if (m_undo_cookie)
+        trx_preserve_temp_undo_capture_page(m_undo_cookie,
+            block->page.id.space(), block->page.id.page_no(), block->frame,
+            UNIV_PAGE_SIZE);
     }
 
     buf_flush_note_modification(block, m_start_lsn, m_end_lsn,
@@ -326,6 +331,7 @@ struct Add_dirty_blocks_to_flush_list {
 
   /** Flush observer */
   FlushObserver *const m_flush_observer;
+  const uint64_t m_undo_cookie;
 };
 
 /** Constructor.
@@ -335,8 +341,9 @@ struct Add_dirty_blocks_to_flush_list {
                                 to REDO by the MTR
 @param[in,out]	observer	flush observer */
 Add_dirty_blocks_to_flush_list::Add_dirty_blocks_to_flush_list(
-    lsn_t start_lsn, lsn_t end_lsn, FlushObserver *observer)
-    : m_end_lsn(end_lsn), m_start_lsn(start_lsn), m_flush_observer(observer) {
+    lsn_t start_lsn, lsn_t end_lsn, FlushObserver *observer, uint64_t undo_cookie)
+    : m_end_lsn(end_lsn), m_start_lsn(start_lsn), m_flush_observer(observer),
+      m_undo_cookie(undo_cookie) {
   /* Do nothing */
 }
 
@@ -425,6 +432,21 @@ bool mtr_t::s_mode_update_valid[MTR_LOG_MODE_MAX][MTR_LOG_MODE_MAX] = {
 #ifndef UNIV_HOTBACKUP
 mtr_t::Logging mtr_t::s_logging;
 #endif /* !UNIV_HOTBACKUP */
+
+void mtr_t::set_preserve_temp_undo_cookie(uint64_t cookie) {
+  auto &current = m_impl.m_preserve_temp_undo_cookie;
+  if (!current || current == cookie) {
+    current = cookie;
+    return;
+  }
+  // Never guess ownership if a future native path mixes undo owners. Closing
+  // only revokes optional capture; no memory is freed with page latches held.
+#ifndef UNIV_HOTBACKUP
+  trx_preserve_temp_undo_capture_close(current);
+  trx_preserve_temp_undo_capture_close(cookie);
+#endif
+  current = UINT64_MAX;
+}
 
 mtr_log_t mtr_t::set_log_mode(mtr_log_t mode) {
   ut_ad(mode < MTR_LOG_MODE_MAX);
@@ -554,6 +576,7 @@ void mtr_t::start(bool sync, bool read_only) {
   m_impl.m_n_log_recs = 0;
   m_impl.m_state = MTR_STATE_ACTIVE;
   m_impl.m_flush_observer = nullptr;
+  m_impl.m_preserve_temp_undo_cookie = 0;
   m_impl.m_marked_nolog = false;
 
 #ifndef UNIV_HOTBACKUP
@@ -776,7 +799,7 @@ void mtr_t::Command::release_all() {
 void mtr_t::Command::add_dirty_blocks_to_flush_list(lsn_t start_lsn,
                                                     lsn_t end_lsn) {
   Add_dirty_blocks_to_flush_list add_to_flush(start_lsn, end_lsn,
-                                              m_impl->m_flush_observer);
+      m_impl->m_flush_observer, m_impl->m_preserve_temp_undo_cookie);
 
   Iterate<Add_dirty_blocks_to_flush_list> iterator(add_to_flush);
 

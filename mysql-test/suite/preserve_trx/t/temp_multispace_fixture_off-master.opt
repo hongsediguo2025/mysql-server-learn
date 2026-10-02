@@ -1,0 +1,2 @@
+--rds-preserve-trx-enable=OFF
+--rds-preserve-trx-temp-table-enable=OFF

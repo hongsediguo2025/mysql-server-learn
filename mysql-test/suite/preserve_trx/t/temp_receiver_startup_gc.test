@@ -1,0 +1,156 @@
+--source include/not_windows.inc
+--source include/not_as_root.inc
+--source include/force_restart.inc
+--disable_query_log
+CREATE TABLE t_temp_gc (id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO t_temp_gc VALUES (1,10),(2,20),(3,30),(4,40);
+INSERT INTO t_temp_gc SELECT id+4,v+40 FROM t_temp_gc;
+INSERT INTO t_temp_gc SELECT id+8,v+80 FROM t_temp_gc;
+INSERT INTO t_temp_gc SELECT id+16,v+160 FROM t_temp_gc;
+INSERT INTO t_temp_gc SELECT id+32,v+320 FROM t_temp_gc;
+--let MYSQLD_DATADIR= `SELECT @@datadir`
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+SHUTDOWN;
+--source include/wait_until_disconnected.inc
+
+--perl
+use strict;
+use warnings;
+use File::Path qw(make_path);
+use File::Spec;
+use POSIX qw(mkfifo);
+my $data = $ENV{'MYSQLD_DATADIR'};
+my $root = File::Spec->catdir($data, 'preserve', '.temp_receiver');
+my $outside = File::Spec->catdir($data, 'temp-gc-outside');
+make_path($root, $outside, {mode => 0700});
+sub put {
+  my ($name, $content) = @_;
+  open(my $f, '>', $name) or die "$name: $!";
+  print {$f} $content;
+  close($f) or die "$name close: $!";
+}
+put("$outside/sentinel", 'keep');
+for my $c ('a','b','c','d','e') {
+  my $boot = $c x 32;
+  make_path("$root/$boot/temp-import-fixture/install", {mode => 0700});
+  put("$root/$boot/temp-import-fixture/install/sentinel", 'garbage');
+  next if $c eq 'c'; # Unmarked directory must not be inferred from its name.
+  if ($c eq 'e') { mkfifo("$root/$boot.owner", 0600) == 0 or die $!; next; }
+  put("$root/$boot.owner", $c eq 'd' ? 'invalid' : "preserve-trx-temp-receiver-v1\n$boot\n");
+}
+my $good = 'a' x 32;
+for (1..260) { put("$root/$good/temp-import-fixture/install/p$_", 'garbage'); }
+symlink($outside, "$root/$good/external") or die $!;
+my $blocked = 'b' x 32;
+chmod(0000, "$root/$blocked") or die $!;
+EOF
+
+# OFF does no new GC work, regardless of owned old-boot artifacts.
+--exec echo "restart: --rds-preserve-trx-enable=OFF --rds-preserve-trx-transfer-artifact-mode=LOCAL_CARRIER" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--disable_result_log
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+--enable_result_log
+--disable_query_log
+SELECT COUNT(*)=64 AND SUM(v)=20800 AS background_ok FROM t_temp_gc;
+SELECT COUNT(*)=4 AND SUM(CAST(VARIABLE_VALUE AS UNSIGNED))=0 AS off_gc_untouched
+  FROM performance_schema.global_status WHERE VARIABLE_NAME IN
+  ('Preserve_trx_temp_gc_scanned','Preserve_trx_temp_gc_removed',
+   'Preserve_trx_temp_gc_errors','Preserve_trx_temp_gc_passes');
+--perl
+my $root = "$ENV{'MYSQLD_DATADIR'}/preserve/.temp_receiver";
+my $good = 'a' x 32;
+die "OFF removed old receiver files" unless -f "$root/$good/temp-import-fixture/install/p260";
+EOF
+
+# LOCAL may also be a receiver. Its reaper removes only old private boots;
+# an inaccessible sibling must neither delay startup nor block good siblings.
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=LOCAL_CARRIER
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--disable_query_log
+--let $wait_timeout= 30
+--let $wait_condition= SELECT CAST(VARIABLE_VALUE AS UNSIGNED)>0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_temp_gc_passes'
+--source include/wait_condition.inc
+SELECT CAST(VARIABLE_VALUE AS UNSIGNED)>0 AS deletion_failure_observed FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_temp_gc_errors';
+START TRANSACTION;
+UPDATE t_temp_gc SET v=v+1 WHERE id<=32;
+COMMIT;
+SELECT COUNT(*)=64 AND SUM(v)=20832 AS background_survived FROM t_temp_gc;
+--perl
+use strict;
+use warnings;
+my $data = $ENV{'MYSQLD_DATADIR'};
+my $root = "$data/preserve/.temp_receiver";
+my $good = 'a' x 32;
+my $blocked = 'b' x 32;
+die "valid old boot not removed" if -e "$root/$good" || -e "$root/$good.owner";
+die "failed directory lost ownership" unless -d "$root/$blocked" && -f "$root/$blocked.owner";
+die "symlink target removed" unless -f "$data/temp-gc-outside/sentinel";
+for my $c ('c','d','e') {
+  my $boot = $c x 32;
+  die "unowned files removed" unless -f "$root/$boot/temp-import-fixture/install/sentinel";
+}
+chmod(0700, "$root/$blocked") or die $!;
+my $until = time()+30;
+while (-e "$root/$blocked" || -e "$root/$blocked.owner") {
+  die "GC did not retry failed boot" if time() >= $until;
+  select(undef, undef, undef, 0.05);
+}
+EOF
+
+# STANDBY startup must leave the namespace to the reaper. Unknown ownership
+# stays untouched across either mode; no local recovery/RESET is exercised.
+--let $removed_before= query_get_value(SHOW GLOBAL STATUS LIKE 'Preserve_trx_temp_gc_removed', Value, 1)
+--perl
+use strict;
+use warnings;
+my $root = "$ENV{'MYSQLD_DATADIR'}/preserve/.temp_receiver";
+my $boot = 'f' x 32;
+open(my $marker, '>', "$root/$boot.owner") or die $!;
+print {$marker} "preserve-trx-temp-receiver-v1\n$boot\n";
+close($marker) or die $!;
+mkdir("$root/$boot", 0700) or die $!;
+for (1..1024) {
+  open(my $file, '>', "$root/$boot/$_") or die $!;
+  print {$file} 'garbage';
+  close($file) or die $!;
+}
+EOF
+--let $wait_timeout= 30
+--let $wait_condition= SELECT CAST(VARIABLE_VALUE AS UNSIGNED)>$removed_before+64 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_temp_gc_removed'
+--source include/wait_condition.inc
+--perl
+my $root = "$ENV{'MYSQLD_DATADIR'}/preserve/.temp_receiver";
+my $boot = 'f' x 32;
+die "large tree was not processed incrementally" unless -d "$root/$boot" && -f "$root/$boot.owner";
+EOF
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--disable_query_log
+--let $wait_timeout= 30
+--let $wait_condition= SELECT CAST(VARIABLE_VALUE AS UNSIGNED)>0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_temp_gc_passes'
+--source include/wait_condition.inc
+--perl
+use strict;
+use warnings;
+use File::Path qw(remove_tree);
+my $data = $ENV{'MYSQLD_DATADIR'};
+my $root = "$data/preserve/.temp_receiver";
+my $interrupted = 'f' x 32;
+die "interrupted cleanup lost its progress" if -e "$root/$interrupted" || -e "$root/$interrupted.owner";
+for my $c ('c','d','e') {
+  my $boot = $c x 32;
+  die "unowned files removed at standby startup" unless -f "$root/$boot/temp-import-fixture/install/sentinel";
+  remove_tree("$root/$boot");
+  unlink("$root/$boot.owner") if -e "$root/$boot.owner";
+}
+remove_tree("$data/temp-gc-outside");
+EOF
+SELECT COUNT(*)=64 AND SUM(v)=20832 AS data_after_restarts FROM t_temp_gc;
+DROP TABLE t_temp_gc;
+--enable_query_log

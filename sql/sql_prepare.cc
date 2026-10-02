@@ -160,6 +160,9 @@ When one supplies long data for a placeholder:
 #include "sql/sql_cmd_ddl_table.h"
 #include "sql/sql_const.h"
 #include "sql/sql_cursor.h"  // Server_side_cursor
+#include "sql/preserve_trx_cursor.h"
+#include "sql/preserve_trx_result_cursor.h"
+#include "sql/preserve_trx_temp_metrics.h"
 #include "sql/sql_db.h"      // mysql_change_db
 #include "sql/sql_digest_stream.h"
 #include "sql/sql_handler.h"  // mysql_ha_rm_tables
@@ -214,6 +217,11 @@ class Query_fetch_protocol_binary final : public Query_result_send {
  public:
   explicit Query_fetch_protocol_binary(THD *thd)
       : Query_result_send(), protocol(thd) {}
+  bool initialize_preserved(const Preserve_trx_cursor_decoder &decoder) {
+    return protocol.initialize_preserved_metadata(
+        decoder.items().size(), decoder.types(), decoder.result_charset());
+  }
+  bool bind_preserved(THD *thd) { return protocol.bind_preserved(thd); }
   bool send_result_set_metadata(THD *thd, const mem_root_deque<Item *> &list,
                                 uint flags) override;
   bool send_data(THD *thd, const mem_root_deque<Item *> &items) override;
@@ -1963,8 +1971,15 @@ void mysql_sql_stmt_execute(THD *thd) {
 void mysqld_stmt_fetch(THD *thd, Prepared_statement *stmt, ulong num_rows) {
   DBUG_TRACE;
   thd->status_var.com_stmt_fetch++;
-  const auto cursor_count_guard = create_scope_guard(
-      [&]() { stmt->update_preserve_cursor_count(); });
+  DBUG_EXECUTE_IF("preserve_cursor_restore_verify", {
+    DBUG_ASSERT(preserve_trx_restore_cursor_for_test(stmt));
+  });
+  const auto cursor_count_guard = create_scope_guard([&]() {
+    stmt->update_preserve_cursor_count();
+    DBUG_EXECUTE_IF("preserve_cursor_snapshot_verify", {
+      if (!thd->is_error()) preserve_trx_cursor_verify_snapshot(stmt->cursor);
+    });
+  });
 
   Server_side_cursor *cursor = stmt->cursor;
   if (cursor == nullptr || !cursor->is_open()) {
@@ -2186,6 +2201,20 @@ bool Reprepare_observer::report_error(THD *thd) {
   return true;
 }
 
+Query_result_send *preserve_trx_create_cursor_sender(
+    THD *thd, MEM_ROOT *root, const Preserve_trx_cursor_decoder &decoder) {
+  auto *sender = new (root) Query_fetch_protocol_binary(thd);
+  if (sender != nullptr && sender->initialize_preserved(decoder)) {
+    destroy(sender);
+    return nullptr;
+  }
+  return sender;
+}
+
+bool preserve_trx_bind_cursor_sender(Query_result_send *sender, THD *thd) {
+  return static_cast<Query_fetch_protocol_binary *>(sender)->bind_preserved(thd);
+}
+
 /**
   Requests for repreparation of statement.
   @returns true if request has been placed.
@@ -2298,6 +2327,11 @@ Prepared_statement::Prepared_statement(THD *thd_arg)
 void Prepared_statement::close_cursor() {
   if (cursor == nullptr) return;
   cursor->close();
+  if (m_preserved_cursor) {
+    cursor = m_original_cursor;
+    m_original_cursor = nullptr;
+    m_preserved_cursor.reset();
+  }
   update_preserve_cursor_count();
 }
 
@@ -2947,6 +2981,7 @@ bool Prepared_statement::check_parameter_types() {
 
 bool Prepared_statement::execute_loop(String *expanded_query,
                                       bool open_cursor) {
+  Preserve_trx_temp_first_dml_timer first_dml(thd, lex);
   const int MAX_REPREPARE_ATTEMPTS = 3;
   Reprepare_observer reprepare_observer;
   bool error;
@@ -3306,6 +3341,8 @@ void Prepared_statement::swap_prepared_statement(Prepared_statement *copy) {
   std::swap(result, copy->result);
   // Need a new cursor, if requested
   std::swap(cursor, copy->cursor);
+  std::swap(m_preserved_cursor, copy->m_preserved_cursor);
+  std::swap(m_original_cursor, copy->m_original_cursor);
   std::swap(m_preserve_cursor_counted, copy->m_preserve_cursor_counted);
 
   DBUG_ASSERT(thd == copy->thd);
@@ -3474,7 +3511,9 @@ bool Prepared_statement::execute(String *expanded_query, bool open_cursor) {
         result = new (m_arena.mem_root) Query_result_send();
       if (!result) {
         error = true;  // OOM
-      } else if ((error = mysql_open_cursor(thd, result, &cursor))) {
+      } else if ((error = mysql_open_cursor(thd, result, &cursor,
+                      !is_sql_prepare() && preserve_trx_cursor_capture_enabled(thd)
+                          ? static_cast<uint32_t>(id) : 0))) {
         // Destroy result if cursor was never created
         if (cursor == nullptr) {
           destroy(result);
@@ -3516,7 +3555,19 @@ bool Prepared_statement::execute(String *expanded_query, bool open_cursor) {
       bool switched = mgr_ptr->switch_resource_group_if_needed(
           thd, &src_res_grp, &dest_res_grp, &ticket, &cur_ticket);
 
-      error = mysql_execute_command(thd, true);
+      {
+        // A previous cursor execution retains its materializing result sink.
+        // Return rows directly now, retaining the sink for later cursor use.
+        Sql_cmd_dml *cursor_cmd =
+            cursor != nullptr ? down_cast<Sql_cmd_dml *>(lex->m_sql_cmd) : nullptr;
+        Query_result *saved_result =
+            cursor_cmd != nullptr ? cursor_cmd->query_result() : nullptr;
+        if (cursor_cmd != nullptr) cursor_cmd->set_query_result(result);
+        auto restore_result = create_scope_guard([&] {
+          if (cursor_cmd != nullptr) cursor_cmd->set_query_result(saved_result);
+        });
+        error = mysql_execute_command(thd, true);
+      }
 
       if (switched)
         mgr_ptr->restore_original_resource_group(thd, src_res_grp,

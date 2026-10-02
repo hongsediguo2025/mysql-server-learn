@@ -1,0 +1,3 @@
+# Internal fault probe; authenticated dependencies must be rejected.
+--let $contract_undo_delta_fault= order
+--source suite/preserve_trx/t/temp_capture_undo_delta.test

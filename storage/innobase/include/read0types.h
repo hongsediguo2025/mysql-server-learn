@@ -187,6 +187,21 @@ class ReadView {
   @return true if view sees transaction id */
   bool sees(trx_id_t id) const { return (id < m_up_limit_id); }
 
+  /** No-allocation history fence for strict Preserve import while purge stops. */
+  bool preserve_covers(trx_id_t low_id, trx_id_t low_no, trx_id_t creator,
+                       const std::vector<trx_id_t> &ids) const {
+    if (m_low_limit_id > low_id || m_low_limit_no > low_no) return false;
+    const auto visible = [&](trx_id_t id) {
+      if (id < m_up_limit_id || id == m_creator_trx_id) return true;
+      if (id >= m_low_limit_id) return false;
+      return m_ids.empty() || !std::binary_search(
+          m_ids.data(), m_ids.data() + m_ids.size(), id);
+    };
+    if (creator == 0 || visible(creator)) return false;
+    for (auto id : ids) if (visible(id)) return false;
+    return true;
+  }
+
   /**
   Mark the view as closed */
   void close() {

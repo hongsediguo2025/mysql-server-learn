@@ -1,0 +1,68 @@
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+SELECT @@global.rds_preserve_trx_temp_id_namespace AS namespace_enabled,
+  @@global.rds_preserve_trx_enable AS preserve_enabled;
+
+# The namespace is a process-lifetime allocation policy, including when
+# transaction preservation is disabled. No transfer/promotion is simulated.
+CREATE TABLE t_id_namespace(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO t_id_namespace VALUES (1,10),(2,20),(3,30);
+CREATE TEMPORARY TABLE tmp_id_namespace(
+  id INT PRIMARY KEY, v INT, KEY(v)) ENGINE=InnoDB;
+INSERT INTO tmp_id_namespace SELECT * FROM t_id_namespace;
+SELECT COUNT(*)=1 AND MIN(TABLE_ID)>=9223372036854775808
+  AND MAX(TABLE_ID)<18446744069414584320 AS temporary_domain
+  FROM information_schema.INNODB_TEMP_TABLE_INFO;
+SELECT TABLE_ID<9223372036854775808 AS persistent_domain
+  FROM information_schema.INNODB_TABLES WHERE NAME='test/t_id_namespace';
+SET @first_id=(SELECT MAX(TABLE_ID)
+  FROM information_schema.INNODB_TEMP_TABLE_INFO);
+START TRANSACTION;
+UPDATE tmp_id_namespace SET v=v+100 WHERE id<=2;
+DELETE FROM tmp_id_namespace WHERE id=3;
+INSERT INTO tmp_id_namespace VALUES(4,40);
+UPDATE t_id_namespace SET v=v+1;
+ROLLBACK;
+SELECT COUNT(*)=3 AND SUM(id)=6 AND SUM(v)=60 AS rollback_ok
+  FROM tmp_id_namespace;
+SELECT SUM(v)=60 AS persistent_rollback_ok FROM t_id_namespace;
+
+SET GLOBAL rds_preserve_trx_temp_table_enable=OFF;
+--connect(id_reader,localhost,root,,test)
+CREATE TEMPORARY TABLE tmp_id_reader(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO tmp_id_reader VALUES(1,7),(2,9);
+START TRANSACTION READ ONLY;
+UPDATE tmp_id_reader SET v=v+2;
+ROLLBACK;
+SELECT SUM(v)=16 AS readonly_rollback_ok FROM tmp_id_reader;
+--connection default
+SELECT COUNT(*)=2 AND COUNT(DISTINCT TABLE_ID)=2 AND MIN(TABLE_ID)=@first_id
+  AND MAX(TABLE_ID)>@first_id AS local_ids_isolated
+  FROM information_schema.INNODB_TEMP_TABLE_INFO;
+TRUNCATE TABLE tmp_id_namespace;
+INSERT INTO tmp_id_namespace VALUES(8,80),(9,90);
+SELECT COUNT(*)=2 AND SUM(v)=170 AS truncate_ok FROM tmp_id_namespace;
+ALTER TABLE tmp_id_namespace
+  ADD COLUMN v2 INT GENERATED ALWAYS AS (v+id) VIRTUAL, ADD KEY(v2);
+START TRANSACTION;
+UPDATE tmp_id_namespace SET v=v+1 WHERE id=8;
+DELETE FROM tmp_id_namespace WHERE id=9;
+INSERT INTO tmp_id_namespace(id,v) VALUES(10,100);
+ROLLBACK;
+SELECT COUNT(*)=2 AND SUM(v2)=187 AS virtual_index_rollback
+  FROM tmp_id_namespace FORCE INDEX(v2);
+CREATE TABLE t_id_after(id INT PRIMARY KEY) ENGINE=InnoDB;
+INSERT INTO t_id_after SELECT id FROM tmp_id_namespace;
+SELECT COUNT(*)=2 AND MAX(TABLE_ID)<9223372036854775808 AS persistent_ids_low
+  FROM information_schema.INNODB_TABLES
+  WHERE NAME IN ('test/t_id_namespace','test/t_id_after');
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
+DROP TEMPORARY TABLE tmp_id_namespace;
+--connection id_reader
+SELECT SUM(v)=16 AS existing_session_intact FROM tmp_id_reader;
+DROP TEMPORARY TABLE tmp_id_reader;
+--disconnect id_reader
+--connection default
+DROP TABLE t_id_namespace, t_id_after;
+SELECT COUNT(*)=0 AS temporary_cleanup
+  FROM information_schema.INNODB_TEMP_TABLE_INFO;

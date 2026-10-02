@@ -2970,7 +2970,11 @@ dberr_t row_create_index_for_mysql(
   just updates dictonary cache. */
   if (!table->is_temporary()) {
     /* Create B-tree */
-    dict_build_index_def(table, index, trx);
+    err = dict_build_index_def(table, index, trx);
+    if (err != DB_SUCCESS) {
+      dict_mem_index_free(index);
+      goto error_handling;
+    }
 
     err = dict_index_add_to_cache_w_vcol(table, index, nullptr, FIL_NULL,
                                          trx_is_strict(trx));
@@ -2988,7 +2992,11 @@ dberr_t row_create_index_for_mysql(
     }
 
   } else {
-    dict_build_index_def(table, index, trx);
+    err = dict_build_index_def(table, index, trx);
+    if (err != DB_SUCCESS) {
+      dict_mem_index_free(index);
+      goto error_handling;
+    }
 #ifdef UNIV_DEBUG
     space_index_t index_id = index->id;
 #endif
@@ -3789,7 +3797,11 @@ and reacquire dict_operation_lock
 @param[in,out]	handler		Table handler or NULL
 @return error code or DB_SUCCESS */
 dberr_t row_drop_table_for_mysql(const char *name, trx_t *trx, bool nonatomic,
-                                 dict_table_t *handler) {
+                                 dict_table_t *handler,
+                                 table_id_t *removed_temp_id,
+                                 space_id_t *removed_temp_space) {
+  if (removed_temp_id != nullptr) *removed_temp_id = 0;
+  if (removed_temp_space != nullptr) *removed_temp_space = 0;
   dberr_t err = DB_SUCCESS;
   dict_table_t *table = nullptr;
   char *filepath = nullptr;
@@ -4130,6 +4142,10 @@ dberr_t row_drop_table_for_mysql(const char *name, trx_t *trx, bool nonatomic,
   if (err != DB_SUCCESS) {
     ut_ad(0);
     goto funct_exit;
+  }
+  if (is_temp) {
+    if (removed_temp_id != nullptr) *removed_temp_id = table_id;
+    if (removed_temp_space != nullptr) *removed_temp_space = space_id;
   }
 
   if (!is_temp) {

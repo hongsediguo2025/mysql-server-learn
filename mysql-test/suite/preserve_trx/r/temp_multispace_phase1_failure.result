@@ -1,0 +1,28 @@
+# Phase1 failure after undo write releases untransferred image and undo
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SELECT COUNT(*)=2 AND SUM(k='' AND n=1 AND v='')=1
+AND SUM(k='c' AND n=3 AND v=0x00ff)=1 AS captured_key_ok FROM tmp_undo_key;
+captured_key_ok
+1
+SELECT COUNT(*)=64 AND SUM(v)=8933 AS captured_aux_ok FROM tmp_undo_aux;
+captured_aux_ok
+1
+SELECT COUNT(*)=2 AND SUM(k='' AND n IS NULL AND v='')=1
+AND SUM(k='b' AND n=2 AND v=0xff)=1 AS key_rollback_ok FROM tmp_undo_key;
+key_rollback_ok
+1
+SELECT COUNT(*)=64 AND SUM(v)=2080 AS aux_rollback_ok FROM tmp_undo_aux;
+aux_rollback_ok
+1
+SELECT COUNT(*)=64 AND SUM(v)=20800 AS persistent_rollback_ok FROM t_undo_multi_base;
+persistent_rollback_ok
+1
+SELECT n=7 AND v='' AS key_commit_ok FROM tmp_undo_key WHERE k='';
+key_commit_ok
+1
+SELECT v=7 AS aux_commit_ok FROM tmp_undo_aux WHERE id=1;
+aux_commit_ok
+1
+SELECT v=7 AS persistent_commit_ok FROM t_undo_multi_base WHERE id=1;
+persistent_commit_ok
+1

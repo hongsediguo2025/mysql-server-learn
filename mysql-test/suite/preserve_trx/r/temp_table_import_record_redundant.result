@@ -1,0 +1,24 @@
+# native record layout: REDUNDANT
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SELECT COUNT(*)=898 AS captured_rows_ok FROM tmp_record_layout;
+captured_rows_ok
+1
+SELECT COUNT(*)=1024 AND SUM(id)=524800 AND SUM(n IS NULL)=512
+AND SUM(n IS NOT NULL AND n=id)=512
+AND SUM(v IS NULL)=128 AND SUM(b IS NULL)=128
+AND SUM(v=REPEAT('a',ELT(MOD(id,8),0,1,127,128,255,256,512)))=896
+AND SUM(b=REPEAT(0xff,ELT(MOD(id,8),0,1,127,128,255,256,512)))=896
+AND SUM(u IS NULL)=341
+AND SUM(u=CONCAT(CONVERT(0xe4b8adf09f9982 USING utf8mb4),id))=683
+AS rollback_contents_ok FROM tmp_record_layout;
+rollback_contents_ok
+1
+SELECT COUNT(*)=1024 AND SUM(v)=5248000 AS persistent_rollback_ok FROM t_temp_layout_base;
+persistent_rollback_ok
+1
+SELECT n=777 AS temporary_commit_ok FROM tmp_record_layout WHERE id=1;
+temporary_commit_ok
+1
+SELECT v=777 AS persistent_commit_ok FROM t_temp_layout_base WHERE id=1;
+persistent_commit_ok
+1

@@ -16,6 +16,11 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include "sql/preserve_trx_result_restore.h"
+#include "sql/preserve_trx_recovery_contract.h"
+#include "sql/preserve_trx_temp_id_contract.h"
+#include "sql/preserve_trx_temp_receiver.h"
+#include "sql/preserve_trx_temp_restore.h"
 
 #include "storage/innobase/include/lock0preserve_plan.h"
 
@@ -246,6 +251,7 @@ std::string preserved_trx_strict_attach_intent_journal_id(
     const Preserve_trx_prepared_token_key &key);
 
 struct Preserve_trx_final_token_facts {
+  Preserve_trx_temp_id_contract temp_id_contract;
   uint64_t required_apply_lsn{0};
   uint64_t physical_fence_lsn{0};
   uint64_t source_trx_id_store{0};
@@ -298,6 +304,10 @@ class Preserve_trx_prepared_token_resources {
   uint64_t native_binlog_bytes() const;
   bool has_record_lock_plan() const;
   bool has_semantic_bundle() const;
+  bool temp_id_contract_bound() const;
+  Preserve_trx_temp_id_contract temp_id_contract() const;
+  bool result_resources_ready() const;
+  bool temp_resources_ready() const;
   bool has_native_binlog_handle() const;
   bool native_binlog_file_backed() const;
   bool has_resurrection_entry() const;
@@ -308,7 +318,14 @@ class Preserve_trx_prepared_token_resources {
       std::unique_ptr<lock_preserve_metadata_plan_t> plan,
       Preserve_memory_lease &&memory_lease);
   Preserve_trx_prepared_status install_semantic_bundle(
-      std::unique_ptr<Preserved_trx_bundle> bundle);
+      std::unique_ptr<Preserved_trx_bundle> bundle,
+      Preserve_memory_lease memory = {},
+      const Preserve_trx_temp_id_contract &temp_id_contract = {});
+  /** Install after the semantic bundle; failure leaves the caller's owner. */
+  Preserve_trx_prepared_status install_result_ready(
+      std::unique_ptr<Preserve_trx_result_restore::Ready> *ready);
+  Preserve_trx_prepared_status install_temp_ready(
+      Preserve_trx_temp_receiver_work::Owner *ready);
   Preserve_trx_prepared_status install_resurrection_entry(
       std::unique_ptr<Preserve_trx_resurrection_index_entry> entry);
   Mysql_binlog_preserve_cache_status prepare_native_binlog_handle(
@@ -425,12 +442,22 @@ class Preserve_trx_attach_lease {
       Preserve_trx_internal_operation_capability *out) const;
   Preserve_trx_prepared_status restore_native_binlog_handle(
       std::unique_ptr<Mysql_binlog_preserve_prepared_cache_handle> *inout);
+  Preserve_trx_prepared_status take_result_ready(
+      std::unique_ptr<Preserve_trx_result_restore::Ready> *out);
+  Preserve_trx_prepared_status restore_result_ready(
+      std::unique_ptr<Preserve_trx_result_restore::Ready> *inout);
+  Preserve_trx_prepared_status take_temp_ready(
+      Preserve_trx_temp_receiver_work::Owner *out);
+  Preserve_trx_prepared_status restore_temp_ready(
+      Preserve_trx_temp_receiver_work::Owner *inout);
 
  private:
   void fail_closed();
   std::shared_ptr<Preserve_trx_prepared_token_entry> m_entry;
   bool m_active{false};
   bool m_activation_started{false};
+  bool m_result_taken{false};
+  bool m_temp_taken{false};
   friend class Preserve_trx_prepared_token_registry;
 };
 
@@ -458,8 +485,14 @@ class Preserve_trx_cleanup_lease {
 };
 
 struct Preserve_trx_prepared_token_snapshot {
+  Preserve_trx_recovery_contract recovery;
   Preserve_trx_prepared_token_key key;
   Preserve_trx_final_token_facts facts;
+  // Available before final facts and after the semantic bundle is taken.
+  Preserve_trx_temp_id_contract resource_temp_id_contract;
+  bool resource_temp_id_contract_bound{false};
+  bool temp_resources_ready{false};
+  std::string prewarm_object_set_digest;
   Preserve_trx_prepared_token_state state{
       Preserve_trx_prepared_token_state::NOT_FOUND};
   bool record_lock_plan_owned{false};
@@ -573,7 +606,9 @@ class Preserve_trx_prepared_token_registry {
   Preserve_trx_prepared_status commit_attach(
       Preserve_trx_attach_lease *lease,
       Preserve_trx_activation_intent_writer intent_writer,
-      void *intent_context);
+      void *intent_context,
+      const Preserve_trx_result_restore::Attach *result_attach = nullptr,
+      const Preserve_trx_temp_restore::Attach *temp_attach = nullptr);
   Preserve_trx_prepared_status rollback_attach_after_activation(
       Preserve_trx_attach_lease *lease,
       Preserve_trx_activation_intent_writer intent_writer,
@@ -595,6 +630,11 @@ class Preserve_trx_prepared_token_registry {
   Preserve_trx_prepared_status find_unique_adopted(
       const std::string &epoch_id, const std::string &token,
       Preserve_trx_prepared_token_snapshot *snapshot) const;
+#ifndef DBUG_OFF
+  Preserve_trx_prepared_status find_unique_ready_for_sql_probe(
+      const std::string &dir, const std::string &token,
+      Preserve_trx_prepared_token_snapshot *snapshot) const;
+#endif
   Preserve_trx_prepared_registry_counts status_counts() const;
   void invalidate_incarnation(const std::string &current_boot_incarnation);
   size_t expire_ready_facts_pending_lease(const std::string &epoch_scope,

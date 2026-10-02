@@ -41,6 +41,8 @@ class Query_result_union : public Query_result_interceptor {
   Temp_table_param tmp_table_param;
   /// Count of rows successfully stored in tmp table
   ha_rows m_rows_in_table;
+  /// A materialized cursor's replacement handler must outlive this command.
+  MEM_ROOT *m_handler_mem_root{nullptr};
 
  public:
   TABLE *table;

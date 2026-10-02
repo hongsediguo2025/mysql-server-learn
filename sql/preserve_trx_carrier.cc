@@ -35,6 +35,7 @@
 #include "my_systime.h"
 #include "my_sys.h"
 #include "sql/preserve_trx.h"
+#include "sql/preserve_trx_temp_table.h"
 #include "sha2.h"
 
 namespace {
@@ -143,7 +144,7 @@ bool external_blob_metadata_matches_descriptors(
 }
 
 Preserve_snapshot_status cleanup_after_write_failure(
-    Preserved_trx_carrier *carrier, const std::string &token,
+    Preserved_trx_carrier *carrier, const Preserved_trx_bundle &bundle,
     Preserve_snapshot_status original_status,
     bool snapshot_write_started, bool *durable_snapshot_may_exist,
     Preserve_snapshot_delete_status *write_failure_delete_status) {
@@ -152,8 +153,16 @@ Preserve_snapshot_status cleanup_after_write_failure(
     write has started, a delete failure means a durable snapshot may still be
     visible after restart and the caller must not assume the token is gone.
   */
+  Preserve_snapshot_remove_options remove_options;
+  if (bundle.owns_current_temp_sidecars &&
+      !bundle.metadata.temp_table_manifest_payload.empty()) {
+    // The source owner needs these bytes to release undo reservations.
+    remove_options.preserve_committed_temp_sidecar_source_space_ids =
+        preserve_trx_temp_table_sidecar_source_space_ids(bundle.metadata);
+  }
   const Preserve_snapshot_delete_status delete_status =
-      carrier->remove_with_status(token);
+      carrier->remove_with_status(bundle.metadata.token,
+                                  std::move(remove_options));
   if (write_failure_delete_status != nullptr)
     *write_failure_delete_status = delete_status;
   if (snapshot_write_started && durable_snapshot_may_exist != nullptr &&
@@ -619,7 +628,7 @@ Preserve_snapshot_status Preserved_trx_store::write_impl(
   }
   if (carrier_status != Preserved_trx_carrier_status::OK)
     return cleanup_after_write_failure(
-        m_carrier, bundle.metadata.token, map_carrier_status(carrier_status),
+        m_carrier, bundle, map_carrier_status(carrier_status),
         true, durable_snapshot_may_exist, write_failure_delete_status);
 
   return Preserve_snapshot_status::OK;

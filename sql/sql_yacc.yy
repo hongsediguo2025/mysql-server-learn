@@ -122,6 +122,7 @@ Note: YYTHD is passed as an argument to yyparse(), and subsequently to yylex().
 #include "sql/partition_element.h"
 #include "sql/partition_info.h"
 #include "sql/preserve_trx.h"
+#include "sql/preserve_trx_cursor.h"
 #include "sql/protocol.h"
 #include "sql/query_options.h"
 #include "sql/resourcegroups/platform/thread_attrs_api.h"
@@ -3775,7 +3776,7 @@ sp_decl:
             {
               ITEMIZE(dflt_value_item, &dflt_value_item);
               const char *expr_start_ptr= $5.expr_start;
-              if (lex->is_metadata_used())
+              if (lex->is_metadata_used() || preserve_trx_cursor_capture_enabled(thd))
               {
                 dflt_value_query= make_string(thd, expr_start_ptr,
                                               @5.raw.end);
@@ -3983,7 +3984,7 @@ sp_decl:
 
             LEX_CSTRING cursor_query= EMPTY_CSTR;
 
-            if (cursor_lex->is_metadata_used())
+            if (cursor_lex->is_metadata_used() || preserve_trx_cursor_capture_enabled(thd))
             {
               cursor_query=
                 make_string(thd,
@@ -4610,7 +4611,7 @@ sp_proc_stmt_return:
 
             const char *expr_start_ptr= @1.raw.end;
 
-            if (lex->is_metadata_used())
+            if (lex->is_metadata_used() || preserve_trx_cursor_capture_enabled(thd))
             {
               expr_query= make_string(thd, expr_start_ptr, @3.raw.end);
               if (!expr_query.str)
@@ -4908,7 +4909,7 @@ sp_if:
             LEX_CSTRING expr_query= EMPTY_CSTR;
             const char *expr_start_ptr= @0.raw.end;
 
-            if (lex->is_metadata_used())
+            if (lex->is_metadata_used() || preserve_trx_cursor_capture_enabled(thd))
             {
               expr_query= make_string(thd, expr_start_ptr, @2.raw.end);
               if (!expr_query.str)
@@ -4996,7 +4997,7 @@ simple_case_stmt:
             LEX_CSTRING case_expr_query= EMPTY_CSTR;
             const char *expr_start_ptr= @1.raw.end;
 
-            if (lex->is_metadata_used())
+            if (lex->is_metadata_used() || preserve_trx_cursor_capture_enabled(thd))
             {
               case_expr_query= make_string(thd, expr_start_ptr, @3.raw.end);
               if (!case_expr_query.str)
@@ -5083,7 +5084,7 @@ simple_when_clause:
             LEX_CSTRING when_expr_query= EMPTY_CSTR;
             const char *expr_start_ptr= @1.raw.end;
 
-            if (lex->is_metadata_used())
+            if (lex->is_metadata_used() || preserve_trx_cursor_capture_enabled(thd))
             {
               when_expr_query= make_string(thd, expr_start_ptr, @3.raw.end);
               if (!when_expr_query.str)
@@ -5139,7 +5140,7 @@ searched_when_clause:
             LEX_CSTRING when_query= EMPTY_CSTR;
             const char *expr_start_ptr= @1.raw.end;
 
-            if (lex->is_metadata_used())
+            if (lex->is_metadata_used() || preserve_trx_cursor_capture_enabled(thd))
             {
               when_query= make_string(thd, expr_start_ptr, @3.raw.end);
               if (!when_query.str)
@@ -5368,7 +5369,7 @@ sp_unlabeled_control:
             LEX_CSTRING expr_query= EMPTY_CSTR;
             const char *expr_start_ptr= @1.raw.end;
 
-            if (lex->is_metadata_used())
+            if (lex->is_metadata_used() || preserve_trx_cursor_capture_enabled(thd))
             {
               expr_query= make_string(thd, expr_start_ptr, @3.raw.end);
               if (!expr_query.str)
@@ -5435,7 +5436,7 @@ sp_unlabeled_control:
             LEX_CSTRING expr_query= EMPTY_CSTR;
             const char *expr_start_ptr= @3.raw.end;
 
-            if (lex->is_metadata_used())
+            if (lex->is_metadata_used() || preserve_trx_cursor_capture_enabled(thd))
             {
               expr_query= make_string(thd, expr_start_ptr, @5.raw.end);
               if (!expr_query.str)

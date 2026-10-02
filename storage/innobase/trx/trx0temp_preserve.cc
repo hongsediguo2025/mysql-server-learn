@@ -25,7 +25,15 @@ this program; if not, write to the Free Software Foundation, Inc.,
 
 *****************************************************************************/
 
+#include "sql/preserve_trx_temp_metrics.h"
 #include "trx0temp_preserve.h"
+#include "trx0temp_preserve_capture.h"
+#include "trx0temp_preserve_source.h"
+#include "trx0temp_preserve_undo_scan.h"
+#include "trx0temp_preserve_import.h"
+#include "trx0temp_preserve_input.h"
+#include "trx0temp_preserve_output.h"
+#include "trx0temp_preserve_native.h"
 
 #include <algorithm>
 #include <array>
@@ -55,20 +63,25 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "fut0lst.h"
 #include "handler/ha_innodb.h"
 #include "log0log.h"
+#include "lock0lock.h"
 #include "mach0data.h"
 #include "mtr0log.h"
 #include "mtr0mtr.h"
 #include "my_dbug.h"
 #include "my_sys.h"
+#include "scope_guard.h"
 #include "row0mysql.h"
 #include "sha2.h"
 #include "sql/mysqld.h"
+#include "sql/current_thd.h"
+#include "sql/preserve_trx.h"
 #include "sql/preserve_trx_resource.h"
 #include "sql/preserve_trx_temp_table.h"
 #include "sql/table.h"
 #include "srv0start.h"
 #include "srv0tmp.h"
 #include "trx0rseg.h"
+#include "trx0temp_preserve_undo.h"
 #include "trx0sys.h"
 #include "trx0trx.h"
 #include "trx0undo.h"
@@ -76,6 +89,19 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "ut0ut.h"
 
 extern uint preserve_trx_drain_phase2_timeout_ms;
+
+struct trx_preserve_temp_native_space {
+  enum class State { PREPARED, LEGACY, NATIVE };
+  Preserve_memory_lease memory;
+  std::shared_ptr<trx_preserve_temp_native_directory> directory;
+  trx_preserve_temp_space_image_descriptor descriptor;
+  trx_preserve_temp_space_image_descriptor *source{nullptr};
+  State state{State::PREPARED};
+  trx_preserve_temp_native_space *cleanup_next{nullptr};
+  bool cleanup_queued{false}, cleanup_running{false};
+  uint32_t capture_readers{0};
+  bool capture_retire_pending{false};
+};
 
 namespace {
 
@@ -91,6 +117,40 @@ namespace {
 std::mutex trx_preserve_temp_dirty_page_streams_mutex;
 std::atomic<uint32_t> trx_preserve_temp_active_dirty_page_streams{0};
 std::atomic<uint32_t> trx_preserve_temp_staged_dirty_page_count{0};
+// Common domain for shared undo writers and buffer snapshots. Do not reset
+// when a descriptor is rearmed; zero is reserved for disk baselines.
+std::atomic<uint64_t> trx_preserve_temp_capture_sequence{0};
+
+// Optional undo scan witnesses. Fixed atomic slots avoid allocation and capture
+// registry locking in mtr commit and retirement. Collisions only cause rereads.
+// Stamps never reset, including when the last watcher leaves: no reuse ABA.
+constexpr size_t k_temp_undo_watch_slots = 4096;
+std::array<std::atomic<uint64_t>, k_temp_undo_watch_slots>
+    trx_preserve_temp_undo_write_versions{};
+std::atomic<uint64_t> trx_preserve_temp_undo_watch_count{0};
+std::atomic<uint64_t> trx_preserve_temp_undo_watch_generation{1};
+
+std::atomic<uint64_t> &trx_preserve_temp_undo_write_version(uint64_t key) {
+  return trx_preserve_temp_undo_write_versions[
+      (key ^ ((key >> 32) * 2654435761U)) & (k_temp_undo_watch_slots - 1)];
+}
+
+void trx_preserve_temp_undo_note_write(uint32_t space, uint32_t page) {
+  if (!trx_preserve_temp_undo_watch_count.load(std::memory_order_acquire)) return;
+  auto &slot = trx_preserve_temp_undo_write_version((uint64_t(space) << 32) | page);
+  auto value = slot.load(std::memory_order_relaxed);
+  while (value != UINT64_MAX &&
+         !slot.compare_exchange_weak(value, value + 1, std::memory_order_acq_rel)) {}
+}
+
+uint64_t trx_preserve_temp_next_capture_sequence() {
+  auto value = trx_preserve_temp_capture_sequence.load(std::memory_order_relaxed);
+  while (value != UINT64_MAX) {
+    if (trx_preserve_temp_capture_sequence.compare_exchange_weak(
+            value, value + 1, std::memory_order_relaxed)) return value + 1;
+  }
+  return 0;  // Exhaustion must never make an old image look newer.
+}
 constexpr size_t k_temp_active_dirty_page_stream_bucket_count = 1024;
 std::array<std::atomic<uint32_t>,
            k_temp_active_dirty_page_stream_bucket_count>
@@ -112,14 +172,17 @@ std::unordered_map<uint32_t, uint32_t>
 std::mutex trx_preserve_temp_adopted_fil_spaces_mutex;
 /*
   Adopted fil spaces are resume-time attachments of sealed temp-table images.
-  They stay outside the normal temp-space pool until the resumed transaction
-  commits, rolls back, or the retry path explicitly forgets the attachment.
+  They stay outside the normal temp-space pool for the tables' lifetime;
+  COMMIT/ROLLBACK do not end a user temporary table's lifetime.
 */
 std::unordered_map<uint32_t, trx_preserve_temp_space_image_descriptor *>
     trx_preserve_temp_adopted_fil_spaces;
 std::unordered_map<uint32_t,
-                   std::unique_ptr<trx_preserve_temp_space_image_descriptor>>
+                   std::unique_ptr<trx_preserve_temp_native_space>>
     trx_preserve_temp_attached_fil_space_descriptors;
+trx_preserve_temp_native_space *trx_preserve_temp_cleanup_head{nullptr};
+trx_preserve_temp_native_space *trx_preserve_temp_cleanup_tail{nullptr};
+std::atomic<bool> trx_preserve_temp_cleanup_pending{false};
 std::set<uint32_t> trx_preserve_temp_last_evicted_drop_space_ids;
 /*
   Reservation registries protect no-redo temporary undo that belongs to a
@@ -219,6 +282,7 @@ void *trx_preserve_temp_drop_observer_context_for_test = nullptr;
 struct trx_preserve_temp_staged_dirty_page {
   uint32_t source_space_id{0};
   uint32_t page_no{0};
+  uint64_t capture_sequence{0};
   std::vector<unsigned char> bytes;
 };
 
@@ -409,23 +473,15 @@ void trx_preserve_temp_staged_dirty_page_bytes_release(
 
 uint64_t trx_preserve_temp_no_redo_undo_buffered_page_bytes(
     const trx_preserve_temp_space_image_descriptor &descriptor) {
-  uint64_t bytes = 0;
-  auto add_pages =
-      [&bytes](const std::vector<trx_preserve_temp_no_redo_undo_page_image>
-                   &pages) {
-        for (const trx_preserve_temp_no_redo_undo_page_image &page : pages) {
-          if (bytes > std::numeric_limits<uint64_t>::max() -
-                          page.bytes.size()) {
-            bytes = std::numeric_limits<uint64_t>::max();
-            return;
-          }
-          bytes += page.bytes.size();
-        }
-      };
-
-  add_pages(descriptor.no_redo_undo_pages);
-  add_pages(descriptor.no_redo_undo_pending_pages);
-  return bytes;
+  // Active capture stores complete, fixed-size physical pages. Count slots
+  // instead of walking both histories on every page-write admission.
+  const uint64_t stored = descriptor.no_redo_undo_pages.size();
+  const uint64_t pending = descriptor.no_redo_undo_pending_pages.size();
+  const uint64_t maximum = std::numeric_limits<uint64_t>::max();
+  if (descriptor.page_size == 0 || stored > maximum - pending ||
+      stored + pending > maximum / descriptor.page_size)
+    return maximum;
+  return (stored + pending) * descriptor.page_size;
 }
 
 enum class trx_preserve_temp_staged_dirty_page_budget_result {
@@ -436,7 +492,8 @@ enum class trx_preserve_temp_staged_dirty_page_budget_result {
 };
 
 void trx_preserve_temp_space_image_mark_dirty_page_stream_degraded_locked(
-    trx_preserve_temp_space_image_descriptor *descriptor, const char *reason);
+    trx_preserve_temp_space_image_descriptor *descriptor, const char *reason, bool notify_participant = true,
+    bool resource_exhausted = false);
 
 void trx_preserve_temp_space_image_mark_no_redo_undo_degraded_locked(
     trx_preserve_temp_space_image_descriptor *descriptor, const char *reason);
@@ -507,7 +564,7 @@ void trx_preserve_temp_space_image_mark_stage_allocation_failed(
   if (stream_it != trx_preserve_temp_dirty_page_streams.end()) {
     trx_preserve_temp_space_image_mark_dirty_page_stream_degraded_locked(
         stream_it->second,
-        "temp-table staged dirty page memory allocation failed");
+        "temp-table staged dirty page memory allocation failed", true, true);
   }
 
   auto no_redo_stream_it =
@@ -601,6 +658,7 @@ struct trx_preserve_temp_captured_no_redo_undo_page {
   trx_preserve_temp_no_redo_undo_page_kind kind{
       trx_preserve_temp_no_redo_undo_page_kind::UNDO_LOG};
   uint32_t page_no{0};
+  uint64_t capture_sequence{0};
   std::vector<unsigned char> bytes;
 };
 
@@ -643,38 +701,6 @@ bool trx_preserve_temp_space_image_valid_page_size(uint32_t page_size) {
          ut_is_2pow(page_size);
 }
 
-const trx_preserve_temp_no_redo_undo_page_image *
-trx_preserve_temp_space_image_complete_no_redo_page(
-    const trx_preserve_temp_space_image_descriptor &descriptor,
-    trx_preserve_temp_no_redo_undo_page_kind kind, uint32_t page_no) {
-  const auto page = std::find_if(
-      descriptor.no_redo_undo_pages.begin(),
-      descriptor.no_redo_undo_pages.end(),
-      [kind, page_no, &descriptor](
-          const trx_preserve_temp_no_redo_undo_page_image &image) {
-        return image.kind == kind && image.page_no == page_no &&
-               image.bytes.size() == descriptor.page_size;
-      });
-  return page == descriptor.no_redo_undo_pages.end() ? nullptr : &*page;
-}
-
-ulint trx_preserve_temp_space_image_read_undo_page_list_len(
-    const trx_preserve_temp_space_image_descriptor &descriptor,
-    const trx_preserve_temp_no_redo_undo_log_anchor &anchor) {
-  const trx_preserve_temp_no_redo_undo_page_image *header =
-      trx_preserve_temp_space_image_complete_no_redo_page(
-          descriptor, trx_preserve_temp_no_redo_undo_page_kind::UNDO_HEADER,
-          anchor.hdr_page_no);
-  if (header == nullptr ||
-      header->bytes.size() <
-          TRX_UNDO_SEG_HDR + TRX_UNDO_PAGE_LIST + FLST_BASE_NODE_SIZE) {
-    return 0;
-  }
-
-  const auto *page = reinterpret_cast<const byte *>(header->bytes.data());
-  return flst_get_len(page + TRX_UNDO_SEG_HDR + TRX_UNDO_PAGE_LIST);
-}
-
 fil_addr_t trx_preserve_temp_space_image_read_fil_addr(const byte *bytes,
                                                        size_t offset) {
   fil_addr_t addr;
@@ -693,122 +719,18 @@ bool trx_preserve_temp_space_image_fil_addr_is_undo_page_node(
          addr.boffset == TRX_UNDO_PAGE_HDR + TRX_UNDO_PAGE_NODE;
 }
 
-bool trx_preserve_temp_space_image_trace_undo_page_list(
+dberr_t trx_preserve_temp_space_image_reconnected_undo_size(
     const trx_preserve_temp_space_image_descriptor &descriptor,
-    const trx_preserve_temp_no_redo_undo_log_anchor &anchor,
-    ulint persisted_size) {
-  /*
-    No-redo undo pages are not discoverable from redo after restart. The sidecar
-    therefore stores enough page images to reconstruct the undo page list, and
-    this validation walks the list before any resume path trusts it.
-  */
-  const trx_preserve_temp_no_redo_undo_page_image *header =
-      trx_preserve_temp_space_image_complete_no_redo_page(
-          descriptor, trx_preserve_temp_no_redo_undo_page_kind::UNDO_HEADER,
-          anchor.hdr_page_no);
-  if (header == nullptr || persisted_size == 0) return false;
-
-  const auto *header_page =
-      reinterpret_cast<const byte *>(header->bytes.data());
-  const size_t list_base = TRX_UNDO_SEG_HDR + TRX_UNDO_PAGE_LIST;
-  const fil_addr_t first = trx_preserve_temp_space_image_read_fil_addr(
-      header_page, list_base + FLST_FIRST);
-  const fil_addr_t last = trx_preserve_temp_space_image_read_fil_addr(
-      header_page, list_base + FLST_LAST);
-  if (first.page != anchor.hdr_page_no ||
-      first.boffset != TRX_UNDO_PAGE_HDR + TRX_UNDO_PAGE_NODE ||
-      last.page != anchor.last_page_no ||
-      last.boffset != TRX_UNDO_PAGE_HDR + TRX_UNDO_PAGE_NODE) {
-    return false;
+    const trx_preserve_temp_no_redo_undo_log_anchor &anchor, ulint *size) {
+  if (!anchor.present) {
+    *size = 0;
+    return DB_SUCCESS;
   }
-
-  page_no_t current_page_no = first.page;
-  page_no_t last_visited_page_no = FIL_NULL;
-  bool saw_top_page = false;
-  std::set<uint32_t> visited_pages;
-
-  for (ulint i = 0; i < persisted_size; ++i) {
-    if (current_page_no == FIL_NULL ||
-        !visited_pages.insert(current_page_no).second) {
-      return false;
-    }
-
-    const trx_preserve_temp_no_redo_undo_page_image *image =
-        trx_preserve_temp_space_image_complete_no_redo_page(
-            descriptor,
-            current_page_no == anchor.hdr_page_no
-                ? trx_preserve_temp_no_redo_undo_page_kind::UNDO_HEADER
-                : trx_preserve_temp_no_redo_undo_page_kind::UNDO_LOG,
-            current_page_no);
-    if (image == nullptr) return false;
-
-    if (current_page_no == anchor.top_page_no) saw_top_page = true;
-    last_visited_page_no = current_page_no;
-
-    const auto *page = reinterpret_cast<const byte *>(image->bytes.data());
-    const size_t next_offset =
-        TRX_UNDO_PAGE_HDR + TRX_UNDO_PAGE_NODE + FLST_NEXT;
-    const fil_addr_t next =
-        trx_preserve_temp_space_image_read_fil_addr(page, next_offset);
-    if (!trx_preserve_temp_space_image_fil_addr_is_null(next) &&
-        !trx_preserve_temp_space_image_fil_addr_is_undo_page_node(next)) {
-      return false;
-    }
-    current_page_no = next.page;
-  }
-
-  return current_page_no == FIL_NULL &&
-         visited_pages.size() == persisted_size &&
-         last_visited_page_no == anchor.last_page_no && saw_top_page;
-}
-
-ulint trx_preserve_temp_space_image_reconnected_undo_size(
-    const trx_preserve_temp_space_image_descriptor &descriptor,
-    const trx_preserve_temp_no_redo_undo_log_anchor &anchor) {
-  const ulint persisted_size =
-      trx_preserve_temp_space_image_read_undo_page_list_len(descriptor, anchor);
-  if (!trx_preserve_temp_space_image_trace_undo_page_list(
-          descriptor, anchor, persisted_size)) {
-    return 0;
-  }
-  return persisted_size;
-}
-
-dberr_t trx_preserve_temp_space_image_collect_undo_page_list(
-    const trx_preserve_temp_space_image_descriptor &descriptor,
-    const trx_preserve_temp_no_redo_undo_log_anchor &anchor,
-    std::vector<const trx_preserve_temp_no_redo_undo_page_image *> *pages) {
-  if (pages == nullptr) return DB_ERROR;
-  pages->clear();
-
-  const ulint persisted_size =
-      trx_preserve_temp_space_image_read_undo_page_list_len(descriptor, anchor);
-  if (!trx_preserve_temp_space_image_trace_undo_page_list(
-          descriptor, anchor, persisted_size)) {
-    return DB_CORRUPTION;
-  }
-
-  page_no_t current_page_no = anchor.hdr_page_no;
-  for (ulint i = 0; i < persisted_size; ++i) {
-    const trx_preserve_temp_no_redo_undo_page_image *image =
-        trx_preserve_temp_space_image_complete_no_redo_page(
-            descriptor,
-            current_page_no == anchor.hdr_page_no
-                ? trx_preserve_temp_no_redo_undo_page_kind::UNDO_HEADER
-                : trx_preserve_temp_no_redo_undo_page_kind::UNDO_LOG,
-            current_page_no);
-    if (image == nullptr) return DB_CORRUPTION;
-
-    pages->push_back(image);
-
-    const auto *page = reinterpret_cast<const byte *>(image->bytes.data());
-    const size_t next_offset =
-        TRX_UNDO_PAGE_HDR + TRX_UNDO_PAGE_NODE + FLST_NEXT;
-    current_page_no =
-        trx_preserve_temp_space_image_read_fil_addr(page, next_offset).page;
-  }
-
-  return current_page_no == FIL_NULL ? DB_SUCCESS : DB_CORRUPTION;
+  std::vector<const trx_preserve_temp_no_redo_undo_page_image *> pages;
+  const dberr_t err =
+      trx_preserve_temp_import_collect_undo_pages(descriptor, anchor, &pages);
+  if (err == DB_SUCCESS) *size = pages.size();
+  return err;
 }
 
 bool trx_preserve_temp_space_image_anchor_offsets_in_page(
@@ -1088,78 +1010,6 @@ bool trx_preserve_temp_space_image_reserve_no_redo_undo_slot_impl(
   return reservation->second == owner_source_space_id;
 }
 
-dberr_t trx_preserve_temp_space_image_materialize_no_redo_undo_pages(
-    const trx_preserve_temp_space_image_descriptor &descriptor,
-    trx_rseg_t *rseg) {
-  if (rseg == nullptr ||
-      !trx_preserve_temp_space_image_no_redo_undo_sidecar_ready(descriptor)) {
-    return DB_ERROR;
-  }
-
-  page_no_t max_page_no = 0;
-  for (const trx_preserve_temp_no_redo_undo_page_image &page :
-       descriptor.no_redo_undo_pages) {
-    if (page.bytes.size() != descriptor.page_size ||
-        !trx_preserve_temp_space_image_valid_no_redo_undo_page_kind(
-            page.kind)) {
-      return DB_CORRUPTION;
-    }
-    max_page_no = std::max(max_page_no, static_cast<page_no_t>(page.page_no));
-  }
-
-  fil_space_t *space = fil_space_get(rseg->space_id);
-  if (space == nullptr || !fil_space_extend(space, max_page_no + 1)) {
-    return DB_ERROR;
-  }
-
-  dberr_t err = DB_SUCCESS;
-  for (const trx_preserve_temp_no_redo_undo_page_image &page :
-       descriptor.no_redo_undo_pages) {
-    /*
-      The rseg header and FSP/XDES/INODE allocator pages describe shared
-      system-temporary tablespace state. They are captured and validated so the
-      sidecar proves the undo graph shape, but replaying them per token would
-      overwrite the allocator state rebuilt by the restarted server and by
-      other preserved transactions. The restored transaction only needs its
-      own undo segment pages to finish commit or rollback; those pages are
-      linked through trx_undo_t below and are deliberately skipped by the
-      normal no-redo undo cache/history/free paths.
-    */
-    if (page.kind ==
-            trx_preserve_temp_no_redo_undo_page_kind::RSEG_HEADER ||
-        page.kind ==
-            trx_preserve_temp_no_redo_undo_page_kind::RSEG_ALLOCATOR) {
-      continue;
-    }
-
-    mtr_t mtr;
-    mtr_start(&mtr);
-    mtr_set_log_mode(&mtr, MTR_LOG_NO_REDO);
-
-    buf_block_t *block = buf_page_get_gen(
-        page_id_t(rseg->space_id, static_cast<page_no_t>(page.page_no)),
-        rseg->page_size, RW_X_LATCH, nullptr, Page_fetch::NORMAL, __FILE__,
-        __LINE__, &mtr);
-    if (block == nullptr) {
-      mtr_commit(&mtr);
-      err = DB_ERROR;
-      break;
-    }
-
-    /*
-      The no-redo undo space may already have freshly initialized pages in the
-      buffer pool after startup. Restoring only the backing file would leave
-      trx_undo_report_row_operation() reading those stale in-memory pages when
-      the resumed transaction appends more temporary-table undo records.
-    */
-    byte *frame = buf_block_get_frame(block);
-    ut_memcpy(frame, page.bytes.data(), page.bytes.size());
-    mtr.set_modified();
-    mtr_commit(&mtr);
-  }
-  return err;
-}
-
 dberr_t trx_preserve_temp_space_image_copy_no_redo_undo_image_to_block(
     const trx_preserve_temp_no_redo_undo_page_image &page, buf_block_t *block,
     bool keep_live_fseg_header, mtr_t *mtr) {
@@ -1216,7 +1066,7 @@ dberr_t trx_preserve_temp_space_image_adopt_no_redo_undo_fseg_ownership_for_anch
   if (!anchor.present) return DB_SUCCESS;
 
   std::vector<const trx_preserve_temp_no_redo_undo_page_image *> pages;
-  dberr_t err = trx_preserve_temp_space_image_collect_undo_page_list(
+  dberr_t err = trx_preserve_temp_import_collect_undo_pages(
       descriptor, anchor, &pages);
   if (err != DB_SUCCESS || pages.empty()) return err == DB_SUCCESS ? DB_ERROR : err;
 
@@ -1329,6 +1179,7 @@ trx_undo_t *trx_preserve_temp_space_image_create_reconnected_undo(
   empty_xid.reset();
   ut_ad(mode == trx_preserve_temp_no_redo_undo_reconnect_mode::NATIVE_OWNED);
   undo->id = anchor.undo_slot;
+  undo->preserve_temp_undo_cookie = 0;
   undo->type = type;
   undo->state = TRX_UNDO_ACTIVE;
   undo->del_marks = type == TRX_UNDO_UPDATE;
@@ -1345,7 +1196,7 @@ trx_undo_t *trx_preserve_temp_space_image_create_reconnected_undo(
   undo->hdr_offset = anchor.hdr_offset;
   undo->last_page_no = anchor.last_page_no;
   undo->size = size;
-  undo->empty = FALSE;
+  undo->empty = anchor.top_offset == 0;
   undo->top_page_no = anchor.top_page_no;
   undo->top_offset = anchor.top_offset;
   undo->top_undo_no = static_cast<undo_no_t>(anchor.top_undo_no);
@@ -1363,7 +1214,7 @@ void trx_preserve_temp_space_image_advance_trx_undo_no_for_native_resume(
 
   auto advance_from_anchor =
       [trx](const trx_preserve_temp_no_redo_undo_log_anchor &anchor) {
-    if (!anchor.present) return;
+    if (!anchor.present || anchor.top_offset == 0) return;
     const undo_no_t next_undo_no =
         static_cast<undo_no_t>(anchor.top_undo_no) + 1;
     if (next_undo_no > trx->undo_no) {
@@ -1391,7 +1242,7 @@ bool trx_preserve_temp_space_image_descriptor_has_identity(
 bool trx_preserve_temp_space_image_is_attach_candidate(
     const trx_preserve_temp_space_image_descriptor &descriptor) {
   return trx_preserve_temp_space_image_descriptor_has_identity(descriptor) &&
-         descriptor.sealed &&
+         !descriptor.undo_only && descriptor.sealed &&
          trx_preserve_temp_space_image_valid_page_size(descriptor.page_size) &&
          descriptor.image_bytes != 0 &&
          descriptor.image_bytes % descriptor.page_size == 0;
@@ -1416,6 +1267,7 @@ bool trx_preserve_temp_space_image_dict_binding_is_valid(
       binding.image_table_id == 0 || binding.clustered_root_page_no == 0 ||
       binding.schema_name.empty() || binding.table_name.empty() ||
       binding.columns.empty() || binding.indexes.empty() ||
+      !binding.virtual_columns_valid() ||
       !trx_preserve_temp_space_image_dict_binding_page_in_image(
           descriptor, binding.clustered_root_page_no)) {
     return false;
@@ -1439,7 +1291,8 @@ bool trx_preserve_temp_space_image_dict_binding_is_valid(
   bool clustered_seen = false;
   for (const trx_preserve_temp_dict_index_binding &index : binding.indexes) {
     if (index.image_index_id == 0 || index.root_page_no == 0 ||
-        index.name.empty() || index.fields.empty() ||
+        index.name.empty() ||
+        (index.fields.empty() && !index.is_generated_cluster()) ||
         index.n_unique_fields > index.fields.size() ||
         (index.unique && index.n_unique_fields == 0) ||
         (!index.unique && index.n_unique_fields != 0) ||
@@ -1507,104 +1360,25 @@ bool trx_preserve_temp_space_image_dict_table_name_cached_locked(
   return found != nullptr;
 }
 
-dict_col_t *trx_preserve_temp_space_image_dict_col_by_name(
-    dict_table_t *table, const std::string &column_name) {
-  const ulint n_user_columns = table->get_n_user_cols();
-  for (ulint i = 0; i < n_user_columns; ++i) {
-    if (!strcmp(table->get_col_name(i), column_name.c_str())) {
-      return table->get_col(i);
-    }
-  }
-  return nullptr;
-}
-
 dict_table_t *trx_preserve_temp_space_image_create_dict_table(
     const trx_preserve_temp_space_image_descriptor &descriptor,
     const trx_preserve_temp_dict_table_binding &binding) {
-  /*
-    Resume registers an in-memory temporary dictionary table that points at the
-    adopted image space. The generated name keeps it separate from the user's
-    logical temporary table name while still letting handler lookup find it for
-    this THD.
-  */
-  std::string table_name =
-      trx_preserve_temp_space_image_dict_table_name(binding);
-  mutex_enter(&dict_sys->mutex);
-  const bool cache_collision =
-      trx_preserve_temp_space_image_dict_table_name_cached_locked(
-          table_name.c_str()) ||
-      trx_preserve_temp_space_image_dict_table_id_cached_locked(
-          binding.image_table_id);
-  mutex_exit(&dict_sys->mutex);
-  if (cache_collision) return nullptr;
-
-  mem_heap_t *heap = mem_heap_create(DICT_HEAP_SIZE);
-  dict_table_t *table =
-      dict_mem_table_create(table_name.c_str(), descriptor.source_space_id,
-                            binding.columns.size(), 0, 0,
-                            binding.table_flags,
-                            DICT_TF2_TEMPORARY);
-  if (table == nullptr) {
-    mem_heap_free(heap);
+  trx_preserve_temp_import_dict_ptr table;
+  if (trx_preserve_temp_import_create_dictionary(descriptor, binding, &table) !=
+      DB_SUCCESS) {
     return nullptr;
   }
-
-  for (const trx_preserve_temp_dict_column_binding &column : binding.columns) {
-    dict_mem_table_add_col(table, heap, column.name.c_str(), column.mtype,
-                           column.prtype, column.len, column.visible);
-  }
-  table->id = binding.image_table_id;
-  dict_table_add_system_columns(table, heap);
-
-  for (const trx_preserve_temp_dict_index_binding &index_binding :
-       binding.indexes) {
-    const ulint index_type =
-        (index_binding.clustered ? DICT_CLUSTERED : 0) |
-        (index_binding.unique ? DICT_UNIQUE : 0);
-    dict_index_t *index =
-        dict_mem_index_create(table_name.c_str(), index_binding.name.c_str(),
-                              descriptor.source_space_id, index_type,
-                              index_binding.fields.size());
-    if (index == nullptr) {
-      mem_heap_free(heap);
-      dict_mem_table_free(table);
-      return nullptr;
-    }
-    index->id = index_binding.image_index_id;
-    index->space = descriptor.source_space_id;
-    index->page = index_binding.root_page_no;
-    index->n_uniq = index_binding.n_unique_fields;
-    index->n_user_defined_cols = index_binding.fields.size();
-    index->disable_ahi = true;
-    for (const trx_preserve_temp_dict_index_field_binding &field :
-         index_binding.fields) {
-      dict_col_t *column =
-          trx_preserve_temp_space_image_dict_col_by_name(table, field.column_name);
-      if (column == nullptr) {
-        mem_heap_free(heap);
-        dict_mem_index_free(index);
-        dict_mem_table_free(table);
-        return nullptr;
-      }
-      dict_index_add_col(index, table, column, field.prefix_len,
-                         field.ascending);
-    }
-    index->table = table;
-    dberr_t err =
-        dict_index_add_to_cache(table, index, index_binding.root_page_no, false);
-    if (err != DB_SUCCESS) {
-      mem_heap_free(heap);
-      dict_mem_table_free(table);
-      return nullptr;
-    }
-  }
-
-  mutex_enter(&dict_sys->mutex);
-  dict_table_add_to_cache(table, false, heap);
-  mutex_exit(&dict_sys->mutex);
-  mem_heap_free(heap);
-
-  return table;
+  // Check and publish in the same critical section. Until publication the
+  // private owner also cleans up every already-normalized native index.
+  IB_mutex_guard guard(&dict_sys->mutex);
+  const bool cache_collision =
+      trx_preserve_temp_space_image_dict_table_name_cached_locked(
+          table->name.m_name) ||
+      trx_preserve_temp_space_image_dict_table_id_cached_locked(
+          binding.image_table_id);
+  if (cache_collision) return nullptr;
+  dict_table_add_to_cache(table.get(), false, nullptr);
+  return table.release();
 }
 
 void trx_preserve_temp_space_image_release_bound_dict_table(
@@ -1664,8 +1438,12 @@ bool trx_preserve_temp_space_image_live_fil_space_adopted(
 
 void trx_preserve_temp_space_image_mark_dirty_page_stream_degraded_locked(
     trx_preserve_temp_space_image_descriptor *descriptor,
-    const char *reason) {
+    const char *reason, bool notify_participant, bool resource_exhausted) {
   if (descriptor == nullptr) return;
+  if (!descriptor->dirty_page_stream_degraded)
+    descriptor->dirty_page_stream_resource_exhausted = resource_exhausted;
+  if (descriptor->dirty_page_stream_optional && resource_exhausted)
+    notify_participant = false;
 
   /*
     Degradation is fail-closed. Once a stream cannot prove it captured every
@@ -1673,8 +1451,6 @@ void trx_preserve_temp_space_image_mark_dirty_page_stream_degraded_locked(
     to an artifact that must no longer be used for preserve.
   */
   descriptor->dirty_page_stream_degraded = true;
-  descriptor->dirty_page_stream_degraded_reason =
-      reason == nullptr ? "" : reason;
   auto stream_it =
       trx_preserve_temp_dirty_page_streams.find(descriptor->source_space_id);
   if (stream_it != trx_preserve_temp_dirty_page_streams.end() &&
@@ -1686,9 +1462,15 @@ void trx_preserve_temp_space_image_mark_dirty_page_stream_degraded_locked(
     trx_preserve_temp_active_dirty_page_stream_bucket_sub(
         descriptor->source_space_id);
   }
-  if (descriptor->dirty_page_participant != nullptr) {
-    descriptor->dirty_page_participant->mark_degraded(
-        descriptor->dirty_page_stream_degraded_reason);
+  try {
+    descriptor->dirty_page_stream_degraded_reason = reason == nullptr ? "" : reason;
+    if (notify_participant && descriptor->dirty_page_participant != nullptr)
+      descriptor->dirty_page_participant->mark_degraded(
+          descriptor->dirty_page_stream_degraded_reason);
+  } catch (const std::bad_alloc &) {
+    // Cleanup also runs from a capture-owner destructor under memory pressure.
+    if (notify_participant && descriptor->dirty_page_participant != nullptr)
+      descriptor->dirty_page_participant->mark_degraded({});
   }
 }
 
@@ -1749,8 +1531,10 @@ bool trx_preserve_temp_space_image_reserve_dirty_page_memory_locked(
   if (!preserve_trx_resource_acquire_memory(
           descriptor->dirty_page_resource_token,
           Preserve_trx_memory_kind::TEMP_DIRTY_PAGE_QUEUE, bytes)) {
+    DBUG_PRINT("preserve_temp_import", ("temporary DATA capture quota rejected space=%u bytes=%llu",
+        descriptor->source_space_id, static_cast<unsigned long long>(bytes)));
     trx_preserve_temp_space_image_mark_dirty_page_stream_degraded_locked(
-        descriptor, "temp-table dirty page memory budget exceeded");
+        descriptor, "temp-table dirty page memory budget exceeded", true, true);
     return false;
   }
   descriptor->dirty_page_memory_reserved_bytes += bytes;
@@ -1758,10 +1542,11 @@ bool trx_preserve_temp_space_image_reserve_dirty_page_memory_locked(
 }
 
 void trx_preserve_temp_space_image_reset_dirty_page_stream_impl(
-    trx_preserve_temp_space_image_descriptor *descriptor) {
+    trx_preserve_temp_space_image_descriptor *descriptor, bool stop_staging = true) {
   if (descriptor == nullptr) return;
   trx_preserve_temp_stage_admission_close_guard close_stage_admission(
-      descriptor->source_space_id, descriptor->no_redo_undo_rseg_space_id);
+      stop_staging ? descriptor->source_space_id : 0,
+      stop_staging ? descriptor->no_redo_undo_rseg_space_id : 0);
   {
     std::lock_guard<std::mutex> guard{
         trx_preserve_temp_dirty_page_streams_mutex};
@@ -1779,15 +1564,21 @@ void trx_preserve_temp_space_image_reset_dirty_page_stream_impl(
   }
   trx_preserve_temp_space_image_release_dirty_page_memory(descriptor);
   descriptor->dirty_page_bytes = 0;
-  descriptor->dirty_page_next_sequence = 1;
   descriptor->dirty_page_stream_armed = false;
   descriptor->dirty_page_stream_registered = false;
   descriptor->dirty_page_stream_degraded = false;
+  descriptor->dirty_page_stream_resource_exhausted = false;
   descriptor->dirty_page_stream_degraded_reason.clear();
   descriptor->dirty_page_participant = nullptr;
   descriptor->dirty_page_resource_token.clear();
   descriptor->dirty_pages.clear();
+  descriptor->dirty_page_index.clear();
+  descriptor->dirty_page_versions.clear();
+  descriptor->dirty_page_version_memory_bytes = 0;
+  descriptor->dirty_page_inflight_bytes = 0;
+  descriptor->dirty_page_round_active = false;
   descriptor->dirty_page_queue_durable = false;
+  descriptor->dirty_page_tail_complete = false;
   descriptor->no_redo_undo_capture_required = false;
   descriptor->no_redo_undo_sidecar_sealed = false;
   descriptor->no_redo_undo_capture_degraded = false;
@@ -1883,20 +1674,6 @@ void trx_preserve_temp_space_image_store_no_redo_undo_anchor(
 }
 
 trx_preserve_temp_no_redo_undo_page_image *
-trx_preserve_temp_space_image_find_no_redo_undo_page(
-    trx_preserve_temp_space_image_descriptor *descriptor,
-    trx_preserve_temp_no_redo_undo_page_kind kind, uint32_t page_no) {
-  auto existing = std::find_if(
-      descriptor->no_redo_undo_pages.begin(),
-      descriptor->no_redo_undo_pages.end(),
-      [kind, page_no](const trx_preserve_temp_no_redo_undo_page_image &image) {
-        return image.kind == kind && image.page_no == page_no;
-      });
-  return existing == descriptor->no_redo_undo_pages.end() ? nullptr
-                                                          : &*existing;
-}
-
-trx_preserve_temp_no_redo_undo_page_image *
 trx_preserve_temp_space_image_find_no_redo_undo_page_by_page_no(
     trx_preserve_temp_space_image_descriptor *descriptor, uint32_t page_no) {
   auto existing = std::find_if(
@@ -1912,26 +1689,36 @@ trx_preserve_temp_space_image_find_no_redo_undo_page_by_page_no(
 dberr_t trx_preserve_temp_space_image_store_no_redo_undo_page(
     trx_preserve_temp_space_image_descriptor *descriptor,
     trx_preserve_temp_no_redo_undo_page_kind kind, uint32_t page_no,
-    const unsigned char *page, size_t page_bytes) {
+    const unsigned char *page, size_t page_bytes, uint64_t capture_sequence = 0) {
   trx_preserve_temp_no_redo_undo_page_image *existing =
-      trx_preserve_temp_space_image_find_no_redo_undo_page(descriptor, kind,
-                                                          page_no);
+      trx_preserve_temp_space_image_find_no_redo_undo_page_by_page_no(
+          descriptor, page_no);
   if (existing == nullptr) {
     trx_preserve_temp_no_redo_undo_page_image image;
     image.kind = kind;
     image.page_no = page_no;
+    image.capture_sequence = capture_sequence;
     image.bytes.assign(page, page + page_bytes);
     descriptor->no_redo_undo_pages.push_back(std::move(image));
     return DB_SUCCESS;
   }
 
+  if (capture_sequence <= existing->capture_sequence) return DB_SUCCESS;
   existing->bytes.assign(page, page + page_bytes);
+  existing->kind = kind;
+  existing->capture_sequence = capture_sequence;
   return DB_SUCCESS;
 }
 
 void trx_preserve_temp_space_image_store_pending_no_redo_undo_page(
     trx_preserve_temp_space_image_descriptor *descriptor, uint32_t page_no,
-    const unsigned char *page, size_t page_bytes) {
+    const unsigned char *page, size_t page_bytes, uint64_t capture_sequence) {
+  // A delayed TLS batch may belong to an earlier capture of this shared space.
+  if (capture_sequence <= descriptor->no_redo_undo_capture_floor) return;
+  const auto *classified =
+      trx_preserve_temp_space_image_find_no_redo_undo_page_by_page_no(
+          descriptor, page_no);
+  if (classified && capture_sequence <= classified->capture_sequence) return;
   auto existing = std::find_if(
       descriptor->no_redo_undo_pending_pages.begin(),
       descriptor->no_redo_undo_pending_pages.end(),
@@ -1942,12 +1729,15 @@ void trx_preserve_temp_space_image_store_pending_no_redo_undo_page(
   if (existing == descriptor->no_redo_undo_pending_pages.end()) {
     trx_preserve_temp_no_redo_undo_page_image image;
     image.page_no = page_no;
+    image.capture_sequence = capture_sequence;
     image.bytes.assign(page, page + page_bytes);
     descriptor->no_redo_undo_pending_pages.push_back(std::move(image));
     return;
   }
 
+  if (capture_sequence <= existing->capture_sequence) return;
   existing->bytes.assign(page, page + page_bytes);
+  existing->capture_sequence = capture_sequence;
 }
 
 bool trx_preserve_temp_space_image_no_redo_undo_page_complete(
@@ -2212,6 +2002,11 @@ dberr_t trx_preserve_temp_space_image_classify_pending_no_redo_undo_pages(
   for (const trx_preserve_temp_no_redo_undo_page_image &pending :
        descriptor->no_redo_undo_pending_pages) {
     if (pending.bytes.size() != descriptor->page_size) return DB_ERROR;
+    const auto *current =
+        trx_preserve_temp_space_image_find_no_redo_undo_page_by_page_no(
+            descriptor, pending.page_no);
+    // Classify only the newest physical page, including when its role changed.
+    if (current && pending.capture_sequence <= current->capture_sequence) continue;
     trx_preserve_temp_no_redo_undo_page_kind kind{
         trx_preserve_temp_no_redo_undo_page_kind::UNDO_LOG};
     if (!trx_preserve_temp_space_image_classify_no_redo_undo_page(
@@ -2279,7 +2074,7 @@ dberr_t trx_preserve_temp_space_image_classify_pending_no_redo_undo_pages(
     }
     dberr_t err = trx_preserve_temp_space_image_store_no_redo_undo_page(
         descriptor, kind, pending.page_no, pending.bytes.data(),
-        pending.bytes.size());
+        pending.bytes.size(), pending.capture_sequence);
     if (err != DB_SUCCESS) return err;
   }
   return DB_SUCCESS;
@@ -2360,9 +2155,9 @@ void trx_preserve_temp_space_image_capture_no_redo_undo_anchor_from_undo(
       static_cast<uint32_t>(undo->hdr_offset),
       static_cast<uint32_t>(undo->hdr_page_no),
       static_cast<uint32_t>(undo->last_page_no),
-      static_cast<uint32_t>(undo->top_page_no),
-      static_cast<uint32_t>(undo->top_offset),
-      static_cast<uint64_t>(undo->top_undo_no));
+      static_cast<uint32_t>(undo->empty ? undo->hdr_page_no : undo->top_page_no),
+      static_cast<uint32_t>(undo->empty ? 0 : undo->top_offset),
+      static_cast<uint64_t>(undo->empty ? 0 : undo->top_undo_no));
 }
 
 bool trx_preserve_temp_space_image_no_redo_undo_sidecar_ready(
@@ -2453,7 +2248,7 @@ dberr_t trx_preserve_temp_space_image_capture_buffer_page(
     const trx_preserve_temp_space_image_descriptor &descriptor,
     const page_size_t &page_size, uint32_t page_no,
     trx_preserve_temp_no_redo_undo_page_kind kind,
-    trx_preserve_temp_captured_no_redo_undo_page *captured) {
+    trx_preserve_temp_captured_no_redo_undo_page *captured, bool standby_transfer) {
   if (captured == nullptr || page_no == FIL_NULL ||
       !descriptor.no_redo_undo_rseg_identity_present) {
     return DB_ERROR;
@@ -2461,11 +2256,15 @@ dberr_t trx_preserve_temp_space_image_capture_buffer_page(
 
   mtr_t mtr;
   mtr_start(&mtr);
+  auto commit = create_scope_guard([&] { mtr_commit(&mtr); });
   buf_block_t *block = buf_page_get_gen(
       page_id_t(descriptor.no_redo_undo_rseg_space_id, page_no), page_size,
-      RW_S_LATCH, nullptr, Page_fetch::IF_IN_POOL, __FILE__, __LINE__, &mtr);
+      RW_S_LATCH, nullptr,
+      standby_transfer ? Page_fetch::NORMAL : Page_fetch::IF_IN_POOL,
+      __FILE__, __LINE__, &mtr);
   if (block == nullptr) {
-    mtr_commit(&mtr);
+    commit.rollback();
+    if (standby_transfer) return DB_ERROR;
     std::vector<unsigned char> file_page;
     const dberr_t err =
         trx_preserve_temp_space_image_read_no_redo_undo_file_page(
@@ -2477,22 +2276,26 @@ dberr_t trx_preserve_temp_space_image_capture_buffer_page(
     }
     captured->kind = kind;
     captured->page_no = page_no;
+    captured->capture_sequence = 0;
     captured->bytes = std::move(file_page);
     return DB_SUCCESS;
   }
 
+  preserve_trx_temp_final_read(descriptor.page_size);
   const unsigned char *frame =
       reinterpret_cast<const unsigned char *>(buf_block_get_frame(block));
   if (!trx_preserve_temp_space_image_no_redo_undo_page_identity_matches(
           descriptor, page_no, frame, descriptor.page_size)) {
-    mtr_commit(&mtr);
     return DB_ERROR;
   }
 
   captured->kind = kind;
   captured->page_no = page_no;
+  captured->capture_sequence = trx_preserve_temp_next_capture_sequence();
+  if (captured->capture_sequence == 0) {
+    return DB_ERROR;
+  }
   captured->bytes.assign(frame, frame + descriptor.page_size);
-  mtr_commit(&mtr);
   return DB_SUCCESS;
 }
 
@@ -2500,14 +2303,16 @@ dberr_t trx_preserve_temp_space_image_capture_undo_log_buffer_pages(
     const trx_preserve_temp_space_image_descriptor &descriptor,
     const page_size_t &page_size,
     const trx_preserve_temp_no_redo_undo_log_anchor &anchor,
-    std::vector<trx_preserve_temp_captured_no_redo_undo_page> *captured_pages) {
+    std::vector<trx_preserve_temp_captured_no_redo_undo_page> *captured_pages,
+    bool standby_transfer, uint64_t page_limit) {
   if (!anchor.present) return DB_SUCCESS;
   if (captured_pages == nullptr) return DB_ERROR;
 
   trx_preserve_temp_captured_no_redo_undo_page header;
   dberr_t err = trx_preserve_temp_space_image_capture_buffer_page(
       descriptor, page_size, anchor.hdr_page_no,
-      trx_preserve_temp_no_redo_undo_page_kind::UNDO_HEADER, &header);
+      trx_preserve_temp_no_redo_undo_page_kind::UNDO_HEADER, &header,
+      standby_transfer);
   if (err != DB_SUCCESS) return err;
 
   const unsigned char *header_page = header.bytes.data();
@@ -2518,7 +2323,8 @@ dberr_t trx_preserve_temp_space_image_capture_undo_log_buffer_pages(
       flst_get_len(header_page + TRX_UNDO_SEG_HDR + TRX_UNDO_PAGE_LIST);
   const fil_addr_t first = trx_preserve_temp_space_image_read_fil_addr(
       header_page, list_base + FLST_FIRST);
-  if (persisted_size == 0 ||
+  if (persisted_size == 0 || (page_limit != 0 && persisted_size > page_limit) ||
+      first.page != anchor.hdr_page_no ||
       !trx_preserve_temp_space_image_fil_addr_is_undo_page_node(first)) {
     return DB_ERROR;
   }
@@ -2540,7 +2346,8 @@ dberr_t trx_preserve_temp_space_image_capture_undo_log_buffer_pages(
     } else {
       err = trx_preserve_temp_space_image_capture_buffer_page(
           descriptor, page_size, current_page_no,
-          trx_preserve_temp_no_redo_undo_page_kind::UNDO_LOG, &body);
+          trx_preserve_temp_no_redo_undo_page_kind::UNDO_LOG, &body,
+          standby_transfer);
       if (err != DB_SUCCESS) return err;
       page = body.bytes.data();
       captured_pages->push_back(std::move(body));
@@ -2564,57 +2371,88 @@ dberr_t trx_preserve_temp_space_image_store_captured_no_redo_pages_locked(
     trx_preserve_temp_space_image_descriptor *descriptor,
     const std::vector<trx_preserve_temp_captured_no_redo_undo_page>
         &captured_pages) {
-  for (const trx_preserve_temp_captured_no_redo_undo_page &captured :
-       captured_pages) {
-    dberr_t err =
-        trx_preserve_temp_space_image_validate_no_redo_undo_page_for_kind_locked(
-            descriptor, captured.kind, captured.page_no, captured.bytes.data(),
-            captured.bytes.size());
-    if (err != DB_SUCCESS) return err;
-    err = trx_preserve_temp_space_image_store_no_redo_undo_page(
-        descriptor, captured.kind, captured.page_no, captured.bytes.data(),
-        captured.bytes.size());
-    if (err != DB_SUCCESS) return err;
-  }
-  return DB_SUCCESS;
+  try {
+    // Initial undo capture can contain many pages. Index once, instead of
+    // searching the growing descriptor twice for every copied page.
+    auto &pages = descriptor->no_redo_undo_pages;
+    std::unordered_map<uint32_t, size_t> positions;
+    positions.reserve(pages.size() + captured_pages.size());
+    for (size_t i = 0; i < pages.size(); ++i) positions.emplace(pages[i].page_no, i);
+    for (const auto &captured : captured_pages) {
+      const auto found = positions.find(captured.page_no);
+      if (found != positions.end() &&
+          captured.capture_sequence <= pages[found->second].capture_sequence)
+        continue;
+      const auto err =
+          trx_preserve_temp_space_image_validate_no_redo_undo_page_for_kind_locked(
+              descriptor, captured.kind, captured.page_no, captured.bytes.data(),
+              captured.bytes.size());
+      if (err != DB_SUCCESS) return err;
+      if (found == positions.end()) {
+        trx_preserve_temp_no_redo_undo_page_image image;
+        image.kind = captured.kind;
+        image.page_no = captured.page_no;
+        image.capture_sequence = captured.capture_sequence;
+        image.bytes = captured.bytes;
+        positions.emplace(image.page_no, pages.size());
+        pages.push_back(std::move(image));
+      } else {
+        auto &image = pages[found->second];
+        image.bytes = captured.bytes;
+        image.kind = captured.kind;
+        image.capture_sequence = captured.capture_sequence;
+      }
+    }
+    return DB_SUCCESS;
+  } catch (const std::bad_alloc &) { return DB_OUT_OF_MEMORY; }
 }
 
 dberr_t trx_preserve_temp_space_image_capture_no_redo_undo_buffer_pages(
     const trx_preserve_temp_space_image_descriptor &descriptor,
     const page_size_t &page_size,
-    std::vector<trx_preserve_temp_captured_no_redo_undo_page> *captured_pages) {
+    std::vector<trx_preserve_temp_captured_no_redo_undo_page> *captured_pages,
+    bool standby_transfer, uint64_t insert_page_limit, uint64_t update_page_limit) {
   if (captured_pages == nullptr) return DB_ERROR;
 
   trx_preserve_temp_captured_no_redo_undo_page rseg_header;
   dberr_t err = trx_preserve_temp_space_image_capture_buffer_page(
       descriptor, page_size, descriptor.no_redo_undo_rseg_page_no,
-      trx_preserve_temp_no_redo_undo_page_kind::RSEG_HEADER, &rseg_header);
+      trx_preserve_temp_no_redo_undo_page_kind::RSEG_HEADER, &rseg_header,
+      standby_transfer);
   if (err != DB_SUCCESS) return err;
   captured_pages->push_back(std::move(rseg_header));
 
   trx_preserve_temp_captured_no_redo_undo_page allocator;
   err = trx_preserve_temp_space_image_capture_buffer_page(
       descriptor, page_size, 0,
-      trx_preserve_temp_no_redo_undo_page_kind::RSEG_ALLOCATOR, &allocator);
+      trx_preserve_temp_no_redo_undo_page_kind::RSEG_ALLOCATOR, &allocator,
+      standby_transfer);
   if (err != DB_SUCCESS) return err;
   captured_pages->push_back(std::move(allocator));
 
   err = trx_preserve_temp_space_image_capture_undo_log_buffer_pages(
-      descriptor, page_size, descriptor.no_redo_insert_undo, captured_pages);
+      descriptor, page_size, descriptor.no_redo_insert_undo, captured_pages,
+      standby_transfer, insert_page_limit);
   if (err != DB_SUCCESS) return err;
 
   return trx_preserve_temp_space_image_capture_undo_log_buffer_pages(
-      descriptor, page_size, descriptor.no_redo_update_undo, captured_pages);
+      descriptor, page_size, descriptor.no_redo_update_undo, captured_pages,
+      standby_transfer, update_page_limit);
 }
 
 dberr_t trx_preserve_temp_space_image_freeze_dirty_stream_for_seal(
     trx_preserve_temp_space_image_descriptor *descriptor,
-    std::vector<trx_preserve_temp_dirty_page_image> *dirty_pages) {
+    std::vector<trx_preserve_temp_dirty_page_image> *dirty_pages,
+    uint64_t *reserved_bytes = nullptr) {
+  // Retire the derived nodes after releasing the global stream mutex.
+  std::map<uint32_t, size_t> retired_index;
+  std::map<uint32_t, uint64_t> retired_versions;
   trx_preserve_temp_stage_admission_close_guard close_stage_admission(
       descriptor->source_space_id);
   std::lock_guard<std::mutex> guard{
       trx_preserve_temp_dirty_page_streams_mutex};
   if (descriptor->dirty_page_stream_degraded ||
+      descriptor->dirty_page_round_active ||
       !trx_preserve_temp_space_image_registered_locked(descriptor)) {
     return DB_ERROR;
   }
@@ -2624,6 +2462,13 @@ dberr_t trx_preserve_temp_space_image_freeze_dirty_stream_for_seal(
     descriptor->dirty_pages.clear();
   }
   descriptor->dirty_page_bytes = 0;
+  retired_index.swap(descriptor->dirty_page_index);
+  retired_versions.swap(descriptor->dirty_page_versions);
+  descriptor->dirty_page_version_memory_bytes = 0;
+  if (reserved_bytes != nullptr) {
+    *reserved_bytes = descriptor->dirty_page_memory_reserved_bytes;
+    descriptor->dirty_page_memory_reserved_bytes = 0;
+  }
 
   auto stream_it =
       trx_preserve_temp_dirty_page_streams.find(descriptor->source_space_id);
@@ -2698,108 +2543,85 @@ bool trx_preserve_temp_space_image_should_disable_undo_cache_impl(
 }
 
 trx_preserve_temp_staged_dirty_page_budget_result
-trx_preserve_temp_space_image_try_reserve_staged_dirty_page_bytes(
+trx_preserve_temp_space_image_try_reserve_staged_dirty_page_bytes_locked(
     uint32_t source_space_id, size_t page_bytes) {
   constexpr const char *k_dirty_budget_exceeded_reason =
       "temp-table dirty page queue budget exceeded";
   constexpr const char *k_no_redo_budget_exceeded_reason =
       "temp-table no-redo undo page queue budget exceeded";
-  std::lock_guard<std::mutex> guard{
-      trx_preserve_temp_dirty_page_streams_mutex};
-
+  const uint64_t staged_bytes =
+      trx_preserve_temp_staged_dirty_page_bytes_for_space_locked(
+          source_space_id);
+  const auto fits = [&](uint64_t buffered, uint64_t limit) {
+    return buffered <= limit && staged_bytes <= limit - buffered &&
+           page_bytes <= limit - buffered - staged_bytes;
+  };
   auto stream_it = trx_preserve_temp_dirty_page_streams.find(source_space_id);
   bool has_active_stream = false;
-  bool dirty_budget_exceeded = false;
-  bool no_redo_budget_exceeded = false;
   bool exceeded = false;
 
   if (stream_it != trx_preserve_temp_dirty_page_streams.end()) {
     trx_preserve_temp_space_image_descriptor *descriptor = stream_it->second;
     if (descriptor != nullptr && !descriptor->dirty_page_stream_degraded) {
-      has_active_stream = true;
-      const uint64_t staged_bytes =
-          trx_preserve_temp_staged_dirty_page_bytes_for_space_locked(
-              source_space_id);
-      if (descriptor->dirty_page_bytes >
-              std::numeric_limits<uint64_t>::max() - staged_bytes ||
-          descriptor->dirty_page_bytes + staged_bytes >
-              std::numeric_limits<uint64_t>::max() - page_bytes ||
-          descriptor->dirty_page_bytes + staged_bytes + page_bytes >
-              descriptor->dirty_page_queue_limit_bytes) {
-        dirty_budget_exceeded = true;
+      if (!fits(descriptor->dirty_page_bytes + descriptor->dirty_page_inflight_bytes,
+                descriptor->dirty_page_queue_limit_bytes)) {
+        trx_preserve_temp_space_image_mark_dirty_page_stream_degraded_locked(
+            descriptor, k_dirty_budget_exceeded_reason, true, true);
         exceeded = true;
+      } else {
+        has_active_stream = true;
       }
     }
   }
 
-  std::vector<trx_preserve_temp_space_image_descriptor *> no_redo_streams;
-  auto no_redo_stream_it =
-      trx_preserve_temp_no_redo_undo_page_streams.find(source_space_id);
-  if (no_redo_stream_it != trx_preserve_temp_no_redo_undo_page_streams.end()) {
-    no_redo_streams = no_redo_stream_it->second;
-    for (trx_preserve_temp_space_image_descriptor *descriptor :
-         no_redo_streams) {
-      if (descriptor == nullptr ||
-          !descriptor->no_redo_undo_rseg_identity_present ||
-          descriptor->no_redo_undo_capture_degraded ||
-          descriptor->no_redo_undo_sidecar_sealed) {
-        continue;
-      }
-
+  // Admission is owner-local. A full queue retires only that descriptor;
+  // remaining owners still receive this page. Degradation erases the vector
+  // element (and possibly the map entry), so re-find without copying peers.
+  size_t owner_index = 0;
+  for (;;) {
+    auto no_redo_stream_it =
+        trx_preserve_temp_no_redo_undo_page_streams.find(source_space_id);
+    if (no_redo_stream_it ==
+            trx_preserve_temp_no_redo_undo_page_streams.end() ||
+        owner_index == no_redo_stream_it->second.size())
+      break;
+    auto *descriptor = no_redo_stream_it->second[owner_index];
+    if (descriptor == nullptr ||
+        !descriptor->no_redo_undo_rseg_identity_present ||
+        descriptor->no_redo_undo_capture_degraded ||
+        descriptor->no_redo_undo_sidecar_sealed) {
+      ++owner_index;
+      continue;
+    }
+    const uint64_t limit = descriptor->dirty_page_queue_limit_bytes;
+    const uint64_t buffered_bytes =
+        trx_preserve_temp_no_redo_undo_buffered_page_bytes(*descriptor);
+    if (limit != 0 && !fits(buffered_bytes, limit)) {
+      trx_preserve_temp_space_image_mark_no_redo_undo_degraded_locked(
+          descriptor, k_no_redo_budget_exceeded_reason);
+      exceeded = true;
+    } else {
       has_active_stream = true;
-      if (descriptor->dirty_page_queue_limit_bytes == 0) {
-        continue;
-      }
-      const uint64_t limit = descriptor->dirty_page_queue_limit_bytes;
-      const uint64_t staged_bytes =
-          trx_preserve_temp_staged_dirty_page_bytes_for_space_locked(
-              source_space_id);
-      const uint64_t buffered_bytes =
-          trx_preserve_temp_no_redo_undo_buffered_page_bytes(*descriptor);
-      if (buffered_bytes > std::numeric_limits<uint64_t>::max() -
-                               staged_bytes ||
-          buffered_bytes + staged_bytes >
-              std::numeric_limits<uint64_t>::max() - page_bytes ||
-          buffered_bytes + staged_bytes + page_bytes > limit) {
-        no_redo_budget_exceeded = true;
-        exceeded = true;
-      }
+      ++owner_index;
     }
   }
 
   if (!has_active_stream) {
-    return trx_preserve_temp_staged_dirty_page_budget_result::NO_STREAM;
-  }
-  if (exceeded) {
-    if (stream_it != trx_preserve_temp_dirty_page_streams.end()) {
-      trx_preserve_temp_space_image_descriptor *descriptor = stream_it->second;
-      if (descriptor != nullptr && !descriptor->dirty_page_stream_degraded) {
-        trx_preserve_temp_space_image_mark_dirty_page_stream_degraded_locked(
-            descriptor, dirty_budget_exceeded
-                            ? k_dirty_budget_exceeded_reason
-                            : "temp-table dirty page discarded after peer "
-                              "stream budget exceeded");
-      }
-    }
-    for (trx_preserve_temp_space_image_descriptor *descriptor :
-         no_redo_streams) {
-      if (descriptor == nullptr ||
-          !descriptor->no_redo_undo_rseg_identity_present ||
-          descriptor->no_redo_undo_capture_degraded ||
-          descriptor->no_redo_undo_sidecar_sealed) {
-        continue;
-      }
-      trx_preserve_temp_space_image_mark_no_redo_undo_degraded_locked(
-          descriptor, no_redo_budget_exceeded
-                          ? k_no_redo_budget_exceeded_reason
-                          : "temp-table no-redo undo page discarded after peer "
-                            "stream budget exceeded");
-    }
-    return trx_preserve_temp_staged_dirty_page_budget_result::EXCEEDED;
+    return exceeded
+               ? trx_preserve_temp_staged_dirty_page_budget_result::EXCEEDED
+               : trx_preserve_temp_staged_dirty_page_budget_result::NO_STREAM;
   }
   trx_preserve_temp_staged_dirty_page_bytes_reserve_locked(source_space_id,
-                                                          page_bytes);
+                                                           page_bytes);
   return trx_preserve_temp_staged_dirty_page_budget_result::RESERVED;
+}
+
+trx_preserve_temp_staged_dirty_page_budget_result
+trx_preserve_temp_space_image_try_reserve_staged_dirty_page_bytes(
+    uint32_t source_space_id, size_t page_bytes) {
+  std::lock_guard<std::mutex> guard{trx_preserve_temp_dirty_page_streams_mutex};
+  return trx_preserve_temp_space_image_try_reserve_staged_dirty_page_bytes_locked(
+      source_space_id, page_bytes);
 }
 
 void trx_preserve_temp_space_image_unregister_no_redo_undo_stream_locked(
@@ -2904,31 +2726,6 @@ dberr_t trx_preserve_temp_space_image_make_file_page(
       nullptr, file_page->data(), nullptr, page_lsn,
       fsp_is_checksum_disabled(descriptor.source_space_id), true);
   return DB_SUCCESS;
-}
-
-dberr_t trx_preserve_temp_space_image_write_file_page_to_callback(
-    const trx_preserve_temp_space_image_descriptor &descriptor,
-    uint32_t page_no, const unsigned char *page, size_t page_bytes,
-    void *context, trx_preserve_temp_space_image_write_page_callback callback) {
-  if (page == nullptr || callback == nullptr ||
-      page_bytes != descriptor.page_size) {
-    return DB_ERROR;
-  }
-
-  try {
-    trx_preserve_temp_shadow_page_image image;
-    image.page_no = page_no;
-    image.bytes.assign(page, page + page_bytes);
-
-    std::vector<unsigned char> file_page;
-    const dberr_t err =
-        trx_preserve_temp_space_image_make_file_page(descriptor, image,
-                                                     &file_page);
-    if (err != DB_SUCCESS) return err;
-    return callback(context, page_no, file_page.data(), file_page.size());
-  } catch (const std::bad_alloc &) {
-    return DB_OUT_OF_MEMORY;
-  }
 }
 
 void trx_preserve_temp_space_image_mark_page_copy_failure(
@@ -3076,31 +2873,6 @@ bool trx_preserve_temp_read_le64(const unsigned char *payload,
   return true;
 }
 
-void trx_preserve_temp_append_le32(std::string *payload, uint32_t value) {
-  for (size_t i = 0; i < 4; ++i) {
-    payload->push_back(static_cast<char>((value >> (i * 8)) & 0xff));
-  }
-}
-
-void trx_preserve_temp_append_le64(std::string *payload, uint64_t value) {
-  for (size_t i = 0; i < 8; ++i) {
-    payload->push_back(static_cast<char>((value >> (i * 8)) & 0xff));
-  }
-}
-
-void trx_preserve_temp_append_no_redo_undo_anchor(
-    std::string *payload,
-    const trx_preserve_temp_no_redo_undo_log_anchor &anchor) {
-  payload->push_back(static_cast<char>(anchor.present ? 1 : 0));
-  trx_preserve_temp_append_le32(payload, anchor.undo_slot);
-  trx_preserve_temp_append_le32(payload, anchor.hdr_page_no);
-  trx_preserve_temp_append_le32(payload, anchor.hdr_offset);
-  trx_preserve_temp_append_le32(payload, anchor.last_page_no);
-  trx_preserve_temp_append_le32(payload, anchor.top_page_no);
-  trx_preserve_temp_append_le32(payload, anchor.top_offset);
-  trx_preserve_temp_append_le64(payload, anchor.top_undo_no);
-}
-
 bool trx_preserve_temp_read_no_redo_undo_anchor(
     const unsigned char *payload, size_t payload_length, size_t *offset,
     trx_preserve_temp_no_redo_undo_log_anchor *anchor) {
@@ -3132,7 +2904,10 @@ bool trx_preserve_temp_no_redo_undo_anchor_identity_valid(
   if (!anchor.present) return true;
   return anchor.undo_slot < TRX_RSEG_N_SLOTS && anchor.hdr_page_no != 0 &&
          anchor.last_page_no != 0 && anchor.top_page_no != 0 &&
-         anchor.hdr_offset != 0 && anchor.top_offset != 0 &&
+         anchor.hdr_offset != 0 &&
+         (anchor.top_offset != 0 ||
+          (anchor.last_page_no == anchor.hdr_page_no &&
+           anchor.top_page_no == anchor.hdr_page_no && anchor.top_undo_no == 0)) &&
          anchor.top_undo_no <
              static_cast<uint64_t>(std::numeric_limits<undo_no_t>::max()) &&
          trx_preserve_temp_space_image_anchor_offsets_in_page(anchor,
@@ -3155,6 +2930,7 @@ bool trx_preserve_temp_no_redo_undo_sidecar_digest_matches(
 
 dberr_t trx_preserve_temp_space_image_capture_no_redo_undo_file_pages_locked(
     trx_preserve_temp_space_image_descriptor *descriptor) {
+  DBUG_EXECUTE_IF("preserve_temp_no_full_undo_scan", { return DB_ERROR; });
   if (descriptor == nullptr ||
       !descriptor->no_redo_undo_rseg_identity_present ||
       descriptor->page_size == 0) {
@@ -3222,6 +2998,108 @@ dberr_t trx_preserve_temp_space_image_capture_no_redo_undo_file_pages_locked(
 }
 
 }  // namespace
+
+trx_preserve_temp_undo_page_watch::trx_preserve_temp_undo_page_watch(
+    trx_preserve_temp_undo_page_watch &&other) noexcept {
+  *this = std::move(other);
+}
+
+trx_preserve_temp_undo_page_watch &trx_preserve_temp_undo_page_watch::operator=(
+    trx_preserve_temp_undo_page_watch &&other) noexcept {
+  if (this != &other) {
+    release();
+    m_key = std::exchange(other.m_key, 0);
+    m_version = other.m_version;
+    m_generation = other.m_generation;
+  }
+  return *this;
+}
+
+void trx_preserve_temp_undo_page_watch::release() noexcept {
+  if (!m_key) return;
+  trx_preserve_temp_undo_watch_count.fetch_sub(1, std::memory_order_acq_rel);
+  m_key = m_version = m_generation = 0;
+}
+
+void trx_preserve_temp_undo_page_watch::acquire(uint32_t space, uint32_t page) {
+  if (m_key || !space || !trx_preserve_temp_space_image_dirty_page_hook_enabled() ||
+      !fsp_is_system_temporary(space)) return;
+  if (!trx_preserve_temp_undo_watch_generation.load(std::memory_order_acquire)) return;
+  auto count = trx_preserve_temp_undo_watch_count.load(std::memory_order_relaxed);
+  while (count != UINT64_MAX) {
+    if (trx_preserve_temp_undo_watch_count.compare_exchange_weak(
+            count, count + 1, std::memory_order_acq_rel)) {
+      m_key = (uint64_t(space) << 32) | page;
+      return;
+    }
+  }
+}
+
+void trx_preserve_temp_undo_page_watch::remember() {
+  m_version = m_generation = 0;
+  if (!m_key || !trx_preserve_temp_space_image_dirty_page_hook_enabled()) return;
+  m_version = trx_preserve_temp_undo_write_version(m_key).load(std::memory_order_acquire);
+  m_generation = trx_preserve_temp_undo_watch_generation.load(std::memory_order_acquire);
+}
+
+bool trx_preserve_temp_undo_page_watch::unchanged() const {
+  if (!m_key || m_version == UINT64_MAX || !m_generation ||
+      !trx_preserve_temp_space_image_dirty_page_hook_enabled()) return false;
+  return m_generation == trx_preserve_temp_undo_watch_generation.load(std::memory_order_acquire) &&
+         m_version == trx_preserve_temp_undo_write_version(m_key).load(std::memory_order_acquire);
+}
+
+void trx_preserve_temp_undo_invalidate_watches() {
+  auto &g = trx_preserve_temp_undo_watch_generation;
+  auto value = g.load(std::memory_order_relaxed);
+  while (value && !g.compare_exchange_weak(
+      value, value == UINT64_MAX ? 0 : value + 1, std::memory_order_acq_rel)) {}
+}
+
+uint64_t trx_preserve_temp_undo_watched_pages() {
+  return trx_preserve_temp_undo_watch_count.load(std::memory_order_acquire);
+}
+
+uint64_t trx_preserve_temp_undo_watch_epoch() {
+  return trx_preserve_temp_space_image_dirty_page_hook_enabled()
+      ? trx_preserve_temp_undo_watch_generation.load(std::memory_order_acquire) : 0;
+}
+
+bool trx_preserve_temp_undo_input_identity_valid(
+    const trx_preserve_temp_space_image_descriptor &source,
+    const trx_preserve_temp_no_redo_undo_log_anchor &insert,
+    const trx_preserve_temp_no_redo_undo_log_anchor &update) {
+  const bool identity = source.undo_only
+      ? source.source_space_id != 0 && source.image_bytes == 0 &&
+        !source.sealed && source.source_space_id == source.no_redo_undo_rseg_space_id &&
+        trx_preserve_temp_space_image_valid_page_size(source.page_size)
+      : trx_preserve_temp_space_image_is_attach_candidate(source);
+  return identity &&
+         (insert.present || update.present) &&
+         trx_preserve_temp_no_redo_undo_anchor_identity_valid(insert, source.page_size) &&
+         trx_preserve_temp_no_redo_undo_anchor_identity_valid(update, source.page_size);
+}
+
+bool trx_preserve_temp_undo_input_page_valid(
+    const trx_preserve_temp_space_image_descriptor &source,
+    const trx_preserve_temp_no_redo_undo_page_image &image) {
+  const auto *page = image.bytes.data();
+  const auto bytes = image.bytes.size();
+  if (bytes != source.page_size ||
+      !trx_preserve_temp_space_image_no_redo_undo_page_identity_matches(
+          source, image.page_no, page, bytes)) return false;
+  switch (image.kind) {
+    case trx_preserve_temp_no_redo_undo_page_kind::RSEG_HEADER:
+      return image.page_no == source.no_redo_undo_rseg_page_no &&
+             trx_preserve_temp_space_image_no_redo_undo_page_type_is_rseg_header(page, bytes);
+    case trx_preserve_temp_no_redo_undo_page_kind::RSEG_ALLOCATOR:
+      return trx_preserve_temp_space_image_no_redo_undo_page_type_is_allocator(page, bytes);
+    case trx_preserve_temp_no_redo_undo_page_kind::UNDO_HEADER:
+    case trx_preserve_temp_no_redo_undo_page_kind::UNDO_LOG:
+      return trx_preserve_temp_space_image_no_redo_undo_page_type_is_undo_log(page, bytes);
+  }
+  return false;
+}
 
 bool trx_preserve_temp_space_image_should_disable_undo_cache(
     uint32_t rseg_space_id) {
@@ -3709,17 +3587,15 @@ trx_preserve_temp_space_image_release_native_no_redo_undo_slots_for_retry(
       trx_preserve_temp_space_image_find_no_redo_rseg(*descriptor);
   if (rseg == nullptr) return DB_ERROR;
 
-  const ulint insert_size =
-      descriptor->no_redo_insert_undo.present
-          ? trx_preserve_temp_space_image_reconnected_undo_size(
-                *descriptor, descriptor->no_redo_insert_undo)
-          : 0;
-  const ulint update_size =
-      descriptor->no_redo_update_undo.present
-          ? trx_preserve_temp_space_image_reconnected_undo_size(
-                *descriptor, descriptor->no_redo_update_undo)
-          : 0;
-  dberr_t err = DB_SUCCESS;
+  ulint insert_size = 0;
+  ulint update_size = 0;
+  dberr_t err = trx_preserve_temp_space_image_reconnected_undo_size(
+      *descriptor, descriptor->no_redo_insert_undo, &insert_size);
+  if (err == DB_SUCCESS) {
+    err = trx_preserve_temp_space_image_reconnected_undo_size(
+        *descriptor, descriptor->no_redo_update_undo, &update_size);
+  }
+  if (err != DB_SUCCESS) return err;
   page_no_t released_size = 0;
   auto clear_anchor_slot =
       [&err, &released_size](
@@ -3918,10 +3794,6 @@ void trx_preserve_temp_space_image_reset_dirty_page_stream(
   trx_preserve_temp_space_image_reset_dirty_page_stream_impl(descriptor);
 }
 
-bool trx_preserve_temp_space_image_preserves_source_space_id(
-    const trx_preserve_temp_space_image_descriptor &descriptor) {
-  return descriptor.source_space_id != 0;
-}
 
 bool trx_preserve_temp_space_image_reserve_space_id(
     const trx_preserve_temp_space_image_descriptor &descriptor) {
@@ -3949,168 +3821,6 @@ bool trx_preserve_temp_space_image_release_reserved_space_id(
   return ibt::release_preserved_space_id(source_space_id);
 }
 
-dberr_t trx_preserve_temp_table_export_source_metadata(
-    TABLE *table, trx_preserve_temp_table_exported_metadata *metadata) {
-  if (!preserve_trx_temp_table_enable) return DB_SUCCESS;
-  if (table == nullptr || table->s == nullptr || table->file == nullptr ||
-      metadata == nullptr) {
-    return DB_ERROR;
-  }
-  if (innodb_hton == nullptr || table->s->db_type() != innodb_hton ||
-      table->file->ht != innodb_hton) {
-    return DB_UNSUPPORTED;
-  }
-
-  ha_innobase *handler = static_cast<ha_innobase *>(table->file);
-  row_prebuilt_t *prebuilt = handler->preserve_trx_temp_table_prebuilt();
-  if (prebuilt == nullptr || prebuilt->table == nullptr) {
-    return DB_ERROR;
-  }
-
-  dict_table_t *dict_table = prebuilt->table;
-  if (!dict_table->is_temporary() || dict_table->space == 0 ||
-      dict_table->id == 0 || dict_table->first_index() == nullptr) {
-    return DB_UNSUPPORTED;
-  }
-  if (dict_table->has_instant_cols() || dict_table->n_v_cols != 0) {
-    return DB_UNSUPPORTED;
-  }
-
-  char *raw_path = fil_space_get_first_path(dict_table->space);
-  if (raw_path == nullptr) return DB_ERROR;
-
-  trx_preserve_temp_table_exported_metadata exported;
-  exported.source_space_id = static_cast<uint32_t>(dict_table->space);
-  exported.page_size = dict_table_page_size(dict_table).physical();
-  exported.table_flags = dict_table->flags;
-  exported.space_flags = fil_space_get_flags(dict_table->space);
-  if (exported.space_flags == UINT32_UNDEFINED ||
-      !fsp_flags_is_valid(exported.space_flags)) {
-    ut_free(raw_path);
-    return DB_ERROR;
-  }
-  DBUG_EXECUTE_IF("preserve_trx_temp_table_force_encrypted_space",
-                  { fsp_flags_set_encryption(exported.space_flags); });
-  if (FSP_FLAGS_GET_ENCRYPTION(exported.space_flags)) {
-    ut_free(raw_path);
-    return DB_UNSUPPORTED;
-  }
-  exported.image_table_id = static_cast<uint64_t>(dict_table->id);
-  exported.source_path = raw_path;
-  ut_free(raw_path);
-
-  trx_preserve_temp_dict_table_binding dict_binding;
-  dict_binding.source_space_id = exported.source_space_id;
-  dict_binding.image_table_id = exported.image_table_id;
-  dict_binding.table_flags = exported.table_flags;
-  const uint16_t n_user_cols = dict_table->get_n_user_cols();
-  if (n_user_cols == 0) return DB_UNSUPPORTED;
-  for (uint16_t column_ordinal = 0; column_ordinal < n_user_cols;
-       ++column_ordinal) {
-    const dict_col_t *column = dict_table->get_col(column_ordinal);
-    const char *column_name = dict_table->get_col_name(column_ordinal);
-    if (column == nullptr || column_name == nullptr || column_name[0] == '\0' ||
-        column->instant_default != nullptr || !column->is_visible ||
-        column->mtype == 0 || column->len == 0) {
-      return DB_UNSUPPORTED;
-    }
-    trx_preserve_temp_dict_column_binding exported_column;
-    exported_column.name = column_name;
-    exported_column.mtype = static_cast<uint32_t>(column->mtype);
-    exported_column.prtype = static_cast<uint32_t>(column->prtype);
-    exported_column.len = static_cast<uint32_t>(column->len);
-    exported_column.visible = column->is_visible;
-    dict_binding.columns.push_back(std::move(exported_column));
-  }
-
-  for (dict_index_t *index = dict_table->first_index(); index != nullptr;
-       index = index->next()) {
-    if (index->space != dict_table->space || index->id == 0 ||
-        index->page == 0 || index->is_corrupted()) {
-      return DB_UNSUPPORTED;
-    }
-    trx_preserve_temp_table_exported_index_metadata exported_index;
-    exported_index.image_index_id = static_cast<uint64_t>(index->id);
-    exported_index.root_page_no = static_cast<uint32_t>(index->page);
-    exported_index.space_flags = exported.space_flags;
-    exported_index.clustered = index->is_clustered();
-    exported_index.name = index->name();
-    if (exported_index.clustered) {
-      exported.clustered_root_page_no = exported_index.root_page_no;
-      dict_binding.clustered_root_page_no = exported_index.root_page_no;
-    }
-    exported.indexes.push_back(std::move(exported_index));
-
-    if (index->n_user_defined_cols == 0) return DB_UNSUPPORTED;
-    trx_preserve_temp_dict_index_binding exported_index_binding;
-    exported_index_binding.image_index_id = static_cast<uint64_t>(index->id);
-    exported_index_binding.root_page_no = static_cast<uint32_t>(index->page);
-    exported_index_binding.clustered = index->is_clustered();
-    exported_index_binding.unique = dict_index_is_unique(index) != 0;
-    exported_index_binding.n_unique_fields =
-        exported_index_binding.unique ? static_cast<uint32_t>(index->n_uniq) : 0;
-    exported_index_binding.name = index->name();
-    if (exported_index_binding.unique &&
-        (exported_index_binding.n_unique_fields == 0 ||
-         exported_index_binding.n_unique_fields > index->n_user_defined_cols)) {
-      return DB_UNSUPPORTED;
-    }
-    for (ulint field_ordinal = 0; field_ordinal < index->n_user_defined_cols;
-         ++field_ordinal) {
-      const dict_field_t *field = index->get_field(field_ordinal);
-      if (field == nullptr || field->col == nullptr ||
-          field->col->ind >= n_user_cols) {
-        return DB_UNSUPPORTED;
-      }
-      const char *field_column_name = dict_table->get_col_name(field->col->ind);
-      if (field_column_name == nullptr || field_column_name[0] == '\0') {
-        return DB_UNSUPPORTED;
-      }
-      trx_preserve_temp_dict_index_field_binding exported_field;
-      exported_field.column_name = field_column_name;
-      exported_field.prefix_len = static_cast<uint32_t>(field->prefix_len);
-      exported_field.ascending = field->is_ascending != 0;
-      exported_index_binding.fields.push_back(std::move(exported_field));
-    }
-    dict_binding.indexes.push_back(std::move(exported_index_binding));
-  }
-
-  if (exported.page_size == 0 || exported.clustered_root_page_no == 0 ||
-      exported.indexes.empty() || dict_binding.clustered_root_page_no == 0 ||
-      dict_binding.columns.empty() || dict_binding.indexes.empty()) {
-    return DB_ERROR;
-  }
-
-  exported.dict_binding = std::move(dict_binding);
-  *metadata = std::move(exported);
-  return DB_SUCCESS;
-}
-
-dberr_t trx_preserve_temp_space_image_begin(
-    THD *thd, TABLE *source_table, uint32_t source_space_id,
-    uint32_t page_size, uint32_t space_flags,
-    trx_preserve_temp_space_image_descriptor *descriptor) {
-  if (thd == nullptr || source_table == nullptr || descriptor == nullptr ||
-      source_space_id == 0 || page_size == 0) {
-    return DB_ERROR;
-  }
-
-  descriptor->source_space_id = source_space_id;
-  descriptor->page_size = page_size;
-  descriptor->space_flags = space_flags;
-  descriptor->image_bytes = 0;
-  descriptor->sealed = false;
-  trx_preserve_temp_space_image_reset_dirty_page_stream(descriptor);
-  trx_preserve_temp_space_image_reset_shadow(descriptor);
-
-  /*
-    Physical temp-table image capture is only valid after SQL has exported the
-    table metadata and InnoDB has an armed dirty-page stream. Returning
-    DB_UNSUPPORTED here keeps callers on the conservative path until that
-    integration explicitly hands in the missing context.
-  */
-  return DB_UNSUPPORTED;
-}
 
 dberr_t trx_preserve_temp_space_image_note_page(
     trx_preserve_temp_space_image_descriptor *descriptor, uint32_t page_no,
@@ -4240,82 +3950,91 @@ dberr_t trx_preserve_temp_space_image_copy_initial_file_pages(
   return err;
 }
 
+dberr_t trx_preserve_temp_prepare_capture_page(
+    const trx_preserve_temp_space_image_descriptor &descriptor,
+    uint32_t page_no, unsigned char *page, size_t bytes) {
+  if (bytes != descriptor.page_size ||
+      !trx_preserve_temp_space_image_page_identity_matches(
+          descriptor, page, bytes, page_no)) return DB_CORRUPTION;
+  if (bytes == UNIV_PAGE_SIZE &&
+      !trx_preserve_temp_space_image_page_is_zero(page, bytes)) {
+    buf_flush_init_for_writing(nullptr, page, nullptr,
+        mach_read_from_8(page + FIL_PAGE_LSN),
+        fsp_is_checksum_disabled(descriptor.source_space_id), true);
+  }
+  return DB_SUCCESS;
+}
+
+bool trx_preserve_temp_capture_resource_exhausted(
+    const trx_preserve_temp_space_image_descriptor *descriptor) {
+  if (!descriptor) return false;
+  std::lock_guard<std::mutex> guard(trx_preserve_temp_dirty_page_streams_mutex);
+  return descriptor->dirty_page_stream_optional &&
+         descriptor->dirty_page_stream_resource_exhausted;
+}
+
+bool trx_preserve_temp_capture_stream_current(
+    const trx_preserve_temp_space_image_descriptor *descriptor, uint64_t floor) {
+  if (!descriptor) return false;
+  std::lock_guard<std::mutex> guard(trx_preserve_temp_dirty_page_streams_mutex);
+  return descriptor->dirty_page_stream_armed &&
+         descriptor->initial_copy_started && !descriptor->sealed &&
+         !descriptor->dirty_page_stream_degraded &&
+         descriptor->dirty_page_capture_floor == floor &&
+         trx_preserve_temp_space_image_registered_locked(descriptor);
+}
+
+namespace {
+dberr_t run_temp_capture_scan(
+    trx_preserve_temp_capture_scan::Mode mode,
+    trx_preserve_temp_space_image_descriptor *descriptor, const char *path,
+    void *context, trx_preserve_temp_space_image_write_page_callback callback) {
+  if (!callback || !descriptor) return DB_ERROR;
+  DBUG_EXECUTE_IF("preserve_temp_source_pool_probe", {
+    if (mode == trx_preserve_temp_capture_scan::Mode::FILE_BASELINE &&
+        !trx_preserve_temp_source_pool_probe()) return DB_ERROR;
+  });
+  DBUG_EXECUTE_IF("preserve_temp_capture_scan_probe", {
+    if (mode == trx_preserve_temp_capture_scan::Mode::FILE_BASELINE &&
+        !trx_preserve_temp_capture_scan_probe(descriptor, path)) return DB_ERROR;
+  });
+  trx_preserve_temp_capture_scan scan;
+  auto error = scan.start(mode, descriptor, path);
+  bool complete = false;
+  size_t budget = 128;
+  DBUG_EXECUTE_IF("preserve_temp_capture_scan_probe", budget = 1;);
+  while (error == DB_SUCCESS && !complete) {
+#ifndef DBUG_OFF
+    const auto before = scan.pages_visited();
+#endif
+    error = scan.step(budget, context, callback, &complete);
+    DBUG_EXECUTE_IF("preserve_temp_capture_scan_probe", {
+      if (scan.pages_visited() - before > budget ||
+          (error == DB_SUCCESS && !complete && scan.pages_visited() == before))
+        return DB_ERROR;
+    });
+  }
+  if (error != DB_SUCCESS) {
+    trx_preserve_temp_space_image_mark_dirty_page_stream_degraded(
+        descriptor, "temp-table image scan failed");
+  } else {
+    DBUG_EXECUTE_IF("preserve_temp_capture_scan_probe", {
+      if (scan.pages_visited() <= 1) return DB_ERROR;
+      if (mode == trx_preserve_temp_capture_scan::Mode::BUFFER_OVERLAY)
+        DBUG_PRINT("preserve_temp_import",
+                   ("temporary capture scan checked copy=1 overlay=1"));
+    });
+  }
+  return error;
+}
+}  // namespace
+
 dberr_t trx_preserve_temp_space_image_copy_initial_file_pages_to_writer(
     trx_preserve_temp_space_image_descriptor *descriptor, const char *path,
     void *context, trx_preserve_temp_space_image_write_page_callback callback) {
   if (!preserve_trx_temp_table_enable) return DB_SUCCESS;
-  if (descriptor == nullptr || path == nullptr || path[0] == '\0' ||
-      callback == nullptr) {
-    return DB_ERROR;
-  }
-  if (!trx_preserve_temp_space_image_descriptor_has_identity(*descriptor) ||
-      !descriptor->initial_copy_started || descriptor->sealed) {
-    return DB_ERROR;
-  }
-
-  File file = my_open(path, O_RDONLY, MYF(0));
-  if (file < 0) {
-    trx_preserve_temp_space_image_mark_dirty_page_stream_degraded(
-        descriptor, "temp-table initial file copy failed");
-    return DB_ERROR;
-  }
-
-  dberr_t err = DB_SUCCESS;
-  const my_off_t file_bytes = my_seek(file, 0, MY_SEEK_END, MYF(0));
-  if (file_bytes == MY_FILEPOS_ERROR || file_bytes == 0 ||
-      file_bytes % descriptor->page_size != 0 ||
-      my_seek(file, 0, MY_SEEK_SET, MYF(0)) == MY_FILEPOS_ERROR) {
-    err = DB_ERROR;
-  }
-
-  std::vector<unsigned char> page;
-  if (err == DB_SUCCESS) {
-    page.resize(descriptor->page_size);
-    const uint64_t page_count = file_bytes / descriptor->page_size;
-    for (uint64_t page_no = 0; page_no < page_count; ++page_no) {
-      if (page_no > std::numeric_limits<uint32_t>::max()) {
-        err = DB_OUT_OF_MEMORY;
-        break;
-      }
-      const size_t bytes_read =
-          my_read(file, page.data(), page.size(), MYF(0));
-      if (bytes_read != page.size()) {
-        trx_preserve_temp_space_image_mark_page_copy_failure(
-            descriptor, "temp-table initial file short read", page_no,
-            bytes_read, page.size(), page.data(), page.size(), file_bytes);
-        err = DB_ERROR;
-        break;
-      }
-      if (!trx_preserve_temp_space_image_page_identity_matches(
-              *descriptor, page.data(), page.size(),
-              static_cast<uint32_t>(page_no))) {
-        trx_preserve_temp_space_image_mark_page_copy_failure(
-            descriptor, "temp-table initial file page identity mismatch",
-            page_no, bytes_read, page.size(), page.data(), page.size(),
-            file_bytes);
-        err = DB_ERROR;
-        break;
-      }
-      err = trx_preserve_temp_space_image_write_file_page_to_callback(
-          *descriptor, static_cast<uint32_t>(page_no), page.data(),
-          page.size(), context, callback);
-      if (err != DB_SUCCESS) break;
-    }
-  }
-
-  if (my_close(file, MYF(0)) != 0 && err == DB_SUCCESS) {
-    err = DB_ERROR;
-  }
-  if (err != DB_SUCCESS) {
-    if (!descriptor->dirty_page_stream_degraded) {
-      trx_preserve_temp_space_image_mark_dirty_page_stream_degraded(
-          descriptor, "temp-table initial file copy failed");
-    }
-    return err;
-  }
-
-  descriptor->shadow_image_bytes = static_cast<uint64_t>(file_bytes);
-  return DB_SUCCESS;
+  return run_temp_capture_scan(trx_preserve_temp_capture_scan::Mode::FILE_BASELINE,
+                              descriptor, path, context, callback);
 }
 
 dberr_t trx_preserve_temp_space_image_overlay_buffer_pool_pages(
@@ -4336,11 +4055,16 @@ dberr_t trx_preserve_temp_space_image_overlay_buffer_pool_pages(
 
   const page_size_t page_size(descriptor->space_flags);
   for (uint32_t page_no : page_nos) {
+    const page_id_t page_id(descriptor->source_space_id, page_no);
+    if (!buf_page_peek(page_id)) continue;
     mtr_t mtr;
     mtr_start(&mtr);
+    // A whole-space image includes freed LOB pages after statement/savepoint
+    // rollback. Copy their bytes; XDES, not a cached debug flag, determines
+    // allocation during import. Avoid pulling every cold baseline page in.
     buf_block_t *block = buf_page_get_gen(
-        page_id_t(descriptor->source_space_id, page_no), page_size,
-        RW_S_LATCH, nullptr, Page_fetch::IF_IN_POOL, __FILE__, __LINE__, &mtr);
+        page_id, page_size, RW_S_LATCH, nullptr, Page_fetch::POSSIBLY_FREED,
+        __FILE__, __LINE__, &mtr);
     if (block == nullptr) {
       mtr_commit(&mtr);
       continue;
@@ -4369,50 +4093,8 @@ dberr_t trx_preserve_temp_space_image_overlay_buffer_pool_pages_to_writer(
     trx_preserve_temp_space_image_descriptor *descriptor, void *context,
     trx_preserve_temp_space_image_write_page_callback callback) {
   if (!preserve_trx_temp_table_enable) return DB_SUCCESS;
-  if (descriptor == nullptr || callback == nullptr ||
-      !trx_preserve_temp_space_image_descriptor_has_identity(*descriptor) ||
-      !descriptor->initial_copy_started || descriptor->sealed ||
-      descriptor->shadow_image_bytes == 0 ||
-      descriptor->shadow_image_bytes % descriptor->page_size != 0) {
-    return DB_ERROR;
-  }
-
-  const uint64_t page_count = descriptor->shadow_image_bytes / descriptor->page_size;
-  if (page_count > std::numeric_limits<uint32_t>::max())
-    return DB_OUT_OF_MEMORY;
-
-  const page_size_t page_size(descriptor->space_flags);
-  for (uint64_t page_no64 = 0; page_no64 < page_count; ++page_no64) {
-    const uint32_t page_no = static_cast<uint32_t>(page_no64);
-    mtr_t mtr;
-    mtr_start(&mtr);
-    buf_block_t *block = buf_page_get_gen(
-        page_id_t(descriptor->source_space_id, page_no), page_size,
-        RW_S_LATCH, nullptr, Page_fetch::IF_IN_POOL, __FILE__, __LINE__, &mtr);
-    if (block == nullptr) {
-      mtr_commit(&mtr);
-      continue;
-    }
-
-    const unsigned char *frame =
-        reinterpret_cast<const unsigned char *>(buf_block_get_frame(block));
-    if (!trx_preserve_temp_space_image_page_identity_matches(
-            *descriptor, frame, descriptor->page_size, page_no)) {
-      mtr_commit(&mtr);
-      trx_preserve_temp_space_image_mark_dirty_page_stream_degraded(
-          descriptor, "temp-table buffer-pool page identity mismatch");
-      return DB_ERROR;
-    }
-
-    const dberr_t err =
-        trx_preserve_temp_space_image_write_file_page_to_callback(
-            *descriptor, page_no, frame, descriptor->page_size, context,
-            callback);
-    mtr_commit(&mtr);
-    if (err != DB_SUCCESS) return err;
-  }
-
-  return DB_SUCCESS;
+  return run_temp_capture_scan(trx_preserve_temp_capture_scan::Mode::BUFFER_OVERLAY,
+                              descriptor, nullptr, context, callback);
 }
 
 dberr_t trx_preserve_temp_space_image_begin_initial_copy(
@@ -4427,15 +4109,19 @@ dberr_t trx_preserve_temp_space_image_begin_initial_copy(
         participant, "unsupported temp tablespace identity");
     return DB_UNSUPPORTED;
   }
-  if (!descriptor->dirty_page_stream_armed ||
-      !participant->capture_epoch_ready_for_copy()) {
-    trx_preserve_temp_space_image_mark_participant_degraded(
-        participant, "temp-table capture epoch not armed");
-    return DB_ERROR;
-  }
+  const bool epoch_ready = participant->capture_epoch_ready_for_copy();
   {
     std::lock_guard<std::mutex> guard{
         trx_preserve_temp_dirty_page_streams_mutex};
+    // A background write can exhaust the optional queue after registration.
+    // Preserve its typed failure instead of degrading the transaction here.
+    if (descriptor->dirty_page_stream_optional &&
+        descriptor->dirty_page_stream_resource_exhausted) return DB_ERROR;
+    if (!descriptor->dirty_page_stream_armed || !epoch_ready) {
+      trx_preserve_temp_space_image_mark_participant_degraded(
+          participant, "temp-table capture epoch not armed");
+      return DB_ERROR;
+    }
     if (!trx_preserve_temp_space_image_registered_locked(descriptor)) {
       trx_preserve_temp_space_image_mark_participant_degraded(
           participant, "temp-table dirty page stream not registered");
@@ -4489,7 +4175,8 @@ dberr_t trx_preserve_temp_space_image_apply_dirty_page_stream_to_writer(
     return DB_ERROR;
   }
 
-  std::vector<trx_preserve_temp_dirty_page_image> dirty_pages;
+  size_t end = 0;
+  uint64_t floor = 0;
   {
     std::lock_guard<std::mutex> guard{
         trx_preserve_temp_dirty_page_streams_mutex};
@@ -4497,25 +4184,50 @@ dberr_t trx_preserve_temp_space_image_apply_dirty_page_stream_to_writer(
         !trx_preserve_temp_space_image_registered_locked(descriptor)) {
       return DB_ERROR;
     }
-    dirty_pages = descriptor->dirty_pages;
+    end = descriptor->dirty_pages.size();
+    floor = descriptor->dirty_page_capture_floor;
   }
-
-  for (const trx_preserve_temp_dirty_page_image &image : dirty_pages) {
-    if (image.bytes.size() != descriptor->page_size) return DB_ERROR;
-    const dberr_t err =
-        trx_preserve_temp_space_image_write_file_page_to_callback(
-            *descriptor, image.page_no, image.bytes.data(), image.bytes.size(),
-            context, callback);
-    if (err != DB_SUCCESS) return err;
+  if (!end) return DB_SUCCESS;
+  try {
+    auto memory = preserve_trx_acquire_memory_lease(
+        descriptor->dirty_page_resource_token,
+        Preserve_trx_memory_kind::TEMP_IMAGE_STREAM_BUFFER, descriptor->page_size);
+    if (!memory.acquired()) return DB_OUT_OF_MEMORY;
+    std::vector<unsigned char> page(descriptor->page_size);
+    // Active slots are only appended or replaced. Do not deep-copy the whole
+    // queue or chase new tail entries; final freeze will include those writes.
+    for (size_t slot = 0; slot < end; ++slot) {
+      uint32_t page_no;
+      {
+        std::lock_guard<std::mutex> guard(trx_preserve_temp_dirty_page_streams_mutex);
+        if (descriptor->dirty_page_stream_degraded ||
+            !trx_preserve_temp_space_image_registered_locked(descriptor) ||
+            descriptor->dirty_page_capture_floor != floor ||
+            slot >= descriptor->dirty_pages.size()) return DB_ERROR;
+        const auto &image = descriptor->dirty_pages[slot];
+        if (image.bytes.size() != page.size()) return DB_ERROR;
+        page_no = image.page_no;
+        std::memcpy(page.data(), image.bytes.data(), page.size());
+      }
+      auto error = trx_preserve_temp_prepare_capture_page(
+          *descriptor, page_no, page.data(), page.size());
+      preserve_trx_temp_final_read(page.size());
+      if (error == DB_SUCCESS) error = callback(context, page_no, page.data(), page.size());
+      if (error != DB_SUCCESS) return error;
+    }
+  } catch (const std::bad_alloc &) {
+    return DB_OUT_OF_MEMORY;
   }
   return DB_SUCCESS;
 }
 
-dberr_t trx_preserve_temp_space_image_finish_streamed_sidecar(
-    trx_preserve_temp_space_image_descriptor *descriptor, void *context,
-    trx_preserve_temp_space_image_write_page_callback callback) {
-  if (!preserve_trx_temp_table_enable) return DB_SUCCESS;
-  if (descriptor == nullptr || callback == nullptr ||
+dberr_t trx_preserve_temp_capture_take_tail(
+    trx_preserve_temp_space_image_descriptor *descriptor,
+    std::vector<trx_preserve_temp_dirty_page_image> *pages,
+    uint64_t *reserved_bytes) {
+  if (!preserve_trx_temp_table_enable) return DB_UNSUPPORTED;
+  if (descriptor == nullptr || pages == nullptr || !pages->empty() ||
+      reserved_bytes == nullptr || *reserved_bytes != 0 ||
       !trx_preserve_temp_space_image_descriptor_has_identity(*descriptor) ||
       !descriptor->initial_copy_started || descriptor->sealed) {
     return DB_ERROR;
@@ -4528,14 +4240,15 @@ dberr_t trx_preserve_temp_space_image_finish_streamed_sidecar(
   }
 
   /*
-    Streamed sidecar finish is the bounded tail of phase 1. It freezes
-    admission, copies the remaining dirty pages to the writer, and leaves the
+    Streamed sidecar finish freezes admission, writes the remaining private
+    dirty-page copies to the writer, and leaves the
     descriptor unsealed until the carrier reports the final size and digest.
   */
-  std::vector<trx_preserve_temp_dirty_page_image> dirty_pages;
+  descriptor->dirty_page_tail_complete = false;
   dberr_t err =
       trx_preserve_temp_space_image_freeze_dirty_stream_for_seal(descriptor,
-                                                                &dirty_pages);
+                                                                pages,
+                                                                reserved_bytes);
   if (err != DB_SUCCESS) {
     if (descriptor->no_redo_undo_capture_required) {
       trx_preserve_temp_space_image_unregister_no_redo_undo_stream(descriptor);
@@ -4543,14 +4256,87 @@ dberr_t trx_preserve_temp_space_image_finish_streamed_sidecar(
     return err;
   }
 
-  for (const trx_preserve_temp_dirty_page_image &image : dirty_pages) {
-    if (image.bytes.size() != descriptor->page_size) return DB_ERROR;
-    err = trx_preserve_temp_space_image_write_file_page_to_callback(
-        *descriptor, image.page_no, image.bytes.data(), image.bytes.size(),
-        context, callback);
-    if (err != DB_SUCCESS) return err;
-  }
   return DB_SUCCESS;
+}
+
+dberr_t trx_preserve_temp_capture_take_round(
+    trx_preserve_temp_space_image_descriptor *descriptor,
+    std::vector<trx_preserve_temp_dirty_page_image> *pages,
+    std::map<uint32_t, size_t> *retired_index, uint64_t *reserved_bytes) {
+  if (!preserve_trx_temp_table_enable || !descriptor || !pages ||
+      !pages->empty() || !retired_index || !retired_index->empty() ||
+      !reserved_bytes || *reserved_bytes != 0)
+    return DB_ERROR;
+  std::lock_guard<std::mutex> guard(trx_preserve_temp_dirty_page_streams_mutex);
+  if (!descriptor->initial_copy_started || descriptor->sealed ||
+      !descriptor->dirty_page_queue_durable ||
+      descriptor->dirty_page_stream_degraded ||
+      descriptor->dirty_page_round_active ||
+      !trx_preserve_temp_space_image_registered_locked(descriptor))
+    return DB_ERROR;
+  pages->swap(descriptor->dirty_pages);
+  retired_index->swap(descriptor->dirty_page_index);
+  *reserved_bytes = descriptor->dirty_page_memory_reserved_bytes -
+                    descriptor->dirty_page_version_memory_bytes;
+  descriptor->dirty_page_memory_reserved_bytes =
+      descriptor->dirty_page_version_memory_bytes;
+  descriptor->dirty_page_inflight_bytes = descriptor->dirty_page_bytes;
+  descriptor->dirty_page_bytes = 0;
+  descriptor->dirty_page_round_active = true;
+  return DB_SUCCESS;
+}
+
+void trx_preserve_temp_capture_end_round(
+    trx_preserve_temp_space_image_descriptor *descriptor,
+    uint64_t floor, bool success) {
+  std::lock_guard<std::mutex> guard(trx_preserve_temp_dirty_page_streams_mutex);
+  if (descriptor->dirty_page_capture_floor != floor ||
+      !descriptor->dirty_page_round_active) return;
+  descriptor->dirty_page_round_active = false;
+  descriptor->dirty_page_inflight_bytes = 0;
+  if (!success)
+    trx_preserve_temp_space_image_mark_dirty_page_stream_degraded_locked(
+        descriptor, "temporary dirty round abandoned before durable write", false);
+}
+
+bool trx_preserve_temp_capture_dirty_mask(
+    const trx_preserve_temp_space_image_descriptor *descriptor,
+    uint64_t expected_floor, uint32_t first_page, uint32_t page_count,
+    uint64_t *dirty_mask) {
+  if (!preserve_trx_enable || !preserve_trx_temp_table_enable || !descriptor ||
+      !dirty_mask || !expected_floor || !page_count || page_count > 64)
+    return false;
+  std::lock_guard<std::mutex> guard(trx_preserve_temp_dirty_page_streams_mutex);
+  if (!descriptor->dirty_page_stream_armed || !descriptor->initial_copy_started ||
+      !descriptor->dirty_page_queue_durable || descriptor->sealed ||
+      descriptor->dirty_page_stream_degraded || descriptor->dirty_page_round_active ||
+      descriptor->dirty_page_capture_floor != expected_floor ||
+      !trx_preserve_temp_space_image_registered_locked(descriptor)) return false;
+  uint64_t mask = 0;
+  const uint64_t end_page = uint64_t{first_page} + page_count;
+  for (auto it = descriptor->dirty_page_versions.lower_bound(first_page);
+       it != descriptor->dirty_page_versions.end() && it->first < end_page; ++it)
+    mask |= uint64_t{1} << (it->first - first_page);
+  *dirty_mask = mask;
+  return true;
+}
+
+void trx_preserve_temp_capture_abandon_candidate(
+    trx_preserve_temp_space_image_descriptor *descriptor) {
+  if (!descriptor) return;
+  std::lock_guard<std::mutex> guard(trx_preserve_temp_dirty_page_streams_mutex);
+  if (trx_preserve_temp_space_image_registered_locked(descriptor))
+    trx_preserve_temp_space_image_mark_dirty_page_stream_degraded_locked(
+        descriptor, "optional temporary capture candidate discarded", false);
+}
+
+void trx_preserve_temp_capture_discard_candidate(
+    trx_preserve_temp_space_image_descriptor *descriptor) {
+  if (!descriptor) return;
+  // Unpublish under the stream mutex. Late TLS delivery looks up by identity;
+  // it cannot retain this descriptor or charge new bytes to it afterwards.
+  trx_preserve_temp_capture_abandon_candidate(descriptor);
+  trx_preserve_temp_space_image_reset_dirty_page_stream_impl(descriptor, false);
 }
 
 dberr_t trx_preserve_temp_space_image_mark_streamed_sidecar_sealed(
@@ -4560,6 +4346,10 @@ dberr_t trx_preserve_temp_space_image_mark_streamed_sidecar_sealed(
   if (descriptor == nullptr || image_digest == nullptr ||
       !trx_preserve_temp_space_image_descriptor_has_identity(*descriptor) ||
       !descriptor->initial_copy_started || descriptor->sealed ||
+      !descriptor->dirty_page_tail_complete ||
+      descriptor->dirty_page_stream_registered ||
+      descriptor->dirty_page_stream_armed ||
+      descriptor->dirty_page_stream_degraded ||
       image_bytes == 0) {
     return DB_ERROR;
   }
@@ -4570,6 +4360,9 @@ dberr_t trx_preserve_temp_space_image_mark_streamed_sidecar_sealed(
   descriptor->shadow_pages.clear();
   trx_preserve_temp_space_image_release_dirty_page_memory(descriptor);
   descriptor->dirty_pages.clear();
+  descriptor->dirty_page_index.clear();
+  descriptor->dirty_page_versions.clear();
+  descriptor->dirty_page_version_memory_bytes = 0;
   descriptor->dirty_page_bytes = 0;
   return DB_SUCCESS;
 }
@@ -4594,7 +4387,7 @@ trx_preserve_temp_space_image_shadow_page_at(
 dberr_t trx_preserve_temp_space_image_arm_dirty_page_stream(
     trx_preserve_temp_space_image_descriptor *descriptor,
     Temp_table_warmcopy_participant *participant,
-    uint64_t queue_limit_bytes, const char *resource_token) {
+    uint64_t queue_limit_bytes, const char *resource_token, bool optional) {
   if (descriptor == nullptr || participant == nullptr ||
       !trx_preserve_temp_space_image_descriptor_has_identity(*descriptor) ||
       queue_limit_bytes == 0) {
@@ -4609,10 +4402,11 @@ dberr_t trx_preserve_temp_space_image_arm_dirty_page_stream(
   trx_preserve_temp_space_image_release_dirty_page_memory(descriptor);
   descriptor->dirty_page_queue_limit_bytes = queue_limit_bytes;
   descriptor->dirty_page_bytes = 0;
-  descriptor->dirty_page_next_sequence = 1;
   descriptor->dirty_page_stream_armed = true;
   descriptor->dirty_page_stream_degraded = false;
+  descriptor->dirty_page_stream_resource_exhausted = false;
   descriptor->dirty_page_stream_degraded_reason.clear();
+  descriptor->dirty_page_stream_optional = optional;
   descriptor->dirty_page_participant = participant;
   descriptor->dirty_page_resource_token =
       resource_token != nullptr && resource_token[0] != '\0'
@@ -4620,8 +4414,14 @@ dberr_t trx_preserve_temp_space_image_arm_dirty_page_stream(
           : std::to_string(descriptor->source_space_id);
   descriptor->dirty_page_memory_reserved_bytes = 0;
   descriptor->dirty_pages.clear();
+  descriptor->dirty_page_index.clear();
+  descriptor->dirty_page_versions.clear();
+  descriptor->dirty_page_version_memory_bytes = 0;
+  descriptor->dirty_page_inflight_bytes = 0;
+  descriptor->dirty_page_round_active = false;
   descriptor->dirty_page_stream_registered = false;
   descriptor->dirty_page_queue_durable = false;
+  descriptor->dirty_page_tail_complete = false;
   return DB_SUCCESS;
 }
 
@@ -4640,19 +4440,22 @@ dberr_t trx_preserve_temp_space_image_register_dirty_page_stream(
   */
   std::lock_guard<std::mutex> guard{
       trx_preserve_temp_dirty_page_streams_mutex};
+  if (trx_preserve_temp_dirty_page_streams.count(descriptor->source_space_id))
+    return DB_ERROR;
+  const uint64_t capture_floor = trx_preserve_temp_next_capture_sequence();
+  if (capture_floor == 0) return DB_ERROR;
+  try {
+    trx_preserve_temp_dirty_page_streams.emplace(descriptor->source_space_id,
+                                                descriptor);
+  } catch (const std::bad_alloc &) {
+    return DB_OUT_OF_MEMORY;
+  }
+  descriptor->dirty_page_capture_floor = capture_floor;
+  descriptor->dirty_page_stream_registered = true;
   trx_preserve_temp_active_dirty_page_stream_bucket_add(
       descriptor->source_space_id);
-  const auto insert_result = trx_preserve_temp_dirty_page_streams.emplace(
-      descriptor->source_space_id, descriptor);
-  const bool inserted = insert_result.second;
-  if (inserted) {
-    descriptor->dirty_page_stream_registered = true;
-    trx_preserve_temp_active_dirty_page_streams_add();
-  } else {
-    trx_preserve_temp_active_dirty_page_stream_bucket_sub(
-        descriptor->source_space_id);
-  }
-  return inserted ? DB_SUCCESS : DB_ERROR;
+  trx_preserve_temp_active_dirty_page_streams_add();
+  return DB_SUCCESS;
 }
 
 void trx_preserve_temp_space_image_unregister_dirty_page_stream(
@@ -4675,9 +4478,106 @@ void trx_preserve_temp_space_image_unregister_dirty_page_stream(
   }
 }
 
-dberr_t trx_preserve_temp_space_image_capture_dirty_page(
+static dberr_t trx_preserve_temp_space_image_store_dirty_page_locked(
+    trx_preserve_temp_space_image_descriptor *descriptor, uint32_t page_no,
+    const unsigned char *page, size_t page_bytes, uint64_t capture_sequence) {
+  if (descriptor == nullptr || !descriptor->dirty_page_stream_armed ||
+      descriptor->dirty_page_stream_degraded) {
+    return DB_ERROR;
+  }
+  if (page_bytes != descriptor->page_size) return DB_ERROR;
+  if (capture_sequence == 0) {
+    trx_preserve_temp_space_image_mark_dirty_page_stream_degraded_locked(
+        descriptor, "temporary page capture version exhausted");
+    return DB_ERROR;
+  }
+  // Queue delivery can outlive unregister/re-register of the same space id.
+  if (capture_sequence <= descriptor->dirty_page_capture_floor)
+    return DB_SUCCESS;
+  if (!trx_preserve_temp_space_image_page_identity_matches(
+          *descriptor, page, page_bytes, page_no)) {
+    trx_preserve_temp_space_image_mark_dirty_page_stream_degraded_locked(
+        descriptor, "temp-table dirty page identity mismatch");
+    return DB_ERROR;
+  }
+
+  /*
+    Delivery may run after a newer writer has released the same page latch.
+    Compare the capture version, never the order of TLS drain operations.
+  */
+  const auto version = descriptor->dirty_page_versions.find(page_no);
+  if (version != descriptor->dirty_page_versions.end() &&
+      capture_sequence <= version->second) return DB_SUCCESS;
+  const auto existing = descriptor->dirty_page_index.find(page_no);
+
+  if (existing == descriptor->dirty_page_index.end()) {
+    const auto limit = descriptor->dirty_page_queue_limit_bytes;
+    if (descriptor->dirty_page_inflight_bytes > limit ||
+        descriptor->dirty_page_bytes > limit - descriptor->dirty_page_inflight_bytes ||
+        page_bytes > limit - descriptor->dirty_page_inflight_bytes -
+                         descriptor->dirty_page_bytes) {
+      trx_preserve_temp_space_image_mark_dirty_page_stream_degraded_locked(
+          descriptor, "temp-table dirty page queue budget exceeded", true, true);
+      return DB_OUT_OF_MEMORY;
+    }
+
+    // Include vector growth and a red-black tree node, not just page bytes.
+    const uint64_t version_bytes =
+        version == descriptor->dirty_page_versions.end() ? 96 : 0;
+    const uint64_t memory_bytes = page_bytes +
+        3 * sizeof(trx_preserve_temp_dirty_page_image) + 96 + version_bytes;
+    if (!trx_preserve_temp_space_image_reserve_dirty_page_memory_locked(
+            descriptor, memory_bytes)) {
+      return DB_OUT_OF_MEMORY;
+    }
+
+    try {
+      trx_preserve_temp_dirty_page_image image;
+      image.page_no = page_no;
+      image.capture_sequence = capture_sequence;
+      image.bytes.assign(page, page + page_bytes);
+      if (version_bytes)
+        descriptor->dirty_page_versions.emplace(page_no, capture_sequence);
+      descriptor->dirty_page_index.emplace(page_no, descriptor->dirty_pages.size());
+      descriptor->dirty_pages.push_back(std::move(image));
+      descriptor->dirty_page_versions.find(page_no)->second = capture_sequence;
+      descriptor->dirty_page_version_memory_bytes += version_bytes;
+      descriptor->dirty_page_bytes += page_bytes;
+      return DB_SUCCESS;
+    } catch (const std::bad_alloc &) {
+      descriptor->dirty_page_index.erase(page_no);
+      if (version_bytes) descriptor->dirty_page_versions.erase(page_no);
+      trx_preserve_temp_space_image_release_dirty_page_memory_bytes(
+          descriptor, memory_bytes);
+      trx_preserve_temp_space_image_mark_dirty_page_stream_degraded_locked(
+          descriptor, "temp-table dirty page memory allocation failed", true, true);
+      return DB_OUT_OF_MEMORY;
+    }
+  }
+
+  if (existing->second >= descriptor->dirty_pages.size() ||
+      descriptor->dirty_pages[existing->second].page_no != page_no) {
+    trx_preserve_temp_space_image_mark_dirty_page_stream_degraded_locked(
+        descriptor, "temp-table dirty page index mismatch");
+    return DB_CORRUPTION;
+  }
+  try {
+    auto &image = descriptor->dirty_pages[existing->second];
+    if (capture_sequence <= image.capture_sequence) return DB_SUCCESS;
+    image.bytes.assign(page, page + page_bytes);
+    image.capture_sequence = capture_sequence;
+    descriptor->dirty_page_versions.find(page_no)->second = capture_sequence;
+    return DB_SUCCESS;
+  } catch (const std::bad_alloc &) {
+    trx_preserve_temp_space_image_mark_dirty_page_stream_degraded_locked(
+        descriptor, "temp-table dirty page memory allocation failed", true, true);
+    return DB_OUT_OF_MEMORY;
+  }
+}
+
+static dberr_t trx_preserve_temp_space_image_capture_versioned_dirty_page(
     uint32_t source_space_id, uint32_t page_no, const unsigned char *page,
-    size_t page_bytes) {
+    size_t page_bytes, uint64_t capture_sequence) {
   if (!preserve_trx_temp_table_enable) return DB_SUCCESS;
   if (source_space_id == 0 || page == nullptr || page_bytes == 0)
     return DB_ERROR;
@@ -4694,6 +4594,19 @@ dberr_t trx_preserve_temp_space_image_capture_dirty_page(
 
   if (no_redo_stream_it !=
       trx_preserve_temp_no_redo_undo_page_streams.end()) {
+    const auto degrade_peers = [&](const char *reason) {
+      // Degrading unregisters the owner; never iterate the erased vector.
+      auto it = trx_preserve_temp_no_redo_undo_page_streams.find(source_space_id);
+      while (it != trx_preserve_temp_no_redo_undo_page_streams.end()) {
+        trx_preserve_temp_space_image_mark_no_redo_undo_degraded_locked(
+            it->second.back(), reason);
+        it = trx_preserve_temp_no_redo_undo_page_streams.find(source_space_id);
+      }
+    };
+    if (capture_sequence == 0) {
+      degrade_peers("temporary page capture version exhausted");
+      return DB_ERROR;
+    }
     for (trx_preserve_temp_space_image_descriptor *no_redo_descriptor :
          no_redo_stream_it->second) {
       if (no_redo_descriptor == nullptr ||
@@ -4703,9 +4616,13 @@ dberr_t trx_preserve_temp_space_image_capture_dirty_page(
           page_bytes != no_redo_descriptor->page_size) {
         return DB_ERROR;
       }
-
-      trx_preserve_temp_space_image_store_pending_no_redo_undo_page(
-          no_redo_descriptor, page_no, page, page_bytes);
+      try {
+        trx_preserve_temp_space_image_store_pending_no_redo_undo_page(
+            no_redo_descriptor, page_no, page, page_bytes, capture_sequence);
+      } catch (const std::bad_alloc &) {
+        degrade_peers("temporary undo dirty page allocation failed");
+        return DB_OUT_OF_MEMORY;
+      }
     }
   }
 
@@ -4713,71 +4630,134 @@ dberr_t trx_preserve_temp_space_image_capture_dirty_page(
     return DB_SUCCESS;
   }
 
-  trx_preserve_temp_space_image_descriptor *descriptor = stream_it->second;
-  if (descriptor == nullptr || !descriptor->dirty_page_stream_armed ||
-      descriptor->dirty_page_stream_degraded) {
-    return DB_ERROR;
-  }
-  if (page_bytes != descriptor->page_size) return DB_ERROR;
-  if (!trx_preserve_temp_space_image_page_identity_matches(
-          *descriptor, page, page_bytes, page_no)) {
-    trx_preserve_temp_space_image_mark_dirty_page_stream_degraded_locked(
-        descriptor, "temp-table dirty page identity mismatch");
-    return DB_ERROR;
-  }
+  return trx_preserve_temp_space_image_store_dirty_page_locked(
+      stream_it->second, page_no, page, page_bytes, capture_sequence);
+}
 
-  /*
-    Record only the latest image for each page, but bump the capture sequence on
-    every update. The final sidecar still applies one image per page number; the
-    sequence records recency without keeping every intermediate page version.
-  */
-  auto existing = std::find_if(
-      descriptor->dirty_pages.begin(), descriptor->dirty_pages.end(),
-      [page_no](const trx_preserve_temp_dirty_page_image &image) {
-        return image.page_no == page_no;
-      });
-
-  if (existing == descriptor->dirty_pages.end()) {
-    if (descriptor->dirty_page_bytes >
-            std::numeric_limits<uint64_t>::max() - page_bytes ||
-        descriptor->dirty_page_bytes + page_bytes >
-        descriptor->dirty_page_queue_limit_bytes) {
-      trx_preserve_temp_space_image_mark_dirty_page_stream_degraded_locked(
-          descriptor, "temp-table dirty page queue budget exceeded");
-      return DB_OUT_OF_MEMORY;
+#ifndef NDEBUG
+bool trx_preserve_temp_capture_round_probe() {
+  space_id_t space = 0;
+  if (ibt::allocate_preserved_space_id(&space) != DB_SUCCESS) return false;
+  const auto release_space = create_scope_guard([&] {
+    ut_a(ibt::release_preserved_space_id(space));
+  });
+  const auto before = preserve_trx_resource_kind_current_bytes(
+      Preserve_trx_memory_kind::TEMP_DIRTY_PAGE_QUEUE);
+  for (unsigned fault = 0; fault != 6; ++fault) {
+    Temp_table_warmcopy_participant participant;
+    trx_preserve_temp_space_image_descriptor d;
+    d.source_space_id = space;
+    d.page_size = UNIV_PAGE_SIZE;
+    const auto reset = create_scope_guard([&] {
+      trx_preserve_temp_space_image_reset_dirty_page_stream(&d);
+    });
+    std::unique_ptr<trx_preserve_temp_capture_round> first(new trx_preserve_temp_capture_round);
+    trx_preserve_temp_capture_round second;
+    if (!participant.arm_dirty_page_capture() ||
+        !participant.arm_metadata_mutation_capture() ||
+        !participant.begin_capture_epoch() ||
+        trx_preserve_temp_space_image_arm_dirty_page_stream(
+            &d, &participant, 2 * UNIV_PAGE_SIZE, "temp_round_probe") != DB_SUCCESS ||
+        trx_preserve_temp_space_image_register_dirty_page_stream(&d) != DB_SUCCESS ||
+        trx_preserve_temp_space_image_begin_initial_copy(&d, &participant) != DB_SUCCESS ||
+        trx_preserve_temp_space_image_mark_dirty_queue_durable(&d) != DB_SUCCESS)
+      return false;
+    if (fault == 5) {
+      // A COPY candidate has no active round to revoke it. Exercise a source
+      // write entering the reset-close window after candidate cancellation.
+      trx_preserve_temp_capture_abandon_candidate(&d);
+      trx_preserve_temp_stage_admission_close_guard closing(space);
+      if (trx_preserve_temp_space_image_mark_stage_rejected_during_close(space) ||
+          !participant.degraded_reason().empty() || !d.dirty_page_stream_degraded ||
+          d.dirty_page_stream_registered) return false;
+      continue;
     }
-
-    if (!trx_preserve_temp_space_image_reserve_dirty_page_memory_locked(
-            descriptor, page_bytes)) {
-      return DB_OUT_OF_MEMORY;
-    }
-
-    try {
-      trx_preserve_temp_dirty_page_image image;
-      image.page_no = page_no;
-      image.capture_sequence = descriptor->dirty_page_next_sequence++;
-      image.bytes.assign(page, page + page_bytes);
-      descriptor->dirty_pages.push_back(std::move(image));
-      descriptor->dirty_page_bytes += page_bytes;
+    std::vector<unsigned char> page(UNIV_PAGE_SIZE, 0);
+    mach_write_to_4(page.data() + FIL_PAGE_OFFSET, 1);
+    mach_write_to_4(page.data() + FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID, space);
+    const auto old = trx_preserve_temp_next_capture_sequence();
+    const auto newer = trx_preserve_temp_next_capture_sequence();
+    const auto capture = [&](uint64_t seq, unsigned char value) {
+      page[FIL_PAGE_DATA] = value;
+      return trx_preserve_temp_space_image_capture_versioned_dirty_page(
+          space, 1, page.data(), page.size(), seq);
+    };
+    if (capture(newer, 2) != DB_SUCCESS || first->start(&d) != DB_SUCCESS ||
+        !d.dirty_page_stream_registered || d.dirty_page_inflight_bytes != UNIV_PAGE_SIZE ||
+        !d.dirty_pages.empty() || d.dirty_page_versions.size() != 1)
+      return false;
+    trx_preserve_temp_capture_tail early_tail;
+    if (early_tail.start(&d) == DB_SUCCESS) return false;
+    unsigned value = 0;
+    const auto sink = [](void *p, uint32_t, const unsigned char *bytes, size_t) {
+      *static_cast<unsigned *>(p) = bytes[FIL_PAGE_DATA];
       return DB_SUCCESS;
-    } catch (const std::bad_alloc &) {
-      trx_preserve_temp_space_image_release_dirty_page_memory_bytes(
-          descriptor, page_bytes);
-      trx_preserve_temp_space_image_mark_dirty_page_stream_degraded_locked(
-          descriptor, "temp-table dirty page memory allocation failed");
-      return DB_OUT_OF_MEMORY;
+    };
+    bool done = true;
+    if (first->step(0, &value, sink, &done) == DB_SUCCESS || done || value)
+      return false;
+    if (fault == 4) {
+      first.reset();
+    } else if (fault == 1) {
+      first->cancel();
+    } else if (fault == 2) {
+      const auto fail = [](void *, uint32_t, const unsigned char *, size_t) {
+        return DB_IO_ERROR;
+      };
+      if (first->step(1, nullptr, fail, &done) != DB_IO_ERROR) return false;
+    } else if (fault == 3) {
+      if (capture(trx_preserve_temp_next_capture_sequence(), 3) != DB_SUCCESS)
+        return false;
+      // Active + in-flight pages consume the complete two-page allowance.
+      mach_write_to_4(page.data() + FIL_PAGE_OFFSET, 2);
+      if (trx_preserve_temp_space_image_capture_versioned_dirty_page(
+              space, 2, page.data(), page.size(),
+              trx_preserve_temp_next_capture_sequence()) != DB_OUT_OF_MEMORY)
+        return false;
+      first->cancel();
+    } else {
+      if (first->step(1, &value, sink, &done) != DB_SUCCESS || !done || value != 2 ||
+          !d.dirty_page_stream_registered || d.dirty_page_round_active ||
+          d.dirty_page_memory_reserved_bytes != d.dirty_page_version_memory_bytes ||
+          capture(old, 1) != DB_SUCCESS || !d.dirty_pages.empty() ||
+          capture(trx_preserve_temp_next_capture_sequence(), 3) != DB_SUCCESS ||
+          second.start(&d) != DB_SUCCESS ||
+          second.step(1, &value, sink, &done) != DB_SUCCESS || !done || value != 3 ||
+          capture(newer, 2) != DB_SUCCESS || !d.dirty_pages.empty()) return false;
+      trx_preserve_temp_capture_round empty;
+      if (empty.start(&d) != DB_SUCCESS ||
+          empty.step(1, &value, sink, &done) != DB_SUCCESS || !done ||
+          empty.pages_written() != 0 || value != 3) return false;
+      trx_preserve_temp_capture_tail tail;
+      if (tail.start(&d) != DB_SUCCESS ||
+          tail.step(1, &value, sink, &done) != DB_SUCCESS || !done || value != 3)
+        return false;
+      unsigned char digest[32]{};
+      if (trx_preserve_temp_space_image_mark_streamed_sidecar_sealed(
+              &d, UNIV_PAGE_SIZE, digest) != DB_SUCCESS) return false;
+    }
+    if (fault) {
+      unsigned char digest[32]{};
+      if (!d.dirty_page_stream_degraded || second.start(&d) == DB_SUCCESS ||
+          trx_preserve_temp_space_image_mark_streamed_sidecar_sealed(
+              &d, UNIV_PAGE_SIZE, digest) == DB_SUCCESS) return false;
     }
   }
+  if (preserve_trx_resource_kind_current_bytes(
+          Preserve_trx_memory_kind::TEMP_DIRTY_PAGE_QUEUE) != before) return false;
+  DBUG_PRINT("preserve_temp_import",
+             ("temporary capture rounds checked late=1 bounded=1 active_budget=1 abandoned=3 empty=1 candidate_cancel=1"));
+  return true;
+}
+#endif
 
-  try {
-    existing->capture_sequence = descriptor->dirty_page_next_sequence++;
-    existing->bytes.assign(page, page + page_bytes);
-    return DB_SUCCESS;
-  } catch (const std::bad_alloc &) {
-    trx_preserve_temp_space_image_mark_dirty_page_stream_degraded_locked(
-        descriptor, "temp-table dirty page memory allocation failed");
-    return DB_OUT_OF_MEMORY;
-  }
+dberr_t trx_preserve_temp_space_image_capture_dirty_page(
+    uint32_t source_space_id, uint32_t page_no, const unsigned char *page,
+    size_t page_bytes) {
+  if (!preserve_trx_temp_table_enable) return DB_SUCCESS;
+  return trx_preserve_temp_space_image_capture_versioned_dirty_page(
+      source_space_id, page_no, page, page_bytes,
+      trx_preserve_temp_next_capture_sequence());
 }
 
 dberr_t trx_preserve_temp_space_image_stage_dirty_page(
@@ -4789,6 +4769,9 @@ dberr_t trx_preserve_temp_space_image_stage_dirty_page(
     return DB_ERROR;
   }
   if (!fsp_is_system_temporary(source_space_id)) return DB_SUCCESS;
+  // A byte stream may be closed or absent while a prior scan is still cached.
+  // Record writes under the caller's latch before every admission early exit.
+  trx_preserve_temp_undo_note_write(source_space_id, page_no);
   if (!trx_preserve_temp_space_image_may_have_active_stream(source_space_id) &&
       !trx_preserve_temp_space_image_may_have_stage_admission_close(
           source_space_id)) {
@@ -4848,6 +4831,9 @@ dberr_t trx_preserve_temp_space_image_stage_dirty_page(
     trx_preserve_temp_staged_dirty_page staged;
     staged.source_space_id = source_space_id;
     staged.page_no = page_no;
+    // The caller still owns the page latch here. Once it is released, another
+    // thread can capture and deliver a newer image before this TLS queue drains.
+    staged.capture_sequence = trx_preserve_temp_next_capture_sequence();
     staged.bytes.assign(page, page + page_bytes);
     trx_preserve_temp_staged_dirty_pages.push_back(std::move(staged));
     trx_preserve_temp_staged_dirty_page_bytes += page_bytes;
@@ -4877,9 +4863,9 @@ dberr_t trx_preserve_temp_space_image_drain_staged_dirty_pages() {
   const uint64_t staged_bytes = trx_preserve_temp_staged_dirty_page_bytes;
   for (const trx_preserve_temp_staged_dirty_page &staged :
        trx_preserve_temp_staged_dirty_pages) {
-    const dberr_t err = trx_preserve_temp_space_image_capture_dirty_page(
+    const dberr_t err = trx_preserve_temp_space_image_capture_versioned_dirty_page(
         staged.source_space_id, staged.page_no, staged.bytes.data(),
-        staged.bytes.size());
+        staged.bytes.size(), staged.capture_sequence);
     if (err != DB_SUCCESS) result = err;
     trx_preserve_temp_staged_dirty_page_bytes_release(staged.source_space_id,
                                                       staged.bytes.size());
@@ -5101,8 +5087,22 @@ dberr_t trx_preserve_temp_space_image_begin_no_redo_undo_capture(
   {
     std::lock_guard<std::mutex> guard{
         trx_preserve_temp_dirty_page_streams_mutex};
+    const uint64_t capture_floor = trx_preserve_temp_next_capture_sequence();
+    if (capture_floor == 0) return DB_ERROR;
     trx_preserve_temp_space_image_unregister_no_redo_undo_stream_locked(
         descriptor);
+    descriptor->no_redo_undo_rseg_identity_present = false;
+    try {
+      trx_preserve_temp_no_redo_undo_page_streams[rseg_space_id].push_back(
+          descriptor);
+    } catch (const std::bad_alloc &) {
+      auto it = trx_preserve_temp_no_redo_undo_page_streams.find(rseg_space_id);
+      if (it != trx_preserve_temp_no_redo_undo_page_streams.end() &&
+          it->second.empty()) {
+        trx_preserve_temp_no_redo_undo_page_streams.erase(it);
+      }
+      return DB_OUT_OF_MEMORY;
+    }
     descriptor->no_redo_undo_capture_required = true;
     descriptor->no_redo_undo_pointers_reconnected = false;
     descriptor->no_redo_undo_native_slots_adopted = false;
@@ -5120,19 +5120,16 @@ dberr_t trx_preserve_temp_space_image_begin_no_redo_undo_capture(
     descriptor->no_redo_undo_pages.clear();
     descriptor->no_redo_undo_pending_pages.clear();
     descriptor->no_redo_undo_peer_known_page_nos.clear();
-    auto &streams = trx_preserve_temp_no_redo_undo_page_streams[rseg_space_id];
-    if (std::find(streams.begin(), streams.end(), descriptor) ==
-        streams.end()) {
-      trx_preserve_temp_active_dirty_page_stream_bucket_add(rseg_space_id);
-      streams.push_back(descriptor);
-      trx_preserve_temp_active_dirty_page_streams_add();
-    }
+    descriptor->no_redo_undo_capture_floor = capture_floor;
+    trx_preserve_temp_active_dirty_page_stream_bucket_add(rseg_space_id);
+    trx_preserve_temp_active_dirty_page_streams_add();
   }
   return DB_SUCCESS;
 }
 
 dberr_t trx_preserve_temp_space_image_capture_no_redo_undo_from_trx(
-    trx_preserve_temp_space_image_descriptor *descriptor, const trx_t *trx) {
+    trx_preserve_temp_space_image_descriptor *descriptor, const trx_t *trx,
+    bool standby_transfer) {
   if (!preserve_trx_temp_table_enable) return DB_SUCCESS;
   if (descriptor == nullptr || trx == nullptr ||
       !trx_preserve_temp_space_image_descriptor_has_identity(*descriptor)) {
@@ -5180,6 +5177,12 @@ dberr_t trx_preserve_temp_space_image_capture_no_redo_undo_from_trx(
   }
 
   std::vector<trx_preserve_temp_captured_no_redo_undo_page> captured_pages;
+  for (const auto *undo : {trx->rsegs.m_noredo.insert_undo,
+                           trx->rsegs.m_noredo.update_undo}) {
+    // Complete native rollback truncates an empty log to its header page.
+    if (undo != nullptr && undo->empty && undo->last_page_no != undo->hdr_page_no)
+      return DB_UNSUPPORTED;
+  }
   {
     std::lock_guard<std::mutex> guard{
         trx_preserve_temp_dirty_page_streams_mutex};
@@ -5194,7 +5197,10 @@ dberr_t trx_preserve_temp_space_image_capture_no_redo_undo_from_trx(
   }
 
   dberr_t err = trx_preserve_temp_space_image_capture_no_redo_undo_buffer_pages(
-      *descriptor, trx->rsegs.m_noredo.rseg->page_size, &captured_pages);
+      *descriptor, trx->rsegs.m_noredo.rseg->page_size, &captured_pages,
+      standby_transfer,
+      standby_transfer && trx->rsegs.m_noredo.insert_undo ? trx->rsegs.m_noredo.insert_undo->size : 0,
+      standby_transfer && trx->rsegs.m_noredo.update_undo ? trx->rsegs.m_noredo.update_undo->size : 0);
   if (err != DB_SUCCESS) return err;
 
   trx_preserve_temp_stage_admission_close_guard close_stage_admission(
@@ -5205,9 +5211,211 @@ dberr_t trx_preserve_temp_space_image_capture_no_redo_undo_from_trx(
       descriptor, captured_pages);
   if (err != DB_SUCCESS) return err;
 
-  err = trx_preserve_temp_space_image_capture_no_redo_undo_file_pages_locked(
-      descriptor);
-  if (err != DB_SUCCESS) return err;
+  DBUG_EXECUTE_IF("preserve_temp_capture_order_probe", {
+    if (captured_pages.empty()) return DB_ERROR;
+    auto fixture = *descriptor;
+    fixture.no_redo_undo_pages.clear();
+    const auto &captured = captured_pages.front();
+    if (trx_preserve_temp_space_image_store_captured_no_redo_pages_locked(
+            &fixture, {captured}) != DB_SUCCESS) return DB_ERROR;
+    auto stale = captured.bytes;
+    stale.back() ^= 1;
+    // A disk baseline must not replace the newer buffer snapshot.
+    if (trx_preserve_temp_space_image_store_no_redo_undo_page(
+            &fixture, captured.kind, captured.page_no, stale.data(),
+            stale.size()) != DB_SUCCESS ||
+        fixture.no_redo_undo_pages.front().bytes != captured.bytes) {
+      DBUG_PRINT("preserve_temp_capture_order_probe",
+                 ("temporary capture order: stale baseline replaced snapshot"));
+      return DB_ERROR;
+    }
+    const uint64_t newer_sequence = trx_preserve_temp_next_capture_sequence();
+    if (!newer_sequence) return DB_ERROR;
+    // Deliver an older version after a newer one, then reapply the snapshot.
+    trx_preserve_temp_space_image_store_pending_no_redo_undo_page(
+        &fixture, captured.page_no, stale.data(), stale.size(), newer_sequence);
+    trx_preserve_temp_space_image_store_pending_no_redo_undo_page(
+        &fixture, captured.page_no, captured.bytes.data(), captured.bytes.size(),
+        captured.capture_sequence);
+    if (trx_preserve_temp_space_image_classify_pending_no_redo_undo_pages(
+            &fixture, false) != DB_SUCCESS ||
+        trx_preserve_temp_space_image_store_captured_no_redo_pages_locked(
+            &fixture, {captured}) != DB_SUCCESS ||
+        fixture.no_redo_undo_pages.front().bytes != stale ||
+        fixture.no_redo_undo_pages.front().capture_sequence != newer_sequence) {
+      return DB_ERROR;
+    }
+    trx_preserve_temp_space_image_descriptor data;
+    data.source_space_id = descriptor->source_space_id;
+    data.page_size = descriptor->page_size;
+    data.dirty_page_stream_armed = true;
+    data.dirty_page_queue_limit_bytes = data.page_size;
+    data.dirty_page_resource_token = descriptor->dirty_page_resource_token;
+    const auto cleanup = create_scope_guard([&] {
+      trx_preserve_temp_space_image_release_dirty_page_memory(&data);
+    });
+    auto old_data = captured.bytes;
+    mach_write_to_4(old_data.data() + FIL_PAGE_OFFSET, 1);
+    mach_write_to_4(old_data.data() + FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID,
+                    data.source_space_id);
+    auto new_data = old_data;
+    new_data.back() ^= 1;
+    if (trx_preserve_temp_space_image_store_dirty_page_locked(
+            &data, 1, old_data.data(), old_data.size(), captured.capture_sequence) != DB_SUCCESS ||
+        trx_preserve_temp_space_image_store_dirty_page_locked(
+            &data, 1, new_data.data(), new_data.size(), newer_sequence) != DB_SUCCESS ||
+        trx_preserve_temp_space_image_store_dirty_page_locked(
+            &data, 1, old_data.data(), old_data.size(), captured.capture_sequence) != DB_SUCCESS ||
+        data.dirty_pages.size() != 1 || data.dirty_page_bytes != data.page_size ||
+        data.dirty_pages.front().bytes != new_data ||
+        data.dirty_pages.front().capture_sequence != newer_sequence) return DB_ERROR;
+    DBUG_PRINT("preserve_temp_capture_order_probe",
+               ("temporary capture order checked baseline=1 reordered=1 data=1"));
+    DBUG_EXECUTE_IF("preserve_temp_capture_peer_budget_probe", {
+      if (([&]() -> dberr_t {
+            // A synthetic registry slot, under the real registry mutex. Never
+            // aliases an actual space or changes the captured transaction's
+            // graph.
+            constexpr uint32_t test_space = UINT32_MAX;
+            if (trx_preserve_temp_no_redo_undo_page_streams.count(test_space) ||
+                trx_preserve_temp_dirty_page_streams.count(test_space))
+              return DB_ERROR;
+            trx_preserve_temp_space_image_descriptor limited, healthy, last;
+            for (auto *owner : {&limited, &healthy, &last}) {
+              owner->no_redo_undo_rseg_identity_present = true;
+              owner->no_redo_undo_rseg_space_id = test_space;
+              owner->page_size = descriptor->page_size;
+            }
+            limited.dirty_page_queue_limit_bytes = descriptor->page_size - 1;
+            last.dirty_page_queue_limit_bytes = descriptor->page_size - 1;
+            healthy.dirty_page_queue_limit_bytes = 2 * descriptor->page_size;
+            const auto retire = create_scope_guard([&] {
+              trx_preserve_temp_space_image_unregister_no_redo_undo_stream_locked(
+                  &limited);
+              trx_preserve_temp_space_image_unregister_no_redo_undo_stream_locked(
+                  &healthy);
+              trx_preserve_temp_space_image_unregister_no_redo_undo_stream_locked(
+                  &last);
+              trx_preserve_temp_no_redo_undo_page_streams.erase(test_space);
+              trx_preserve_temp_staged_dirty_page_bytes_by_space.erase(
+                  test_space);
+            });
+            auto &owners =
+                trx_preserve_temp_no_redo_undo_page_streams[test_space];
+            owners = {&limited, &healthy, &last};
+            for (size_t n = 0; n < 3; ++n) {
+              trx_preserve_temp_active_dirty_page_streams_add();
+              trx_preserve_temp_active_dirty_page_stream_bucket_add(test_space);
+            }
+            const auto admitted =
+                trx_preserve_temp_space_image_try_reserve_staged_dirty_page_bytes_locked(
+                    test_space, descriptor->page_size);
+            if (admitted != trx_preserve_temp_staged_dirty_page_budget_result::
+                                RESERVED ||
+                !limited.no_redo_undo_capture_degraded || !last.no_redo_undo_capture_degraded ||
+                healthy.no_redo_undo_capture_degraded ||
+                trx_preserve_temp_staged_dirty_page_bytes_for_space_locked(
+                    test_space) != descriptor->page_size)
+              return DB_ERROR;
+            const auto survivors = trx_preserve_temp_no_redo_undo_page_streams.find(test_space);
+            if (survivors == trx_preserve_temp_no_redo_undo_page_streams.end() ||
+                survivors->second.size() != 1 || survivors->second.front() != &healthy)
+              return DB_ERROR;
+            for (auto *owner : survivors->second)
+              trx_preserve_temp_space_image_store_pending_no_redo_undo_page(
+                  owner, captured.page_no, captured.bytes.data(), captured.bytes.size(), newer_sequence);
+            if (healthy.no_redo_undo_pending_pages.size() != 1 ||
+                healthy.no_redo_undo_pending_pages.front().bytes != captured.bytes ||
+                !limited.no_redo_undo_pending_pages.empty() || !last.no_redo_undo_pending_pages.empty())
+              return DB_ERROR;
+            healthy.dirty_page_queue_limit_bytes = 0;
+            if (trx_preserve_temp_space_image_try_reserve_staged_dirty_page_bytes_locked(
+                    test_space, descriptor->page_size) !=
+                trx_preserve_temp_staged_dirty_page_budget_result::RESERVED)
+              return DB_ERROR;
+            healthy.dirty_page_queue_limit_bytes = UINT64_MAX;
+            trx_preserve_temp_staged_dirty_page_bytes_by_space[test_space] = UINT64_MAX;
+            if (trx_preserve_temp_space_image_try_reserve_staged_dirty_page_bytes_locked(
+                    test_space, descriptor->page_size) !=
+                    trx_preserve_temp_staged_dirty_page_budget_result::EXCEEDED ||
+                !healthy.no_redo_undo_capture_degraded ||
+                trx_preserve_temp_no_redo_undo_page_streams.count(test_space) != 0 ||
+                trx_preserve_temp_staged_dirty_page_bytes_for_space_locked(test_space) != UINT64_MAX)
+              return DB_ERROR;
+            DBUG_PRINT("preserve_temp_capture_order_probe",
+                       ("temporary undo peer budget isolated=1"));
+            return DB_SUCCESS;
+          }()) != DB_SUCCESS)
+        return DB_ERROR;
+    });
+    DBUG_EXECUTE_IF("preserve_temp_capture_epoch_probe", {
+      if (descriptor->dirty_page_capture_floor == 0 ||
+          descriptor->no_redo_undo_capture_floor == 0 ||
+          captured.capture_sequence <= descriptor->no_redo_undo_capture_floor)
+        return DB_ERROR;
+      trx_preserve_temp_space_image_release_dirty_page_memory_bytes(
+          &data, data.dirty_page_memory_reserved_bytes);
+      data.dirty_pages.clear();
+      data.dirty_page_index.clear();
+      data.dirty_page_versions.clear();
+      data.dirty_page_version_memory_bytes = 0;
+      data.dirty_page_bytes = 0;
+      data.dirty_page_capture_floor = newer_sequence;
+      if (trx_preserve_temp_space_image_store_dirty_page_locked(
+              &data, 1, old_data.data(), old_data.size(), captured.capture_sequence) != DB_SUCCESS ||
+          trx_preserve_temp_space_image_store_dirty_page_locked(
+              &data, 1, old_data.data(), old_data.size(), newer_sequence) != DB_SUCCESS ||
+          !data.dirty_pages.empty() || !data.dirty_page_index.empty() ||
+          data.dirty_page_memory_reserved_bytes != 0) {
+        DBUG_PRINT("preserve_temp_capture_order_probe", ("temporary capture epoch stale data entered new stream"));
+        return DB_ERROR;
+      }
+      const auto post_floor = trx_preserve_temp_next_capture_sequence();
+      if (!post_floor || trx_preserve_temp_space_image_store_dirty_page_locked(
+              &data, 1, new_data.data(), new_data.size(), post_floor) != DB_SUCCESS ||
+          data.dirty_pages.size() != 1 || data.dirty_pages.front().bytes != new_data)
+        return DB_ERROR;
+      fixture.no_redo_undo_pages.clear();
+      fixture.no_redo_undo_pending_pages.clear();
+      fixture.no_redo_undo_capture_floor = captured.capture_sequence - 1;
+      auto peer = fixture;
+      peer.no_redo_undo_capture_floor = newer_sequence;
+      for (auto *target : {&fixture, &peer})
+        trx_preserve_temp_space_image_store_pending_no_redo_undo_page(target,
+            captured.page_no, captured.bytes.data(), captured.bytes.size(), captured.capture_sequence);
+      trx_preserve_temp_space_image_store_pending_no_redo_undo_page(&peer,
+          captured.page_no, captured.bytes.data(), captured.bytes.size(), newer_sequence);
+      if (fixture.no_redo_undo_pending_pages.size() != 1 ||
+          !peer.no_redo_undo_pending_pages.empty()) {
+        DBUG_PRINT("preserve_temp_capture_order_probe", ("temporary capture epoch undo peer boundary failed"));
+        return DB_ERROR;
+      }
+      auto snapshot = captured;
+      snapshot.capture_sequence = post_floor;
+      const auto post_snapshot = trx_preserve_temp_next_capture_sequence();
+      if (!post_snapshot) return DB_ERROR;
+      trx_preserve_temp_space_image_store_pending_no_redo_undo_page(&peer,
+          captured.page_no, stale.data(), stale.size(), post_snapshot);
+      if (trx_preserve_temp_space_image_store_captured_no_redo_pages_locked(
+              &peer, {snapshot}) != DB_SUCCESS ||
+          trx_preserve_temp_space_image_classify_pending_no_redo_undo_pages(
+              &peer, false) != DB_SUCCESS || peer.no_redo_undo_pages.size() != 1 ||
+          peer.no_redo_undo_pages.front().bytes != stale)
+        return DB_ERROR;
+      DBUG_PRINT("preserve_temp_capture_order_probe",
+                 ("temporary capture epoch checked data=1 peers=1 post_snapshot=1"));
+    });
+  });
+
+  // Standby constructs target undo with native allocation. Its input needs
+  // this owner's complete page-list graph plus FSP0/rseg evidence, not every
+  // shared allocator page in the file. All graph pages above were S-latched,
+  // including disk misses, so their versions supersede prior staged images.
+  if (!standby_transfer) {
+    err = trx_preserve_temp_space_image_capture_no_redo_undo_file_pages_locked(
+        descriptor);
+    if (err != DB_SUCCESS) return err;
+  }
   err = trx_preserve_temp_space_image_classify_pending_no_redo_undo_pages(
       descriptor, false);
   return err;
@@ -5242,6 +5450,8 @@ dberr_t trx_preserve_temp_space_image_capture_no_redo_undo_page(
     return DB_ERROR;
   }
 
+  const uint64_t capture_sequence = trx_preserve_temp_next_capture_sequence();
+  if (capture_sequence == 0) return DB_ERROR;
   trx_preserve_temp_stage_admission_close_guard close_stage_admission(
       descriptor->no_redo_undo_rseg_space_id);
   std::lock_guard<std::mutex> guard{
@@ -5258,7 +5468,7 @@ dberr_t trx_preserve_temp_space_image_capture_no_redo_undo_page(
   }
 
   return trx_preserve_temp_space_image_store_no_redo_undo_page(
-      descriptor, kind, page_no, page, page_bytes);
+      descriptor, kind, page_no, page, page_bytes, capture_sequence);
 }
 
 dberr_t trx_preserve_temp_space_image_capture_no_redo_undo_anchor(
@@ -5342,7 +5552,8 @@ dberr_t trx_preserve_temp_space_image_seal_no_redo_undo_sidecar(
 
 dberr_t trx_preserve_temp_space_image_build_no_redo_undo_sidecar_payload(
     const trx_preserve_temp_space_image_descriptor &descriptor,
-    std::string *payload) {
+    std::string *payload, bool run_live_debug_probe) {
+  (void)run_live_debug_probe;
   if (payload == nullptr) return DB_ERROR;
   payload->clear();
   if (!preserve_trx_temp_table_enable) return DB_SUCCESS;
@@ -5352,53 +5563,32 @@ dberr_t trx_preserve_temp_space_image_build_no_redo_undo_sidecar_payload(
     return DB_ERROR;
   }
 
-  /*
-    The sidecar payload is self-verifying: it carries rseg identity, undo
-    anchors, classified pages, and a trailing digest. Loading code validates the
-    whole object into a temporary descriptor before mutating the caller.
-  */
-  payload->append(kTempNoRedoUndoSidecarMagic,
-                  kTempNoRedoUndoSidecarMagicBytes);
-  trx_preserve_temp_append_le32(payload, kTempNoRedoUndoSidecarVersion);
-  trx_preserve_temp_append_le32(payload, descriptor.page_size);
-  trx_preserve_temp_append_le32(payload,
-                                descriptor.no_redo_undo_rseg_space_id);
-  trx_preserve_temp_append_le32(payload,
-                                descriptor.no_redo_undo_rseg_page_no);
-  trx_preserve_temp_append_le32(payload,
-                                descriptor.no_redo_undo_rseg_slot);
-  trx_preserve_temp_append_no_redo_undo_anchor(
-      payload, descriptor.no_redo_insert_undo);
-  trx_preserve_temp_append_no_redo_undo_anchor(
-      payload, descriptor.no_redo_update_undo);
-
-  if (descriptor.no_redo_undo_pages.size() >
-      std::numeric_limits<uint32_t>::max()) {
-    payload->clear();
-    return DB_OUT_OF_MEMORY;
-  }
-  trx_preserve_temp_append_le32(
-      payload, static_cast<uint32_t>(descriptor.no_redo_undo_pages.size()));
-  for (const trx_preserve_temp_no_redo_undo_page_image &page :
-       descriptor.no_redo_undo_pages) {
-    if (page.bytes.size() != descriptor.page_size ||
-        !trx_preserve_temp_space_image_valid_no_redo_undo_page_kind(
-            page.kind)) {
-      payload->clear();
-      return DB_ERROR;
+  DBUG_EXECUTE_IF("preserve_temp_import_undo_probe", {
+    if (run_live_debug_probe) {
+      const auto err = trx_preserve_temp_undo_probe(descriptor);
+      if (err != DB_SUCCESS) return err;
     }
-    payload->push_back(static_cast<char>(page.kind));
-    trx_preserve_temp_append_le32(payload, page.page_no);
-    trx_preserve_temp_append_le32(payload,
-                                  static_cast<uint32_t>(page.bytes.size()));
-    payload->append(reinterpret_cast<const char *>(page.bytes.data()),
-                    page.bytes.size());
+  });
+
+  // Compatibility for synchronous final/fallback callers. The wire encoder is
+  // shared with the bounded ordinary worker, including its trailing digest.
+  trx_preserve_temp_undo_output output;
+  auto err = output.start(descriptor);
+  if (err != DB_SUCCESS) return err;
+  bool complete = false;
+  while (!complete) {
+    err = output.step(64 * 1024, payload,
+        [](void *context, uint64_t offset, const unsigned char *data, size_t size) {
+          auto *bytes = static_cast<std::string *>(context);
+          if (bytes->size() != offset) return DB_ERROR;
+          try {
+            bytes->append(reinterpret_cast<const char *>(data), size);
+          } catch (const std::bad_alloc &) { return DB_OUT_OF_MEMORY; }
+          return DB_SUCCESS;
+        }, &complete);
+    if (err != DB_SUCCESS) { payload->clear(); return err; }
   }
 
-  unsigned char digest[kTempNoRedoUndoSidecarDigestBytes]{};
-  SHA_EVP256(reinterpret_cast<const unsigned char *>(payload->data()),
-             payload->length(), digest);
-  payload->append(reinterpret_cast<const char *>(digest), sizeof(digest));
   return DB_SUCCESS;
 }
 
@@ -5465,10 +5655,6 @@ bool trx_preserve_temp_space_image_no_redo_undo_pointers_reconnected(
   return descriptor.no_redo_undo_pointers_reconnected;
 }
 
-size_t trx_preserve_temp_space_image_no_redo_undo_page_count(
-    const trx_preserve_temp_space_image_descriptor &descriptor) {
-  return descriptor.no_redo_undo_pages.size();
-}
 
 const trx_preserve_temp_no_redo_undo_page_image *
 trx_preserve_temp_space_image_no_redo_undo_page_at(
@@ -5489,63 +5675,6 @@ trx_preserve_temp_space_image_no_redo_update_undo_anchor(
   return &descriptor.no_redo_update_undo;
 }
 
-bool trx_preserve_temp_space_image_no_redo_undo_page_claim_slot(
-    const trx_preserve_temp_space_image_descriptor &descriptor,
-    const trx_preserve_temp_no_redo_undo_page_image &page,
-    uint32_t *undo_slot, bool *claim_page) {
-  if (undo_slot == nullptr || claim_page == nullptr) return false;
-  *undo_slot = 0;
-  *claim_page = false;
-
-  auto first_anchor_slot =
-      [&descriptor](uint32_t *slot) -> bool {
-    if (slot == nullptr) return false;
-    if (descriptor.no_redo_insert_undo.present) {
-      *slot = descriptor.no_redo_insert_undo.undo_slot;
-      return true;
-    }
-    if (descriptor.no_redo_update_undo.present) {
-      *slot = descriptor.no_redo_update_undo.undo_slot;
-      return true;
-    }
-    return false;
-  };
-
-  switch (page.kind) {
-    case trx_preserve_temp_no_redo_undo_page_kind::RSEG_HEADER:
-    case trx_preserve_temp_no_redo_undo_page_kind::RSEG_ALLOCATOR:
-      *claim_page = true;
-      return first_anchor_slot(undo_slot);
-    case trx_preserve_temp_no_redo_undo_page_kind::UNDO_HEADER:
-    case trx_preserve_temp_no_redo_undo_page_kind::UNDO_LOG:
-      break;
-  }
-
-  auto anchor_names_page =
-      [&descriptor, &page](const trx_preserve_temp_no_redo_undo_log_anchor
-                               &anchor) -> bool {
-    if (!anchor.present) return false;
-
-    std::vector<const trx_preserve_temp_no_redo_undo_page_image *> pages;
-    const dberr_t err =
-        trx_preserve_temp_space_image_collect_undo_page_list(descriptor,
-                                                             anchor, &pages);
-    if (err != DB_SUCCESS) return false;
-    return std::find(pages.begin(), pages.end(), &page) != pages.end();
-  };
-
-  const bool insert_names_page =
-      anchor_names_page(descriptor.no_redo_insert_undo);
-  const bool update_names_page =
-      anchor_names_page(descriptor.no_redo_update_undo);
-  if (insert_names_page && update_names_page) return false;
-  if (!insert_names_page && !update_names_page) return true;
-
-  *claim_page = true;
-  *undo_slot = insert_names_page ? descriptor.no_redo_insert_undo.undo_slot
-                                 : descriptor.no_redo_update_undo.undo_slot;
-  return true;
-}
 
 dberr_t trx_preserve_temp_space_image_adopt_no_redo_undo_slots_for_native_resume(
     trx_preserve_temp_space_image_descriptor *descriptor,
@@ -5582,19 +5711,17 @@ dberr_t trx_preserve_temp_space_image_adopt_no_redo_undo_slots_for_native_resume
       *descriptor);
   if (rseg == nullptr) return fail("no matching no-redo rseg found");
 
-  const ulint insert_size =
-      descriptor->no_redo_insert_undo.present
-          ? trx_preserve_temp_space_image_reconnected_undo_size(
-                *descriptor, descriptor->no_redo_insert_undo)
-          : 0;
-  const ulint update_size =
-      descriptor->no_redo_update_undo.present
-          ? trx_preserve_temp_space_image_reconnected_undo_size(
-                *descriptor, descriptor->no_redo_update_undo)
-          : 0;
-  if ((descriptor->no_redo_insert_undo.present && insert_size == 0) ||
-      (descriptor->no_redo_update_undo.present && update_size == 0)) {
-    return fail("captured no-redo undo size is zero");
+  ulint insert_size = 0;
+  ulint update_size = 0;
+  dberr_t err = trx_preserve_temp_space_image_reconnected_undo_size(
+      *descriptor, descriptor->no_redo_insert_undo, &insert_size);
+  if (err == DB_SUCCESS) {
+    err = trx_preserve_temp_space_image_reconnected_undo_size(
+        *descriptor, descriptor->no_redo_update_undo, &update_size);
+  }
+  if (err != DB_SUCCESS) {
+    (void)fail("captured no-redo undo page validation failed");
+    return err;
   }
   const page_no_t adopted_size = static_cast<page_no_t>(insert_size + update_size);
 
@@ -5637,7 +5764,6 @@ dberr_t trx_preserve_temp_space_image_adopt_no_redo_undo_slots_for_native_resume
     return fail(reason);
   };
 
-  dberr_t err = DB_SUCCESS;
   staged_slots_reserved =
       trx_preserve_temp_space_image_reserve_staged_no_redo_undo_slots(
           descriptor, live_rseg_page_no);
@@ -5805,16 +5931,15 @@ dberr_t trx_preserve_temp_space_image_reconnect_no_redo_undo_before_resume(
 
   trx_undo_t *insert_undo = nullptr;
   trx_undo_t *update_undo = nullptr;
-  const ulint insert_size =
-      descriptor->no_redo_insert_undo.present
-          ? trx_preserve_temp_space_image_reconnected_undo_size(
-                *descriptor, descriptor->no_redo_insert_undo)
-          : 0;
-  const ulint update_size =
-      descriptor->no_redo_update_undo.present
-          ? trx_preserve_temp_space_image_reconnected_undo_size(
-                *descriptor, descriptor->no_redo_update_undo)
-          : 0;
+  ulint insert_size = 0;
+  ulint update_size = 0;
+  dberr_t err = trx_preserve_temp_space_image_reconnected_undo_size(
+      *descriptor, descriptor->no_redo_insert_undo, &insert_size);
+  if (err == DB_SUCCESS) {
+    err = trx_preserve_temp_space_image_reconnected_undo_size(
+        *descriptor, descriptor->no_redo_update_undo, &update_size);
+  }
+  if (err != DB_SUCCESS) return err;
 
   if (descriptor->no_redo_insert_undo.present) {
     insert_undo = trx_preserve_temp_space_image_create_reconnected_undo(
@@ -5965,6 +6090,16 @@ dberr_t trx_preserve_temp_space_image_validate(
   return DB_SUCCESS;
 }
 
+dberr_t trx_preserve_temp_space_image_validate_dict_binding(
+    const trx_preserve_temp_space_image_descriptor &descriptor,
+    const trx_preserve_temp_dict_table_binding &binding) {
+  return trx_preserve_temp_space_image_is_attach_candidate(descriptor) &&
+                 trx_preserve_temp_space_image_dict_binding_is_valid(descriptor,
+                                                                    binding)
+             ? DB_SUCCESS
+             : DB_CORRUPTION;
+}
+
 dberr_t trx_preserve_temp_space_image_bind_dict_table(
     trx_preserve_temp_space_image_descriptor *descriptor,
     const trx_preserve_temp_dict_table_binding &binding) {
@@ -5995,6 +6130,13 @@ dberr_t trx_preserve_temp_space_image_bind_dict_table(
   if (trx_preserve_temp_space_image_bound_dict_table_collides(*descriptor,
                                                              binding)) {
     return DB_ERROR;
+  }
+
+  try {
+    descriptor->bound_dict_tables.reserve(descriptor->bound_dict_tables.size() +
+                                          1);
+  } catch (const std::bad_alloc &) {
+    return DB_OUT_OF_MEMORY;
   }
 
   dict_table_t *table =
@@ -6147,62 +6289,16 @@ dberr_t trx_preserve_temp_space_image_load_no_redo_undo_sidecar(
   if (!trx_preserve_temp_space_image_no_redo_undo_sidecar_ready(loaded)) {
     return fail_corrupt_without_mutation();
   }
-  if (loaded.no_redo_insert_undo.present &&
-      trx_preserve_temp_space_image_reconnected_undo_size(
-          loaded, loaded.no_redo_insert_undo) == 0) {
-    return fail_corrupt_without_mutation();
-  }
-  if (loaded.no_redo_update_undo.present &&
-      trx_preserve_temp_space_image_reconnected_undo_size(
-          loaded, loaded.no_redo_update_undo) == 0) {
-    return fail_corrupt_without_mutation();
+  for (const auto *anchor :
+       {&loaded.no_redo_insert_undo, &loaded.no_redo_update_undo}) {
+    if (!anchor->present) continue;
+    std::vector<const trx_preserve_temp_no_redo_undo_page_image *> pages;
+    const dberr_t err =
+        trx_preserve_temp_import_collect_undo_pages(loaded, *anchor, &pages);
+    if (err != DB_SUCCESS) return err;
   }
 
   *descriptor = std::move(loaded);
-  return DB_SUCCESS;
-}
-
-dberr_t trx_preserve_temp_space_image_register_dict_tables_for_resume(
-    THD *thd, const trx_preserve_temp_space_image_descriptor &descriptor) {
-  if (!preserve_trx_temp_table_enable) return DB_SUCCESS;
-  if (thd == nullptr || descriptor.bound_dict_tables.empty()) return DB_ERROR;
-
-  innodb_session_t *session = thd_to_innodb_session(thd);
-  if (session == nullptr) return DB_ERROR;
-
-  for (dict_table_t *table : descriptor.bound_dict_tables) {
-    if (table == nullptr || table->name.m_name == nullptr) return DB_ERROR;
-    if (session->lookup_table_handler(table->name.m_name) == nullptr) {
-      session->register_table_handler(table->name.m_name, table);
-    }
-  }
-  return DB_SUCCESS;
-}
-
-dberr_t trx_preserve_temp_space_image_unregister_dict_tables_for_resume(
-    THD *thd, const trx_preserve_temp_space_image_descriptor &descriptor) {
-  if (thd == nullptr) return DB_ERROR;
-
-  innodb_session_t *session = thd_to_innodb_session(thd);
-  if (session == nullptr) return DB_ERROR;
-
-  for (dict_table_t *table : descriptor.bound_dict_tables) {
-    if (table == nullptr || table->name.m_name == nullptr) continue;
-    session->unregister_table_handler(table->name.m_name);
-  }
-  return DB_SUCCESS;
-}
-
-dberr_t trx_preserve_temp_space_image_unregister_dict_table_name_for_resume(
-    THD *thd, const char *table_name) {
-  if (thd == nullptr || table_name == nullptr || table_name[0] == '\0') {
-    return DB_ERROR;
-  }
-
-  innodb_session_t *session = thd_to_innodb_session(thd);
-  if (session == nullptr) return DB_ERROR;
-
-  session->unregister_table_handler(table_name);
   return DB_SUCCESS;
 }
 
@@ -6211,6 +6307,7 @@ dberr_t trx_preserve_temp_space_image_adopt_preserved_fil_space(
     const char *image_path) {
   if (!preserve_trx_temp_table_enable) return DB_SUCCESS;
   if (descriptor == nullptr || image_path == nullptr || image_path[0] == '\0' ||
+      descriptor->fil_space_adopted || !descriptor->adopted_fil_space_path.empty() ||
       !trx_preserve_temp_space_image_is_attach_candidate(*descriptor)) {
     return DB_ERROR;
   }
@@ -6243,34 +6340,82 @@ dberr_t trx_preserve_temp_space_image_adopt_preserved_fil_space(
       return DB_ERROR;
     }
   }
-  bool reservation_created = false;
-  if (!ibt::reserve_or_keep_preserved_space_id(descriptor->source_space_id,
-                                              &reservation_created)) {
-    return DB_ERROR;
-  }
-
-  const page_no_t image_pages =
-      static_cast<page_no_t>(descriptor->image_bytes / descriptor->page_size);
-  const std::string fil_space_name =
-      "preserve_temp/" + std::to_string(descriptor->source_space_id);
-  const dberr_t fil_err = fil_preserve_temp_space_adopt(
-      descriptor->source_space_id, fil_space_name.c_str(), image_path,
-      descriptor->space_flags, image_pages);
-  if (fil_err != DB_SUCCESS) {
-    if (reservation_created) {
-      ibt::release_preserved_space_id(descriptor->source_space_id);
+  bool reservation_created = false, fil_created = false;
+  // Nothing can reference this fil before publication. Failure must retain
+  // the caller's pre-existing reservation and the unchanged installation file.
+  const auto unwind = create_scope_guard([&]() {
+    if (fil_created) {
+      const auto err = fil_preserve_temp_space_forget(descriptor->source_space_id);
+      ut_a(err == DB_SUCCESS || err == DB_TABLESPACE_NOT_FOUND);
     }
-    return fil_err;
+    if (reservation_created)
+      ibt::release_preserved_space_id(descriptor->source_space_id);
+  });
+  try {
+    std::string path(image_path);
+    const std::string fil_space_name =
+        "preserve_temp/" + std::to_string(descriptor->source_space_id);
+    if (!ibt::reserve_or_keep_preserved_space_id(descriptor->source_space_id,
+                                                &reservation_created))
+      return DB_ERROR;
+    const page_no_t image_pages =
+        static_cast<page_no_t>(descriptor->image_bytes / descriptor->page_size);
+    const dberr_t fil_err = fil_preserve_temp_space_adopt(
+        descriptor->source_space_id, fil_space_name.c_str(), path.c_str(),
+        descriptor->space_flags, image_pages);
+    if (fil_err != DB_SUCCESS) return fil_err;
+    fil_created = true;
+    DBUG_EXECUTE_IF("preserve_temp_fil_publish_oom", throw std::bad_alloc(););
+    {
+      std::lock_guard<std::mutex> guard{
+          trx_preserve_temp_adopted_fil_spaces_mutex};
+      if (!trx_preserve_temp_adopted_fil_spaces.emplace(
+              descriptor->source_space_id, descriptor).second) return DB_ERROR;
+      // All potentially throwing work is complete before publishing state.
+      descriptor->adopted_fil_space_path.swap(path);
+      descriptor->fil_space_adopted = true;
+      descriptor->normal_temp_pool_member = false;
+    }
+    fil_created = reservation_created = false;
+    return DB_SUCCESS;
+  } catch (const std::bad_alloc &) {
+    return DB_OUT_OF_MEMORY;
   }
+}
 
-  descriptor->adopted_fil_space_path = image_path;
-  descriptor->fil_space_adopted = true;
-  descriptor->normal_temp_pool_member = false;
+dberr_t trx_preserve_temp_space_image_forget_unbound_fil_space(
+    trx_preserve_temp_space_image_descriptor *descriptor) {
+  if (descriptor == nullptr ||
+      !trx_preserve_temp_space_image_is_attach_candidate(*descriptor) ||
+      descriptor->bound_dict_table != nullptr || !descriptor->bound_dict_tables.empty() ||
+      descriptor->no_redo_undo_pointers_reconnected ||
+      descriptor->no_redo_undo_native_slots_adopted ||
+      descriptor->no_redo_undo_reconnected_trx != nullptr) return DB_ERROR;
   {
-    std::lock_guard<std::mutex> guard{
-        trx_preserve_temp_adopted_fil_spaces_mutex};
-    trx_preserve_temp_adopted_fil_spaces.emplace(descriptor->source_space_id,
-                                                 descriptor);
+    std::lock_guard<std::mutex> guard(trx_preserve_temp_adopted_fil_spaces_mutex);
+    const auto it = trx_preserve_temp_adopted_fil_spaces.find(descriptor->source_space_id);
+    if (it == trx_preserve_temp_adopted_fil_spaces.end()) {
+      return !descriptor->fil_space_adopted && descriptor->adopted_fil_space_path.empty()
+                 ? DB_SUCCESS : DB_ERROR;
+    }
+    if (it->second != descriptor || !descriptor->fil_space_adopted ||
+        descriptor->adopted_fil_space_path.empty() ||
+        trx_preserve_temp_attached_fil_space_descriptors.count(descriptor->source_space_id))
+      return DB_ERROR;
+  }
+  // Exclusive idle ownership is required. Do not hold the registry mutex
+  // across native buffer-pool retirement or touch dictionary/undo ownership.
+  DBUG_EXECUTE_IF("preserve_temp_fil_forget_failure", return DB_IO_ERROR;);
+  const auto err = fil_preserve_temp_space_forget(descriptor->source_space_id);
+  if (err != DB_SUCCESS && err != DB_TABLESPACE_NOT_FOUND) return err;
+  DBUG_EXECUTE_IF("preserve_temp_fil_after_forget_failure", return DB_IO_ERROR;);
+  {
+    std::lock_guard<std::mutex> guard(trx_preserve_temp_adopted_fil_spaces_mutex);
+    const auto it = trx_preserve_temp_adopted_fil_spaces.find(descriptor->source_space_id);
+    ut_a(it != trx_preserve_temp_adopted_fil_spaces.end() && it->second == descriptor);
+    trx_preserve_temp_adopted_fil_spaces.erase(it);
+    descriptor->fil_space_adopted = false;
+    descriptor->adopted_fil_space_path.clear();
   }
   return DB_SUCCESS;
 }
@@ -6278,80 +6423,6 @@ dberr_t trx_preserve_temp_space_image_adopt_preserved_fil_space(
 bool trx_preserve_temp_space_image_fil_space_adopted(
     const trx_preserve_temp_space_image_descriptor &descriptor) {
   return descriptor.fil_space_adopted;
-}
-
-dberr_t trx_preserve_temp_space_image_bound_dict_table_summary(
-    const trx_preserve_temp_space_image_descriptor &descriptor,
-    uint64_t *image_table_id, uint32_t *space_id, bool *temporary) {
-  if (descriptor.bound_dict_table == nullptr || image_table_id == nullptr ||
-      space_id == nullptr || temporary == nullptr) {
-    return DB_ERROR;
-  }
-  *image_table_id = descriptor.bound_dict_table->id;
-  *space_id = descriptor.bound_dict_table->space;
-  *temporary = descriptor.bound_dict_table->is_temporary();
-  return DB_SUCCESS;
-}
-
-size_t trx_preserve_temp_space_image_bound_dict_index_count(
-    const trx_preserve_temp_space_image_descriptor &descriptor) {
-  size_t count = 0;
-  for (const dict_table_t *table : descriptor.bound_dict_tables) {
-    for (const dict_index_t *index =
-             table == nullptr ? nullptr : table->first_index();
-         index != nullptr; index = index->next()) {
-      ++count;
-    }
-  }
-  return count;
-}
-
-dberr_t trx_preserve_temp_space_image_bound_dict_index_summary(
-    const trx_preserve_temp_space_image_descriptor &descriptor, size_t ordinal,
-    trx_preserve_temp_bound_dict_index *summary) {
-  if (descriptor.bound_dict_table == nullptr || summary == nullptr) {
-    return DB_ERROR;
-  }
-  size_t current = 0;
-  for (const dict_table_t *table : descriptor.bound_dict_tables) {
-    for (const dict_index_t *index =
-             table == nullptr ? nullptr : table->first_index();
-         index != nullptr; index = index->next(), ++current) {
-      if (current == ordinal) {
-        summary->image_index_id = index->id;
-        summary->space_id = index->space;
-        summary->root_page_no = index->page;
-        summary->clustered = index->is_clustered();
-        summary->name = index->name();
-        return DB_SUCCESS;
-      }
-    }
-  }
-  return DB_ERROR;
-}
-
-size_t trx_preserve_temp_space_image_bound_dict_column_count(
-    const trx_preserve_temp_space_image_descriptor &descriptor) {
-  return descriptor.bound_dict_table == nullptr
-             ? 0
-             : descriptor.bound_dict_table->get_n_user_cols();
-}
-
-dberr_t trx_preserve_temp_space_image_bound_dict_column_summary(
-    const trx_preserve_temp_space_image_descriptor &descriptor, size_t ordinal,
-    trx_preserve_temp_bound_dict_column *summary) {
-  if (descriptor.bound_dict_table == nullptr || summary == nullptr ||
-      ordinal >= descriptor.bound_dict_table->get_n_user_cols()) {
-    return DB_ERROR;
-  }
-
-  const dict_col_t *column = descriptor.bound_dict_table->get_col(ordinal);
-  summary->name = descriptor.bound_dict_table->get_col_name(ordinal);
-  summary->mtype = column->mtype;
-  summary->prtype = column->prtype;
-  summary->len = column->len;
-  summary->visible = column->is_visible;
-  return DB_SUCCESS;
 }
 
 const std::string &trx_preserve_temp_space_image_fil_space_path(
@@ -6362,6 +6433,129 @@ const std::string &trx_preserve_temp_space_image_fil_space_path(
 bool trx_preserve_temp_space_image_normal_temp_pool_member(
     const trx_preserve_temp_space_image_descriptor &descriptor) {
   return descriptor.normal_temp_pool_member;
+}
+
+dberr_t trx_preserve_temp_native_directory::create(
+    const std::string &token, const std::string &root, const std::string &install,
+    std::shared_ptr<trx_preserve_temp_native_directory> *out) {
+  if (out == nullptr || *out || root.empty() || token.empty() || token.size() > 64 ||
+      root.size() > FN_REFLEN || install.size() > FN_REFLEN) return DB_ERROR;
+  try {
+    if (install != root + "/install") return DB_ERROR;
+    auto memory = preserve_trx_acquire_memory_lease(
+        token, Preserve_trx_memory_kind::TEMP_METADATA_IMPORT,
+        sizeof(trx_preserve_temp_native_directory) + 4096 +
+        2 * (token.size() + root.size() + install.size()));
+    if (!memory.acquired()) return DB_OUT_OF_MEMORY;
+    auto value = std::make_shared<trx_preserve_temp_native_directory>();
+    value->m_memory = std::move(memory);
+    value->m_root = root;
+    value->m_install = install;
+    *out = std::move(value);
+    return DB_SUCCESS;
+  } catch (const std::bad_alloc &) { return DB_OUT_OF_MEMORY; }
+}
+
+trx_preserve_temp_native_directory::~trx_preserve_temp_native_directory() {
+  // These are exclusively-created directories. Never recurse into live files.
+  if (!m_install.empty()) (void)rmdir(m_install.c_str());
+  if (!m_root.empty()) (void)rmdir(m_root.c_str());
+}
+
+dberr_t trx_preserve_temp_native_prepare(
+    const std::string &token, trx_preserve_temp_space_image_descriptor *source,
+    const std::shared_ptr<trx_preserve_temp_native_directory> &directory,
+    trx_preserve_temp_native_space **ticket) {
+  if (ticket == nullptr || *ticket != nullptr || source == nullptr || !directory ||
+      token.empty() || token.size() > 64 || !source->sealed || !source->fil_space_adopted ||
+      source->adopted_fil_space_path.empty() || source->bound_dict_tables.empty() ||
+      source->bound_dict_tables.size() > 1024 || source->normal_temp_pool_member ||
+      source->bound_dict_table != source->bound_dict_tables.front() ||
+      source->no_redo_undo_capture_required || source->no_redo_undo_pointers_reconnected ||
+      source->no_redo_undo_native_slots_adopted || source->no_redo_undo_reconnected_trx ||
+      !source->no_redo_undo_pages.empty() || !source->shadow_pages.empty() ||
+      source->dirty_page_stream_armed || source->dirty_page_stream_registered)
+    return DB_ERROR;
+  if (!preserve_trx_is_enabled() || !preserve_trx_temp_table_enable) return DB_UNSUPPORTED;
+  try {
+    auto memory = preserve_trx_acquire_memory_lease(
+        token, Preserve_trx_memory_kind::TEMP_METADATA_IMPORT,
+        sizeof(trx_preserve_temp_native_space) + 4096 + 2 * token.size() +
+        2 * source->adopted_fil_space_path.size() +
+        2 * source->bound_dict_tables.size() * sizeof(dict_table_t *));
+    if (!memory.acquired()) return DB_OUT_OF_MEMORY;
+    auto value = std::make_unique<trx_preserve_temp_native_space>();
+    value->memory = std::move(memory);
+    value->directory = directory;
+    value->source = source;
+    auto &d = value->descriptor;
+    d.source_space_id = source->source_space_id;
+    d.page_size = source->page_size;
+    d.space_flags = source->space_flags;
+    d.image_bytes = source->image_bytes;
+    memcpy(d.image_digest, source->image_digest, sizeof(d.image_digest));
+    d.sealed = d.fil_space_adopted = true;
+    d.adopted_fil_space_path = source->adopted_fil_space_path;
+    d.bound_dict_tables = source->bound_dict_tables;
+    d.bound_dict_table = d.bound_dict_tables.front();
+    const uint64_t actual_bytes = sizeof(trx_preserve_temp_native_space) + 4096 +
+          2 * token.size() + d.adopted_fil_space_path.capacity() +
+          d.bound_dict_tables.capacity() * sizeof(dict_table_t *);
+    if (actual_bytes > value->memory.bytes() && !value->memory.grow_to(actual_bytes))
+      return DB_OUT_OF_MEMORY;
+    std::lock_guard<std::mutex> guard(trx_preserve_temp_adopted_fil_spaces_mutex);
+    const auto it = trx_preserve_temp_adopted_fil_spaces.find(d.source_space_id);
+    if (it == trx_preserve_temp_adopted_fil_spaces.end() || it->second != source)
+      return DB_ERROR;
+    DBUG_EXECUTE_IF("preserve_temp_native_slot_oom", throw std::bad_alloc(););
+    auto inserted = trx_preserve_temp_attached_fil_space_descriptors.emplace(d.source_space_id, nullptr);
+    if (!inserted.second) return DB_ERROR;
+    *ticket = value.get();
+    inserted.first->second = std::move(value);
+    return DB_SUCCESS;
+  } catch (const std::bad_alloc &) { return DB_OUT_OF_MEMORY; }
+}
+
+bool trx_preserve_temp_native_valid(trx_preserve_temp_native_space *ticket,
+                                   trx_preserve_temp_space_image_descriptor *source) {
+  if (ticket == nullptr || source == nullptr) return false;
+  std::lock_guard<std::mutex> guard(trx_preserve_temp_adopted_fil_spaces_mutex);
+  const auto a = trx_preserve_temp_adopted_fil_spaces.find(source->source_space_id);
+  const auto b = trx_preserve_temp_attached_fil_space_descriptors.find(source->source_space_id);
+  return a != trx_preserve_temp_adopted_fil_spaces.end() && a->second == source &&
+      b != trx_preserve_temp_attached_fil_space_descriptors.end() && b->second.get() == ticket &&
+      ticket->state == trx_preserve_temp_native_space::State::PREPARED && ticket->source == source &&
+      source->fil_space_adopted && ticket->descriptor.bound_dict_tables == source->bound_dict_tables &&
+      ticket->descriptor.adopted_fil_space_path == source->adopted_fil_space_path;
+}
+
+void trx_preserve_temp_native_commit(trx_preserve_temp_native_space *ticket,
+                                    trx_preserve_temp_space_image_descriptor *source) noexcept {
+  ut_a(trx_preserve_temp_native_valid(ticket, source));
+  std::lock_guard<std::mutex> guard(trx_preserve_temp_adopted_fil_spaces_mutex);
+  auto it = trx_preserve_temp_adopted_fil_spaces.find(source->source_space_id);
+  it->second = &ticket->descriptor;
+  ticket->source = nullptr;
+  ticket->state = trx_preserve_temp_native_space::State::NATIVE;
+  source->bound_dict_tables.clear();
+  source->bound_dict_table = nullptr;
+  source->fil_space_adopted = false;
+  source->adopted_fil_space_path.clear();
+  source->source_space_id = 0;
+}
+
+void trx_preserve_temp_native_cancel(trx_preserve_temp_native_space *ticket) noexcept {
+  if (ticket == nullptr) return;
+  std::unique_ptr<trx_preserve_temp_native_space> retired;
+  {
+    std::lock_guard<std::mutex> guard(trx_preserve_temp_adopted_fil_spaces_mutex);
+    auto it = trx_preserve_temp_attached_fil_space_descriptors.find(ticket->descriptor.source_space_id);
+    ut_a(it != trx_preserve_temp_attached_fil_space_descriptors.end() &&
+         it->second.get() == ticket && ticket->state == trx_preserve_temp_native_space::State::PREPARED &&
+         ticket->capture_readers == 0);
+    retired = std::move(it->second);
+    trx_preserve_temp_attached_fil_space_descriptors.erase(it);
+  }
 }
 
 dberr_t trx_preserve_temp_space_image_attach_to_thd(
@@ -6379,52 +6573,80 @@ dberr_t trx_preserve_temp_space_image_attach_to_thd(
     tracking. The adopted fil-space map is redirected to that copy so later
     close/drop paths see the same state that the THD is using.
   */
-  auto owned =
-      std::make_unique<trx_preserve_temp_space_image_descriptor>(descriptor);
-  trx_preserve_temp_space_image_descriptor *owned_descriptor = owned.get();
+  auto owned = std::make_unique<trx_preserve_temp_native_space>();
+  owned->descriptor = descriptor;
+  owned->state = trx_preserve_temp_native_space::State::LEGACY;
+  auto *owned_descriptor = &owned->descriptor;
   {
     std::lock_guard<std::mutex> guard{
         trx_preserve_temp_adopted_fil_spaces_mutex};
     auto adopted =
         trx_preserve_temp_adopted_fil_spaces.find(descriptor.source_space_id);
-    if (adopted == trx_preserve_temp_adopted_fil_spaces.end()) {
+    if (adopted == trx_preserve_temp_adopted_fil_spaces.end() ||
+        adopted->second != &descriptor) {
       return DB_ERROR;
     }
-    trx_preserve_temp_attached_fil_space_descriptors[descriptor.source_space_id] =
-        std::move(owned);
+    auto inserted = trx_preserve_temp_attached_fil_space_descriptors.emplace(
+        descriptor.source_space_id, nullptr);
+    if (!inserted.second) return DB_ERROR;
+    inserted.first->second = std::move(owned);
     adopted->second = owned_descriptor;
   }
   return DB_SUCCESS;
 }
 
-dberr_t trx_preserve_temp_space_image_drop(
-    const trx_preserve_temp_space_image_descriptor &descriptor) {
-  if (!trx_preserve_temp_space_image_descriptor_has_identity(descriptor)) {
+
+static dberr_t drop_preserved_fil_space_impl(
+    trx_preserve_temp_space_image_descriptor *descriptor, bool reaper,
+    bool *removed_owner = nullptr, uint32_t lookup_id = 0) {
+  if (removed_owner != nullptr) *removed_owner = false;
+  if (lookup_id == 0 && (descriptor == nullptr ||
+      !trx_preserve_temp_space_image_descriptor_has_identity(*descriptor))) {
     return DB_ERROR;
   }
-
-  return DB_UNSUPPORTED;
-}
-
-dberr_t trx_preserve_temp_space_image_drop_preserved_fil_space(
-    trx_preserve_temp_space_image_descriptor *descriptor) {
-  if (descriptor == nullptr ||
-      !trx_preserve_temp_space_image_descriptor_has_identity(*descriptor)) {
-    return DB_ERROR;
-  }
-
+  const auto id = lookup_id != 0 ? lookup_id : descriptor->source_space_id;
+  std::unique_ptr<trx_preserve_temp_native_space> retired;
+  trx_preserve_temp_native_space *synchronous_owner = nullptr;
+  const auto release_claim = create_scope_guard([&] {
+    if (synchronous_owner == nullptr || retired) return;
+    std::lock_guard<std::mutex> guard(trx_preserve_temp_adopted_fil_spaces_mutex);
+    const auto it = trx_preserve_temp_attached_fil_space_descriptors.find(id);
+    if (it != trx_preserve_temp_attached_fil_space_descriptors.end() &&
+        it->second.get() == synchronous_owner)
+      synchronous_owner->cleanup_running = false;
+  });
   trx_preserve_temp_space_image_descriptor *target = descriptor;
   {
     std::lock_guard<std::mutex> guard{
         trx_preserve_temp_adopted_fil_spaces_mutex};
     auto owned = trx_preserve_temp_attached_fil_space_descriptors.find(
-        descriptor->source_space_id);
+        id);
     if (owned != trx_preserve_temp_attached_fil_space_descriptors.end() &&
         owned->second != nullptr) {
-      target = owned->second.get();
+      if (owned->second->state == trx_preserve_temp_native_space::State::PREPARED)
+        return DB_ERROR;
+      if (owned->second->cleanup_queued || (owned->second->cleanup_running && !reaper))
+        return DB_ERROR;
+      if (owned->second->state == trx_preserve_temp_native_space::State::NATIVE &&
+          !owned->second->descriptor.bound_dict_tables.empty()) return DB_ERROR;
+      if (owned->second->capture_readers != 0) {
+        owned->second->capture_retire_pending = true;
+        return DB_TABLE_IS_BEING_USED;
+      }
+      if (!reaper &&
+          owned->second->state == trx_preserve_temp_native_space::State::NATIVE) {
+        synchronous_owner = owned->second.get();
+        synchronous_owner->cleanup_running = true;
+      }
+      target = &owned->second->descriptor;
+    } else if (target == nullptr) {
+      const auto adopted = trx_preserve_temp_adopted_fil_spaces.find(id);
+      if (adopted != trx_preserve_temp_adopted_fil_spaces.end())
+        target = adopted->second;
     }
   }
 
+  if (target == nullptr) return DB_TABLESPACE_NOT_FOUND;
   if (!target->fil_space_adopted || target->adopted_fil_space_path.empty()) {
     return DB_ERROR;
   }
@@ -6509,7 +6731,7 @@ dberr_t trx_preserve_temp_space_image_drop_preserved_fil_space(
   target->no_redo_undo_adopted_rseg_page_no = 0;
   target->no_redo_undo_adopted_rseg_slot = 0;
   target->no_redo_undo_reconnected_trx = nullptr;
-  if (target != descriptor) {
+  if (descriptor != nullptr && target != descriptor) {
     descriptor->no_redo_undo_pointers_reconnected = false;
     descriptor->no_redo_undo_native_slots_adopted = false;
     descriptor->no_redo_undo_adopted_rseg_identity_present = false;
@@ -6528,40 +6750,152 @@ dberr_t trx_preserve_temp_space_image_drop_preserved_fil_space(
         it->second == target) {
       trx_preserve_temp_adopted_fil_spaces.erase(it);
     }
-    trx_preserve_temp_attached_fil_space_descriptors.erase(
-        target->source_space_id);
+    auto owned = trx_preserve_temp_attached_fil_space_descriptors.find(target->source_space_id);
+    if (owned != trx_preserve_temp_attached_fil_space_descriptors.end()) {
+      ut_a(owned->second->capture_readers == 0);
+      if (removed_owner != nullptr) *removed_owner = true;
+      retired = std::move(owned->second);
+      trx_preserve_temp_attached_fil_space_descriptors.erase(owned);
+    }
   }
   return fil_err == DB_SUCCESS && undo_delete_err == DB_SUCCESS ? DB_SUCCESS
                                                                 : DB_ERROR;
 }
 
+// Intrusive debt queue: its owner and linkage are allocated before handoff.
+// Caller holds the registry mutex. Never queue a live table or borrowed space.
+static void enqueue_native_cleanup(trx_preserve_temp_native_space *owner) {
+  if (owner->cleanup_queued || owner->cleanup_running ||
+      owner->state != trx_preserve_temp_native_space::State::NATIVE ||
+      !owner->descriptor.bound_dict_tables.empty()) return;
+  owner->capture_retire_pending = true;
+  if (owner->capture_readers != 0) return;
+  owner->cleanup_queued = true;
+  owner->cleanup_next = nullptr;
+  if (trx_preserve_temp_cleanup_tail != nullptr)
+    trx_preserve_temp_cleanup_tail->cleanup_next = owner;
+  else
+    trx_preserve_temp_cleanup_head = owner;
+  trx_preserve_temp_cleanup_tail = owner;
+  trx_preserve_temp_cleanup_pending.store(true, std::memory_order_release);
+}
+
+dberr_t trx_preserve_temp_native_capture_acquire(
+    uint32_t space_id, trx_preserve_temp_native_space **ticket) {
+  if (space_id == 0 || ticket == nullptr || *ticket != nullptr) return DB_ERROR;
+  if (!preserve_trx_is_enabled() || !preserve_trx_temp_table_enable)
+    return DB_UNSUPPORTED;
+  std::lock_guard<std::mutex> guard(trx_preserve_temp_adopted_fil_spaces_mutex);
+  const auto it = trx_preserve_temp_attached_fil_space_descriptors.find(space_id);
+  const auto adopted = trx_preserve_temp_adopted_fil_spaces.find(space_id);
+  if (it == trx_preserve_temp_attached_fil_space_descriptors.end() ||
+      adopted == trx_preserve_temp_adopted_fil_spaces.end())
+    return DB_TABLESPACE_NOT_FOUND;
+  auto *owner = it->second.get();
+  if (owner == nullptr || owner->state != trx_preserve_temp_native_space::State::NATIVE ||
+      owner->capture_retire_pending || owner->cleanup_queued || owner->cleanup_running ||
+      adopted->second != &owner->descriptor || !owner->descriptor.fil_space_adopted ||
+      owner->descriptor.bound_dict_tables.empty() ||
+      owner->capture_readers == UINT32_MAX) return DB_ERROR;
+  ++owner->capture_readers;
+  *ticket = owner;
+  DBUG_PRINT("preserve_temp_import",
+             ("temporary source native borrowed space=%u", space_id));
+  return DB_SUCCESS;
+}
+
+void trx_preserve_temp_native_capture_release(
+    trx_preserve_temp_native_space *ticket) noexcept {
+  if (ticket == nullptr) return;
+  bool wake = false;
+  {
+    std::lock_guard<std::mutex> guard(trx_preserve_temp_adopted_fil_spaces_mutex);
+    ut_a(ticket->state == trx_preserve_temp_native_space::State::NATIVE &&
+         ticket->capture_readers != 0);
+    --ticket->capture_readers;
+    DBUG_PRINT("preserve_temp_import",
+               ("temporary source native released space=%u remaining=%u",
+                ticket->descriptor.source_space_id, ticket->capture_readers));
+    if (ticket->capture_readers == 0 && ticket->capture_retire_pending) {
+      enqueue_native_cleanup(ticket);
+      wake = ticket->cleanup_queued;
+    }
+  }
+  if (wake) preserved_trx_request_expired_reaper_scan();
+}
+
+static void retry_native_cleanup(uint32_t id) {
+  {
+    std::lock_guard<std::mutex> guard(trx_preserve_temp_adopted_fil_spaces_mutex);
+    auto it = trx_preserve_temp_attached_fil_space_descriptors.find(id);
+    if (it == trx_preserve_temp_attached_fil_space_descriptors.end()) return;
+    enqueue_native_cleanup(it->second.get());
+  }
+  preserved_trx_request_expired_reaper_scan();
+}
+
+#ifndef NDEBUG
+dberr_t trx_preserve_temp_space_image_drop_preserved_fil_space(
+    trx_preserve_temp_space_image_descriptor *descriptor) {
+  if (descriptor == nullptr) return DB_ERROR;
+  const auto id = descriptor->source_space_id;
+  dberr_t err;
+  try { err = drop_preserved_fil_space_impl(descriptor, false); }
+  catch (const std::bad_alloc &) { err = DB_OUT_OF_MEMORY; }
+  // No descriptor access after publication; the reaper may retire it at once.
+  if (err != DB_SUCCESS) retry_native_cleanup(id);
+  return err;
+}
+#endif
+
+void trx_preserve_temp_native_reap_once() {
+  if (!trx_preserve_temp_cleanup_pending.load(std::memory_order_acquire)) return;
+  trx_preserve_temp_native_space *owner;
+  uint32_t id;
+  {
+    std::lock_guard<std::mutex> guard(trx_preserve_temp_adopted_fil_spaces_mutex);
+    owner = trx_preserve_temp_cleanup_head;
+    if (owner == nullptr) return;
+    ut_a(owner->capture_readers == 0);
+    trx_preserve_temp_cleanup_head = owner->cleanup_next;
+    if (trx_preserve_temp_cleanup_head == nullptr) trx_preserve_temp_cleanup_tail = nullptr;
+    trx_preserve_temp_cleanup_pending.store(trx_preserve_temp_cleanup_head != nullptr,
+                                          std::memory_order_release);
+    owner->cleanup_next = nullptr;
+    owner->cleanup_queued = false;
+    owner->cleanup_running = true;
+    id = owner->descriptor.source_space_id;
+  }
+  bool removed = false;
+  try { (void)drop_preserved_fil_space_impl(&owner->descriptor, true, &removed); }
+  catch (...) { /* Keep the registered owner for the next bounded pass. */ }
+  if (removed) return;
+  std::lock_guard<std::mutex> guard(trx_preserve_temp_adopted_fil_spaces_mutex);
+  const auto it = trx_preserve_temp_attached_fil_space_descriptors.find(id);
+  if (it != trx_preserve_temp_attached_fil_space_descriptors.end() && it->second.get() == owner) {
+    owner->cleanup_running = false;
+    enqueue_native_cleanup(owner);
+  }
+}
+
 dberr_t trx_preserve_temp_space_image_drop_preserved_fil_space_by_space_id(
     uint32_t source_space_id) {
   if (source_space_id == 0) return DB_ERROR;
-
-  trx_preserve_temp_space_image_descriptor *target = nullptr;
-  {
-    std::lock_guard<std::mutex> guard{
-        trx_preserve_temp_adopted_fil_spaces_mutex};
-    auto owned =
-        trx_preserve_temp_attached_fil_space_descriptors.find(source_space_id);
-    if (owned != trx_preserve_temp_attached_fil_space_descriptors.end() &&
-        owned->second != nullptr) {
-      target = owned->second.get();
-    } else {
-      auto adopted = trx_preserve_temp_adopted_fil_spaces.find(source_space_id);
-      if (adopted != trx_preserve_temp_adopted_fil_spaces.end()) {
-        target = adopted->second;
-      }
-    }
+  // Resolve and claim under one registry lock; no raw owner crosses the gap.
+  dberr_t err;
+  try {
+    err = drop_preserved_fil_space_impl(nullptr, false, nullptr, source_space_id);
+  } catch (const std::bad_alloc &) {
+    err = DB_OUT_OF_MEMORY;
   }
-
-  if (target == nullptr) return DB_TABLESPACE_NOT_FOUND;
-  return trx_preserve_temp_space_image_drop_preserved_fil_space(target);
+  if (err != DB_SUCCESS && err != DB_TABLESPACE_NOT_FOUND)
+    retry_native_cleanup(source_space_id);
+  return err;
 }
 
 dberr_t trx_preserve_temp_space_image_drop_bound_table_by_space_id(
-    uint32_t source_space_id, dict_table_t *table) {
+    uint32_t source_space_id, dict_table_t *table, bool *table_removed) {
+  if (table_removed != nullptr) *table_removed = false;
   if (source_space_id == 0 || table == nullptr) return DB_ERROR;
 
   trx_preserve_temp_space_image_descriptor *target = nullptr;
@@ -6572,7 +6906,9 @@ dberr_t trx_preserve_temp_space_image_drop_bound_table_by_space_id(
         trx_preserve_temp_attached_fil_space_descriptors.find(source_space_id);
     if (owned != trx_preserve_temp_attached_fil_space_descriptors.end() &&
         owned->second != nullptr) {
-      target = owned->second.get();
+      if (owned->second->state == trx_preserve_temp_native_space::State::PREPARED ||
+          owned->second->cleanup_queued || owned->second->cleanup_running) return DB_ERROR;
+      target = &owned->second->descriptor;
     } else {
       auto adopted = trx_preserve_temp_adopted_fil_spaces.find(source_space_id);
       if (adopted != trx_preserve_temp_adopted_fil_spaces.end()) {
@@ -6587,24 +6923,49 @@ dberr_t trx_preserve_temp_space_image_drop_bound_table_by_space_id(
                             target->bound_dict_tables.end(), table);
   if (table_it == target->bound_dict_tables.end()) return DB_ERROR;
 
-  target->bound_dict_tables.erase(table_it);
-  if (target->bound_dict_table == table) {
-    target->bound_dict_table = target->bound_dict_tables.empty()
-                                   ? nullptr
-                                   : target->bound_dict_tables.front();
-  }
-
-  mutex_enter(&dict_sys->mutex);
-  if (table->get_ref_count() == 0) {
+  {
+    IB_mutex_guard guard(&dict_sys->mutex);
+    if (!table->cached || table->space != source_space_id ||
+        !table->is_temporary() || table->is_intrinsic()) return DB_ERROR;
+    // Wait for handle-close's tail before checking native deletion preconditions.
+    table->lock();
+    const bool busy = table->get_ref_count() != 0 || table->n_rec_locks.load() != 0 ||
+                      table->stats_bg_flag != BG_STAT_NONE || lock_table_has_locks(table);
+    table->unlock();
+    if (busy) return DB_TABLE_IS_BEING_USED;
+    // The native free destroys the handle mutex; never hold it across free.
     dict_table_remove_from_cache(table);
   }
-  mutex_exit(&dict_sys->mutex);
 
-  if (!target->bound_dict_tables.empty()) {
-    return DB_SUCCESS;
+  {
+    std::lock_guard<std::mutex> guard(trx_preserve_temp_adopted_fil_spaces_mutex);
+    target->bound_dict_tables.erase(table_it);
+    if (target->bound_dict_table == table) {
+      target->bound_dict_table = target->bound_dict_tables.empty()
+                                     ? nullptr
+                                     : target->bound_dict_tables.front();
+    }
+    if (table_removed != nullptr) *table_removed = true;
+    if (!target->bound_dict_tables.empty()) return DB_SUCCESS;
+    const auto owned =
+        trx_preserve_temp_attached_fil_space_descriptors.find(source_space_id);
+    if (owned != trx_preserve_temp_attached_fil_space_descriptors.end() &&
+        owned->second->capture_readers != 0) {
+      // Logical DROP is complete. Last-reader retirement never blocks it.
+      owned->second->capture_retire_pending = true;
+      return DB_SUCCESS;
+    }
   }
 
-  return trx_preserve_temp_space_image_drop_preserved_fil_space(target);
+  try {
+    DBUG_EXECUTE_IF("preserve_temp_bound_table_drop_oom", throw std::bad_alloc(););
+    return trx_preserve_temp_space_image_drop_preserved_fil_space_by_space_id(
+        source_space_id);
+  } catch (const std::bad_alloc &) {
+    // Preserve the completed table deletion so the caller revokes its handler.
+    retry_native_cleanup(source_space_id);
+    return DB_OUT_OF_MEMORY;
+  }
 }
 
 bool trx_preserve_temp_space_image_fil_space_adopted_by_space_id(
@@ -6664,6 +7025,7 @@ dberr_t trx_preserve_temp_space_image_release_preserved_fil_space_for_retry(
       !trx_preserve_temp_space_image_descriptor_has_identity(*descriptor)) {
     return DB_ERROR;
   }
+  std::unique_ptr<trx_preserve_temp_native_space> retired;
   trx_preserve_temp_space_image_descriptor *target = descriptor;
   {
     std::lock_guard<std::mutex> guard{
@@ -6672,7 +7034,9 @@ dberr_t trx_preserve_temp_space_image_release_preserved_fil_space_for_retry(
         descriptor->source_space_id);
     if (owned != trx_preserve_temp_attached_fil_space_descriptors.end() &&
         owned->second != nullptr) {
-      target = owned->second.get();
+      if (owned->second->state != trx_preserve_temp_native_space::State::LEGACY)
+        return DB_ERROR;
+      target = &owned->second->descriptor;
     }
   }
 
@@ -6719,8 +7083,11 @@ dberr_t trx_preserve_temp_space_image_release_preserved_fil_space_for_retry(
     if (it != trx_preserve_temp_adopted_fil_spaces.end()) {
       trx_preserve_temp_adopted_fil_spaces.erase(it);
     }
-    trx_preserve_temp_attached_fil_space_descriptors.erase(
-        target->source_space_id);
+    auto owned = trx_preserve_temp_attached_fil_space_descriptors.find(target->source_space_id);
+    if (owned != trx_preserve_temp_attached_fil_space_descriptors.end()) {
+      retired = std::move(owned->second);
+      trx_preserve_temp_attached_fil_space_descriptors.erase(owned);
+    }
   }
   if (target == descriptor) {
     descriptor->fil_space_adopted = false;
@@ -6770,21 +7137,29 @@ void trx_preserve_temp_space_image_set_drop_observer_for_test(
 }
 
 void trx_preserve_temp_space_image_clear_adopted_fil_spaces_for_test() {
-  std::lock_guard<std::mutex> guard{
-      trx_preserve_temp_adopted_fil_spaces_mutex};
-  for (const auto &attached_space : trx_preserve_temp_attached_fil_space_descriptors) {
-    trx_preserve_temp_space_image_release_bound_dict_table(
-        attached_space.second.get());
+  decltype(trx_preserve_temp_attached_fil_space_descriptors) attached;
+  decltype(trx_preserve_temp_adopted_fil_spaces) adopted;
+  {
+    std::lock_guard<std::mutex> guard(trx_preserve_temp_adopted_fil_spaces_mutex);
+    for (const auto &entry : trx_preserve_temp_attached_fil_space_descriptors)
+      ut_a(entry.second->capture_readers == 0);
+    attached.swap(trx_preserve_temp_attached_fil_space_descriptors);
+    adopted.swap(trx_preserve_temp_adopted_fil_spaces);
+    trx_preserve_temp_cleanup_head = trx_preserve_temp_cleanup_tail = nullptr;
+    trx_preserve_temp_cleanup_pending.store(false, std::memory_order_release);
+    trx_preserve_temp_last_evicted_drop_space_ids.clear();
+    trx_preserve_temp_drop_observer_for_test = nullptr;
+    trx_preserve_temp_drop_observer_context_for_test = nullptr;
   }
-  for (const auto &adopted_space : trx_preserve_temp_adopted_fil_spaces) {
-    (void)fil_preserve_temp_space_forget(adopted_space.first);
-    ibt::release_preserved_space_id(adopted_space.first);
+  for (const auto &space : attached) {
+    if (space.second && space.second->state != trx_preserve_temp_native_space::State::PREPARED)
+      trx_preserve_temp_space_image_release_bound_dict_table(&space.second->descriptor);
   }
-  trx_preserve_temp_adopted_fil_spaces.clear();
-  trx_preserve_temp_attached_fil_space_descriptors.clear();
-  trx_preserve_temp_last_evicted_drop_space_ids.clear();
-  trx_preserve_temp_drop_observer_for_test = nullptr;
-  trx_preserve_temp_drop_observer_context_for_test = nullptr;
+  for (const auto &space : adopted) {
+    (void)fil_preserve_temp_space_forget(space.first);
+    ibt::release_preserved_space_id(space.first);
+  }
+  attached.clear();
   {
     std::lock_guard<std::mutex> reservation_guard{
         trx_preserve_temp_no_redo_undo_reservations_mutex};

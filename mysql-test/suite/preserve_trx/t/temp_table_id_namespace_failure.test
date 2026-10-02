@@ -1,0 +1,30 @@
+--source include/have_debug.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+SELECT @@global.rds_preserve_trx_temp_id_namespace AS namespace_enabled;
+--disable_query_log
+CALL mtr.add_suppression("The table 'tmp_id_exhausted' is full");
+--enable_query_log
+CREATE TEMPORARY TABLE tmp_id_survivor(id INT PRIMARY KEY, v INT)
+  ENGINE=InnoDB;
+INSERT INTO tmp_id_survivor VALUES(1,10),(2,20);
+SET SESSION debug='+d,preserve_temp_table_id_exhausted';
+--error ER_RECORD_FILE_FULL
+CREATE TEMPORARY TABLE tmp_id_exhausted(id INT PRIMARY KEY) ENGINE=InnoDB;
+SET SESSION debug='-d,preserve_temp_table_id_exhausted';
+SELECT COUNT(*)=1 AS no_table_leak FROM information_schema.INNODB_TEMP_TABLE_INFO;
+SET SESSION debug='+d,preserve_temp_index_id_exhausted';
+--error ER_RECORD_FILE_FULL
+CREATE TEMPORARY TABLE tmp_id_exhausted(id INT PRIMARY KEY, KEY(id)) ENGINE=InnoDB;
+SET SESSION debug='-d,preserve_temp_index_id_exhausted';
+SELECT COUNT(*)=1 AS no_index_leak FROM information_schema.INNODB_TEMP_TABLE_INFO;
+CREATE TEMPORARY TABLE tmp_id_exhausted(id INT PRIMARY KEY, KEY(id)) ENGINE=InnoDB;
+INSERT INTO tmp_id_exhausted SELECT id FROM tmp_id_survivor;
+START TRANSACTION;
+UPDATE tmp_id_survivor SET v=v+100;
+DELETE FROM tmp_id_exhausted WHERE id=1;
+ROLLBACK;
+SELECT COUNT(*)=2 AND SUM(v)=30 AS survivor_intact FROM tmp_id_survivor;
+SELECT COUNT(*)=2 AND SUM(id)=3 AS retry_ok FROM tmp_id_exhausted;
+DROP TEMPORARY TABLE tmp_id_survivor, tmp_id_exhausted;
+SELECT COUNT(*)=0 AS cleanup_ok FROM information_schema.INNODB_TEMP_TABLE_INFO;

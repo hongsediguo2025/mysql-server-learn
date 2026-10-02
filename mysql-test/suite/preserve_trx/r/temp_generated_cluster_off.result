@@ -1,0 +1,12 @@
+SELECT COUNT(*)=512 AND SUM(v)=1313280 AS native_rollback FROM t_generated_off;
+native_rollback
+1
+SELECT COUNT(*)=512 AND SUM(v)=1313280 AS temp_rollback FROM tmp_generated_off;
+temp_rollback
+1
+SELECT COUNT(*)=514 AND SUM(v)=1323540 AS native_insert FROM t_generated_off;
+native_insert
+1
+SELECT COUNT(*)=514 AND SUM(v)=1323540 AS temp_insert FROM tmp_generated_off;
+temp_insert
+1

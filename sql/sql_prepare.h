@@ -312,12 +312,21 @@ class Ed_row final {
 };
 
 class Server_side_cursor;
+class Preserve_trx_result_cursor;
+class Preserve_trx_cursor_decoder;
+Query_result_send *preserve_trx_create_cursor_sender(
+    THD *, MEM_ROOT *, const Preserve_trx_cursor_decoder &);
+bool preserve_trx_bind_cursor_sender(Query_result_send *, THD *);
 
 /**
   Prepared_statement: a statement that can contain placeholders.
 */
 
 class Prepared_statement final {
+  friend class Preserve_trx_result_restore;
+#ifndef NDEBUG
+  friend bool preserve_trx_restore_cursor_for_test(Prepared_statement *);
+#endif
   enum flag_values { IS_IN_USE = 1, IS_SQL_PREPARE = 2 };
 
  public:
@@ -353,6 +362,12 @@ class Prepared_statement final {
   uint flags;
   bool with_log;
   bool m_preserve_cursor_counted{false};
+  std::unique_ptr<Preserve_trx_result_cursor> m_preserved_cursor;
+  Server_side_cursor *m_original_cursor{nullptr};
+  void attach_preserved_cursor(std::unique_ptr<Preserve_trx_result_cursor>);
+#ifndef NDEBUG
+  bool install_preserved_cursor(std::unique_ptr<Preserve_trx_result_cursor>);
+#endif
   LEX_CSTRING m_name; /* name for named prepared statements */
   /**
     Name of the current (default) database.

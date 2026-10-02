@@ -1,0 +1,22 @@
+--source include/have_debug.inc
+--source include/have_log_bin.inc
+--disable_query_log
+--let $contract_trace= $MYSQLTEST_VARDIR/log/temp_contract_owner.trace
+--let _CONTRACT_OWNER_TRACE= $contract_trace
+--let $receiver_namespace= 1
+--let $contract_temporary= cursor-no-undo
+--let $contract_loopback= 1
+--let $contract_engine= resources
+--let $contract_resume= success
+--source suite/preserve_trx/include/temp_id_contract_source.inc
+--disable_query_log
+--perl
+use strict;
+use warnings;
+open(my $fh, '<', $ENV{'_CONTRACT_OWNER_TRACE'}) or die "missing contract trace: $!";
+my $trace=do {local $/; <$fh>};
+die "prepared contract did not survive gate ownership transfer"
+  unless $trace =~ /prepared contract immutable through prewarm facts and gate/;
+EOF
+--echo prepared_temp_contract_survives_semantic_bundle_transfer
+--enable_query_log

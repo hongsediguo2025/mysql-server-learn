@@ -1,0 +1,3 @@
+# Internal fault probe; SQL exercises fallback or fail-closed behavior.
+--let $contract_undo_delta_fault= digest
+--source suite/preserve_trx/t/temp_capture_undo_delta.test

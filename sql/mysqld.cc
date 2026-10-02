@@ -763,9 +763,18 @@
 #include "sql/persisted_variable.h"              // Persisted_variables_cache
 #include "sql/plugin_table.h"
 #include "sql/preserve_trx.h"
+#include "sql/preserve_trx_temp_metrics.h"
+#include "sql/preserve_trx_temp_receiver.h"
 #include "sql/preserve_trx_promotion.h"
 #include "sql/preserve_trx_lock_warmcopy.h"
 #include "sql/preserve_trx_resource.h"
+#include "sql/preserve_trx_temp_gc.h"
+#include "sql/preserve_trx_cursor.h"
+#include "sql/preserve_trx_cursor_file.h"
+#include "sql/preserve_trx_receiver_candidates.h"
+#include "sql/preserve_trx_result_pretransfer.h"
+#include "sql/preserve_trx_cursor_decode.h"
+#include "sql/preserve_trx_result_cursor.h"
 #include "sql/protocol.h"
 #include "sql/psi_memory_key.h"  // key_memory_MYSQL_RELAY_LOG_index
 #include "sql/query_options.h"
@@ -2397,6 +2406,7 @@ static void clean_up(bool print_message) {
   preserved_trx_stop_expired_reaper();
   preserved_trx_promotion_shutdown_gate_workers();
   preserve_trx_transfer_shutdown_receiver_prewarm_workers();
+  Preserve_trx_temp_receiver_work::shutdown_retired();
 
   ha_pre_dd_shutdown();
   dd::shutdown();
@@ -5917,6 +5927,8 @@ static int init_server_components() {
 
   if (!opt_initialize && !is_help_or_validate_option()) {
     preserved_trx_enter_server_startup();
+    if (preserve_trx_is_enabled())
+      preserve_trx_temp_gc_startup(preserved_trx_dir_value());
     if (preserved_trx_skip_local_startup_recovery()) {
       const Preserve_trx_transfer_status cleanup_status =
           preserve_trx_transfer_cleanup_startup_root();
@@ -9036,6 +9048,72 @@ SHOW_VAR status_vars[] = {
     {"Preserve_trx_lock_warmcopy_unsupported_family",
      (char *)&show_preserve_trx_lock_warmcopy_unsupported_family, SHOW_FUNC,
      SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_cursor_live_results",
+     (char *)&show_preserve_trx_cursor_live_results, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_cursor_capture_bytes",
+     (char *)&show_preserve_trx_cursor_capture_bytes, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_cursor_capture_completed",
+     (char *)&show_preserve_trx_cursor_capture_completed, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_cursor_capture_failures",
+     (char *)&show_preserve_trx_cursor_capture_failures, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+#ifndef NDEBUG
+    {"Preserve_trx_cursor_snapshot_exports",
+     (char *)&show_preserve_trx_cursor_snapshot_exports, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_cursor_row_seek_headers",
+     (char *)&show_preserve_trx_cursor_row_seek_headers, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+#endif
+    {"Preserve_trx_cursor_file_preflights",
+     (char *)&show_preserve_trx_cursor_file_preflights, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_cursor_file_rejections",
+     (char *)&show_preserve_trx_cursor_file_rejections, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_cursor_decoded_rows",
+     (char *)&show_preserve_trx_cursor_decoded_rows, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_cursor_preflight_rows",
+     (char *)&show_preserve_trx_cursor_preflight_rows, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_result_early_abandoned",
+     (char *)&show_preserve_trx_result_early_abandoned, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_result_early_ready",
+     (char *)&show_preserve_trx_result_early_ready, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_result_pretransfer_bytes",
+     (char *)&show_preserve_trx_result_pretransfer_bytes, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_result_pretransfer_results",
+     (char *)&show_preserve_trx_result_pretransfer_results, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_pretransfer_bytes",
+     (char *)&show_preserve_trx_temp_pretransfer_bytes, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_image_delta_bytes",
+     (char *)&show_preserve_trx_temp_image_delta_bytes, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_image_delta_built",
+     (char *)&show_preserve_trx_temp_image_delta_built, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_image_delta_assembled",
+     (char *)&show_preserve_trx_temp_image_delta_assembled, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_undo_delta_bytes",
+     (char *)&show_preserve_trx_temp_undo_delta_bytes, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_undo_delta_built",
+     (char *)&show_preserve_trx_temp_undo_delta_built, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_undo_delta_assembled",
+     (char *)&show_preserve_trx_temp_undo_delta_assembled, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_native_early_ready",
+     (char *)&show_preserve_trx_temp_native_early_ready, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_native_early_reused",
+     (char *)&show_preserve_trx_temp_native_early_reused, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_native_early_failed",
+     (char *)&show_preserve_trx_temp_native_early_failed, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_undo_early_ready",
+     (char *)&show_preserve_trx_temp_undo_early_ready, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_undo_early_reused",
+     (char *)&show_preserve_trx_temp_undo_early_reused, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_undo_early_read_bytes",
+     (char *)&show_preserve_trx_temp_undo_early_read_bytes, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_undo_early_abandoned",
+     (char *)&show_preserve_trx_temp_undo_early_abandoned, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_undo_early_superseded",
+     (char *)&show_preserve_trx_temp_undo_early_superseded, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_result_early_rows",
+     (char *)&show_preserve_trx_result_early_rows, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_result_early_reused",
+     (char *)&show_preserve_trx_result_early_reused, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_cursor_restored_cursors",
+     (char *)&show_preserve_trx_cursor_restored_cursors, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"Preserve_trx_memory_current_bytes",
      (char *)&show_preserve_trx_memory_current_bytes, SHOW_FUNC,
      SHOW_SCOPE_GLOBAL},
@@ -9126,8 +9204,71 @@ SHOW_VAR status_vars[] = {
     {"Preserve_trx_closing_to_final_ack_us",
      (char *)&show_preserve_trx_closing_to_final_ack_us, SHOW_FUNC,
      SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_stage", (char *)preserve_trx_temp_stage_status,
+     SHOW_ARRAY, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_prebuild_baselines",
+     (char *)&show_preserve_trx_temp_prebuild_baselines, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_prebuild_buffer_pages",
+     (char *)&show_preserve_trx_temp_prebuild_buffer_pages, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_prebuild_file_pages",
+     (char *)&show_preserve_trx_temp_prebuild_file_pages, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_prebuild_rounds",
+     (char *)&show_preserve_trx_temp_prebuild_rounds, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_prebuild_round_pages",
+     (char *)&show_preserve_trx_temp_prebuild_round_pages, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_prebuild_undo_pages",
+     (char *)&show_preserve_trx_temp_prebuild_undo_pages, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_prebuild_undo_reused_pages",
+     (char *)&show_preserve_trx_temp_prebuild_undo_reused_pages, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_undo_watched_pages",
+     (char *)&show_preserve_trx_temp_undo_watched_pages, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_undo_owners",
+     (char *)&show_preserve_trx_temp_undo_owners, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_undo_owner_pages_used",
+     (char *)&show_preserve_trx_temp_undo_owner_pages_used, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_undo_owner_quota_rejected",
+     (char *)&show_preserve_trx_temp_undo_owner_quota_rejected, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_undo_owner_pages_routed",
+     (char *)&show_preserve_trx_temp_undo_owner_pages_routed, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_prebuild_undo_scans",
+     (char *)&show_preserve_trx_temp_prebuild_undo_scans, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_prebuild_undo_stale",
+     (char *)&show_preserve_trx_temp_prebuild_undo_stale, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_undo_shared_fallback",
+     (char *)&show_preserve_trx_temp_undo_shared_fallback, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_prebuild_undo_write_steps",
+     (char *)&show_preserve_trx_temp_prebuild_undo_write_steps, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_prebuild_undo_claim_pages",
+     (char *)&show_preserve_trx_temp_prebuild_undo_claim_pages, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_prebuild_undo_claim_reused",
+     (char *)&show_preserve_trx_temp_prebuild_undo_claim_reused, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_prebuild_undo_write_bytes",
+     (char *)&show_preserve_trx_temp_prebuild_undo_write_bytes, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_prebuild_final_reused",
+     (char *)&show_preserve_trx_temp_prebuild_final_reused, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_prebuild_final_fallback",
+     (char *)&show_preserve_trx_temp_prebuild_final_fallback, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_prebuild_stale",
+     (char *)&show_preserve_trx_temp_prebuild_stale, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_gc_scanned",
+     (char *)&show_preserve_trx_temp_gc_scanned, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_gc_removed",
+     (char *)&show_preserve_trx_temp_gc_removed, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_gc_errors",
+     (char *)&show_preserve_trx_temp_gc_errors, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_gc_passes",
+     (char *)&show_preserve_trx_temp_gc_passes, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_prebuild_active",
+     (char *)&show_preserve_trx_temp_prebuild_active, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_prebuild_installed",
+     (char *)&show_preserve_trx_temp_prebuild_installed, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_temp_prebuild_steps",
+     (char *)&show_preserve_trx_temp_prebuild_steps, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"Preserve_trx_phase2_total_us",
      (char *)&show_preserve_trx_phase2_total_us, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_phase2_command_boundary_wait_active",
+     (char *)&show_preserve_trx_phase2_command_boundary_wait_active, SHOW_FUNC,
      SHOW_SCOPE_GLOBAL},
     {"Preserve_trx_early_staged_tokens",
      (char *)&show_preserve_trx_early_staged_tokens, SHOW_FUNC,

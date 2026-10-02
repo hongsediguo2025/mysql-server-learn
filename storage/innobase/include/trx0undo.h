@@ -367,6 +367,7 @@ void trx_undo_mem_free(trx_undo_t *undo); /* in: the undo object to be freed */
 in the corresponding transaction object */
 
 struct trx_undo_t {
+  uint64_t preserve_temp_undo_cookie;
   /* Set undo segment to prepared state and set XID
   @param[in]	in_xid	transaction XID. */
   void set_prepared(const XID *in_xid);

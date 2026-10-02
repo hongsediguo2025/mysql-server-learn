@@ -26,8 +26,18 @@ my $trx_preserve = read_file('storage/innobase/trx/trx0preserve.cc');
 my ($trx_list_init) =
   $trx =~ /(void\s+trx_lists_init_at_db_start\s*\([^)]*\)\s*\{[\s\S]*?^\})/m
   or die "could not isolate trx_lists_init_at_db_start\n";
+my $native_list_without_metric = $trx_list_init;
+die "missing gated physical resurrection timer\n"
+  unless $native_list_without_metric =~ s/
+    Preserve_trx_temp_stage_timer\s+metric\s*\(
+    \s*preserved_trx_physical_promotion_in_progress\s*\(\s*\)
+    \s*\?\s*Preserve_trx_temp_stage::PHYSICAL_RESURRECTION
+    \s*:\s*Preserve_trx_temp_stage::NONE\s*,\s*&success\s*\)\s*;
+  //sx;
 die "native trx-list initialization must not understand receiver token selection\n"
-  if $trx_list_init =~ /ready_tokens|failed_tokens|CLASSIFIED|receiver|promotion/i;
+  if $native_list_without_metric =~ /ready_tokens|failed_tokens|CLASSIFIED|receiver|promotion/i;
+die "physical resurrection metric gate must only read enabled online bootstrap state\n"
+  unless $promotion =~ /bool\s+preserved_trx_physical_promotion_in_progress\s*\(\s*\)\s*\{\s*return\s+preserve_trx_is_enabled\s*\(\s*\)\s*&&\s*!preserved_trx_server_startup_active\s*\(\s*\)\s*&&\s*g_physical_promotion_bootstrap_active\.load\s*\(\s*std::memory_order_acquire\s*\)\s*;\s*\}/s;
 
 my ($bootstrap) =
   $promotion =~ /(preserved_trx_prepare_before_trx_sys_init_for_physical_promotion\s*\([\s\S]*?^\})/m

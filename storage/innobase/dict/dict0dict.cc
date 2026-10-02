@@ -37,6 +37,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include <strfunc.h>
 #include <sys/types.h>
 #include <algorithm>
+#include <memory>
 #include <string>
 
 #ifndef UNIV_HOTBACKUP
@@ -2372,6 +2373,14 @@ dberr_t dict_index_add_to_cache_w_vcol(dict_table_t *table, dict_index_t *index,
     new_index = dict_index_build_internal_non_clust(table, index);
   }
 
+  /* Diagnostics below may allocate. Until publication, keep the normalized
+  index owned independently of the caller's original index. */
+  std::unique_ptr<dict_index_t, decltype(&dict_mem_index_free)> normalized_owner(
+      new_index, dict_mem_index_free);
+  DBUG_EXECUTE_IF("preserve_temp_dictionary_normalize_oom", {
+    if (!table->cached && table->is_temporary()) throw std::bad_alloc();
+  });
+
   /* Set the n_fields value in new_index to the actual defined
   number of fields in the cache internal representation */
 
@@ -2391,7 +2400,6 @@ dberr_t dict_index_add_to_cache_w_vcol(dict_table_t *table, dict_index_t *index,
 
   if (dict_index_too_big_for_tree(table, new_index, strict)) {
     if (strict) {
-      dict_mem_index_free(new_index);
       dict_mem_index_free(index);
       return (DB_TOO_BIG_RECORD);
     } else if (current_thd != nullptr) {
@@ -2455,6 +2463,7 @@ dberr_t dict_index_add_to_cache_w_vcol(dict_table_t *table, dict_index_t *index,
 
   /* Add the new index as the last index for the table */
   UT_LIST_ADD_LAST(table->indexes, new_index);
+  normalized_owner.release();
 
   /* Intrinsic table are not added to dictionary cache instead are
   cached to session specific thread cache. */

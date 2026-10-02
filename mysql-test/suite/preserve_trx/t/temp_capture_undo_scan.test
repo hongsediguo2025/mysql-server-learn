@@ -1,0 +1,16 @@
+--let $contract_large_undo= 1
+--let $contract_capture_trace= 1
+--source suite/preserve_trx/t/temp_capture_worker.test
+perl;
+  my $file = "$ENV{MYSQLTEST_VARDIR}/log/temp-source-pool.trace";
+  open(my $fh, '<', $file) or die "open $file: $!";
+  local $/; my $trace = <$fh>;
+  die "worker undo was reread during final seal\n"
+    unless $trace =~ /temporary undo final seal writer_verified=1 bytes=\d+/;
+  my $large = 0;
+  while ($trace =~ /temporary undo claim slots pages=(\d+) chains=(\d+)/g) {
+    die "undo claims repeatedly traversed chains\n" unless $2 >= 1 && $2 <= 2;
+    $large = 1 if $1 > 8;
+  }
+  die "large undo ownership index was not exercised\n" unless $large;
+EOF

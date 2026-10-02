@@ -6374,6 +6374,7 @@ class Parallel_probe_transfer_frame_sink final
   std::atomic<uint> m_payload_sends{0};
 };
 
+#ifndef NDEBUG
 class Reordering_receiver_loopback_transfer_frame_sink final
     : public Preserve_trx_transfer_encoded_frame_sink {
  public:
@@ -6529,6 +6530,7 @@ class Reordering_receiver_loopback_transfer_frame_sink final
   std::atomic<uint> m_receiver_active{0};
   std::atomic<uint> m_receiver_max_active{0};
 };
+#endif
 
 Preserve_trx_transfer_status make_discarding_transfer_sink(
     std::unique_ptr<Preserve_trx_transfer_encoded_frame_sink> *sink) {
@@ -15122,6 +15124,7 @@ TEST(PreservedTrxTransfer, ProtocolV2TerminalControlFramesRoundTrip) {
   }
 }
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        ExternalObjectDescriptorUsesOnlyProductV1Domain) {
   Preserve_trx_transfer_object_descriptor descriptor;
@@ -15168,6 +15171,7 @@ TEST_F(PreserveSnapshotTest,
             preserve_trx_transfer_handle_receiver_payload(
                 m_dir, encoded_prototype, &store, &registry, 300));
 }
+#endif
 
 TEST(PreservedTrxTransfer, ProtocolV2ControlCrcAndPayloadDigestRejectBitFlip) {
   Preserve_trx_transfer_frame frame;
@@ -15194,6 +15198,7 @@ TEST(PreservedTrxTransfer, ProtocolV2ControlCrcAndPayloadDigestRejectBitFlip) {
             preserve_trx_transfer_decode_frame(payload_flip, &decoded));
 }
 
+#ifndef NDEBUG
 TEST(PreservedTrxTransfer, ProtocolV2OpenEpochRoundTripsRetentionAndNonce) {
   Preserve_trx_transfer_frame open;
   open.type = Preserve_trx_transfer_frame_type::OPEN_EPOCH;
@@ -15232,6 +15237,7 @@ TEST(PreservedTrxTransfer, ProtocolV2OpenEpochRoundTripsRetentionAndNonce) {
   EXPECT_EQ(ack.accepted_terminal_status_retention_us,
             decoded_ack.accepted_terminal_status_retention_us);
 }
+#endif
 
 TEST(PreservedTrxTransfer, ProtocolV2ReceiverBindsPrincipalAndProcessNonce) {
   Preserve_trx_transfer_receiver_registry registry;
@@ -16194,6 +16200,7 @@ TEST(PreservedTrxTransfer,
 }
 
 #ifndef DBUG_OFF
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferControlOnlyResourceExhaustedDoesNotPoisonExactRetry) {
   Transfer_codec_context_guard codec_guard;
@@ -16256,6 +16263,7 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_FALSE(registry.consume_session_only_token(
       session_only_token, handoff.epoch_id, handoff.generation));
 }
+#endif
 #endif
 
 TEST_F(PreserveSnapshotTest,
@@ -16360,6 +16368,7 @@ TEST_F(PreserveSnapshotTest,
             terminal.outcome);
 }
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        ReceiverCommitAdmissionFreezesAuthenticatedTombstoneAtCas) {
   Transfer_codec_context_guard codec_guard;
@@ -16432,6 +16441,7 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_EQ(1U,
             registry.retire_acknowledged_epochs_once(terminal.retire_after_us));
 }
+#endif
 
 TEST_F(PreserveSnapshotTest,
        ReceiverCommitAdmissionRejectsPublishedFactDigestMismatch) {
@@ -18475,6 +18485,7 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_FALSE(projection_exists);
 }
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferReceiverOnlineReadySkipsProjectionAndSingleEpochBind) {
   Transfer_codec_context_guard codec_guard;
@@ -18547,6 +18558,7 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_EQ(projection_marker_before,
             preserve_trx_transfer_receiver_projection_marker_write_us_status());
 }
+#endif
 
 TEST_F(PreserveSnapshotTest, TransferReceiverDoesNotWriteRawFrameSpool) {
   Transfer_codec_context_guard codec_guard;
@@ -18759,6 +18771,7 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_EQ(0U, registry.cleanup_debt_count_for_unit_test());
 }
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferReceiverFinalAckBoundsSequenceHistory) {
   Transfer_codec_context_guard codec_guard;
@@ -18810,6 +18823,7 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_FALSE(registry.frame_sequence_applied(manifest.epoch_id, 1));
   EXPECT_EQ(0U, registry.size());
 }
+#endif
 
 TEST_F(PreserveSnapshotTest,
        TransferReceiverRestartDoesNotRebuildProcessLocalAdmission) {
@@ -19616,6 +19630,7 @@ TEST_F(PreserveSnapshotTest, TransferReceiverCorruptFrameRemovesStagedTokenFiles
   EXPECT_FALSE(token_state.standby_pending);
 }
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferReceiverHandlePayloadDecodesAndAppliesFrames) {
   Transfer_codec_context_guard codec_guard;
@@ -19711,6 +19726,7 @@ TEST_F(PreserveSnapshotTest,
                 m_dir, "not-a-transfer-frame", &store, &registry, 300,
                 nullptr));
 }
+#endif
 
 #ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
@@ -22182,6 +22198,7 @@ TEST_F(PreserveSnapshotTest, TransferReceiverBatchTreatsCommitAsBarrier) {
                 &probe));
 }
 
+#ifndef NDEBUG
 class Transfer_receiver_payload_test_sink final
     : public Preserve_trx_transfer_encoded_frame_sink {
  public:
@@ -22211,6 +22228,7 @@ class Transfer_receiver_payload_test_sink final
   Preserve_snapshot_metadata *m_written_metadata{nullptr};
   size_t m_frame_count{0};
 };
+#endif
 
 struct Phase1_transfer_batch_probe {
   std::mutex mutex;
@@ -22536,6 +22554,7 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_TRUE(probe.batches.empty());
 }
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferSourceEpochSessionBatchesPhase1ControlAndBlobFrames) {
   preserve_trx_transfer_reset_source_phase1_metrics();
@@ -22640,7 +22659,9 @@ TEST_F(PreserveSnapshotTest,
   }
   preserve_trx_transfer_shutdown_receiver_prewarm_workers();
 }
+#endif
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferPhase1ManifestBatchSkipsDeclaredTokenWithoutObjects) {
   Transfer_codec_context_guard codec_guard;
@@ -22681,6 +22702,7 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_EQ(Preserve_trx_transfer_receiver_state::ABORTED, aborted.state);
   preserve_trx_transfer_shutdown_receiver_prewarm_workers();
 }
+#endif
 
 TEST_F(PreserveSnapshotTest,
        TransferSourceEpochSessionSnapshotsPhase1BatchLimits) {
@@ -22785,6 +22807,7 @@ TEST(PreservedTrxTransfer, TransferLegacyEpochHelperAdvancesOnlyAfterAck) {
   EXPECT_EQ(7U, next_sequence);
 }
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest, TransferFrameAckBindsAcceptedPayloadDigest) {
   Transfer_codec_context_guard codec_guard;
   Preserve_trx_transfer_frame frame;
@@ -22820,7 +22843,9 @@ TEST_F(PreserveSnapshotTest, TransferFrameAckBindsAcceptedPayloadDigest) {
                 encoded_ack, "00112233445566778899aabbccddeeff",
                 encoded_frame, &verified));
 }
+#endif
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest, TransferFrameAckAcceptsFrameBatchPayload) {
   Transfer_codec_context_guard codec_guard;
   const std::string nonce = "00112233445566778899aabbccddeeff";
@@ -22856,7 +22881,9 @@ TEST_F(PreserveSnapshotTest, TransferFrameAckAcceptsFrameBatchPayload) {
                                                    encoded_batch, &verified));
   EXPECT_EQ(2U, verified.sequence);
 }
+#endif
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest, TransferFrameAckPreservesCommittedOutcome) {
   Transfer_codec_context_guard codec_guard;
   Preserve_trx_transfer_frame frame;
@@ -22885,7 +22912,9 @@ TEST_F(PreserveSnapshotTest, TransferFrameAckPreservesCommittedOutcome) {
   EXPECT_EQ(Preserve_trx_transfer_status::COMMITTED_NOT_READY,
             verified.status);
 }
+#endif
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest, TransferFrameAckPreservesCleanAbandonOutcome) {
   Transfer_codec_context_guard codec_guard;
   const std::string nonce = "00112233445566778899aabbccddeeff";
@@ -22917,6 +22946,7 @@ TEST_F(PreserveSnapshotTest, TransferFrameAckPreservesCleanAbandonOutcome) {
   EXPECT_EQ(Preserve_trx_transfer_status::NOT_COMMITTED_CLEAN,
             verified.status);
 }
+#endif
 
 TEST(PreservedTrxTransfer, TransferEpochIdUsesBootNonceAndMonotonicIdentity) {
   const std::string boot_nonce =
@@ -23204,6 +23234,7 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_TRUE(registry.lookup(epoch_id, manifest.token, &record));
 }
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        ReceiverCommitApplyMissingTokenCannotLeaveAdmissionPending) {
   Transfer_codec_context_guard codec_guard;
@@ -23246,7 +23277,9 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_EQ(Preserve_trx_transfer_receiver_state::CORRUPT,
             sibling_record.state);
 }
+#endif
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        ReceiverPrecommitApplyFailureConvergesAdmittedCommit) {
   Transfer_codec_context_guard codec_guard;
@@ -23300,7 +23333,9 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_EQ(Preserve_trx_transfer_receiver_state::CORRUPT,
             sibling_record.state);
 }
+#endif
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferReceiverBatchRejectsMutatingFrameAfterCommit) {
   Transfer_codec_context_guard codec_guard;
@@ -23347,6 +23382,7 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_EQ(Preserve_trx_transfer_epoch_terminal_outcome::CORRUPT,
             registry.query_epoch_terminal(m_dir, epoch_id));
 }
+#endif
 
 TEST(PreservedTrxTransfer,
      TransferReceiverSequenceGateWaitsForEarlierConcurrentPayload) {
@@ -23555,6 +23591,7 @@ TEST_F(PreserveSnapshotTest,
 }
 #endif
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferOnlineHandlerHoldsPayloadLeaseThroughApplyCallback) {
   Transfer_codec_context_guard codec_guard;
@@ -23586,6 +23623,7 @@ TEST_F(PreserveSnapshotTest,
   preserve_trx_resource_manager_set_limits_for_unit_test(
       Preserve_trx_resource_limits{});
 }
+#endif
 
 #ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
@@ -23634,6 +23672,7 @@ TEST_F(PreserveSnapshotTest,
 }
 #endif
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferOnlinePayloadRequiresReceiverNonceAndOrdering) {
   Transfer_codec_context_guard codec_guard;
@@ -23689,6 +23728,7 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_EQ(qualified, epoch);
   EXPECT_EQ(1U, sequence);
 }
+#endif
 
 TEST_F(PreserveSnapshotTest, TransferSourceEpochRejectsChunkAboveCodecLimit) {
   Transfer_codec_context_guard codec_guard;
@@ -23789,6 +23829,7 @@ TEST_F(PreserveSnapshotTest,
   preserve_trx_transfer_shutdown_receiver_prewarm_workers();
 }
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferReceiverAckLossRetriesFrameAndAbortIdempotently) {
   Transfer_codec_context_guard codec_guard;
@@ -23852,6 +23893,7 @@ TEST_F(PreserveSnapshotTest,
   ASSERT_TRUE(registry.lookup(epoch_id, 815, &record));
   EXPECT_EQ(Preserve_trx_transfer_receiver_state::ABORTED, record.state);
 }
+#endif
 
 TEST_F(PreserveSnapshotTest,
        TransferSourceEpochSessionSplitsControlFramesAtSnapshotBatchBytes) {
@@ -24157,6 +24199,7 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_EQ(abort_sequence, abort.sequence);
 }
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest, TransferSourceSendsBundleThroughFrameSink) {
   Transfer_codec_context_guard codec_guard;
   const uint64_t transfer_token = 401;
@@ -24197,6 +24240,7 @@ TEST_F(PreserveSnapshotTest, TransferSourceSendsBundleThroughFrameSink) {
   EXPECT_EQ(Preserve_trx_transfer_status::COMMITTED_NOT_READY,
             registry.query_accepted_epoch(m_dir, manifest.epoch_id));
 }
+#endif
 
 TEST_F(PreserveSnapshotTest,
        TransferSourceBundleFramesDeclareTokenBeforeManifestFrame) {
@@ -24233,6 +24277,7 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_EQ(manifest.token, second_frame.token);
 }
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferReceiverPayloadBatchPublishesEpochWithWorkers) {
   Transfer_codec_context_guard codec_guard;
@@ -24315,6 +24360,7 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_EQ(admitted_bytes_before + expected_admitted_bytes,
             preserve_trx_transfer_receiver_admitted_bytes_status());
 }
+#endif
 
 #ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
@@ -24527,6 +24573,7 @@ TEST_F(PreserveSnapshotTest,
             first_payload_frame.type);
 }
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferSourceStreamingLifecyclePredeclaresTokensBeforeObjects) {
   Transfer_codec_context_guard codec_guard;
@@ -24618,7 +24665,9 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_EQ(Preserve_trx_transfer_status::COMMITTED_NOT_READY,
             registry.query_accepted_epoch(m_dir, first_manifest.epoch_id));
 }
+#endif
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferSourceEpochSessionSendsExternallyBuiltObjects) {
   Transfer_codec_context_guard codec_guard;
@@ -24696,6 +24745,7 @@ TEST_F(PreserveSnapshotTest,
             registry.query_accepted_epoch(m_dir, manifest.epoch_id));
   EXPECT_FALSE(preserve_trx_transfer_epoch_committed(m_dir, manifest));
 }
+#endif
 
 TEST_F(PreserveSnapshotTest,
        TransferSourceEpochSessionTreatsCommittedOutcomeAsTerminal) {
@@ -25309,6 +25359,7 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_GE(sink.max_active(), 2U);
 }
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferParallelFinalPayloadsSurviveOutOfOrderReceiverSessions) {
   Transfer_codec_context_guard codec_guard;
@@ -25390,7 +25441,9 @@ TEST_F(PreserveSnapshotTest,
       << " summary_corrupt=" << summary.corrupt_tokens.size();
   EXPECT_EQ(3U, summary.ready_tokens.size());
 }
+#endif
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferSourceEpochSessionStreamsObjectChunksBeforeFinalize) {
   Transfer_codec_context_guard codec_guard;
@@ -25495,6 +25548,7 @@ TEST_F(PreserveSnapshotTest,
             registry.query_accepted_epoch(m_dir, manifest.epoch_id));
   EXPECT_FALSE(preserve_trx_transfer_epoch_committed(m_dir, manifest));
 }
+#endif
 
 #ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
@@ -25704,6 +25758,7 @@ TEST_F(PreserveSnapshotTest,
 }
 #endif
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferReceiverPhase1PrewarmManifestMovesDeclaredTokenToReceiving) {
   Transfer_codec_context_guard codec_guard;
@@ -25776,6 +25831,7 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_EQ(local_redo_before,
             preserve_trx_transfer_receiver_strict_target_local_redo_bytes_status());
 }
+#endif
 
 #ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
@@ -25850,6 +25906,7 @@ TEST_F(PreserveSnapshotTest, TransferReceiverPrewarmYieldsByWorkBatch) {
 }
 #endif
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferReceiverStagedTokenPrewarmHasPriorityOverObjectBacklog) {
   Transfer_codec_context_guard codec_guard;
@@ -25962,6 +26019,7 @@ TEST_F(PreserveSnapshotTest,
                 record_object_prewarm_before,
             4U);
 }
+#endif
 
 #ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
@@ -26150,6 +26208,7 @@ TEST_F(PreserveSnapshotTest,
             miss_count_before + 1);
 }
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferReceiverCommitEpochDoesNotLaunchColdPrewarmFallback) {
   Transfer_codec_context_guard codec_guard;
@@ -26191,6 +26250,7 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_EQ(fallback_count_before,
             preserve_trx_transfer_receiver_committed_epoch_fallback_count_status());
 }
+#endif
 
 TEST_F(PreserveSnapshotTest,
        TransferReceiverCommitEpochDoesNotListArtifactsPerToken) {
@@ -26304,6 +26364,7 @@ TEST_F(PreserveSnapshotTest,
                 manifest));
 }
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest, TransferSourceCanDeclareTokenBeforeManifest) {
   Transfer_codec_context_guard codec_guard;
 
@@ -26359,7 +26420,9 @@ TEST_F(PreserveSnapshotTest, TransferSourceCanDeclareTokenBeforeManifest) {
 
   ASSERT_TRUE(wait_for_epoch_ready_token(manifest.epoch_id, manifest.token));
 }
+#endif
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferSourceEpochSessionAbortsRemovedTargetsBeforeCommit) {
   Transfer_codec_context_guard codec_guard;
@@ -26417,7 +26480,9 @@ TEST_F(PreserveSnapshotTest,
             registry.query_accepted_epoch(m_dir, manifest.epoch_id));
   EXPECT_FALSE(preserve_trx_transfer_epoch_committed(m_dir, manifest));
 }
+#endif
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferSourceEpochSessionBatchesFinalMetadataUntilCommit) {
   Transfer_codec_context_guard codec_guard;
@@ -26508,7 +26573,9 @@ TEST_F(PreserveSnapshotTest,
   ASSERT_TRUE(wait_for_epoch_ready_token("epoch-source-session-batch-final",
                                          913));
 }
+#endif
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferReceiverBatchSignalsAfterAdmissionBeforeSemanticApply) {
   Transfer_codec_context_guard codec_guard;
@@ -26559,7 +26626,9 @@ TEST_F(PreserveSnapshotTest,
   ASSERT_TRUE(wait_for_epoch_ready_token("epoch-source-session-spool-signal",
                                          914));
 }
+#endif
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferReceiverCommitSignalsAfterProcessLocalAcceptBeforeReadyBinding) {
   Transfer_codec_context_guard codec_guard;
@@ -26599,7 +26668,9 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_FALSE(probe.saw_commit_marker);
   EXPECT_TRUE(probe.saw_current_process_accepted);
 }
+#endif
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferReceiverExactCommitRetryResendsAcceptedAck) {
   Transfer_codec_context_guard codec_guard;
@@ -26681,7 +26752,9 @@ TEST_F(PreserveSnapshotTest,
                 m_dir, "epoch-source-session-commit-ack-retry", &accepted));
   EXPECT_EQ(Preserve_trx_transfer_epoch_lifecycle::READY, accepted.lifecycle);
 }
+#endif
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferReceiverCommitWaitsForPriorSavedPayloadSemanticApply) {
   Transfer_receiver_config_guard receiver_config;
@@ -26746,7 +26819,9 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_EQ(static_cast<int>(Preserve_trx_transfer_status::CORRUPT),
             commit_status.load());
 }
+#endif
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferReceiverAbandonWaitsForInFlightPayloadSemanticApply) {
   Transfer_receiver_config_guard receiver_config;
@@ -26819,7 +26894,9 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_TRUE(registry.lookup(epoch_id, existing.token, &record));
   EXPECT_TRUE(registry.lookup(epoch_id, declare.token, &record));
 }
+#endif
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferReceiverSameTokenPayloadWaitsForEarlierSemanticApply) {
   Transfer_codec_context_guard codec_guard;
@@ -26928,7 +27005,9 @@ TEST_F(PreserveSnapshotTest,
   ASSERT_TRUE(registry.lookup(manifest.epoch_id, token, &record));
   EXPECT_EQ(1U, record.sealed_objects.count(chunk.object_id));
 }
+#endif
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferReceiverDifferentTokenPayloadDoesNotWaitForSemanticApply) {
   Transfer_receiver_config_guard receiver_config;
@@ -26996,7 +27075,9 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_EQ(static_cast<int>(Preserve_trx_transfer_status::OK),
             first_status.load());
 }
+#endif
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferReceiverPayloadRetryReusesSameTokenApplyReservation) {
   Transfer_receiver_config_guard receiver_config;
@@ -27059,6 +27140,7 @@ TEST_F(PreserveSnapshotTest,
   ASSERT_TRUE(registry.lookup(epoch_id, token, &record));
   EXPECT_EQ(Preserve_trx_transfer_receiver_state::ABORTED, record.state);
 }
+#endif
 
 TEST_F(PreserveSnapshotTest,
        TransferReceiverSealDoesNotPublishProjectionBeforeCommitEpoch) {
@@ -27152,6 +27234,7 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_FALSE(state.standby_pending);
 }
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferSessionArtifactSinkDoesNotPublishProjectionBeforeCommitEpoch) {
   Transfer_codec_context_guard codec_guard;
@@ -27202,6 +27285,7 @@ TEST_F(PreserveSnapshotTest,
             registry.query_accepted_epoch(
                 m_dir, "epoch-session-sink-prepublish"));
 }
+#endif
 
 TEST_F(PreserveSnapshotTest,
        TransferSessionArtifactSinkBatchesFinalTokenMetadataFrames) {
@@ -27441,6 +27525,7 @@ TEST_F(PreserveSnapshotTest,
   }
 }
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferSourceEpochSessionAbortEpochCleansFinalizedAndDeclaredTokens) {
   Transfer_codec_context_guard codec_guard;
@@ -27486,6 +27571,7 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_EQ(Preserve_trx_transfer_receiver_state::ABORTED, second_record.state);
   EXPECT_EQ("source_batch_failed", second_record.last_error);
 }
+#endif
 
 TEST_F(PreserveSnapshotTest, TransferReceiverAbortCanCancelDeclaredToken) {
   Transfer_receiver_config_guard receiver_config;
@@ -27890,6 +27976,7 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_EQ(1, client_state.disconnect_count.load());
 }
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest, TransferArtifactSinkPublishesThroughFrameSink) {
   Transfer_codec_context_guard codec_guard;
   const uint64_t transfer_token = 601;
@@ -27926,7 +28013,9 @@ TEST_F(PreserveSnapshotTest, TransferArtifactSinkPublishesThroughFrameSink) {
 
   ASSERT_TRUE(wait_for_epoch_ready_token("epoch-artifact", transfer_token));
 }
+#endif
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferSessionArtifactSinkDefersEpochCommitToSourceSession) {
   Transfer_codec_context_guard codec_guard;
@@ -27989,7 +28078,9 @@ TEST_F(PreserveSnapshotTest,
                                          transfer_token));
   EXPECT_TRUE(receiver_metadata.token.empty());
 }
+#endif
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferSessionArtifactSinkSkipsPhase2BulkForPresealedObjects) {
   Transfer_codec_context_guard codec_guard;
@@ -28076,6 +28167,7 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_EQ(bulk_bytes_before,
             preserve_trx_transfer_phase2_bulk_bytes_status());
 }
+#endif
 
 TEST_F(PreserveSnapshotTest,
        TransferSessionArtifactSinkUsesPresealedPrebuiltRecordLocksBlob) {
@@ -28141,6 +28233,7 @@ TEST_F(PreserveSnapshotTest,
             preserve_trx_transfer_phase2_bulk_bytes_status());
 }
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferSessionArtifactSinkReplacesStalePresealedRecordLocksBlob) {
   Transfer_codec_context_guard codec_guard;
@@ -28211,7 +28304,9 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_FALSE(state.snapshot);
   EXPECT_FALSE(state.standby_pending);
 }
+#endif
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferSourceAndReceiverReplaceDeclaredRecordLocksBlobForCatchup) {
   Transfer_codec_context_guard codec_guard;
@@ -28274,6 +28369,7 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_EQ(final_descriptor.digest, record.objects[0].digest);
   EXPECT_TRUE(registry.all_objects_sealed(record.epoch_id, record.token));
 }
+#endif
 
 TEST_F(PreserveSnapshotTest,
        TransferSessionArtifactSinkRejectsUnsealedPrebuiltRecordLocksBlob) {
@@ -28380,6 +28476,7 @@ TEST_F(PreserveSnapshotTest,
             preserve_trx_transfer_phase2_bulk_bytes_status());
 }
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferReceiverCommitEpochUsesPresealedPrebuiltRecordLocksBlob) {
   Transfer_codec_context_guard codec_guard;
@@ -28486,7 +28583,9 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_EQ(local_redo_before,
             preserve_trx_transfer_receiver_strict_target_local_redo_bytes_status());
 }
+#endif
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferReceiverCommitEpochUsesPresealedRecordLocksAndBinlogBlob) {
   Transfer_codec_context_guard codec_guard;
@@ -28569,6 +28668,7 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_FALSE(state.snapshot);
   EXPECT_FALSE(state.standby_pending);
 }
+#endif
 
 #ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
@@ -29209,6 +29309,7 @@ TEST_F(PreserveSnapshotTest, ArtifactSinkFactoryRejectsStandbyWithoutFrameSink) 
   EXPECT_EQ(nullptr, sink.get());
 }
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest, ArtifactSinkFactoryUsesSourceEpochSession) {
   Transfer_codec_context_guard codec_guard;
   const uint64_t transfer_token = 702;
@@ -29251,6 +29352,7 @@ TEST_F(PreserveSnapshotTest, ArtifactSinkFactoryUsesSourceEpochSession) {
   ASSERT_TRUE(wait_for_epoch_ready_token("epoch-factory-session",
                                          transfer_token));
 }
+#endif
 
 TEST_F(PreserveSnapshotTest,
        DeferredTransferArtifactSinkCapturesWithoutPublishingFrames) {
@@ -29934,6 +30036,7 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_GT(frame_sink.frames().size(), first_stage_frame_count);
 }
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferSessionArtifactSinkQueuesFinalMetadataUntilCommit) {
   Transfer_codec_context_guard codec_guard;
@@ -29991,6 +30094,7 @@ TEST_F(PreserveSnapshotTest,
   ASSERT_TRUE(wait_for_epoch_ready_token("epoch-factory-session-queued",
                                          transfer_token));
 }
+#endif
 
 TEST_F(PreserveSnapshotTest,
        TransferSessionArtifactSinkPublishesAfterPhase1PrewarmManifest) {

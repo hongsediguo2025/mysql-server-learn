@@ -67,11 +67,24 @@ UPDATE t_receiver_partial_selection SET v=31 WHERE id=3;
 DRAIN TRANSACTIONS PRESERVE;
 
 --connection receiver_partial_ha
-SET GLOBAL debug='-d,preserve_trx_receiver_fail_one_token_prewarm';
+# DRAIN may return before receiver workers reach the one-token fault.
 --let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_tokens')=3
 --source include/wait_condition.inc
+SET GLOBAL debug='-d,preserve_trx_receiver_fail_one_token_prewarm';
 --let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_worker_active')=0 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_queued_bytes')=0
+--let $show_rpl_debug_info= 0
 --source include/wait_condition.inc
+--let $show_rpl_debug_info= 1
+if (!$success)
+{
+  SHOW GLOBAL STATUS WHERE Variable_name IN (
+    'Preserve_trx_transfer_receiver_worker_active',
+    'Preserve_trx_transfer_receiver_queued_bytes',
+    'Preserve_trx_transfer_receiver_auto_prewarm_tokens',
+    'Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens',
+    'Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens');
+  --die Receiver worker or queue did not quiesce
+}
 
 SELECT VARIABLE_VALUE=3 AS three_classified_tokens
   FROM performance_schema.global_status

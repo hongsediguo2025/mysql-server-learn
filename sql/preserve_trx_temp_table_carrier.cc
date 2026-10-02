@@ -21,7 +21,9 @@
    along with this program; if not, write to the Free Software
    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
 
+#include "sql/preserve_trx_temp_metrics.h"
 #include "sql/preserve_trx_temp_table_carrier.h"
+#include "sql/preserve_trx_temp_delta.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -45,13 +47,17 @@
 #include "my_io.h"
 #include "my_sys.h"
 #include "my_thread_local.h"
+#include "scope_guard.h"
 #include "sha2.h"
 #include "sql/preserve_trx.h"
+#include "sql/preserve_trx_resource.h"
 #include "sql/preserve_trx_xid.h"
 
 namespace {
 
-constexpr uint32_t kTempTableManifestVersion = 7;
+constexpr uint32_t kTempTableManifestVersion = 12;
+constexpr uint32_t kTempTableManifestVirtualVersion = 9;
+constexpr uint32_t kTempTableManifestOwnershipVersion = 7;
 constexpr uint32_t kTempTableManifestMinSupportedVersion = 6;
 constexpr uint32_t kTempTableManifestLegacyVersion = 6;
 constexpr uint32_t kTempTableImageFormatVersion = 1;
@@ -154,9 +160,15 @@ bool fsync_directory(const std::string &dir) {
   (void)dir;
   return false;
 #else
-  File fd = my_open(normalize_dir(dir).c_str(), O_RDONLY | O_NOFOLLOW, MYF(0));
+  File fd = my_open(dir.c_str(), O_RDONLY | O_NOFOLLOW, MYF(0));
   if (fd < 0) return true;
-  bool error = my_sync(fd, MYF(0)) != 0;
+  bool error = false;
+  DBUG_EXECUTE_IF("preserve_temp_image_cleanup_dir_sync_failure", {
+    DBUG_PRINT("preserve_temp_import",
+               ("temporary image cleanup directory sync fault"));
+    error = true;
+  });
+  if (!error) error = my_sync(fd, MYF(0)) != 0;
   if (my_close(fd, MYF(0))) error = true;
   return error;
 #endif
@@ -171,14 +183,20 @@ Preserved_trx_carrier_status fsync_directory_after_install(
 }
 
 bool write_all(File file, const unsigned char *bytes, size_t size) {
-  return size == 0 || my_write(file, bytes, size, MYF(0)) == size;
+  if (!size) return true;
+  const auto written = my_write(file, bytes, size, MYF(0));
+  if (written != MY_FILE_ERROR) preserve_trx_temp_final_write(written);
+  return written == size;
 }
 
 Preserved_trx_carrier_status install_temp_file(const std::string &tmp_path,
-                                               const std::string &final_path) {
+                                               const std::string &final_path,
+                                               bool *source_removed = nullptr) {
+  if (source_removed != nullptr) *source_removed = false;
 #ifdef _WIN32
   if (MoveFileEx(tmp_path.c_str(), final_path.c_str(),
                  MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH)) {
+    if (source_removed != nullptr) *source_removed = true;
     return Preserved_trx_carrier_status::OK;
   }
   my_osmaperr(GetLastError());
@@ -191,7 +209,14 @@ Preserved_trx_carrier_status install_temp_file(const std::string &tmp_path,
       stale warm/tmp path as cleanup work instead of failing after publishing
       an otherwise untracked durable sidecar.
     */
-    (void)my_delete(tmp_path.c_str(), MYF(0));
+    bool skip_unlink = false;
+    DBUG_EXECUTE_IF("preserve_temp_image_writer_unlink_failure", {
+      skip_unlink = source_removed != nullptr;
+    });
+    const bool removed = !skip_unlink &&
+                         (my_delete(tmp_path.c_str(), MYF(0)) == 0 ||
+                          my_errno() == ENOENT);
+    if (source_removed != nullptr) *source_removed = removed;
     return Preserved_trx_carrier_status::OK;
   }
   set_my_errno(errno);
@@ -340,6 +365,7 @@ bool read_file(const std::string &path, std::string *out) {
     const size_t read_len =
         my_read(file, reinterpret_cast<uchar *>(&(*out)[0]), out->size(),
                 MYF(0));
+    if (read_len != MY_FILE_ERROR) preserve_trx_temp_final_read(read_len);
     error = read_len != out->size();
   }
   if (my_close(file, MYF(0))) error = true;
@@ -380,6 +406,7 @@ Preserved_trx_carrier_status validate_file_digest(
         std::min<uint64_t>(remaining, buffer.size()));
     const size_t read_len = my_read(
         file, reinterpret_cast<uchar *>(&buffer[0]), chunk, MYF(0));
+    if (read_len != MY_FILE_ERROR) preserve_trx_temp_final_read(read_len);
     if (read_len != chunk ||
         EVP_DigestUpdate(ctx, buffer.data(), read_len) != 1) {
       error = true;
@@ -407,63 +434,6 @@ std::array<unsigned char, 32> sha256_digest(const std::string &payload) {
   SHA_EVP256(reinterpret_cast<const unsigned char *>(payload.data()),
              payload.length(), digest.data());
   return digest;
-}
-
-Preserved_trx_carrier_status file_size_and_digest(
-    const std::string &path, Preserved_temp_table_image_writer_result *result) {
-  if (result == nullptr) return Preserved_trx_carrier_status::CORRUPT;
-  MY_STAT stat_area;
-  const Preserved_trx_carrier_status stat_status =
-      stat_regular_sidecar(path, &stat_area);
-  if (stat_status != Preserved_trx_carrier_status::OK) return stat_status;
-  if (stat_area.st_size <= 0 ||
-      temp_sidecar_expected_size_exceeds_read_limit(
-          static_cast<uint64_t>(stat_area.st_size))) {
-    return Preserved_trx_carrier_status::CORRUPT;
-  }
-
-  File file;
-  Preserved_trx_carrier_status open_status =
-      open_regular_sidecar_for_read(path, stat_area, &file);
-  if (open_status != Preserved_trx_carrier_status::OK) return open_status;
-
-  EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-  if (ctx == nullptr || EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr) != 1) {
-    if (ctx != nullptr) EVP_MD_CTX_free(ctx);
-    (void)my_close(file, MYF(0));
-    return Preserved_trx_carrier_status::IO_ERROR;
-  }
-
-  std::string buffer(kSidecarDigestBufferBytes, '\0');
-  uint64_t remaining = static_cast<uint64_t>(stat_area.st_size);
-  bool error = false;
-  while (remaining > 0) {
-    const size_t chunk = static_cast<size_t>(
-        std::min<uint64_t>(remaining, buffer.size()));
-    const size_t read_len = my_read(
-        file, reinterpret_cast<uchar *>(&buffer[0]), chunk, MYF(0));
-    if (read_len != chunk ||
-        EVP_DigestUpdate(ctx, buffer.data(), read_len) != 1) {
-      error = true;
-      break;
-    }
-    remaining -= read_len;
-  }
-
-  Preserved_temp_table_image_writer_result local_result;
-  unsigned int digest_len = 0;
-  if (!error &&
-      (EVP_DigestFinal_ex(ctx, local_result.sha256.data(), &digest_len) != 1 ||
-       digest_len != local_result.sha256.size())) {
-    error = true;
-  }
-  EVP_MD_CTX_free(ctx);
-  if (my_close(file, MYF(0))) error = true;
-  if (error) return Preserved_trx_carrier_status::IO_ERROR;
-
-  local_result.size = static_cast<uint64_t>(stat_area.st_size);
-  *result = local_result;
-  return Preserved_trx_carrier_status::OK;
 }
 
 bool digest_is_zero(const std::array<unsigned char, 32> &digest) {
@@ -497,8 +467,9 @@ bool descriptor_is_valid(
     }
     if (!index_ids.insert(index.image_index_id).second) return false;
     if (!index_names.insert(index.name).second) return false;
-    if (index.name == "PRIMARY" &&
-        index.root_page_no == descriptor.clustered_root_page_no) {
+    // The clustered index may be a promoted UNIQUE key. Its native role is
+    // checked against the DD and dictionary binding, not its SQL name.
+    if (index.root_page_no == descriptor.clustered_root_page_no) {
       has_clustered = true;
     }
   }
@@ -516,7 +487,8 @@ bool dict_binding_is_valid(
       binding.table_name != entry.table_name || binding.columns.empty() ||
       binding.columns.size() > kMaxTempTableManifestColumns ||
       binding.indexes.empty() ||
-      binding.indexes.size() > kMaxTempTableManifestIndexes) {
+      binding.indexes.size() > kMaxTempTableManifestIndexes ||
+      !binding.virtual_columns_valid()) {
     return false;
   }
 
@@ -540,7 +512,8 @@ bool dict_binding_is_valid(
   bool has_clustered = false;
   for (const trx_preserve_temp_dict_index_binding &index : binding.indexes) {
     if (index.image_index_id == 0 || index.root_page_no == 0 ||
-        index.name.empty() || index.fields.empty() ||
+        index.name.empty() ||
+        (index.fields.empty() && !index.is_generated_cluster()) ||
         index.n_unique_fields > index.fields.size() ||
         (index.unique && index.n_unique_fields == 0) ||
         (!index.unique && index.n_unique_fields != 0) ||
@@ -580,7 +553,8 @@ bool undo_descriptor_is_valid(
   if (descriptor.source_space_id == 0 ||
       !sidecar_blob_name_is_valid(descriptor.blob_name,
                                   descriptor.source_space_id, ".undo") ||
-      descriptor.size == 0 || digest_is_zero(descriptor.sha256)) {
+      descriptor.size == 0 || digest_is_zero(descriptor.sha256) ||
+      !preserve_trx_temp_undo_delta_refs_valid(descriptor)) {
     return false;
   }
 
@@ -653,7 +627,7 @@ bool read_string(std::string_view payload, size_t *offset, std::string *value) {
 }
 
 bool encode_descriptor(const Preserved_temp_table_image_descriptor &descriptor,
-                       std::string *payload) {
+                       uint32_t version, std::string *payload) {
   if (!descriptor_is_valid(descriptor)) return false;
   store_le32(payload, descriptor.table_ordinal);
   store_le32(payload, descriptor.source_space_id);
@@ -678,12 +652,19 @@ bool encode_descriptor(const Preserved_temp_table_image_descriptor &descriptor,
     store_le32(payload, index.space_flags);
     if (!store_string(payload, index.name)) return false;
   }
-  return true;
+  if (version >= 12) {
+    for (const auto *file : {&descriptor.base, &descriptor.delta}) {
+      if (!store_string(payload, file->name)) return false;
+      store_le64(payload, file->size);
+      payload->append(reinterpret_cast<const char *>(file->digest.data()), 32);
+    }
+  }
+  return preserve_trx_temp_image_delta_refs_valid(descriptor);
 }
 
 bool encode_undo_descriptor(
     const Preserved_temp_table_undo_descriptor &descriptor,
-    std::string *payload) {
+    uint32_t version, std::string *payload) {
   if (!undo_descriptor_is_valid(descriptor)) return false;
   store_le32(payload, descriptor.source_space_id);
   if (!store_string(payload, descriptor.blob_name)) return false;
@@ -693,6 +674,14 @@ bool encode_undo_descriptor(
   store_le32(payload, descriptor.no_redo_undo_rseg_space_id);
   store_le32(payload, descriptor.no_redo_undo_rseg_page_no);
   store_le32(payload, descriptor.no_redo_undo_rseg_slot);
+  if (version >= 10) store_le32(payload, descriptor.page_size);
+  if (version >= 11) {
+    for (const auto *file : {&descriptor.base, &descriptor.delta}) {
+      if (!store_string(payload, file->name)) return false;
+      store_le64(payload, file->size);
+      payload->append(reinterpret_cast<const char *>(file->digest.data()), 32);
+    }
+  }
   return true;
 }
 
@@ -795,6 +784,16 @@ bool decode_descriptor(std::string_view payload, uint32_t manifest_version,
     }
     parsed.indexes.push_back(std::move(index));
   }
+  if (manifest_version >= 12) {
+    for (auto *file : {&parsed.base, &parsed.delta}) {
+      if (!read_string(payload, offset, &file->name) ||
+          !read_le64(payload, offset, &file->size) ||
+          payload.size() - *offset < file->digest.size()) return false;
+      std::copy_n(payload.begin() + *offset, file->digest.size(), file->digest.begin());
+      *offset += file->digest.size();
+    }
+  }
+  if (!preserve_trx_temp_image_delta_refs_valid(parsed)) return false;
   if (!descriptor_is_valid(parsed)) return false;
   *descriptor = std::move(parsed);
   return true;
@@ -802,7 +801,7 @@ bool decode_descriptor(std::string_view payload, uint32_t manifest_version,
 
 bool encode_dict_binding(
     const trx_preserve_temp_dict_table_binding &binding,
-    std::string *payload) {
+    uint32_t version, std::string *payload) {
   store_le32(payload, binding.source_space_id);
   store_le64(payload, binding.image_table_id);
   store_le32(payload, binding.clustered_root_page_no);
@@ -824,6 +823,12 @@ bool encode_dict_binding(
     store_le32(payload, column.prtype);
     store_le32(payload, column.len);
     store_u8(payload, column.visible ? 1 : 0);
+    if (version >= 9) {
+      store_le32(payload, static_cast<uint32_t>(column.base_columns.size()));
+      for (uint32_t base : column.base_columns) store_le32(payload, base);
+    } else if (column.is_virtual() || !column.base_columns.empty()) {
+      return false;
+    }
   }
 
   if (binding.indexes.empty() ||
@@ -834,7 +839,8 @@ bool encode_dict_binding(
   for (const trx_preserve_temp_dict_index_binding &index :
        binding.indexes) {
     if (index.image_index_id == 0 || index.root_page_no == 0 ||
-        index.name.empty() || index.fields.empty() ||
+        index.name.empty() ||
+        (index.fields.empty() && !index.is_generated_cluster()) ||
         index.fields.size() > kMaxTempTableManifestIndexFields ||
         !store_string(payload, index.name)) {
       return false;
@@ -855,10 +861,11 @@ bool encode_dict_binding(
       store_u8(payload, field.ascending ? 1 : 0);
     }
   }
+  if (version >= 8) store_le64(payload, binding.autoinc_next);
   return true;
 }
 
-bool decode_dict_binding(std::string_view payload, size_t *offset,
+bool decode_dict_binding(std::string_view payload, uint32_t version, size_t *offset,
                          trx_preserve_temp_dict_table_binding *binding) {
   trx_preserve_temp_dict_table_binding parsed;
   uint32_t column_count = 0;
@@ -885,6 +892,19 @@ bool decode_dict_binding(std::string_view payload, size_t *offset,
       return false;
     }
     column.visible = visible != 0;
+    if (version >= 9) {
+      uint32_t bases = 0;
+      if (!read_le32(payload, offset, &bases) || bases > column_count ||
+          bases > (payload.size() - *offset) / 4) return false;
+      column.base_columns.reserve(bases);
+      for (uint32_t b = 0; b < bases; ++b) {
+        uint32_t base = 0;
+        if (!read_le32(payload, offset, &base)) return false;
+        column.base_columns.push_back(base);
+      }
+    } else if (column.is_virtual()) {
+      return false;
+    }
     parsed.columns.push_back(std::move(column));
   }
 
@@ -907,12 +927,13 @@ bool decode_dict_binding(std::string_view payload, size_t *offset,
         !read_le32(payload, offset, &index.n_unique_fields) ||
         !read_le32(payload, offset, &field_count) || index.name.empty() ||
         index.image_index_id == 0 || index.root_page_no == 0 ||
-        clustered > 1 || unique > 1 || field_count == 0 ||
+        clustered > 1 || unique > 1 ||
         field_count > kMaxTempTableManifestIndexFields) {
       return false;
     }
     index.clustered = clustered != 0;
     index.unique = unique != 0;
+    if (field_count == 0 && !index.is_generated_cluster()) return false;
     if (index.n_unique_fields > field_count ||
         (index.unique && index.n_unique_fields == 0) ||
         (!index.unique && index.n_unique_fields != 0)) {
@@ -935,6 +956,9 @@ bool decode_dict_binding(std::string_view payload, size_t *offset,
     parsed.indexes.push_back(std::move(index));
   }
 
+  if (version >= 8 && !read_le64(payload, offset, &parsed.autoinc_next))
+    return false;
+  if (!parsed.virtual_columns_valid()) return false;
   *binding = std::move(parsed);
   return true;
 }
@@ -958,6 +982,17 @@ bool decode_undo_descriptor(std::string_view payload, uint32_t manifest_version,
         !read_le32(payload, offset, &parsed.no_redo_undo_rseg_page_no) ||
         !read_le32(payload, offset, &parsed.no_redo_undo_rseg_slot)) {
       return false;
+    }
+  }
+  if (manifest_version >= 10 && !read_le32(payload, offset, &parsed.page_size))
+    return false;
+  if (manifest_version >= 11) {
+    for (auto *file : {&parsed.base, &parsed.delta}) {
+      if (!read_string(payload, offset, &file->name) ||
+          !read_le64(payload, offset, &file->size) || payload.size() - *offset < 32)
+        return false;
+      std::copy_n(payload.begin() + *offset, 32, file->digest.begin());
+      *offset += 32;
     }
   }
   if (!undo_descriptor_is_valid(parsed, manifest_version >= 4)) return false;
@@ -1003,6 +1038,9 @@ bool shared_physical_image_matches(
     const Preserved_temp_table_image_descriptor &rhs) {
   return lhs.blob_name == rhs.blob_name && lhs.size == rhs.size &&
          lhs.sha256 == rhs.sha256 &&
+         lhs.base.name == rhs.base.name && lhs.base.size == rhs.base.size &&
+         lhs.base.digest == rhs.base.digest && lhs.delta.name == rhs.delta.name &&
+         lhs.delta.size == rhs.delta.size && lhs.delta.digest == rhs.delta.digest &&
          lhs.sealed_temp_op_seq == rhs.sealed_temp_op_seq &&
          lhs.image_space_id == rhs.image_space_id &&
          lhs.image_format_version == rhs.image_format_version &&
@@ -1044,8 +1082,12 @@ bool manifest_undo_images_match_tables(
     if (!undo_descriptor_is_valid(undo, require_no_redo_undo_identity))
       return false;
     if (!undo_space_ids.insert(undo.source_space_id).second) return false;
-    if (table_space_ids.find(undo.source_space_id) == table_space_ids.end())
+    if (table_space_ids.find(undo.source_space_id) == table_space_ids.end() &&
+        !preserve_trx_temp_undo_is_independent(undo))
       return false;
+    const auto image = image_by_space_id.find(undo.source_space_id);
+    if (undo.page_size && image != image_by_space_id.end() &&
+        undo.page_size != image->second->page_size) return false;
     std::string undo_token;
     if (!sidecar_blob_name_token(undo.blob_name, undo.source_space_id, ".undo",
                                  &undo_token)) {
@@ -1056,15 +1098,17 @@ bool manifest_undo_images_match_tables(
         image_token->second != undo_token) {
       return false;
     }
+    if (preserve_trx_temp_undo_is_independent(undo) &&
+        !token_by_space_id.empty() &&
+        token_by_space_id.begin()->second != undo_token) return false;
   }
   /*
-    v1 reconnects no-redo undo at transaction scope: a resumed trx owns one
-    m_noredo rseg/insert/update tuple.  Multiple physical temp spaces may share
-    one image source space, but multiple undo-bearing source spaces would encode
-    a manifest that passes preserve and then fails on the second reconnect.
+    A resumed trx owns one m_noredo rseg/insert/update tuple across all its
+    temporary image spaces. The undo source_space_id selects a legacy DATA
+    carrier or the independent system temporary undo space itself.
+    Membership and token matching were checked above; a second copy is invalid.
   */
-  if (undo_space_ids.size() > 1) return false;
-  return undo_space_ids.empty() || undo_space_ids == table_space_ids;
+  return undo_space_ids.size() <= 1;
 }
 
 bool manifest_ownership_claims_match_undo_images(
@@ -1137,6 +1181,13 @@ Preserved_trx_carrier_status delete_file_if_exists(const std::string &path,
 Preserved_trx_carrier_status delete_file_and_tmp_if_exists(
     const std::string &path, bool *deleted) {
   if (deleted != nullptr) *deleted = false;
+  DBUG_EXECUTE_IF("preserve_temp_image_cleanup_oom", {
+    DBUG_PRINT("preserve_temp_import", ("temporary image cleanup allocation fault"));
+    throw std::bad_alloc();
+  });
+  // Finish allocations before deleting either name. Cleanup must not throw
+  // after unlink without reporting the directory change to its owner.
+  const std::string tmp_path = path + ".tmp";
 
   bool deleted_main = false;
   Preserved_trx_carrier_status status =
@@ -1144,7 +1195,7 @@ Preserved_trx_carrier_status delete_file_and_tmp_if_exists(
   if (status != Preserved_trx_carrier_status::OK) return status;
 
   bool deleted_tmp = false;
-  status = delete_file_if_exists(path + ".tmp", &deleted_tmp);
+  status = delete_file_if_exists(tmp_path, &deleted_tmp);
   if (status != Preserved_trx_carrier_status::OK) return status;
 
   if (deleted != nullptr) *deleted = deleted_main || deleted_tmp;
@@ -1301,32 +1352,55 @@ namespace {
 
 class Local_file_temp_table_image_writer final
     : public Preserved_temp_table_image_writer {
+  using Status = Preserved_trx_carrier_status;
  public:
-  Local_file_temp_table_image_writer(std::string dir, std::string warm_path)
+  Local_file_temp_table_image_writer(std::string dir, std::string warm_path,
+                                     std::string token, uint64_t append_bytes = 0)
       : m_dir(std::move(dir)),
         m_warm_path(std::move(warm_path)),
-        m_tmp_path(m_warm_path + ".tmp") {}
+        m_tmp_path(m_warm_path + ".tmp"), m_token(std::move(token)),
+        m_append_only(append_bytes != 0), m_append_bytes(append_bytes) {}
 
   ~Local_file_temp_table_image_writer() override {
-    if (!m_closed) (void)abort();
+    (void)close_digest();
+    if (m_close_status != Preserved_trx_carrier_status::OK) {
+      (void)abort();
+    } else {
+      // A successful close leaves the published image with the caller. A
+      // failed unlink after link() may still leave our staging name behind.
+      (void)remove_owned_file(m_tmp_path, &m_owns_tmp);
+      (void)sync_directory_if_needed();
+    }
   }
 
   Preserved_trx_carrier_status open() {
     /*
       The streaming writer builds a warm image before a token is assigned.
       close() is the only path that publishes the warm file; destruction without
-      close is treated as abort and removes both tmp and warm names.
+      close is treated as abort and removes only names created by this writer.
     */
     if (ensure_directory(m_dir)) return Preserved_trx_carrier_status::IO_ERROR;
     if (file_exists(m_warm_path))
       return Preserved_trx_carrier_status::ALREADY_EXISTS;
+    if (m_append_only) {
+      m_digest_memory = preserve_trx_acquire_memory_lease(
+          m_token, Preserve_trx_memory_kind::TEMP_IMAGE_STREAM_BUFFER, 4096);
+      if (!m_digest_memory.acquired()) return Status::IO_ERROR;
+      m_digest = EVP_MD_CTX_new();
+      if (!m_digest || EVP_DigestInit_ex(m_digest, EVP_sha256(), nullptr) != 1)
+        return fail_digest(Status::IO_ERROR);
+    }
+    m_writer_fd_lease = preserve_trx_acquire_file_resource_lease(m_dir, 1, m_append_bytes);
+    if (!m_writer_fd_lease.acquired()) return Status::IO_ERROR;
     m_file =
-        my_create(m_tmp_path.c_str(), 0600, O_WRONLY | O_TRUNC | O_EXCL,
+        my_create(m_tmp_path.c_str(), 0600, O_RDWR | O_TRUNC | O_EXCL,
                   MYF(0));
     if (m_file < 0) {
+      m_writer_fd_lease.release();
       return my_errno() == EEXIST ? Preserved_trx_carrier_status::ALREADY_EXISTS
                                   : Preserved_trx_carrier_status::IO_ERROR;
     }
+    m_owns_tmp = true;
     return Preserved_trx_carrier_status::OK;
   }
 
@@ -1336,6 +1410,10 @@ class Local_file_temp_table_image_writer final
     if (m_file < 0 || m_closed || (data == nullptr && length != 0))
       return Preserved_trx_carrier_status::CORRUPT;
     if (length == 0) return Preserved_trx_carrier_status::OK;
+    if (m_append_only && (offset != m_digest_offset ||
+                         m_digest_failure != Status::OK || !m_digest ||
+                         offset > m_append_bytes || length > m_append_bytes - offset))
+      return Status::CORRUPT;
     if (offset > static_cast<uint64_t>(std::numeric_limits<my_off_t>::max()) ||
         length >
             static_cast<uint64_t>(std::numeric_limits<my_off_t>::max()) -
@@ -1343,21 +1421,87 @@ class Local_file_temp_table_image_writer final
         offset + length > temp_sidecar_max_read_bytes()) {
       return Preserved_trx_carrier_status::CORRUPT;
     }
-    return my_pwrite(m_file, data, length, static_cast<my_off_t>(offset),
-                     MYF(0)) == length
-               ? Preserved_trx_carrier_status::OK
-               : Preserved_trx_carrier_status::IO_ERROR;
+    if (!m_append_only) m_digest_done = false;
+    const auto written = my_pwrite(m_file, data, length, static_cast<my_off_t>(offset), MYF(0));
+    if (written != MY_FILE_ERROR) preserve_trx_temp_final_write(written);
+    if (written != length)
+      return m_append_only ? fail_digest(Status::IO_ERROR) : Status::IO_ERROR;
+    if (m_append_only) {
+      m_writer_fd_lease.settle_writes(offset + length);
+      if (EVP_DigestUpdate(m_digest, data, length) != 1)
+        return fail_digest(Status::IO_ERROR);
+      m_digest_offset += length;
+    }
+    return Status::OK;
+  }
+
+  Status read_at(uint64_t offset, unsigned char *data, size_t length) override {
+    if (m_append_only || m_closed || m_file < 0 || !data ||
+        offset > temp_sidecar_max_read_bytes() ||
+        length > temp_sidecar_max_read_bytes() - offset) return Status::CORRUPT;
+    const auto bytes = my_pread(m_file, data, length, offset, MYF(0));
+    if (bytes != MY_FILE_ERROR) preserve_trx_temp_final_read(bytes);
+    return bytes == length ? Status::OK : Status::IO_ERROR;
+  }
+
+  Status checkpoint_result(uint64_t size,
+                            const std::array<unsigned char, 32> &digest) override {
+    if (m_append_only || m_closed || m_file < 0) return Status::CORRUPT;
+    MY_STAT stat;
+    if (my_fstat(m_file, &stat) != 0 || stat.st_size <= 0 ||
+        uint64_t(stat.st_size) != size) return Status::CORRUPT;
+    m_digest_result.size = size;
+    m_digest_result.sha256 = digest;
+    m_digest_done = true;
+    return Status::OK;
   }
 
   Preserved_trx_carrier_status truncate(uint64_t length) override {
+    if (m_append_only) return Status::CORRUPT;
     if (m_file < 0 || m_closed) return Preserved_trx_carrier_status::CORRUPT;
     if (length == 0 || length > temp_sidecar_max_read_bytes() ||
         length > static_cast<uint64_t>(std::numeric_limits<my_off_t>::max())) {
       return Preserved_trx_carrier_status::CORRUPT;
     }
-    return my_chsize(m_file, static_cast<my_off_t>(length), 0, MYF(0)) == 0
-               ? Preserved_trx_carrier_status::OK
-               : Preserved_trx_carrier_status::IO_ERROR;
+    MY_STAT stat;
+    if (my_fstat(m_file, &stat) != 0) return Status::IO_ERROR;
+    if (stat.st_size >= 0 && uint64_t(stat.st_size) == length) return Status::OK;
+    m_digest_done = false;
+    const auto previous = stat.st_size;
+    const bool failed = my_chsize(m_file, static_cast<my_off_t>(length), 0, MYF(0)) != 0;
+    if (previous >= 0 && uint64_t(previous) < length) {
+      const uint64_t completed = !failed ? length :
+          (my_fstat(m_file, &stat) == 0 && stat.st_size > previous
+               ? uint64_t(stat.st_size) : uint64_t(previous));
+      preserve_trx_temp_final_write(completed - uint64_t(previous));
+    }
+    return failed ? Status::IO_ERROR : Status::OK;
+  }
+
+  Status resize_step(uint64_t length, size_t byte_budget, bool *complete,
+                     uint64_t *written) override {
+    if (!complete || !written || !byte_budget || !length || m_append_only ||
+        m_file < 0 || m_closed || length > temp_sidecar_max_read_bytes())
+      return Status::CORRUPT;
+    *complete = false;
+    *written = 0;
+    MY_STAT stat;
+    if (my_fstat(m_file, &stat) != 0 || stat.st_size < 0) return Status::IO_ERROR;
+    const auto current = static_cast<uint64_t>(stat.st_size);
+    if (current >= length) {
+      if (current > length && truncate(length) != Status::OK) return Status::IO_ERROR;
+      *complete = true;
+      return Status::OK;
+    }
+    unsigned char zeros[4096]{};
+    const auto bytes = static_cast<size_t>(std::min<uint64_t>(
+        {length - current, uint64_t(byte_budget), uint64_t(sizeof(zeros))}));
+    const auto status = write_at(current, zeros, bytes);
+    if (status == Status::OK) {
+      *written = bytes;
+      *complete = current + bytes == length;
+    }
+    return status;
   }
 
   Preserved_trx_carrier_status flush() override {
@@ -1367,64 +1511,269 @@ class Local_file_temp_table_image_writer final
   }
 
   Preserved_trx_carrier_status close() override {
-    if (m_closed) return Preserved_trx_carrier_status::OK;
+    if (m_closed) return m_close_status;
     if (m_file < 0) return Preserved_trx_carrier_status::CORRUPT;
     bool error = my_sync(m_file, MYF(0)) != 0;
+    DBUG_EXECUTE_IF("preserve_temp_image_writer_sync_failure", error = true;);
+    if (my_fstat(m_file, &m_published_stat) != 0) error = true;
+    if (m_append_only) {
+      unsigned length = 0;
+      if (m_digest_failure != Status::OK || !m_digest ||
+          m_published_stat.st_size <= 0 ||
+          uint64_t(m_published_stat.st_size) != m_digest_offset ||
+          m_digest_offset != m_append_bytes ||
+          EVP_DigestFinal_ex(m_digest, m_digest_result.sha256.data(), &length) != 1 ||
+          length != m_digest_result.sha256.size()) {
+        error = true;
+      } else {
+        m_digest_result.size = m_digest_offset;
+        m_digest_done = true;
+      }
+      (void)close_digest();
+    }
     if (my_close(m_file, MYF(0))) error = true;
     m_file = -1;
+    m_writer_fd_lease.release();
+    m_closed = true;
     if (error) {
-      (void)my_delete(m_tmp_path.c_str(), MYF(0));
-      m_closed = true;
-      return Preserved_trx_carrier_status::IO_ERROR;
+      m_close_status = Preserved_trx_carrier_status::IO_ERROR;
+      (void)abort();
+      return m_close_status;
     }
 
-    const Preserved_trx_carrier_status install_status =
-        install_temp_file(m_tmp_path, m_warm_path);
-    if (install_status != Preserved_trx_carrier_status::OK) {
-      (void)my_delete(m_tmp_path.c_str(), MYF(0));
-      m_closed = true;
-      return install_status;
+    bool source_removed = false;
+    m_close_status = install_temp_file(m_tmp_path, m_warm_path, &source_removed);
+    if (m_close_status != Preserved_trx_carrier_status::OK) {
+      (void)abort();
+      return m_close_status;
     }
-    const Preserved_trx_carrier_status fsync_status =
-        fsync_directory_after_install(m_dir, m_warm_path);
-    m_closed = true;
-    return fsync_status;
+    m_owns_tmp = !source_removed;
+    m_owns_warm = true;
+    m_directory_sync_pending = true;
+    if (sync_directory_if_needed()) {
+      m_close_status =
+          Preserved_trx_carrier_status::IO_ERROR_DURABLE_SNAPSHOT_MAY_EXIST;
+      (void)abort();
+    }
+    return m_close_status;
   }
 
   Preserved_trx_carrier_status result(
-      Preserved_temp_table_image_writer_result *result) override {
-    /*
-      The digest returned here becomes the manifest descriptor. Callers must
-      read it only after close(), when the warm sidecar is durable.
-    */
-    if (!m_closed || m_file >= 0) return Preserved_trx_carrier_status::CORRUPT;
-    return file_size_and_digest(m_warm_path, result);
+      Preserved_temp_table_image_writer_result *output) override {
+    if (!output) return Status::CORRUPT;
+    bool complete = false;
+    unsigned char unused;
+    if (m_digest_done || m_digest_failure != Status::OK)
+      return result_step(&unused, 1, &complete, output);
+    // Compatibility for synchronous callers; workers can lend their already
+    // budgeted scratch directly to result_step().
+    constexpr size_t buffer_bytes = 64 * 1024;
+    try {
+      auto memory = preserve_trx_acquire_memory_lease(
+          m_token, Preserve_trx_memory_kind::TEMP_IMAGE_STREAM_BUFFER,
+          buffer_bytes);
+      if (!memory.acquired()) return fail_digest(Status::IO_ERROR);
+      std::vector<unsigned char> buffer(buffer_bytes);
+      while (!complete) {
+        const auto status = result_step(buffer.data(), buffer.size(),
+                                         &complete, output);
+        if (status != Status::OK) return status;
+      }
+    } catch (const std::bad_alloc &) {
+      return fail_digest(Status::IO_ERROR);
+    }
+    return Status::OK;
+  }
+
+  Status certify_closed_undo(const std::string &path, uint64_t size,
+                            const std::array<unsigned char, 32> &digest) override {
+    if (!m_append_only || !m_digest_done || path != m_warm_path ||
+        size != m_digest_result.size || digest != m_digest_result.sha256)
+      return Status::CORRUPT;
+    Preserved_temp_table_image_writer_result result;
+    return this->result(&result);
+  }
+
+  Status pin_closed_undo_read_fd(uint64_t size,
+                                const std::array<unsigned char, 32> &digest,
+                                int *output) override {
+    if (!output || !m_append_only || !m_closed || !m_owns_warm ||
+        m_close_status != Status::OK || !m_digest_done ||
+        size != m_digest_result.size ||
+        digest != m_digest_result.sha256)
+      return Status::CORRUPT;
+    const auto checked = validate_digest_file();
+    if (checked != Status::OK) return checked;
+    File file = my_open(m_warm_path.c_str(), O_RDONLY | O_NOFOLLOW, MYF(0));
+    if (file < 0) return Status::IO_ERROR;
+    auto close = create_scope_guard([&] { if (file >= 0) my_close(file, MYF(0)); });
+    MY_STAT stat;
+    if (my_fstat(file, &stat) != 0) return Status::IO_ERROR;
+    if (!same_opened_regular_sidecar(m_published_stat, stat) ||
+        m_published_stat.st_mtime != stat.st_mtime)
+      return Status::CORRUPT;
+    *output = file;
+    file = -1;
+    return Status::OK;
+  }
+
+  Preserved_trx_carrier_status result_step(
+      unsigned char *buffer, size_t buffer_bytes, bool *complete,
+      Preserved_temp_table_image_writer_result *output) override {
+    if (complete != nullptr) *complete = false;
+    if (!buffer || !buffer_bytes || !complete || !output || !m_closed ||
+        m_file >= 0 || !m_owns_warm || m_close_status != Status::OK)
+      return Status::CORRUPT;
+    if (m_digest_failure != Status::OK) return m_digest_failure;
+    if (m_digest_done) {
+      const auto status = validate_digest_file();
+      if (status != Status::OK) return fail_digest(status);
+      *output = m_digest_result;
+      *complete = true;
+      return Status::OK;
+    }
+    try {
+      if (m_digest_file < 0) {
+        if (m_published_stat.st_size <= 0 ||
+            temp_sidecar_expected_size_exceeds_read_limit(m_published_stat.st_size))
+          return fail_digest(Status::CORRUPT);
+        auto status = validate_digest_file();
+        if (status != Status::OK) return fail_digest(status);
+        m_digest_fd_lease = preserve_trx_acquire_file_resource_lease(m_dir, 1, 0);
+        m_digest_memory = preserve_trx_acquire_memory_lease(
+            m_token, Preserve_trx_memory_kind::TEMP_IMAGE_STREAM_BUFFER, 4096);
+        if (!m_digest_fd_lease.acquired() || !m_digest_memory.acquired())
+          return fail_digest(Status::IO_ERROR);
+        status = open_regular_sidecar_for_read(m_warm_path, m_published_stat,
+                                               &m_digest_file);
+        if (status != Status::OK) return fail_digest(status);
+        m_digest = EVP_MD_CTX_new();
+        if (!m_digest || EVP_DigestInit_ex(m_digest, EVP_sha256(), nullptr) != 1)
+          return fail_digest(Status::IO_ERROR);
+      }
+      const uint64_t size = m_published_stat.st_size;
+      const auto chunk = static_cast<size_t>(
+          std::min<uint64_t>(size - m_digest_offset, buffer_bytes));
+      const auto bytes = my_read(m_digest_file, buffer, chunk, MYF(0));
+      if (bytes != MY_FILE_ERROR) preserve_trx_temp_final_read(bytes);
+      if (bytes != chunk ||
+          EVP_DigestUpdate(m_digest, buffer, chunk) != 1)
+        return fail_digest(Status::IO_ERROR);
+      m_digest_offset += chunk;
+      if (m_digest_offset != size) return Status::OK;
+      const auto status = validate_digest_file();
+      if (status != Status::OK) return fail_digest(status);
+      Preserved_temp_table_image_writer_result candidate;
+      candidate.size = size;
+      unsigned digest_bytes = 0;
+      if (EVP_DigestFinal_ex(m_digest, candidate.sha256.data(), &digest_bytes) != 1 ||
+          digest_bytes != candidate.sha256.size())
+        return fail_digest(Status::IO_ERROR);
+      if (close_digest()) return fail_digest(Status::IO_ERROR);
+      m_digest_result = candidate;
+      m_digest_done = true;
+      *output = candidate;
+      *complete = true;
+      return Status::OK;
+    } catch (const std::bad_alloc &) {
+      return fail_digest(Status::IO_ERROR);
+    }
   }
 
   Preserved_trx_carrier_status abort() override {
-    bool error = false;
+    bool error = close_digest();
     if (m_file >= 0) {
       if (my_close(m_file, MYF(0))) error = true;
       m_file = -1;
     }
-    if (my_delete(m_tmp_path.c_str(), MYF(0)) && my_errno() != ENOENT) {
-      error = true;
-    }
-    if (my_delete(m_warm_path.c_str(), MYF(0)) && my_errno() != ENOENT) {
-      error = true;
-    }
-    if (fsync_directory(m_dir)) error = true;
+    m_writer_fd_lease.release();
+    if (remove_owned_file(m_tmp_path, &m_owns_tmp)) error = true;
+    if (remove_owned_file(m_warm_path, &m_owns_warm)) error = true;
+    if (sync_directory_if_needed()) error = true;
     m_closed = true;
+    if (m_close_status == Preserved_trx_carrier_status::OK)
+      m_close_status = Preserved_trx_carrier_status::CORRUPT;
     return error ? Preserved_trx_carrier_status::IO_ERROR
                  : Preserved_trx_carrier_status::OK;
   }
 
  private:
+  // The warm file is immutable after close. Check its fixed descriptor and
+  // pathname before publishing a digest used by the later path-based seal.
+  Status validate_digest_file() const {
+    const auto matches = [&](const MY_STAT &stat) {
+      return same_opened_regular_sidecar(m_published_stat, stat) &&
+             m_published_stat.st_mtime == stat.st_mtime;
+    };
+    MY_STAT stat;
+    if (m_digest_file >= 0) {
+      if (my_fstat(m_digest_file, &stat) != 0) return Status::IO_ERROR;
+      if (!matches(stat)) return Status::CORRUPT;
+    }
+    const auto status = stat_regular_sidecar(m_warm_path, &stat);
+    if (status != Status::OK) return status;
+    return matches(stat) ? Status::OK : Status::CORRUPT;
+  }
+
+  bool close_digest() {
+    bool error = false;
+    if (m_digest_file >= 0) {
+      error = my_close(m_digest_file, MYF(0)) != 0;
+      m_digest_file = -1;
+    }
+    if (m_digest) EVP_MD_CTX_free(m_digest);
+    m_digest = nullptr;
+    m_digest_memory.release();
+    m_digest_fd_lease.release();
+    return error;
+  }
+
+  Status fail_digest(Status status) {
+    (void)close_digest();
+    m_digest_failure = status;
+    return status;
+  }
+
+  bool remove_owned_file(const std::string &path, bool *owned) {
+    if (!*owned) return false;
+    DBUG_EXECUTE_IF("preserve_temp_image_writer_delete_failure", return true;);
+    if (my_delete(path.c_str(), MYF(0)) && my_errno() != ENOENT) return true;
+    *owned = false;
+    m_directory_sync_pending = true;
+    return false;
+  }
+
+  bool sync_directory_if_needed() {
+    if (!m_directory_sync_pending) return false;
+    DBUG_EXECUTE_IF("preserve_temp_image_writer_dir_sync_failure", return true;);
+    if (fsync_directory(m_dir)) return true;
+    m_directory_sync_pending = false;
+    return false;
+  }
+
   std::string m_dir;
   std::string m_warm_path;
   std::string m_tmp_path;
+  std::string m_token;
+  bool m_append_only{false};
+  uint64_t m_append_bytes{0};
+  MY_STAT m_published_stat{};
+  File m_digest_file{-1};
+  EVP_MD_CTX *m_digest{nullptr};
+  Preserve_memory_lease m_digest_memory;
+  Preserve_file_resource_lease m_digest_fd_lease;
+  Preserve_file_resource_lease m_writer_fd_lease;
+  uint64_t m_digest_offset{0};
+  bool m_digest_done{false};
+  Status m_digest_failure{Status::OK};
+  Preserved_temp_table_image_writer_result m_digest_result;
   File m_file{-1};
   bool m_closed{false};
+  bool m_owns_tmp{false};
+  bool m_owns_warm{false};
+  bool m_directory_sync_pending{false};
+  Preserved_trx_carrier_status m_close_status{
+      Preserved_trx_carrier_status::CORRUPT};
 };
 
 }  // namespace
@@ -1432,6 +1781,259 @@ class Local_file_temp_table_image_writer final
 Local_file_preserved_temp_table_image_carrier::
     Local_file_preserved_temp_table_image_carrier(std::string dir)
     : m_dir(normalize_dir(std::move(dir))) {}
+
+#ifndef NDEBUG
+bool preserve_trx_temp_image_writer_probe(const std::string &dir,
+                                         const std::string &token) {
+  using Status = Preserved_trx_carrier_status;
+  // Called only from a completed real capture. Each check uses fresh, private
+  // names; collisions are introduced explicitly by this probe.
+  const std::string id = token + "_writer_probe";
+  const std::string warm = join_path(dir, warm_image_filename(id, 1));
+  const std::string tmp = warm + ".tmp";
+  const std::string bytes = "existing image owner";
+  const auto matches = [&](const std::string &path) {
+    std::string data;
+    return read_file(path, &data) && data == bytes;
+  };
+  const auto create = [&](const std::string &path) {
+    File file = my_create(path.c_str(), 0600, O_WRONLY | O_EXCL, MYF(0));
+    if (file < 0) return true;
+    const bool error = !write_all(
+        file, reinterpret_cast<const unsigned char *>(bytes.data()), bytes.size());
+    return my_close(file, MYF(0)) != 0 || error;
+  };
+  Local_file_preserved_temp_table_image_carrier carrier(dir);
+  std::unique_ptr<Preserved_temp_table_image_writer> writer;
+  // The caller still owns these names when the competing factory fails.
+  for (const auto &path : {tmp, warm}) {
+    if (create(path) ||
+        carrier.create_warm_image_writer(id, 1, &writer) != Status::ALREADY_EXISTS ||
+        writer != nullptr || !matches(path)) return true;
+    if (my_delete(path.c_str(), MYF(0))) return true;
+  }
+  // A concurrent publisher can win after open() but before installation.
+  if (carrier.create_warm_image_writer(id, 1, &writer) != Status::OK ||
+      writer->write_at(0, reinterpret_cast<const unsigned char *>(bytes.data()),
+                       bytes.size()) != Status::OK || create(warm) ||
+      writer->close() != Status::ALREADY_EXISTS ||
+      writer->close() != Status::ALREADY_EXISTS) return true;
+  Preserved_temp_table_image_writer_result result;
+  if (writer->result(&result) == Status::OK || writer->abort() != Status::OK ||
+      !matches(warm) || file_exists(tmp)) return true;
+  writer.reset();
+  if (!matches(warm) || my_delete(warm.c_str(), MYF(0))) return true;
+  // Normal close transfers the warm artifact to the caller. Destruction must
+  // preserve it; an explicit abort instead revokes only this writer's output.
+  if (carrier.create_warm_image_writer(id, 1, &writer) != Status::OK ||
+      writer->write_at(0, reinterpret_cast<const unsigned char *>(bytes.data()),
+                       bytes.size()) != Status::OK ||
+      writer->close() != Status::OK || writer->close() != Status::OK ||
+      writer->result(&result) != Status::OK || result.size != bytes.size())
+    return true;
+  writer.reset();
+  if (!matches(warm) || my_delete(warm.c_str(), MYF(0))) return true;
+  if (carrier.create_warm_image_writer(id, 1, &writer) != Status::OK ||
+      writer->write_at(0, reinterpret_cast<const unsigned char *>(bytes.data()),
+                       bytes.size()) != Status::OK ||
+      writer->close() != Status::OK || writer->abort() != Status::OK ||
+      writer->abort() != Status::OK || writer->result(&result) == Status::OK ||
+      writer->close() == Status::OK || file_exists(tmp) || file_exists(warm))
+    return true;
+  // Once deletion succeeded, a later owner may reuse the name.
+  if (create(warm)) return true;
+  writer.reset();
+  if (!matches(warm) || my_delete(warm.c_str(), MYF(0))) return true;
+  DBUG_EXECUTE_IF("preserve_temp_image_writer_digest_probe", {
+    const auto memory = preserve_trx_resource_kind_current_bytes(
+        Preserve_trx_memory_kind::TEMP_IMAGE_STREAM_BUFFER);
+    const auto fd_quota_available = [&]() {
+      DBUG_PUSH("+d,preserve_temp_file_budget_two_fds");
+      const auto restore = create_scope_guard([]() { DBUG_POP(); });
+      return preserve_trx_acquire_file_resource_lease(dir, 2, 0).acquired();
+    };
+    const auto resources_released = [&]() {
+      return preserve_trx_resource_kind_current_bytes(
+                 Preserve_trx_memory_kind::TEMP_IMAGE_STREAM_BUFFER) == memory &&
+             fd_quota_available();
+    };
+    if (carrier.create_warm_image_writer(id, 1, &writer) != Status::OK ||
+        writer->write_at(0, reinterpret_cast<const unsigned char *>(bytes.data()),
+                         bytes.size()) != Status::OK ||
+        writer->close() != Status::OK) return true;
+    unsigned char scratch[3];
+    bool complete = false;
+    Preserved_temp_table_image_writer_result untouched;
+    untouched.size = UINT64_MAX;
+    untouched.sha256.fill(0xa5);
+    const auto unchanged = [&]() {
+      return result.size == untouched.size && result.sha256 == untouched.sha256;
+    };
+    result = untouched;
+    if (writer->result_step(scratch, 0, &complete, &result) != Status::CORRUPT ||
+        complete || !unchanged()) return true;
+    size_t steps = 0;
+    while (!complete && steps <= bytes.size()) {
+      if (writer->result_step(scratch, sizeof(scratch), &complete, &result) !=
+          Status::OK) return true;
+      ++steps;
+      if (!complete && !unchanged()) return true;
+      if (!complete && fd_quota_available()) return true;
+    }
+    if (!complete || steps != (bytes.size() + sizeof(scratch) - 1) / sizeof(scratch) ||
+        result.size != bytes.size() || result.sha256 != sha256_digest(bytes)) {
+      DBUG_PRINT("preserve_temp_import",
+                 ("temporary image digest exceeded batch budget steps=%zu", steps));
+      return true;
+    }
+    if (!resources_released()) return true;
+    // A cached result needs no additional descriptor or digest workspace.
+    const bool cached = [&]() {
+      DBUG_PUSH("+d,preserve_temp_file_budget_no_fd");
+      const auto restore = create_scope_guard([]() { DBUG_POP(); });
+      result = untouched;
+      return writer->result(&result) == Status::OK &&
+             result.size == bytes.size() && result.sha256 == sha256_digest(bytes);
+    }();
+    if (!cached || writer->abort() != Status::OK) return true;
+    writer.reset();
+    // Every case starts with a real closed image and interrupts its read.
+    for (unsigned fault = 0; fault < 7; ++fault) {
+      if (carrier.create_warm_image_writer(id, 1, &writer) != Status::OK ||
+          writer->write_at(0, reinterpret_cast<const unsigned char *>(bytes.data()),
+                           bytes.size()) != Status::OK ||
+          writer->close() != Status::OK) return true;
+      result = untouched;
+      complete = false;
+      if (fault != 6 &&
+          (writer->result_step(scratch, sizeof(scratch), &complete, &result) !=
+               Status::OK || complete || !unchanged() ||
+           fd_quota_available())) return true;
+      if (fault == 0) {
+        if (writer->abort() != Status::OK || file_exists(warm) ||
+            writer->result_step(scratch, sizeof(scratch), &complete, &result) ==
+                Status::OK || complete) return true;
+      } else if (fault == 1) {
+        writer.reset();
+        if (!matches(warm) || my_delete(warm.c_str(), MYF(0))) return true;
+      } else {
+        const auto backup = warm + ".probe";
+        if (fault == 2 || fault == 3) {
+          const auto file = my_open(warm.c_str(), O_WRONLY | O_APPEND, MYF(0));
+          if (file < 0) return true;
+          const bool error = fault == 2
+              ? my_write(file, reinterpret_cast<const uchar *>("x"), 1, MYF(0)) != 1
+              : my_chsize(file, bytes.size() / 2, 0, MYF(0)) != 0;
+          const bool closed = my_close(file, MYF(0)) == 0;
+          if (error || !closed) return true;
+        } else if (fault == 4) {
+          if (my_rename(warm.c_str(), backup.c_str(), MYF(0)) || create(warm))
+            return true;
+        }
+        auto status = Status::OK;
+        if (fault == 5 || fault == 6) {
+          DBUG_PUSH(fault == 5 ? "+d,simulate_file_read_error"
+                               : "+d,preserve_temp_file_budget_no_fd");
+          const auto restore = create_scope_guard([]() { DBUG_POP(); });
+          status = writer->result_step(scratch, sizeof(scratch), &complete, &result);
+        } else {
+          for (size_t n = 0; status == Status::OK && n <= bytes.size(); ++n)
+            status = writer->result_step(scratch, sizeof(scratch), &complete, &result);
+        }
+        if (status == Status::OK || complete || !unchanged() ||
+            writer->result_step(scratch, sizeof(scratch), &complete, &result) != status ||
+            complete || !unchanged() || !resources_released()) return true;
+        if (fault == 4 && (my_delete(warm.c_str(), MYF(0)) ||
+                          my_rename(backup.c_str(), warm.c_str(), MYF(0)))) return true;
+        if (writer->abort() != Status::OK) return true;
+      }
+      writer.reset();
+      if (!resources_released() || file_exists(warm) || file_exists(tmp)) return true;
+    }
+    const auto undo_path = join_path(dir, warm_undo_filename(id, 1));
+    const auto backup = undo_path + ".probe";
+    if (carrier.create_warm_undo_writer(id, 1, bytes.size(), &writer) != Status::OK ||
+        writer->write_at(0, reinterpret_cast<const unsigned char *>(bytes.data()),
+                         bytes.size()) != Status::OK ||
+        writer->close() != Status::OK || writer->result(&result) != Status::OK)
+      return true;
+    auto different_digest = result.sha256;
+    different_digest[0] ^= 1;
+    if (writer->certify_closed_undo(warm, result.size, result.sha256) == Status::OK ||
+        writer->certify_closed_undo(undo_path, result.size + 1, result.sha256) == Status::OK ||
+        writer->certify_closed_undo(undo_path, result.size, different_digest) == Status::OK ||
+        writer->certify_closed_undo(undo_path, result.size, result.sha256) != Status::OK ||
+        !resources_released()) return true;
+    // An equal-sized replacement with identical bytes is a different owner.
+    if (my_rename(undo_path.c_str(), backup.c_str(), MYF(0)) || create(undo_path) ||
+        writer->certify_closed_undo(undo_path, result.size, result.sha256) == Status::OK)
+      return true;
+    writer.reset();
+    if (!matches(undo_path) || !matches(backup) || !resources_released() ||
+        my_delete(undo_path.c_str(), MYF(0)) || my_delete(backup.c_str(), MYF(0)))
+      return true;
+    DBUG_PRINT("preserve_temp_import", ("temporary image digest batch checked undo_certificate=1"));
+  });
+  DBUG_EXECUTE_IF("preserve_temp_image_writer_cleanup_probe", {
+    for (bool directory_failure : {false, true}) {
+      if (carrier.create_warm_image_writer(id, 1, &writer) != Status::OK ||
+          writer->write_at(0, reinterpret_cast<const unsigned char *>(bytes.data()),
+                           bytes.size()) != Status::OK) return true;
+      const auto expected = directory_failure
+                                ? Status::IO_ERROR_DURABLE_SNAPSHOT_MAY_EXIST
+                                : Status::IO_ERROR;
+      const bool failure_checked = [&]() {
+        DBUG_PUSH(directory_failure
+                      ? "+d,preserve_temp_image_writer_dir_sync_failure,preserve_temp_image_writer_delete_failure"
+                      : "+d,preserve_temp_image_writer_sync_failure,preserve_temp_image_writer_delete_failure");
+        const auto restore_debug = create_scope_guard([]() { DBUG_POP(); });
+        return writer->close() == expected && writer->close() == expected &&
+               writer->result(&result) != Status::OK &&
+               writer->abort() == Status::IO_ERROR;
+      }();
+      if (!failure_checked ||
+          !matches(directory_failure ? warm : tmp) ||
+          writer->abort() != Status::OK || writer->abort() != Status::OK ||
+          file_exists(tmp) || file_exists(warm)) return true;
+      if (create(warm)) return true;
+      writer.reset();
+      if (!matches(warm) || my_delete(warm.c_str(), MYF(0))) return true;
+    }
+    // A failed directory sync remains retryable even after both names vanish.
+    if (carrier.create_warm_image_writer(id, 1, &writer) != Status::OK ||
+        writer->close() != Status::OK) return true;
+    const bool failure_checked = [&]() {
+      DBUG_PUSH("+d,preserve_temp_image_writer_dir_sync_failure");
+      const auto restore_debug = create_scope_guard([]() { DBUG_POP(); });
+      return writer->abort() == Status::IO_ERROR &&
+             writer->abort() == Status::IO_ERROR;
+    }();
+    if (!failure_checked ||
+        file_exists(tmp) || file_exists(warm) || writer->abort() != Status::OK)
+      return true;
+    writer.reset();
+#ifndef _WIN32
+    // link() can succeed while unlink(tmp) fails. Destruction retries only
+    // the owned staging name, leaving the successful warm image usable.
+    if (carrier.create_warm_image_writer(id, 1, &writer) != Status::OK ||
+        writer->write_at(0, reinterpret_cast<const unsigned char *>(bytes.data()),
+                         bytes.size()) != Status::OK) return true;
+    const auto close_status = [&]() {
+      DBUG_PUSH("+d,preserve_temp_image_writer_unlink_failure");
+      const auto restore_debug = create_scope_guard([]() { DBUG_POP(); });
+      return writer->close();
+    }();
+    if (close_status != Status::OK || !matches(tmp) || !matches(warm)) return true;
+    writer.reset();
+    if (file_exists(tmp) || !matches(warm) || my_delete(warm.c_str(), MYF(0)))
+      return true;
+#endif
+    DBUG_PRINT("preserve_temp_import",
+               ("temporary image writer cleanup retry checked"));
+  });
+  return false;
+}
+#endif
 
 Preserved_trx_carrier_status
 Local_file_preserved_temp_table_image_carrier::create_warm_image_writer(
@@ -1449,11 +2051,25 @@ Local_file_preserved_temp_table_image_carrier::create_warm_image_writer(
   */
   auto local_writer = std::make_unique<Local_file_temp_table_image_writer>(
       m_dir, join_path(m_dir, warm_image_filename(warmcopy_id,
-                                                 source_space_id)));
+                                                 source_space_id)), warmcopy_id);
   const Preserved_trx_carrier_status status = local_writer->open();
   if (status != Preserved_trx_carrier_status::OK) return status;
   *writer = std::move(local_writer);
   return Preserved_trx_carrier_status::OK;
+}
+
+Preserved_trx_carrier_status
+Local_file_preserved_temp_table_image_carrier::create_warm_undo_writer(
+    const std::string &id, uint32_t space, uint64_t expected_bytes,
+    std::unique_ptr<Preserved_temp_table_image_writer> *writer) {
+  if (!writer || *writer || !token_is_filename_safe(id) || !space ||
+      !expected_bytes || expected_bytes > temp_sidecar_max_read_bytes())
+    return Preserved_trx_carrier_status::CORRUPT;
+  auto output = std::make_unique<Local_file_temp_table_image_writer>(
+      m_dir, join_path(m_dir, warm_undo_filename(id, space)), id, expected_bytes);
+  const auto status = output->open();
+  if (status == Preserved_trx_carrier_status::OK) *writer = std::move(output);
+  return status;
 }
 
 Preserved_trx_carrier_status
@@ -1568,6 +2184,14 @@ Preserved_trx_carrier_status
 Local_file_preserved_temp_table_image_carrier::seal_warm_undo(
     const std::string &warmcopy_id, const std::string &token,
     const Preserved_temp_table_undo_descriptor &descriptor) {
+  return seal_warm_undo(warmcopy_id, token, descriptor, nullptr);
+}
+
+Preserved_trx_carrier_status
+Local_file_preserved_temp_table_image_carrier::seal_warm_undo(
+    const std::string &warmcopy_id, const std::string &token,
+    const Preserved_temp_table_undo_descriptor &descriptor,
+    Preserved_temp_table_image_writer *closed_writer) {
   if (!token_is_filename_safe(warmcopy_id) || !token_is_filename_safe(token) ||
       !undo_descriptor_is_valid(descriptor) ||
       descriptor.blob_name !=
@@ -1582,17 +2206,17 @@ Local_file_preserved_temp_table_image_carrier::seal_warm_undo(
   if (file_exists(sealed_path))
     return Preserved_trx_carrier_status::ALREADY_EXISTS;
 
-  /*
-    No-redo undo sidecars are optional but all-or-nothing for a temp table that
-    modified data. Seal only a digest-matching warm undo body; resume later
-    rejects manifests whose undo descriptor cannot be read back. Current SQL
-    resume policy still rejects transactions that require using a valid no-redo
-    undo sidecar; the sidecar is captured for durable evidence and future
-    reconnect support, not as an enabled replay path.
-  */
+  // A retained worker writer certifies its exact closed path and digest.
+  // Synchronous capture and external files still require the full read.
   const Preserved_trx_carrier_status digest_status =
-      validate_file_digest(warm_path, descriptor.size, descriptor.sha256);
+      closed_writer ? closed_writer->certify_closed_undo(
+                          warm_path, descriptor.size, descriptor.sha256)
+                    : validate_file_digest(warm_path, descriptor.size, descriptor.sha256);
   if (digest_status != Preserved_trx_carrier_status::OK) return digest_status;
+
+  DBUG_PRINT("preserve_temp_import",
+             ("temporary undo final seal writer_verified=%d bytes=%llu",
+              closed_writer != nullptr, static_cast<unsigned long long>(descriptor.size)));
 
   const Preserved_trx_carrier_status status =
       install_temp_file(warm_path, sealed_path);
@@ -1804,7 +2428,9 @@ bool preserve_trx_encode_temp_table_manifest(
     physical sidecars. It stores logical names, serialized DD state, image
     descriptors, and InnoDB dictionary binding in one versioned payload.
   */
-  if (payload == nullptr || manifest.tables.empty()) return false;
+  if (payload == nullptr ||
+      (manifest.tables.empty() && !preserve_trx_temp_history_only(manifest))) return false;
+  if (!preserve_trx_temp_history_valid(manifest)) return false;
   if (manifest.tables.size() > kMaxTempTableManifestTables)
     return false;
   if (!manifest_undo_images_match_tables(manifest, true)) return false;
@@ -1820,15 +2446,34 @@ bool preserve_trx_encode_temp_table_manifest(
 
   std::set<uint32_t> ordinals;
   std::string encoded;
-  store_le32(&encoded, manifest.ownership_claims.empty()
-                           ? kTempTableManifestLegacyVersion
-                           : kTempTableManifestVersion);
+  const bool has_autoinc = std::any_of(manifest.tables.begin(), manifest.tables.end(),
+      [](const auto &entry) { return entry.dict_binding.autoinc_next != 0; });
+  const bool has_virtual = std::any_of(manifest.tables.begin(), manifest.tables.end(),
+      [](const auto &entry) {
+        return std::any_of(entry.dict_binding.columns.begin(), entry.dict_binding.columns.end(),
+            [](const auto &column) { return column.is_virtual(); });
+      });
+  const bool has_history = manifest.tables.empty() || !manifest.retired_tables.empty() ||
+      std::any_of(manifest.undo_images.begin(), manifest.undo_images.end(),
+                  preserve_trx_temp_undo_is_independent) ||
+      std::any_of(manifest.tables.begin(), manifest.tables.end(),
+                  [](const auto &table) { return table.generation != 1; });
+  const bool has_delta = std::any_of(manifest.undo_images.begin(), manifest.undo_images.end(),
+      [](const auto &undo) { return !undo.delta.name.empty(); });
+  const bool image_delta = std::any_of(manifest.tables.begin(), manifest.tables.end(),
+      [](const auto &table) { return !table.image.delta.name.empty(); });
+  const uint32_t version = image_delta ? 12 : has_delta ? 11 : has_history ? 10 :
+      has_virtual ? kTempTableManifestVirtualVersion : has_autoinc ? 8 :
+      (manifest.ownership_claims.empty() ? kTempTableManifestLegacyVersion :
+                                         kTempTableManifestOwnershipVersion);
+  store_le32(&encoded, version);
   store_le32(&encoded, static_cast<uint32_t>(manifest.tables.size()));
   store_le64(&encoded, manifest.owner_trx_id);
   for (const auto &entry : manifest.tables) {
     if (!ordinals.insert(entry.table_ordinal).second)
       return false;
     store_le32(&encoded, entry.table_ordinal);
+    if (version >= 10) store_le32(&encoded, entry.generation);
     if (!store_string(&encoded, entry.schema_name) ||
         !store_string(&encoded, entry.table_name) ||
         !store_string(&encoded, entry.engine_name)) {
@@ -1836,20 +2481,31 @@ bool preserve_trx_encode_temp_table_manifest(
     }
     store_u8(&encoded, entry.binlog_drop_if_temp ? 1 : 0);
     if (!store_string(&encoded, entry.serialized_dd_table) ||
-        !encode_descriptor(entry.image, &encoded) ||
-        !encode_dict_binding(entry.dict_binding, &encoded)) {
+        !encode_descriptor(entry.image, version, &encoded) ||
+        !encode_dict_binding(entry.dict_binding, version, &encoded)) {
       return false;
     }
   }
   store_le32(&encoded, static_cast<uint32_t>(manifest.undo_images.size()));
   for (const auto &undo : manifest.undo_images) {
-    if (!encode_undo_descriptor(undo, &encoded)) return false;
+    if (!encode_undo_descriptor(undo, version, &encoded)) return false;
   }
-  if (!manifest.ownership_claims.empty()) {
+  if (version >= kTempTableManifestOwnershipVersion) {
     store_le32(&encoded,
                static_cast<uint32_t>(manifest.ownership_claims.size()));
     for (const auto &claim : manifest.ownership_claims) {
       if (!encode_ownership_claim(claim, &encoded)) return false;
+    }
+  }
+  if (version >= 10) {
+    store_le64(&encoded, manifest.sealed_history_sequence);
+    store_le32(&encoded, static_cast<uint32_t>(manifest.retired_tables.size()));
+    for (const auto &table : manifest.retired_tables) {
+      store_le64(&encoded, table.table_id);
+      store_le32(&encoded, table.source_space_id);
+      store_le32(&encoded, table.table_ordinal);
+      store_le32(&encoded, table.generation);
+      store_le64(&encoded, table.drop_sequence);
     }
   }
   *payload = std::move(encoded);
@@ -1869,7 +2525,7 @@ bool preserve_trx_decode_temp_table_manifest(
   if (!read_le32(payload, &offset, &version) ||
       !read_le32(payload, &offset, &count) ||
       version < kTempTableManifestMinSupportedVersion ||
-      version > kTempTableManifestVersion || count == 0 ||
+      version > kTempTableManifestVersion || (count == 0 && version < 10) ||
       count > kMaxTempTableManifestTables) {
     return false;
   }
@@ -1884,13 +2540,14 @@ bool preserve_trx_decode_temp_table_manifest(
     Preserved_temp_table_manifest_entry entry;
     uint8_t drop_if_temp = 0;
     if (!read_le32(payload, &offset, &entry.table_ordinal) ||
+        (version >= 10 && !read_le32(payload, &offset, &entry.generation)) ||
         !read_string(payload, &offset, &entry.schema_name) ||
         !read_string(payload, &offset, &entry.table_name) ||
         !read_string(payload, &offset, &entry.engine_name) ||
         !read_u8(payload, &offset, &drop_if_temp) ||
         !read_string(payload, &offset, &entry.serialized_dd_table) ||
         !decode_descriptor(payload, version, &offset, &entry.image) ||
-        !decode_dict_binding(payload, &offset, &entry.dict_binding)) {
+        !decode_dict_binding(payload, version, &offset, &entry.dict_binding)) {
       return false;
     }
     if (drop_if_temp > 1) return false;
@@ -1914,10 +2571,19 @@ bool preserve_trx_decode_temp_table_manifest(
     }
     decoded.undo_images.push_back(std::move(undo));
   }
-  if (version >= kTempTableManifestVersion) {
+  if (version >= kTempTableManifestOwnershipVersion) {
     uint32_t ownership_count = 0;
     if (!read_le32(payload, &offset, &ownership_count) ||
-        ownership_count == 0 || ownership_count > kMaxTempTableOwnershipClaims) {
+        (version == kTempTableManifestOwnershipVersion && ownership_count == 0) ||
+        ownership_count > kMaxTempTableOwnershipClaims) {
+      return false;
+    }
+    // Each claim has a string length, six integers, a role and a SHA-256.
+    // Reject impossible counts before allocating the declared vector.
+    constexpr size_t min_claim_bytes = 4 + 6 * 4 + 1 + 32;
+    if (ownership_count > (payload.size() - offset) / min_claim_bytes) {
+      DBUG_PRINT("preserve_temp_import",
+                 ("temporary manifest claim count exceeds payload"));
       return false;
     }
     decoded.ownership_claims.reserve(ownership_count);
@@ -1936,7 +2602,25 @@ bool preserve_trx_decode_temp_table_manifest(
     if (!manifest_ownership_claims_match_undo_images(decoded)) return false;
     decoded.native_adoption_capable = !decoded.ownership_claims.empty();
   }
+  if (version >= 10) {
+    uint32_t retired_count = 0;
+    if (!read_le64(payload, &offset, &decoded.sealed_history_sequence) ||
+        !read_le32(payload, &offset, &retired_count) || retired_count > 16384 ||
+        retired_count > (payload.size() - offset) / 28) return false;
+    decoded.retired_tables.reserve(retired_count);
+    for (uint32_t n = 0; n < retired_count; ++n) {
+      Preserved_temp_retired_table table;
+      if (!read_le64(payload, &offset, &table.table_id) ||
+          !read_le32(payload, &offset, &table.source_space_id) ||
+          !read_le32(payload, &offset, &table.table_ordinal) ||
+          !read_le32(payload, &offset, &table.generation) ||
+          !read_le64(payload, &offset, &table.drop_sequence)) return false;
+      decoded.retired_tables.push_back(table);
+    }
+  }
   if (offset != payload.length()) return false;
+  if (decoded.tables.empty() && !preserve_trx_temp_history_only(decoded)) return false;
+  if (!preserve_trx_temp_history_valid(decoded)) return false;
   if (!manifest_undo_images_match_tables(decoded, version >= 4)) return false;
   *manifest = std::move(decoded);
   return true;

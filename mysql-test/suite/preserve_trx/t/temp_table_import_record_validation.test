@@ -1,0 +1,5 @@
+--let $capture_case= bounded validation of captured native index records
+--let $capture_trace_name= temp_import_record_validation.trace
+--let $capture_fault= preserve_temp_import_plan_probe,preserve_trx_fail_before_snapshot_fsync
+--let $capture_trace_pattern= temporary index records validated
+--source suite/preserve_trx/include/temp_table_capture_undo_failure.inc

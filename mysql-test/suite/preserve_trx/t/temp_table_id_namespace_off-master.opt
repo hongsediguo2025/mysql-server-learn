@@ -1,0 +1,2 @@
+--rds-preserve-trx-temp-id-namespace=OFF
+--rds-preserve-trx-enable=OFF

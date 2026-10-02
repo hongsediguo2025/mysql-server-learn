@@ -1,0 +1,14 @@
+# Internal negative entry test only; this does not simulate online promotion.
+--source include/have_debug.inc
+SELECT @@global.rds_preserve_trx_enable;
+SET SESSION debug='+d,preserve_temp_physical_metrics_probe';
+--disable_result_log
+SHOW PRESERVED TRANSACTIONS;
+--enable_result_log
+SET SESSION debug='';
+SELECT VARIABLE_NAME,VARIABLE_VALUE FROM performance_schema.global_status
+WHERE VARIABLE_NAME IN ('Preserve_trx_temp_stage_physical_prepare_calls',
+'Preserve_trx_temp_stage_physical_prepare_failure_calls',
+'Preserve_trx_temp_stage_physical_adopt_calls',
+'Preserve_trx_temp_stage_physical_adopt_failure_calls',
+'Preserve_trx_temp_stage_physical_resurrect_calls') ORDER BY VARIABLE_NAME;

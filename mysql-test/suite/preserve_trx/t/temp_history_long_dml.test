@@ -1,0 +1,2 @@
+--let $contract_temp_history= long-dml
+--source suite/preserve_trx/t/temp_capture_worker.test

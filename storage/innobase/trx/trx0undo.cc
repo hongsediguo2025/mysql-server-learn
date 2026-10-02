@@ -50,6 +50,8 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "srv0srv.h"
 #include "srv0start.h"
 #include "trx0temp_preserve.h"
+#include "trx0temp_preserve_undo.h"
+#include "trx0temp_preserve_undo_capture.h"
 #include "trx0purge.h"
 #include "trx0rec.h"
 #include "trx0rseg.h"
@@ -940,6 +942,9 @@ buf_block_t *trx_undo_add_page(
   ut_ad(mutex_own(&(trx->undo_mutex)));
   ut_ad(mutex_own(&(undo_ptr->rseg->mutex)));
 
+  if (undo_ptr == &trx->rsegs.m_noredo && trx->preserve_temp_undo_cookie)
+    mtr->set_preserve_temp_undo_cookie(trx->preserve_temp_undo_cookie);
+
   rseg = undo_ptr->rseg;
 
   if (rseg->get_curr_size() == rseg->max_size) {
@@ -1049,6 +1054,9 @@ void trx_undo_free_last_page_func(
   ut_ad(undo->hdr_page_no != undo->last_page_no);
   ut_ad(undo->size > 0);
 
+  if (undo->preserve_temp_undo_cookie)
+    mtr->set_preserve_temp_undo_cookie(undo->preserve_temp_undo_cookie);
+
   undo->last_page_no =
       trx_undo_free_page(undo->rseg, FALSE, undo->space, undo->hdr_page_no,
                          undo->last_page_no, mtr);
@@ -1157,6 +1165,8 @@ void trx_undo_truncate_end_func(
     if (fsp_is_system_temporary(undo->rseg->space_id)) {
       ut_ad(trx->rsegs.m_noredo.rseg == undo->rseg);
       mtr.set_log_mode(MTR_LOG_NO_REDO);
+      if (undo->preserve_temp_undo_cookie)
+        mtr.set_preserve_temp_undo_cookie(undo->preserve_temp_undo_cookie);
     } else {
       ut_ad(trx->rsegs.m_redo.rseg == undo->rseg);
     }
@@ -1488,6 +1498,7 @@ static trx_undo_t *trx_undo_mem_create(trx_rseg_t *rseg, ulint id, ulint type,
   }
 
   undo->id = id;
+  undo->preserve_temp_undo_cookie = 0;
   undo->type = type;
   undo->state = TRX_UNDO_ACTIVE;
   undo->del_marks = FALSE;
@@ -1528,6 +1539,7 @@ static void trx_undo_mem_init_for_reuse(
   ut_a(undo->id < TRX_RSEG_N_SLOTS);
 
   undo->state = TRX_UNDO_ACTIVE;
+  undo->preserve_temp_undo_cookie = 0;
   undo->del_marks = FALSE;
   undo->trx_id = trx_id;
   undo->xid = *xid;
@@ -1667,6 +1679,52 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
   }
 
   return (err);
+}
+
+dberr_t trx_undo_create_for_temp_preserve(trx_rseg_t *rseg,
+                                         uint64_t owner_trx_id, bool insert,
+                                         trx_undo_t **output, mtr_t *mtr) {
+  if (rseg == nullptr || output == nullptr || mtr == nullptr ||
+      owner_trx_id == 0 || owner_trx_id >= (uint64_t{1} << 48) ||
+      !fsp_is_system_temporary(rseg->space_id) ||
+      mtr->get_log_mode() != MTR_LOG_NO_REDO) return DB_ERROR;
+  ut_ad(mutex_own(&rseg->mutex));
+  if (rseg->get_curr_size() >= rseg->max_size) return DB_OUT_OF_FILE_SPACE;
+  XID xid;
+  xid.reset();
+  const auto type = insert ? TRX_UNDO_INSERT : TRX_UNDO_UPDATE;
+  // Allocate the owner before a slot or FSEG can become visible. Nothing
+  // after successful seg_create allocates C++ memory or can lose its owner.
+  auto *undo = trx_undo_mem_create(rseg, 0, type, owner_trx_id, &xid, FIL_NULL, 0);
+  if (undo == nullptr) return DB_OUT_OF_MEMORY;
+  DBUG_EXECUTE_IF("preserve_temp_target_undo_before_create_oom", {
+    DBUG_PRINT("preserve_temp_import",
+               ("temporary target undo allocation fault before slot"));
+    trx_undo_mem_free(undo);
+    return DB_OUT_OF_MEMORY;
+  });
+  auto *rseg_header =
+      trx_rsegf_get(rseg->space_id, rseg->page_no, rseg->page_size, mtr);
+  page_t *page = nullptr;
+  ulint slot = 0;
+  const auto err = trx_undo_seg_create(rseg, rseg_header, type, &slot, &page, mtr);
+  if (err != DB_SUCCESS) {
+    trx_undo_mem_free(undo);
+    return err;
+  }
+  const auto offset = trx_undo_header_create(page, owner_trx_id, mtr);
+  trx_undo_header_add_space_for_xid(page, page + offset, mtr, false);
+  undo->id = slot;
+  undo->hdr_page_no = undo->last_page_no = undo->top_page_no = page_get_page_no(page);
+  undo->hdr_offset = offset;
+  undo->top_offset = 0;
+  undo->top_undo_no = 0;
+  undo->preserve_no_redo_undo_disable_cache = true;
+  rseg->incr_curr_size();
+  if (insert) UT_LIST_ADD_FIRST(rseg->insert_undo_list, undo);
+  else UT_LIST_ADD_FIRST(rseg->update_undo_list, undo);
+  *output = undo;
+  return DB_SUCCESS;
 }
 
 /*================ UNDO LOG ASSIGNMENT AND CLEANUP =====================*/
@@ -1834,6 +1892,8 @@ dberr_t trx_undo_assign_undo(
   mtr.start();
   if (no_redo) {
     mtr.set_log_mode(MTR_LOG_NO_REDO);
+    if (trx->preserve_temp_undo_cookie)
+      mtr.set_preserve_temp_undo_cookie(trx->preserve_temp_undo_cookie);
   } else {
     ut_ad(&trx->rsegs.m_redo == undo_ptr);
   }
@@ -1860,6 +1920,7 @@ dberr_t trx_undo_assign_undo(
     }
   }
 
+  undo->preserve_temp_undo_cookie = no_redo ? trx->preserve_temp_undo_cookie : 0;
   if (type == TRX_UNDO_INSERT) {
     UT_LIST_ADD_FIRST(rseg->insert_undo_list, undo);
     ut_ad(undo_ptr->insert_undo == nullptr);
@@ -1899,6 +1960,10 @@ page_t *trx_undo_set_state_at_finish(
     trx_undo_t *undo, /*!< in: undo log memory copy */
     mtr_t *mtr)       /*!< in: mtr */
 {
+  if (undo->preserve_temp_undo_cookie) {
+    trx_preserve_temp_undo_capture_close(undo->preserve_temp_undo_cookie);
+    undo->preserve_temp_undo_cookie = 0;
+  }
   trx_usegf_t *seg_hdr;
   trx_upagef_t *page_hdr;
   page_t *undo_page;
@@ -1938,6 +2003,10 @@ page_t *trx_undo_set_state_at_finish(
 @return undo log segment header page, x-latched */
 page_t *trx_undo_set_state_at_prepare(trx_t *trx, trx_undo_t *undo,
                                       bool rollback, mtr_t *mtr) {
+  if (undo->preserve_temp_undo_cookie) {
+    trx_preserve_temp_undo_capture_close(undo->preserve_temp_undo_cookie);
+    undo->preserve_temp_undo_cookie = 0;
+  }
   trx_usegf_t *seg_hdr;
   trx_ulogf_t *undo_header;
   page_t *undo_page;

@@ -1,0 +1,2 @@
+--let $contract_undo_cache_invalidate= 1
+--source suite/preserve_trx/t/temp_capture_undo_page_cache.test

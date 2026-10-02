@@ -1,0 +1,70 @@
+# native target temporary undo retry
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
+CREATE TABLE t_capture_undo_failure(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO t_capture_undo_failure VALUES(1, 10);
+CREATE TEMPORARY TABLE tmp_capture_undo_failure(
+id INT PRIMARY KEY,
+v VARCHAR(512) CHARACTER SET latin1 NOT NULL,
+b VARBINARY(512) NOT NULL DEFAULT 0x00ff,
+c VARCHAR(16) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL DEFAULT 'C',
+u VARCHAR(16) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT 'U',
+KEY(v(16))
+) ENGINE=InnoDB;
+INSERT INTO tmp_capture_undo_failure(id, v) VALUES(1, REPEAT('a', 512));
+SELECT COUNT(*) AS baseline_rows, SUM(id) AS baseline_ids
+FROM tmp_capture_undo_failure;
+baseline_rows	baseline_ids
+128	8256
+START TRANSACTION;
+UPDATE tmp_capture_undo_failure SET v=REPEAT('b', 512);
+DELETE FROM tmp_capture_undo_failure WHERE MOD(id, 8)=0;
+INSERT INTO tmp_capture_undo_failure(id, v) VALUES
+(1001, REPEAT('c', 512)), (1002, REPEAT('c', 512));
+UPDATE t_capture_undo_failure SET v=99 WHERE id=1;
+INSERT INTO t_capture_undo_failure VALUES(2, 20);
+DRAIN TRANSACTIONS PRESERVE;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+expected kernel branch reached
+SELECT COUNT(*) AS preserved_count FROM performance_schema.preserved_transactions;
+preserved_count
+0
+SELECT COUNT(*)=114 AND SUM(id)=9171
+AND SUM(ASCII(v))=11174 AND SUM(OCTET_LENGTH(v))=114*512 AS contents_ok
+FROM tmp_capture_undo_failure;
+contents_ok
+1
+SELECT * FROM t_capture_undo_failure ORDER BY id;
+id	v
+1	99
+2	20
+UPDATE tmp_capture_undo_failure SET v=REPEAT('d', 512) WHERE id=1;
+DELETE FROM tmp_capture_undo_failure WHERE id=1002;
+INSERT INTO tmp_capture_undo_failure(id, v) VALUES(1003, REPEAT('e', 512));
+UPDATE t_capture_undo_failure SET v=101 WHERE id=1;
+SELECT COUNT(*)=114 AND SUM(id)=9172 AND SUM(ASCII(v))=11178 AS continued_dml_ok
+FROM tmp_capture_undo_failure;
+continued_dml_ok
+1
+ROLLBACK;
+SELECT COUNT(*)=128 AND SUM(id)=8256
+AND SUM(v=REPEAT('a', 512))=128
+AND SUM(b=0x00ff AND c='C' AND u='U')=128 AS rollback_ok
+FROM tmp_capture_undo_failure;
+rollback_ok
+1
+SELECT * FROM t_capture_undo_failure ORDER BY id;
+id	v
+1	10
+START TRANSACTION;
+UPDATE tmp_capture_undo_failure SET v=REPEAT('z', 512) WHERE id=1;
+UPDATE t_capture_undo_failure SET v=11 WHERE id=1;
+COMMIT;
+SELECT id, LEFT(v, 1) AS committed_value FROM tmp_capture_undo_failure WHERE id=1;
+id	committed_value
+1	z
+SELECT * FROM t_capture_undo_failure ORDER BY id;
+id	v
+1	11
+DROP TEMPORARY TABLE tmp_capture_undo_failure;
+DROP TABLE t_capture_undo_failure;

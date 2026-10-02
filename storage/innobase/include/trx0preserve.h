@@ -275,19 +275,30 @@ dberr_t trx_preserve_reactivate_prepare_failure_in_original_thd(
     THD *thd, trx_preserve_thd_transition_failure *reason = nullptr);
 dberr_t trx_preserve_activate_reattached_in_original_thd(trx_t *trx, THD *thd);
 bool trx_preserve_is_active_attached_to_thd(trx_t *trx, THD *thd);
-dberr_t trx_preserve_freeze_current(THD *thd, const XID &xid);
-trx_t *trx_preserve_create_temp_only_claimed(const XID &xid, uint64_t trx_id);
+dberr_t trx_preserve_freeze_current(THD *thd, const XID &xid,
+                                    bool read_context = false);
+/** Exact native no-undo context proof; does not allocate a transaction. */
+bool trx_preserve_current_thd_has_read_context(THD *thd);
+bool trx_preserve_is_read_context(trx_t *trx);
+/** Non-creating phase-1 probe. Caller pins THD and holds LOCK_thd_data;
+only a server-idle target can prove absence of a native transaction. */
+bool trx_preserve_idle_thd_has_no_engine(THD *thd);
+trx_t *trx_preserve_create_temp_only_claimed(const XID &xid, uint64_t trx_id,
+    uint64_t freeze_lsn = 0, uint64_t safe_next_floor = 0);
 bool trx_preserve_engine_state_facts(const trx_t *trx,
                                      bool *has_persistent_state,
                                      bool *has_temp_state);
+/** Freeze-boundary proof for a detached transaction with only temporary undo. */
+bool trx_preserve_export_temp_only_facts(trx_t *trx, const XID &expected_xid,
+                                         uint64_t *owner, uint64_t *freeze_lsn);
+bool trx_preserve_export_read_context_facts(trx_t *trx, const XID &expected_xid,
+                                           uint64_t *owner, uint64_t *freeze_lsn);
 uint64_t trx_preserve_trx_id(const trx_t *trx);
 void trx_preserve_release_claim_before_free(trx_t *trx);
-bool trx_preserve_current_thd_has_read_view(THD *thd);
 bool trx_preserve_current_thd_has_record_locks(THD *thd);
-bool trx_preserve_current_thd_has_no_redo_undo(THD *thd);
 bool trx_preserve_current_thd_no_redo_undo_state(THD *thd, bool *present,
-                                                 uint64_t *top_undo_no);
-bool trx_preserve_current_thd_has_autoinc_locks(THD *thd);
+                                                 uint64_t *top_undo_no,
+                                                 bool live_records_only = false);
 bool trx_preserve_trx_has_read_view(trx_t *trx);
 bool trx_preserve_trx_has_autoinc_locks(trx_t *trx);
 uint32_t trx_preserve_modified_table_count(trx_t *trx);
@@ -350,11 +361,15 @@ bool trx_preserve_validate_trx_id_store_fact(uint64_t store_value,
 void trx_preserve_close_read_views_for_shutdown();
 dberr_t trx_preserve_export_read_view(THD *thd, std::string *payload,
                                       uint64_t *low_limit_no);
-dberr_t trx_preserve_import_read_view(trx_t *trx, const std::string &payload);
-dberr_t trx_preserve_debug_replace_current_thd_read_view(
-    THD *thd, const std::string &payload);
+/** Export after detach, fixing a read-only view's creator at the freeze boundary. */
+dberr_t trx_preserve_export_frozen_read_view(trx_t *trx, std::string *payload,
+                                           uint64_t *low_limit_no);
+dberr_t trx_preserve_import_read_view(trx_t *trx, const std::string &payload,
+                                     bool allow_stopped_purge = false);
 bool trx_preserve_read_view_payload_is_valid_for_import(
     const std::string &payload);
+bool trx_preserve_read_view_payload_matches_owner(const std::string &payload,
+                                                 uint64_t owner);
 dberr_t trx_preserve_export_record_locks(trx_t *trx, std::string *payload);
 dberr_t trx_preserve_export_record_locks(trx_t *trx, std::string *payload,
                                          uint32_t max_lock_count);
@@ -428,33 +443,17 @@ bool trx_preserve_table_locks_payload_lock_count(
     const std::string &payload, uint32_t *lock_count);
 bool trx_preserve_table_locks_payload_has_autoinc(const std::string &payload);
 
-struct Preserve_table_lock_import_debug_result {
-  dberr_t export_err{DB_ERROR};
-  dberr_t import_err{DB_ERROR};
-  dberr_t reexport_err{DB_ERROR};
-  dberr_t release_err{DB_ERROR};
-  bool valid{false};
-  bool count_ok{false};
-  bool reexport_count_ok{false};
-  uint32_t count{0};
-  uint32_t reexport_count{0};
-};
 
-void trx_preserve_debug_table_lock_import_roundtrip(
-    THD *thd, uint32_t max_lock_count,
-    Preserve_table_lock_import_debug_result *result);
 
 dberr_t trx_preserve_export_savepoints(trx_t *trx, std::string *payload);
 dberr_t trx_preserve_export_savepoints(THD *thd, std::string *payload);
 dberr_t trx_preserve_import_savepoints(
     trx_t *trx, const std::string &payload,
     const std::vector<std::string> &savepoint_names);
-dberr_t trx_preserve_import_current_thd_savepoints(THD *thd,
-                                                  const std::string &payload);
 bool trx_preserve_savepoints_payload_is_valid_for_import(
-    const std::string &payload, uint32_t *savepoint_count);
+    const std::string &payload, uint32_t *savepoint_count,
+    uint64_t *undo_no_floor = nullptr);
 dberr_t trx_preserve_set_isolation(trx_t *trx, uint8_t tx_isolation);
-dberr_t trx_preserve_set_current_thd_isolation(THD *thd, uint8_t tx_isolation);
 bool trx_preserve_thd_can_accept_preserved_trx(THD *thd);
 bool trx_preserve_rseg_has_preserved_trx(const trx_rseg_t *rseg);
 void trx_preserve_collect_preserved_rsegs(
@@ -462,17 +461,11 @@ void trx_preserve_collect_preserved_rsegs(
 void trx_preserve_note_rseg_owner_state_change(
     trx_t *trx, int old_state, int new_state);
 
-struct Preserve_rseg_collection_debug_result {
-  bool contains_redo{false};
-  bool contains_noredo{false};
-  uint32_t count{0};
-};
 
-void trx_preserve_debug_current_thd_rseg_collection(
-    THD *thd, Preserve_rseg_collection_debug_result *result);
 
 trx_t *trx_preserve_detach_current_thd(
-    THD *thd, trx_preserve_thd_transition_failure *reason = nullptr);
+    THD *thd, trx_preserve_thd_transition_failure *reason = nullptr,
+    bool read_context = false);
 dberr_t trx_preserve_attach_to_thd(trx_t *trx, THD *thd);
 dberr_t trx_preserve_reattach_preserved_to_original_thd(trx_t *trx, THD *thd);
 dberr_t trx_preserve_detach_resumed_from_thd(trx_t *trx, THD *thd);

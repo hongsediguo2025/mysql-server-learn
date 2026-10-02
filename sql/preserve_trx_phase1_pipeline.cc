@@ -70,7 +70,7 @@ uint64_t monotonic_us() {
 }
 
 size_t family_index(Preserve_trx_phase1_pipeline_family family) {
-  return family == Preserve_trx_phase1_pipeline_family::RECORD_LOCK ? 0 : 1;
+  return static_cast<size_t>(family);
 }
 
 struct Phase1_pipeline_family_key {
@@ -163,7 +163,8 @@ enum class Phase1_pipeline_operation_stage : uint8_t {
   RECORD_CAPTURE,
   RECORD_STORE_SNAPSHOT,
   RECORD_PREPARE,
-  BINLOG_PREPARE
+  BINLOG_PREPARE,
+  TEMP_STEP
 };
 
 class Phase1_pipeline_operation_permit {
@@ -247,15 +248,25 @@ void destroy_pipeline_worker_thd(THD *worker_thd, bool thread_initialized) {
 class Preserve_trx_phase1_pipeline::Impl {
  public:
   Impl(const Preserve_trx_phase1_pipeline_config &config,
-       Preserve_trx_phase1_binlog_provider_port *binlog_provider)
-      : m_config(config), m_binlog_provider(binlog_provider) {}
+       Preserve_trx_phase1_binlog_provider_port *binlog_provider,
+       Preserve_trx_phase1_temp_provider_port *temp_provider)
+      : m_config(config), m_binlog_provider(binlog_provider),
+        m_temp_provider(temp_provider) {}
 
   ~Impl() {
     const bool clean = join_while_draining();
     assert(clean);
   }
 
+  void clear_temp_demand() {
+    std::lock_guard<std::mutex> guard(m_mutex);
+    m_temp_waiting_bytes = 0;
+    advance_revision_locked();
+    m_condition.notify_all();
+  }
+
   bool start() {
+
     if (!config_valid()) {
       {
         std::lock_guard<std::mutex> invalid_guard(m_mutex);
@@ -463,6 +474,7 @@ class Preserve_trx_phase1_pipeline::Impl {
       Phase1_pipeline_slot *slot = slot_for_token_locked(admission_id);
       if (slot == nullptr ||
           slot->state != Phase1_pipeline_slot_state::OWNER_HELD ||
+          slot->descriptor.family == Preserve_trx_phase1_pipeline_family::TEMP_TABLE ||
           slot->result.status !=
               Preserve_trx_phase1_pipeline_result_status::PREPARED ||
           slot->cancel_revision != m_cancel_revision ||
@@ -560,7 +572,7 @@ class Preserve_trx_phase1_pipeline::Impl {
           m_lifecycle == Preserve_trx_phase1_pipeline_lifecycle::RUNNING &&
           !m_wait_permit_admission_open && !m_ordinary_admission_open &&
           m_record_sequence_queue.empty() && m_record_ready_queue.empty() &&
-          m_binlog_ready_queue.empty();
+          m_binlog_ready_queue.empty() && m_temp_ready_queue.empty();
       advance_revision_locked();
     }
     m_condition.notify_all();
@@ -584,7 +596,7 @@ class Preserve_trx_phase1_pipeline::Impl {
       transitioned =
           m_lifecycle == Preserve_trx_phase1_pipeline_lifecycle::FINALIZING &&
           m_record_sequence_queue.empty() && m_record_ready_queue.empty() &&
-          m_binlog_ready_queue.empty();
+          m_binlog_ready_queue.empty() && m_temp_ready_queue.empty();
       advance_revision_locked();
     }
     m_condition.notify_all();
@@ -722,6 +734,9 @@ class Preserve_trx_phase1_pipeline::Impl {
     result.credit_in_use_bytes = m_credit_in_use_bytes;
     result.record_credit_in_use_bytes = m_family_credit_in_use_bytes[0];
     result.binlog_credit_in_use_bytes = m_family_credit_in_use_bytes[1];
+    result.temp_credit_in_use_bytes = m_family_credit_in_use_bytes[2];
+    result.temp_steps = m_temp_steps;
+    result.ordinary_temp_slow_operations = m_ordinary_temp_slow_operations;
     result.tail_record_credit_consumed_bytes = m_tail_credit_consumed_bytes[0];
     result.cancel_revision = m_cancel_revision;
     result.operation_cutoff_us = m_operation_cutoff_us;
@@ -1168,6 +1183,7 @@ class Preserve_trx_phase1_pipeline::Impl {
       m_record_sequence_queue.initialize(m_config.result_slots);
       m_record_ready_queue.initialize(m_config.result_slots);
       m_binlog_ready_queue.initialize(m_config.result_slots);
+      m_temp_ready_queue.initialize(m_config.result_slots);
       m_final_record_sequence_queue.initialize(m_config.result_slots);
       m_final_ready_queue.initialize(m_config.result_slots);
       m_result_queue.initialize(m_config.result_slots);
@@ -1330,8 +1346,12 @@ class Preserve_trx_phase1_pipeline::Impl {
           if (finished_us >= started_us && !final_generation &&
               kind == Preserve_trx_phase1_pipeline_operation_kind::
                           NATIVE_WAIT_CAPABLE &&
-              stage == Phase1_pipeline_operation_stage::BINLOG_PREPARE) {
-            ++m_ordinary_binlog_slow_operations;
+              (stage == Phase1_pipeline_operation_stage::BINLOG_PREPARE ||
+               stage == Phase1_pipeline_operation_stage::TEMP_STEP)) {
+            if (stage == Phase1_pipeline_operation_stage::TEMP_STEP)
+              ++m_ordinary_temp_slow_operations;
+            else
+              ++m_ordinary_binlog_slow_operations;
           } else {
             ++m_operation_budget_overruns;
             enter_canceling_locked();
@@ -1439,6 +1459,7 @@ class Preserve_trx_phase1_pipeline::Impl {
         overruns = &m_final_record_prepare_operation_overruns;
         break;
       case Phase1_pipeline_operation_stage::BINLOG_PREPARE:
+      case Phase1_pipeline_operation_stage::TEMP_STEP:
         return;
     }
     ++*samples;
@@ -1651,6 +1672,7 @@ class Preserve_trx_phase1_pipeline::Impl {
       uint64_t operation_deadline_us = 0;
       bool final_generation = false;
       bool debug_prepare = false;
+      bool temp_step_executed = false;
       Preserve_trx_phase1_pipeline_family family =
           Preserve_trx_phase1_pipeline_family::RECORD_LOCK;
       Preserve_trx_phase1_work_descriptor descriptor;
@@ -1733,14 +1755,15 @@ class Preserve_trx_phase1_pipeline::Impl {
         const Phase1_pipeline_operation_stage operation_stage =
             family == Preserve_trx_phase1_pipeline_family::RECORD_LOCK
                 ? Phase1_pipeline_operation_stage::RECORD_PREPARE
-                : Phase1_pipeline_operation_stage::BINLOG_PREPARE;
+                : family == Preserve_trx_phase1_pipeline_family::TEMP_TABLE
+                    ? Phase1_pipeline_operation_stage::TEMP_STEP
+                    : Phase1_pipeline_operation_stage::BINLOG_PREPARE;
         operation_status = try_acquire_operation(
             token, revision, operation_kind, operation_stage,
             final_generation, &permit);
         if (permit) {
           if (debug_prepare) {
-            if (family ==
-                Preserve_trx_phase1_pipeline_family::RECORD_LOCK) {
+            if (family != Preserve_trx_phase1_pipeline_family::BINLOG_CACHE) {
               prepare_outcome.status =
                   Preserve_trx_phase1_pipeline_result_status::PREPARED;
             } else {
@@ -1762,6 +1785,14 @@ class Preserve_trx_phase1_pipeline::Impl {
             preserve_trx_phase1_record_adapter_prepare(
                 worker_thd, descriptor, capture_payload, control,
                 &prepare_outcome);
+          } else if (family == Preserve_trx_phase1_pipeline_family::TEMP_TABLE) {
+            if (m_temp_provider == nullptr) {
+              prepare_outcome.status = Preserve_trx_phase1_pipeline_result_status::ADAPTER_NOT_INSTALLED;
+            } else {
+              temp_step_executed = true;
+              prepare_outcome.status = m_temp_provider->step(
+                  descriptor, descriptor.capture_byte_limit, &prepare_outcome.reason);
+            }
           } else {
             Adapter_control_context context;
             context.pipeline = this;
@@ -1818,11 +1849,11 @@ class Preserve_trx_phase1_pipeline::Impl {
           fail_invariant_locked();
         } else {
           finish_executor_locked(slot);
+          if (temp_step_executed) ++m_temp_steps;
           slot->record_capture_payload.reset();
           if (operation_status == Phase1_pipeline_operation_status::GRANTED &&
               work_still_valid_locked(*slot)) {
-            if (family ==
-                Preserve_trx_phase1_pipeline_family::RECORD_LOCK) {
+            if (family != Preserve_trx_phase1_pipeline_family::BINLOG_CACHE) {
               publish_adapter_result_locked(token, &prepare_outcome);
             } else {
               publish_binlog_adapter_result_locked(token,
@@ -1866,18 +1897,28 @@ class Preserve_trx_phase1_pipeline::Impl {
           descriptor.family};
       if (family_key_exists_locked(key))
         return Preserve_trx_phase1_pipeline_submit_status::SINGLE_FLIGHT;
+      const bool temp = descriptor.family == Preserve_trx_phase1_pipeline_family::TEMP_TABLE;
+      if (temp && descriptor.estimated_credit_bytes > m_pipeline_credit_bytes)
+        return Preserve_trx_phase1_pipeline_submit_status::INVALID_DESCRIPTOR;
+      if (temp) m_temp_waiting_bytes = descriptor.estimated_credit_bytes;
+      if (!temp && !final_generation && m_temp_waiting_bytes != 0 &&
+          outstanding_slots_locked() + 1 >= m_slots.size()) {
+        ++m_submit_no_slot;
+        return Preserve_trx_phase1_pipeline_submit_status::NO_SLOT;
+      }
       Phase1_pipeline_slot *slot = allocate_slot_locked();
       if (slot == nullptr) {
         ++m_submit_no_slot;
         return Preserve_trx_phase1_pipeline_submit_status::NO_SLOT;
       }
+      slot->descriptor = descriptor;
       if (!can_reserve_credit_locked(descriptor.family, final_generation,
                                      descriptor.estimated_credit_bytes)) {
         ++m_submit_no_credit;
         reset_unpublished_slot_locked(slot);
         return Preserve_trx_phase1_pipeline_submit_status::NO_CREDIT;
       }
-      slot->descriptor = descriptor;
+      if (temp) m_temp_waiting_bytes = 0;
       slot->state = Phase1_pipeline_slot_state::QUEUED;
       reserve_credit_locked(slot, descriptor.estimated_credit_bytes);
       const uint64_t token = token_for_slot_locked(slot);
@@ -1888,7 +1929,8 @@ class Preserve_trx_phase1_pipeline::Impl {
                  Preserve_trx_phase1_pipeline_family::RECORD_LOCK) {
         queue = &m_record_sequence_queue;
       } else {
-        queue = &m_binlog_ready_queue;
+        queue = descriptor.family == Preserve_trx_phase1_pipeline_family::TEMP_TABLE
+                    ? &m_temp_ready_queue : &m_binlog_ready_queue;
       }
       if (!queue->push(token)) {
         fail_invariant_locked();
@@ -1917,7 +1959,9 @@ class Preserve_trx_phase1_pipeline::Impl {
     if (descriptor.family !=
             Preserve_trx_phase1_pipeline_family::RECORD_LOCK &&
         descriptor.family !=
-            Preserve_trx_phase1_pipeline_family::BINLOG_CACHE) {
+            Preserve_trx_phase1_pipeline_family::BINLOG_CACHE &&
+        descriptor.family !=
+            Preserve_trx_phase1_pipeline_family::TEMP_TABLE) {
       return false;
     }
     if (descriptor.family ==
@@ -1925,6 +1969,9 @@ class Preserve_trx_phase1_pipeline::Impl {
         descriptor.capture_byte_limit > descriptor.estimated_credit_bytes) {
       return false;
     }
+    if (descriptor.family == Preserve_trx_phase1_pipeline_family::TEMP_TABLE &&
+        (descriptor.capture_byte_limit == 0 ||
+         descriptor.capture_byte_limit > descriptor.estimated_credit_bytes)) return false;
     if (descriptor.use_record_store_snapshot &&
         (!final_generation ||
          descriptor.family !=
@@ -2013,6 +2060,7 @@ class Preserve_trx_phase1_pipeline::Impl {
 #ifndef DBUG_OFF
     if (m_debug_family_demand[index]) return true;
 #endif
+    if (index == 2 && m_temp_waiting_bytes != 0) return true;
     for (const Phase1_pipeline_slot &slot : m_slots) {
       if (slot.state != Phase1_pipeline_slot_state::FREE &&
           family_index(slot.descriptor.family) == index) {
@@ -2023,16 +2071,10 @@ class Preserve_trx_phase1_pipeline::Impl {
   }
 
   bool credit_empty_and_balanced_locked() const {
-    if (m_family_credit_in_use_bytes[0] >
-        std::numeric_limits<uint64_t>::max() -
-            m_family_credit_in_use_bytes[1])
-      return false;
-    const uint64_t family_total = m_family_credit_in_use_bytes[0] +
-                                  m_family_credit_in_use_bytes[1];
-    return family_total == m_credit_in_use_bytes &&
-           m_credit_in_use_bytes == 0 &&
-           m_family_credit_in_use_bytes[0] == 0 &&
-           m_family_credit_in_use_bytes[1] == 0;
+    return m_credit_in_use_bytes == 0 &&
+           std::all_of(std::begin(m_family_credit_in_use_bytes),
+                       std::end(m_family_credit_in_use_bytes),
+                       [](uint64_t bytes) { return bytes == 0; });
   }
 
   bool can_reserve_credit_locked(Preserve_trx_phase1_pipeline_family family,
@@ -2050,16 +2092,22 @@ class Preserve_trx_phase1_pipeline::Impl {
              m_tail_credit_consumed_bytes[index] <= cap - additional_bytes;
     }
 
-    const uint64_t reserve[2] = {m_pipeline_record_reserve_bytes,
-                                 m_pipeline_binlog_reserve_bytes};
-    const size_t other = 1 - index;
-    const uint64_t shared =
-        m_pipeline_credit_bytes - reserve[0] - reserve[1];
+    // TEMP borrows the existing shared pool. A waiting TEMP admission protects
+    // its next step from later admissions/growth, without reserving idle bytes.
+    if (family != Preserve_trx_phase1_pipeline_family::TEMP_TABLE &&
+        m_temp_waiting_bytes != 0 &&
+        (m_temp_waiting_bytes > m_pipeline_credit_bytes - additional_bytes ||
+         m_credit_in_use_bytes > m_pipeline_credit_bytes - additional_bytes -
+                                    m_temp_waiting_bytes)) return false;
+    const uint64_t reserve[3] = {m_pipeline_record_reserve_bytes,
+                                m_pipeline_binlog_reserve_bytes, 0};
+    const uint64_t shared = m_pipeline_credit_bytes - reserve[0] - reserve[1];
     uint64_t family_limit = reserve[index] + shared;
-    if (!family_has_demand_locked(other)) family_limit += reserve[other];
+    for (size_t other = 0; other < 3; ++other)
+      if (other != index && !family_has_demand_locked(other))
+        family_limit += reserve[other];
     return additional_bytes <= family_limit &&
-           m_family_credit_in_use_bytes[index] <=
-               family_limit - additional_bytes;
+           m_family_credit_in_use_bytes[index] <= family_limit - additional_bytes;
   }
 
   void reserve_credit_locked(Phase1_pipeline_slot *slot,
@@ -2264,6 +2312,8 @@ class Preserve_trx_phase1_pipeline::Impl {
     cancel_queue_locked(&m_record_sequence_queue, reason);
     cancel_queue_locked(&m_record_ready_queue, reason);
     cancel_queue_locked(&m_binlog_ready_queue, reason);
+    cancel_queue_locked(&m_temp_ready_queue, reason);
+    m_temp_waiting_bytes = 0;
     m_cancel_queue_sweep_active = sweep_was_active;
   }
 
@@ -2286,6 +2336,8 @@ class Preserve_trx_phase1_pipeline::Impl {
       cancel_queue_locked(&m_record_sequence_queue, "pipeline_cancelled");
       cancel_queue_locked(&m_record_ready_queue, "pipeline_cancelled");
       cancel_queue_locked(&m_binlog_ready_queue, "pipeline_cancelled");
+      cancel_queue_locked(&m_temp_ready_queue, "pipeline_cancelled");
+      m_temp_waiting_bytes = 0;
       cancel_queue_locked(&m_final_record_sequence_queue,
                           "pipeline_cancelled");
       cancel_queue_locked(&m_final_ready_queue, "pipeline_cancelled");
@@ -2327,7 +2379,8 @@ class Preserve_trx_phase1_pipeline::Impl {
       return !m_final_ready_queue.empty();
     return m_lifecycle == Preserve_trx_phase1_pipeline_lifecycle::RUNNING &&
            m_ordinary_admission_open &&
-           (!m_record_ready_queue.empty() || !m_binlog_ready_queue.empty());
+           (!m_record_ready_queue.empty() || !m_binlog_ready_queue.empty() ||
+            !m_temp_ready_queue.empty());
   }
 
   bool dispatchable_work_available_locked() const {
@@ -2352,11 +2405,18 @@ class Preserve_trx_phase1_pipeline::Impl {
         ++m_ordinary_active_limit_deferrals;
         return false;
       }
-      if (!m_record_ready_queue.empty() &&
+      if (!m_temp_ready_queue.empty() &&
+          (m_non_temp_dispatch_streak >= 3 ||
+           (m_record_ready_queue.empty() && m_binlog_ready_queue.empty()))) {
+        if (!m_temp_ready_queue.pop(token)) return false;
+        m_non_temp_dispatch_streak = 0;
+      } else if (!m_record_ready_queue.empty() &&
           (m_binlog_ready_queue.empty() || m_record_dispatch_streak < 2)) {
+        m_non_temp_dispatch_streak = std::min(3U, m_non_temp_dispatch_streak + 1);
         if (!m_record_ready_queue.pop(token)) return false;
         ++m_record_dispatch_streak;
       } else if (m_binlog_ready_queue.pop(token)) {
+        m_non_temp_dispatch_streak = std::min(3U, m_non_temp_dispatch_streak + 1);
         m_record_dispatch_streak = 0;
       } else {
         return false;
@@ -2430,13 +2490,13 @@ class Preserve_trx_phase1_pipeline::Impl {
 
   bool all_work_queues_empty_locked() const {
     return m_record_sequence_queue.empty() && m_record_ready_queue.empty() &&
-           m_binlog_ready_queue.empty() &&
+           m_binlog_ready_queue.empty() && m_temp_ready_queue.empty() &&
            m_final_record_sequence_queue.empty() && m_final_ready_queue.empty();
   }
 
   uint64_t queued_count_locked() const {
     return m_record_sequence_queue.size() + m_record_ready_queue.size() +
-           m_binlog_ready_queue.size() +
+           m_binlog_ready_queue.size() + m_temp_ready_queue.size() +
            m_final_record_sequence_queue.size() + m_final_ready_queue.size();
   }
 
@@ -2594,6 +2654,9 @@ class Preserve_trx_phase1_pipeline::Impl {
             << current.effective_record_reserve_bytes
             << " effective_binlog_reserve_bytes="
             << current.effective_binlog_reserve_bytes
+            << " temp_steps=" << current.temp_steps
+            << " temp_credit_in_use_bytes=" << current.temp_credit_in_use_bytes
+            << " ordinary_temp_slow_operations=" << current.ordinary_temp_slow_operations
             << " publication_failures=" << current.publication_failures
             << " publication_ack_uncertain="
             << current.publication_ack_uncertain
@@ -2617,6 +2680,9 @@ class Preserve_trx_phase1_pipeline::Impl {
 
   const Preserve_trx_phase1_pipeline_config m_config;
   Preserve_trx_phase1_binlog_provider_port *m_binlog_provider{nullptr};
+  Preserve_trx_phase1_temp_provider_port *m_temp_provider{nullptr};
+  uint64_t m_temp_steps{0};
+  uint64_t m_ordinary_temp_slow_operations{0};
   mutable std::mutex m_mutex;
   std::condition_variable m_condition;
   std::mutex m_join_mutex;
@@ -2633,13 +2699,15 @@ class Preserve_trx_phase1_pipeline::Impl {
   bool m_debug_hold_first_ordinary{false};
   bool m_debug_first_ordinary_held{false};
   bool m_debug_cap_deferral_observed{false};
-  bool m_debug_family_demand[2]{false, false};
+  bool m_debug_family_demand[3]{};
 #endif
   bool m_cancel_queue_sweep_active{false};
   uint32_t m_init_reports{0};
   uint32_t m_workers_ready{0};
   uint32_t m_init_failures{0};
   uint32_t m_record_dispatch_streak{0};
+  uint32_t m_non_temp_dispatch_streak{0};
+  uint64_t m_temp_waiting_bytes{0};
   size_t m_free_slot_cursor{0};
   uint64_t m_event_revision{0};
   uint64_t m_cancel_revision{1};
@@ -2650,8 +2718,8 @@ class Preserve_trx_phase1_pipeline::Impl {
   uint64_t m_pipeline_record_reserve_bytes{0};
   uint64_t m_pipeline_binlog_reserve_bytes{0};
   uint64_t m_credit_in_use_bytes{0};
-  uint64_t m_family_credit_in_use_bytes[2]{0, 0};
-  uint64_t m_tail_credit_consumed_bytes[2]{0, 0};
+  uint64_t m_family_credit_in_use_bytes[3]{};
+  uint64_t m_tail_credit_consumed_bytes[3]{};
   uint64_t m_active_jobs{0};
   uint32_t m_ordinary_active_limit{0};
   uint64_t m_active_ordinary_jobs{0};
@@ -2694,6 +2762,7 @@ class Preserve_trx_phase1_pipeline::Impl {
   Phase1_pipeline_token_ring m_record_sequence_queue;
   Phase1_pipeline_token_ring m_record_ready_queue;
   Phase1_pipeline_token_ring m_binlog_ready_queue;
+  Phase1_pipeline_token_ring m_temp_ready_queue;
   Phase1_pipeline_token_ring m_final_record_sequence_queue;
   Phase1_pipeline_token_ring m_final_ready_queue;
   Phase1_pipeline_token_ring m_result_queue;
@@ -2702,12 +2771,14 @@ class Preserve_trx_phase1_pipeline::Impl {
 
 Preserve_trx_phase1_pipeline::Preserve_trx_phase1_pipeline(
     const Preserve_trx_phase1_pipeline_config &config,
-    Preserve_trx_phase1_binlog_provider_port *binlog_provider)
-    : m_impl(new Impl(config, binlog_provider)) {}
+    Preserve_trx_phase1_binlog_provider_port *binlog_provider,
+    Preserve_trx_phase1_temp_provider_port *temp_provider)
+    : m_impl(new Impl(config, binlog_provider, temp_provider)) {}
 
 Preserve_trx_phase1_pipeline::~Preserve_trx_phase1_pipeline() = default;
 
 bool Preserve_trx_phase1_pipeline::start() { return m_impl->start(); }
+void Preserve_trx_phase1_pipeline::clear_temp_demand() { m_impl->clear_temp_demand(); }
 
 Preserve_trx_phase1_pipeline_submit_status
 Preserve_trx_phase1_pipeline::try_submit(

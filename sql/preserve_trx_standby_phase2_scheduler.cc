@@ -358,7 +358,7 @@ class Attempt {
     bool entered_body{false};
     bool has_old_transaction{false};
     bool pending_t0_body_first_transaction{false};
-    bool t0_running_call{false};
+    bool running_compound{false};
     bool terminalizing{false};
     uint64_t last_mdl_proof_revision{0};
     uint64_t last_mdl_proof_us{0};
@@ -387,6 +387,7 @@ class Attempt {
     uint32_t isolation_level{0};
     Preserve_trx_external_thd_pin_handle pin;
     Transaction_key old_transaction;
+    uint64_t transaction_ordinal{0};
     Command_key pending_t0_body_first_command;
     uint32_t probe_inflight{0};
     bool has_old_transaction{false};
@@ -437,7 +438,7 @@ class Attempt {
   Terminal_snapshot frozen_terminal_snapshot;
   bool terminal_snapshot_frozen{false};
   uint64_t revision{0};
-  uint64_t call_retire_revision{0};
+  uint64_t compound_revision{0};
   uint64_t mdl_demand_revision{0};
   uint64_t next_mdl_demand_generation{1};
   bool t0_registration_complete{false};
@@ -873,11 +874,11 @@ Attempt::Transaction_record *reserve_t0_transaction_locked(
 
 Attempt::Transaction_record *find_native_transaction_locked(
     Attempt *attempt, const lock_preserve_phase2_identity &identity,
-    bool *known_retiring_owner, bool *known_running_call) {
+    bool *known_retiring_owner, bool *known_running_compound) {
   if (known_retiring_owner != nullptr) *known_retiring_owner = false;
-  if (known_running_call != nullptr) *known_running_call = false;
+  if (known_running_compound != nullptr) *known_running_compound = false;
   if (attempt == nullptr || known_retiring_owner == nullptr ||
-      known_running_call == nullptr ||
+      known_running_compound == nullptr ||
       identity.raw_cookie == 0 || identity.version == 0 ||
       identity.owner_thd_cookie == 0) {
     return nullptr;
@@ -933,22 +934,23 @@ Attempt::Transaction_record *find_native_transaction_locked(
   } else {
     auto pending = attempt->commands.find(
         matching_connection->pending_t0_body_first_command);
-    if (pending == attempt->commands.end() || !pending->second.t0_member ||
+    if (pending == attempt->commands.end() ||
         !pending->second.entered_body ||
         !pending->second.pending_t0_body_first_transaction ||
         pending->first.connection_incarnation != connection_incarnation) {
       return nullptr;
     }
-    if (pending->second.t0_running_call) {
+    if (pending->second.running_compound) {
       /* The exact native owner is already executing; it needs no permit. */
       if (matching_connection->pin &&
           matching_connection->thd->preserve_trx_phase2_command_stage.load(
               std::memory_order_acquire) ==
               Preserve_trx_phase2_command_stage::EXECUTING) {
-        *known_running_call = true;
+        *known_running_compound = true;
       }
       return nullptr;
     }
+    if (!pending->second.t0_member) return nullptr;
     match = reserve_t0_transaction_locked(
         attempt, matching_connection, connection_incarnation,
         identity.raw_cookie, matching_connection->isolation_level);
@@ -987,7 +989,12 @@ Attempt::Transaction_record *reserve_t0_transaction_locked(
     return nullptr;
   }
   if (!connection->has_old_transaction) {
-    connection->old_transaction = {connection_incarnation, 1};
+    if (connection->transaction_ordinal == UINT64_MAX) {
+      mark_safety_abort_locked(attempt);
+      return nullptr;
+    }
+    connection->old_transaction = {
+        connection_incarnation, ++connection->transaction_ordinal};
     connection->has_old_transaction = true;
   }
   Attempt::Transaction_record transaction;
@@ -1242,6 +1249,34 @@ bool prove_mdl_support_at_owner_gate_locked(
   return true;
 }
 
+/*
+  An admitted multi-statement packet may commit and start another transaction.
+  Like an executing CALL, its exact native owner is allowed to finish without
+  inheriting a previous transaction's support edges. Observe its final identity
+  only at packet exit. Invalidate probes borrowed before this transition.
+*/
+void enter_running_compound_locked(Attempt *attempt,
+                                   Attempt::Connection_record *connection,
+                                   Attempt::Command_record *command) {
+  if (command->running_compound) return;
+  if (connection->has_old_transaction) {
+    auto *transaction =
+        find_transaction_locked(attempt, connection->old_transaction);
+    if (transaction == nullptr) {
+      mark_safety_abort_locked(attempt);
+      return;
+    }
+    close_transaction_locked(attempt, connection, transaction);
+  }
+  command->has_old_transaction = false;
+  command->old_transaction = {};
+  command->terminalizing = false;
+  command->running_compound = true;
+  command->pending_t0_body_first_transaction = true;
+  connection->pending_t0_body_first_command = command->key;
+  ++attempt->compound_revision;
+}
+
 void apply_command_exit_locked(
     Attempt *attempt, Attempt::Connection_record *connection,
     const Attempt::Command_record &command,
@@ -1407,6 +1442,14 @@ void register_captured_command(THD *command_thd,
 
 }  // namespace
 
+bool command_boundary_wait_active() {
+  const Attempt_handle attempt = active_route_snapshot();
+  if (attempt == nullptr) return false;
+  std::lock_guard<std::mutex> lock(attempt->mutex);
+  return attempt->t0_registration_complete &&
+         attempt->terminal == Terminal_result::RUNNING;
+}
+
 bool capture_command(THD *command_thd, Command_key *command) {
   if (command != nullptr) *command = {};
   if (command_thd == nullptr ||
@@ -1434,6 +1477,7 @@ bool capture_command(THD *command_thd, Command_key *command) {
       command_thd->preserve_trx_phase2_connection_incarnation,
       command_thd->preserve_trx_phase2_aggregate_sequence};
   command_thd->preserve_trx_phase2_outer_is_call = false;
+  command_thd->preserve_trx_phase2_outer_is_multi_statement = false;
   command_thd->preserve_trx_phase2_command_stage.store(
       Preserve_trx_phase2_command_stage::ADMISSION_INFLIGHT,
       std::memory_order_release);
@@ -1541,9 +1585,10 @@ Attempt_handle publish_and_register_t0(THD *owner,
       const bool command_is_t0 =
           stage == Preserve_trx_phase2_command_stage::T0_CLAIMED_PRE_GATE ||
           stage == Preserve_trx_phase2_command_stage::EXECUTING;
-      const bool t0_running_call =
+      const bool running_compound =
           stage == Preserve_trx_phase2_command_stage::EXECUTING &&
-          candidate->preserve_trx_phase2_outer_is_call;
+          (candidate->preserve_trx_phase2_outer_is_call ||
+           candidate->preserve_trx_phase2_outer_is_multi_statement);
       if (!command_is_t0 && !sql_transaction_active) {
         mysql_mutex_unlock(&candidate->LOCK_thd_data);
         return;
@@ -1606,7 +1651,7 @@ Attempt_handle publish_and_register_t0(THD *owner,
           return;
         }
         Attempt::Transaction_record *old_transaction = nullptr;
-        if (sql_transaction_active && !t0_running_call) {
+        if (sql_transaction_active && !running_compound) {
           old_transaction = reserve_t0_transaction_locked(
               m_attempt.get(), &connection->second,
               key.connection_incarnation, raw_engine_cookie,
@@ -1620,15 +1665,15 @@ Attempt_handle publish_and_register_t0(THD *owner,
           record.entered_body =
               stage == Preserve_trx_phase2_command_stage::EXECUTING;
           record.pending_t0_body_first_transaction =
-              record.entered_body && (!sql_transaction_active || t0_running_call);
-          record.t0_running_call = t0_running_call;
+              record.entered_body && (!sql_transaction_active || running_compound);
+          record.running_compound = running_compound;
           if (old_transaction != nullptr) {
             record.old_transaction = old_transaction->key;
             record.has_old_transaction = true;
           }
           auto command = m_attempt->commands.emplace(key, record).first;
           command->second.t0_member = true;
-          command->second.t0_running_call = record.t0_running_call;
+          command->second.running_compound = record.running_compound;
           command->second.entered_body =
               command->second.entered_body || record.entered_body;
           executing_registered = command->second.entered_body;
@@ -2010,6 +2055,10 @@ Gate_action gate_command(THD *command_thd,
         continue;
       }
       command_record.entered_body = true;
+      if (request.outer_is_multi_statement) {
+        enter_running_compound_locked(attempt.get(), &connection_record,
+                                      &command_record);
+      }
       if (!note_eligible_body_locked(attempt.get(), request.command,
                                      command_thd->thread_id())) {
         mark_safety_abort_locked(attempt.get());
@@ -2143,10 +2192,10 @@ Finish_result finish_command(THD *command_thd,
       }
       auto command = attempt->commands.find(fact.command);
       if ((command != attempt->commands.end() &&
-           command->second.t0_running_call) ||
+           command->second.running_compound) ||
           (!attempt->t0_registration_complete && fact.entered_body &&
-           fact.outer_is_call)) {
-        ++attempt->call_retire_revision;
+           (fact.outer_is_call || fact.outer_is_multi_statement))) {
+        ++attempt->compound_revision;
       }
       if (!attempt->t0_registration_complete) {
         attempt->retired_during_t0.insert(fact.command);
@@ -2200,7 +2249,7 @@ void note_teardown_begin(uint64_t connection_incarnation) {
       if (!attempt->t0_registration_complete) {
         attempt->retired_during_t0.insert(command->first);
       }
-      if (command->second.t0_running_call) ++attempt->call_retire_revision;
+      if (command->second.running_compound) ++attempt->compound_revision;
       erase_waiter_support_locked(attempt.get(), command->first,
                                   Lock_domain::INNODB);
       erase_mdl_demand_locked(attempt.get(), command->first);
@@ -2280,7 +2329,7 @@ Terminal_result tick(const Attempt_handle &attempt, uint64_t now_us,
     THD *thd{nullptr};
     uint64_t expected_waiter_cookie{0};
     uint64_t expected_waiter_version{0};
-    uint64_t call_retire_revision{0};
+    uint64_t compound_revision{0};
     bool valid{false};
     bool completes_round{false};
   };
@@ -2439,7 +2488,7 @@ Terminal_result tick(const Attempt_handle &attempt, uint64_t now_us,
         }
         work.command = candidate_key;
         work.thd = connection->second.thd;
-        work.call_retire_revision = attempt->call_retire_revision;
+        work.compound_revision = attempt->compound_revision;
         if (connection->second.has_old_transaction) {
           Attempt::Transaction_record *transaction = find_transaction_locked(
               attempt.get(), connection->second.old_transaction);
@@ -2546,7 +2595,7 @@ Terminal_result tick(const Attempt_handle &attempt, uint64_t now_us,
           work.command.connection_incarnation);
       auto command = attempt->commands.find(work.command);
       call_retire_stale_discarded =
-          work.call_retire_revision != attempt->call_retire_revision;
+          work.compound_revision != attempt->compound_revision;
       bool merge_current =
           !probe_input_stale && attempt->terminal == Terminal_result::RUNNING &&
           !call_retire_stale_discarded &&
@@ -2670,7 +2719,7 @@ Terminal_result tick(const Attempt_handle &attempt, uint64_t now_us,
               break;
             }
 
-            if (!command->second.t0_running_call) {
+            if (!command->second.running_compound) {
               Attempt::Transaction_record *waiter_transaction = nullptr;
               if (connection->second.has_old_transaction) {
                 waiter_transaction = find_transaction_locked(
@@ -2718,16 +2767,16 @@ Terminal_result tick(const Attempt_handle &attempt, uint64_t now_us,
                 break;
               }
               bool known_retiring_owner = false;
-              bool known_running_call = false;
+              bool known_running_compound = false;
               Attempt::Transaction_record *blocker =
                   find_native_transaction_locked(
                       attempt.get(), native_blockers[i].identity,
-                      &known_retiring_owner, &known_running_call);
+                      &known_retiring_owner, &known_running_compound);
               if (known_retiring_owner) {
                 mapping_stale = true;
                 break;
               }
-              if (known_running_call) continue;
+              if (known_running_compound) continue;
               if (blocker == nullptr) {
                 mapping_complete = false;
                 break;

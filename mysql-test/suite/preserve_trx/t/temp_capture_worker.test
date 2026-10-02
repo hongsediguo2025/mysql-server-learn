@@ -1,0 +1,17 @@
+--source include/have_debug.inc
+--source include/have_log_bin.inc
+--let $contract_prebuild_workers= 1
+if ($contract_native_early)
+{
+  --let $contract_prebuild_workers= 2
+}
+if ($contract_early_results)
+{
+  --let $contract_prebuild_workers= 2
+}
+--let $receiver_namespace= 1
+--let $contract_temporary= cursor
+--let $contract_loopback= 1
+--let $contract_engine= temp-only
+--let $contract_resume= success
+--source suite/preserve_trx/include/temp_id_contract_source.inc

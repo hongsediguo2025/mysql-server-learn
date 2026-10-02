@@ -404,9 +404,13 @@ data dictionary will remain locked.
 @param[in]	nonatomic	Whether it is permitted to release
 and reacquire dict_operation_lock
 @param[in,out]	handler		Table handler or NULL
+@param[out]     removed_temp_id Optional identity of a removed temporary table
+@param[out]     removed_temp_space Optional space of a removed temporary table
 @return error code or DB_SUCCESS */
 dberr_t row_drop_table_for_mysql(const char *name, trx_t *trx, bool nonatomic,
-                                 dict_table_t *handler = nullptr);
+                                 dict_table_t *handler = nullptr,
+                                 table_id_t *removed_temp_id = nullptr,
+                                 space_id_t *removed_temp_space = nullptr);
 /** Drop a table for MySQL. If the data dictionary was not already locked
 by the transaction, the transaction will be committed.  Otherwise, the
 data dictionary will remain locked.

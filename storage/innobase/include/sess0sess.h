@@ -43,6 +43,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "ut0new.h"
 
 #include <map>
+#include <new>
 
 class dict_intrinsic_table_t {
  public:
@@ -114,6 +115,7 @@ class innodb_session_t {
   /** Remove table handler entry.
   @param[in]	table_name	name of the table to remove */
   void unregister_table_handler(const char *table_name) {
+    DBUG_EXECUTE_IF("preserve_temp_handler_unregister_key_oom", throw std::bad_alloc(););
     table_cache_t::iterator it = m_open_tables.find(table_name);
     if (it == m_open_tables.end()) {
       return;
@@ -121,6 +123,15 @@ class innodb_session_t {
 
     delete (it->second);
     m_open_tables.erase(table_name);
+  }
+
+  /** Unregister with a key prepared before native table destruction. No
+  temporary string or second key lookup may allocate after the table is freed. */
+  void unregister_table_handler(const std::string &table_name) noexcept {
+    auto it = m_open_tables.find(table_name);
+    if (it == m_open_tables.end()) return;
+    delete it->second;
+    m_open_tables.erase(it);
   }
 
   /** Count of register table handler.
@@ -137,6 +148,9 @@ class innodb_session_t {
 
     return (m_usr_temp_tblsp);
   }
+
+  /** Inspect an existing user space without allocating one for capture. */
+  ibt::Tablespace *existing_usr_temp_tblsp() const { return m_usr_temp_tblsp; }
 
   ibt::Tablespace *get_instrinsic_temp_tblsp() {
     if (m_intrinsic_temp_tblsp == nullptr) {

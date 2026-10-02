@@ -1,0 +1,27 @@
+--source include/have_debug.inc
+--source include/not_log_bin.inc
+
+# A surviving reader owns another same-name user temporary table. Its native
+# IDs and contents must remain untouched while an import plan prepares tables.
+--connect(receiver_reader,localhost,root,,test)
+CREATE TEMPORARY TABLE tmp_capture_undo_failure(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO tmp_capture_undo_failure VALUES(1, 700), (2, 800);
+SET SESSION TRANSACTION READ ONLY;
+SELECT SUM(v) AS receiver_before FROM tmp_capture_undo_failure;
+--connection default
+
+--let $capture_case= private target dictionary with a surviving temporary-table reader
+--let $capture_trace_name= temp_import_private_dictionary.trace
+--let $capture_fault= preserve_temp_import_plan_probe,preserve_trx_fail_before_snapshot_fsync
+--let $capture_trace_pattern= temporary private dictionary validated
+--source suite/preserve_trx/include/temp_table_capture_undo_failure.inc
+
+--connection receiver_reader
+SELECT COUNT(*)=2 AND SUM(v)=1500 AS receiver_unchanged FROM tmp_capture_undo_failure;
+SET SESSION TRANSACTION READ WRITE;
+CREATE TEMPORARY TABLE tmp_receiver_after(id INT PRIMARY KEY) ENGINE=InnoDB;
+INSERT INTO tmp_receiver_after VALUES(3), (4);
+SELECT SUM(id) AS receiver_later_allocation FROM tmp_receiver_after;
+DROP TEMPORARY TABLE tmp_receiver_after, tmp_capture_undo_failure;
+--disconnect receiver_reader
+--connection default

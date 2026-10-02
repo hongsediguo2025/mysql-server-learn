@@ -42,9 +42,22 @@ die "shared helper must only publish PENDING_QUIESCE targets at an idle boundary
   unless $shared_helper =~ /Preserve_trx_batch_thd_state::PENDING_QUIESCE/s &&
          $shared_helper =~ /m_server_idle/s;
 die "shared helper must publish both active and transactionless target states\n"
-  unless $shared_helper =~ /preserve_trx_has_batch_active_transaction/s &&
+  unless $shared_helper =~ /preserve_trx_has_batch_token_contents/s &&
          $shared_helper =~ /Preserve_trx_batch_thd_state::QUIESCED/s &&
          $shared_helper =~ /Preserve_trx_batch_thd_state::DRAINED_NO_TRANSACTION/s;
+
+my $batch_contents = extract_function_body(
+  $preserve_src, 'static bool preserve_trx_has_batch_token_contents(THD *thd)');
+die "batch contents must combine native activity with retained standby resources\n"
+  unless $batch_contents =~ /return\s+preserve_trx_has_batch_active_transaction\s*\(\s*thd\s*\)\s*\|\|\s*preserve_trx_has_retained_standby_resources\s*\(\s*thd\s*\)\s*;/s;
+my $retained = extract_function_body(
+  $preserve_src, 'static bool preserve_trx_has_retained_standby_resources(THD *thd)');
+die "retained resources must remain gated to enabled Classic standby transfer\n"
+  unless $retained =~ /preserve_trx_is_enabled\s*\(\s*\)\s*&&\s*preserve_trx_temp_id_namespace/s &&
+         $retained =~ /thd\s*!=\s*nullptr\s*&&\s*thd->is_classic_protocol\s*\(\s*\)/s &&
+         $retained =~ /preserve_trx_transfer_artifact_decision\s*\(\s*\)\s*==\s*Preserve_trx_transfer_artifact_decision::STANDBY_TRANSFER_SAVE/s &&
+         $retained =~ /preserve_trx_temp_table_enable\s*&&/s &&
+         $retained =~ /preserve_trx_cursor_capture_enabled\s*\(\s*thd\s*\)\s*&&/s;
 
 my $batch_active_helper = extract_function_body(
   $preserve_src,

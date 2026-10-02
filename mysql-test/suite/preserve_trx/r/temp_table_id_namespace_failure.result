@@ -1,0 +1,36 @@
+SELECT @@global.rds_preserve_trx_temp_id_namespace AS namespace_enabled;
+namespace_enabled
+1
+CREATE TEMPORARY TABLE tmp_id_survivor(id INT PRIMARY KEY, v INT)
+ENGINE=InnoDB;
+INSERT INTO tmp_id_survivor VALUES(1,10),(2,20);
+SET SESSION debug='+d,preserve_temp_table_id_exhausted';
+CREATE TEMPORARY TABLE tmp_id_exhausted(id INT PRIMARY KEY) ENGINE=InnoDB;
+ERROR HY000: The table 'tmp_id_exhausted' is full
+SET SESSION debug='-d,preserve_temp_table_id_exhausted';
+SELECT COUNT(*)=1 AS no_table_leak FROM information_schema.INNODB_TEMP_TABLE_INFO;
+no_table_leak
+1
+SET SESSION debug='+d,preserve_temp_index_id_exhausted';
+CREATE TEMPORARY TABLE tmp_id_exhausted(id INT PRIMARY KEY, KEY(id)) ENGINE=InnoDB;
+ERROR HY000: The table 'tmp_id_exhausted' is full
+SET SESSION debug='-d,preserve_temp_index_id_exhausted';
+SELECT COUNT(*)=1 AS no_index_leak FROM information_schema.INNODB_TEMP_TABLE_INFO;
+no_index_leak
+1
+CREATE TEMPORARY TABLE tmp_id_exhausted(id INT PRIMARY KEY, KEY(id)) ENGINE=InnoDB;
+INSERT INTO tmp_id_exhausted SELECT id FROM tmp_id_survivor;
+START TRANSACTION;
+UPDATE tmp_id_survivor SET v=v+100;
+DELETE FROM tmp_id_exhausted WHERE id=1;
+ROLLBACK;
+SELECT COUNT(*)=2 AND SUM(v)=30 AS survivor_intact FROM tmp_id_survivor;
+survivor_intact
+1
+SELECT COUNT(*)=2 AND SUM(id)=3 AS retry_ok FROM tmp_id_exhausted;
+retry_ok
+1
+DROP TEMPORARY TABLE tmp_id_survivor, tmp_id_exhausted;
+SELECT COUNT(*)=0 AS cleanup_ok FROM information_schema.INNODB_TEMP_TABLE_INFO;
+cleanup_ok
+1

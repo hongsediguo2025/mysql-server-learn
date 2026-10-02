@@ -1,0 +1,6 @@
+SELECT @@global.rds_preserve_trx_temp_id_namespace AS namespace_enabled;
+--let $capture_case= temporary receiver undo input is bounded and budgeted
+--let $capture_trace_name= temp_undo_input.trace
+--let $capture_fault= preserve_temp_import_source_undo_probe,preserve_temp_transfer_input_probe,preserve_temp_undo_input_probe,preserve_temp_import_target_image_probe
+--let $capture_trace_pattern= (?s)temporary undo input checked pages=[1-9][0-9]* batches=[1-9][0-9]* faults=4 cancelled=3.*temporary source undo owner checked failure=1 cancelled_plan=1.*temporary source import prepared.*temporary receiver images checked.*temporary namespace requires standby transfer
+--source suite/preserve_trx/include/temp_table_capture_undo_failure.inc

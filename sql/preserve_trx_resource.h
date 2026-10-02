@@ -24,12 +24,15 @@
 #ifndef SQL_PRESERVE_TRX_RESOURCE_INCLUDED
 #define SQL_PRESERVE_TRX_RESOURCE_INCLUDED
 
+#include <array>
 #include <cstdint>
 #include <string>
 
 #include "my_inttypes.h"
 #include "mysql/status_var.h"
 #include "sql/set_var.h"
+
+std::array<unsigned char, 32> preserve_trx_digest(const void *, size_t);
 
 class THD;
 class sys_var;
@@ -54,6 +57,15 @@ enum class Preserve_trx_memory_kind {
   PROMOTION_BINLOG_NATIVE_CACHE,
   /* Snapshot encode/decode working memory. */
   SNAPSHOT_CODEC_BUFFER,
+  /* Creation-time cursor artifact streaming buffers. */
+  CURSOR_RESULT_BUFFER,
+  /* Private native temporary undo and its source-to-target position map. */
+  TEMP_UNDO_IMPORT,
+  /* Bounded data-page decoding and row-reference relocation workspace. */
+  TEMP_PAGE_IMPORT,
+  /* Private source dictionary tables, native indexes and builder workspace. */
+  TEMP_DICTIONARY_IMPORT,
+  TEMP_METADATA_IMPORT,
   COUNT
 };
 
@@ -80,6 +92,11 @@ class Preserve_memory_lease {
 
   bool acquired() const { return m_acquired; }
   uint64_t bytes() const { return m_bytes; }
+  const std::string &token() const { return m_token; }
+  /** Extend an existing reservation atomically; failure leaves it unchanged. */
+  bool grow_to(uint64_t bytes);
+  /** Return unused reservation without releasing the remaining ownership. */
+  bool shrink_to(uint64_t bytes);
   void release();
 
  private:
@@ -102,6 +119,48 @@ class Preserve_memory_lease {
 */
 Preserve_memory_lease preserve_trx_acquire_memory_lease(
     const std::string &token, Preserve_trx_memory_kind kind, uint64_t bytes);
+
+/** Reservation for files written in one directory's filesystem. Shares FD
+headroom and pending disk bytes with native binlog preparation. Native caches
+reserve conservatively on every configured tmpdir device. One owner serializes
+operations on a lease; the files and descriptors remain its responsibility. */
+class Preserve_file_resource_lease {
+ public:
+  Preserve_file_resource_lease() = default;
+  Preserve_file_resource_lease(const Preserve_file_resource_lease &) = delete;
+  Preserve_file_resource_lease &operator=(const Preserve_file_resource_lease &) = delete;
+  Preserve_file_resource_lease(Preserve_file_resource_lease &&other) noexcept;
+  Preserve_file_resource_lease &operator=(Preserve_file_resource_lease &&other) noexcept;
+  ~Preserve_file_resource_lease();
+
+  bool acquired() const { return m_acquired; }
+  uint64_t pending_bytes() const { return m_bytes - m_written; }
+  /** Cumulative successful sequential writes across this lease's files, not a
+  batch delta. Repeated/smaller values are ignored. This is not an fsync fence. */
+  void settle_writes(uint64_t written_prefix_bytes);
+  /** Immutable output is complete: return unused write reservation while
+  retaining descriptor ownership. No subsequent writes are permitted. */
+  void finish_writes();
+  /** Return quota only, after stopping writes and closing owned descriptors. */
+  void release();
+
+ private:
+  uint64_t m_filesystem{0};
+  uint64_t m_fds{0};
+  uint64_t m_bytes{0};
+  uint64_t m_written{0};
+  bool m_acquired{false};
+  friend Preserve_file_resource_lease preserve_trx_acquire_file_resource_lease(
+      const std::string &, uint64_t, uint64_t);
+};
+
+/** bytes == 0 reserves only descriptors for reading existing files. */
+Preserve_file_resource_lease preserve_trx_acquire_file_resource_lease(
+    const std::string &directory, uint64_t fd_count, uint64_t bytes);
+
+#ifndef NDEBUG
+bool preserve_trx_file_resource_probe(const std::string &directory);
+#endif
 
 /*
   Atomic Preserve-owned reservation for a detached native binlog cache. The
@@ -191,8 +250,6 @@ uint64_t preserve_trx_resource_kind_current_bytes(
 uint64_t preserve_trx_resource_kind_current_bytes_for_unit_test(
     Preserve_trx_memory_kind kind);
 uint64_t preserve_trx_resource_kind_cap_bytes(Preserve_trx_memory_kind kind);
-uint64_t preserve_trx_resource_kind_cap_bytes_for_unit_test(
-    Preserve_trx_memory_kind kind);
 
 bool preserve_trx_sysvar_check_enable(sys_var *self, THD *thd, set_var *var);
 bool preserve_trx_sysvar_update_enable(sys_var *self, THD *thd,
@@ -234,7 +291,66 @@ int show_preserve_trx_lock_warmcopy_journal_bytes(THD *thd, SHOW_VAR *var,
                                                   char *buf);
 int show_preserve_trx_lock_warmcopy_live_fallback(THD *thd, SHOW_VAR *var,
                                                   char *buf);
+ulonglong preserve_trx_temp_prebuild_stale_status();
+int show_preserve_trx_temp_prebuild_stale(THD *, SHOW_VAR *, char *);
+ulonglong preserve_trx_temp_prebuild_active_status();
+int show_preserve_trx_temp_prebuild_active(THD *, SHOW_VAR *, char *);
+ulonglong preserve_trx_temp_prebuild_installed_status();
+int show_preserve_trx_temp_prebuild_installed(THD *, SHOW_VAR *, char *);
+ulonglong preserve_trx_temp_prebuild_steps_status();
+int show_preserve_trx_temp_prebuild_steps(THD *, SHOW_VAR *, char *);
+ulonglong preserve_trx_temp_prebuild_baselines_status();
+int show_preserve_trx_temp_prebuild_baselines(THD *, SHOW_VAR *, char *);
+ulonglong preserve_trx_temp_prebuild_buffer_pages_status();
+int show_preserve_trx_temp_prebuild_buffer_pages(THD *, SHOW_VAR *, char *);
+ulonglong preserve_trx_temp_prebuild_file_pages_status();
+int show_preserve_trx_temp_prebuild_file_pages(THD *, SHOW_VAR *, char *);
+ulonglong preserve_trx_temp_prebuild_rounds_status();
+int show_preserve_trx_temp_prebuild_rounds(THD *, SHOW_VAR *, char *);
+ulonglong preserve_trx_temp_prebuild_round_pages_status();
+int show_preserve_trx_temp_prebuild_round_pages(THD *, SHOW_VAR *, char *);
+ulonglong preserve_trx_temp_prebuild_undo_pages_status();
+int show_preserve_trx_temp_prebuild_undo_pages(THD *, SHOW_VAR *, char *);
+ulonglong preserve_trx_temp_prebuild_undo_reused_pages_status();
+int show_preserve_trx_temp_prebuild_undo_reused_pages(THD *, SHOW_VAR *, char *);
+int show_preserve_trx_temp_undo_watched_pages(THD *, SHOW_VAR *, char *);
+int show_preserve_trx_temp_undo_owners(THD *, SHOW_VAR *, char *);
+int show_preserve_trx_temp_undo_owner_pages_used(THD *, SHOW_VAR *, char *);
+int show_preserve_trx_temp_undo_owner_pages_routed(THD *, SHOW_VAR *, char *);
+int show_preserve_trx_temp_undo_owner_quota_rejected(THD *, SHOW_VAR *, char *);
+ulonglong preserve_trx_temp_prebuild_undo_scans_status();
+int show_preserve_trx_temp_prebuild_undo_scans(THD *, SHOW_VAR *, char *);
+ulonglong preserve_trx_temp_prebuild_undo_stale_status();
+int show_preserve_trx_temp_prebuild_undo_stale(THD *, SHOW_VAR *, char *);
+int show_preserve_trx_temp_undo_shared_fallback(THD *, SHOW_VAR *, char *);
+ulonglong preserve_trx_temp_prebuild_undo_write_steps_status();
+int show_preserve_trx_temp_prebuild_undo_write_steps(THD *, SHOW_VAR *, char *);
+ulonglong preserve_trx_temp_prebuild_undo_claim_pages_status();
+int show_preserve_trx_temp_prebuild_undo_claim_pages(THD *, SHOW_VAR *, char *);
+ulonglong preserve_trx_temp_prebuild_undo_claim_reused_status();
+int show_preserve_trx_temp_prebuild_undo_claim_reused(THD *, SHOW_VAR *, char *);
+ulonglong preserve_trx_temp_prebuild_undo_write_bytes_status();
+int show_preserve_trx_temp_prebuild_undo_write_bytes(THD *, SHOW_VAR *, char *);
+int show_preserve_trx_temp_pretransfer_bytes(THD *, SHOW_VAR *, char *);
+int show_preserve_trx_temp_image_delta_bytes(THD *, SHOW_VAR *, char *);
+int show_preserve_trx_temp_image_delta_built(THD *, SHOW_VAR *, char *);
+int show_preserve_trx_temp_image_delta_assembled(THD *, SHOW_VAR *, char *);
+int show_preserve_trx_temp_undo_delta_bytes(THD *, SHOW_VAR *, char *);
+int show_preserve_trx_temp_undo_delta_built(THD *, SHOW_VAR *, char *);
+int show_preserve_trx_temp_undo_delta_assembled(THD *, SHOW_VAR *, char *);
+ulonglong preserve_trx_temp_prebuild_final_reused_status();
+int show_preserve_trx_temp_prebuild_final_reused(THD *, SHOW_VAR *, char *);
+ulonglong preserve_trx_temp_prebuild_final_fallback_status();
+int show_preserve_trx_temp_prebuild_final_fallback(THD *, SHOW_VAR *, char *);
+
+int show_preserve_trx_temp_gc_scanned(THD *, SHOW_VAR *, char *);
+int show_preserve_trx_temp_gc_removed(THD *, SHOW_VAR *, char *);
+int show_preserve_trx_temp_gc_errors(THD *, SHOW_VAR *, char *);
+int show_preserve_trx_temp_gc_passes(THD *, SHOW_VAR *, char *);
 int show_preserve_trx_phase2_total_us(THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_phase2_command_boundary_wait_active(THD *thd,
+                                                       SHOW_VAR *var,
+                                                       char *buf);
 int show_preserve_trx_phase2_target_wait_us(THD *thd, SHOW_VAR *var,
                                             char *buf);
 int show_preserve_trx_phase1_readiness_samples(THD *thd, SHOW_VAR *var,

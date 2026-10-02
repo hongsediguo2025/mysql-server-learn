@@ -58,6 +58,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "row0sel.h"
 #include "row0upd.h"
 #include "trx0rec.h"
+#include "trx0temp_preserve_dict.h"
 #include "trx0undo.h"
 #include "usr0sess.h"
 
@@ -3435,7 +3436,7 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
 
 /** Allocates a row id for row and inits the node->index field. */
 UNIV_INLINE
-void row_ins_alloc_row_id_step(ins_node_t *node) /*!< in: row insert node */
+dberr_t row_ins_alloc_row_id_step(ins_node_t *node) /*!< in: row insert node */
 {
   row_id_t row_id;
 
@@ -3444,14 +3445,20 @@ void row_ins_alloc_row_id_step(ins_node_t *node) /*!< in: row insert node */
   if (dict_index_is_unique(node->table->first_index())) {
     /* No row id is stored if the clustered index is unique */
 
-    return;
+    return DB_SUCCESS;
   }
 
   /* Fill in row id value to row */
 
-  row_id = dict_sys_get_new_row_id();
+  if (node->table->preserve_memory != nullptr) {
+    const auto err = trx_preserve_temp_allocate_row_id(node->table, &row_id);
+    if (err != DB_SUCCESS) return err;
+  } else {
+    row_id = dict_sys_get_new_row_id();
+  }
 
   dict_sys_write_row_id(node->row_id_buf, row_id);
+  return DB_SUCCESS;
 }
 
 /** Gets a row to insert from the values list. */
@@ -3524,7 +3531,8 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
   DBUG_PRINT("row_ins", ("table: %s", node->table->name.m_name));
 
   if (node->state == INS_NODE_ALLOC_ROW_ID) {
-    row_ins_alloc_row_id_step(node);
+    err = row_ins_alloc_row_id_step(node);
+    if (err != DB_SUCCESS) return err;
 
     node->index = node->table->first_index();
     node->entry = UT_LIST_GET_FIRST(node->entry_list);

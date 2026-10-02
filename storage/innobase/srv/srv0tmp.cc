@@ -25,9 +25,11 @@ this program; if not, write to the Free Software Foundation, Inc.,
 *****************************************************************************/
 
 #include "srv0tmp.h"
+#include "trx0temp_preserve_source.h"
 #include <algorithm>
 #include <atomic>
 #include <mutex>
+#include <new>
 #include <set>
 #include "dict0dict.h"
 #include "ib0mutex.h"
@@ -115,16 +117,53 @@ bool reserve_or_keep_preserved_space_id(space_id_t space_id, bool *created) {
     return false;
   }
 
+  // Close next_space_id's zero-reservation fast path before publishing the
+  // set entry. On allocation failure restore the count before unwinding.
   preserved_space_id_reservation_active_count.fetch_add(
       1, std::memory_order_release);
-  std::pair<std::set<space_id_t>::iterator, bool> result =
-      preserved_space_id_reservations.insert(space_id);
-  if (!result.second) {
+  try {
+    DBUG_EXECUTE_IF("preserve_temp_keep_space_id_oom", throw std::bad_alloc(););
+    const auto result = preserved_space_id_reservations.insert(space_id);
+    if (!result.second)
+      preserved_space_id_reservation_active_count.fetch_sub(
+          1, std::memory_order_acq_rel);
+    if (created != nullptr) *created = result.second;
+  } catch (const std::bad_alloc &) {
     preserved_space_id_reservation_active_count.fetch_sub(
         1, std::memory_order_acq_rel);
+    throw;
   }
-  if (created != nullptr) *created = result.second;
   return true;
+}
+
+dberr_t allocate_preserved_space_id(space_id_t *space_id) {
+  Tablespace_pool *pool = tbsp_pool;
+  if (space_id == nullptr || pool == nullptr) return DB_ERROR;
+
+  // Native expansion can advance the watermark without the reservation lock.
+  // Holding the pool lock first makes choosing and reserving one id atomic.
+  IB_mutex_guard pool_guard(&pool->m_mutex);
+  if (!pool->m_pool_initialized) return DB_ERROR;
+  std::lock_guard<std::mutex> guard(preserved_space_id_reservations_mutex);
+
+  space_id_t candidate = Tablespace::m_last_used_space_id;
+  do {
+    if (candidate >= dict_sys_t::s_max_temp_space_id) return DB_NO_SESSION_TEMP;
+    ++candidate;
+  } while (is_preserved_space_id_reserved_low(candidate));
+
+  try {
+    DBUG_EXECUTE_IF("preserve_temp_allocate_space_id_oom",
+                    throw std::bad_alloc(););
+    preserved_space_id_reservations.insert(candidate);
+  } catch (const std::bad_alloc &) {
+    return DB_OUT_OF_MEMORY;
+  }
+  preserved_space_id_reservation_active_count.fetch_add(
+      1, std::memory_order_release);
+  Tablespace::m_last_used_space_id = candidate;
+  *space_id = candidate;
+  return DB_SUCCESS;
 }
 
 bool release_preserved_space_id(space_id_t space_id) {
@@ -185,7 +224,8 @@ space_id_t allocate_temp_tablespace_object_for_test() {
 /** Sesssion Temporary tablespace */
 Tablespace::Tablespace()
     : m_space_id(next_space_id()), m_inited(), m_thread_id() {
-  ut_ad(m_space_id <= dict_sys_t::s_max_temp_space_id);
+  ut_ad(m_space_id == SPACE_UNKNOWN ||
+        m_space_id <= dict_sys_t::s_max_temp_space_id);
   m_purpose = TBSP_NONE;
 }
 
@@ -210,6 +250,7 @@ Tablespace::~Tablespace() {
 }
 
 dberr_t Tablespace::create() {
+  if (m_space_id == SPACE_UNKNOWN) return DB_NO_SESSION_TEMP;
   ut_ad(m_space_id > dict_sys_t::s_min_temp_space_id);
 
   /* Create the filespace flags */
@@ -291,7 +332,9 @@ std::string Tablespace::path() const {
 space_id_t Tablespace::next_space_id() {
   if (preserved_space_id_reservation_active_count.load(
           std::memory_order_acquire) == 0) {
-    ut_a(m_last_used_space_id < dict_sys_t::s_max_temp_space_id);
+    if (m_last_used_space_id >= dict_sys_t::s_max_temp_space_id) {
+      return SPACE_UNKNOWN;
+    }
     return ++m_last_used_space_id;
   }
 
@@ -299,7 +342,7 @@ space_id_t Tablespace::next_space_id() {
 
   space_id_t candidate = m_last_used_space_id;
   do {
-    ut_a(candidate < dict_sys_t::s_max_temp_space_id);
+    if (candidate >= dict_sys_t::s_max_temp_space_id) return SPACE_UNKNOWN;
     ++candidate;
   } while (is_preserved_space_id_reserved_low(candidate));
 
@@ -354,6 +397,7 @@ Tablespace *Tablespace_pool::get(my_thread_id id, enum tbsp_purpose purpose) {
   ts = m_free->back();
   m_free->pop_back();
   m_active->push_back(ts);
+  ts->m_preserve_return_pending = false;
   ts->set_thread_id_and_purpose(id, purpose);
 
   release();
@@ -515,6 +559,7 @@ dberr_t open_or_create(bool create_new_db) {
 }
 
 void free_tmp(Tablespace *ts) {
+  if (trx_preserve_temp_pool_lease::defer_return(ts)) return;
   ts->reset_thread_id_and_purpose();
   tbsp_pool->free_ts(ts);
 }

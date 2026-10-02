@@ -1,0 +1,33 @@
+--let $capture_case= receiver retains verified temporary image across retry and cleanup
+--let $capture_trace_name= temp_import_receiver_file.trace
+--let $capture_fault= preserve_temp_import_source_undo_probe,preserve_temp_import_receiver_file_probe,preserve_transfer_object_index_history_probe,preserve_transfer_reservation_ledger_probe,preserve_trx_fail_before_snapshot_fsync
+--let $capture_trace_pattern= temporary receiver file retained after retries replacement and cleanup
+--source suite/preserve_trx/include/temp_table_capture_undo_failure.inc
+
+# The common residue check does not cover receiver .part/.ranges files.
+--let _TEMP_FILE_DATADIR= `SELECT @@datadir`
+--perl
+use strict;
+use warnings;
+use File::Spec;
+open(my $trace, '<', "$ENV{'MYSQLTEST_VARDIR'}/log/temp_import_receiver_file.trace")
+  or die "missing receiver trace: $!";
+my $captured = do { local $/; <$trace> };
+close($trace);
+die "multi-object dispatch or unknown-object cleanup was not verified\n"
+  unless $captured =~ /temporary receiver chunk dispatch checked objects=2 copied=1 unknown_cleanup=1 retained=1/;
+die "receiver object index publication and retry were not verified\n"
+  unless $captured =~ /temporary receiver object index checked reorder=1 append=1 oom_retry=1 snapshots=1 terminal=1/;
+die "retained index snapshots exceeded budget or changed lookup\n"
+  unless $captured =~ /temporary object index history verified snapshots=8192/;
+die "reservation transitions or overflow recovery failed\n"
+  unless $captured =~ /receiver reservation ledger verified epoch_live=1 global_debt=1 duplicate=1 retry=1 overflow_recovery=1/;
+my $dir = File::Spec->catdir($ENV{'_TEMP_FILE_DATADIR'}, 'preserve', '.transfer');
+if (-d $dir) {
+  opendir(my $dh, $dir) or die "cannot open transfer directory: $!";
+  my @residue = grep { /^temp-file-probe-/ } readdir($dh);
+  closedir($dh);
+  die "temporary receiver probe staging remains: @residue\n" if @residue;
+}
+EOF
+--let _TEMP_FILE_DATADIR=

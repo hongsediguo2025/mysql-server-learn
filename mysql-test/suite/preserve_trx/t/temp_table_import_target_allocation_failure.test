@@ -1,0 +1,5 @@
+--let $capture_case= native target identity allocation failure preserves the source
+--let $capture_trace_name= temp_import_target_allocation_failure.trace
+--let $capture_fault= preserve_temp_import_plan_probe,preserve_temp_allocate_space_id_oom
+--let $capture_trace_pattern= temporary target identity allocation failed error=
+--source suite/preserve_trx/include/temp_table_capture_undo_failure.inc

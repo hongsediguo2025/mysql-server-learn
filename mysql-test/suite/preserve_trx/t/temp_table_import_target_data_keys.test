@@ -1,0 +1,85 @@
+--source include/have_debug.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+--echo # Native collation, undo keys and committed temporary rows
+--disable_query_log
+--let $saved_global_debug= `SELECT @@global.debug`
+--let $data_trace= $MYSQLTEST_VARDIR/log/temp_target_data_keys.trace
+--eval SET GLOBAL debug='d,preserve_temp_import,preserve_temp_import_source_undo_probe,preserve_temp_import_target_data_probe,preserve_trx_fail_before_snapshot_fsync:O,$data_trace'
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
+CREATE TABLE t_data_base(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO t_data_base
+  WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<64)
+  SELECT n,n*10 FROM seq;
+--connect(data_app,localhost,root,,test)
+CREATE TEMPORARY TABLE tmp_data_ci(
+  k VARCHAR(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci PRIMARY KEY,
+  n INT
+) ENGINE=InnoDB ROW_FORMAT=REDUNDANT;
+CREATE TEMPORARY TABLE tmp_data_aux(id INT PRIMARY KEY, k INT NULL, v VARCHAR(32), UNIQUE KEY(k))
+  ENGINE=InnoDB;
+INSERT INTO tmp_data_ci VALUES('alpha',1),('keep',2);
+INSERT INTO tmp_data_aux VALUES(1,1,'one'),(2,NULL,'null1'),(3,NULL,'null2');
+START TRANSACTION;
+DELETE FROM tmp_data_ci WHERE k='alpha';
+# Native UPD_DEL can retain old 'alpha' in undo while the current key is 'ALPHA'.
+INSERT INTO tmp_data_ci VALUES('ALPHA',7);
+UPDATE tmp_data_aux SET v='changed1' WHERE v='null1';
+UPDATE tmp_data_aux SET v='changed2' WHERE v='changed1';
+INSERT INTO tmp_data_aux VALUES(4,NULL,'null3');
+UPDATE t_data_base SET v=v+100;
+DELETE FROM t_data_base WHERE MOD(id,8)=0;
+INSERT INTO t_data_base VALUES(65,650);
+--connection default
+--error ER_PRESERVE_TRX_UNSUPPORTED
+DRAIN TRANSACTIONS PRESERVE;
+--let _TEMP_DATA_TRACE= $data_trace
+--perl
+use strict;
+use warnings;
+open(my $fh, '<', $ENV{'_TEMP_DATA_TRACE'}) or die "missing data trace: $!";
+my $trace = do { local $/; <$fh> };
+close($fh);
+die "current and committed rows were not both converted\n"
+  unless $trace =~ /temporary data page relocation complete .*current=[1-9][0-9]* baseline=[1-9][0-9]*/;
+die "native collation was not exercised\n"
+  unless $trace =~ /temporary data page row keys .*types=7 hidden=0 collation=[1-9][0-9]*/;
+die "invalid current pointer or historical alias was not checked\n"
+  unless $trace =~ /temporary data page rejection checks=([0-9]+) historical_aliases=1/
+      && ($1 & 79) == 79;
+die "workspace admission was not checked\n"
+  unless $trace =~ /temporary data page workspace faults=1 missing_undo=0 growth=1/;
+die "snapshot fault was not reached\n" unless $trace =~ /temporary snapshot fsync fault/;
+EOF
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+--connection data_app
+--enable_query_log
+SELECT COUNT(*)=2 AND SUM(BINARY k='ALPHA' AND n=7)=1 AS captured_ci_ok FROM tmp_data_ci;
+SELECT COUNT(*)=4 AND SUM(v='changed2')=1 AND SUM(k IS NULL)=3 AS captured_aux_ok FROM tmp_data_aux;
+--disable_query_log
+UPDATE tmp_data_ci SET n=8 WHERE k='ALPHA';
+DELETE FROM tmp_data_aux WHERE v='null2';
+ROLLBACK;
+--enable_query_log
+SELECT COUNT(*)=2 AND SUM(BINARY k='alpha' AND n=1)=1 AS rollback_ci_ok FROM tmp_data_ci;
+SELECT COUNT(*)=3 AND SUM(v='null1')=1 AND SUM(k IS NULL)=2 AS rollback_aux_ok FROM tmp_data_aux;
+SELECT COUNT(*)=64 AND SUM(v)=20800 AS rollback_base_ok FROM t_data_base;
+--disable_query_log
+START TRANSACTION;
+UPDATE tmp_data_ci SET n=9 WHERE k='alpha';
+UPDATE tmp_data_aux SET v='committed' WHERE k=1;
+UPDATE t_data_base SET v=9 WHERE id=1;
+COMMIT;
+--enable_query_log
+SELECT n=9 AS commit_ci_ok FROM tmp_data_ci WHERE k='alpha';
+SELECT v='committed' AS commit_aux_ok FROM tmp_data_aux WHERE k=1;
+SELECT v=9 AS commit_base_ok FROM t_data_base WHERE id=1;
+--disable_query_log
+DROP TEMPORARY TABLE tmp_data_ci, tmp_data_aux;
+--disconnect data_app
+--connection default
+DROP TABLE t_data_base;
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+--eval SET GLOBAL debug='$saved_global_debug'
+--enable_query_log

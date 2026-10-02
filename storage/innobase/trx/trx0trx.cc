@@ -53,6 +53,8 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "srv0srv.h"
 #include "srv0start.h"
 #include "sql/preserve_trx_xid.h"
+#include "sql/preserve_trx_promotion.h"
+#include "sql/preserve_trx_temp_metrics.h"
 #include "trx0purge.h"
 #include "trx0preserve.h"
 #include "trx0rec.h"
@@ -146,6 +148,7 @@ static void trx_init(trx_t *trx) {
   status is required for asynchronous handling. */
 
   trx->id = 0;
+  trx->preserve_temp_undo_cookie = 0;
 
   trx->no = TRX_ID_MAX;
 
@@ -1074,6 +1077,11 @@ static void trx_resurrect(trx_rseg_t *rseg) {
  transactions to be rolled back or cleaned up are built based on the
  undo log lists. */
 void trx_lists_init_at_db_start(void) {
+  bool success = false;
+  Preserve_trx_temp_stage_timer metric(
+      preserved_trx_physical_promotion_in_progress()
+          ? Preserve_trx_temp_stage::PHYSICAL_RESURRECTION
+          : Preserve_trx_temp_stage::NONE, &success);
   ut_a(srv_is_being_started);
 
   /* Look through the rollback segments in the TRX_SYS for
@@ -1108,6 +1116,7 @@ void trx_lists_init_at_db_start(void) {
 
     UT_LIST_ADD_FIRST(trx_sys->rw_trx_list, it->m_trx);
   }
+  success = true;
 }
 
 /** Get next redo rollback segment in round-robin fashion.
@@ -3009,14 +3018,16 @@ dberr_t trx_prepare_for_mysql(trx_t *trx) {
   return trx_prepare_for_mysql_low(trx);
 }
 
-dberr_t trx_freeze_for_preserve(trx_t *trx) {
+dberr_t trx_freeze_for_preserve(trx_t *trx, bool read_context) {
   trx_start_if_not_started_xa(trx, false);
 
   TrxInInnoDB trx_in_innodb(trx, true);
   if (trx_in_innodb.is_aborted() && trx->killed_by != os_thread_get_curr_id()) {
     return DB_FORCED_ABORT;
   }
-  if (!trx_state_eq(trx, TRX_STATE_ACTIVE) || !trx_is_rseg_updated(trx)) {
+  if (!trx_state_eq(trx, TRX_STATE_ACTIVE) ||
+      (read_context ? !trx_preserve_is_read_context(trx)
+                    : !trx_is_rseg_updated(trx))) {
     return DB_ERROR;
   }
   if (trx->preserve_undo_contract != trx_preserve_undo_contract::NONE &&

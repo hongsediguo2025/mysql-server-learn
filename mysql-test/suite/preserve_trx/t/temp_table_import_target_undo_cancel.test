@@ -1,0 +1,5 @@
+--let $capture_case= native target temporary undo partial cancellation
+--let $capture_trace_name= temp_import_target_undo_cancel.trace
+--let $capture_fault= preserve_temp_import_source_undo_probe,preserve_temp_import_target_undo_probe,preserve_temp_target_undo_retry_probe,preserve_temp_target_undo_cancel_probe,preserve_trx_fail_before_snapshot_fsync
+--let $capture_trace_pattern= temporary target undo partial cancellation complete prefix=34
+--source suite/preserve_trx/include/temp_table_capture_undo_failure.inc

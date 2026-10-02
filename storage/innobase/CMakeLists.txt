@@ -202,6 +202,21 @@ SET(INNOBASE_SOURCES
   trx/trx0i_s.cc
   trx/trx0preserve.cc
   trx/trx0temp_preserve.cc
+  trx/trx0temp_preserve_debug.cc
+  trx/trx0temp_preserve_capture.cc
+  trx/trx0temp_preserve_undo_scan.cc
+  trx/trx0temp_preserve_undo_capture.cc
+  trx/trx0temp_preserve_output.cc
+  trx/trx0temp_preserve_source.cc
+  trx/trx0temp_preserve_id.cc
+  trx/trx0temp_preserve_import.cc
+  trx/trx0temp_preserve_lob.cc
+  trx/trx0temp_preserve_input.cc
+  trx/trx0temp_preserve_graph.cc
+  trx/trx0temp_preserve_dict.cc
+  trx/trx0temp_preserve_stats.cc
+  trx/trx0temp_preserve_record.cc
+  trx/trx0temp_preserve_undo.cc
   trx/trx0purge.cc
   trx/trx0rec.cc
   trx/trx0roll.cc

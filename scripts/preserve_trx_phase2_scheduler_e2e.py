@@ -1203,7 +1203,10 @@ def _run_sysbench_write_only_drain(args: argparse.Namespace) -> Dict[str, Any]:
         raise RuntimeError("sysbench report interval must be positive")
 
     sysbench = Path(args.sysbench_binary or shutil.which("sysbench") or "")
-    script = args.sysbench_script
+    workload = ("oltp_read_write" if args.scenario == "sysbench-read-write-drain"
+                else "oltp_write_only")
+    script = args.sysbench_script or Path(__file__).resolve().with_name(
+        workload + "_staggered_init.lua")
     if not sysbench.is_file():
         raise RuntimeError(f"sysbench binary is unavailable: {sysbench}")
     if script is None or not script.is_file():
@@ -1277,7 +1280,7 @@ def _run_sysbench_write_only_drain(args: argparse.Namespace) -> Dict[str, Any]:
             source_connection.close()
         prepare_command = [
             str(sysbench),
-            "oltp_write_only",
+            workload,
             "--db-driver=mysql",
             f"--mysql-host={args.source_host}",
             f"--mysql-port={args.source_port}",
@@ -1387,6 +1390,9 @@ def _run_sysbench_write_only_drain(args: argparse.Namespace) -> Dict[str, Any]:
             if before_metrics is not None else 0
         )
         skip_trx = args.sysbench_skip_trx == "on"
+        # Stock sysbench retains neither user temporary tables nor cursors.
+        # PS definitions are replayed externally and do not create tokens.
+        session_only_control_handoff = skip_trx
         ignore_errors = "1213,1020,1205,4020" + (",1062" if skip_trx else "")
         duplicate_error_sql = (
             "SELECT COALESCE(SUM(SUM_ERROR_RAISED),0) FROM "
@@ -1430,7 +1436,11 @@ def _run_sysbench_write_only_drain(args: argparse.Namespace) -> Dict[str, Any]:
             f"--tables={args.sysbench_tables}",
             f"--table-size={args.sysbench_table_size}",
             f"--threads={args.sysbench_threads}",
-            f"--time={max(args.sysbench_runtime_seconds + 300, 600)}",
+            # The harness owns termination after DRAIN and the 4020 hold
+            # checks (or in finally on failure). A sysbench wall-clock limit
+            # can retire every PS while a longer configured Phase1 is active.
+            "--time=0",
+            "--events=0",
             f"--skip-trx={args.sysbench_skip_trx}",
             f"--report-interval={args.report_interval_seconds}",
             f"--mysql-ignore-errors={ignore_errors}",
@@ -1567,6 +1577,14 @@ def _run_sysbench_write_only_drain(args: argparse.Namespace) -> Dict[str, Any]:
                 "sysbench connection count changed before DRAIN: "
                 f"{len(pre_drain_connection_ids)}"
             )
+        prepared_stmt_count_before_drain = _mysql_scalar(
+            runner.runtime, "SELECT VARIABLE_VALUE FROM performance_schema.global_status "
+            "WHERE VARIABLE_NAME='Prepared_stmt_count'")
+        print("SYSBENCH_PREPARED_STATEMENTS " + json.dumps({
+            "workload": workload if tpcc is None else "sysbench-tpcc",
+            "connections": len(pre_drain_connection_ids),
+            "prepared_stmt_count": prepared_stmt_count_before_drain,
+        }, sort_keys=True), flush=True)
 
         if skip_trx:
             duplicate_errors["before_drain"] = _mysql_scalar(
@@ -1595,7 +1613,7 @@ def _run_sysbench_write_only_drain(args: argparse.Namespace) -> Dict[str, Any]:
         survivor_count = sum(
             row["token_role"] == "SURVIVOR" for row in decoded_rows
         )
-        if skip_trx:
+        if session_only_control_handoff:
             if (len(decoded_rows) != 1
                     or decoded_rows[0]["token_role"] != "SUMMARY"
                     or decoded_rows[0]["outcome"] != "NO_PRESERVABLE_TOKENS"
@@ -1662,6 +1680,53 @@ def _run_sysbench_write_only_drain(args: argparse.Namespace) -> Dict[str, Any]:
                       flush=True)
             finally:
                 connection.close()
+        source_phase2_total_us = None
+        if not session_only_control_handoff:
+            warmcopy_metrics = runner.read_latest_warmcopy_metrics_since(
+                drain_log_offset
+            )
+            if (warmcopy_metrics is None
+                    or warmcopy_metrics.phase2_total_ms is None
+                    or warmcopy_metrics.phase2_end_monotonic_us is None):
+                raise RuntimeError("source Phase2 metrics were not observed")
+            runner._record_warmcopy_drain_metrics(warmcopy_metrics)
+            # ON reports use the validated FINAL interval below. The legacy
+            # timestamp is needed here only for the existing readiness check.
+            if not skip_trx:
+                source_phase2_total_us = int(round(warmcopy_metrics.phase2_total_ms * 1000))
+        control_commit_advanced = False
+        if session_only_control_handoff:
+            control_commit_advanced = runner._read_status_int(
+                control_commit_status,
+                connection_factory=runner._receiver_admin_connection,
+            ) > before_control_commit
+            after_metrics = runner.read_receiver_prewarm_metrics_from_status(
+                connection_factory=runner._receiver_admin_connection
+            )
+            if (not control_commit_advanced or after_metrics is None
+                    or after_metrics.auto_prewarm_tokens != 0
+                    or after_metrics.auto_prewarm_ready_tokens != 0
+                    or after_metrics.auto_prewarm_not_ready_tokens != 0):
+                raise RuntimeError("receiver session-only control commit is incomplete")
+        else:
+            after_metrics = _wait_receiver_epoch_advance(
+                runner,
+                before_wins=before_wins,
+                timeout_s=float(args.receiver_ready_timeout_seconds),
+            )
+            runner.wait_for_receiver_readiness(
+                expected_standby_pending=survivor_count,
+                timeout_s=float(args.receiver_ready_timeout_seconds),
+                connection_factory=runner._receiver_admin_connection,
+            )
+            after_metrics = runner.receiver_prewarm_metrics or after_metrics
+
+        # Keep the original backend connections in HOLD until receiver READY.
+        # Same-host PS destruction must not compete with final preparation.
+        receiver_ready_completed_ns = time.monotonic_ns()
+        ready_connection_ids = _read_sysbench_connection_ids(runner)
+        if ready_connection_ids != pre_drain_connection_ids:
+            raise RuntimeError("original sysbench connections changed before receiver READY")
         sysbench_rc = _stop_sysbench(process)
         process = None
         if reader is not None:
@@ -1714,41 +1779,24 @@ def _run_sysbench_write_only_drain(args: argparse.Namespace) -> Dict[str, Any]:
             else None
         )
 
-        source_phase2_total_us = None
-        if not skip_trx:
-            warmcopy_metrics = runner.read_latest_warmcopy_metrics_since(
-                drain_log_offset
-            )
-            if warmcopy_metrics is None or warmcopy_metrics.phase2_total_ms is None:
-                raise RuntimeError("source Phase2 metrics were not observed")
-            runner._record_warmcopy_drain_metrics(warmcopy_metrics)
-            source_phase2_total_us = int(round(warmcopy_metrics.phase2_total_ms * 1000))
-        control_commit_advanced = False
-        if skip_trx:
-            control_commit_advanced = runner._read_status_int(
-                control_commit_status,
-                connection_factory=runner._receiver_admin_connection,
-            ) > before_control_commit
-            after_metrics = runner.read_receiver_prewarm_metrics_from_status(
-                connection_factory=runner._receiver_admin_connection
-            )
-            if (not control_commit_advanced or after_metrics is None
-                    or after_metrics.auto_prewarm_tokens != 0
-                    or after_metrics.auto_prewarm_ready_tokens != 0
-                    or after_metrics.auto_prewarm_not_ready_tokens != 0):
-                raise RuntimeError("receiver session-only control commit is incomplete")
-        else:
-            after_metrics = _wait_receiver_epoch_advance(
-                runner,
-                before_wins=before_wins,
-                timeout_s=float(args.receiver_ready_timeout_seconds),
-            )
-            runner.wait_for_receiver_readiness(
-                expected_standby_pending=survivor_count,
-                timeout_s=float(args.receiver_ready_timeout_seconds),
-                connection_factory=runner._receiver_admin_connection,
-            )
-            after_metrics = runner.receiver_prewarm_metrics or after_metrics
+        # Read exact final counters after READY, before owned teardown. A
+        # periodic observer can miss a short final interval entirely.
+        preserve_final_status = {}
+        for side, connect in (
+            ("source", runner._source_ha_control_connection),
+            ("receiver", runner._receiver_admin_connection),
+        ):
+            connection = connect()
+            try:
+                values = runner.runtime.execute(connection,
+                    "SHOW GLOBAL STATUS WHERE Variable_name LIKE 'Preserve_trx_%'",
+                    fetch=True)
+                preserve_final_status[side] = {
+                    str(name): int(value) if str(value).isdigit() else str(value)
+                    for name, value in values
+                }
+            finally:
+                connection.close()
 
         if not _tcp_endpoint_reachable(args.source_host, args.source_port):
             raise RuntimeError("source listener is not reachable after DRAIN")
@@ -1762,9 +1810,11 @@ def _run_sysbench_write_only_drain(args: argparse.Namespace) -> Dict[str, Any]:
                 drain_completed_ns - drain_started_ns
             ) // 1000,
             "drain_survivor_count": survivor_count,
+            "drain_result_rows": decoded_rows,
             "drain_outcome": decoded_rows[0]["outcome"],
             "receiver_control_commit_advanced": control_commit_advanced,
-            "receiver_ready_applicable": not skip_trx,
+            "receiver_ready_applicable": not session_only_control_handoff,
+            "preserve_final_status": preserve_final_status,
             "effective_business_config": effective_business_config,
             "standby_transfer_effective_modes": runner.standby_transfer_effective_modes,
             "receiver_epoch_delta": (
@@ -1795,6 +1845,7 @@ def _run_sysbench_write_only_drain(args: argparse.Namespace) -> Dict[str, Any]:
             "source_phase2_total_us": source_phase2_total_us,
             "source_log_window_offset": drain_log_offset,
             "sysbench": {
+                "workload": workload,
                 "skip_trx": skip_trx,
                 "command": sysbench_command,
                 "mysql_ignore_errors": ignore_errors,
@@ -1808,6 +1859,7 @@ def _run_sysbench_write_only_drain(args: argparse.Namespace) -> Dict[str, Any]:
                 "report_interval_seconds": args.report_interval_seconds,
                 "full_report_count": full_report_count,
                 "connections_ready": ready_count,
+                "prepared_stmt_count_before_drain": prepared_stmt_count_before_drain,
                 "connections_ready_monotonic_ns": connections_ready_ns,
                 "reports_at_ready": reports_at_ready,
                 "discarded_partial_report": discarded,
@@ -1866,6 +1918,11 @@ def _run_sysbench_write_only_drain(args: argparse.Namespace) -> Dict[str, Any]:
                 "controlled_stop_after_hold_verification": (
                     controlled_stop_after_hold_verification
                 ),
+                "receiver_ready_before_sysbench_stop": (
+                    True if not session_only_control_handoff else None
+                ),
+                "connection_ids_before_sysbench_stop": list(ready_connection_ids),
+                "receiver_ready_completed_monotonic_ns": receiver_ready_completed_ns,
                 "raw_log": str(sysbench_log),
             },
         }
@@ -1878,6 +1935,14 @@ def _run_sysbench_write_only_drain(args: argparse.Namespace) -> Dict[str, Any]:
             report["sysbench"].pop("table_size", None)
         return report
     finally:
+        # Preserve the real child exit status before harness teardown. A lost
+        # SQL connection alone cannot distinguish a signal from a server error.
+        print("SYSBENCH_SERVER_PROCESSES " + json.dumps([
+            {"pid": child.pid, "returncode_before_cleanup": child.poll(),
+             "side": "source" if str(args.source_datadir) in str(child.args)
+                     else "receiver"}
+            for child in runner.server_processes
+        ], sort_keys=True), flush=True)
         if process is not None:
             _stop_sysbench(process)
         if reader is not None:
@@ -1893,6 +1958,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "mode-smoke",
             "lock-ddl-source-restore",
             "sysbench-write-only-drain",
+            "sysbench-read-write-drain",
             "sysbench-tpcc-drain",
         ),
         default="validate-log",
@@ -1915,9 +1981,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--sysbench-script",
         type=Path,
-        default=Path(__file__).resolve().with_name(
-            "oltp_write_only_staggered_init.lua"
-        ),
     )
     parser.add_argument("--sysbench-threads", type=int, default=0)
     parser.add_argument("--tpcc-script-dir", type=Path)
@@ -1956,7 +2019,7 @@ def _run_and_validate(args: argparse.Namespace, report: Dict[str, Any],
 
     log_offset = 0
     scenario_report: Mapping[str, Any] = {}
-    if args.scenario in {"sysbench-write-only-drain", "sysbench-tpcc-drain"}:
+    if args.scenario in {"sysbench-write-only-drain", "sysbench-read-write-drain", "sysbench-tpcc-drain"}:
         scenario_report = _run_sysbench_write_only_drain(args)
         report.update(scenario_report)
         log_offset = int(scenario_report.get("source_log_window_offset", 0))
@@ -2011,7 +2074,7 @@ def _run_and_validate(args: argparse.Namespace, report: Dict[str, Any],
         expected_mode=args.expected_mode,
         require_success=True,
     )
-    if args.scenario == "sysbench-write-only-drain" and args.sysbench_skip_trx == "on":
+    if args.scenario in {"sysbench-write-only-drain", "sysbench-read-write-drain"} and args.sysbench_skip_trx == "on":
         # The zero-token handoff has no legacy warmcopy metric; use this attempt's
         # validated final record, including scheduler time, without a fallback.
         if len(records) != 1:

@@ -42,6 +42,7 @@
 #include "sql/mdl.h"
 #include "sql/my_decimal.h"
 #include "sql/preserve_trx_lock_warmcopy.h"
+#include "sql/preserve_trx_result_manifest.h"
 #include "sql/rpl_gtid.h"
 #include "sql/sql_const.h"
 #include "sql/preserve_trx_temp_table_carrier.h"
@@ -122,7 +123,8 @@ Preserve_snapshot_status preserve_trx_snapshot_codec_peak_bytes(
       !add_string(metadata.user_vars_payload) ||
       !add_string(metadata.sql_savepoints_payload) ||
       !add_string(metadata.innodb_savepoints_payload) ||
-      !add_string(metadata.temp_table_manifest_payload)) {
+      !add_string(metadata.temp_table_manifest_payload) ||
+      !add_string(metadata.cursor_manifest_payload)) {
     return Preserve_snapshot_status::INVALID_ARGUMENT;
   }
   for (const Preserve_snapshot_modified_table_name &table :
@@ -234,6 +236,7 @@ constexpr uint16_t kTlvBinlogCachePayload = 0x70;
 constexpr uint16_t kTlvBinlogWarmcopyMetadata = 0x71;
 constexpr uint16_t kTlvTempTableManifest = 0x80;
 constexpr uint16_t kTlvExternalBlobDescriptors = 0x81;
+constexpr uint16_t kTlvCursorManifest = 0x82;
 constexpr uint32_t kBinlogCacheFlagImmediate = 1U << 0;
 constexpr uint32_t kBinlogCacheFlagWithXid = 1U << 1;
 constexpr uint32_t kBinlogCacheFlagWithSbr = 1U << 2;
@@ -271,11 +274,17 @@ constexpr uint16_t kSavepointHandlerSupportedMask =
 constexpr uint16_t kMinReadableUserVariablesVersion = 1;
 constexpr uint16_t kUserVariablesVersion = 2;
 constexpr uint16_t kSemanticContractVersion = 1;
+constexpr uint16_t kSemanticContractCursorVersion = 2;
+constexpr uint16_t kSemanticContractRecoveryVersion = 3;
+constexpr uint16_t kSemanticContractTempDdlVersion = 4;
 constexpr uint16_t kSavepointTopologyVersion = 1;
 constexpr size_t kSemanticContractLength = 24;
+constexpr size_t kSemanticContractRecoveryLength = 44;
+constexpr size_t kSemanticContractTempDdlLength = 45;
 constexpr uint8_t kSemanticStatePersistent = 1U << 0;
 constexpr uint8_t kSemanticStateTemp = 1U << 1;
 constexpr uint8_t kSemanticStateLoggedPersistentWork = 1U << 2;
+constexpr uint8_t kSemanticStateCursorResults = 1U << 3;
 constexpr uint8_t kSemanticStateKnownFlags =
     kSemanticStatePersistent | kSemanticStateTemp |
     kSemanticStateLoggedPersistentWork;
@@ -444,6 +453,13 @@ std::string transaction_access_mode_tlv_value(
 }
 
 bool semantic_contract_is_valid(const Preserve_snapshot_metadata &metadata) {
+  if ((metadata.temp_ddl_rollback_flags & ~0x06U) != 0) return false;
+  if (!preserve_trx_recovery_header_valid(metadata)) return false;
+  if (metadata.recovery.basis != Preserve_trx_engine_recovery::LEGACY) {
+    return metadata.binlog_format == Preserve_snapshot_binlog_format::ROW &&
+           metadata.auto_increment_increment != 0 &&
+           metadata.auto_increment_offset != 0;
+  }
   switch (metadata.engine_shape) {
     case Preserve_snapshot_engine_shape::PERSISTENT_ONLY:
       if (!metadata.has_persistent_engine_state ||
@@ -481,6 +497,7 @@ bool semantic_payload_facts_are_valid(
           Preserve_snapshot_binlog_state::LOGGED_WITH_CACHE &&
       metadata.binlog_cache_with_content;
   return semantic_contract_is_valid(metadata) &&
+         preserve_trx_recovery_payload_valid(metadata) &&
          metadata.has_temp_engine_state == has_temp_payload &&
          metadata.has_logged_persistent_work == has_logged_payload;
 }
@@ -488,8 +505,13 @@ bool semantic_payload_facts_are_valid(
 std::string semantic_contract_tlv_value(
     const Preserve_snapshot_metadata &metadata) {
   std::string value;
-  value.reserve(kSemanticContractLength);
-  append_le16(&value, kSemanticContractVersion);
+  const bool temp_ddl = metadata.temp_ddl_rollback_flags != 0;
+  const bool recovery = temp_ddl || metadata.recovery.basis != Preserve_trx_engine_recovery::LEGACY;
+  value.reserve(temp_ddl ? kSemanticContractTempDdlLength :
+                recovery ? kSemanticContractRecoveryLength : kSemanticContractLength);
+  append_le16(&value, temp_ddl ? kSemanticContractTempDdlVersion :
+                         recovery ? kSemanticContractRecoveryVersion : metadata.cursor_manifest_payload.empty()
+                         ? kSemanticContractVersion : kSemanticContractCursorVersion);
   value.push_back(static_cast<char>(metadata.engine_shape));
   uint8_t state_flags = 0;
   if (metadata.has_persistent_engine_state)
@@ -497,6 +519,8 @@ std::string semantic_contract_tlv_value(
   if (metadata.has_temp_engine_state) state_flags |= kSemanticStateTemp;
   if (metadata.has_logged_persistent_work)
     state_flags |= kSemanticStateLoggedPersistentWork;
+  if (!metadata.cursor_manifest_payload.empty())
+    state_flags |= kSemanticStateCursorResults;
   value.push_back(static_cast<char>(state_flags));
   value.push_back(static_cast<char>(metadata.binlog_format));
   uint8_t policy_flags = 0;
@@ -508,6 +532,15 @@ std::string semantic_contract_tlv_value(
   append_le16(&value, 0);
   append_le64(&value, metadata.auto_increment_increment);
   append_le64(&value, metadata.auto_increment_offset);
+  if (recovery) {
+    value.push_back(static_cast<char>(metadata.recovery.basis));
+    value.push_back(static_cast<char>((metadata.recovery.sql_transaction_active ? 1 : 0) |
+                                     (metadata.recovery.explicit_begin ? 2 : 0)));
+    append_le16(&value, 0);
+    append_le64(&value, metadata.recovery.owner_trx_id);
+    append_le64(&value, metadata.recovery.freeze_lsn);
+  }
+  if (temp_ddl) value.push_back(static_cast<char>(metadata.temp_ddl_rollback_flags));
   return value;
 }
 
@@ -1225,15 +1258,24 @@ bool parse_transaction_access_mode_tlv(const std::string &value,
 
 bool parse_semantic_contract_tlv(const std::string &value,
                                  Preserve_snapshot_metadata *metadata) {
-  if (metadata == nullptr || value.length() != kSemanticContractLength ||
-      read_le16(value, 0) != kSemanticContractVersion ||
+  if (metadata == nullptr ||
+      (value.length() != kSemanticContractLength &&
+       value.length() != kSemanticContractRecoveryLength &&
+       value.length() != kSemanticContractTempDdlLength) ||
       read_le16(value, 6) != 0) {
     return true;
   }
 
   const uint8_t state_flags = static_cast<uint8_t>(value[3]);
   const uint8_t policy_flags = static_cast<uint8_t>(value[5]);
-  if ((state_flags & ~kSemanticStateKnownFlags) != 0 ||
+  const auto version = read_le16(value, 0);
+  const bool temp_ddl = version == kSemanticContractTempDdlVersion;
+  const bool recovery = temp_ddl || version == kSemanticContractRecoveryVersion;
+  const bool has_results = (state_flags & kSemanticStateCursorResults) != 0;
+  if ((!recovery && version != (has_results ? kSemanticContractCursorVersion : kSemanticContractVersion)) ||
+      value.length() != (temp_ddl ? kSemanticContractTempDdlLength :
+                          recovery ? kSemanticContractRecoveryLength : kSemanticContractLength) ||
+      (state_flags & ~(kSemanticStateKnownFlags | kSemanticStateCursorResults)) != 0 ||
       (policy_flags & ~kSemanticPolicyKnownFlags) != 0) {
     return true;
   }
@@ -1257,6 +1299,21 @@ bool parse_semantic_contract_tlv(const std::string &value,
       (policy_flags & kSemanticPolicyAutocommit) != 0;
   metadata->auto_increment_increment = read_le64(value, 8);
   metadata->auto_increment_offset = read_le64(value, 16);
+  metadata->recovery = {};
+  metadata->temp_ddl_rollback_flags = temp_ddl
+      ? static_cast<uint8_t>(value[kSemanticContractRecoveryLength]) : 0;
+  if (temp_ddl && metadata->temp_ddl_rollback_flags == 0) return true;
+  if (recovery) {
+    const auto flags = static_cast<uint8_t>(value[25]);
+    if ((flags & ~3U) != 0 || read_le16(value, 26) != 0) return true;
+    metadata->recovery.basis = static_cast<Preserve_trx_engine_recovery>(
+        static_cast<uint8_t>(value[24]));
+    if (!temp_ddl && metadata->recovery.basis == Preserve_trx_engine_recovery::LEGACY) return true;
+    metadata->recovery.sql_transaction_active = (flags & 1) != 0;
+    metadata->recovery.explicit_begin = (flags & 2) != 0;
+    metadata->recovery.owner_trx_id = read_le64(value, 28);
+    metadata->recovery.freeze_lsn = read_le64(value, 36);
+  }
   return !semantic_contract_is_valid(*metadata);
 }
 
@@ -2125,6 +2182,16 @@ bool apply_bundle_semantics(std::vector<Preserve_snapshot_tlv> *tlvs,
       parse_semantic_contract_tlv(semantic_contract->value, metadata)) {
     return true;
   }
+  const auto *cursor_manifest = find_tlv(*tlvs, kTlvCursorManifest);
+  const bool has_results = (static_cast<uint8_t>(semantic_contract->value[3]) &
+                       kSemanticStateCursorResults) != 0;
+  if (has_results != (cursor_manifest != nullptr)) return true;
+  metadata->cursor_manifest_payload.clear();
+  if (cursor_manifest != nullptr) {
+    Preserve_trx_result_manifest_view parsed;
+    if (parsed.read(cursor_manifest->value)) return true;
+    metadata->cursor_manifest_payload = cursor_manifest->value;
+  }
 
   const Preserve_snapshot_tlv *savepoint_topology =
       find_tlv(*tlvs, kTlvSavepointTopology);
@@ -2595,6 +2662,12 @@ Preserve_snapshot_status build_preserved_trx_bundle(
 
   if (append_temp_table_manifest_tlv(built.metadata, &built.tlvs))
     return Preserve_snapshot_status::INVALID_ARGUMENT;
+  if (!built.metadata.cursor_manifest_payload.empty()) {
+    Preserve_trx_result_manifest_view parsed;
+    if (parsed.read(built.metadata.cursor_manifest_payload))
+      return Preserve_snapshot_status::INVALID_ARGUMENT;
+    built.tlvs.push_back({kTlvCursorManifest, built.metadata.cursor_manifest_payload});
+  }
   built.owns_current_temp_sidecars =
       !built.metadata.temp_table_manifest_payload.empty();
 

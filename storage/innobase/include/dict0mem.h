@@ -1567,6 +1567,12 @@ struct dict_table_t {
   /** Id of the table. */
   table_id_t id;
 
+#if !defined(UNIV_HOTBACKUP) && !defined(UNIV_LIBRARY)
+  /** Non-null only after a prepared temporary dictionary transfers ownership.
+  Zero initialized by dict_mem_table_create; released after this table's heap. */
+  trx_preserve_temp_dictionary_memory *preserve_memory;
+#endif
+
   /** Memory heap. If you allocate from this heap after the table has
   been created then be sure to account the allocation into
   dict_sys->size. When closing the table we do something like

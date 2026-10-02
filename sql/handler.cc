@@ -2152,7 +2152,7 @@ int ha_rollback_trans(THD *thd, bool all) {
     if (preserve_trx_temp_table_transaction_state_needs_clear(thd))
       preserve_trx_temp_table_clear_transaction_state(thd);
   } else {
-    preserve_trx_temp_table_note_statement_rollback(thd);
+    preserve_trx_temp_table_note_statement_rollback(thd, error == 0);
   }
 
   return error;

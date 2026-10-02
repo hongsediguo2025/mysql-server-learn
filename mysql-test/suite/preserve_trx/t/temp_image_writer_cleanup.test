@@ -1,0 +1,5 @@
+--let $capture_case= temporary image writer retries only owned cleanup
+--let $capture_trace_name= temp_image_writer_cleanup.trace
+--let $capture_fault= preserve_temp_image_writer_ownership_probe,preserve_temp_image_writer_cleanup_probe,preserve_trx_fail_before_snapshot_fsync
+--let $capture_trace_pattern= temporary image writer cleanup retry checked
+--source suite/preserve_trx/include/temp_table_capture_undo_failure.inc

@@ -1,0 +1,65 @@
+--disable_query_log
+--disable_result_log
+--let $off= `SELECT @@GLOBAL.rds_preserve_trx_enable=0`
+if (!$off)
+{
+  --die this native comparison requires preserve OFF
+}
+CREATE TABLE t_index_native(id INT PRIMARY KEY,v INT) ENGINE=InnoDB;
+INSERT INTO t_index_native VALUES(1,10),(2,20);
+CREATE TEMPORARY TABLE tmp_index_native(id INT PRIMARY KEY,v INT,KEY ix_keep(v),KEY ix_drop(id,v)) ENGINE=InnoDB;
+INSERT INTO tmp_index_native WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM s WHERE n<64) SELECT n,n MOD 4 FROM s;
+
+BEGIN;
+UPDATE tmp_index_native SET v=v+1;
+UPDATE t_index_native SET v=v+1 WHERE id=1;
+CREATE INDEX ix_new ON tmp_index_native(v);
+ROLLBACK;
+--let $ok= `SELECT (SELECT SUM(v)=160 FROM tmp_index_native FORCE INDEX(ix_new)) AND (SELECT v=11 FROM t_index_native WHERE id=1)`
+if (!$ok)
+{
+  --die CREATE INDEX lost its native implicit commit
+}
+
+BEGIN;
+UPDATE tmp_index_native SET v=v+1;
+UPDATE t_index_native SET v=v+1 WHERE id=1;
+DROP INDEX ix_drop ON tmp_index_native;
+ROLLBACK;
+--let $ok= `SELECT (SELECT SUM(v)=224 FROM tmp_index_native) AND (SELECT v=12 FROM t_index_native WHERE id=1)`
+if (!$ok)
+{
+  --die DROP INDEX lost its native implicit commit
+}
+--error ER_KEY_DOES_NOT_EXITS
+SELECT * FROM tmp_index_native FORCE INDEX(ix_drop);
+
+BEGIN;
+UPDATE tmp_index_native SET v=v+1;
+UPDATE t_index_native SET v=v+1 WHERE id=1;
+--error ER_DUP_ENTRY
+CREATE UNIQUE INDEX ix_failed ON tmp_index_native(v);
+ROLLBACK;
+--let $ok= `SELECT (SELECT SUM(v)=288 FROM tmp_index_native FORCE INDEX(ix_keep)) AND (SELECT v=13 FROM t_index_native WHERE id=1)`
+if (!$ok)
+{
+  --die failed CREATE INDEX lost the committed prefix or old definition
+}
+--error ER_KEY_DOES_NOT_EXITS
+SELECT * FROM tmp_index_native FORCE INDEX(ix_failed);
+
+BEGIN;
+UPDATE tmp_index_native SET v=v+1;
+UPDATE t_index_native SET v=v+1 WHERE id=1;
+--error ER_CANT_DROP_FIELD_OR_KEY
+DROP INDEX ix_missing ON tmp_index_native;
+ROLLBACK;
+--let $ok= `SELECT (SELECT SUM(v)=352 FROM tmp_index_native FORCE INDEX(ix_keep)) AND (SELECT v=14 FROM t_index_native WHERE id=1)`
+if (!$ok)
+{
+  --die failed DROP INDEX lost the committed prefix or old definition
+}
+DROP TEMPORARY TABLE tmp_index_native;
+DROP TABLE t_index_native;
+--enable_result_log
+--echo native INDEX success/error commit semantics unchanged with preserve OFF

@@ -1,0 +1,23 @@
+# Real transfer held before READY. Restart is teardown only, not recovery acceptance.
+--source suite/preserve_trx/t/temp_source_transfer_cursor.test
+--connection contract_receiver
+SELECT VARIABLE_NAME,VARIABLE_VALUE FROM performance_schema.global_status
+WHERE VARIABLE_NAME IN ('Preserve_trx_temp_stage_final_tokens',
+'Preserve_trx_temp_stage_final_active_epochs',
+'Preserve_trx_temp_stage_final_ready_epochs') ORDER BY VARIABLE_NAME;
+--disable_result_log
+--disable_query_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--enable_query_log
+--perl
+open my $fh, '<', "$ENV{MYSQLTEST_VARDIR}/log/mysqld.2.err" or die $!;
+my $log = do {local $/; <$fh>};
+my $current = (split /CURRENT_TEST: preserve_trx\.temp_stage_metrics_cancel\n/, $log)[-1];
+my @samples = grep {/PRESERVE_TEMP_FINAL_V1 /} split /\n/, $current;
+die "unfinished final missing cancellation sample\n" unless @samples == 1;
+my %s = $samples[0] =~ /(\w+)=(\S+)/g;
+die "shutdown counted unfinished READY\n" unless $s{outcome} eq 'CANCELLED';
+die "cancellation wall mismatch\n" unless $s{end_us} - $s{begin_us} == $s{wall_us}
+  && $s{wall_us} == $s{prepare_only_us} + $s{bind_only_us} + $s{overlap_us} + $s{other_us};
+EOF

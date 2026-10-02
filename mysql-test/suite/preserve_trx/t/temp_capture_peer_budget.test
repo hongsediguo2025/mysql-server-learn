@@ -1,0 +1,2 @@
+--let $peer_budget_probe= 1
+--source suite/preserve_trx/t/temp_capture_page_order.test

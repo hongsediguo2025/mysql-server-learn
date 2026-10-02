@@ -1,0 +1,18 @@
+SELECT @@global.rds_preserve_trx_enable;
+@@global.rds_preserve_trx_enable
+1
+SET SESSION debug='+d,preserve_temp_physical_metrics_probe';
+SHOW PRESERVED TRANSACTIONS;
+SET SESSION debug='';
+SELECT VARIABLE_NAME,VARIABLE_VALUE FROM performance_schema.global_status
+WHERE VARIABLE_NAME IN ('Preserve_trx_temp_stage_physical_prepare_calls',
+'Preserve_trx_temp_stage_physical_prepare_failure_calls',
+'Preserve_trx_temp_stage_physical_adopt_calls',
+'Preserve_trx_temp_stage_physical_adopt_failure_calls',
+'Preserve_trx_temp_stage_physical_resurrect_calls') ORDER BY VARIABLE_NAME;
+VARIABLE_NAME	VARIABLE_VALUE
+Preserve_trx_temp_stage_physical_adopt_calls	1
+Preserve_trx_temp_stage_physical_adopt_failure_calls	1
+Preserve_trx_temp_stage_physical_prepare_calls	1
+Preserve_trx_temp_stage_physical_prepare_failure_calls	1
+Preserve_trx_temp_stage_physical_resurrect_calls	0

@@ -1,0 +1,5 @@
+--let $capture_case= temporary capture release races with source pool return
+--let $capture_trace_name= temp_capture_pool_race.trace
+--let $capture_fault= preserve_temp_source_pool_probe,preserve_temp_source_pool_race,preserve_trx_fail_before_snapshot_fsync
+--let $capture_trace_pattern= temporary source pool concurrent retirement checked rounds=64
+--source suite/preserve_trx/include/temp_table_capture_undo_failure.inc

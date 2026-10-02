@@ -206,6 +206,8 @@ struct mtr_t {
 
     /** Flush Observer */
     FlushObserver *m_flush_observer;
+    /** Explicit active temporary-undo owner, reset on every start(). */
+    uint64_t m_preserve_temp_undo_cookie;
 
 #ifdef UNIV_DEBUG
     /** For checking corruption. */
@@ -415,6 +417,8 @@ struct mtr_t {
   @param mode	 logging mode
   @return	old mode */
   mtr_log_t set_log_mode(mtr_log_t mode);
+
+  void set_preserve_temp_undo_cookie(uint64_t cookie);
 
   /** Read 1 - 4 bytes from a file page buffered in the buffer pool.
   @param ptr	pointer from where to read

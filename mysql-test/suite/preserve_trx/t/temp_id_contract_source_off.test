@@ -1,0 +1,3 @@
+--source include/not_log_bin.inc
+--let $receiver_namespace= 0
+--source suite/preserve_trx/include/temp_id_contract_source.inc

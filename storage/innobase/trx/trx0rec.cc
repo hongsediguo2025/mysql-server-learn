@@ -2201,6 +2201,8 @@ dberr_t trx_undo_report_row_operation(
     undo logs are not restored on restart. */
     undo_ptr = &trx->rsegs.m_noredo;
     mtr.set_log_mode(MTR_LOG_NO_REDO);
+    if (trx->preserve_temp_undo_cookie)
+      mtr.set_preserve_temp_undo_cookie(trx->preserve_temp_undo_cookie);
   } else {
     undo_ptr = &trx->rsegs.m_redo;
   }

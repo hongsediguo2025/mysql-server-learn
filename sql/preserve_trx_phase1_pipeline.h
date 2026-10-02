@@ -45,7 +45,8 @@ enum class Preserve_trx_phase1_pipeline_lifecycle : uint8_t {
 
 enum class Preserve_trx_phase1_pipeline_family : uint8_t {
   RECORD_LOCK,
-  BINLOG_CACHE
+  BINLOG_CACHE,
+  TEMP_TABLE
 };
 
 enum class Preserve_trx_phase1_pipeline_submit_status : uint8_t {
@@ -185,6 +186,9 @@ struct Preserve_trx_phase1_pipeline_snapshot {
   uint64_t credit_in_use_bytes{0};
   uint64_t record_credit_in_use_bytes{0};
   uint64_t binlog_credit_in_use_bytes{0};
+  uint64_t temp_credit_in_use_bytes{0};
+  uint64_t temp_steps{0};
+  uint64_t ordinary_temp_slow_operations{0};
   uint64_t tail_record_credit_consumed_bytes{0};
   uint64_t cancel_revision{0};
   uint64_t operation_cutoff_us{0};
@@ -232,11 +236,22 @@ struct Preserve_trx_phase1_pipeline_snapshot {
   bool sequencer_ready{false};
 };
 
+/** The TEMP owner keeps native leases and private captures outside the value-only
+queue. One admission runs one bounded step; no live THD is used by this port. */
+class Preserve_trx_phase1_temp_provider_port {
+ public:
+  virtual ~Preserve_trx_phase1_temp_provider_port() = default;
+  virtual Preserve_trx_phase1_pipeline_result_status step(
+      const Preserve_trx_phase1_work_descriptor &, size_t byte_budget,
+      std::string *reason) = 0;
+};
+
 class Preserve_trx_phase1_pipeline {
  public:
   explicit Preserve_trx_phase1_pipeline(
       const Preserve_trx_phase1_pipeline_config &config,
-      Preserve_trx_phase1_binlog_provider_port *binlog_provider = nullptr);
+      Preserve_trx_phase1_binlog_provider_port *binlog_provider = nullptr,
+      Preserve_trx_phase1_temp_provider_port *temp_provider = nullptr);
   ~Preserve_trx_phase1_pipeline();
 
   Preserve_trx_phase1_pipeline(const Preserve_trx_phase1_pipeline &) = delete;
@@ -244,6 +259,7 @@ class Preserve_trx_phase1_pipeline {
       const Preserve_trx_phase1_pipeline &) = delete;
 
   bool start();
+  void clear_temp_demand();
   Preserve_trx_phase1_pipeline_submit_status try_submit(
       const Preserve_trx_phase1_work_descriptor &descriptor);
   Preserve_trx_phase1_pipeline_submit_status try_submit_final(

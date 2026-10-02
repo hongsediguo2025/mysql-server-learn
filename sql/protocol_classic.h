@@ -242,6 +242,12 @@ class Protocol_binary final : public Protocol_text {
  public:
   Protocol_binary() {}
   Protocol_binary(THD *thd_arg) : Protocol_text(thd_arg) {}
+  /** Rebind a prepared Preserve sender without resetting its column cache. */
+  bool bind_preserved(THD *thd);
+  /** Initialize a preserved cursor sender without writing protocol packets.
+  The caller supplies the cursor arena for metadata allocations. */
+  bool initialize_preserved_metadata(uint columns, const enum_field_types *types,
+                                     const CHARSET_INFO *result_charset);
   void start_row() override;
   bool store_null() override;
   bool store_tiny(longlong from, uint32 zerofill) override;

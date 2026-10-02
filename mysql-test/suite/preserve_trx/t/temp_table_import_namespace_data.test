@@ -1,0 +1,6 @@
+SELECT @@global.rds_preserve_trx_temp_id_namespace AS namespace_enabled;
+--let $capture_case= temporary data page and current undo relocation
+--let $capture_trace_name= temp_import_namespace_data.trace
+--let $capture_fault= preserve_temp_import_source_undo_probe,preserve_temp_import_target_data_probe
+--let $capture_trace_pattern= (?s)temporary data page relocation complete pages=[1-9][0-9]* rows=[1-9][0-9]* current=[1-9][0-9]*.*temporary namespace requires standby transfer
+--source suite/preserve_trx/include/temp_table_capture_undo_failure.inc

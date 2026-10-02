@@ -1,0 +1,12 @@
+--source include/have_debug.inc
+--source include/have_log_bin.inc
+--disable_query_log
+CALL mtr.add_suppression("The table 'tmp_shapes_.*' is full!");
+--enable_query_log
+--let $receiver_namespace= 1
+--let $contract_temporary= cursor
+--let $contract_loopback= 1
+--let $contract_engine= temp-only
+--let $contract_column_shapes= rowid-limit
+--let $contract_resume= success
+--source suite/preserve_trx/include/temp_id_contract_source.inc

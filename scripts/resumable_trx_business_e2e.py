@@ -11363,9 +11363,8 @@ END
             ),
             "sampler_error": self._continuous_business_progress_error,
         }
-        if self.config.continuous_large_tx_shape == "LOCKSET":
-            # Keep evidence even when source/client clock mapping is invalid.
-            result["raw_progress_samples"] = samples
+        # Keep evidence even when source/client clock mapping is invalid.
+        result["raw_progress_samples"] = samples
         timeline = dict(getattr(self, "continuous_source_timeline", {}))
         phase1_started_us = int(timeline.get("phase1_started_us", 0) or 0)
         t0_us = int(
@@ -11377,9 +11376,10 @@ END
         attempt_terminal_us = int(
             timeline.get("attempt_terminal_us", 0) or 0
         )
-        drain_call_start_us = int(
-            getattr(self, "continuous_drain_call_start_monotonic_us", 0)
-        )
+        drain_call_start_us = int(getattr(
+            self, "continuous_drain_execute_start_monotonic_us",
+            getattr(self, "continuous_drain_call_start_monotonic_us", 0),
+        ))
         drain_response_received_us = int(
             getattr(
                 self,
@@ -12799,6 +12799,9 @@ END
                 )
             ),
             "continuous_drain_call_start_monotonic_us": drain_call_us,
+            "continuous_drain_execute_start_monotonic_us": int(getattr(
+                self, "continuous_drain_execute_start_monotonic_us", 0
+            )),
             "continuous_drain_response_received_monotonic_us": (
                 drain_response_received_us
             ),
@@ -14341,14 +14344,26 @@ END
             self.drain_result_transport_disconnected = False
         try:
             conn = self.runtime.connect(database=False)
-            rows = self.runtime.execute(
-                conn,
-                "DRAIN TRANSACTIONS PRESERVE WITH USER VARS",
-                fetch=expects_transfer_result,
-            )
             if self.config.continuous_business_through_drain:
-                self.continuous_drain_response_received_monotonic_us = (
-                    time.monotonic_ns() // 1000
+                # Cursor construction may issue COM_PING. Bracket only the
+                # DRAIN response for source/harness clock-offset bounds.
+                cursor = conn.cursor()
+                try:
+                    self.continuous_drain_execute_start_monotonic_us = (
+                        time.monotonic_ns() // 1000
+                    )
+                    cursor.execute("DRAIN TRANSACTIONS PRESERVE WITH USER VARS")
+                    rows = cursor.fetchall() if expects_transfer_result else ()
+                    self.continuous_drain_response_received_monotonic_us = (
+                        time.monotonic_ns() // 1000
+                    )
+                finally:
+                    cursor.close()
+            else:
+                rows = self.runtime.execute(
+                    conn,
+                    "DRAIN TRANSACTIONS PRESERVE WITH USER VARS",
+                    fetch=expects_transfer_result,
                 )
             if expects_transfer_result:
                 self.drain_result_rows = self._decode_transfer_drain_result(rows)

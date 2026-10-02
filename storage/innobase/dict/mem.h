@@ -49,6 +49,13 @@ dict_table_t *dict_mem_table_create(
 /** Free a table memory object. */
 void dict_mem_table_free(dict_table_t *table); /*!< in: table */
 
+#if !defined(UNIV_HOTBACKUP) && !defined(UNIV_LIBRARY)
+struct trx_preserve_temp_dictionary_memory;
+/** Return imported dictionary credit after native table/index destruction. */
+void trx_preserve_temp_dictionary_memory_free(
+    trx_preserve_temp_dictionary_memory *memory) noexcept;
+#endif
+
 /** Creates an index memory object.
  @return own: index object */
 dict_index_t *dict_mem_index_create(

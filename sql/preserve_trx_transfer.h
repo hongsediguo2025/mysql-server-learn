@@ -42,8 +42,11 @@
 #include "sql/preserve_trx_bundle.h"
 #include "sql/preserve_trx_carrier.h"
 #include "sql/preserve_trx_resurrection_index.h"
+#include "sql/preserve_trx_temp_id_contract.h"
+#include "sql/preserve_trx_resource.h"
 
 class THD;
+class Preserve_trx_sealed_file;
 class lock_preserve_metadata_plan_t;
 struct MYSQL;
 struct lock_preserve_record_lock_metadata_facts_t;
@@ -55,15 +58,21 @@ struct Preserve_trx_prepared_token_key;
   that understands the canonical session-only payload before switchover.
 */
 static constexpr uint16_t kPreserveTrxTransferProtocolVersion = 2;
+// Only OPEN and its ACK use v3; data frames and stored artifacts stay v2.
+static constexpr uint16_t kPreserveTrxTransferOpenContractVersion = 3;
 static constexpr uint32_t kPreserveTrxTransferOperationTimeoutMs = 30000;
 static constexpr uint16_t kPreserveTrxTransferLockPlanContractVersion =
     kPreservedTrxLockPlanContractVersion;
 static constexpr uint32_t PRESERVE_TRX_TRANSFER_STRICT_ACTIVE_UNDO = 1U << 0;
 static constexpr uint32_t
     PRESERVE_TRX_TRANSFER_STRICT_PARTICIPANTS_AUTHENTICATED = 1U << 1;
+static constexpr uint32_t PRESERVE_TRX_TRANSFER_STRICT_NO_REDO_CONTEXT = 1U << 2;
+static constexpr uint32_t PRESERVE_TRX_TRANSFER_STRICT_RESOURCE_ONLY = 1U << 3;
 static constexpr uint32_t kPreserveTrxTransferStrictEligibilityKnownFlags =
     PRESERVE_TRX_TRANSFER_STRICT_ACTIVE_UNDO |
-    PRESERVE_TRX_TRANSFER_STRICT_PARTICIPANTS_AUTHENTICATED;
+    PRESERVE_TRX_TRANSFER_STRICT_PARTICIPANTS_AUTHENTICATED |
+    PRESERVE_TRX_TRANSFER_STRICT_NO_REDO_CONTEXT |
+    PRESERVE_TRX_TRANSFER_STRICT_RESOURCE_ONLY;
 static constexpr const char kPreserveTrxResurrectionIndexObjectId[] =
     "resurrection_index";
 
@@ -441,7 +450,9 @@ enum class Preserve_trx_transfer_object_kind : uint16_t {
   SNAPSHOT_BUNDLE = 1,
   EXTERNAL_BLOB = 2,
   TEMP_TABLE_SIDECAR = 3,
-  RESURRECTION_INDEX = 4
+  RESURRECTION_INDEX = 4,
+  // Wire kind 5 (former PS descriptor) is no longer accepted.
+  CURSOR_RESULT = 6
 };
 
 enum class Preserve_trx_transfer_strict_eligibility_status : uint8_t {
@@ -472,7 +483,7 @@ enum class Preserve_trx_transfer_frame_type : uint16_t {
   DECLARE_TOKEN = 8,
   DECLARE_OBJECT = 9,
   QUERY_EPOCH_STATUS = 10,
-  ABANDON_EPOCH_IF_NOT_COMMITTED = 12
+  ABANDON_EPOCH_IF_NOT_COMMITTED = 12,
 };
 
 struct Preserve_trx_transfer_lock_plan_contract {
@@ -577,18 +588,21 @@ struct Preserve_trx_transfer_frame {
   Preserve_trx_transfer_trx_id_store_fact trx_id_store;
   uint64_t requested_terminal_status_retention_us{0};
   std::array<unsigned char, kPreservedTrxSha256Length> terminal_fact_digest{};
+  Preserve_trx_temp_id_contract temp_id_contract;
   std::string manifest_payload;
   std::string chunk_payload;
   std::string reason;
 };
 
 struct Preserve_trx_transfer_frame_ack {
+  uint16_t protocol_version{kPreserveTrxTransferProtocolVersion};
   std::string epoch_id;
   std::string receiver_process_nonce;
   uint64_t sequence{0};
   std::array<unsigned char, kPreservedTrxSha256Length> frame_digest{};
   Preserve_trx_transfer_status status{Preserve_trx_transfer_status::OK};
   uint64_t accepted_terminal_status_retention_us{0};
+  Preserve_trx_temp_id_contract temp_id_contract;
 };
 
 Preserve_trx_transfer_status
@@ -618,7 +632,10 @@ enum class Preserve_trx_transfer_receiver_state {
   ABORTED
 };
 
+class Preserve_trx_transfer_object_index;
+class Preserve_trx_receiver_candidates;
 struct Preserve_trx_transfer_receiver_record {
+  Preserve_trx_temp_id_contract temp_id_contract;
   /*
     Receiver-private in-memory state for one transferred token. This record is
     intentionally separate from g_preserved_trx_records: a standby-pending token
@@ -634,8 +651,24 @@ struct Preserve_trx_transfer_receiver_record {
   Preserve_trx_transfer_receiver_state state{
       Preserve_trx_transfer_receiver_state::RECEIVING};
   std::vector<Preserve_trx_transfer_object_descriptor> objects;
+  std::shared_ptr<const Preserve_trx_transfer_object_index> object_index;
   std::set<std::string> sealed_objects;
+  // Phase1 may change descriptors; a queued final bundle must remain immutable.
+  bool staged_manifest_frozen{false};
+  bool has_resource_objects{false};
+  bool has_snapshot_bundle{false};
+  bool resource_final_observed{false};
+  bool staging_resources_retired{false};
+  // Admission reserves the retirement owner, so cancellation never allocates it.
+  std::map<std::string, uint64_t> staging_tickets;
+  /* Temporary sidecars retain the descriptor verified at SEAL. Record copies
+     share ownership; replacement/terminal cleanup drops only its own refs. */
+  using Sealed_files =
+      std::map<std::string, std::shared_ptr<const Preserve_trx_sealed_file>>;
+  Sealed_files sealed_files;
+  std::shared_ptr<Preserve_trx_receiver_candidates> resource_candidates;
   uint64_t reserved_bytes{0};
+  uint64_t resource_reserved_bytes{0};
   std::string last_error;
 };
 
@@ -680,6 +713,7 @@ struct Preserve_trx_transfer_accepted_epoch {
   std::string root_dir;
   std::string epoch_id;
   std::string receiver_process_generation;
+  Preserve_trx_temp_id_contract temp_id_contract;
   uint64_t source_fence_lsn{0};
   std::vector<uint64_t> tokens;
   std::array<unsigned char, kPreservedTrxSha256Length> fact_digest{};
@@ -742,13 +776,19 @@ struct Preserve_trx_transfer_payload_apply_reservation {
 
 class Preserve_trx_transfer_receiver_registry {
  public:
+  struct Staging_retirement {
+    uint64_t id{0};
+    std::string object_id;
+  };
   ~Preserve_trx_transfer_receiver_registry();
 
   Preserve_trx_transfer_status open_online_epoch(
       const std::string &epoch_id, const std::string &authenticated_principal,
       uint64_t requested_terminal_status_retention_us,
       const std::string &receiver_process_nonce,
-      uint64_t *accepted_terminal_status_retention_us);
+      uint64_t *accepted_terminal_status_retention_us,
+      const Preserve_trx_temp_id_contract &requested_temp_id_contract = {},
+      Preserve_trx_temp_id_contract *accepted_temp_id_contract = nullptr);
   Preserve_trx_transfer_status validate_online_epoch(
       const std::string &epoch_id, const std::string &authenticated_principal,
       const std::string &receiver_process_nonce,
@@ -763,10 +803,18 @@ class Preserve_trx_transfer_receiver_registry {
 
   Preserve_trx_transfer_status begin_receive(
       const Preserve_trx_transfer_manifest &manifest,
-      uint64_t manifest_payload_bytes = 0);
+      uint64_t manifest_payload_bytes = 0,
+      std::vector<Staging_retirement> *retirements = nullptr,
+      bool *first_resource_final = nullptr);
+  Preserve_trx_transfer_status freeze_staged_manifest(
+      const Preserve_trx_transfer_manifest &manifest);
   Preserve_trx_transfer_status declare_object(
       const std::string &epoch_id, uint64_t token,
-      const Preserve_trx_transfer_object_descriptor &descriptor);
+      const Preserve_trx_transfer_object_descriptor &descriptor,
+      uint64_t *retirement_id = nullptr);
+  /** Wire deletion and last verified reader are separate release conditions. */
+  void mark_staging_object_deleted(uint64_t retirement_id);
+  size_t reap_retired_staging_once(size_t budget = 32);
 
   Preserve_trx_transfer_status stage_strict_v1_object_chunk(
       const Preserve_trx_transfer_manifest &manifest,
@@ -779,17 +827,24 @@ class Preserve_trx_transfer_receiver_registry {
       const Preserve_trx_transfer_manifest &manifest,
       const std::string &object_id,
       std::shared_ptr<const std::string> *payload) const;
-  void erase_strict_v1_object(const std::string &epoch_id, uint64_t token,
-                              const std::string &object_id);
   void erase_strict_v1_token_objects(const std::string &epoch_id,
                                      uint64_t token);
+  /** After producers/workers stop, release file pins before mysys teardown.
+  Staged files remain on disk; this is not a token abort or recovery path. */
+  void discard_records_for_process_shutdown();
 
   Preserve_trx_transfer_status mark_saved_online(const std::string &epoch_id,
-                                                 uint64_t token);
+                                                 uint64_t token,
+                                                 bool staging_deleted = false);
+  /** Release staging admission only after token directory deletion succeeds.
+  Terminal markers stop mutation but retain their live reservation until here
+  or the atomic handoff to cleanup debt below. Idempotent after completion. */
+  Preserve_trx_transfer_status complete_staging_cleanup(
+      const std::string &epoch_id, uint64_t token);
   Preserve_trx_transfer_status mark_cleanup_pending(
       const std::string &root_dir, const std::string &epoch_id, uint64_t token,
       uint64_t now_us, Preserve_trx_transfer_receiver_state target_state,
-      const std::string &reason);
+      const std::string &reason, uint64_t minimum_cleanup_bytes = 0);
   size_t retry_cleanup_debt_once(uint64_t now_us);
   size_t cleanup_debt_count_for_unit_test() const;
   Preserve_trx_transfer_status acknowledge_epoch(
@@ -838,6 +893,9 @@ class Preserve_trx_transfer_receiver_registry {
                               const std::string &epoch_id) const;
   bool accepted_epoch_is_expired(const std::string &root_dir,
                                  const std::string &epoch_id) const;
+  bool accepted_epoch_rejects_token(const std::string &root_dir,
+                                    const std::string &epoch_id,
+                                    uint64_t token) const;
   Preserve_trx_transfer_status mark_accepted_epoch_ready(
       const std::string &root_dir, const std::string &epoch_id, uint64_t now_us,
       uint64_t ready_deadline_monotonic_us);
@@ -873,7 +931,8 @@ class Preserve_trx_transfer_receiver_registry {
                                             const std::string &reason);
   Preserve_trx_transfer_status mark_object_sealed(
       const std::string &epoch_id, uint64_t token,
-      const std::string &object_id);
+      const std::string &object_id,
+      std::shared_ptr<const Preserve_trx_sealed_file> file = nullptr);
   Preserve_trx_transfer_status consume_frame_sequence(
       const std::string &epoch_id, uint64_t sequence,
       Preserve_trx_transfer_frame_type frame_type,
@@ -934,7 +993,7 @@ class Preserve_trx_transfer_receiver_registry {
   void rollback_frame_sequence(const std::string &epoch_id,
                                uint64_t sequence);
   bool all_objects_sealed(const std::string &epoch_id,
-                          uint64_t token) const;
+                          uint64_t token, bool require_snapshot = false) const;
   std::vector<Preserve_trx_transfer_receiver_record>
   receiving_records_for_epoch(const std::string &epoch_id) const;
   std::vector<Preserve_trx_transfer_receiver_record>
@@ -942,6 +1001,17 @@ class Preserve_trx_transfer_receiver_registry {
 
   bool lookup(const std::string &epoch_id, uint64_t token,
               Preserve_trx_transfer_receiver_record *record) const;
+  bool lookup_state(const std::string &epoch_id, uint64_t token,
+                    Preserve_trx_transfer_receiver_state *state,
+                    Preserve_trx_temp_id_contract *contract = nullptr,
+                    bool *has_resource_objects = nullptr) const;
+  // Object operations take a token header and indexed descriptor. Binlog
+  // prewarm may request its one companion; CHUNK never copies sealed owners.
+  bool lookup_object(const std::string &epoch_id, uint64_t token,
+                           const std::string &object_id,
+                           Preserve_trx_transfer_receiver_record *record,
+                           size_t *object_count, bool sealed_owners = false,
+                           const char *companion = nullptr) const;
   size_t size() const;
   size_t active_epoch_count() const;
   uint64_t expired_epoch_count() const;
@@ -949,12 +1019,53 @@ class Preserve_trx_transfer_receiver_registry {
 
  private:
   using Token_key = std::pair<std::string, uint64_t>;
+  struct Retired_staging {
+    Preserve_memory_lease memory;
+    Token_key token;
+    std::string object_id;
+    uint64_t bytes{0};
+    std::shared_ptr<const Preserve_trx_sealed_file> file;
+    bool retired{false}, path_deleted{false}, closing{false};
+    uint64_t previous{0}, next{0};
+  };
+  using Retired_staging_map = std::map<uint64_t, Retired_staging>;
+  Retired_staging_map m_retired_staging;
+  std::map<Token_key, std::set<uint64_t>> m_staging_by_token;
+  uint64_t m_next_staging_retirement{1}, m_staging_reap_cursor{0};
+  uint64_t m_staging_retired_head{0}, m_staging_retired_tail{0};
+  void retire_staging_ticket_locked(uint64_t id);
+  Preserve_trx_transfer_status stage_retirement_locked(
+      const Preserve_trx_transfer_receiver_record &record,
+      const Preserve_trx_transfer_object_descriptor &object,
+      std::vector<uint64_t> *pending, uint64_t *bytes);
+  void commit_retirements_locked(const std::vector<uint64_t> &pending,
+                                 uint64_t bytes);
+  Preserve_trx_transfer_status prepare_staging_ticket_locked(
+      const Token_key &key, const Preserve_trx_transfer_object_descriptor &object,
+      uint64_t *id);
+  void discard_staging_tickets_locked(uint64_t first_id);
+  void erase_staging_ticket_locked(Retired_staging_map::iterator ticket);
+  Preserve_trx_transfer_status retire_all_staging_locked(
+      Preserve_trx_transfer_receiver_record &record);
+  void mark_staging_token_deleted_locked(const Token_key &key);
+  Preserve_trx_transfer_status retire_epoch_staging_locked(const std::string &epoch);
 
-  uint64_t cleanup_debt_reserved_bytes_locked(bool *overflow) const;
+  Preserve_trx_transfer_status check_reservation_locked(
+      const std::string &epoch, uint64_t old_bytes, uint64_t new_bytes,
+      uint64_t limit);
+  void set_reservation_locked(Preserve_trx_transfer_receiver_record &record,
+                              uint64_t bytes);
+  void add_cleanup_debt_bytes_locked(uint64_t bytes);
+  void subtract_cleanup_debt_bytes_locked(uint64_t bytes);
+  bool retain_epoch_resources_locked(
+      const std::string &epoch_id,
+      std::vector<std::shared_ptr<const void>> *resources) const;
 
   Preserve_trx_transfer_status mark_terminal_locked(
       const Token_key &key, Preserve_trx_transfer_receiver_state state,
-      const std::string &reason);
+      const std::string &reason,
+      Preserve_trx_transfer_receiver_record::Sealed_files *retired_files,
+      std::shared_ptr<Preserve_trx_receiver_candidates> *retired_candidates);
   Preserve_trx_transfer_status erase_cleaned_epoch(
       const std::string &root_dir, const std::string &epoch_id,
       Preserve_trx_transfer_epoch_lifecycle expected_lifecycle);
@@ -962,6 +1073,9 @@ class Preserve_trx_transfer_receiver_registry {
   mutable std::mutex m_mutex;
   std::condition_variable m_sequence_condition;
   std::map<Token_key, Preserve_trx_transfer_receiver_record> m_records;
+  std::map<std::string, uint64_t> m_live_reserved_by_epoch;
+  // Cleanup debt spans all epochs. Keep carry reversible after an overflow.
+  uint64_t m_cleanup_debt_bytes{0}, m_cleanup_debt_carries{0};
   std::map<std::string, uint64_t> m_next_sequence_by_epoch;
   std::set<std::string> m_active_payload_sequences;
   struct Payload_apply_record {
@@ -1008,6 +1122,7 @@ class Preserve_trx_transfer_receiver_registry {
     std::string authenticated_principal;
     uint64_t requested_terminal_status_retention_us{0};
     uint64_t accepted_terminal_status_retention_us{0};
+    Preserve_trx_temp_id_contract temp_id_contract;
     Preserve_trx_transfer_runtime_policy runtime_policy;
     uint64_t max_inflight_bytes{0};
   };
@@ -1108,10 +1223,12 @@ Preserve_trx_transfer_status preserve_trx_transfer_decode_frame_batch(
     const std::string &encoded_batch,
     std::vector<std::string> *encoded_frames);
 
+#ifndef NDEBUG
 Preserve_trx_transfer_status
 preserve_trx_transfer_validate_online_payload_identity(
     const std::string &encoded_payload, std::string *receiver_process_nonce,
     std::string *epoch_id, uint64_t *last_sequence);
+#endif
 
 Preserve_trx_transfer_status preserve_trx_transfer_build_frame_ack(
     const std::string &receiver_process_nonce,
@@ -1119,10 +1236,12 @@ Preserve_trx_transfer_status preserve_trx_transfer_build_frame_ack(
     Preserve_trx_transfer_frame_ack *ack);
 Preserve_trx_transfer_status preserve_trx_transfer_encode_frame_ack(
     const Preserve_trx_transfer_frame_ack &ack, std::string *encoded);
+#ifndef NDEBUG
 Preserve_trx_transfer_status preserve_trx_transfer_verify_frame_ack(
     const std::string &encoded_ack,
     const std::string &expected_receiver_process_nonce,
     const std::string &encoded_payload, Preserve_trx_transfer_frame_ack *ack);
+#endif
 
 Preserve_trx_transfer_status preserve_trx_transfer_validate_receiver_manifest(
     const Preserve_trx_transfer_manifest &manifest);
@@ -1166,6 +1285,8 @@ class Preserve_trx_transfer_encoded_frame_sink {
     (void)session_index;
     return send_encoded_frame(encoded_frame);
   }
+  // Only for immutable batches made by the source encoder. Identity comes
+  // from the same locked sequence allocation; the ACK still binds all bytes.
   virtual Preserve_trx_transfer_status open_epoch_transport(
       const std::string &epoch_id,
       uint64_t requested_terminal_status_retention_us,
@@ -1183,6 +1304,9 @@ class Preserve_trx_transfer_encoded_frame_sink {
   }
   virtual void set_operation_timeout_ms(uint timeout_ms) {
     (void)timeout_ms;
+  }
+  virtual Preserve_trx_temp_id_contract negotiated_temp_id_contract() const {
+    return {};
   }
   virtual void request_cancel() {}
   virtual Preserve_trx_transfer_status prepare_cancelled_epoch_cleanup() {
@@ -1205,6 +1329,7 @@ struct Preserve_trx_transfer_source_epoch_options {
   void *final_ack_arbiter_context{nullptr};
 };
 
+class Preserve_trx_result_pretransfer;
 class Preserve_trx_transfer_source_epoch_session {
  public:
   Preserve_trx_transfer_source_epoch_session(
@@ -1219,6 +1344,11 @@ class Preserve_trx_transfer_source_epoch_session {
   Preserve_trx_transfer_status open_epoch(
       uint64_t requested_terminal_status_retention_us,
       uint64_t absolute_monotonic_deadline_us);
+  Preserve_trx_temp_id_contract negotiated_temp_id_contract() const;
+  std::shared_ptr<Preserve_trx_result_pretransfer> result_source();
+  Preserve_trx_transfer_status result_object_progress(
+      uint64_t token, const Preserve_trx_transfer_object_descriptor &object,
+      bool *declared, bool *sealed, uint64_t *offset) const;
   Preserve_trx_transfer_status declare_tokens_batch(
       const std::vector<uint64_t> &transfer_tokens);
   Preserve_trx_transfer_status declare_object(
@@ -1332,13 +1462,13 @@ class Preserve_trx_transfer_source_epoch_session {
       const std::vector<uint64_t> *session_only_tokens);
 
   std::string m_epoch_id;
+  std::shared_ptr<Preserve_trx_result_pretransfer> m_result_source;
   Preserve_trx_transfer_runtime_policy m_runtime_policy;
   uint32_t m_chunk_bytes{0};
   uint64_t m_max_inflight_bytes{0};
   uint64_t m_phase1_batch_bytes{0};
   Preserve_trx_transfer_encoded_frame_sink *m_sink{nullptr};
-  Preserve_trx_transfer_source_before_commit_send m_before_commit_send{
-      nullptr};
+  Preserve_trx_transfer_source_before_commit_send m_before_commit_send{nullptr};
   void *m_before_commit_send_context{nullptr};
   Preserve_trx_transfer_source_final_ack_arbiter m_final_ack_arbiter{nullptr};
   void *m_final_ack_arbiter_context{nullptr};
@@ -1350,6 +1480,7 @@ class Preserve_trx_transfer_source_epoch_session {
   bool m_ack_uncertain{false};
   bool m_final_metadata_accepted{false};
   bool m_epoch_transport_open{false};
+  Preserve_trx_temp_id_contract m_temp_id_contract;
   uint64_t m_requested_terminal_status_retention_us{0};
   uint64_t m_absolute_monotonic_deadline_us{0};
   std::string m_source_process_generation;
@@ -1538,6 +1669,8 @@ void preserve_trx_transfer_set_prewarm_paused_for_unit_test(bool paused);
 bool preserve_trx_transfer_receiver_workers_starting_for_unit_test();
 /* Receiver transfer state is valid only for the current mysqld process. */
 Preserve_trx_transfer_status preserve_trx_transfer_cleanup_startup_root();
+/** Process identity shared by receiver readiness and private TEMP artifacts. */
+std::string preserve_trx_transfer_receiver_boot_incarnation();
 Preserve_trx_transfer_status
 preserve_trx_transfer_cleanup_receiver_restart_state(
     const std::string &root_dir);
@@ -1631,7 +1764,16 @@ Preserve_trx_transfer_status preserve_trx_transfer_stage_object_chunk(
 Preserve_trx_transfer_status preserve_trx_transfer_seal_staged_object(
     const std::string &root_dir,
     const Preserve_trx_transfer_manifest &manifest,
-    const std::string &object_id);
+    const std::string &object_id,
+    std::shared_ptr<const Preserve_trx_sealed_file> *file = nullptr);
+
+#ifndef NDEBUG
+Preserve_trx_transfer_status preserve_trx_transfer_probe_temp_file(
+    const std::string &root, const std::string &token,
+    const std::string &source_path, uint64_t size,
+    const std::array<unsigned char, 32> &digest,
+    std::shared_ptr<const Preserve_trx_sealed_file> *output);
+#endif
 
 Preserve_trx_transfer_status preserve_trx_transfer_read_sealed_object_payload(
     const std::string &root_dir,
@@ -1702,11 +1844,13 @@ Preserve_trx_transfer_status preserve_trx_transfer_apply_receiver_frame(
     uint64_t timeout_seconds,
     Preserve_snapshot_metadata *written_metadata = nullptr);
 
+#ifndef NDEBUG
 Preserve_trx_transfer_status preserve_trx_transfer_handle_receiver_payload(
     const std::string &root_dir, const std::string &encoded_frame,
     Preserved_trx_store *store, Preserve_trx_transfer_receiver_registry *registry,
     uint64_t timeout_seconds,
     Preserve_snapshot_metadata *written_metadata = nullptr);
+#endif
 
 using Preserve_trx_transfer_after_admission_callback =
     Preserve_trx_transfer_status (*)(void *context,
@@ -1717,6 +1861,7 @@ using Preserve_trx_transfer_commit_accepted_callback =
         void *context, const std::string &epoch_id,
         Preserve_trx_transfer_status committed_status);
 
+#ifndef NDEBUG
 Preserve_trx_transfer_status preserve_trx_transfer_handle_receiver_payload_batch(
     const std::string &root_dir, const std::vector<std::string> &encoded_frames,
     Preserved_trx_store *store, Preserve_trx_transfer_receiver_registry *registry,
@@ -1726,6 +1871,7 @@ Preserve_trx_transfer_status preserve_trx_transfer_handle_receiver_payload_batch
     void *after_admission_context = nullptr,
     Preserve_trx_transfer_commit_accepted_callback commit_accepted = nullptr,
     void *commit_accepted_context = nullptr);
+#endif
 
 using Preserve_trx_transfer_frame_apply_callback =
     Preserve_trx_transfer_status (*)(const Preserve_trx_transfer_frame &frame,

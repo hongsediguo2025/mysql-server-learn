@@ -1,0 +1,26 @@
+# Native collation, undo keys and committed temporary rows
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SELECT COUNT(*)=2 AND SUM(BINARY k='ALPHA' AND n=7)=1 AS captured_ci_ok FROM tmp_data_ci;
+captured_ci_ok
+1
+SELECT COUNT(*)=4 AND SUM(v='changed2')=1 AND SUM(k IS NULL)=3 AS captured_aux_ok FROM tmp_data_aux;
+captured_aux_ok
+1
+SELECT COUNT(*)=2 AND SUM(BINARY k='alpha' AND n=1)=1 AS rollback_ci_ok FROM tmp_data_ci;
+rollback_ci_ok
+1
+SELECT COUNT(*)=3 AND SUM(v='null1')=1 AND SUM(k IS NULL)=2 AS rollback_aux_ok FROM tmp_data_aux;
+rollback_aux_ok
+1
+SELECT COUNT(*)=64 AND SUM(v)=20800 AS rollback_base_ok FROM t_data_base;
+rollback_base_ok
+1
+SELECT n=9 AS commit_ci_ok FROM tmp_data_ci WHERE k='alpha';
+commit_ci_ok
+1
+SELECT v='committed' AS commit_aux_ok FROM tmp_data_aux WHERE k=1;
+commit_aux_ok
+1
+SELECT v=9 AS commit_base_ok FROM t_data_base WHERE id=1;
+commit_base_ok
+1

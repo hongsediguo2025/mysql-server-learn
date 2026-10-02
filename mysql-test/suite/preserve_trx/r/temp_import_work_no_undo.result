@@ -1,0 +1,22 @@
+# Receiver image generation without active temporary undo
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SELECT COUNT(*)=64 AND SUM(v=CONCAT('base-',id))=64 AS baseline_ok
+FROM tmp_source_no_undo;
+baseline_ok
+1
+SELECT SUM(v)=20864 AS persistent_pending_ok FROM t_source_no_undo;
+persistent_pending_ok
+1
+SELECT COUNT(*)=64 AND SUM(v=CONCAT('base-',id))=64 AS temp_rollback_ok
+FROM tmp_source_no_undo;
+temp_rollback_ok
+1
+SELECT SUM(v)=20800 AS persistent_rollback_ok FROM t_source_no_undo;
+persistent_rollback_ok
+1
+SELECT v='committed' AS temp_commit_ok FROM tmp_source_no_undo WHERE id=1;
+temp_commit_ok
+1
+SELECT v=7 AS persistent_commit_ok FROM t_source_no_undo WHERE id=1;
+persistent_commit_ok
+1

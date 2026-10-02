@@ -3508,7 +3508,13 @@ dict_index_t *row_merge_create_index(trx_t *trx, dict_table_t *table,
   /* Create B-tree */
   mutex_exit(&dict_sys->mutex);
 
-  dict_build_index_def(table, index, trx);
+  err = dict_build_index_def(table, index, trx);
+  if (err != DB_SUCCESS) {
+    dict_mem_index_free(index);
+    trx->error_state = err;
+    mutex_enter(&dict_sys->mutex);
+    return nullptr;
+  }
 
   err = dict_index_add_to_cache_w_vcol(table, index, add_v, index->page,
                                        trx_is_strict(trx));

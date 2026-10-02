@@ -1,0 +1,6 @@
+SELECT @@global.rds_preserve_trx_temp_id_namespace AS namespace_enabled;
+--let $capture_case= temporary receiver image generation and owned cancellation
+--let $capture_trace_name= temp_transfer_input.trace
+--let $capture_fault= preserve_temp_import_source_undo_probe,preserve_temp_transfer_input_probe,preserve_temp_import_target_image_probe
+--let $capture_trace_pattern= (?s)temporary manifest claim count exceeds payload.*temporary transfer input checked objects=2 rejected=16 pinned_after_cleanup=1 replacement_checked=1 wrong_pin_checked=1.*temporary source import prepared.*temporary receiver images checked.*temporary namespace requires standby transfer
+--source suite/preserve_trx/include/temp_table_capture_undo_failure.inc

@@ -1,0 +1,2 @@
+--let $contract_early_results= large
+--source suite/preserve_trx/t/temp_capture_continuous.test

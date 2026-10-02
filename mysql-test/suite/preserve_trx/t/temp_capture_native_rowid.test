@@ -1,0 +1,2 @@
+--let $contract_column_shapes= rowid
+--source suite/preserve_trx/t/temp_capture_native_early.test

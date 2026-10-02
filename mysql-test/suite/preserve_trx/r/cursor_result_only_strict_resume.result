@@ -1,0 +1,4 @@
+dependency-free PS EXECUTE after strict SQL RESUME passed
+production RESOURCES temporary transfer: cursor-only passed
+loopback receiver prepared temporary resources before READY
+strict SQL RESUME integration: success passed

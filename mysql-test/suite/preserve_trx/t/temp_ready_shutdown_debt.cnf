@@ -1,0 +1,4 @@
+!include temp_ready_workload.cnf
+
+[mysqld.2]
+debug=d,preserve_temp_receiver_shutdown_cleanup_oom

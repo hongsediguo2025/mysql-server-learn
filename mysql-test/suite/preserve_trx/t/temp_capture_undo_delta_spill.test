@@ -1,0 +1,3 @@
+# Internal allocation-denial probe; SQL validates the file fallback and RESUME.
+--let $contract_undo_delta_fault= spill
+--source suite/preserve_trx/t/temp_capture_undo_delta.test

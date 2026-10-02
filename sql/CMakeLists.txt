@@ -437,6 +437,9 @@ SET(SQL_SHARED_SOURCES
   partition_info.cc
   partitioning/partition_handler.cc
   preserve_trx_bundle.cc
+  preserve_trx_recovery_contract.cc
+  preserve_trx_resource_session.cc
+  preserve_trx_no_redo_context.cc
   preserve_trx_carrier.cc
   preserve_trx_carrier_file.cc
   preserve_trx.cc
@@ -454,9 +457,36 @@ SET(SQL_SHARED_SOURCES
   preserve_trx_resurrection_index.cc
   preserve_trx_rewrite.cc
   preserve_trx_standby_phase2_scheduler.cc
+  preserve_trx_temp_prebuild.cc
+  preserve_trx_temp_pretransfer.cc
+  preserve_trx_temp_delta.cc
+  preserve_trx_temp_undo_prebuild.cc
+  preserve_trx_temp_metrics.cc
+  preserve_trx_temp_gc.cc
+  preserve_trx_temp_history.cc
   preserve_trx_temp_table.cc
+  preserve_trx_temp_id_contract.cc
+  preserve_trx_temp_receiver.cc
+  preserve_trx_temp_restore.cc
+  preserve_trx_temp_import.cc
+  preserve_trx_temp_transfer.cc
+  preserve_trx_file.cc
+  preserve_trx_debug.cc
+  preserve_trx_cursor.cc
+  preserve_trx_cursor_file.cc
+  preserve_trx_cursor_decode.cc
+  preserve_trx_result_manifest.cc
+  preserve_trx_result_restore.cc
+  preserve_trx_result_transfer.cc
+  preserve_trx_result_pretransfer.cc
+  preserve_trx_result_cursor.cc
+  preserve_trx_command.cc
+  preserve_trx_receiver_candidates.cc
+  preserve_trx_receiver_retired.cc
+  preserve_trx_receiver_prepare.cc
   preserve_trx_temp_table_carrier.cc
   preserve_trx_transfer.cc
+  preserve_trx_transfer_index.cc
   preserve_trx_warmcopy.cc
   persisted_variable.cc
   protocol_classic.cc

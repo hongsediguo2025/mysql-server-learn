@@ -80,6 +80,7 @@
 #include "sql/protocol.h"
 #include "sql/protocol_classic.h"
 #include "sql/preserve_trx.h"
+#include "sql/preserve_trx_cursor.h"
 #include "sql/preserve_trx_temp_table.h"
 #include "sql/psi_memory_key.h"
 #include "sql/query_result.h"
@@ -769,6 +770,7 @@ Sql_condition *THD::raise_condition(uint sql_errno, const char *sqlstate,
 */
 
 void THD::init(void) {
+  preserve_trx_temp_first_dml_pending = false;
   plugin_thdvar_init(this, m_enable_plugins);
   /*
     variables= global_system_variables above has reset
@@ -887,6 +889,8 @@ void THD::cleanup_connection(void) {
   user_vars.clear();
   sp_cache_clear(&sp_proc_cache);
   sp_cache_clear(&sp_func_cache);
+  preserve_trx_result_owner.reset();
+  preserve_trx_pending_cursor_count.store(0, std::memory_order_release);
 
   clear_error();
   // clear the warnings
@@ -996,6 +1000,8 @@ void THD::cleanup(void) {
   close_temporary_tables(this);
   sp_cache_clear(&sp_proc_cache);
   sp_cache_clear(&sp_func_cache);
+  preserve_trx_result_owner.reset();
+  preserve_trx_pending_cursor_count.store(0, std::memory_order_release);
 
   /*
     Actions above might generate events for the binary log, so we
@@ -1709,6 +1715,8 @@ Prepared_statement_map::Prepared_statement_map()
     : st_hash(key_memory_prepared_statement_map),
       names_hash(system_charset_info, key_memory_prepared_statement_map),
       m_last_found_statement(nullptr) {}
+
+
 
 int Prepared_statement_map::insert(Prepared_statement *statement) {
   st_hash.emplace(statement->id, unique_ptr<Prepared_statement>(statement));

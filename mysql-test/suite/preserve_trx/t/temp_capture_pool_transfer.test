@@ -1,0 +1,24 @@
+--source include/have_debug.inc
+--source include/have_log_bin.inc
+--let $receiver_namespace= 1
+--let $contract_temporary= cursor
+--let $contract_loopback= 1
+--let $contract_engine= temp-only
+--let $contract_resume= success
+--let $contract_capture_trace= 1
+--source suite/preserve_trx/include/temp_id_contract_source.inc
+--let _TEMP_SOURCE_POOL_TRACE= $MYSQLTEST_VARDIR/log/temp-source-pool.trace
+--perl
+use strict;
+use warnings;
+open(my $fh, '<', $ENV{'_TEMP_SOURCE_POOL_TRACE'}) or die "missing capture trace: $!";
+my $trace = do { local $/; <$fh> };
+my %borrows;
+$borrows{$1}++ while $trace =~ /temporary source pool borrowed space=(\d+)/g;
+die "standby source did not borrow its native pool space\n" unless %borrows;
+for my $space (keys %borrows) {
+  my @returns = ($trace =~ /temporary source pool released space=$space remaining=0/g);
+  die "source pool borrow was not released\n" unless @returns == $borrows{$space};
+}
+print "standby source pool borrows released\n";
+EOF

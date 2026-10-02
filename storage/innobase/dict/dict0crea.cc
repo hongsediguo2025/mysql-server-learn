@@ -54,6 +54,8 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "row0mysql.h"
 #include "srv0start.h"
 #include "trx0roll.h"
+#include "trx0temp_preserve.h"
+#include "trx0temp_preserve_id.h"
 #include "usr0sess.h"
 #include "ut0vec.h"
 
@@ -81,7 +83,8 @@ dberr_t dict_build_table_def(dict_table_t *table, trx_t *trx) {
     ut_ad(strcmp(tbl_name.c_str(), innodb_dd_table[table->id - 1].name) == 0);
 
   } else {
-    dict_table_assign_new_id(table, trx);
+    const auto err = dict_table_assign_new_id(table, trx);
+    if (err != DB_SUCCESS) return err;
   }
 
   dberr_t err = dict_build_tablespace_for_table(table, trx);
@@ -310,6 +313,12 @@ dberr_t dict_build_tablespace_for_table(dict_table_t *table, trx_t *trx) {
         tblsp = innodb_session->get_instrinsic_temp_tblsp();
       } else {
         tblsp = innodb_session->get_usr_temp_tblsp();
+        DBUG_EXECUTE_IF("preserve_temp_second_space_probe", {
+          if (preserve_trx_is_enabled() && preserve_trx_temp_table_enable) {
+            /* Both spaces retain their native session-pool ownership. */
+            tblsp = innodb_session->get_instrinsic_temp_tblsp();
+          }
+        });
       }
 
       /* Session temporary tablespace couldn't be allocated. This means,
@@ -331,8 +340,9 @@ dberr_t dict_build_tablespace_for_table(dict_table_t *table, trx_t *trx) {
   return (DB_SUCCESS);
 }
 
-/** Builds an index definition */
-void dict_build_index_def(const dict_table_t *table, /*!< in: table */
+/** Builds an index definition.
+@return DB_SUCCESS or an allocation error */
+dberr_t dict_build_index_def(const dict_table_t *table, /*!< in: table */
                           dict_index_t *index,       /*!< in/out: index */
                           trx_t *trx) /*!< in/out: InnoDB transaction handle */
 {
@@ -340,7 +350,10 @@ void dict_build_index_def(const dict_table_t *table, /*!< in: table */
   ut_ad((UT_LIST_GET_LEN(table->indexes) > 0) || index->is_clustered());
 
   if (!table->is_intrinsic()) {
-    if (srv_is_upgrade_mode) {
+    if (preserve_trx_temp_id_namespace && table->is_temporary()) {
+      const auto err = trx_preserve_temp_allocate_ids(nullptr, &index->id);
+      if (err != DB_SUCCESS) return err;
+    } else if (srv_is_upgrade_mode) {
       index->id = dd_upgrade_indexes_num++;
       ut_ad(index->id <= dd_get_total_indexes_num());
     } else {
@@ -365,6 +378,7 @@ void dict_build_index_def(const dict_table_t *table, /*!< in: table */
 
   /* Note that the index was created by this transaction. */
   index->trx_id = trx->id;
+  return DB_SUCCESS;
 }
 
 /** Creates an index tree for the index if it is not a member of a cluster.
@@ -620,16 +634,20 @@ bool dict_foreigns_has_this_col(const dict_table_t *table,
 
 /** Assign a new table ID and put it into the table cache and the transaction.
 @param[in,out]	table	Table that needs an ID
-@param[in,out]	trx	Transaction */
-void dict_table_assign_new_id(dict_table_t *table, trx_t *trx) {
+@param[in,out]	trx	Transaction
+@return DB_SUCCESS or an allocation error */
+dberr_t dict_table_assign_new_id(dict_table_t *table, trx_t *trx) {
   if (table->is_intrinsic()) {
     /* There is no significance of this table->id (if table is
     intrinsic) so assign it default instead of something meaningful
     to avoid confusion.*/
     table->id = ULINT_UNDEFINED;
+  } else if (preserve_trx_temp_id_namespace && table->is_temporary()) {
+    return trx_preserve_temp_allocate_ids(&table->id, nullptr);
   } else {
     dict_hdr_get_new_id(&table->id, nullptr, nullptr, table, false);
   }
+  return DB_SUCCESS;
 }
 
 /** Create in-memory tablespace dictionary index & table

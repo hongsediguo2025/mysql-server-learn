@@ -1,0 +1,5 @@
+--let $capture_case= shared source undo allocation failure retains source ownership
+--let $capture_trace_name= temp_import_source_undo_allocation_failure.trace
+--let $capture_fault= preserve_temp_import_source_undo_probe,preserve_temp_import_source_undo_oom
+--let $capture_trace_pattern= temporary source undo allocation fault before ownership
+--source suite/preserve_trx/include/temp_table_capture_undo_failure.inc

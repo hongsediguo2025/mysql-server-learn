@@ -35,9 +35,17 @@
 #include <vector>
 
 #include "sql/preserve_trx_bundle.h"
+#include "sql/preserve_trx_resource.h"
 #include "sql/preserve_trx_temp_table_carrier.h"
+#include "sql/preserve_trx_temp_history.h"
+#include "storage/innobase/include/trx0temp_preserve_source.h"
+#include "storage/innobase/include/trx0temp_preserve_undo_scan.h"
+#include "storage/innobase/include/trx0temp_preserve_undo_capture.h"
 
 class THD;
+class trx_preserve_temp_import_plan;
+class Preserve_trx_temp_transfer_input;
+class Preserve_trx_temp_pretransfer_file;
 struct trx_preserve_temp_space_image_descriptor;
 struct trx_t;
 struct TABLE;
@@ -119,6 +127,15 @@ struct Temp_table_journal_record {
   DDL/savepoint/rollback boundaries; SQL row payloads are not replayed on
   resume.
 */
+Preserved_temp_table_undo_descriptor preserve_trx_temp_undo_descriptor(
+    const std::string &token,
+    const trx_preserve_temp_space_image_descriptor &descriptor,
+    const std::string &payload);
+Preserved_temp_table_undo_descriptor preserve_trx_temp_undo_descriptor(
+    const std::string &token,
+    const trx_preserve_temp_space_image_descriptor &descriptor,
+    const Preserved_temp_table_image_writer_result &result);
+
 class Temp_table_warmcopy_participant {
  public:
   struct Prebuilt_sidecar {
@@ -132,12 +149,34 @@ class Temp_table_warmcopy_participant {
     uint32_t source_space_id{0};
     std::string warmcopy_id;
     std::string preserve_dir;
+    // Native backing must outlive the active descriptor and its writer.
+    trx_preserve_temp_pool_lease source_pool;
+    trx_preserve_temp_native_lease source_native;
+    Preserve_memory_lease resident_memory;
+    Preserve_memory_lease undo_claim_memory;
+    std::vector<Preserved_temp_table_ownership_claim> undo_claims;
+    bool undo_claims_ready{false};
     trx_preserve_temp_space_image_descriptor descriptor;
     std::unique_ptr<Preserved_temp_table_image_writer> image_writer;
+    // Closed sequential writer certifies the same immutable undo file at seal.
+    std::unique_ptr<Preserved_temp_table_image_writer> undo_writer;
+    // Fixed, already sealed wire base; keeps its inode through warm retirement.
+    std::shared_ptr<Preserve_trx_temp_pretransfer_file> undo_base;
+    std::shared_ptr<Preserve_trx_temp_pretransfer_file> image_base;
+    // BASE belongs to this registration. Truncated bytes cannot use the
+    // never-dirty proof if a later resize fills them with zeroes again.
+    uint64_t image_base_capture_floor{0}, image_base_clean_prefix_bytes{0};
+    std::shared_ptr<Preserve_trx_temp_pretransfer_file> image_checkpoint;
+    bool checkpoint_attempted{false};
     bool has_undo{false};
+    bool undo_scan_pending{false};
+    trx_preserve_temp_source_undo_snapshot undo_snapshot;
+    trx_preserve_temp_undo_page_cache undo_page_cache;
     Preserved_temp_table_undo_descriptor undo;
-    size_t journal_record_count{0};
+    uint64_t history_sequence{0};
     uint64_t mutation_generation{0};
+    uint64_t data_generation{0};
+    bool continuous{false};
     bool tail_sealed{false};
   };
 
@@ -159,12 +198,18 @@ class Temp_table_warmcopy_participant {
   const std::vector<Temp_table_journal_record> &journal() const {
     return m_journal;
   }
-  size_t journal_record_count() const {
+  uint64_t history_sequence() const {
     std::lock_guard<std::recursive_mutex> guard(m_state_mutex);
-    return m_journal.size();
+    return m_next_sequence - 1;
   }
+  /* Savepoint create/release alone cannot invalidate a sealed undo graph. */
+  bool undo_history_unchanged_since(uint64_t history_sequence,
+                                    uint64_t data_generation) const;
   uint64_t mutation_generation() const {
     return m_mutation_generation.load(std::memory_order_acquire);
+  }
+  uint64_t data_generation() const {
+    return m_data_generation.load(std::memory_order_acquire);
   }
   /* True when any DDL-like or row-changing temp-table tail history exists. */
   bool has_row_history() const;
@@ -212,25 +257,45 @@ class Temp_table_warmcopy_participant {
   bool has_table(uint32_t table_ordinal) const;
   uint32_t table_generation(uint32_t table_ordinal) const;
   bool note_drop_table(uint32_t table_ordinal);
+  bool note_native_drop(uint32_t table_ordinal, uint64_t table_id,
+                        uint32_t source_space_id, const std::string &token);
+  void confirm_native_drop(uint64_t table_id, uint32_t source_space_id);
+  bool export_retired_tables(Preserved_temp_table_manifest *) const;
+  uint64_t history_work_bytes() const;
   bool note_truncate_table(uint32_t table_ordinal);
   bool append_table_event(uint32_t table_ordinal,
                           Temp_table_journal_record::Kind kind,
                           std::string payload);
+  bool reserve_prebuilt_sidecars(size_t count);
   bool remember_prebuilt_sidecar(std::unique_ptr<Prebuilt_sidecar> sidecar);
   Prebuilt_sidecar *find_prebuilt_sidecar(uint32_t source_space_id);
+  std::unique_ptr<Prebuilt_sidecar> take_prebuilt_sidecar(uint32_t source_space_id);
   const Prebuilt_sidecar *find_prebuilt_sidecar(
       uint32_t source_space_id) const;
   const std::vector<std::unique_ptr<Prebuilt_sidecar>> &prebuilt_sidecars()
       const {
     return m_prebuilt_sidecars;
   }
-  void clear_prebuilt_sidecars() { m_prebuilt_sidecars.clear(); }
+  void clear_prebuilt_sidecars() {
+    m_undo_capture.reset();
+    m_prebuilt_sidecars.clear();
+  }
+  /** Caller holds the idle command boundary, or has joined capture workers. */
+  std::unique_ptr<trx_preserve_temp_undo_capture> &undo_capture() {
+    return m_undo_capture;
+  }
   bool current_statement_touched() const {
     std::lock_guard<std::recursive_mutex> guard(m_state_mutex);
     return m_current_statement_touched;
   }
   void clear_current_statement_touch() {
     std::lock_guard<std::recursive_mutex> guard(m_state_mutex);
+    m_current_statement_touched = false;
+  }
+  void invalidate_prebuilt_after_rollback() {
+    std::lock_guard<std::recursive_mutex> guard(m_state_mutex);
+    m_mutation_generation.fetch_add(1, std::memory_order_release);
+    m_data_generation.fetch_add(1, std::memory_order_release);
     m_current_statement_touched = false;
   }
 
@@ -273,7 +338,7 @@ class Temp_table_warmcopy_participant {
   bool m_metadata_mutation_capture_armed{false};
   bool m_capture_epoch_started{false};
   uint64_t m_capture_epoch_start_sequence{0};
-  /* Monotonic sequence for logical journal records. */
+  /* Monotonic sequence, including compacted physical DML markers. */
   uint64_t m_next_sequence{1};
   /* Logical table ids remain stable across the journal for one participant. */
   uint32_t m_next_table_ordinal{1};
@@ -284,9 +349,14 @@ class Temp_table_warmcopy_participant {
   /* Latest reason that made this participant unusable for warmcopy preserve. */
   std::string m_degraded_reason;
   std::vector<Table_state> m_tables;
+  Preserve_trx_temp_history m_ddl_history;
   std::vector<Temp_table_journal_record> m_journal;
+  bool m_tracked_dml{false};
+  uint64_t m_last_undo_mutation_sequence{0};
   std::vector<std::unique_ptr<Prebuilt_sidecar>> m_prebuilt_sidecars;
+  std::unique_ptr<trx_preserve_temp_undo_capture> m_undo_capture;
   std::atomic<uint64_t> m_mutation_generation{0};
+  std::atomic<uint64_t> m_data_generation{0};
   mutable std::recursive_mutex m_state_mutex;
 };
 
@@ -355,7 +425,8 @@ bool preserve_trx_temp_table_note_release_savepoint(THD *thd,
 bool preserve_trx_temp_table_note_rollback_to_savepoint(
     THD *thd, const char *name, size_t name_length);
 void preserve_trx_temp_table_note_statement_commit(THD *thd);
-void preserve_trx_temp_table_note_statement_rollback(THD *thd);
+void preserve_trx_temp_table_note_statement_rollback(
+    THD *thd, bool rollback_succeeded = false);
 bool preserve_trx_temp_table_begin_capture_epoch(THD *thd);
 bool preserve_trx_temp_table_prebuild_phase1_sidecars(
     THD *thd, trx_t *trx, const std::string &dir,
@@ -368,7 +439,8 @@ bool preserve_trx_temp_table_seal_phase1_tail_sidecar(
     THD *thd, trx_t *trx, uint32_t source_space_id,
     const std::string &token, Preserved_temp_table_image_carrier *carrier,
     trx_preserve_temp_space_image_descriptor *descriptor,
-    Preserved_temp_table_undo_descriptor *undo, std::string *warmcopy_id);
+    Preserved_temp_table_undo_descriptor *undo, std::string *warmcopy_id,
+    bool capture_transaction_undo = true);
 void preserve_trx_temp_table_discard_phase1_sidecars(THD *thd,
                                                      const std::string &dir);
 
@@ -376,7 +448,8 @@ void preserve_trx_temp_table_discard_phase1_sidecars(THD *thd,
   Build the sealed physical image for one user temporary table from the initial
   file copy plus buffer-pool overlays and dirty-page stream. max_rows is kept
   for SQL-level budget compatibility but is applied by the InnoDB image path as
-  the dirty-page queue limit for the sidecar capture.
+  the dirty-page queue limit for the sidecar capture. Only the transaction's
+  chosen image carrier captures undo; other image spaces pass false.
 */
 bool preserve_trx_temp_table_build_baseline_image(
     THD *thd, TABLE *table, Temp_table_warmcopy_participant *participant,
@@ -384,11 +457,29 @@ bool preserve_trx_temp_table_build_baseline_image(
     trx_preserve_temp_space_image_descriptor *descriptor = nullptr,
     std::string *image_payload = nullptr, std::string *undo_payload = nullptr,
     Preserved_temp_table_image_carrier *carrier = nullptr,
-    const std::string *warmcopy_id = nullptr);
+    const std::string *warmcopy_id = nullptr,
+    bool capture_transaction_undo = true);
 
 Preserve_snapshot_status preserve_trx_temp_table_build_preserve_manifest(
     THD *thd, trx_t *trx, const std::string &dir, const std::string &token,
     Preserve_snapshot_metadata *metadata);
+
+#ifndef NDEBUG
+/** Build source-only import resources from a codec-validated manifest. The
+caller owns an immutable lease on its already verified sealed image files;
+path lookup here does not establish that lease for receiver staging. The plan
+owns private source dictionaries, pinned image files and one undo graph. No
+target IDs are allocated or resources published. A received input makes both
+image and undo use its pinned files; missing entries never fall back to paths.
+Output changes on success only. This synchronous source preparation still
+needs bounded decoding and retained source-graph budgets before worker use;
+it is not a receiver READY proof. */
+Preserve_snapshot_status preserve_trx_temp_table_prepare_source_import(
+    const std::string &dir, const std::string &token,
+    const Preserved_temp_table_manifest &manifest,
+    std::unique_ptr<trx_preserve_temp_import_plan> *output,
+    const Preserve_trx_temp_transfer_input *received = nullptr);
+#endif
 
 struct Preserve_trx_temp_table_resume_policy {
   /*

@@ -1,0 +1,6 @@
+SELECT @@global.rds_preserve_trx_temp_id_namespace AS namespace_enabled;
+--let $capture_case= receiver import work retains ownership across source preparation batches
+--let $capture_trace_name= temp_import_work.trace
+--let $capture_fault= preserve_temp_import_source_undo_probe,preserve_temp_transfer_input_probe,preserve_temp_import_work_probe,preserve_temp_import_target_image_probe
+--let $capture_trace_pattern= (?s)temporary import input retired.*temporary import work cancellation checked phases=9 failures=3 quota=1 admission=2.*temporary import work prepared batches=[1-9][0-9]*.*temporary source import prepared.*temporary receiver images checked.*temporary namespace requires standby transfer
+--source suite/preserve_trx/include/temp_table_capture_undo_failure.inc

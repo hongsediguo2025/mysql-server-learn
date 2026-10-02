@@ -1,0 +1,5 @@
+--let $capture_case= private dictionary allocation failure after index normalization
+--let $capture_trace_name= temp_import_dictionary_allocation_failure.trace
+--let $capture_fault= preserve_temp_import_plan_probe,preserve_temp_import_dict_after_index_oom
+--let $capture_trace_pattern= (?s)temporary private dictionary index allocation fault.*temporary private dictionary released indexes=2
+--source suite/preserve_trx/include/temp_table_capture_undo_failure.inc

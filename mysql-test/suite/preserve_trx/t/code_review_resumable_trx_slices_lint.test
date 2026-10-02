@@ -110,6 +110,8 @@ my $sql_class_path = File::Spec->catfile($source_root, 'sql', 'sql_class.cc');
 my $sys_vars_path = File::Spec->catfile($source_root, 'sql', 'sys_vars.cc');
 my $transfer_path = File::Spec->catfile($source_root, 'sql',
                                         'preserve_trx_transfer.cc');
+my $receiver_retired_path = File::Spec->catfile($source_root, 'sql',
+                                                'preserve_trx_receiver_retired.cc');
 my $transfer_header_path = File::Spec->catfile($source_root, 'sql',
                                                'preserve_trx_transfer.h');
 my $sql_lock_warmcopy_path = File::Spec->catfile(
@@ -170,6 +172,7 @@ my $sql_yacc = read_source($sql_yacc_path);
 my $sql_class = read_source($sql_class_path);
 my $sys_vars = read_source($sys_vars_path);
 my $transfer = read_source($transfer_path);
+my $receiver_retired = read_source($receiver_retired_path);
 my $transfer_header = read_source($transfer_header_path);
 my $sql_lock_warmcopy = read_source($sql_lock_warmcopy_path);
 my $promotion = read_source($promotion_path);
@@ -319,8 +322,8 @@ die "THD::release_resources must wait for preserve external THD pins before rele
          $release_resources_body =~
      /m_release_resources_done\s*=\s*true[\s\S]*preserved_trx_end_external_thd_teardown\s*\(\s*this\s*\)/s;
 my ($receiver_payload_batch) =
-  $transfer =~ /(Preserve_trx_transfer_status preserve_trx_transfer_handle_receiver_payload_batch\([\s\S]*?^})/m
-  or die "could not isolate standby receiver encoded payload batch path\n";
+  $transfer =~ /(Preserve_trx_transfer_status handle_decoded_receiver_payload_batch\([\s\S]*?^})/m
+  or die "could not isolate standby receiver decoded payload batch path\n";
 die "standby receiver encoded payload batch path must acknowledge sequence/digest admission before semantic apply\n"
   unless $receiver_payload_batch !~ /\(void\)\s*worker_count\s*;/ &&
          $receiver_payload_batch =~ /worker_count/s &&
@@ -511,9 +514,11 @@ my ($receiver_staged_finish) =
   or die "could not isolate receiver staged-token completion helper\n";
 die "recoverable staged-token prewarm must return to the staged queue\n"
   unless $receiver_staged_finish =~
-         /WAIT_DEPENDENCY[\s\S]*RETRYABLE_NOT_READY[\s\S]*g_receiver_staged_token_prewarm_jobs\.push_back/s;
+         /WAIT_DEPENDENCY[\s\S]*RETRYABLE_NOT_READY[\s\S]*g_receiver_staged_token_prewarm_jobs\.splice\s*\(\s*g_receiver_staged_token_prewarm_jobs\.end\s*\(\s*\)\s*,\s*\*active_job\s*\)/s &&
+         $receiver_staged_finish =~ /!expired_or_removed\s*&&\s*requeue\s*&&\s*still_owned\s*&&\s*!g_receiver_prewarm_shutdown/s &&
+         $receiver_staged_finish =~ /retryable_not_ready\s*&&\s*retry_budget_available/s;
 die "staged-token retry must not bypass dependency gating through the object queue\n"
-  if $receiver_staged_finish =~ /g_receiver_prewarm_jobs\.push_back/s;
+  if $receiver_staged_finish =~ /g_receiver_prewarm_jobs\.(?:push_back|emplace_back|splice)\s*\(/s;
 die "receiver token-local failure injection state must be compiled only with DBUG\n"
   unless $transfer =~
          /#ifndef DBUG_OFF\s+bool debug_failure_injected\{false\};\s+bool debug_retry_injected\{false\};\s+#endif/s;
@@ -534,7 +539,7 @@ my ($receiver_dispatch_command) =
   or die "could not isolate standby receiver COM dispatch path\n";
 die "standby receiver single sequence frame must use the authenticated admission/apply ACK path\n"
   unless $receiver_dispatch_command =~
-     /receiver_frame_is_sequence_tracked\s*\(\s*decoded_frame\.type\s*\)[\s\S]*preserve_trx_transfer_handle_receiver_payload_batch[\s\S]*send_receiver_admission_ack/s;
+     /receiver_frame_is_sequence_tracked\s*\(\s*identity_frame\.type\s*\)[\s\S]*handle_decoded_receiver_payload_batch[\s\S]*send_receiver_admission_ack/s;
 die "standby streaming transfer must abort phase1-declared tokens that are not in the final quiesced target set\n"
   unless $preserve =~ /abort_phase1_transfer_targets_not_quiesced/s;
 die "standby streaming transfer must re-sweep phase1 target declarations before object streaming\n"
@@ -562,9 +567,15 @@ die "standby streaming transfer binlog catch-up must stay before final target pr
 die "standby streaming transfer must not do generic unbounded bulk backfill in phase2\n"
   if $preserve =~ /backfill_batch_transfer_binlog_blobs/s ||
      $preserve =~ /transfer_binlog_phase2_backfill/s;
-die "standby streaming transfer must declare the authoritative CLOSING transaction set before object catch-up\n"
+die "standby streaming transfer must declare the authoritative CLOSING token set before object catch-up\n"
   unless $preserve =~
-     /Preserve_batch_target_counter[\s\S]*declare_transfer_targets\s*\(\s*counter\.transaction_target_thread_ids\s*\(\s*\)/s;
+     /Preserve_batch_target_counter[\s\S]*declare_transfer_targets\s*\(\s*counter\.token_target_thread_ids\s*\(\s*\)/s;
+die "CLOSING token classification must include gated retained resources\n"
+  unless $preserve =~ /has_token_contents\s*=\s*active_batch_transaction\s*\|\|\s*preserve_trx_has_retained_standby_resources\(candidate\)/s &&
+         $preserve =~ /token_target_thread_ids\(\)\s*const\s*\{\s*return\s+m_token_target_thread_ids;/s &&
+         $preserve =~ /if\s*\(has_token_contents\)\s*m_token_target_thread_ids\.push_back\(candidate->thread_id\(\)\)/s;
+die "record-lock final targets must remain limited to active transactions\n"
+  unless $preserve =~ /final_record_target_ids\.reserve\(\s*counter\.transaction_target_thread_ids\(\)\.size\(\)\);\s*for\s*\(const my_thread_id target_id\s*:\s*counter\.transaction_target_thread_ids\(\)\)\s*\{\s*final_record_target_ids\.push_back\(static_cast<uint64_t>\(target_id\)\)/s;
 die "standby streaming transfer batch path must commit the source epoch only after all batch target snapshots are ready\n"
   unless $preserve =~ /batch_transfer_source_session[\s\S]*commit_epoch/s;
 die "standby streaming transfer phase2 publish must skip external objects already sealed during phase1\n"
@@ -631,7 +642,8 @@ die "table-lock export must use the global shared latch so concurrent exporters 
 die "table-lock export must not take the global exclusive latch\n"
   if $preserve_export_table_locks =~ /Global_exclusive_latch_guard/s;
 die "table-lock shared export must pin the transaction until payload copy completes\n"
-  unless $preserve_export_table_locks =~ /trx_reference\s*\(\s*trx\s*,\s*true\s*\)/s &&
+  unless $preserve_export_table_locks =~
+         /trx_mutex_enter\s*\(\s*trx\s*\)[\s\S]*trx->state\s*!=\s*TRX_STATE_ACTIVE[\s\S]*trx->state\s*!=\s*TRX_STATE_PREPARED[\s\S]*trx->state\s*!=\s*TRX_STATE_PRESERVED[\s\S]*\+\+trx->n_ref[\s\S]*trx->lock\.table_locks/s &&
          $preserve_export_table_locks =~ /trx_release_reference\s*\(\s*trx\s*\)/s;
 die "table-lock shared export must reject stale or foreign lock ownership\n"
   unless $preserve_export_table_locks =~
@@ -915,7 +927,12 @@ $carrier =~ /Preserve_snapshot_status cleanup_after_write_failure[\s\S]*?^}/m
   or die "could not isolate cleanup_after_write_failure\n";
 my $store_write_cleanup = $&;
 die "store write cleanup must remove the full carrier record after snapshot write failure\n"
-  unless $store_write_cleanup =~ /remove_with_status\s*\(\s*token\s*\)/s;
+  unless $store_write_cleanup =~ /remove_with_status\s*\(\s*bundle\.metadata\.token\s*,\s*std::move\(remove_options\)\s*\)/s;
+die "write cleanup must retain owned TEMP source bytes until reservation release\n"
+  unless $store_write_cleanup =~ /if\s*\(bundle\.owns_current_temp_sidecars\s*&&\s*!bundle\.metadata\.temp_table_manifest_payload\.empty\(\)\)\s*\{[\s\S]*?preserve_committed_temp_sidecar_source_space_ids\s*=\s*preserve_trx_temp_table_sidecar_source_space_ids\(bundle\.metadata\)/s;
+die "write cleanup must preserve snapshot ambiguity and report failed deletion\n"
+  unless $store_write_cleanup =~ /snapshot_write_started\s*&&\s*durable_snapshot_may_exist\s*!=\s*nullptr\s*&&\s*delete_status\s*==\s*Preserve_snapshot_delete_status::ERROR_BEFORE_SNAPSHOT_DELETE\)\s*\{\s*\*durable_snapshot_may_exist\s*=\s*true/s &&
+         $store_write_cleanup =~ /if\s*\(delete_status\s*!=\s*Preserve_snapshot_delete_status::OK\)\s*return\s+Preserve_snapshot_status::IO_ERROR/s;
 
 $carrier =~ /Preserve_snapshot_status Preserved_trx_store::write[\s\S]*?^Preserve_snapshot_status Preserved_trx_store::read/m
   or die "could not isolate Preserved_trx_store::write\n";
@@ -1086,7 +1103,7 @@ die "batch prepare failure helper must restore InnoDB and binlog state before re
          $batch_prepare_restore =~ /reattached_to_original_thd/s;
 $preserve =~ /DBUG_EXECUTE_IF\s*\(\s*"pfx_prepare_low"[\s\S]*?prepare_failed\s*=\s*true[\s\S]*?if\s*\(\s*prepare_failed\s*\)\s*\{[\s\S]*?return\s+restore_unprepared_batch_prepare_failure_or_rollback\s*\(\s*\)\s*;/m
   or die "pre-engine-prepare failure hook must route through unprepared batch restore helper\n";
-$preserve =~ /trx_preserve_freeze_current\s*\(\s*thd\s*,\s*xid\s*\)[\s\S]*?return\s+restore_batch_prepare_failure_or_rollback\s*\(\s*\)\s*;/m
+$preserve =~ /trx_preserve_freeze_current\s*\(\s*thd\s*,\s*xid\s*,\s*read_context\s*\)[\s\S]*?return\s+restore_batch_prepare_failure_or_rollback\s*\(\s*\)\s*;/m
   or die "preserve engine freeze failure must route through the reversible batch restore helper\n";
 $preserve =~ /DBUG_EXECUTE_IF\s*\(\s*"pfx_temp_prepare"[\s\S]*?temp_prepare_failed\s*=\s*true[\s\S]*?if\s*\(\s*temp_prepare_failed\s*\)\s*\{[\s\S]*?return\s+restore_batch_prepare_failure_or_rollback\s*\(\s*\)\s*;/m
   or die "temp-only prepare failure hook must route through batch restore helper\n";
@@ -1098,7 +1115,7 @@ my $binlog_preflight_pos =
         'set_stage(Preserve_trx_preserve_stage::BINLOG_PREFLIGHT);',
         $kernel_row_format_guard_pos);
 my $freeze_pos =
-  index($preserve, 'trx_preserve_freeze_current(thd, xid)',
+  index($preserve, 'trx_preserve_freeze_current(thd, xid, read_context)',
         $kernel_row_format_guard_pos);
 die "non-ROW binlog format must fail before binlog export and Preserve freeze\n"
   if $kernel_row_format_guard_pos < 0 || $binlog_preflight_pos < 0 ||
@@ -1585,16 +1602,30 @@ die "GTID strict-transfer gates must not invade the native binlog hot path\n"
   if $binlog =~ /preserve_snapshot_gtid_state_is_strict_transfer_safe|emit_no_cache_binlog_mode_metadata/s ||
      $binlog_ostream =~ /preserve_snapshot_gtid_state_is_strict_transfer_safe|emit_no_cache_binlog_mode_metadata/s;
 
-$preserve =~ /if\s*\(trx_preserve_export_read_view[\s\S]*?preserve_trx_reject_unsupported\s*\(\s*\)/m
+$preserve =~ /if\s*\(trx_preserve_export_read_view\s*\([^)]*\)\s*!=\s*DB_SUCCESS\)\s*\{\s*return\s+reject_after_binlog_export\("read_view_export_failed"\)/m
   or die "preserve flow must reject ReadView export failure before durable point\n";
-$trx_preserve =~ /dberr_t trx_preserve_export_read_view[\s\S]*?^}/m
-  or die "could not isolate trx_preserve_export_read_view\n";
+$trx_preserve =~ /^static dberr_t trx_preserve_export_read_view_impl\s*\([^)]*\)\s*\{[\s\S]*?^}/m
+  or die "could not isolate trx_preserve_export_read_view_impl\n";
 my $read_view_export = $&;
 die "ReadView export failure must have an injectable debug point\n"
   unless $read_view_export =~ /preserve_trx_fail_export_read_view/s;
 die "ReadView export failure must fail closed\n"
   unless $read_view_export =~ /preserve_trx_fail_export_read_view[\s\S]*return\s+DB_ERROR/s &&
          $read_view_export =~ /preserve_export_view[\s\S]*return\s+DB_ERROR/s;
+my ($read_view_current) = $trx_preserve =~
+  /(^dberr_t\s+trx_preserve_export_read_view\s*\([^)]*\)\s*\{[\s\S]*?^})/m
+  or die "could not isolate current ReadView export\n";
+my ($read_view_frozen) = $trx_preserve =~
+  /(^dberr_t\s+trx_preserve_export_frozen_read_view\s*\([^)]*\)\s*\{[\s\S]*?^})/m
+  or die "could not isolate frozen ReadView export\n";
+die "ReadView wrappers must distinguish attached and detached owners\n"
+  unless $read_view_current =~ /trx_preserve_export_read_view_impl\s*\(\s*thd_to_trx\(thd\),\s*payload,\s*low_limit_no,\s*false\)/s &&
+         $read_view_frozen =~ /trx->mysql_thd\s*!=\s*nullptr\s*\|\|\s*trx->id\s*==\s*0/s &&
+         $read_view_frozen =~ /!trx_state_eq\(trx,\s*TRX_STATE_PRESERVED\)/s &&
+         $read_view_frozen =~ /preserve_undo_contract\s*!=\s*trx_preserve_undo_contract::ACTIVE_UNDO_V1\)\s*return\s+DB_ERROR/s &&
+         $read_view_frozen =~ /trx_preserve_export_read_view_impl\(trx,\s*payload,\s*low_limit_no,\s*true\)/s;
+die "frozen ReadView failure must thaw and reject the detached transaction\n"
+  unless $preserve =~ /if\s*\(has_no_redo_facts\s*&&\s*trx_preserve_export_frozen_read_view\([^)]*\)\s*!=\s*DB_SUCCESS\)\s*\{\s*thaw_lock_warmcopy_conversion\(\);\s*return\s+reject_after_detach_failure_or_rollback\(\)/s;
 $trx_preserve =~ /dberr_t trx_preserve_import_read_view[\s\S]*?^}/m
   or die "could not isolate trx_preserve_import_read_view\n";
 my $read_view_import = $&;
@@ -2058,7 +2089,7 @@ die "preserve public helper must route object construction through kernel\n"
          $preserve_attached =~ /preserve_trx_kernel_preserve_attached_transaction\s*\(\s*request\s*\)/s;
 die "preserve public helper must not directly export objects or write snapshots\n"
   if $preserve_attached =~
-     /create_preserved_trx_default_store|build_preserved_trx_bundle|trx_preserve_export_record_locks|trx_preserve_export_table_locks|trx_preserve_export_read_view/s;
+     /create_preserved_trx_default_store|build_preserved_trx_bundle|trx_preserve_export_record_locks|trx_preserve_export_table_locks|trx_preserve_export_(?:frozen_)?read_view\s*\(/s;
 die "batch preserve public helper must not own SQL response delivery\n"
   if $preserve_attached =~ /preserved_trx_register_pending_token_delivery|\bmy_ok\s*\(/s;
 
@@ -2255,10 +2286,10 @@ die "pre-attach sync point must be before target context-switch attach loop\n"
   if $1 =~ /preserve_one_target\s*\(|preserve_trx_preserve_attached_transaction/s;
 die "lock warmcopy must not hold a global prepare guard across Preserve freeze\n"
   if $preserve =~
-     /lock_warmcopy_prepare_guard\.reset\s*\(\s*lock_warmcopy_prepare_guard_create\s*\(\s*\)\s*\)[\s\S]*trx_preserve_freeze_current\s*\(\s*thd\s*,\s*xid\s*\)[\s\S]*lock_warmcopy_prepare_guard\.reset\s*\(\s*\)/s;
+     /lock_warmcopy_prepare_guard\.reset\s*\(\s*lock_warmcopy_prepare_guard_create\s*\(\s*\)\s*\)[\s\S]*trx_preserve_freeze_current\s*\(\s*thd\s*,\s*xid\s*,\s*read_context\s*\)[\s\S]*lock_warmcopy_prepare_guard\.reset\s*\(\s*\)/s;
 die "lock warmcopy final fence must use per-trx conversion freeze before Preserve freeze\n"
   unless $preserve =~
-         /trx_t\s+\*lock_warmcopy_frozen_trx\s*=\s*nullptr[\s\S]*auto\s+thaw_lock_warmcopy_conversion[\s\S]*trx_preserve_lock_warmcopy_conversion_freeze\s*\(\s*thd[\s\S]*trx_preserve_freeze_current\s*\(\s*thd\s*,\s*xid\s*\)[\s\S]*thaw_lock_warmcopy_conversion/s;
+         /trx_t\s+\*lock_warmcopy_frozen_trx\s*=\s*nullptr[\s\S]*auto\s+thaw_lock_warmcopy_conversion[\s\S]*trx_preserve_lock_warmcopy_conversion_freeze\s*\(\s*thd[\s\S]*trx_preserve_freeze_current\s*\(\s*thd\s*,\s*xid\s*,\s*read_context\s*\)[\s\S]*thaw_lock_warmcopy_conversion/s;
 die "batch preserve detach/reattach failures must expose InnoDB transition reasons\n"
   unless $trx_preserve_header =~ /enum class trx_preserve_thd_transition_failure/s &&
          $trx_preserve =~ /trx_preserve_thd_transition_failure_name/s &&
@@ -2271,7 +2302,7 @@ die "lock warmcopy must expose a debug-only post-freeze conversion attempt injec
          /preserve_trx_lock_warmcopy_after_conversion_freeze[\s\S]{0,600}DBUG_EXECUTE_IF\s*\(\s*"preserve_trx_lock_warmcopy_simulate_conversion_after_freeze"[\s\S]{0,600}preserve_trx_lock_warmcopy_after_final_fence/s &&
          $trx_preserve =~
          /trx_preserve_lock_warmcopy_note_conversion_attempt_after_freeze[\s\S]*lock_warmcopy_trx_conversion_note_attempt[\s\S]*lock_warmcopy_trx_conversion_note_handled/s;
-$preserve =~ /if\s*\(\s*trx_preserve_freeze_current\s*\(\s*thd\s*,\s*xid\s*\)\s*!=\s*DB_SUCCESS\s*\)([\s\S]*?)metadata\.has_read_view/m
+$preserve =~ /if\s*\(\s*trx_preserve_freeze_current\s*\(\s*thd\s*,\s*xid\s*,\s*read_context\s*\)\s*!=\s*DB_SUCCESS\s*\)([\s\S]*?)metadata\.has_read_view/m
   or die "could not isolate lock warmcopy guarded metadata region\n";
 my $lock_warmcopy_guarded_metadata = $1;
 die "lock warmcopy conversion freeze must cover detach, claim, lock metadata, and table/autoinc cross-check\n"
@@ -2638,7 +2669,7 @@ die "standby transfer receiver dispatch must require PRESERVE_TRX_TRANSFER_ADMIN
   unless $transfer_dispatch_command =~ /PRESERVE_TRX_TRANSFER_ADMIN/s &&
          $transfer_dispatch_command =~ /has_global_grant/s &&
          index($transfer_dispatch_command, 'has_global_grant') <
-         index($transfer_dispatch_command, 'preserve_trx_transfer_handle_receiver_payload');
+         index($transfer_dispatch_command, 'handle_decoded_receiver_payload_batch');
 die "standby transfer receiver dispatch must not require source-side preserve_trx_transfer_enable\n"
   if $transfer_dispatch_command =~ /!preserve_trx_transfer_enable/s;
 die "standby transfer receiver dispatch must log non-OK frame status before mapping to generic SQL errors\n"
@@ -2646,7 +2677,7 @@ die "standby transfer receiver dispatch must log non-OK frame status before mapp
          /status\s*!=\s*Preserve_trx_transfer_status::OK[\s\S]*PRESERVE: standby transfer receiver frame failed[\s\S]*transfer_status_name\s*\(\s*status\s*\)/s;
 die "standby transfer receiver dispatch failure log must include decoded frame type when available\n"
   unless $transfer_dispatch_command =~
-         /preserve_trx_transfer_decode_frame\s*\(\s*encoded_frame[\s\S]*frame_type[\s\S]*std::to_string\s*\(\s*static_cast<int>\s*\(\s*decoded_frame\.type\s*\)\s*\)/s;
+         /preserve_trx_transfer_decode_frame\s*\(\s*encoded_frame[\s\S]*frame_type[\s\S]*std::to_string\s*\(\s*static_cast<int>\s*\(\s*identity_frame\.type\s*\)\s*\)/s;
 $transfer =~
   /preserve_trx_transfer_apply_receiver_frame_internal\([\s\S]*?^}\n\nPreserve_trx_transfer_status preserve_trx_transfer_apply_receiver_frame\(/m
   or die "could not isolate preserve_trx_transfer_apply_receiver_frame_internal\n";
@@ -2694,15 +2725,15 @@ die "standby transfer production source epochs must include a per-start boot non
          $transfer =~ /my_rand_buffer[\s\S]*transfer_source_epoch_boot_nonce/s;
 die "standby transfer default client must verify receiver ACK identity and control integrity\n"
   unless $transfer =~
-         /default_transfer_client_send[\s\S]*preserve_trx_transfer_verify_frame_ack/s &&
+         /default_transfer_client_send[\s\S]*verify_transfer_frame_ack/s &&
          $transfer =~
-         /preserve_trx_transfer_verify_frame_ack[\s\S]*receiver_process_nonce[\s\S]*frame_digest[\s\S]*my_checksum/s;
+         /verify_transfer_frame_ack[\s\S]*receiver_process_nonce[\s\S]*frame_digest[\s\S]*my_checksum/s;
 die "standby transfer source must pin an unconfirmed payload until its exact ACK arrives\n"
   unless $transfer =~
          /m_uncertain_payloads\s*\[\s*connection_index\s*\][\s\S]*uncertain_payload\s*!=\s*encoded_frame[\s\S]*ACK_UNCERTAIN/s;
 die "standby transfer receiver must validate process nonce, principal, and batch order before creating store side effects\n"
   unless $receiver_dispatch_command =~
-         /preserve_trx_transfer_validate_online_payload_identity[\s\S]*validate_online_epoch[\s\S]*create_preserved_trx_process_local_store/s;
+         /decoded_payload_identity[\s\S]*validate_online_epoch[\s\S]*create_preserved_trx_process_local_store/s;
 die "standby transfer receiver dispatch must not use the crash-durable local preserve store\n"
   if $receiver_dispatch_command =~ /create_preserved_trx_default_store/s;
 die "standby transfer receiver retries must bind sequence admission to frame digest\n"
@@ -2715,8 +2746,9 @@ die "standby transfer batch decoder must validate count against remaining bytes 
          $transfer =~
          /preserve_trx_transfer_decode_manifest[\s\S]*kMinEncodedObjectBytes[\s\S]*acquire_transfer_decode_memory_lease[\s\S]*reserve\s*\(\s*object_count\s*\)/s;
 die "standby transfer online handler must retain aggregate decoded payload accounting through apply and ACK\n"
-  unless $receiver_payload_batch =~
-         /payload_lease[\s\S]*after_admission[\s\S]*preserve_trx_transfer_apply_receiver_frame_batch_with_workers/s;
+  unless $receiver_dispatch_command =~
+         /Preserve_memory_lease\s+decoded_memory[\s\S]*decode_frame_batch_impl\(\s*encoded_frame,\s*nullptr,\s*&decoded_frames,\s*&decoded_memory\)[\s\S]*handle_decoded_receiver_payload_batch[\s\S]*send_receiver_authenticated_ack/s &&
+         $receiver_dispatch_command !~ /decoded_memory\.(?:release|reset)\s*\(/s;
 die "standby transfer online receiver must not persist or replay raw frame spool files\n"
   if $transfer =~
      /receiver\.frames|append_receiver_frame_spool|Receiver_frame_spool_disable_guard/s;
@@ -2764,12 +2796,12 @@ die "standby transfer policy receiver workers must default to three and drive th
   unless $transfer_header =~ /uint32_t\s+receiver_workers\s*\{\s*3\s*\}/s &&
          $transfer =~ /receiver_runtime_policy\.receiver_workers/s;
 die "standby transfer receiver batch payload path must use the bounded frame worker helper\n"
-  unless $transfer_header =~ /preserve_trx_transfer_handle_receiver_payload_batch/s &&
+  unless $receiver_dispatch_command =~ /handle_decoded_receiver_payload_batch/s &&
          $transfer_header =~ /preserve_trx_transfer_apply_receiver_frame_batch_with_workers/s &&
-         $transfer =~ /preserve_trx_transfer_handle_receiver_payload_batch[\s\S]*preserve_trx_transfer_decode_frame[\s\S]*preserve_trx_transfer_apply_receiver_frame_batch_with_workers/s;
+         $receiver_payload_batch =~ /pre_admit_receiver_batch_sequence[\s\S]*preserve_trx_transfer_apply_receiver_frame_batch_with_workers/s;
 die "standby transfer multi-session receiver must serialize process-local sequence admission without serializing semantic worker apply\n"
   unless $transfer =~
-             /preserve_trx_transfer_handle_receiver_payload_batch[\s\S]*begin_payload_sequence[\s\S]*end_payload_sequence[\s\S]*pre_admit_receiver_batch_sequence[\s\S]*preserve_trx_transfer_apply_receiver_frame_batch_with_workers/s;
+             /handle_decoded_receiver_payload_batch[\s\S]*begin_payload_sequence[\s\S]*end_payload_sequence[\s\S]*pre_admit_receiver_batch_sequence[\s\S]*preserve_trx_transfer_apply_receiver_frame_batch_with_workers/s;
 die "standby transfer receiver must register same-token apply order before releasing sequence admission and wait only after ACK\n"
   unless $receiver_payload_batch =~
              /end_payload_sequence[\s\S]*payload_sequence_guard/s &&
@@ -2795,7 +2827,7 @@ my $transfer_batch_worker_helper = $&;
 die "standby transfer commit frame must be the only receiver batch barrier\n"
   unless $transfer_batch_worker_helper =~
          /is_batch_barrier[\s\S]*COMMIT_EPOCH/s &&
-         $transfer_batch_worker_helper =~ /flush_segment\s*\(\s*\)[\s\S]*apply_frame\s*\(\s*frame\s*,\s*context\s*\)/s;
+         $transfer_batch_worker_helper =~ /apply_receiver_frame_segment_with_workers\s*\(\s*first,\s*pos,[\s\S]*apply_frame\s*\(\s*frame\s*,\s*context\s*\)/s;
 die "promotion gate must not participate in the standby transfer batch scheduler\n"
   if $transfer_batch_worker_helper =~ /PROMOTION_GATE_EPOCH/s;
 $transfer =~ /Preserve_trx_transfer_status preserve_trx_transfer_seal_staged_object[\s\S]*?^}/m
@@ -3017,7 +3049,7 @@ die "ACTIVE-Undo v1 must not retain the XID provenance ledger\n"
   if $preserve =~ /xid_provenance/i || $trx_preserve =~ /xid_provenance/i ||
      $carrier =~ /xid_provenance/i || $carrier_file =~ /xid_provenance/i;
 die "source Preserve must freeze ACTIVE Undo and publish local authority only after a redo barrier\n"
-  unless $preserve =~ /trx_preserve_freeze_current\s*\(\s*thd\s*,\s*xid\s*\)/s &&
+  unless $preserve =~ /trx_preserve_freeze_current\s*\(\s*thd\s*,\s*xid\s*,\s*read_context\s*\)/s &&
          $preserve =~ /stage_local_authority/s &&
          $preserve =~ /trx_preserve_flush_redo_up_to/s &&
          $preserve =~ /commit_local_authority/s;
@@ -3225,11 +3257,24 @@ die "receiver pending summary must use current-process semantics\n"
   unless $promotion_header =~ /RECEIVED_CURRENT_PROCESS/s &&
          $promotion =~
          /summary->state\s*=\s*[\s\S]{0,100}RECEIVED_CURRENT_PROCESS/s;
+my ($receiver_reservation) = $receiver_retired =~
+  /(Preserve_trx_transfer_receiver_registry::check_reservation_locked\s*\([^)]*\)\s*\{[\s\S]*?^})/m
+  or die "could not isolate receiver reservation check\n";
 die "inflight budget pressure must be retryable resource exhaustion\n"
   unless $transfer =~
          /inflight_bytes\s*>\s*preserve_trx_transfer_max_inflight_bytes[\s\S]{0,120}RESOURCE_EXHAUSTED/s &&
-         $transfer =~
-         /epoch_reserved_bytes\s*\+\s*reserved_bytes\s*>[\s\S]{0,180}RESOURCE_EXHAUSTED/s;
+         $receiver_reservation =~
+         /if\s*\(other\s*\+\s*new_bytes\s*>\s*limit\)\s*return\s+Preserve_trx_transfer_status::RESOURCE_EXHAUSTED/s;
+die "receiver reservation must account replacements and retained cleanup debt without overflow\n"
+  unless $receiver_reservation =~ /if\s*\(live\s*<\s*old_bytes\)\s*return\s+Preserve_trx_transfer_status::CORRUPT/s &&
+         $receiver_reservation =~ /other\s*=\s*live\s*-\s*old_bytes/s &&
+         $receiver_reservation =~ /m_cleanup_debt_carries\s*\|\|[\s\S]*m_cleanup_debt_bytes\s*>\s*std::numeric_limits<uint64_t>::max\(\)\s*-\s*other/s &&
+         $receiver_reservation =~ /other\s*\+=\s*m_cleanup_debt_bytes/s &&
+         $receiver_reservation =~ /new_bytes\s*>\s*std::numeric_limits<uint64_t>::max\(\)\s*-\s*other/s;
+my $receiver_quota_checks = () = $transfer =~
+  /const auto quota_status = check_reservation_locked\([^;]+;\s*if\s*\(quota_status\s*!=\s*Preserve_trx_transfer_status::OK\)\s*return quota_status;/sg;
+die "receiver OPEN, replacement and new-object admission must propagate quota failures\n"
+  unless $receiver_quota_checks == 3;
 die "standby transfer design doc must not claim production HA promotion is complete in this milestone\n"
   unless $standby_transfer_doc =~
          /当前实现状态[\s\S]*source transport[\s\S]*fail-closed/s ||
@@ -3449,6 +3494,10 @@ die "empty survivor DRAIN must not clear generation or restore business\n"
 my @rds_preserve_parameters = qw(
   rds_preserve_trx_enable
   rds_preserve_trx_temp_table_enable
+  rds_preserve_trx_temp_id_namespace
+  rds_preserve_trx_result_capture_enable
+  rds_preserve_trx_result_capture_max_bytes
+  rds_preserve_trx_result_capture_max_count
   rds_preserve_trx_memory_budget_bytes
   rds_preserve_trx_drain_phase1_timeout_ms
   rds_preserve_trx_drain_phase2_timeout_ms
@@ -3483,7 +3532,7 @@ for my $parameter (@rds_preserve_parameters) {
 my @registered_rds_parameters =
   $sys_vars =~
     /static\s+Sys_var_[A-Za-z0-9_]+\s+Sys_[A-Za-z0-9_]+\s*\(\s*"(rds_preserve_trx_[a-z0-9_]+)"/sg;
-die "Preserve product parameter surface must contain exactly 27 rds_ names\n"
+die "Preserve product parameter surface must contain exactly 31 rds_ names\n"
   unless @registered_rds_parameters == @rds_preserve_parameters;
 die "legacy Preserve sysvar registrations must be removed\n"
   if $sys_vars =~

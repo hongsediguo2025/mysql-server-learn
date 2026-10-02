@@ -1,0 +1,2 @@
+# Preserve OFF keeps the two-space fixture on the native single-space path
+# Native allocation, rollback and session pool release verified

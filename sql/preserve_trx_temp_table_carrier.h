@@ -33,7 +33,14 @@
 #include <vector>
 
 #include "sql/preserve_trx_carrier.h"
+#include "sql/preserve_trx_temp_history.h"
 #include "storage/innobase/include/trx0temp_preserve.h"
+
+struct Preserved_temp_table_wire_file {
+  std::string name;
+  uint64_t size{0};
+  std::array<unsigned char, 32> digest{};
+};
 
 struct Preserved_temp_table_image_descriptor {
   /*
@@ -71,13 +78,16 @@ struct Preserved_temp_table_image_descriptor {
   uint32_t space_flags{0};
   uint32_t table_flags{0};
   std::vector<Index_descriptor> indexes;
+  // v12: immutable wire base and cumulative patch; logical identity stays above.
+  Preserved_temp_table_wire_file base, delta;
 };
 
 struct Preserved_temp_table_undo_descriptor {
   /*
-    Optional no-redo undo sidecar for temp-DML. It is keyed by the same source
-    space id as the image and by the no-redo rollback segment identity captured
-    during preserve. Newer manifests pair it with ownership claims so SQL resume
+    Optional transaction-wide no-redo undo sidecar for temp-DML. One live image
+    space supplies its carrier id even when the transaction has several image
+    spaces. The rseg identity identifies the actual undo pages. Newer manifests
+    pair it with ownership claims so SQL resume
     can reconnect those pages as native temporary undo. Older descriptors remain
     readable for compatibility but do not by themselves prove native adoption.
   */
@@ -88,6 +98,11 @@ struct Preserved_temp_table_undo_descriptor {
   uint32_t no_redo_undo_rseg_space_id{0};
   uint32_t no_redo_undo_rseg_page_no{0};
   uint32_t no_redo_undo_rseg_slot{0};
+  /* v10: needed when the transaction has undo but no surviving data image. */
+  uint32_t page_size{0};
+  // v11: optional physical dependencies; size/sha256 above remain the complete
+  // logical undo. Both references are present together, or neither is present.
+  Preserved_temp_table_wire_file base, delta;
 };
 
 struct Preserved_temp_table_ownership_claim {
@@ -143,6 +158,7 @@ struct Preserved_temp_table_manifest_entry {
     so resume can validate them before opening the uncached TABLE.
   */
   uint32_t table_ordinal{0};
+  uint32_t generation{1};
   std::string schema_name;
   std::string table_name;
   std::string engine_name;
@@ -161,6 +177,8 @@ struct Preserved_temp_table_manifest {
   uint64_t owner_trx_id{0};
   /* Decode-derived capability; callers must not set this as intent. */
   bool native_adoption_capable{false};
+  uint64_t sealed_history_sequence{0};
+  std::vector<Preserved_temp_retired_table> retired_tables;
   std::vector<Preserved_temp_table_manifest_entry> tables;
   std::vector<Preserved_temp_table_undo_descriptor> undo_images;
   std::vector<Preserved_temp_table_ownership_claim> ownership_claims;
@@ -185,11 +203,51 @@ class Preserved_temp_table_image_writer {
 
   virtual Preserved_trx_carrier_status truncate(uint64_t length) = 0;
 
+  /** Serialized worker copy of the current warm DATA image. This is not an
+  immutable pin; the caller must finish copying before allowing further writes. */
+  virtual Preserved_trx_carrier_status read_at(
+      uint64_t, unsigned char *, size_t) {
+    return Preserved_trx_carrier_status::CORRUPT;
+  }
+  /** The exclusive worker just hashed the complete current image. Any later
+  write invalidates this certificate, so an unchanged final can reuse it. */
+  virtual Preserved_trx_carrier_status checkpoint_result(
+      uint64_t, const std::array<unsigned char, 32> &) {
+    return Preserved_trx_carrier_status::CORRUPT;
+  }
+
+  /** Worker checkpoint extent padding. Unlike my_chsize growth, each call
+  writes at most byte_budget bytes. The caller reserves that much scratch. */
+  virtual Preserved_trx_carrier_status resize_step(
+      uint64_t, size_t, bool *, uint64_t *) {
+    return Preserved_trx_carrier_status::CORRUPT;
+  }
+
   virtual Preserved_trx_carrier_status flush() = 0;
 
   virtual Preserved_trx_carrier_status close() = 0;
 
   virtual Preserved_trx_carrier_status result(
+      Preserved_temp_table_image_writer_result *result) = 0;
+
+  /** Only a closed sequential writer may certify its own immutable undo. */
+  virtual Preserved_trx_carrier_status certify_closed_undo(
+      const std::string &, uint64_t, const std::array<unsigned char, 32> &) {
+    return Preserved_trx_carrier_status::CORRUPT;
+  }
+
+  /** Pin the certified warm undo inode for bounded ordinary transfer. The
+      caller owns the returned read-only descriptor and must close it. */
+  virtual Preserved_trx_carrier_status pin_closed_undo_read_fd(
+      uint64_t, const std::array<unsigned char, 32> &, int *) {
+    return Preserved_trx_carrier_status::CORRUPT;
+  }
+
+  /* Read at most buffer_bytes of the closed image per call. Scratch is
+  borrowed only during this call; result is published only when complete.
+  Calls on one writer are serialized by its owner. abort() cancels a scan. */
+  virtual Preserved_trx_carrier_status result_step(
+      unsigned char *buffer, size_t buffer_bytes, bool *complete,
       Preserved_temp_table_image_writer_result *result) = 0;
 
   virtual Preserved_trx_carrier_status abort() = 0;
@@ -279,6 +337,13 @@ class Local_file_preserved_temp_table_image_carrier final
  public:
   explicit Local_file_preserved_temp_table_image_carrier(std::string dir);
 
+  /** Sequential undo output hashes bytes as they are written. Random writes
+  and truncate are rejected; close/result use the same ownership checks as an
+  image writer without rereading the completed file. */
+  Preserved_trx_carrier_status create_warm_undo_writer(
+      const std::string &, uint32_t, uint64_t expected_bytes,
+      std::unique_ptr<Preserved_temp_table_image_writer> *);
+
   Preserved_trx_carrier_status create_warm_image_writer(
       const std::string &warmcopy_id, uint32_t source_space_id,
       std::unique_ptr<Preserved_temp_table_image_writer> *writer) override;
@@ -302,6 +367,11 @@ class Local_file_preserved_temp_table_image_carrier final
   Preserved_trx_carrier_status seal_warm_undo(
       const std::string &warmcopy_id, const std::string &token,
       const Preserved_temp_table_undo_descriptor &descriptor) override;
+
+  Preserved_trx_carrier_status seal_warm_undo(
+      const std::string &warmcopy_id, const std::string &token,
+      const Preserved_temp_table_undo_descriptor &descriptor,
+      Preserved_temp_table_image_writer *closed_writer);
 
   Preserved_trx_carrier_status remove_warm_image(
       const std::string &warmcopy_id, uint32_t source_space_id) override;
@@ -363,5 +433,10 @@ Preserved_temp_table_ownership_conflict
 preserve_trx_temp_table_check_ownership_conflicts(
     const Preserved_temp_table_manifest &lhs,
     const Preserved_temp_table_manifest &rhs);
+
+#ifndef NDEBUG
+bool preserve_trx_temp_image_writer_probe(const std::string &dir,
+                                         const std::string &token);
+#endif
 
 #endif  // SQL_PRESERVE_TRX_TEMP_TABLE_CARRIER_INCLUDED

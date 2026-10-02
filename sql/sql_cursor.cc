@@ -41,6 +41,8 @@
 #include "sql/item.h"
 #include "sql/parse_tree_node_base.h"
 #include "sql/protocol.h"
+#include "sql/preserve_trx_cursor.h"
+#include "sql/preserve_trx_cursor_decode.h"
 #include "sql/query_options.h"
 #include "sql/query_result.h"
 #include "sql/sql_cmd_dml.h"  // Sql_cmd_dml
@@ -84,13 +86,39 @@ class Materialized_cursor final : public Server_side_cursor {
   ulong fetch_limit{0};
   ulong fetch_count{0};
   bool is_rnd_inited{false};
+  std::shared_ptr<Preserve_trx_cursor_result> m_preserved_result;
+  bool m_preserve_position_valid{true};
+#ifndef NDEBUG
+  std::unique_ptr<Preserve_trx_cursor_decoder> m_preserve_decoder;
+#endif
 
  public:
   Materialized_cursor(Query_result *result);
   void set_table(TABLE *table_arg);
   void set_result(Query_result *result_arg) { result = result_arg; }
   int send_result_set_metadata(
-      THD *thd, const mem_root_deque<Item *> &send_result_set_metadata);
+      THD *thd, const mem_root_deque<Item *> &send_result_set_metadata,
+      uint32_t preserve_statement_id);
+  bool capture_result(THD *thd) {
+    return Preserve_trx_cursor_result::capture(thd, table, &m_preserved_result);
+  }
+  const Preserve_trx_cursor_result *preserved_result() const override {
+    return m_preserved_result.get();
+  }
+  bool preserve_snapshot(Preserve_trx_cursor_snapshot *output) const override {
+    if (output == nullptr || !is_open() || !m_preserve_position_valid ||
+        !m_preserved_result || fetch_count > m_preserved_result->rows())
+      return false;
+    Preserve_trx_cursor_snapshot snapshot;
+    if (!m_preserved_result->describe(&snapshot.descriptor)) return false;
+    snapshot.artifact = m_preserved_result;
+    snapshot.file = m_preserved_result->sealed_file();
+    snapshot.fetch_count = fetch_count;
+    snapshot.fetch_limit = fetch_limit;
+    snapshot.open = true;
+    *output = std::move(snapshot);
+    return true;
+  }
   bool is_open() const override { return table->has_storage_handler(); }
   bool open(THD *) override;
   bool fetch(ulong num_rows) override;
@@ -111,6 +139,7 @@ class Query_result_materialize final : public Query_result_union {
   Query_result *result; /**< the result object of the caller (PS or SP) */
  public:
   Materialized_cursor *materialized_cursor;
+  uint32_t preserve_statement_id{0};
   Query_result_materialize(Query_result *result_arg)
       : Query_result_union(),
         result(result_arg),
@@ -168,7 +197,8 @@ class Query_result_materialize final : public Query_result_union {
 */
 
 bool mysql_open_cursor(THD *thd, Query_result *result,
-                       Server_side_cursor **pcursor) {
+                       Server_side_cursor **pcursor,
+                       uint32_t preserve_statement_id) {
   sql_digest_state *parent_digest;
   PSI_statement_locker *parent_locker;
   Query_result_materialize *result_materialize = nullptr;
@@ -224,6 +254,8 @@ bool mysql_open_cursor(THD *thd, Query_result *result,
 
   // Pass the Query_result_materialize object to the query
   lex->result = result_materialize;
+  if (result_materialize != nullptr)
+    result_materialize->preserve_statement_id = preserve_statement_id;
 
   parent_digest = thd->m_digest;
   parent_locker = thd->m_statement_psi;
@@ -231,6 +263,7 @@ bool mysql_open_cursor(THD *thd, Query_result *result,
   thd->m_statement_psi = nullptr;
 
   bool rc = mysql_execute_command(thd);
+  if (result_materialize != nullptr) result_materialize->preserve_statement_id = 0;
 
   thd->m_digest = parent_digest;
   DEBUG_SYNC(thd, "after_table_close");
@@ -268,6 +301,11 @@ bool mysql_open_cursor(THD *thd, Query_result *result,
       mysql_execute_command(), so all tables except from the cursor
       temporary table have been closed.
     */
+    if (materialized_cursor->capture_result(thd)) {
+      result_materialize->abort_result_set(thd);
+      materialized_cursor->close();
+      return true;
+    }
     if (materialized_cursor->open(thd)) {
       return true;
     }
@@ -304,7 +342,8 @@ void Materialized_cursor::set_table(TABLE *table_arg) { table = table_arg; }
 */
 
 int Materialized_cursor::send_result_set_metadata(
-    THD *thd, const mem_root_deque<Item *> &send_result_set_metadata) {
+    THD *thd, const mem_root_deque<Item *> &send_result_set_metadata,
+    uint32_t preserve_statement_id) {
   /*
     Create objects in the mem_root of the cursor. The item list will be
     referenced after the execution of the current statement, so it cannot
@@ -348,6 +387,10 @@ int Materialized_cursor::send_result_set_metadata(
     mysql_execute_command() is finished, item_list can not be used for
     sending metadata, because it references closed table.
   */
+  if (preserve_statement_id != 0) {
+    m_preserved_result = Preserve_trx_cursor_result::create(
+        thd, table, preserve_statement_id, item_list);
+  }
   if (result->send_result_set_metadata(thd, item_list,
                                        Protocol::SEND_NUM_ROWS)) {
     thd->swap_query_arena(backup_arena, &m_arena);
@@ -381,11 +424,13 @@ bool Materialized_cursor::open(THD *thd) {
     thd->server_status |= SERVER_STATUS_CURSOR_EXISTS;
     result->send_eof(thd);
   } else {
+    m_preserved_result.reset();
     result->abort_result_set(thd);
   }
 
   fetch_limit = 0;
   fetch_count = 0;
+  m_preserve_position_valid = !rc;
 
   return rc;
 }
@@ -409,19 +454,38 @@ bool Materialized_cursor::fetch(ulong num_rows) {
   result->begin_dataset();
   for (fetch_limit += num_rows; fetch_count < fetch_limit; fetch_count++) {
     if ((res = table->file->ha_rnd_next(table->record[0]))) break;
+    DBUG_EXECUTE_IF("preserve_cursor_capture_verify", {
+      if (m_preserved_result && !m_preserved_result->verify_current_row(table)) {
+        my_error(ER_INTERNAL_ERROR, MYF(0), "preserved cursor row mismatch");
+        close();
+        return true;
+      }
+    });
     /* Send data only if the read was successful. */
     /*
       If network write failed (i.e. due to a closed socked),
       the error has already been set. Return true if the error
       is set.
     */
-    if (result->send_data(thd, item_list)) return true;
+    const mem_root_deque<Item *> *send_items = &item_list;
+    DBUG_EXECUTE_IF("preserve_cursor_decode_verify", {
+      if (m_preserved_result) {
+        DBUG_ASSERT(preserve_trx_cursor_decode_for_test(
+            thd, *m_preserved_result, fetch_count, &m_preserve_decoder));
+        send_items = &m_preserve_decoder->items();
+      }
+    });
+    if (result->send_data(thd, *send_items)) {
+      m_preserve_position_valid = false;
+      return true;
+    }
   }
 
   switch (res) {
     case 0:
       thd->server_status |= SERVER_STATUS_CURSOR_EXISTS;
-      result->send_eof(thd);
+      if (result->send_eof(thd) || thd->is_error())
+        m_preserve_position_valid = false;
       break;
     case HA_ERR_END_OF_FILE:
       thd->server_status |= SERVER_STATUS_LAST_ROW_SENT;
@@ -438,6 +502,15 @@ bool Materialized_cursor::fetch(ulong num_rows) {
 }
 
 void Materialized_cursor::close() {
+#ifndef NDEBUG
+  m_preserve_decoder.reset();
+#endif
+  DBUG_EXECUTE_IF("preserve_cursor_pin_verify", {
+    auto pinned = m_preserved_result;
+    m_preserved_result.reset();
+    preserve_trx_cursor_verify_pin(std::move(pinned));
+  });
+  m_preserved_result.reset();
   if (is_rnd_inited) {
     (void)table->file->ha_rnd_end();
     is_rnd_inited = false;
@@ -483,6 +556,7 @@ bool Query_result_materialize::prepare(THD *thd,
     return true;
   }
   materialized_cursor->set_table(table);
+  m_handler_mem_root = &materialized_cursor->mem_root;
 
   return false;
 }
@@ -507,7 +581,8 @@ bool Query_result_materialize::start_execution(THD *thd) {
 
 bool Query_result_materialize::send_result_set_metadata(
     THD *thd, const mem_root_deque<Item *> &list, uint) {
-  if (materialized_cursor->send_result_set_metadata(thd, list)) {
+  if (materialized_cursor->send_result_set_metadata(thd, list,
+                                                   preserve_statement_id)) {
     return true;
   }
 

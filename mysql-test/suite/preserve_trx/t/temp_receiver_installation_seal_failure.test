@@ -1,0 +1,6 @@
+SELECT @@global.rds_preserve_trx_temp_id_namespace AS namespace_enabled;
+--let $capture_case= receiver installation seal failure
+--let $capture_trace_name= temp_receiver_installation_seal_failure.trace
+--let $capture_fault= preserve_temp_import_source_undo_probe,preserve_temp_import_target_image_probe,preserve_temp_receiver_installation_seal_probe
+--let $capture_trace_pattern= (?s)temporary receiver installation seal failure checked.*temporary namespace requires standby transfer
+--source suite/preserve_trx/include/temp_table_capture_undo_failure.inc

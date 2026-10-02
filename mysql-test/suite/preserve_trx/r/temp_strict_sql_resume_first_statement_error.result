@@ -1,0 +1,3 @@
+production TEMP_ONLY temporary transfer: cursor-no-undo passed
+loopback receiver prepared temporary resources before READY
+strict SQL RESUME integration: success passed

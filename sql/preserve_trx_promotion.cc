@@ -22,6 +22,7 @@
    Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
 
 #include "sql/preserve_trx_promotion.h"
+#include "sql/preserve_trx_temp_metrics.h"
 
 #include <algorithm>
 #include <array>
@@ -316,7 +317,6 @@ struct Promotion_record_lock_proof {
 std::mutex g_ready_cache_mutex;
 std::map<Promotion_ready_cache_key, Promotion_ready_cache_entry> g_ready_cache;
 std::atomic<uint64_t> g_ready_cache_bytes{0};
-std::atomic<uint64_t> g_ready_cache_evictions{0};
 uint64_t g_ready_cache_access_sequence{0};
 
 void add_ready_cache_bytes(uint64_t value, uint64_t *total) {
@@ -426,7 +426,6 @@ void ready_cache_store_locked(Promotion_ready_cache_key key,
     entry.state = Preserve_trx_promotion_ready_state::APPLY_PENDING;
     entry.reason = "promotion ready cache byte budget exceeded";
     entry.estimated_bytes = ready_cache_entry_bytes(key, entry);
-    g_ready_cache_evictions.fetch_add(1);
   }
 
   while (entry.estimated_bytes <= cap &&
@@ -441,11 +440,9 @@ void ready_cache_store_locked(Promotion_ready_cache_key key,
                         ? current_bytes - victim->second.estimated_bytes
                         : 0;
     g_ready_cache.erase(victim);
-    g_ready_cache_evictions.fetch_add(1);
   }
   if (entry.estimated_bytes > cap ||
       current_bytes > cap - entry.estimated_bytes) {
-    g_ready_cache_evictions.fetch_add(1);
     g_ready_cache_bytes.store(current_bytes);
     return;
   }
@@ -1620,9 +1617,6 @@ uint64_t preserve_trx_promotion_ready_cache_bytes_status() {
   return g_ready_cache_bytes.load();
 }
 
-uint64_t preserve_trx_promotion_ready_cache_evictions_status() {
-  return g_ready_cache_evictions.load();
-}
 
 void preserved_trx_promotion_ready_cache_purge_epoch(
     const std::string &preserve_dir, const std::string &epoch_id) {
@@ -1792,12 +1786,13 @@ Preserve_trx_promotion_adopt_status prewarm_loaded_bundle_into_ready_cache(
     const std::string &preserve_dir, const std::string &epoch_id,
     uint64_t token, uint64_t required_apply_lsn,
     const Preserved_trx_bundle &bundle, bool wait_for_final_epoch_fact,
-    const Promotion_record_lock_proof *record_lock_proof) {
+    const Promotion_record_lock_proof *record_lock_proof,
+    const Preserve_trx_temp_receiver_work *temp_ready = nullptr) {
   const std::string token_string = std::to_string(token);
   std::string dry_validate_reason;
   const Preserve_snapshot_status dry_validate_status =
       preserved_trx_dry_validate_loaded_bundle(preserve_dir, token_string,
-                                               bundle, &dry_validate_reason);
+                                               bundle, &dry_validate_reason, temp_ready);
   if (dry_validate_status != Preserve_snapshot_status::OK) {
     if (dry_validate_status == Preserve_snapshot_status::CORRUPT ||
         dry_validate_status == Preserve_snapshot_status::UNSUPPORTED) {
@@ -2072,7 +2067,8 @@ Preserve_trx_promotion_adopt_status
 preserved_trx_promotion_prewarm_staged_bundle_for_receiver(
     const std::string &preserve_dir, const std::string &epoch_id,
     uint64_t token, uint64_t required_apply_lsn,
-    const Preserved_trx_bundle &bundle) {
+    const Preserved_trx_bundle &bundle,
+    const Preserve_trx_temp_receiver_work *temp_ready) {
   if (preserve_dir.empty() || epoch_id.empty() || token == 0) {
     return Preserve_trx_promotion_adopt_status::INVALID_ARGUMENT;
   }
@@ -2080,7 +2076,8 @@ preserved_trx_promotion_prewarm_staged_bundle_for_receiver(
     return Preserve_trx_promotion_adopt_status::NOT_ENABLED;
   }
   return prewarm_loaded_bundle_into_ready_cache(
-      preserve_dir, epoch_id, token, required_apply_lsn, bundle, true, nullptr);
+      preserve_dir, epoch_id, token, required_apply_lsn, bundle, true, nullptr,
+      temp_ready);
 }
 
 Preserve_trx_promotion_adopt_status
@@ -2090,7 +2087,7 @@ preserved_trx_promotion_prewarm_staged_bundle_with_record_lock_proof_for_receive
     const Preserved_trx_bundle &bundle, uint64_t record_lock_page_count,
     uint64_t record_lock_resident_pages, uint64_t record_lock_cold_gets,
     uint64_t record_lock_bitmap_pages, uint64_t record_lock_bitmap_bits,
-    bool metadata_only) {
+    bool metadata_only, const Preserve_trx_temp_receiver_work *temp_ready) {
   if (preserve_dir.empty() || epoch_id.empty() || token == 0) {
     return Preserve_trx_promotion_adopt_status::INVALID_ARGUMENT;
   }
@@ -2106,7 +2103,8 @@ preserved_trx_promotion_prewarm_staged_bundle_with_record_lock_proof_for_receive
   proof.bitmap_pages = record_lock_bitmap_pages;
   proof.bitmap_bits = record_lock_bitmap_bits;
   return prewarm_loaded_bundle_into_ready_cache(
-      preserve_dir, epoch_id, token, required_apply_lsn, bundle, true, &proof);
+      preserve_dir, epoch_id, token, required_apply_lsn, bundle, true, &proof,
+      temp_ready);
 }
 
 Preserve_trx_promotion_adopt_status
@@ -2953,7 +2951,18 @@ bool strict_prepared_snapshot_is_ready(
           snapshot.state ==
               Preserve_trx_prepared_token_state::READY_FOR_GATE) &&
          snapshot.semantic_bundle_owned && facts.semantic_validated &&
-         snapshot.resurrection_entry_owned &&
+         snapshot.resource_temp_id_contract_bound &&
+         snapshot.resource_temp_id_contract == facts.temp_id_contract &&
+         snapshot.temp_resources_ready &&
+         (snapshot.recovery.resource_only()
+              ? !snapshot.resurrection_entry_owned && snapshot.recovery.owner_trx_id == 0 &&
+                    snapshot.recovery.freeze_lsn == 0
+              : snapshot.recovery.needs_no_redo_context()
+              ? !snapshot.resurrection_entry_owned && snapshot.recovery.owner_trx_id != 0 &&
+                    snapshot.recovery.freeze_lsn != 0
+              : (snapshot.recovery.basis == Preserve_trx_engine_recovery::LEGACY ||
+                 snapshot.recovery.basis == Preserve_trx_engine_recovery::REDO_RESURRECTION) &&
+                    snapshot.resurrection_entry_owned) &&
          facts.lock_plan_ready && facts.binlog_handle_ready &&
          facts.resources_reserved && !facts.predicate_lock_present &&
          (!has_record_locks || snapshot.record_lock_plan_owned) &&
@@ -2993,6 +3002,7 @@ bool strict_prepared_snapshot_matches_accepted_epoch(
   return strict_prepared_snapshot_is_ready(snapshot) &&
          strict_physical_promotion_gtid_config_matches(
              snapshot, target_log_bin_configured, target_gtid_mode) &&
+         facts.temp_id_contract == accepted.temp_id_contract &&
          facts.required_apply_lsn <= accepted.source_fence_lsn &&
          facts.physical_fence_lsn == accepted.source_fence_lsn &&
          facts.epoch_fact_digest == digest_hex(accepted.fact_digest) &&
@@ -3006,7 +3016,8 @@ adopt_ready_epoch_for_physical_promotion_impl(
     bool use_test_provider, const std::vector<trx_t *> *verified_transactions,
     const Preserve_trx_transfer_accepted_epoch *accepted_epoch,
     const Preserve_trx_physical_promotion_pin_lease *prepared_token_pin,
-    Preserve_trx_physical_promotion_gate_result *result) {
+    Preserve_trx_physical_promotion_gate_result *result,
+    bool *gate_handoff_started = nullptr) {
   if (result == nullptr) {
     return Preserve_trx_physical_promotion_gate_status::INVALID_ARGUMENT;
   }
@@ -3259,7 +3270,9 @@ adopt_ready_epoch_for_physical_promotion_impl(
       }
     }
   };
-  if (!run_promotion_gate_worker_batch(worker_count, run_worker)) {
+  std::function<void()> worker(run_worker);
+  if (gate_handoff_started != nullptr) *gate_handoff_started = true;
+  if (!run_promotion_gate_worker_batch(worker_count, std::move(worker))) {
     global_failure.store(true, std::memory_order_release);
     worker_abort.store(true, std::memory_order_release);
   }
@@ -3473,28 +3486,48 @@ bool Preserve_trx_physical_promotion_bootstrap_attempt::prepare_gate_handoff(
   trx_preserve_startup_reservation_result reservation;
   try {
     verified_transactions->reserve(m_impl->gate_request.tokens.size());
+    m_impl->reserved_transactions.reserve(m_impl->gate_request.tokens.size());
     for (const auto &key : m_impl->gate_request.tokens) {
+      Preserve_trx_prepared_token_snapshot snapshot;
+      if (preserved_trx_strict_prepared_token_registry().snapshot(key, &snapshot) !=
+              Preserve_trx_prepared_status::OK || !strict_prepared_snapshot_is_ready(snapshot))
+        return false;
+      if (snapshot.recovery.needs_no_redo_context() || snapshot.recovery.resource_only()) {
+        verified_transactions->push_back(nullptr);
+        continue;
+      }
       trx_t *verified =
           trx_preserve_startup_resurrection_find_verified(key.token);
       if (verified == nullptr) return false;
       verified_transactions->push_back(verified);
     }
-    if (trx_preserve_startup_reserve_verified(&reservation) != DB_SUCCESS ||
+    const auto reserve_status = trx_preserve_startup_reserve_verified(&reservation);
+    // Candidate discovery does not own native claims. After reservation,
+    // remember only the exact successful subset; all storage is preallocated.
+    for (size_t index = 0; index < verified_transactions->size(); ++index) {
+      if ((*verified_transactions)[index] != nullptr &&
+          trx_preserve_validate_reserved_authority(
+              (*verified_transactions)[index],
+              m_impl->gate_request.tokens[index].token))
+        m_impl->reserved_transactions.push_back((*verified_transactions)[index]);
+    }
+    if (reserve_status != DB_SUCCESS ||
         !reservation.rejected_authorities.empty() ||
         reservation.reserved_authorities.size() !=
-            verified_transactions->size()) {
-      m_impl->reserved_transactions = *verified_transactions;
+            m_impl->reserved_transactions.size() ||
+        m_impl->reserved_transactions.size() !=
+            static_cast<size_t>(std::count_if(verified_transactions->begin(),
+                verified_transactions->end(), [](trx_t *trx) { return trx != nullptr; }))) {
       return false;
     }
     for (size_t index = 0; index < verified_transactions->size(); ++index) {
-      if (!trx_preserve_validate_reserved_authority(
+      if ((*verified_transactions)[index] != nullptr &&
+          !trx_preserve_validate_reserved_authority(
               (*verified_transactions)[index],
               m_impl->gate_request.tokens[index].token)) {
-        m_impl->reserved_transactions = *verified_transactions;
         return false;
       }
     }
-    m_impl->reserved_transactions = *verified_transactions;
   } catch (const std::bad_alloc &) {
     return false;
   }
@@ -3502,7 +3535,6 @@ bool Preserve_trx_physical_promotion_bootstrap_attempt::prepare_gate_handoff(
   *request = &m_impl->gate_request;
   *accepted_epoch = &m_impl->accepted_epoch;
   *prepared_token_pin = &m_impl->prepared_token_pin;
-  m_impl->gate_handoff_started = true;
   return true;
 }
 
@@ -3529,10 +3561,20 @@ bool Preserve_trx_physical_promotion_bootstrap_attempt::
   return true;
 }
 
+bool preserved_trx_physical_promotion_in_progress() {
+  return preserve_trx_is_enabled() && !preserved_trx_server_startup_active() &&
+         g_physical_promotion_bootstrap_active.load(std::memory_order_acquire);
+}
+
 Preserve_trx_physical_promotion_gate_status
 preserved_trx_prepare_before_trx_sys_init_for_physical_promotion(
     const Preserve_trx_physical_bootstrap_request &request,
     Preserve_trx_physical_promotion_bootstrap_attempt *attempt) {
+  bool metric_success = false;
+  Preserve_trx_temp_stage_timer metric(
+      preserve_trx_is_enabled() && !preserved_trx_server_startup_active()
+          ? Preserve_trx_temp_stage::PHYSICAL_PREPARE
+          : Preserve_trx_temp_stage::NONE, &metric_success);
   if (!preserve_trx_is_enabled()) {
     return Preserve_trx_physical_promotion_gate_status::NOT_ENABLED;
   }
@@ -3665,7 +3707,8 @@ preserved_trx_prepare_before_trx_sys_init_for_physical_promotion(
     Preserve_trx_prepared_token_snapshot snapshot;
     if (prepared_registry.snapshot(key, &snapshot) !=
             Preserve_trx_prepared_status::OK ||
-        !strict_prepared_snapshot_is_ready(snapshot)) {
+        !strict_prepared_snapshot_is_ready(snapshot) ||
+        snapshot.facts.temp_id_contract != accepted.temp_id_contract) {
       return fail_closed(
           Preserve_trx_physical_promotion_gate_status::REGISTRY_NOT_READY);
     }
@@ -3694,6 +3737,18 @@ preserved_trx_prepare_before_trx_sys_init_for_physical_promotion(
     for (const auto &fact_token : fact_tokens) {
       if (ready_tokens.count(fact_token.token) == 0) continue;
       Preserve_trx_resurrection_index_entry entry;
+      Preserve_trx_prepared_token_snapshot snapshot;
+      if (ready_index >= impl->gate_request.tokens.size() ||
+          prepared_registry.snapshot(impl->gate_request.tokens[ready_index], &snapshot) !=
+              Preserve_trx_prepared_status::OK) return fail_closed(
+                  Preserve_trx_physical_promotion_gate_status::REGISTRY_NOT_READY);
+      if (snapshot.recovery.needs_no_redo_context() || snapshot.recovery.resource_only()) {
+        if (!snapshot.recovery.resource_only() &&
+            snapshot.recovery.freeze_lsn != fact_token.source_freeze_lsn)
+          return fail_closed(Preserve_trx_physical_promotion_gate_status::REGISTRY_NOT_READY);
+        ++ready_index;
+        continue;
+      }
       if (ready_index >= impl->gate_request.tokens.size() ||
           prepared_registry.copy_ready_resurrection_entry(
               impl->gate_request.tokens[ready_index], promotion_monotonic_us(),
@@ -3722,6 +3777,7 @@ preserved_trx_prepare_before_trx_sys_init_for_physical_promotion(
           Preserve_trx_physical_promotion_gate_status::REGISTRY_NOT_READY);
     }
   }
+  metric_success = true;
   return Preserve_trx_physical_promotion_gate_status::OK;
 }
 
@@ -3739,6 +3795,11 @@ Preserve_trx_physical_promotion_gate_status
 preserved_trx_adopt_ready_epoch_for_physical_promotion(
     Preserve_trx_physical_promotion_bootstrap_attempt *attempt,
     Preserve_trx_physical_promotion_gate_result *result) {
+  bool metric_success = false;
+  Preserve_trx_temp_stage_timer metric(
+      preserve_trx_is_enabled() && !preserved_trx_server_startup_active()
+          ? Preserve_trx_temp_stage::PHYSICAL_ADOPT
+          : Preserve_trx_temp_stage::NONE, &metric_success);
   if (result == nullptr) {
     return Preserve_trx_physical_promotion_gate_status::INVALID_ARGUMENT;
   }
@@ -3770,7 +3831,11 @@ preserved_trx_adopt_ready_epoch_for_physical_promotion(
   }
 
   std::vector<uint64_t> initially_failed_tokens;
+  std::vector<trx_t *> redo_reservations;
   try {
+    redo_reservations.reserve(verified_transactions.size());
+    for (auto *trx : verified_transactions)
+      if (trx != nullptr) redo_reservations.push_back(trx);
     initially_failed_tokens.reserve(accepted_epoch->failed_tokens.size());
     for (const auto &failed : accepted_epoch->failed_tokens) {
       initially_failed_tokens.push_back(failed.token);
@@ -3799,9 +3864,18 @@ preserved_trx_adopt_ready_epoch_for_physical_promotion(
     result->message = "no READY tokens; ordinary recovery only";
     status = result->status;
   } else {
-    status = adopt_ready_epoch_for_physical_promotion_impl(
-        promotion_normalize_dir(preserved_trx_dir_value()), *request, false,
-        &verified_transactions, accepted_epoch, prepared_token_pin, result);
+    try {
+      status = adopt_ready_epoch_for_physical_promotion_impl(
+          promotion_normalize_dir(preserved_trx_dir_value()), *request, false,
+          &verified_transactions, accepted_epoch, prepared_token_pin, result,
+          &attempt->m_impl->gate_handoff_started);
+    } catch (const std::bad_alloc &) {
+      status = attempt->m_impl->gate_handoff_started
+          ? Preserve_trx_physical_promotion_gate_status::CLEANUP_TAINTED
+          : Preserve_trx_physical_promotion_gate_status::REGISTRY_NOT_READY;
+      result->status = status;
+      result->message = "physical promotion preparation allocation failed";
+    }
   }
 
   if (status == Preserve_trx_physical_promotion_gate_status::OK) {
@@ -3835,14 +3909,15 @@ preserved_trx_adopt_ready_epoch_for_physical_promotion(
       result->message =
           "strict adopt failed with a partial reservation outcome";
     }
+    const bool gate_owned_claims = attempt->m_impl->gate_handoff_started;
     const auto cleanup_status = attempt->abort();
     if (cleanup_status != Preserve_trx_physical_promotion_gate_status::OK) {
       result->status = cleanup_status;
       result->message =
           "physical promotion gate failed and epoch cleanup is tainted";
-    } else if (!all_ready_rolled_back && result->rolled_back_count == 0 &&
+    } else if (gate_owned_claims && !all_ready_rolled_back && result->rolled_back_count == 0 &&
                trx_preserve_abandon_active_undo_reservations(
-                   verified_transactions) != DB_SUCCESS) {
+                   redo_reservations) != DB_SUCCESS) {
       result->status =
           Preserve_trx_physical_promotion_gate_status::CLEANUP_TAINTED;
       result->message =
@@ -3861,6 +3936,7 @@ preserved_trx_adopt_ready_epoch_for_physical_promotion(
       return cleanup_status;
     }
   }
+  metric_success = status == Preserve_trx_physical_promotion_gate_status::OK;
   return status;
 }
 

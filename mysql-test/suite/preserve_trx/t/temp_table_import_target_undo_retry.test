@@ -1,0 +1,5 @@
+--let $capture_case= native target temporary undo retry
+--let $capture_trace_name= temp_import_target_undo_retry.trace
+--let $capture_fault= preserve_temp_import_source_undo_probe,preserve_temp_import_target_undo_probe,preserve_temp_target_undo_retry_probe,preserve_trx_fail_before_snapshot_fsync
+--let $capture_trace_pattern= temporary target undo retry retained prefix=2
+--source suite/preserve_trx/include/temp_table_capture_undo_failure.inc

@@ -1,0 +1,5 @@
+--let $capture_case= namespace target identities on a captured multi-page image
+--let $capture_trace_name= temp_import_namespace_identity.trace
+--let $capture_fault= preserve_temp_import_plan_probe
+--let $capture_trace_pattern= (?s)temporary namespace identity stable without dictionary writes.*temporary namespace requires standby transfer
+--source suite/preserve_trx/include/temp_table_capture_undo_failure.inc

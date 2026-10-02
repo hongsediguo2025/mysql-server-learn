@@ -1527,7 +1527,7 @@ TEST(TempResumeMaterializerContractTest,
   const std::string sql_header = read_source_file_for_temp_table_test(
       "sql/preserve_trx_temp_table.h");
   const std::string sql_impl = read_source_file_for_temp_table_test(
-      "sql/preserve_trx_temp_table.cc");
+      "sql/preserve_trx_temp_restore.cc");
 
   ASSERT_FALSE(sql_header.empty());
   ASSERT_FALSE(sql_impl.empty());
@@ -1580,22 +1580,24 @@ TEST(TempResumeMaterializerContractTest,
      StagedLinkIsTheOnlyPathThatPublishesTemporaryTables) {
   const std::string sql_impl = read_source_file_for_temp_table_test(
       "sql/preserve_trx_temp_table.cc");
+  const std::string restore_impl = read_source_file_for_temp_table_test(
+      "sql/preserve_trx_temp_restore.cc");
 
   ASSERT_FALSE(sql_impl.empty());
 
   const std::string stage_body =
       extract_function_body_after_signature_for_temp_table_test(
-          sql_impl,
+          restore_impl,
           "Preserve_snapshot_status "
           "preserve_trx_temp_table_stage_open_for_resume(");
   const std::string link_body =
       extract_function_body_after_signature_for_temp_table_test(
-          sql_impl,
+          restore_impl,
           "Preserve_snapshot_status "
           "preserve_trx_temp_table_link_staged_tables(");
   const std::string close_body =
       extract_function_body_after_signature_for_temp_table_test(
-          sql_impl, "void preserve_trx_temp_table_close_staged_tables(");
+          restore_impl, "void preserve_trx_temp_table_close_staged_tables(");
   const std::string materialize_body =
       extract_function_body_after_signature_for_temp_table_test(
           sql_impl,
@@ -1853,6 +1855,8 @@ TEST(TempLivePreserveManifestContractTest,
       "storage/innobase/include/trx0temp_preserve.h");
   const std::string innodb_impl = read_source_file_for_temp_table_test(
       "storage/innobase/trx/trx0temp_preserve.cc");
+  const std::string innodb_source_impl = read_source_file_for_temp_table_test(
+      "storage/innobase/trx/trx0temp_preserve_source.cc");
 
   ASSERT_FALSE(sql_header.empty());
   ASSERT_FALSE(sql_impl.empty());
@@ -1882,7 +1886,7 @@ TEST(TempLivePreserveManifestContractTest,
       innodb_header,
       "dberr_t trx_preserve_temp_table_export_source_metadata("));
   EXPECT_TRUE(source_contains_exact_signature_for_temp_table_test(
-      innodb_impl,
+      innodb_source_impl,
       "dberr_t trx_preserve_temp_table_export_source_metadata("));
   EXPECT_TRUE(source_contains_exact_signature_for_temp_table_test(
       innodb_header,
@@ -2915,7 +2919,8 @@ TEST(TempResumeMaterializerContractTest,
          "feature disable";
   const std::string close_staged_tables_body =
       extract_function_body_after_signature_for_temp_table_test(
-          sql_impl,
+          read_source_file_for_temp_table_test(
+              "sql/preserve_trx_temp_restore.cc"),
           "void preserve_trx_temp_table_close_staged_tables(");
   ASSERT_FALSE(close_staged_tables_body.empty());
   EXPECT_EQ(std::string::npos,
@@ -3858,7 +3863,7 @@ void expect_no_redo_undo_sidecar_not_loaded(
       trx_preserve_temp_space_image_no_redo_update_undo_anchor(descriptor)
           ->present);
   EXPECT_EQ(0U,
-            trx_preserve_temp_space_image_no_redo_undo_page_count(descriptor));
+            descriptor.no_redo_undo_pages.size());
 }
 
 void expect_loaded_no_redo_undo_page(
@@ -3867,7 +3872,7 @@ void expect_loaded_no_redo_undo_page(
     const std::vector<unsigned char> &expected_bytes) {
   bool found = false;
   for (size_t i = 0;
-       i < trx_preserve_temp_space_image_no_redo_undo_page_count(descriptor);
+       i < descriptor.no_redo_undo_pages.size();
        ++i) {
     const trx_preserve_temp_no_redo_undo_page_image *image =
         trx_preserve_temp_space_image_no_redo_undo_page_at(descriptor, i);
@@ -4383,7 +4388,7 @@ TEST(TempDirtyPageStreamTest,
   EXPECT_EQ(0U,
             trx_preserve_temp_space_image_staged_dirty_page_bytes_for_test());
   EXPECT_EQ(0U,
-            trx_preserve_temp_space_image_no_redo_undo_page_count(descriptor));
+            descriptor.no_redo_undo_pages.size());
   EXPECT_TRUE(
       trx_preserve_temp_space_image_no_redo_undo_capture_degraded(descriptor));
   EXPECT_EQ("temp-table no-redo undo page queue budget exceeded",
@@ -5787,7 +5792,7 @@ TEST(TempNoRedoUndoCaptureTest, CapturesUndoChainPagesForPreservedTrx) {
                 &descriptor, true, 7, 96, 40, 41, 41, 128, 99));
 
   EXPECT_EQ(2U,
-            trx_preserve_temp_space_image_no_redo_undo_page_count(descriptor));
+            descriptor.no_redo_undo_pages.size());
   const trx_preserve_temp_no_redo_undo_page_image *first =
       trx_preserve_temp_space_image_no_redo_undo_page_at(descriptor, 0);
   const trx_preserve_temp_no_redo_undo_page_image *second =
@@ -5886,7 +5891,7 @@ TEST(TempNoRedoUndoCaptureTest, CapturesRollbackSegmentAllocatorPages) {
   EXPECT_TRUE(
       trx_preserve_temp_space_image_no_redo_undo_sidecar_sealed(descriptor));
   EXPECT_EQ(4U,
-            trx_preserve_temp_space_image_no_redo_undo_page_count(descriptor));
+            descriptor.no_redo_undo_pages.size());
   const trx_preserve_temp_no_redo_undo_page_image *first =
       trx_preserve_temp_space_image_no_redo_undo_page_at(descriptor, 0);
   const trx_preserve_temp_no_redo_undo_page_image *second =
@@ -5939,7 +5944,7 @@ TEST(TempNoRedoUndoCaptureTest,
             trx_preserve_temp_space_image_capture_dirty_page(
                 rseg_space_id, 102, allocator.data(), allocator.size()));
   EXPECT_EQ(0U,
-            trx_preserve_temp_space_image_no_redo_undo_page_count(descriptor));
+            descriptor.no_redo_undo_pages.size());
   ASSERT_EQ(DB_SUCCESS,
             trx_preserve_temp_space_image_capture_dirty_page(
                 rseg_space_id, 103, undo_header.data(), undo_header.size()));
@@ -5947,7 +5952,7 @@ TEST(TempNoRedoUndoCaptureTest,
             trx_preserve_temp_space_image_capture_dirty_page(
                 rseg_space_id, 104, undo_log.data(), undo_log.size()));
   EXPECT_EQ(0U,
-            trx_preserve_temp_space_image_no_redo_undo_page_count(descriptor));
+            descriptor.no_redo_undo_pages.size());
 
   ASSERT_EQ(DB_SUCCESS,
             trx_preserve_temp_space_image_capture_no_redo_undo_anchor(
@@ -5959,13 +5964,13 @@ TEST(TempNoRedoUndoCaptureTest,
   EXPECT_TRUE(
       trx_preserve_temp_space_image_no_redo_undo_sidecar_sealed(descriptor));
   EXPECT_EQ(4U,
-            trx_preserve_temp_space_image_no_redo_undo_page_count(descriptor));
+            descriptor.no_redo_undo_pages.size());
   bool saw_rseg_header = false;
   bool saw_allocator = false;
   bool saw_undo_header = false;
   bool saw_undo_log = false;
   for (size_t i = 0;
-       i < trx_preserve_temp_space_image_no_redo_undo_page_count(descriptor);
+       i < descriptor.no_redo_undo_pages.size();
        ++i) {
     const trx_preserve_temp_no_redo_undo_page_image *image =
         trx_preserve_temp_space_image_no_redo_undo_page_at(descriptor, i);
@@ -6033,7 +6038,7 @@ TEST(TempNoRedoUndoCaptureTest,
             trx_preserve_temp_space_image_stage_dirty_page(
                 rseg_space_id, 104, undo_log.data(), undo_log.size()));
   EXPECT_EQ(0U,
-            trx_preserve_temp_space_image_no_redo_undo_page_count(descriptor));
+            descriptor.no_redo_undo_pages.size());
 
   ASSERT_EQ(DB_SUCCESS,
             trx_preserve_temp_space_image_capture_no_redo_undo_anchor(
@@ -6046,7 +6051,7 @@ TEST(TempNoRedoUndoCaptureTest,
   EXPECT_EQ(0U,
             trx_preserve_temp_space_image_active_dirty_page_streams_for_test());
   EXPECT_EQ(4U,
-            trx_preserve_temp_space_image_no_redo_undo_page_count(descriptor));
+            descriptor.no_redo_undo_pages.size());
 }
 
 TEST(TempNoRedoUndoCaptureTest,
@@ -6114,7 +6119,7 @@ TEST(TempNoRedoUndoCaptureTest,
                 &descriptor));
   bool saw_refreshed_body = false;
   for (size_t i = 0;
-       i < trx_preserve_temp_space_image_no_redo_undo_page_count(descriptor);
+       i < descriptor.no_redo_undo_pages.size();
        ++i) {
     const trx_preserve_temp_no_redo_undo_page_image *image =
         trx_preserve_temp_space_image_no_redo_undo_page_at(descriptor, i);
@@ -6216,9 +6221,9 @@ TEST(TempNoRedoUndoCaptureTest,
   EXPECT_EQ(DB_SUCCESS,
             trx_preserve_temp_space_image_seal_no_redo_undo_sidecar(&second));
   EXPECT_EQ(4U,
-            trx_preserve_temp_space_image_no_redo_undo_page_count(first));
+            first.no_redo_undo_pages.size());
   EXPECT_EQ(4U,
-            trx_preserve_temp_space_image_no_redo_undo_page_count(second));
+            second.no_redo_undo_pages.size());
 
   auto expect_page =
       [](const trx_preserve_temp_space_image_descriptor &descriptor,
@@ -6226,8 +6231,7 @@ TEST(TempNoRedoUndoCaptureTest,
          const std::vector<unsigned char> &bytes) {
         bool found = false;
         for (size_t i = 0;
-             i < trx_preserve_temp_space_image_no_redo_undo_page_count(
-                     descriptor);
+             i < descriptor.no_redo_undo_pages.size();
              ++i) {
           const trx_preserve_temp_no_redo_undo_page_image *image =
               trx_preserve_temp_space_image_no_redo_undo_page_at(descriptor,
@@ -6334,7 +6338,7 @@ TEST(TempNoRedoUndoCaptureTest,
 
   bool saw_shared_undo_log = false;
   for (size_t i = 0;
-       i < trx_preserve_temp_space_image_no_redo_undo_page_count(second);
+       i < second.no_redo_undo_pages.size();
        ++i) {
     const trx_preserve_temp_no_redo_undo_page_image *image =
         trx_preserve_temp_space_image_no_redo_undo_page_at(second, i);
@@ -6519,7 +6523,7 @@ TEST(TempNoRedoUndoCaptureTest,
   bool saw_new_rseg_header = false;
   bool saw_old_rseg_header = false;
   for (size_t i = 0;
-       i < trx_preserve_temp_space_image_no_redo_undo_page_count(descriptor);
+       i < descriptor.no_redo_undo_pages.size();
        ++i) {
     const trx_preserve_temp_no_redo_undo_page_image *image =
         trx_preserve_temp_space_image_no_redo_undo_page_at(descriptor, i);
@@ -7039,7 +7043,7 @@ TEST(TempNoRedoUndoCaptureTest, RejectsUnknownUndoPage) {
                 trx_preserve_temp_no_redo_undo_page_kind::UNDO_LOG, 69,
                 page.data(), page.size()));
   EXPECT_EQ(1U,
-            trx_preserve_temp_space_image_no_redo_undo_page_count(descriptor));
+            descriptor.no_redo_undo_pages.size());
 
   EXPECT_EQ(DB_UNSUPPORTED,
             trx_preserve_temp_space_image_capture_no_redo_undo_page(
@@ -7047,7 +7051,7 @@ TEST(TempNoRedoUndoCaptureTest, RejectsUnknownUndoPage) {
                 static_cast<trx_preserve_temp_no_redo_undo_page_kind>(0xff),
                 70, page.data(), page.size()));
   EXPECT_EQ(1U,
-            trx_preserve_temp_space_image_no_redo_undo_page_count(descriptor));
+            descriptor.no_redo_undo_pages.size());
   EXPECT_TRUE(
       trx_preserve_temp_space_image_no_redo_undo_capture_degraded(descriptor));
   EXPECT_EQ("unknown no-redo temporary undo page kind",
@@ -7093,13 +7097,13 @@ TEST(TempNoRedoUndoCaptureTest, SealRejectsManualSidecarFlagWithoutRsegIdentity)
             trx_preserve_temp_space_image_note_temp_dml_requires_no_redo_undo(
                 &descriptor));
   descriptor.no_redo_undo_pages.push_back(
-      {trx_preserve_temp_no_redo_undo_page_kind::RSEG_HEADER, 91,
+      {trx_preserve_temp_no_redo_undo_page_kind::RSEG_HEADER, 91, 0,
        undo_header});
   descriptor.no_redo_undo_pages.push_back(
-      {trx_preserve_temp_no_redo_undo_page_kind::RSEG_ALLOCATOR, 92,
+      {trx_preserve_temp_no_redo_undo_page_kind::RSEG_ALLOCATOR, 92, 0,
        allocator});
   descriptor.no_redo_undo_pages.push_back(
-      {trx_preserve_temp_no_redo_undo_page_kind::UNDO_HEADER, 90,
+      {trx_preserve_temp_no_redo_undo_page_kind::UNDO_HEADER, 90, 0,
        undo_header});
   descriptor.no_redo_update_undo.present = true;
   descriptor.no_redo_update_undo.undo_slot = 4;
@@ -7243,7 +7247,7 @@ TEST(TempNoRedoUndoCaptureTest, ExplicitTempFeatureOffNoRedoUndoApiIsNoop) {
       trx_preserve_temp_space_image_no_redo_undo_pointers_reconnected(
           descriptor));
   EXPECT_EQ(0U,
-            trx_preserve_temp_space_image_no_redo_undo_page_count(descriptor));
+            descriptor.no_redo_undo_pages.size());
   EXPECT_EQ(0U, descriptor.no_redo_undo_rseg_space_id);
   EXPECT_EQ(0U, descriptor.no_redo_undo_rseg_page_no);
   EXPECT_EQ(0U, descriptor.no_redo_undo_rseg_slot);
@@ -7315,7 +7319,7 @@ TEST(TempNoRedoUndoSidecarLoadTest, LoadsSealedUndoSidecarIntoDescriptor) {
   EXPECT_EQ(kRsegPageNo, descriptor.no_redo_undo_rseg_page_no);
   EXPECT_EQ(4U, descriptor.no_redo_undo_rseg_slot);
   EXPECT_EQ(4U,
-            trx_preserve_temp_space_image_no_redo_undo_page_count(descriptor));
+            descriptor.no_redo_undo_pages.size());
   expect_loaded_no_redo_undo_page(
       descriptor, trx_preserve_temp_no_redo_undo_page_kind::RSEG_HEADER,
       kRsegPageNo, rseg_header);
@@ -7555,7 +7559,7 @@ TEST(TempNoRedoUndoSidecarLoadTest, RejectsRsegIdentityMismatchWithoutMutation) 
   EXPECT_FALSE(
       trx_preserve_temp_space_image_no_redo_undo_sidecar_sealed(descriptor));
   EXPECT_EQ(0U,
-            trx_preserve_temp_space_image_no_redo_undo_page_count(descriptor));
+            descriptor.no_redo_undo_pages.size());
 }
 
 TEST(TempNoRedoUndoSidecarLoadTest,
@@ -7651,7 +7655,7 @@ TEST(TempNoRedoUndoSidecarLoadTest, RejectsRsegSlotMismatchWithoutMutation) {
   EXPECT_FALSE(
       trx_preserve_temp_space_image_no_redo_undo_sidecar_sealed(descriptor));
   EXPECT_EQ(0U,
-            trx_preserve_temp_space_image_no_redo_undo_page_count(descriptor));
+            descriptor.no_redo_undo_pages.size());
 }
 
 TEST(TempNoRedoUndoSidecarLoadTest, RejectsParserBoundaryCorruption) {
@@ -9927,6 +9931,7 @@ TEST_F(TempFilAdoptionTest, EncryptedSpaceFlagRejectsAdoption) {
   EXPECT_EQ(nullptr, fil_space_get(space_id));
 }
 
+#ifndef NDEBUG
 TEST_F(TempFilAdoptionTest, BindDictIndexesToAdoptedPhysicalImage) {
   PreserveTrxTempTableEnableGuard enable_guard(true);
   const uint32_t space_id = source_space_id();
@@ -10009,6 +10014,7 @@ TEST_F(TempFilAdoptionTest, BindDictIndexesToAdoptedPhysicalImage) {
             trx_preserve_temp_space_image_drop_preserved_fil_space(
                 &descriptor));
 }
+#endif
 
 TEST_F(TempFilAdoptionTest, BindDictRejectsMismatchedSourceSpaceId) {
   PreserveTrxTempTableEnableGuard enable_guard(true);
@@ -10087,6 +10093,7 @@ TEST_F(TempFilAdoptionTest, BindDictRejectsSecondaryBeforePrimary) {
             trx_preserve_temp_space_image_bound_dict_index_count(descriptor));
 }
 
+#ifndef NDEBUG
 TEST_F(TempFilAdoptionTest, BindDictAllowsSameLogicalTempNameForDifferentSpaces) {
   PreserveTrxTempTableEnableGuard enable_guard(true);
   const uint32_t first_space_id = source_space_id();
@@ -10133,7 +10140,9 @@ TEST_F(TempFilAdoptionTest, BindDictAllowsSameLogicalTempNameForDifferentSpaces)
             trx_preserve_temp_space_image_drop_preserved_fil_space(
                 &second_descriptor));
 }
+#endif
 
+#ifndef NDEBUG
 TEST_F(TempFilAdoptionTest, BindDictAllowsMultipleTempTablesInOneSourceSpace) {
   PreserveTrxTempTableEnableGuard enable_guard(true);
   const uint32_t space_id = source_space_id();
@@ -10187,7 +10196,9 @@ TEST_F(TempFilAdoptionTest, BindDictAllowsMultipleTempTablesInOneSourceSpace) {
             trx_preserve_temp_space_image_drop_preserved_fil_space(
                 &descriptor));
 }
+#endif
 
+#ifndef NDEBUG
 TEST_F(TempFilAdoptionTest,
        BindDictRejectsDuplicateRootPageInOneSourceSpace) {
   PreserveTrxTempTableEnableGuard enable_guard(true);
@@ -10225,7 +10236,9 @@ TEST_F(TempFilAdoptionTest,
             trx_preserve_temp_space_image_drop_preserved_fil_space(
                 &descriptor));
 }
+#endif
 
+#ifndef NDEBUG
 TEST_F(TempFilAdoptionTest,
        BindDictRejectsDuplicateRootPageInsideOneTableBinding) {
   PreserveTrxTempTableEnableGuard enable_guard(true);
@@ -10248,7 +10261,9 @@ TEST_F(TempFilAdoptionTest,
             trx_preserve_temp_space_image_drop_preserved_fil_space(
                 &descriptor));
 }
+#endif
 
+#ifndef NDEBUG
 TEST_F(TempFilAdoptionTest,
        BindDictRejectsDuplicateLogicalNameInOneSourceSpace) {
   PreserveTrxTempTableEnableGuard enable_guard(true);
@@ -10287,7 +10302,9 @@ TEST_F(TempFilAdoptionTest,
             trx_preserve_temp_space_image_drop_preserved_fil_space(
                 &descriptor));
 }
+#endif
 
+#ifndef NDEBUG
 TEST_F(TempFilAdoptionTest, BindDictRejectsDuplicateImageTableIdWithoutCrash) {
   PreserveTrxTempTableEnableGuard enable_guard(true);
   const uint32_t first_space_id = source_space_id();
@@ -10329,6 +10346,7 @@ TEST_F(TempFilAdoptionTest, BindDictRejectsDuplicateImageTableIdWithoutCrash) {
             trx_preserve_temp_space_image_drop_preserved_fil_space(
                 &first_descriptor));
 }
+#endif
 
 TEST_F(TempFilAdoptionTest, BindDictRejectsDuplicateIndexId) {
   PreserveTrxTempTableEnableGuard enable_guard(true);
@@ -10437,6 +10455,7 @@ TEST_F(TempFilAdoptionTest, BindDictNoopsWhenFeatureDisabled) {
             trx_preserve_temp_space_image_bound_dict_index_count(descriptor));
 }
 
+#ifndef NDEBUG
 TEST_F(TempFilAdoptionTest, DropAfterBindRemovesBoundDictTable) {
   PreserveTrxTempTableEnableGuard enable_guard(true);
   const uint32_t space_id = source_space_id();
@@ -10461,6 +10480,7 @@ TEST_F(TempFilAdoptionTest, DropAfterBindRemovesBoundDictTable) {
   EXPECT_EQ(0U,
             trx_preserve_temp_space_image_bound_dict_index_count(descriptor));
 }
+#endif
 
 TEST_F(TempFilAdoptionTest, DoesNotJoinNormalTempPool) {
   PreserveTrxTempTableEnableGuard enable_guard(true);
@@ -10659,6 +10679,7 @@ TEST_F(TempFilAdoptionTest, AttachFailureKeepsRecoveredSpaceRetryable) {
       descriptor));
 }
 
+#ifndef NDEBUG
 TEST_F(TempFilAdoptionTest,
        ReleaseForRetryEvictsPagesKeepsSidecarAndSpaceIdReserved) {
   PreserveTrxTempTableEnableGuard enable_guard(true);
@@ -10703,7 +10724,9 @@ TEST_F(TempFilAdoptionTest,
             trx_preserve_temp_space_image_drop_preserved_fil_space(
                 &descriptor));
 }
+#endif
 
+#ifndef NDEBUG
 TEST_F(TempFilAdoptionTest,
        ReleaseForRetryBlocksTempPoolReuseUntilTokenCleanup) {
   PreserveTrxTempTableEnableGuard enable_guard(true);
@@ -10731,7 +10754,9 @@ TEST_F(TempFilAdoptionTest,
             trx_preserve_temp_space_image_drop_preserved_fil_space(
                 &descriptor));
 }
+#endif
 
+#ifndef NDEBUG
 TEST_F(TempFilAdoptionTest, ReleaseForRetryCleansAttachedOwnedDescriptor) {
   PreserveTrxTempTableEnableGuard enable_guard(true);
   const uint32_t space_id = source_space_id();
@@ -10769,7 +10794,9 @@ TEST_F(TempFilAdoptionTest, ReleaseForRetryCleansAttachedOwnedDescriptor) {
             trx_preserve_temp_space_image_drop_preserved_fil_space(
                 &retry_descriptor));
 }
+#endif
 
+#ifndef NDEBUG
 TEST_F(TempFilAdoptionTest, DropEvictsBufferPoolPagesBeforeDeletingSidecar) {
   PreserveTrxTempTableEnableGuard enable_guard(true);
   const uint32_t space_id = source_space_id();
@@ -10807,7 +10834,9 @@ TEST_F(TempFilAdoptionTest, DropEvictsBufferPoolPagesBeforeDeletingSidecar) {
   EXPECT_FALSE(exists(undo_path));
   EXPECT_EQ(space_id, ibt::allocate_temp_tablespace_object_for_test());
 }
+#endif
 
+#ifndef NDEBUG
 TEST_F(TempFilAdoptionTest, DropCleansReservationWhenFilDetachFailsAfterDelete) {
   PRESERVE_TRX_TEMP_SKIP_IF_NDEBUG();
   PreserveTrxTempTableEnableGuard enable_guard(true);
@@ -10832,7 +10861,9 @@ TEST_F(TempFilAdoptionTest, DropCleansReservationWhenFilDetachFailsAfterDelete) 
   EXPECT_FALSE(trx_preserve_temp_space_image_fil_space_adopted(descriptor));
   EXPECT_EQ(space_id, ibt::allocate_temp_tablespace_object_for_test());
 }
+#endif
 
+#ifndef NDEBUG
 TEST_F(TempFilAdoptionTest, DropFailsClosedWhenFilSystemIsUnavailable) {
   PreserveTrxTempTableEnableGuard enable_guard(true);
   const uint32_t space_id = source_space_id();
@@ -10855,7 +10886,9 @@ TEST_F(TempFilAdoptionTest, DropFailsClosedWhenFilSystemIsUnavailable) {
   EXPECT_TRUE(trx_preserve_temp_space_image_fil_space_adopted(descriptor));
   EXPECT_TRUE(ibt::is_preserved_space_id_reserved(space_id));
 }
+#endif
 
+#ifndef NDEBUG
 TEST_F(TempFilAdoptionTest, DropKeepsReservationWhenPhysicalDeleteFails) {
   PRESERVE_TRX_TEMP_SKIP_IF_NDEBUG();
   PreserveTrxTempTableEnableGuard enable_guard(true);
@@ -10885,6 +10918,7 @@ TEST_F(TempFilAdoptionTest, DropKeepsReservationWhenPhysicalDeleteFails) {
   EXPECT_FALSE(trx_preserve_temp_space_image_fil_space_adopted(descriptor));
   EXPECT_FALSE(ibt::is_preserved_space_id_reserved(space_id));
 }
+#endif
 
 class PreserveTrxTempTableManifestValidationTest
     : public PreserveTrxTempTableCarrierTest,
@@ -11257,7 +11291,7 @@ TEST_F(TempPhysicalTlvTest,
   std::string page31;
   const trx_preserve_temp_no_redo_undo_page_image *image31 = nullptr;
   for (size_t i = 0;
-       i < trx_preserve_temp_space_image_no_redo_undo_page_count(descriptor);
+       i < descriptor.no_redo_undo_pages.size();
        ++i) {
     const trx_preserve_temp_no_redo_undo_page_image *image =
         trx_preserve_temp_space_image_no_redo_undo_page_at(descriptor, i);

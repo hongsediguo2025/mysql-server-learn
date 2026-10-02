@@ -45,6 +45,7 @@ The tablespace memory cache */
 #include "fsp0space.h"
 #include "fsp0sysspace.h"
 #include "ha_prototypes.h"
+#include "scope_guard.h"
 #include "hash0hash.h"
 #include "log0recv.h"
 #include "mach0data.h"
@@ -84,7 +85,9 @@ The tablespace memory cache */
 #include <limits>
 #include <list>
 #include <mutex>
+#include <new>
 #include <thread>
+#include <type_traits>
 #include <tuple>
 #include <unordered_map>
 #include <vector>
@@ -914,7 +917,7 @@ class Fil_shard {
 
   /** Map the space ID and name to the tablespace instance.
   @param[in]	space		Tablespace instance */
-  void space_add(fil_space_t *space);
+  void space_add(fil_space_t *space, bool preserve_import = false);
 
   /** Prepare to free a file. Remove from the unflushed list
   if there are no pending flushes.
@@ -1057,7 +1060,8 @@ class Fil_shard {
   @return pointer to created tablespace, to be filled in with fil_node_create()
   @retval nullptr on failure (such as when the same tablespace exists) */
   fil_space_t *space_create(const char *name, space_id_t space_id,
-                            uint32_t flags, fil_type_t purpose)
+                            uint32_t flags, fil_type_t purpose,
+                            bool preserve_import = false)
       MY_ATTRIBUTE((warn_unused_result));
 
   /** Adjust temporary auto-generated names created during
@@ -2066,7 +2070,7 @@ void Fil_shard::release_open_slot(size_t shard_id) {
 
 /** Map the space ID and name to the tablespace instance.
 @param[in]	space		Tablespace instance */
-void Fil_shard::space_add(fil_space_t *space) {
+void Fil_shard::space_add(fil_space_t *space, bool preserve_import) {
   ut_ad(mutex_owned());
 
   {
@@ -2075,6 +2079,9 @@ void Fil_shard::space_add(fil_space_t *space) {
     ut_a(it.second);
   }
 
+  if (preserve_import) {
+    DBUG_EXECUTE_IF("fil_preserve_temp_space_name_oom", throw std::bad_alloc(););
+  }
   {
     auto name = space->name;
 
@@ -3268,6 +3275,9 @@ dberr_t fil_preserve_temp_space_adopt(space_id_t space_id, const char *name,
   }
   if (fil_system == nullptr) return DB_ERROR;
 
+  ut_ad(fsp_flags_is_valid(flags));
+  ut_ad(srv_page_size == UNIV_PAGE_SIZE_ORIG || flags != 0);
+
   if (fil_space_get(space_id) != nullptr) return DB_TABLESPACE_EXISTS;
 
   std::vector<byte> page_storage(UNIV_PAGE_SIZE);
@@ -3291,23 +3301,47 @@ dberr_t fil_preserve_temp_space_adopt(space_id_t space_id, const char *name,
     return DB_CORRUPTION;
   }
 
-  fil_space_t *space =
-      fil_space_create(name, space_id, flags, FIL_TYPE_TEMPORARY);
+  fil_space_t *space = nullptr;
+  try {
+    fil_system->mutex_acquire_all();
+    const auto unlock = create_scope_guard([]() { fil_system->mutex_release_all(); });
+    DBUG_EXECUTE_IF("fil_space_create_failure", return DB_ERROR;);
+    space = fil_system->shard_by_id(space_id)->space_create(
+        name, space_id, flags, FIL_TYPE_TEMPORARY, true);
+  } catch (const std::bad_alloc &) {
+    return DB_OUT_OF_MEMORY;
+  }
   if (space == nullptr) return DB_ERROR;
 
+  const auto forget = create_scope_guard([&]() {
+    if (space != nullptr) ut_a(fil_space_free(space_id, false));
+  });
+  try {
+    // create_node appends while holding its shard mutex. Reserve its sole
+    // slot here so a vector allocation cannot unwind that native lock.
+    auto shard = fil_system->shard_by_id(space_id);
+    shard->mutex_acquire();
+    const auto unlock = create_scope_guard([&]() { shard->mutex_release(); });
+    DBUG_EXECUTE_IF("fil_preserve_temp_files_reserve_oom", throw std::bad_alloc(););
+    space->files.reserve(1);
+    static_assert(std::is_nothrow_copy_constructible<fil_node_t>::value,
+                  "Reserved file insertion must not throw");
+  } catch (const std::bad_alloc &) {
+    return DB_OUT_OF_MEMORY;
+  }
+
   DBUG_EXECUTE_IF("fil_preserve_temp_space_node_create_failure", {
-    fil_space_free(space_id, false);
     return DB_ERROR;
   });
 
   if (fil_node_create(path, size, space, false, false) == nullptr) {
-    fil_space_free(space_id, false);
     return DB_ERROR;
   }
   space->size_in_header = size_in_header;
   space->free_limit = free_limit;
   space->free_len = static_cast<uint32_t>(free_len);
 
+  space = nullptr;  // Native fil cache owns the completed attachment.
   return DB_SUCCESS;
 }
 
@@ -3343,7 +3377,8 @@ Error messages are issued to the server log.
 @return pointer to created tablespace, to be filled in with fil_node_create()
 @retval nullptr on failure (such as when the same tablespace exists) */
 fil_space_t *Fil_shard::space_create(const char *name, space_id_t space_id,
-                                     uint32_t flags, fil_type_t purpose) {
+                                     uint32_t flags, fil_type_t purpose,
+                                     bool preserve_import) {
   ut_ad(mutex_owned());
 
   /* Look for a matching tablespace. */
@@ -3409,7 +3444,23 @@ fil_space_t *Fil_shard::space_create(const char *name, space_id_t space_id,
   }
 #endif /* !UNIV_HOTBACKUP */
 
-  space_add(space);
+  if (preserve_import) {
+    ut_a(purpose == FIL_TYPE_TEMPORARY);
+    try {
+      space_add(space, true);
+    } catch (const std::bad_alloc &) {
+      // Both shard maps still have exclusive ownership. Undo a partial
+      // insertion before the dedicated caller releases their mutexes.
+      auto id = m_spaces.find(space_id);
+      if (id != m_spaces.end() && id->second == space) m_spaces.erase(id);
+      auto name = m_names.find(space->name);
+      if (name != m_names.end() && name->second == space) m_names.erase(name);
+      space_free_low(space);
+      throw;
+    }
+  } else {
+    space_add(space);
+  }
 
   return (space);
 }

@@ -1,0 +1,4 @@
+--source include/not_windows.inc
+--source include/have_debug.inc
+--let $cursor_port= `SELECT @@port`
+--exec python3 $MYSQL_TEST_DIR/../scripts/preserve_trx_cursor_attach_e2e.py --port=$cursor_port

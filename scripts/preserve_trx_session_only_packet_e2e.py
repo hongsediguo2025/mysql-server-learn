@@ -43,7 +43,7 @@ def string_encoded(data, pos=0):
 class Client:
     """Only the uncompressed protocol subset needed by this local test."""
 
-    def __init__(self, port, user="root", password=""):
+    def __init__(self, port, user="root", password="", extra_capabilities=0):
         self.sock = socket.create_connection(("127.0.0.1", port), timeout=30)
         self.sock.settimeout(60)
         _, greeting = self.packet()
@@ -55,6 +55,7 @@ class Client:
         pos += 11
         salt += greeting[pos:pos + max(13, auth_len - 8)].rstrip(b"\0")
         caps = 0x1 | 0x4 | 0x200 | 0x2000 | 0x8000 | 0x20000 | 0x80000
+        caps |= extra_capabilities
         auth = self.auth(password, salt)
         payload = struct.pack("<IIB23x", caps, 16 * 1024 * 1024, 45)
         payload += user.encode() + b"\0" + bytes([len(auth)]) + auth

@@ -26,7 +26,9 @@ this program; if not, write to the Free Software Foundation, Inc.,
 
 #ifndef srv0tmp_h
 #define srv0tmp_h
+#include <atomic>
 #include "srv0srv.h"
+class trx_preserve_temp_pool_lease;
 namespace ibt {
 
 /** Purpose for using tablespace */
@@ -53,6 +55,14 @@ reservation for the caller.
 @param[out] created true if this call created the reservation
 @return true if the id is now reserved */
 bool reserve_or_keep_preserved_space_id(space_id_t space_id, bool *created);
+
+/** Allocate and reserve a new id for an online preserved temporary space.
+The caller must keep the initialized pool alive for the duration of the call.
+The reservation transfers to non-pool adoption or is explicitly released; its
+release never rewinds the native allocation watermark.
+@param[out] space_id allocated id, unchanged on failure
+@return DB_SUCCESS, DB_NO_SESSION_TEMP, DB_OUT_OF_MEMORY, or DB_ERROR */
+dberr_t allocate_preserved_space_id(space_id_t *space_id);
 
 /** Release a preserved session temporary tablespace id reservation.
 @param[in] space_id session temporary tablespace id to release
@@ -129,6 +139,13 @@ class Tablespace {
   std::string path() const;
 
  private:
+  friend class ::trx_preserve_temp_pool_lease;
+  friend class Tablespace_pool;
+  /** Updates and pending return are serialized by the pool mutex. The atomic
+  count provides the zero-borrow fast path in native free_tmp(). */
+  std::atomic<uint32_t> m_preserve_capture_readers{0};
+  bool m_preserve_return_pending{false};
+
   /** Allocate the next unreserved session temporary tablespace id. */
   static space_id_t next_space_id();
 
@@ -145,6 +162,8 @@ class Tablespace {
   /** Next available space_id for tablespace. These are
   hardcoded space_ids at higher range */
   static space_id_t m_last_used_space_id;
+
+  friend dberr_t allocate_preserved_space_id(space_id_t *space_id);
 
   friend bool reserve_preserved_space_id(space_id_t space_id);
 
@@ -215,6 +234,9 @@ class Tablespace_pool {
   }
 
  private:
+  friend class ::trx_preserve_temp_pool_lease;
+  friend dberr_t allocate_preserved_space_id(space_id_t *space_id);
+
   /** Acquire the mutex. It is used for all
   operations on the pool */
   void acquire() { mutex_enter(&m_mutex); }

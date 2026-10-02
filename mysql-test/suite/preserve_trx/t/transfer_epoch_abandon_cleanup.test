@@ -1,0 +1,9 @@
+--source include/not_windows.inc
+--source include/force_restart.inc
+--disable_query_log
+--let $saved_enable= `SELECT @@global.rds_preserve_trx_enable`
+SET GLOBAL rds_preserve_trx_enable=ON;
+--let $abandon_port= `SELECT @@port`
+--exec python3 $MYSQL_TEST_DIR/../scripts/preserve_trx_epoch_abandon_e2e.py --port=$abandon_port --report=$MYSQLTEST_VARDIR/log/epoch-abandon-cleanup.json
+--eval SET GLOBAL rds_preserve_trx_enable=$saved_enable
+--enable_query_log

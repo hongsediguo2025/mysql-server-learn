@@ -1,0 +1,2 @@
+--let $contract_continuous_capture= 1
+--source suite/preserve_trx/t/temp_capture_worker.test

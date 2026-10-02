@@ -1,0 +1,5 @@
+--let $capture_case= import probe allocation failure cleans sealed source artifacts
+--let $capture_trace_name= temp_import_probe_allocation_failure.trace
+--let $capture_fault= preserve_temp_import_plan_probe,preserve_temp_import_probe_bad_alloc
+--let $capture_trace_pattern= temporary import probe allocation fault
+--source suite/preserve_trx/include/temp_table_capture_undo_failure.inc

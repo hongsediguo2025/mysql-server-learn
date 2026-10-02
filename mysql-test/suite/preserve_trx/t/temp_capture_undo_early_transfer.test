@@ -1,0 +1,5 @@
+--let $contract_continuous_capture= 1
+--let $contract_large_undo= 1
+--let $contract_independent_undo= 1
+--let $contract_expect_early_undo= 1
+--source suite/preserve_trx/t/temp_capture_worker.test

@@ -1,0 +1,5 @@
+# Keep the default READY deadline and full two-copy image workload, but
+# run this bounded-time functional check outside the parallel MTR phase.
+--source include/not_parallel.inc
+--let $contract_early_results= supersede
+--source suite/preserve_trx/t/temp_capture_continuous.test

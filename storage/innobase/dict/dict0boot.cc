@@ -43,6 +43,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "os0file.h"
 #include "srv0srv.h"
 #include "trx0trx.h"
+#include "trx0temp_preserve_id.h"
 
 /** Gets a pointer to the dictionary header and x-latches its page.
  @return pointer to the dictionary header, page x-latched */
@@ -116,7 +117,9 @@ void dict_hdr_get_new_id(table_id_t *table_id, space_index_t *index_id,
     /* This means we are running out of table_ids and
     entering into reserved range of table_ids for SDI
     tables */
-    if (id >= dict_sdi_get_table_id(0)) {
+    if (id >= dict_sdi_get_table_id(0) ||
+        (preserve_trx_temp_id_namespace &&
+         id >= TRX_PRESERVE_TEMP_TABLE_ID_BEGIN)) {
       ib::fatal(ER_IB_MSG_160) << "InnoDB is running out of table_ids"
                                << " Please dump and reload the database";
     }
@@ -212,6 +215,16 @@ dberr_t dict_boot(void) {
 
   /* Get the dictionary header */
   dict_hdr = dict_hdr_get(&mtr);
+
+  err = trx_preserve_temp_id_check_boot(
+      mach_read_from_8(dict_hdr + DICT_HDR_TABLE_ID),
+      srv_is_upgrade_mode ? DICT_MAX_DD_TABLES : 0);
+  if (err != DB_SUCCESS) {
+    mtr_commit(&mtr);
+    ib::error() << "Persistent table ID watermark overlaps the configured "
+                  "temporary table ID namespace";
+    return err;
+  }
 
   /* Because we only write new row ids to disk-based data structure
   (dictionary header) when it is divisible by

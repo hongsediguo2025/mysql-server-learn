@@ -109,8 +109,10 @@
 #include "sql/psi_memory_key.h"
 #include "sql/preserve_trx.h"
 #include "sql/preserve_trx_resource.h"
+#include "sql/preserve_trx_cursor.h"
 #include "sql/preserve_trx_promotion.h"
 #include "sql/preserve_trx_transfer.h"
+#include "storage/innobase/include/trx0temp_preserve_undo_scan.h"
 #include "sql/query_options.h"
 #include "sql/rpl_group_replication.h"  // is_group_replication_running
 #include "sql/rpl_info_factory.h"       // Rpl_info_factory
@@ -1029,6 +1031,11 @@ static Sys_var_bool Sys_partial_revokes(
     ON_CHECK(check_partial_revokes), ON_UPDATE(partial_revokes_update), nullptr,
     sys_var::PARSE_EARLY);
 
+static bool preserve_trx_temp_table_update(sys_var *, THD *, enum_var_type) {
+  trx_preserve_temp_undo_invalidate_watches();
+  return false;
+}
+
 static Sys_var_bool Sys_preserve_trx_temp_table_enable(
     "rds_preserve_trx_temp_table_enable",
     "Enable constrained user InnoDB temporary table preserve/resume support. "
@@ -1036,7 +1043,37 @@ static Sys_var_bool Sys_preserve_trx_temp_table_enable(
     "sidecars; DDL, unsupported metadata, savepoint and statement-rollback "
     "boundaries remain fail-closed before durable token creation.",
     GLOBAL_VAR(preserve_trx_temp_table_enable), CMD_LINE(OPT_ARG),
-    DEFAULT(true), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+    DEFAULT(true), NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(nullptr),
+    ON_UPDATE(preserve_trx_temp_table_update));
+
+static Sys_var_bool Sys_preserve_trx_temp_id_namespace(
+    "rds_preserve_trx_temp_id_namespace",
+    "Use process-local temporary table/index IDs and restrict persistent "
+    "table IDs to the low half of their range. Requires compatible physical "
+    "writers; remains active even when Preserve is disabled.",
+    READ_ONLY GLOBAL_VAR(preserve_trx_temp_id_namespace), CMD_LINE(OPT_ARG),
+    DEFAULT(false), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_bool Sys_preserve_trx_result_capture_enable(
+    "rds_preserve_trx_result_capture_enable",
+    "Capture materialized Classic cursor results at creation in standby "
+    "transfer mode. Does not by itself enable cursor transfer or RESUME.",
+    READ_ONLY GLOBAL_VAR(preserve_trx_result_capture_enable), CMD_LINE(OPT_ARG),
+    DEFAULT(false), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_ulonglong Sys_preserve_trx_result_capture_max_bytes(
+    "rds_preserve_trx_result_capture_max_bytes",
+    "Maximum bytes held by live cursor result capture files on this server.",
+    READ_ONLY GLOBAL_VAR(preserve_trx_result_capture_max_bytes),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(4096, LLONG_MAX), DEFAULT(1073741824),
+    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_result_capture_max_count(
+    "rds_preserve_trx_result_capture_max_count",
+    "Maximum simultaneously owned cursor result capture files.",
+    READ_ONLY GLOBAL_VAR(preserve_trx_result_capture_max_count),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, UINT_MAX32), DEFAULT(256),
+    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
 
 static Sys_var_ulonglong Sys_preserve_trx_memory_budget_bytes(
     "rds_preserve_trx_memory_budget_bytes",

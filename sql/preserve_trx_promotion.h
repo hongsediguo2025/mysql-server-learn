@@ -43,6 +43,8 @@ extern const uint preserve_trx_promotion_gate_timeout_ms;
 extern const ulonglong preserve_trx_promotion_ready_cache_max_bytes;
 
 bool preserved_trx_promotion_start_gate_workers();
+/** Internal observation only; does not enter or advance a promotion stage. */
+bool preserved_trx_physical_promotion_in_progress();
 void preserved_trx_promotion_shutdown_gate_workers();
 uint64_t preserve_trx_promotion_gate_worker_count_status();
 uint64_t preserve_trx_promotion_gate_worker_active_count_status();
@@ -66,7 +68,6 @@ uint64_t preserve_trx_promotion_prewarm_record_lock_page_count_status();
 uint64_t preserve_trx_promotion_prewarm_record_lock_resident_pages_status();
 uint64_t preserve_trx_promotion_prewarm_record_lock_cold_page_gets_status();
 uint64_t preserve_trx_promotion_ready_cache_bytes_status();
-uint64_t preserve_trx_promotion_ready_cache_evictions_status();
 
 void preserved_trx_promotion_ready_cache_purge_epoch(
     const std::string &preserve_dir, const std::string &epoch_id);
@@ -182,11 +183,13 @@ preserved_trx_promotion_prewarm_standby_pending_token(
     const std::string &preserve_dir, const std::string &epoch_id,
     uint64_t token, uint64_t required_apply_lsn);
 
+class Preserve_trx_temp_receiver_work;
 Preserve_trx_promotion_adopt_status
 preserved_trx_promotion_prewarm_staged_bundle_for_receiver(
     const std::string &preserve_dir, const std::string &epoch_id,
     uint64_t token, uint64_t required_apply_lsn,
-    const Preserved_trx_bundle &bundle);
+    const Preserved_trx_bundle &bundle,
+    const Preserve_trx_temp_receiver_work *temp_ready = nullptr);
 
 Preserve_trx_promotion_adopt_status
 preserved_trx_promotion_prewarm_staged_bundle_with_record_lock_proof_for_receiver(
@@ -195,7 +198,8 @@ preserved_trx_promotion_prewarm_staged_bundle_with_record_lock_proof_for_receive
     const Preserved_trx_bundle &bundle, uint64_t record_lock_page_count,
     uint64_t record_lock_resident_pages, uint64_t record_lock_cold_gets,
     uint64_t record_lock_bitmap_pages, uint64_t record_lock_bitmap_bits,
-    bool metadata_only);
+    bool metadata_only,
+    const Preserve_trx_temp_receiver_work *temp_ready = nullptr);
 
 Preserve_trx_promotion_adopt_status
 preserved_trx_promotion_bind_prewarmed_epoch_for_receiver(

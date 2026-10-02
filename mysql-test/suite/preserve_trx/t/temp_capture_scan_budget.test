@@ -1,0 +1,5 @@
+--let $capture_case= temporary image capture fits a 512KiB memory budget
+--let $capture_trace_name= temp_capture_scan_budget.trace
+--let $capture_fault= preserve_temp_capture_scan_probe,preserve_trx_fail_before_snapshot_fsync
+--let $capture_trace_pattern= temporary capture scan checked copy=1 overlay=1
+--source suite/preserve_trx/include/temp_table_capture_undo_failure.inc

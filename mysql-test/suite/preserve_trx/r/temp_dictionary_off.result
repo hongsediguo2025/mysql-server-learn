@@ -1,0 +1,13 @@
+SELECT @@global.rds_preserve_trx_enable AS preserve_enabled;
+preserve_enabled
+0
+SELECT COUNT(*)=32 AND SUM(v)=5280 AS persistent_ok FROM t_dictionary_off;
+persistent_ok
+1
+SELECT COUNT(*)=32 AND SUM(n)=5280 AS temporary_ok FROM tmp_dictionary_off;
+temporary_ok
+1
+SELECT COUNT(*)=0 AS rejected_table_absent FROM information_schema.tables
+WHERE table_schema=DATABASE() AND table_name='t_dictionary_too_big';
+rejected_table_absent
+1

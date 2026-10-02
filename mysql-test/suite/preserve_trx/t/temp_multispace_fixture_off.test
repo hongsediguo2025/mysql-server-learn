@@ -1,0 +1,47 @@
+--source include/have_debug.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+--echo # Preserve OFF keeps the two-space fixture on the native single-space path
+--disable_query_log
+--let $preserve_off= `SELECT NOT @@global.rds_preserve_trx_enable AND NOT @@global.rds_preserve_trx_temp_table_enable`
+if (!$preserve_off)
+{
+  --die fixture requires Preserve OFF at server startup
+}
+--connect(space_off,localhost,root,,test)
+--let $space_app_id= `SELECT CONNECTION_ID()`
+CREATE TEMPORARY TABLE tmp_space_off_a(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+SET SESSION debug='+d,preserve_temp_second_space_probe';
+CREATE TEMPORARY TABLE tmp_space_off_b(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+SET SESSION debug='-d,preserve_temp_second_space_probe';
+--let $native_space= `SELECT COUNT(*)=2 AND COUNT(DISTINCT t.SPACE)=1 FROM information_schema.INNODB_TEMP_TABLE_INFO t JOIN information_schema.INNODB_SESSION_TEMP_TABLESPACES s ON t.SPACE=s.SPACE WHERE s.ID=CONNECTION_ID()`
+if (!$native_space)
+{
+  --die Preserve OFF changed native temporary-space allocation
+}
+INSERT INTO tmp_space_off_a VALUES(1,10),(2,20),(3,30);
+INSERT INTO tmp_space_off_b SELECT * FROM tmp_space_off_a;
+START TRANSACTION;
+UPDATE tmp_space_off_a SET v=v+100;
+DELETE FROM tmp_space_off_b WHERE id=2;
+INSERT INTO tmp_space_off_b VALUES(4,40);
+ROLLBACK;
+--let $rows_ok= `SELECT COUNT(*)=3 AND SUM(v)=60 FROM tmp_space_off_a`
+if (!$rows_ok)
+{
+  --die first native table rollback failed
+}
+--let $rows_ok= `SELECT COUNT(*)=3 AND SUM(v)=60 FROM tmp_space_off_b`
+if (!$rows_ok)
+{
+  --die second native table rollback failed
+}
+DROP TEMPORARY TABLE tmp_space_off_a, tmp_space_off_b;
+--disconnect space_off
+--connection default
+--let $wait_timeout= 10
+--let $wait_condition= SELECT COUNT(*)=0 FROM information_schema.INNODB_SESSION_TEMP_TABLESPACES WHERE ID=$space_app_id
+--source include/wait_condition.inc
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+--enable_query_log
+--echo # Native allocation, rollback and session pool release verified

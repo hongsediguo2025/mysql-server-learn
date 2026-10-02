@@ -22,6 +22,9 @@
    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
 
 #include "sql/preserve_trx_resource.h"
+#include <openssl/sha.h>
+#include "storage/innobase/include/trx0temp_preserve_undo_scan.h"
+#include "storage/innobase/include/trx0temp_preserve_undo_capture.h"
 
 #include <algorithm>
 #include <array>
@@ -30,8 +33,10 @@
 #include <map>
 #include <mutex>
 #include <utility>
+#include <vector>
 
 #ifndef _WIN32
+#include <sys/stat.h>
 #include <sys/statvfs.h>
 #endif
 
@@ -41,6 +46,10 @@
 #include "scope_guard.h"
 #include "sql/preserve_trx.h"
 #include "sql/preserve_trx_lock_warmcopy.h"
+#include "sql/preserve_trx_temp_gc.h"
+#include "sql/preserve_trx_temp_pretransfer.h"
+#include "sql/preserve_trx_temp_delta.h"
+#include "sql/preserve_trx_temp_undo_prebuild.h"
 #include "sql/mysqld.h"
 #include "sql/preserve_trx_promotion.h"
 #include "sql/preserve_trx_promotion_prepared.h"
@@ -81,15 +90,54 @@ struct Token_kind_key {
   }
 };
 
+struct Token_kind_view {
+  const std::string &token;
+  Preserve_trx_memory_kind kind;
+};
+
+struct Token_kind_less {
+  using is_transparent = void;
+  template <typename A, typename B>
+  bool operator()(const A &a, const B &b) const {
+    if (a.token != b.token) return a.token < b.token;
+    return static_cast<int>(a.kind) < static_cast<int>(b.kind);
+  }
+};
+
+struct Filesystem_limits {
+  uint64_t id{0};
+  uint64_t free_bytes{0};
+};
+
+bool disk_admits(uint64_t available, uint64_t pending, uint64_t requested) {
+  const auto headroom = std::max<uint64_t>(1ULL << 30, available / 10);
+  return pending <= available && requested <= available - pending &&
+         headroom <= available - pending - requested;
+}
+
+bool fd_admits(const Preserve_trx_external_resource_limits &limits,
+               uint64_t pending, uint64_t requested) {
+  const auto headroom = std::max<uint64_t>(64, limits.open_files_limit / 10);
+  return limits.snapshots_available &&
+         limits.current_open_files <= limits.open_files_limit &&
+         pending <= limits.open_files_limit - limits.current_open_files &&
+         requested <= limits.open_files_limit - limits.current_open_files - pending &&
+         headroom <= limits.open_files_limit - limits.current_open_files - pending - requested;
+}
+
 bool preserve_trx_capture_external_resource_limits(
-    Preserve_trx_external_resource_limits *limits) {
+    const char *directory, Preserve_trx_external_resource_limits *limits,
+    Filesystem_limits *device) {
   if (limits == nullptr || open_files_limit == 0) return false;
 #ifdef _WIN32
+  (void)directory;
+  (void)device;
   return false;
 #else
   struct statvfs filesystem{};
-  const char *const tmpdir = mysql_tmpdir;
-  if (tmpdir == nullptr || statvfs(tmpdir, &filesystem) != 0 ||
+  struct stat path_stat{};
+  if (directory == nullptr || stat(directory, &path_stat) != 0 ||
+      !S_ISDIR(path_stat.st_mode) || statvfs(directory, &filesystem) != 0 ||
       filesystem.f_frsize == 0 ||
       filesystem.f_bavail >
           std::numeric_limits<uint64_t>::max() / filesystem.f_frsize) {
@@ -101,6 +149,22 @@ bool preserve_trx_capture_external_resource_limits(
   limits->tmpdir_free_bytes =
       static_cast<uint64_t>(filesystem.f_bavail) * filesystem.f_frsize;
   limits->snapshots_available = true;
+  device->id = static_cast<uint64_t>(path_stat.st_dev);
+  device->free_bytes = limits->tmpdir_free_bytes;
+  DBUG_EXECUTE_IF("preserve_temp_file_budget_small_disk", {
+    device->free_bytes = limits->tmpdir_free_bytes = (1ULL << 30) + 16384;
+  });
+  DBUG_EXECUTE_IF("preserve_temp_file_budget_no_disk", {
+    device->free_bytes = limits->tmpdir_free_bytes = (1ULL << 30) - 1;
+  });
+  DBUG_EXECUTE_IF("preserve_temp_file_budget_no_fd", {
+    limits->current_open_files = limits->open_files_limit;
+  });
+  DBUG_EXECUTE_IF("preserve_temp_file_budget_two_fds", {
+    const auto headroom = std::max<uint64_t>(64, limits->open_files_limit / 10);
+    if (limits->open_files_limit > headroom + 2)
+      limits->current_open_files = limits->open_files_limit - headroom - 2;
+  });
   return true;
 #endif
 }
@@ -126,36 +190,126 @@ class Preserve_resource_manager {
        reduce that ledger between an old free-space sample and admission. */
     std::lock_guard<std::mutex> guard(m_mutex);
     Preserve_trx_external_resource_limits limits;
+    std::vector<Filesystem_limits> filesystems;
 #ifndef NDEBUG
     if (m_external_limits_override) {
       limits = m_external_limits;
-      return acquire_native_binlog_locked(token, memory_bytes, fd_count,
-                                          tmpdir_bytes, limits, growing);
-    }
+      filesystems.push_back({0, limits.tmpdir_free_bytes});
+    } else
 #endif
     if (fd_count != 0 || tmpdir_bytes != 0) {
-      if (!preserve_trx_capture_external_resource_limits(&limits)) return false;
-    } else {
-      DBUG_EXECUTE_IF("preserve_trx_native_binlog_resource_trace", {
-        preserve_trx_capture_external_resource_limits(&limits);
-      });
+      // Native statement and transaction caches choose tmpdir independently.
+      // Reserve against every possible filesystem without advancing rotation.
+      if (mysql_tmpdir_list.list == nullptr) return false;
+      for (uint n = 0; n <= mysql_tmpdir_list.max; ++n) {
+        Filesystem_limits fs;
+        Preserve_trx_external_resource_limits sample;
+        if (!preserve_trx_capture_external_resource_limits(
+                mysql_tmpdir_list.list[n], &sample, &fs)) return false;
+        auto existing = std::find_if(filesystems.begin(), filesystems.end(),
+            [&](const Filesystem_limits &item) { return item.id == fs.id; });
+        if (existing == filesystems.end()) filesystems.push_back(fs);
+        else existing->free_bytes = std::min(existing->free_bytes, fs.free_bytes);
+        if (!limits.snapshots_available) limits = sample;
+        else limits.tmpdir_free_bytes = std::min(limits.tmpdir_free_bytes,
+                                                 sample.tmpdir_free_bytes);
+      }
     }
     DBUG_EXECUTE_IF("preserve_trx_native_binlog_tmpdir_3m", {
       limits.tmpdir_free_bytes = std::min<uint64_t>(
           limits.tmpdir_free_bytes, (1ULL << 30) + (3ULL << 20));
+      for (auto &fs : filesystems)
+        fs.free_bytes = std::min<uint64_t>(fs.free_bytes, (1ULL << 30) + (3ULL << 20));
     });
     DBUG_EXECUTE_IF("preserve_trx_native_binlog_tmpdir_1m", {
       limits.tmpdir_free_bytes = std::min<uint64_t>(
           limits.tmpdir_free_bytes, (1ULL << 30) + (1ULL << 20));
+      for (auto &fs : filesystems)
+        fs.free_bytes = std::min<uint64_t>(fs.free_bytes, (1ULL << 30) + (1ULL << 20));
     });
     DBUG_EXECUTE_IF("preserve_trx_native_binlog_tmpdir_memory_only", {
       if (growing && memory_bytes > 0 && fd_count == 0 && tmpdir_bytes == 0)
         limits.tmpdir_free_bytes = std::min<uint64_t>(
             limits.tmpdir_free_bytes, (1ULL << 30) - 1);
     });
-    return acquire_native_binlog_locked(token, memory_bytes, fd_count,
-                                        tmpdir_bytes, limits, growing);
+    std::vector<uint64_t> devices;
+    bool file_disk_ok = true;
+    for (const auto &fs : filesystems) {
+      devices.push_back(fs.id);
+      const auto pending = file_pending_locked(fs.id);
+      if (tmpdir_bytes != 0 &&
+          (pending > UINT64_MAX - m_reserved_native_tmpdir_bytes ||
+           !disk_admits(fs.free_bytes,
+                        pending + m_reserved_native_tmpdir_bytes, tmpdir_bytes)))
+        file_disk_ok = false;
+    }
+    std::sort(devices.begin(), devices.end());
+    if (!devices.empty() && m_reserved_native_fds != 0 &&
+        devices != m_native_filesystems) return false;
+    const bool acquired = acquire_native_binlog_locked(
+        token, memory_bytes, fd_count, tmpdir_bytes, limits, growing, file_disk_ok);
+    if (acquired && !devices.empty()) m_native_filesystems.swap(devices);
+    return acquired;
   }
+
+  bool acquire_files(const std::string &directory, uint64_t fds, uint64_t bytes,
+                     uint64_t *filesystem) {
+    if (directory.empty() || fds == 0) return false;
+    std::lock_guard<std::mutex> guard(m_mutex);
+    Preserve_trx_external_resource_limits limits;
+    Filesystem_limits fs;
+    if (!preserve_trx_capture_external_resource_limits(
+            directory.c_str(), &limits, &fs)) return false;
+    if (m_reserved_file_fds > UINT64_MAX - m_reserved_native_fds ||
+        !fd_admits(limits, m_reserved_file_fds + m_reserved_native_fds, fds))
+      return false;
+    auto pending = file_pending_locked(fs.id);
+    if (std::binary_search(m_native_filesystems.begin(), m_native_filesystems.end(), fs.id)) {
+      if (pending > UINT64_MAX - m_reserved_native_tmpdir_bytes) return false;
+      pending += m_reserved_native_tmpdir_bytes;
+    }
+    if (bytes != 0 && !disk_admits(fs.free_bytes, pending, bytes)) return false;
+    DBUG_EXECUTE_IF("preserve_temp_file_budget_allocation_failure", {
+      throw std::bad_alloc();
+    });
+    auto it = m_file_budgets.find(fs.id);
+    if (it == m_file_budgets.end())
+      it = m_file_budgets.emplace(fs.id, File_budget{}).first;
+    auto &budget = it->second;
+    // The only allocation precedes publication; settle/release never allocate.
+    budget.pending += bytes;
+    ++budget.owners;
+    m_reserved_file_fds += fds;
+    *filesystem = fs.id;
+    return true;
+  }
+
+  void settle_files(uint64_t filesystem, uint64_t bytes) {
+    std::lock_guard<std::mutex> guard(m_mutex);
+    const auto it = m_file_budgets.find(filesystem);
+    DBUG_ASSERT(it != m_file_budgets.end() && it->second.pending >= bytes);
+    if (it != m_file_budgets.end() && it->second.pending >= bytes)
+      it->second.pending -= bytes;
+  }
+
+  void release_files(uint64_t filesystem, uint64_t fds, uint64_t pending) {
+    std::lock_guard<std::mutex> guard(m_mutex);
+    const auto it = m_file_budgets.find(filesystem);
+    DBUG_ASSERT(it != m_file_budgets.end() && it->second.owners != 0 &&
+                it->second.pending >= pending && m_reserved_file_fds >= fds);
+    if (it == m_file_budgets.end()) return;
+    it->second.pending -= pending;
+    m_reserved_file_fds -= fds;
+    if (--it->second.owners == 0) m_file_budgets.erase(it);
+  }
+
+ private:
+  uint64_t file_pending_locked(uint64_t filesystem) const {
+    const auto it = m_file_budgets.find(filesystem);
+    return it == m_file_budgets.end() ? 0 : it->second.pending;
+  }
+
+ public:
 
   void settle_native_binlog_tmpdir(const std::string &token, uint64_t written,
                                    uint64_t *settled) {
@@ -308,24 +462,39 @@ class Preserve_resource_manager {
     if (bytes > kind_cap || m_by_kind[kind_index] > kind_cap - bytes) {
       return false;
     }
-    /* Construct allocating keys before changing any grow accounting. */
-    const Token_kind_key token_kind{token, kind};
-    const auto existing_token = m_by_token.find(token);
-    const auto existing_kind = m_by_token_kind.find(token_kind);
+    const Token_kind_view token_kind{token, kind};
+    auto existing_token = m_by_token.find(token);
+    auto existing_kind = m_by_token_kind.find(token_kind);
     if (growing && (existing_token == m_by_token.end() ||
                     existing_kind == m_by_token_kind.end())) return false;
     const uint64_t token_bytes =
-        growing ? existing_token->second : m_by_token[token];
+        existing_token == m_by_token.end() ? 0 : existing_token->second;
     if (token_bytes > per_token_budget - bytes) return false;
+    if (!growing) {
+      bool inserted_token = false;
+      if (existing_token == m_by_token.end()) {
+        const auto inserted = m_by_token.emplace(token, 0);
+        existing_token = inserted.first;
+        inserted_token = inserted.second;
+      }
+      auto rollback_token = create_scope_guard([&] {
+        if (inserted_token) m_by_token.erase(existing_token);
+      });
+      DBUG_EXECUTE_IF("preserve_cursor_capture_memory_failure", {
+        if (kind == Preserve_trx_memory_kind::CURSOR_RESULT_BUFFER)
+          throw std::bad_alloc();
+      });
+      if (existing_kind == m_by_token_kind.end()) {
+        existing_kind =
+            m_by_token_kind.emplace(Token_kind_key{token, kind}, 0).first;
+      }
+      rollback_token.commit();
+    }
+    // All potentially allocating operations precede accounting publication.
     m_current_bytes += bytes;
     m_peak_bytes = std::max(m_peak_bytes, m_current_bytes);
-    if (growing) {
-      existing_token->second += bytes;
-      existing_kind->second += bytes;
-    } else {
-      m_by_token[token] = token_bytes + bytes;
-      m_by_token_kind[token_kind] += bytes;
-    }
+    existing_token->second += bytes;
+    existing_kind->second += bytes;
     m_by_kind[kind_index] += bytes;
     return true;
   }
@@ -334,7 +503,7 @@ class Preserve_resource_manager {
                              Preserve_trx_memory_kind kind, uint64_t bytes) {
     const size_t kind_index = preserve_memory_kind_index(kind);
     if (token.empty() || kind_index >= kPreserveMemoryKindCount) return;
-    Token_kind_key key{token, kind};
+    const Token_kind_view key{token, kind};
     auto kind_it = m_by_token_kind.find(key);
     const uint64_t released_bytes =
         kind_it == m_by_token_kind.end()
@@ -365,27 +534,21 @@ class Preserve_resource_manager {
   bool acquire_native_binlog_locked(
       const std::string &token, uint64_t memory_bytes, uint64_t fd_count,
       uint64_t tmpdir_bytes,
-      const Preserve_trx_external_resource_limits &limits, bool growing) {
+      const Preserve_trx_external_resource_limits &limits, bool growing,
+      bool file_disk_ok) {
     if (token.empty() || (!growing && (memory_bytes == 0 || fd_count == 0)) ||
         ((fd_count != 0 || tmpdir_bytes != 0) &&
          (!limits.snapshots_available || limits.open_files_limit == 0))) {
       return false;
     }
-    const auto existing_fd = m_native_fd_by_token.find(token);
-    const auto existing_tmpdir = m_native_tmpdir_by_token.find(token);
+    auto existing_fd = m_native_fd_by_token.find(token);
+    auto existing_tmpdir = m_native_tmpdir_by_token.find(token);
     if (growing && (existing_fd == m_native_fd_by_token.end() ||
                     existing_tmpdir == m_native_tmpdir_by_token.end()))
       return false;
-    const uint64_t fd_headroom =
-        std::max<uint64_t>(64, limits.open_files_limit / 10);
     if (fd_count != 0 &&
-        (limits.current_open_files > limits.open_files_limit ||
-         m_reserved_native_fds >
-             limits.open_files_limit - limits.current_open_files ||
-         fd_count > limits.open_files_limit - limits.current_open_files -
-                        m_reserved_native_fds ||
-         fd_headroom > limits.open_files_limit - limits.current_open_files -
-                           m_reserved_native_fds - fd_count)) {
+        (m_reserved_native_fds > UINT64_MAX - m_reserved_file_fds ||
+         !fd_admits(limits, m_reserved_native_fds + m_reserved_file_fds, fd_count))) {
       return false;
     }
     const uint64_t tmpdir_headroom = std::max<uint64_t>(
@@ -405,13 +568,30 @@ class Preserve_resource_manager {
                static_cast<unsigned long long>(tmpdir_headroom));
       LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG, message);
     });
-    if (tmpdir_bytes != 0 &&
+    if (!file_disk_ok || (tmpdir_bytes != 0 &&
         (m_reserved_native_tmpdir_bytes > limits.tmpdir_free_bytes ||
          tmpdir_bytes >
              limits.tmpdir_free_bytes - m_reserved_native_tmpdir_bytes ||
          tmpdir_headroom > limits.tmpdir_free_bytes -
-                               m_reserved_native_tmpdir_bytes - tmpdir_bytes)) {
+                               m_reserved_native_tmpdir_bytes - tmpdir_bytes))) {
       return false;
+    }
+    bool new_fd = false, new_tmpdir = false, published = false;
+    auto rollback_nodes = create_scope_guard([&] {
+      if (published) return;
+      if (new_fd) m_native_fd_by_token.erase(token);
+      if (new_tmpdir) m_native_tmpdir_by_token.erase(token);
+    });
+    if (!growing) {
+      const auto fd_node = m_native_fd_by_token.emplace(token, 0);
+      new_fd = fd_node.second;
+      existing_fd = fd_node.first;
+      DBUG_EXECUTE_IF("preserve_temp_native_budget_allocation_failure", {
+        throw std::bad_alloc();
+      });
+      const auto tmp_node = m_native_tmpdir_by_token.emplace(token, 0);
+      new_tmpdir = tmp_node.second;
+      existing_tmpdir = tmp_node.first;
     }
     if (!acquire_memory_locked(
             token, Preserve_trx_memory_kind::PROMOTION_BINLOG_NATIVE_CACHE,
@@ -420,13 +600,9 @@ class Preserve_resource_manager {
     }
     m_reserved_native_fds += fd_count;
     m_reserved_native_tmpdir_bytes += tmpdir_bytes;
-    if (growing) {
-      existing_fd->second += fd_count;
-      existing_tmpdir->second += tmpdir_bytes;
-    } else {
-      m_native_fd_by_token[token] += fd_count;
-      m_native_tmpdir_by_token[token] += tmpdir_bytes;
-    }
+    existing_fd->second += fd_count;
+    existing_tmpdir->second += tmpdir_bytes;
+    published = true;
     return true;
   }
 
@@ -480,6 +656,9 @@ class Preserve_resource_manager {
     m_reserved_native_tmpdir_bytes = 0;
     m_native_fd_by_token.clear();
     m_native_tmpdir_by_token.clear();
+    m_native_filesystems.clear();
+    m_file_budgets.clear();
+    m_reserved_file_fds = 0;
   }
 
  private:
@@ -489,13 +668,22 @@ class Preserve_resource_manager {
   uint64_t m_spill_bytes{0};
   uint64_t m_spill_failures{0};
   std::map<std::string, uint64_t> m_by_token;
-  std::map<Token_kind_key, uint64_t> m_by_token_kind;
+  std::map<Token_kind_key, uint64_t, Token_kind_less> m_by_token_kind;
   std::array<uint64_t, kPreserveMemoryKindCount> m_by_kind{};
   uint64_t m_reserved_native_fds{0};
   /* Pending writes only; completed file writes are already in statvfs usage. */
   uint64_t m_reserved_native_tmpdir_bytes{0};
   std::map<std::string, uint64_t> m_native_fd_by_token;
   std::map<std::string, uint64_t> m_native_tmpdir_by_token;
+  // Native caches may choose any configured tmpdir. Their pending bytes are
+  // conservatively charged to each device; image writes have one exact device.
+  std::vector<uint64_t> m_native_filesystems;
+  struct File_budget {
+    uint64_t pending{0};
+    uint64_t owners{0};
+  };
+  std::map<uint64_t, File_budget> m_file_budgets;
+  uint64_t m_reserved_file_fds{0};
 #ifndef NDEBUG
   Preserve_trx_external_resource_limits m_external_limits;
   bool m_external_limits_override{false};
@@ -581,8 +769,83 @@ DEFINE_PRESERVE_TRX_SHOW_FUNC(
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_lock_warmcopy_live_fallback,
     preserve_trx_lock_warmcopy_live_fallback_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_prebuild_stale,
+                             preserve_trx_temp_prebuild_stale_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_prebuild_active,
+                             preserve_trx_temp_prebuild_active_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_prebuild_installed,
+                             preserve_trx_temp_prebuild_installed_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_prebuild_steps,
+                             preserve_trx_temp_prebuild_steps_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_prebuild_baselines,
+                             preserve_trx_temp_prebuild_baselines_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_prebuild_buffer_pages,
+                             preserve_trx_temp_prebuild_buffer_pages_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_prebuild_file_pages,
+                             preserve_trx_temp_prebuild_file_pages_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_prebuild_rounds,
+                             preserve_trx_temp_prebuild_rounds_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_prebuild_round_pages,
+                             preserve_trx_temp_prebuild_round_pages_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_prebuild_undo_pages,
+                             preserve_trx_temp_prebuild_undo_pages_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_prebuild_undo_reused_pages,
+                             preserve_trx_temp_prebuild_undo_reused_pages_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_undo_watched_pages,
+                             trx_preserve_temp_undo_watched_pages())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_undo_owners,
+                             trx_preserve_temp_undo_capture_owners())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_undo_owner_pages_used,
+                             trx_preserve_temp_undo_capture_pages_used())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_undo_owner_pages_routed,
+                             trx_preserve_temp_undo_capture_pages_routed())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_undo_owner_quota_rejected,
+                             trx_preserve_temp_undo_capture_quota_rejected())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_prebuild_undo_scans,
+                             preserve_trx_temp_prebuild_undo_scans_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_prebuild_undo_stale,
+                             preserve_trx_temp_prebuild_undo_stale_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_undo_shared_fallback,
+                             preserve_trx_temp_undo_shared_fallback_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_prebuild_undo_write_steps,
+                             preserve_trx_temp_prebuild_undo_write_steps_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_prebuild_undo_claim_pages,
+                             preserve_trx_temp_prebuild_undo_claim_pages_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_prebuild_undo_claim_reused,
+                             preserve_trx_temp_prebuild_undo_claim_reused_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_prebuild_undo_write_bytes,
+                             preserve_trx_temp_prebuild_undo_write_bytes_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_pretransfer_bytes,
+                             preserve_trx_temp_pretransfer_bytes_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_image_delta_bytes,
+                            preserve_trx_temp_image_delta_bytes_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_image_delta_built,
+                            preserve_trx_temp_image_delta_built_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_image_delta_assembled,
+                            preserve_trx_temp_image_delta_assembled_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_undo_delta_bytes,
+                             preserve_trx_temp_undo_delta_bytes_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_undo_delta_built,
+                             preserve_trx_temp_undo_delta_built_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_undo_delta_assembled,
+                             preserve_trx_temp_undo_delta_assembled_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_prebuild_final_reused,
+                             preserve_trx_temp_prebuild_final_reused_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_prebuild_final_fallback,
+                             preserve_trx_temp_prebuild_final_fallback_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_gc_scanned,
+                             preserve_trx_temp_gc_scanned_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_gc_removed,
+                             preserve_trx_temp_gc_removed_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_gc_errors,
+                             preserve_trx_temp_gc_errors_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_gc_passes,
+                             preserve_trx_temp_gc_passes_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_phase2_total_us,
                               preserve_trx_phase2_total_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_phase2_command_boundary_wait_active,
+    preserve_trx_phase2_command_boundary_wait_active_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_phase2_target_wait_us,
                               preserve_trx_phase2_target_wait_us_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_phase1_readiness_samples,
@@ -1314,6 +1577,26 @@ Preserve_memory_lease &Preserve_memory_lease::operator=(
 
 Preserve_memory_lease::~Preserve_memory_lease() { release(); }
 
+bool Preserve_memory_lease::grow_to(uint64_t bytes) {
+  if (!m_acquired || bytes < m_bytes) return false;
+  if (bytes == m_bytes) return true;
+  try {
+    if (!g_preserve_resource_manager.acquire(m_token, m_kind, bytes - m_bytes))
+      return false;
+    m_bytes = bytes;
+    return true;
+  } catch (const std::bad_alloc &) { return false; }
+}
+
+bool Preserve_memory_lease::shrink_to(uint64_t bytes) {
+  if (!m_acquired || bytes > m_bytes) return false;
+  if (bytes != m_bytes) {
+    g_preserve_resource_manager.release(m_token, m_kind, m_bytes - bytes);
+    m_bytes = bytes;
+  }
+  return true;
+}
+
 void Preserve_memory_lease::release() {
   if (!m_acquired) return;
   g_preserve_resource_manager.release(m_token, m_kind, m_bytes);
@@ -1323,11 +1606,67 @@ void Preserve_memory_lease::release() {
 
 Preserve_memory_lease preserve_trx_acquire_memory_lease(
     const std::string &token, Preserve_trx_memory_kind kind, uint64_t bytes) {
-  if (!g_preserve_resource_manager.acquire(token, kind, bytes)) {
-    return Preserve_memory_lease(token, kind, bytes, false);
-  }
-  return Preserve_memory_lease(token, kind, bytes, true);
+  Preserve_memory_lease lease(token, kind, bytes, false);
+  lease.m_acquired = g_preserve_resource_manager.acquire(token, kind, bytes);
+  return lease;
 }
+
+Preserve_file_resource_lease::Preserve_file_resource_lease(
+    Preserve_file_resource_lease &&other) noexcept {
+  *this = std::move(other);
+}
+
+Preserve_file_resource_lease &Preserve_file_resource_lease::operator=(
+    Preserve_file_resource_lease &&other) noexcept {
+  if (this != &other) {
+    release();
+    m_filesystem = other.m_filesystem;
+    m_fds = other.m_fds;
+    m_bytes = other.m_bytes;
+    m_written = other.m_written;
+    m_acquired = other.m_acquired;
+    other.m_acquired = false;
+    other.m_fds = other.m_bytes = other.m_written = 0;
+  }
+  return *this;
+}
+
+Preserve_file_resource_lease::~Preserve_file_resource_lease() { release(); }
+
+void Preserve_file_resource_lease::release() {
+  if (!m_acquired) return;
+  g_preserve_resource_manager.release_files(m_filesystem, m_fds, pending_bytes());
+  m_acquired = false;
+  m_fds = m_bytes = m_written = 0;
+}
+
+void Preserve_file_resource_lease::settle_writes(uint64_t written_prefix_bytes) {
+  if (!m_acquired) return;
+  written_prefix_bytes = std::min(written_prefix_bytes, m_bytes);
+  if (written_prefix_bytes <= m_written) return;
+  g_preserve_resource_manager.settle_files(m_filesystem,
+                                          written_prefix_bytes - m_written);
+  m_written = written_prefix_bytes;
+}
+
+void Preserve_file_resource_lease::finish_writes() {
+  if (!m_acquired) return;
+  g_preserve_resource_manager.settle_files(m_filesystem, pending_bytes());
+  m_bytes = m_written;
+}
+
+Preserve_file_resource_lease preserve_trx_acquire_file_resource_lease(
+    const std::string &directory, uint64_t fd_count, uint64_t bytes) {
+  Preserve_file_resource_lease lease;
+  lease.m_acquired = g_preserve_resource_manager.acquire_files(
+      directory, fd_count, bytes, &lease.m_filesystem);
+  if (lease.m_acquired) {
+    lease.m_fds = fd_count;
+    lease.m_bytes = bytes;
+  }
+  return lease;
+}
+
 
 Preserve_native_binlog_resource_lease::
     Preserve_native_binlog_resource_lease(std::string token,
@@ -1435,10 +1774,11 @@ Preserve_native_binlog_resource_lease
 preserve_trx_acquire_native_binlog_resource_lease(
     const std::string &token, uint64_t memory_bytes, uint64_t fd_count,
     uint64_t tmpdir_bytes) {
-  const bool acquired = g_preserve_resource_manager.acquire_native_binlog(
+  Preserve_native_binlog_resource_lease lease(
+      token, memory_bytes, fd_count, tmpdir_bytes, false);
+  lease.m_acquired = g_preserve_resource_manager.acquire_native_binlog(
       token, memory_bytes, fd_count, tmpdir_bytes);
-  return Preserve_native_binlog_resource_lease(
-      token, memory_bytes, fd_count, tmpdir_bytes, acquired);
+  return lease;
 }
 
 bool preserve_trx_resource_acquire_memory(const std::string &token,
@@ -1504,10 +1844,6 @@ uint64_t preserve_trx_resource_kind_cap_bytes(
   return preserve_memory_kind_cap(kind, preserve_trx_memory_budget_bytes);
 }
 
-uint64_t preserve_trx_resource_kind_cap_bytes_for_unit_test(
-    Preserve_trx_memory_kind kind) {
-  return preserve_trx_resource_kind_cap_bytes(kind);
-}
 
 #ifndef NDEBUG
 void preserve_trx_resource_manager_set_external_limits_for_unit_test(
@@ -1525,3 +1861,9 @@ preserve_trx_native_binlog_reserved_tmpdir_bytes_for_unit_test() {
       .reserved_native_tmpdir_bytes_for_unit_test();
 }
 #endif
+
+std::array<unsigned char, 32> preserve_trx_digest(const void *data, size_t size) {
+  std::array<unsigned char, 32> result{};
+  SHA256(static_cast<const unsigned char *>(data), size, result.data());
+  return result;
+}

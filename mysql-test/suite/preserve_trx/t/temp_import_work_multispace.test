@@ -1,0 +1,109 @@
+--source include/have_debug.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+--echo # Two physical spaces share one complete transaction undo
+--disable_query_log
+--let $saved_global_debug= `SELECT @@global.debug`
+--let $undo_trace= $MYSQLTEST_VARDIR/log/temp_import_work_multispace.trace
+--eval SET GLOBAL debug='d,preserve_temp_import,preserve_temp_import_source_undo_probe,preserve_temp_transfer_input_probe,preserve_temp_import_work_probe,preserve_temp_import_target_image_probe,preserve_temp_receiver_fil_attach_failure_probe,preserve_temp_receiver_dictionary_publish_failure_probe,preserve_temp_receiver_dictionary_native_probe:O,$undo_trace'
+SET GLOBAL rds_preserve_trx_enable=ON;
+SET GLOBAL rds_preserve_trx_temp_table_enable=ON;
+CREATE TABLE t_undo_multi_base(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO t_undo_multi_base
+  WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<64)
+  SELECT n, n*10 FROM seq;
+--connect(undo_app,localhost,root,,test)
+--let $space_app_id= `SELECT CONNECTION_ID()`
+CREATE TEMPORARY TABLE tmp_undo_key(
+  k VARBINARY(32) PRIMARY KEY, n INT NULL, v VARBINARY(128)
+) ENGINE=InnoDB ROW_FORMAT=REDUNDANT;
+SET SESSION debug='+d,preserve_temp_second_space_probe';
+CREATE TEMPORARY TABLE tmp_undo_aux(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+SET SESSION debug='-d,preserve_temp_second_space_probe';
+--let $two_spaces= `SELECT COUNT(*)=2 AND COUNT(DISTINCT t.SPACE)=2 FROM information_schema.INNODB_TEMP_TABLE_INFO t JOIN information_schema.INNODB_SESSION_TEMP_TABLESPACES s ON t.SPACE=s.SPACE WHERE s.ID=CONNECTION_ID()`
+if (!$two_spaces)
+{
+  --die fixture did not create two real temporary tablespaces
+}
+INSERT INTO tmp_undo_key VALUES('',NULL,''),('b',2,0xff);
+INSERT INTO tmp_undo_aux SELECT id,id FROM t_undo_multi_base;
+START TRANSACTION;
+UPDATE tmp_undo_key SET n=1 WHERE k='';
+UPDATE tmp_undo_aux SET v=v+100;
+DELETE FROM tmp_undo_key WHERE k='b';
+INSERT INTO tmp_undo_key VALUES('c',3,0x00ff);
+# Cross the insert/update stream boundary, then link another update predecessor.
+UPDATE tmp_undo_key SET n=4 WHERE k='c';
+UPDATE tmp_undo_key SET n=3 WHERE k='c';
+DELETE FROM tmp_undo_aux WHERE id=2;
+INSERT INTO tmp_undo_aux VALUES(2,555);
+UPDATE t_undo_multi_base SET v=999 WHERE id=1;
+--connection default
+--error ER_PRESERVE_TRX_UNSUPPORTED
+DRAIN TRANSACTIONS PRESERVE;
+--let _TEMP_UNDO_TRACE= $undo_trace
+--perl
+use strict;
+use warnings;
+open(my $fh, '<', $ENV{'_TEMP_UNDO_TRACE'}) or die "missing undo trace: $!";
+my $trace = do { local $/; <$fh> };
+close($fh);
+die "two real image spaces must publish just one undo\n"
+  unless $trace =~ /temporary manifest candidate spaces=2 tables=2 undo=1/;
+die "impossible ownership count was not rejected before allocation\n"
+  unless $trace =~ /temporary manifest claim count exceeds payload/;
+die "two image spaces did not share one transferred undo\n"
+  unless $trace =~ /temporary transfer input checked objects=3 rejected=16 pinned_after_cleanup=1 replacement_checked=1 wrong_pin_checked=1/;
+die "transaction-level source import was not prepared\n"
+  unless $trace =~ /temporary source import prepared spaces=2 tables=2 undo_records=71 links=[1-9][0-9]* external=0 targets=0/;
+die "source preparation did not retain cross-batch ownership\n"
+  unless $trace =~ /temporary import work prepared batches=[1-9][0-9]* read_bytes=[1-9][0-9]* single_read=1 owners=1/;
+die "source preparation cancellation failed\n"
+  unless $trace =~ /temporary import work cancellation checked phases=9 failures=3 quota=1/;
+die "receiver image preparation failed\n"
+  unless $trace =~ /temporary receiver images checked bytes=[1-9][0-9]* batches=[1-9][0-9]* cancel=0 fault=0/;
+die "receiver partial multi-space fil attachment did not unwind\n"
+  unless $trace =~ /temporary receiver fil attachment failure checked/;
+die "receiver multi-space dictionary publication did not unwind\n"
+  unless $trace =~ /temporary receiver dictionary publication failure checked/;
+die "receiver multi-space native dictionary ownership was not checked\n"
+  unless $trace =~ /temporary receiver native dictionary ownership checked/;
+die "standby scope gate was not reached\n"
+  unless $trace =~ /temporary namespace requires standby transfer/;
+EOF
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+--connection undo_app
+--enable_query_log
+SELECT COUNT(*)=2 AND SUM(k='' AND n=1 AND v='')=1
+  AND SUM(k='c' AND n=3 AND v=0x00ff)=1 AS captured_key_ok FROM tmp_undo_key;
+SELECT COUNT(*)=64 AND SUM(v)=8933 AS captured_aux_ok FROM tmp_undo_aux;
+--disable_query_log
+UPDATE tmp_undo_key SET v=0x1234 WHERE k='';
+DELETE FROM tmp_undo_aux WHERE id=64;
+ROLLBACK;
+--enable_query_log
+SELECT COUNT(*)=2 AND SUM(k='' AND n IS NULL AND v='')=1
+  AND SUM(k='b' AND n=2 AND v=0xff)=1 AS key_rollback_ok FROM tmp_undo_key;
+SELECT COUNT(*)=64 AND SUM(v)=2080 AS aux_rollback_ok FROM tmp_undo_aux;
+SELECT COUNT(*)=64 AND SUM(v)=20800 AS persistent_rollback_ok FROM t_undo_multi_base;
+--disable_query_log
+START TRANSACTION;
+UPDATE tmp_undo_key SET n=7 WHERE k='';
+UPDATE tmp_undo_aux SET v=7 WHERE id=1;
+UPDATE t_undo_multi_base SET v=7 WHERE id=1;
+COMMIT;
+--enable_query_log
+SELECT n=7 AND v='' AS key_commit_ok FROM tmp_undo_key WHERE k='';
+SELECT v=7 AS aux_commit_ok FROM tmp_undo_aux WHERE id=1;
+SELECT v=7 AS persistent_commit_ok FROM t_undo_multi_base WHERE id=1;
+--disable_query_log
+DROP TEMPORARY TABLE tmp_undo_key, tmp_undo_aux;
+--disconnect undo_app
+--connection default
+--let $wait_timeout= 10
+--let $wait_condition= SELECT COUNT(*)=0 FROM information_schema.INNODB_SESSION_TEMP_TABLESPACES WHERE ID=$space_app_id
+--source include/wait_condition.inc
+DROP TABLE t_undo_multi_base;
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+--eval SET GLOBAL debug='$saved_global_debug'
+--enable_query_log

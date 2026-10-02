@@ -81,15 +81,43 @@ SET DEBUG_SYNC='now SIGNAL closing_abort_survivor_staged_continue';
 --reap
 
 --connection default
+# The injected token ABORT failure still permits pre-COMMIT epoch ABANDON.
+# A terminal marker alone also describes ABANDONING, so check both the
+# terminal decision and the released receiver resources.
+SELECT VARIABLE_VALUE=1 AS epoch_abandon_claimed
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_wins';
+SELECT VARIABLE_VALUE=1 AS epoch_terminal_status_retained
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_status_tombstones';
+SELECT VARIABLE_VALUE=0 AS no_terminal_conflict
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_terminal_cas_conflicts';
+SELECT VARIABLE_VALUE=0 AS no_receiver_commit
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_recv_terminal_commit_admitted_mono_us';
 SELECT VARIABLE_VALUE=0 AS no_active_epoch
   FROM performance_schema.global_status
  WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs';
-SELECT VARIABLE_VALUE+0 >= 1 AS uncommitted_receiver_state_only
+SELECT VARIABLE_VALUE=0 AS no_inflight_receiver_token
   FROM performance_schema.global_status
  WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens';
 SELECT VARIABLE_VALUE=0 AS no_saved_receiver_token
   FROM performance_schema.global_status
  WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_saved_online_tokens';
+SELECT VARIABLE_VALUE=0 AS no_failed_receiver_token
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_failed_tokens';
+# Retired file owners can release their cleanup debt asynchronously.
+--let $wait_condition= SELECT COUNT(*)=4 AND SUM(VARIABLE_VALUE+0)=0 FROM performance_schema.global_status WHERE VARIABLE_NAME IN ('Preserve_trx_transfer_receiver_inflight_bytes','Preserve_trx_transfer_receiver_queued_bytes','Preserve_trx_transfer_receiver_worker_active','Preserve_trx_transfer_receiver_staged_token_active')
+--source include/wait_condition.inc
+SELECT COUNT(*)=5 AND SUM(VARIABLE_VALUE+0)=0 AS no_source_handoff_uncertainty
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME IN ('Preserve_trx_transfer_source_handoff_pending_epochs',
+                         'Preserve_trx_transfer_source_commit_unknown_epochs',
+                         'Preserve_trx_transfer_quarantine_epochs',
+                         'Preserve_trx_transfer_quarantine_tokens',
+                         'Preserve_trx_transfer_quarantine_bytes');
 SELECT VARIABLE_VALUE=1 AS timeout_detected
   FROM performance_schema.global_status
  WHERE VARIABLE_NAME='Preserve_trx_closing_command_timed_out_count';
@@ -97,10 +125,17 @@ SELECT VARIABLE_VALUE=0 AS no_exclusion_without_abort_ack
   FROM performance_schema.global_status
  WHERE VARIABLE_NAME='Preserve_trx_closing_excluded_tokens';
 
+# The restored changes remain uncommitted to other connections.
+SELECT id,v AS externally_visible_value
+  FROM t_closing_timeout_abort_failure ORDER BY id;
+
 # The failed single-token ABORT escalates to an epoch failure, but the
 # survivor that was already detached and staged must be restored to its THD.
 --connection closing_abort_survivor
 SELECT v AS restored_survivor_value
+  FROM t_closing_timeout_abort_failure WHERE id=2;
+UPDATE t_closing_timeout_abort_failure SET v=v+1 WHERE id=2;
+SELECT v AS restored_survivor_continued_value
   FROM t_closing_timeout_abort_failure WHERE id=2;
 ROLLBACK;
 

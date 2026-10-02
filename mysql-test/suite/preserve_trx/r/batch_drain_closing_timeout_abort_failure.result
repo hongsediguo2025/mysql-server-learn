@@ -1,18 +1,35 @@
 survivor_reached_receiver_before_abort_failure
 1
 ERROR HY000: Resumable transactions across shutdown do not support this operation
+epoch_abandon_claimed
+1
+epoch_terminal_status_retained
+1
+no_terminal_conflict
+1
+no_receiver_commit
+1
 no_active_epoch
 1
-uncommitted_receiver_state_only
+no_inflight_receiver_token
 1
 no_saved_receiver_token
+1
+no_failed_receiver_token
+1
+no_source_handoff_uncertainty
 1
 timeout_detected
 1
 no_exclusion_without_abort_ack
 1
+id	externally_visible_value
+1	10
+2	20
 restored_survivor_value
 21
+restored_survivor_continued_value
+22
 old_command_completed
 1
 id	v

@@ -1,0 +1,2 @@
+--let $packet_case= auto
+--source suite/preserve_trx/include/temp_command_packet.inc

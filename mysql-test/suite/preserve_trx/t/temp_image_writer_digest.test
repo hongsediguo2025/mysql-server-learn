@@ -1,0 +1,5 @@
+--let $capture_case= temporary image digest respects the batch budget
+--let $capture_trace_name= temp_image_writer_digest.trace
+--let $capture_fault= preserve_temp_image_writer_ownership_probe,preserve_temp_image_writer_digest_probe,preserve_trx_fail_before_snapshot_fsync
+--let $capture_trace_pattern= temporary image digest batch checked undo_certificate=1
+--source suite/preserve_trx/include/temp_table_capture_undo_failure.inc

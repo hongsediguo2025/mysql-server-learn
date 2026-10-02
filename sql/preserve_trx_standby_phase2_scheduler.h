@@ -66,6 +66,7 @@ struct Admission_request {
   Command_class command_class{Command_class::DEFAULT_DENY};
   bool effective_no_chain{false};
   bool outer_is_call{false};
+  bool outer_is_multi_statement{false};
   Transaction_observation transaction_observation;
 };
 
@@ -73,6 +74,7 @@ struct Command_exit_fact {
   Command_key command;
   bool entered_body{false};
   bool outer_is_call{false};
+  bool outer_is_multi_statement{false};
   uint64_t native_body_exit_us{0};
   uint64_t thread_id_projection{0};
   Transaction_observation transaction_observation;
@@ -151,6 +153,8 @@ using Attempt_handle = std::shared_ptr<Attempt>;
 
 bool capture_command(THD *command_thd, Command_key *command);
 bool captured_command_key(THD *command_thd, Command_key *command);
+/** Live observation: T0 registration is complete and convergence is running. */
+bool command_boundary_wait_active();
 bool dependency_transaction_is_active(THD *thd);
 Attempt_handle publish_and_register_t0(THD *owner,
                                        const Owner_config &config);

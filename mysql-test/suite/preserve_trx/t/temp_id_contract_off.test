@@ -1,0 +1,5 @@
+--source include/not_windows.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+--let $contract_port= `SELECT @@port`
+--exec python3 $MYSQL_TEST_DIR/../scripts/preserve_trx_temp_contract_e2e.py --port=$contract_port --namespace=0

@@ -28,10 +28,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
+#include "sql/preserve_trx_recovery_contract.h"
 
 class THD;
+struct Preserve_trx_result_image;
 
 static constexpr size_t kPreservedTrxSha256Length = 32;
 static constexpr uint16_t kPreservedTrxLockPlanContractVersion = 1;
@@ -74,7 +77,8 @@ enum class Preserve_snapshot_binlog_state : uint8_t {
 enum class Preserve_snapshot_engine_shape : uint8_t {
   PERSISTENT_ONLY = 1,
   TEMP_ONLY = 2,
-  MIXED = 3
+  MIXED = 3,
+  NONE = 4
 };
 
 enum class Preserve_snapshot_binlog_format : uint8_t {
@@ -131,6 +135,7 @@ struct Preserve_snapshot_metadata {
     only after claim, so early reject/rollback may not persist a new count.
   */
   uint32_t recovered_count{0};
+  Preserve_trx_recovery_contract recovery;
   Preserve_snapshot_engine_shape engine_shape{
       Preserve_snapshot_engine_shape::PERSISTENT_ONLY};
   bool has_persistent_engine_state{true};
@@ -210,6 +215,9 @@ struct Preserve_snapshot_metadata {
   bool foreign_key_checks{true};
   bool unique_checks{true};
   bool autocommit{true};
+  // Native SESSION rollback warnings for temporary CREATE/DROP (bits 1/2).
+  // No nontransactional-table support is implied by this field.
+  uint8_t temp_ddl_rollback_flags{0};
   uint64_t auto_increment_increment{1};
   uint64_t auto_increment_offset{1};
   /*
@@ -261,6 +269,8 @@ struct Preserve_snapshot_metadata {
     before the preserved trx is claimed.
   */
   std::string temp_table_manifest_payload;
+  /* Standby-only PS/result object references; requires semantic contract V2. */
+  std::string cursor_manifest_payload;
 };
 
 /*
@@ -423,6 +433,8 @@ class PreserveBinlogBlobProvider {
   callers can validate semantic state separately from durable file placement.
   owns_current_temp_sidecars tells the carrier that temp sidecars sealed earlier
   for this token are allowed during the pre-write conflict check.
+  On write failure those sidecars remain with the caller for metadata-aware
+  undo reservation release and cleanup.
 */
 struct Preserved_trx_bundle {
   Preserve_snapshot_metadata metadata;
@@ -434,6 +446,8 @@ struct Preserved_trx_bundle {
     new blob publication.
   */
   std::vector<Preserved_trx_external_blob_descriptor> blob_descriptors;
+  /* Source-only transport ownership; never serialized into snapshot bytes. */
+  std::shared_ptr<const Preserve_trx_result_image> source_cursor_results;
   bool owns_current_temp_sidecars{false};
 };
 

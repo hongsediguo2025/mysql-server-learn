@@ -133,11 +133,6 @@ class Local_file_preserved_trx_carrier final
       const std::string &blob_name,
       uint64_t warmcopy_epoch,
       const Preserved_trx_external_blob_descriptor &descriptor) override;
-  Preserved_trx_carrier_status
-  install_staged_external_blob_for_standby_projection(
-      const std::string &token, const std::string &blob_name,
-      const std::string &staged_path,
-      const Preserved_trx_external_blob_descriptor &descriptor);
   Preserved_trx_carrier_status read_warm_external_blob(
       const std::string &warmcopy_id, const std::string &blob_name,
       uint64_t warmcopy_epoch,
