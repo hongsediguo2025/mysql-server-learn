@@ -113,9 +113,6 @@ class Preserve_trx_cursor_file {
   Preserve_trx_file_status m_status{Preserve_trx_file_status::OK};
 };
 
-#ifndef NDEBUG
-void preserve_trx_cursor_verify_file(const Preserve_trx_cursor_result &artifact);
-#endif
 int show_preserve_trx_cursor_file_preflights(THD *, SHOW_VAR *, char *);
 int show_preserve_trx_cursor_file_rejections(THD *, SHOW_VAR *, char *);
 #endif

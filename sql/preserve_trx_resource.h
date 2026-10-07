@@ -315,8 +315,10 @@ ulonglong preserve_trx_temp_prebuild_undo_reused_pages_status();
 int show_preserve_trx_temp_prebuild_undo_reused_pages(THD *, SHOW_VAR *, char *);
 int show_preserve_trx_temp_undo_watched_pages(THD *, SHOW_VAR *, char *);
 int show_preserve_trx_temp_undo_owners(THD *, SHOW_VAR *, char *);
+#ifndef NDEBUG
 int show_preserve_trx_temp_undo_owner_pages_used(THD *, SHOW_VAR *, char *);
 int show_preserve_trx_temp_undo_owner_pages_routed(THD *, SHOW_VAR *, char *);
+#endif
 int show_preserve_trx_temp_undo_owner_quota_rejected(THD *, SHOW_VAR *, char *);
 ulonglong preserve_trx_temp_prebuild_undo_scans_status();
 int show_preserve_trx_temp_prebuild_undo_scans(THD *, SHOW_VAR *, char *);

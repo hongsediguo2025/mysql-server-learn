@@ -8126,7 +8126,6 @@ class PreserveSnapshotTest : public ::testing::Test {
  protected:
   void SetUp() override {
 #ifndef NDEBUG
-    preserve_trx_transfer_reset_io_rate_limiters_for_unit_test();
 #endif
     m_saved_server_uuid = server_uuid;
     m_saved_server_uuid_ptr = server_uuid_ptr;
@@ -22102,34 +22101,23 @@ TEST(PreserveTrxTransferRuntimePolicy, MapsCompleteProfiles) {
   EXPECT_EQ(3U, business.data_sessions);
   EXPECT_EQ(3U, business.receiver_workers);
   EXPECT_EQ(1U, business.prewarm_workers);
-  EXPECT_EQ(32ULL * 1024ULL * 1024ULL,
-            business.transfer_io_bytes_per_sec);
   EXPECT_EQ(1024U * 1024U, business.warmcopy_chunk_bytes);
   EXPECT_EQ(1000U, business.warmcopy_min_open_ms);
-  EXPECT_EQ(8U, business.commit_batch_tokens);
 
   const auto balanced = preserve_trx_transfer_runtime_policy_for_profile(
       PRESERVE_TRX_TRANSFER_RUNTIME_BALANCED);
   EXPECT_EQ(4U, balanced.receiver_workers);
   EXPECT_EQ(3U, balanced.prewarm_workers);
-  EXPECT_EQ(256ULL * 1024ULL * 1024ULL,
-            balanced.transfer_io_bytes_per_sec);
-  EXPECT_EQ(512ULL * 1024ULL * 1024ULL,
-            balanced.prewarm_io_bytes_per_sec);
   EXPECT_EQ(4U * 1024U * 1024U, balanced.warmcopy_chunk_bytes);
   EXPECT_EQ(100U, balanced.warmcopy_min_open_ms);
-  EXPECT_EQ(16U, balanced.commit_batch_tokens);
 
   const auto promotion = preserve_trx_transfer_runtime_policy_for_profile(
       PRESERVE_TRX_TRANSFER_RUNTIME_PROMOTION_PREPARE);
   EXPECT_EQ(8U, promotion.receiver_workers);
   EXPECT_EQ(8U, promotion.prewarm_workers);
-  EXPECT_EQ(4ULL * 1024ULL * 1024ULL * 1024ULL,
-            promotion.transfer_io_bytes_per_sec);
   EXPECT_EQ(1024ULL * 1024ULL * 1024ULL,
             promotion.prewarm_max_bytes);
   EXPECT_EQ(16U * 1024U * 1024U, promotion.warmcopy_chunk_bytes);
-  EXPECT_EQ(32U, promotion.commit_batch_tokens);
   EXPECT_EQ(8ULL * 1024ULL * 1024ULL,
             promotion.phase1_batch_bytes);
   EXPECT_EQ(50U, promotion.phase1_batch_linger_ms);
@@ -22137,8 +22125,6 @@ TEST(PreserveTrxTransferRuntimePolicy, MapsCompleteProfiles) {
   const auto invalid =
       preserve_trx_transfer_runtime_policy_for_profile(UINT_MAX32);
   EXPECT_EQ(PRESERVE_TRX_TRANSFER_RUNTIME_BUSINESS_FIRST, invalid.profile);
-  EXPECT_EQ(business.transfer_io_bytes_per_sec,
-            invalid.transfer_io_bytes_per_sec);
 }
 
 TEST_F(PreserveSnapshotTest,
@@ -25879,31 +25865,7 @@ TEST_F(PreserveSnapshotTest,
 
 }
 
-TEST_F(PreserveSnapshotTest, TransferReceiverPrewarmYieldsByWorkBatch) {
-  uint64_t active_work_us = 0;
-  EXPECT_FALSE(
-      preserve_trx_transfer_receiver_prewarm_work_batch_should_yield_for_unit_test(
-          200, 1000, &active_work_us));
-  EXPECT_EQ(200U, active_work_us);
-  EXPECT_FALSE(
-      preserve_trx_transfer_receiver_prewarm_work_batch_should_yield_for_unit_test(
-          799, 1000, &active_work_us));
-  EXPECT_EQ(999U, active_work_us);
-  EXPECT_TRUE(
-      preserve_trx_transfer_receiver_prewarm_work_batch_should_yield_for_unit_test(
-          1, 1000, &active_work_us));
-  EXPECT_EQ(0U, active_work_us);
 
-  active_work_us = std::numeric_limits<uint64_t>::max() - 5;
-  EXPECT_TRUE(
-      preserve_trx_transfer_receiver_prewarm_work_batch_should_yield_for_unit_test(
-          10, 1000, &active_work_us));
-  EXPECT_EQ(0U, active_work_us);
-  EXPECT_FALSE(
-      preserve_trx_transfer_receiver_prewarm_work_batch_should_yield_for_unit_test(
-          1000, 0, &active_work_us));
-  EXPECT_EQ(0U, active_work_us);
-}
 #endif
 
 #ifndef NDEBUG
@@ -27325,7 +27287,6 @@ TEST_F(PreserveSnapshotTest,
   Capturing_transfer_frame_sink frame_sink;
   Preserve_trx_transfer_source_epoch_options options;
   options.runtime_policy = preserve_trx_transfer_current_runtime_policy();
-  options.runtime_policy.commit_batch_tokens = 2;
   options.runtime_policy.sender_workers = 3;
   options.chunk_bytes = 4096;
   options.max_inflight_bytes = preserve_trx_transfer_max_inflight_bytes;

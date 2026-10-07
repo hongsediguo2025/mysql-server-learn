@@ -1,0 +1,8 @@
+--source include/have_debug.inc
+--source include/have_log_bin.inc
+--disable_query_log
+CALL mtr.add_suppression('PRESERVE: receiver temporary completion failed token=[0-9]+ error=');
+--enable_query_log
+--let $contract_async_temp= sync-error
+--let $contract_large_undo= 1
+--source suite/preserve_trx/t/temp_capture_worker.test

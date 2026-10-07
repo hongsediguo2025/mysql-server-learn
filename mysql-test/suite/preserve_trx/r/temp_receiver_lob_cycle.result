@@ -1,1 +1,1 @@
-receiver rejected corrupt LOB before READY: cycle
+receiver rejected corrupt LOB before SQL RESUME: cycle

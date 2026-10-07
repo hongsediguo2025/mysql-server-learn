@@ -1,1 +1,1 @@
-receiver rejected corrupt LOB before READY: validate
+receiver rejected corrupt LOB before SQL RESUME: validate

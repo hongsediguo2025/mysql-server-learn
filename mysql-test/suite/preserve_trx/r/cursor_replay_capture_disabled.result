@@ -1,2 +1,0 @@
-ordinary PS uses session-only handoff; external replay needs no cursor artifact
-ordinary PS handoff is independent of the cursor capture gate

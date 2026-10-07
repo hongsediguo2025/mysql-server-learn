@@ -565,7 +565,7 @@ bool same_generation_anchor(const trx_preserve_temp_no_redo_undo_log_anchor &old
 
 dberr_t trx_preserve_temp_import_plan::reuse_private_batch(
     trx_preserve_temp_import_plan *old, size_t work, size_t bytes,
-    bool *complete, bool *reused) {
+    bool *complete, bool *reused, bool data_only) {
   if (!old || old == this || !complete || !reused || !work || !bytes ||
       m_cancelling || old->m_cancelling) return DB_ERROR;
   *complete = *reused = false;
@@ -584,11 +584,19 @@ dberr_t trx_preserve_temp_import_plan::reuse_private_batch(
     if (m_target_ids_allocated || !m_source_dictionary_prepared || m_source_undo_incomplete ||
         !old->target_dictionary_prepared() || !old->lob_complete() ||
         old->m_native_prepared || old->m_native_handed_off || old->m_target_stats ||
-        m_spaces.size() != old->m_spaces.size() || m_resource_only != old->m_resource_only ||
+        m_spaces.size() != old->m_spaces.size() ||
         m_undo_only != old->m_undo_only || m_retired_table_ids != old->m_retired_table_ids ||
-        m_dictionary_token != old->m_dictionary_token ||
-        bool(m_source_undo) != bool(old->m_source_undo)) return fresh();
-    if (m_source_undo) {
+        m_dictionary_token != old->m_dictionary_token) return fresh();
+    if (data_only) {
+      // A different transaction may borrow private DATA identities, never its
+      // predecessor's native undo or translated record pointers.
+      if (m_spaces.empty() || m_undo_only || m_target_undo ||
+          (old->m_source_undo && (!old->m_target_undo ||
+           !old->m_target_undo->owns_undo() ||
+           old->m_target_undo->next != old->source_undo_record_count()))) return fresh();
+    } else if (m_resource_only != old->m_resource_only ||
+               bool(m_source_undo) != bool(old->m_source_undo)) return fresh();
+    if (!data_only && m_source_undo) {
       const auto &a = *old->m_source_undo->source, &b = *m_source_undo->source;
       if (!old->m_target_undo || !old->m_target_undo->owns_undo() ||
           old->m_target_undo->next != old->source_undo_record_count() ||
@@ -607,7 +615,7 @@ dberr_t trx_preserve_temp_import_plan::reuse_private_batch(
   while (work && m_reuse_phase == Reuse_phase::TABLES) {
     if (m_reuse_space == m_spaces.size()) {
       m_reuse_space = m_reuse_table = 0;
-      m_reuse_phase = Reuse_phase::UNDO;
+      m_reuse_phase = data_only ? Reuse_phase::MOVE : Reuse_phase::UNDO;
       break;
     }
     const auto &a = *old->m_spaces[m_reuse_space], &b = *m_spaces[m_reuse_space];
@@ -663,8 +671,10 @@ dberr_t trx_preserve_temp_import_plan::reuse_private_batch(
   }
   while (work && m_reuse_phase == Reuse_phase::MOVE) {
     if (m_reuse_space == m_spaces.size()) {
-      m_target_undo = std::move(old->m_target_undo);
-      if (m_target_undo) m_target_undo->next = 0;
+      if (!data_only) {
+        m_target_undo = std::move(old->m_target_undo);
+        if (m_target_undo) m_target_undo->next = 0;
+      }
       m_frozen = m_target_ids_allocated = true;
       m_reuse_phase = Reuse_phase::DONE;
       *complete = *reused = true;
@@ -830,7 +840,7 @@ dberr_t trx_preserve_temp_probe_native_lifetime(
   }
   struct Space {
     uint32_t id;
-    std::string original, installation;
+    std::string installation;
     std::vector<dict_table_t *> tables;
   };
   std::vector<Space> spaces;
@@ -865,7 +875,6 @@ dberr_t trx_preserve_temp_probe_native_lifetime(
   for (size_t n = 0; n < plan->space_count(); ++n) {
     Space space;
     space.id = plan->target_space(n)->source_space_id;
-    space.original = root + "/" + (*work)->image(n)->blob_name;
     space.installation = *(*work)->installation_path(n);
     if ((*work)->attach_file(n) != DB_SUCCESS) return DB_ERROR;
     for (size_t t = 0; t < plan->target_bindings(n)->size(); ++t) {
@@ -986,7 +995,6 @@ dberr_t trx_preserve_temp_probe_native_lifetime(
                         trx->rsegs.m_noredo.update_undo != installed_undo.update_undo ||
                         trx->rsegs.m_noredo.rseg != installed_undo.rseg)) return DB_ERROR;
   for (const auto &space : spaces) {
-    if (access(space.original.c_str(), F_OK) == 0) return DB_ERROR;
     if (!native_first) {
       if (access(space.installation.c_str(), F_OK) != 0 ||
           !trx_preserve_temp_space_image_fil_space_adopted_by_space_id(space.id)) return DB_ERROR;
@@ -3097,6 +3105,11 @@ bool trx_preserve_temp_import_plan::target_ids_allocated() const {
 const trx_preserve_temp_space_image_descriptor *
 trx_preserve_temp_import_plan::source_space(size_t n) const {
   return n < m_spaces.size() ? &m_spaces[n]->source : nullptr;
+}
+
+std::shared_ptr<const Preserve_trx_sealed_file>
+trx_preserve_temp_import_plan::source_file(size_t n) const {
+  return n < m_spaces.size() ? m_spaces[n]->source_file : nullptr;
 }
 
 const trx_preserve_temp_space_image_descriptor *

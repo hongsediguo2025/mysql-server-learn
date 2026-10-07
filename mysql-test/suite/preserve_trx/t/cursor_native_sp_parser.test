@@ -1,0 +1,78 @@
+# SP instructions keep native parsing/reprepare behavior with cursor capture
+# enabled and Preserve OFF. SP cursors remain inside the CALL command.
+--source include/force_restart.inc
+--disable_query_log
+--let $mode= 2
+while ($mode)
+{
+  --dec $mode
+  if (!$mode)
+  {
+    --let $restart_parameters= restart: --rds-preserve-trx-enable=OFF
+    --source include/restart_mysqld.inc
+    --let $restart_parameters=
+    --disable_query_log
+  }
+  SELECT @@GLOBAL.rds_preserve_trx_enable AS preserve_enabled,
+         (@@GLOBAL.rds_preserve_trx_transfer_artifact_mode='STANDBY_TRANSFER_SAVE') AS standby_mode;
+
+  CREATE TEMPORARY TABLE sp_parser_data (id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+  CREATE TEMPORARY TABLE sp_parser_audit (id INT AUTO_INCREMENT PRIMARY KEY, v INT)
+    ENGINE=InnoDB;
+  INSERT INTO sp_parser_data VALUES (1, 10), (2, 20);
+
+  delimiter |;
+  CREATE FUNCTION sp_parser_value(p INT) RETURNS INT DETERMINISTIC NO SQL
+  BEGIN
+    DECLARE extra INT DEFAULT 1 + 1;
+    RETURN p + extra;
+  END|
+  CREATE PROCEDURE sp_parser_run(step INT)
+  BEGIN
+    DECLARE v INT DEFAULT 1 + 1;
+    DECLARE x INT DEFAULT 0;
+    DECLARE total INT DEFAULT 0;
+    DECLARE constant_cursor CURSOR FOR SELECT 7;
+    DECLARE table_cursor CURSOR FOR SELECT SUM(d.v) FROM sp_parser_data AS d;
+    OPEN constant_cursor;
+    FETCH constant_cursor INTO x;
+    CLOSE constant_cursor;
+    IF x = 7 THEN
+      SET v = v + 1;
+    ELSE
+      SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'constant cursor mismatch';
+    END IF;
+    CASE v
+      WHEN 3 THEN SET v = v + 4;
+      ELSE SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'simple CASE mismatch';
+    END CASE;
+    CASE
+      WHEN v = 7 THEN SET v = v + 1;
+      ELSE SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'searched CASE mismatch';
+    END CASE;
+    WHILE v < 10 DO
+      SET v = v + 1;
+    END WHILE;
+    REPEAT
+      SET v = v - 1;
+    UNTIL v = 9 END REPEAT;
+    OPEN table_cursor;
+    FETCH table_cursor INTO total;
+    CLOSE table_cursor;
+    INSERT INTO sp_parser_audit(v) VALUES (sp_parser_value(v) + x + total);
+    UPDATE sp_parser_data AS d SET d.v = d.v + step;
+  END|
+  delimiter ;|
+
+  CALL sp_parser_run(1);
+  CALL sp_parser_run(1);
+  # Reuse cached instructions, then invalidate the table dependency.
+  ALTER TABLE sp_parser_data ADD COLUMN extra INT DEFAULT 0;
+  CALL sp_parser_run(2);
+  SELECT id, v FROM sp_parser_audit ORDER BY id;
+  SELECT id, v, extra FROM sp_parser_data ORDER BY id;
+  DROP PROCEDURE sp_parser_run;
+  DROP FUNCTION sp_parser_value;
+  DROP TEMPORARY TABLE sp_parser_data, sp_parser_audit;
+}
+--enable_query_log

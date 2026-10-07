@@ -7,7 +7,6 @@ gtid-mode=ON
 enforce-gtid-consistency=ON
 rds-preserve-trx-enable=ON
 rds-preserve-trx-temp-id-namespace=ON
-rds-preserve-trx-result-capture-enable=ON
 
 [mysqld.2]
 server_id=2
@@ -18,7 +17,6 @@ gtid-mode=ON
 enforce-gtid-consistency=ON
 rds-preserve-trx-enable=ON
 rds-preserve-trx-temp-id-namespace=ON
-rds-preserve-trx-result-capture-enable=ON
 rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE
 rds-preserve-trx-standby-phase2-scheduler-mode=DEPENDENCY_CONVERGENCE_V1
 rds-preserve-trx-phase1-capture-mode=BOUNDED_PIPELINE_V1

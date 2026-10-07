@@ -26,6 +26,10 @@ flowchart LR
 
 TEMP 的连续捕获由现有 [temp_prebuild](../../../sql/preserve_trx_temp_prebuild.cc) 和 [InnoDB capture](../../../storage/innobase/trx/trx0temp_preserve_capture.cc) 推进；undo 按真实事务 owner 路由，跨空间只维护一份相应 undo 图。
 
+DRAIN 前结果仅保存轻量身份和空引用。Phase1 新结果通过 `preserve_trx_cursor_stream.*` 在原生成功插入后把完整行发布到有界环，既有 worker 同时封装并发送；业务回调没有迁移文件／网络 I/O。receiver 以普通 write/pwrite 接收 OPEN 前缀，不 fsync；保留文件开关、范围记录及重传内容比较。完整结果经最终 DECLARE、SEAL 和值校验后才可标记准备完成。环满或单行过大放弃可选流，保持原生查询正确性；后续捕获若到 final 仍失败，本次 Preserve 也失败。
+
+存量结果和上述回退通过 `preserve_trx_cursor_capture.*` 借用安全命令边界、分段扫描原生物化表，每段恢复 handler 书签、诊断区和 TLS 后归还；封存不占住业务 session。两条路径复用值格式、索引、预算、原 worker 和 final 选择；已传前缀不代表 READY，跨命令也不保留裸 TABLE/PS 引用。细则见详细设计 §6。
+
 结果预传由 [result_pretransfer](../../../sql/preserve_trx_result_pretransfer.cc) 接入原 TEMP worker。无开放 cursor 时跳过 PS map；有 cursor 时仍可能遍历 map 获取稳定 snapshot，不能把整个流程说成 O(1)。已知 PS 的 pointer/is_open 判断本身很小，不等于扫描任意多 PS 没有成本。
 
 ## 3. BASE、DELTA 与最终集合
@@ -34,13 +38,17 @@ TEMP 延续不可变 BASE＋累积 DELTA 和 selected dependency。版本索引�
 
 捕获切轮固定当前版本，同时覆盖后续业务修改；发送端持有稳定文件和 owner。结构、undo 历史或来源失配时按已有条件 fresh/rebuild 或失败，不以频繁全量回退冒充增量验收。
 
+最终文件的 delta 比较仍须读取逻辑内容。E111 的采样发现协调线程逐 4 KiB 读取 BASE 是一个串行热点，因此在原 builder 已计费的固定缓冲中合并相邻文件读取，仍逐 4 KiB 比较和编码。读取量服从原 step 软额度，不跨 step 留缓存，不改变摘要、协议或 image 路径的脏页判定；减少系统调用不代表免除了完整扫描。效果以本轮复测为准。
+
 源格式先与工件合同一致，再产生目标身份转换结果；重定位后页不能被源格式增量直接覆盖。兼容代次复用目标 ID、原生 undo 和私有 DATA writer。跨代复用是否发生、重写字节和失败原因均需观测。
 
 已声明 transport 对象累计留存与 final 最终选择分开：旧结果文件可仍负有封存/清理责任，但不得因此进入最终开放 cursor 集合。最终 [result_manifest](../../../sql/preserve_trx_result_manifest.h) 只含源 ID、generation、大小/摘要、消费位置；TEMP 继续按所选依赖准备。
 
 ```mermaid
 flowchart TB
-    R[同代封存结果文件] --> P[提前传输和 receiver 校验]
+    C[Phase1 有界扫描
+恢复业务位置并归还] --> R[同代封存结果文件]
+    R --> P[提前传输和 receiver 校验]
     A[FETCH 完成到第100行] --> B[FETCH 完成到第200行]
     B --> M[final 只确定最终位置和活结果]
     P --> M
@@ -52,7 +60,9 @@ flowchart TB
 
 ## 4. final、READY、接管各自完成什么
 
-源端按完整命令边界固定 DATA/undo/DD/结果。原 stop purge、T0、closing 顺序不变；没有新的 PS 参数增量阶段。
+源端按完整命令边界固定 DATA/undo/DD/结果。原 stop purge、T0、closing 顺序不变；stop purge 后、T0 前在原截止期内对已有目标执行最后有限结果采样。final 在 freeze/detach 前复用同一核心补齐未封存的活结果；没有新的 PS 参数增量阶段。
+
+最终 TEMP 文件由现有 final target worker 在独占 candidate 时完成增量比较和传输，再经队列交给 coordinator。复用同一个 TEMP stream；coordinator 按既有 presealed 状态跳过已完成对象，不重复比较文件。文件扫描不持传输序号锁，各帧仍按原 session 锁维护线序。任一 worker 失败即沿原 abort／join／源事务恢复路径退出；binlog HWM、FINAL 发布和升主接点不前移。并发暂存按原预算分别计费，不新增线程池或跨线程文件生命周期。
 
 receiver 在 READY 前完成原生 TEMP 资源、SQL 元数据、结果文件/value preflight、decoder、sender 及位置。仅 seal 成功或传输 ACK 不代表准备完成。已有候选必须与 final 身份/摘要吻合才能接管。
 

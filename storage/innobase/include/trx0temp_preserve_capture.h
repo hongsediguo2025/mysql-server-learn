@@ -31,6 +31,8 @@ class trx_preserve_temp_capture_scan {
 #ifndef NDEBUG
   void cancel();
 #endif
+  /** Logical scan length fixed by start(), including trailing zero pages. */
+  uint64_t image_bytes() const;
   uint64_t pages_visited() const;
   uint64_t buffer_pages_read() const;
   uint64_t file_pages_read() const;

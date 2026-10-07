@@ -14,7 +14,11 @@ std::string preserve_trx_temp_candidate_name(
     uint64_t, const std::array<unsigned char, 32> &);
 bool preserve_trx_temp_candidate_object(
     const Preserve_trx_transfer_object_descriptor &);
-
+/** Send one bounded step of an immutable, not yet final-authorized manifest. */
+Preserve_trx_transfer_status preserve_trx_temp_candidate_send_step(
+    Preserve_trx_transfer_source_epoch_session *, uint64_t token,
+    const Preserve_trx_transfer_object_descriptor &, const std::string &payload,
+    size_t byte_budget, bool *complete);
 
 Preserve_trx_transfer_status preserve_trx_temp_transfer_descriptors(
     const std::string &token, const std::string &manifest,
@@ -25,11 +29,13 @@ Preserve_trx_transfer_status preserve_trx_temp_transfer_validate(
     const std::vector<Preserve_trx_transfer_object_descriptor> &objects);
 
 /** Stream frozen source sidecars from one pinned FD per file. The receiver's
-SEAL verifies the capture digest; no source whole-file rehash or payload copy.
+SEAL verifies the capture digest. Final raw images may be encoded as sparse
+BASEs, validating the logical digest during that scan. Update only this portable
+bundle after the wire objects are sealed. Logical source files stay intact.
 An interrupted file follows token/epoch abort, not offset-zero retry. */
 Preserve_trx_transfer_status preserve_trx_temp_transfer_stream(
     Preserve_trx_transfer_source_epoch_session *session, uint64_t token,
-    const std::string &preserve_dir, const std::string &manifest);
+    const std::string &preserve_dir, Preserved_trx_bundle *bundle);
 
 /** Immutable input for one complete temporary-resource manifest. The caller
 supplies an authenticated receiver record; this class does not authenticate

@@ -1,0 +1,3 @@
+--source include/have_openssl.inc
+--let $contract_cursor_transport= tls-compressed
+--source suite/preserve_trx/t/cursor_result_only_strict_resume.test

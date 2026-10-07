@@ -1,0 +1,2 @@
+--let $contract_expect_sparse= 1
+--source suite/preserve_trx/t/temp_capture_native_early.test

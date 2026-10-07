@@ -1,1 +1,1 @@
-receiver rejected corrupt LOB before READY: json_version
+receiver rejected corrupt LOB before SQL RESUME: json_version

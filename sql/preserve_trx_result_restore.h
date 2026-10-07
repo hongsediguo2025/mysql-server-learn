@@ -79,11 +79,17 @@ class Preserve_trx_result_restore {
       THD *, uint32_t source_id, Prepared_statement *);
 };
 
-/** Called by physical replication after replaying this source PS, on its
-restored owner thread before releasing business commands. Original IDs and
-the authoritative replay-record/session mapping are caller responsibilities. */
+/** Called after successful RESUME and replay of this source PS, before business
+commands are released. current_thd remains the caller, possibly a separate
+control session; diagnostics belong to that caller. All restored resources and
+the FETCH protocol are bound to target_thd.
+The caller must keep the target THD, registered PS and protocol alive and
+exclusively owned for the whole call: no concurrent commands, PS map changes or
+session cleanup. This API does not acquire session ownership or switch TLS.
+Original IDs and the authoritative replay-record/session mapping are caller
+responsibilities. */
 Preserve_cursor_attach_status preserve_trx_attach_cursor_after_ps_replay(
-    THD *, uint32_t source_statement_id, Prepared_statement *target_ps);
+    THD *target_thd, uint32_t source_statement_id, Prepared_statement *target_ps);
 
 #ifndef NDEBUG
 bool preserve_trx_cursor_test_command(THD *, const char *, size_t);

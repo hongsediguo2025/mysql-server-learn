@@ -2,6 +2,7 @@
 default-authentication-plugin=mysql_native_password
 
 [mysqld.1]
+# Exercise native CLOSE cleanup for statements without an open result.
 server-id=1
 
 [mysqld.2]

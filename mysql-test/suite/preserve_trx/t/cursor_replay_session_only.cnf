@@ -10,7 +10,6 @@ gtid-mode=ON
 enforce-gtid-consistency=ON
 rds-preserve-trx-enable=ON
 rds-preserve-trx-temp-id-namespace=ON
-rds-preserve-trx-result-capture-enable=ON
 
 [ENV]
 SERVER_MYPORT_2=@mysqld.1.port

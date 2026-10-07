@@ -62,7 +62,8 @@ bool preserve_trx_recovery_payload_valid(const Preserve_snapshot_metadata &m) {
              m.session_participant_order.empty() &&
              m.binlog_state != Preserve_snapshot_binlog_state::LOGGED_WITH_CACHE &&
              !m.has_logged_persistent_work &&
-             (!m.temp_table_manifest_payload.empty() || !m.cursor_manifest_payload.empty());
+             (!m.temp_table_manifest_payload.empty() || !m.cursor_manifest_payload.empty() ||
+              (m.recovery.explicit_begin && m.recovery.sql_transaction_active));
     default:
       return true;
   }

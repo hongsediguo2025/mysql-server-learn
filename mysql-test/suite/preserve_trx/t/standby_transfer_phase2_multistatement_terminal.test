@@ -27,12 +27,12 @@ if ($sync_warnings)
 --connection multi_commit
 delimiter ||;
 --send
-COMMIT; UPDATE t_phase2_multi SET v=901 WHERE id=3||
+COMMIT||
 delimiter ;||
 --connection multi_rollback
 delimiter ||;
 --send
-ROLLBACK; UPDATE t_phase2_multi SET v=902 WHERE id=3||
+ROLLBACK||
 delimiter ;||
 --connection multi_ha
 SET DEBUG_SYNC='now WAIT_FOR multi_commit_body TIMEOUT 5';
@@ -52,18 +52,16 @@ SET DEBUG_SYNC='now SIGNAL multi_terminal_continue';
 --enable_result_log
 --enable_info
 --connection multi_commit
---error ER_PRESERVE_TRX_SESSION_DRAINED
 --reap
 --connection multi_rollback
---error ER_PRESERVE_TRX_SESSION_DRAINED
 --reap
 --disable_info
 --disable_result_log
 --error ER_PRESERVE_TRX_SESSION_DRAINED
-SELECT 1;
+UPDATE t_phase2_multi SET v=902 WHERE id=3;
 --connection multi_commit
 --error ER_PRESERVE_TRX_SESSION_DRAINED
-SELECT 1;
+UPDATE t_phase2_multi SET v=901 WHERE id=3;
 --connection default
 --reap
 --connection multi_ha

@@ -181,6 +181,7 @@ void thd_increment_bytes_sent(size_t length) {
 void thd_increment_bytes_received(size_t length) {
   THD *thd = current_thd;
   if (likely(thd != nullptr)) {
+    preserve_trx_cursor_end_read(thd);
     (void)preserved_trx_wait_if_batch_session_quiesced(thd);
     thd->status_var.bytes_received += length;
   }
@@ -188,8 +189,10 @@ void thd_increment_bytes_received(size_t length) {
 
 void thd_wait_if_preserve_trx_batch_session_quiesced() {
   THD *thd = current_thd;
-  if (likely(thd != nullptr))
+  if (likely(thd != nullptr)) {
+    preserve_trx_cursor_end_read(thd);
     (void)preserved_trx_wait_if_batch_session_quiesced(thd);
+  }
 }
 
 partition_info *thd_get_work_part_info(THD *thd) { return thd->work_part_info; }

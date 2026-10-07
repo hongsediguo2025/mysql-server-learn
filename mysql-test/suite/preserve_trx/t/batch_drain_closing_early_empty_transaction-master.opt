@@ -1,1 +1,3 @@
 --rds-preserve-trx-standby-phase2-scheduler-mode=DEPENDENCY_CONVERGENCE_V1
+# Keep legacy empty-BEGIN classification; namespace ON supports NONE recovery.
+--rds-preserve-trx-temp-id-namespace=OFF

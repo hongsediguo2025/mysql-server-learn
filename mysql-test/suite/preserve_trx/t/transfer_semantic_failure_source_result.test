@@ -1,0 +1,22 @@
+--source include/not_windows.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+--disable_query_log
+--let $credential_file= $MYSQL_TMP_DIR/semantic.secret
+--write_file $credential_file
+semantic-secret
+EOF
+--exec chmod 600 $credential_file
+--connect(semantic_receiver,127.0.0.1,root,,test,$SERVER_MYPORT_2,)
+CREATE USER semantic_transfer@localhost IDENTIFIED BY 'semantic-secret';
+GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.* TO semantic_transfer@localhost;
+--connection default
+CREATE USER semantic_app@localhost;
+GRANT SELECT,INSERT,UPDATE,DELETE,CREATE TEMPORARY TABLES ON test.* TO semantic_app@localhost;
+--let $restart_parameters= restart: --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$SERVER_MYPORT_2 --rds-preserve-trx-transfer-target-user=semantic_transfer --rds-preserve-trx-transfer-credential-name=semantic --rds-preserve-trx-transfer-credential-secret-file=$credential_file --rds-preserve-trx-standby-phase2-scheduler-mode=DEPENDENCY_CONVERGENCE_V1 --rds-preserve-trx-phase1-capture-mode=BOUNDED_PIPELINE_V1
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--disable_query_log
+--let $source_port= `SELECT @@port`
+--exec python3 $MYSQL_TEST_DIR/../scripts/preserve_trx_semantic_failure_e2e.py --port=$source_port --receiver-port=$SERVER_MYPORT_2 --source-resource=result --receiver-log=$MYSQLTEST_VARDIR/log/mysqld.2.err

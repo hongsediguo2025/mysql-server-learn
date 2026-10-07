@@ -139,6 +139,12 @@ class SealAckBarrier:
         self.group = None
         self.group_lock = threading.Lock()
         self.retry = None
+        self.observed_chunks = []
+        self.observed_seals = []
+        self.temp_requests, self.temp_frames = {}, {}
+        self.temp_multi_kinds, self.tracked_sequences = set(), {}
+        self.drop_query_ack = False
+        self.query_dropped = False
         self.match = b".undo.delta."
         self.stopped = threading.Event()
         self.held = threading.Event()
@@ -155,48 +161,83 @@ class SealAckBarrier:
             self.groups.append(gate)
         return gate
 
-    def arm_retry(self, token):
+    def arm_retry(self, token, result=False):
         self.retry = dict(token=token, key=None, end=0, connection=None,
-                          drop=None, replayed=False, continued=False, sealed=False)
+                          drop=None, replayed=False, continued=False, sealed=False,
+                          result=result, lengths=[])
 
-    def retry_ack(self, request, packet, connection):
-        raw, key, kind, offset, length = request
-        assert packet[0] == 0, packet
-        _, pos = length_encoded(packet, 1)
-        _, pos = length_encoded(packet, pos)
-        size, pos = length_encoded(packet, pos + 4)
-        assert pos + size == len(packet)
-        version, _, sequence = struct.unpack_from("<HHQ", raw, 8)
-        check_ack(bytes.fromhex(packet[pos:].decode()), raw, key[0], version,
-                  sequence, key[1])
+    def retry_ack(self, raw, parsed, connection):
+        # The relay has already authenticated the whole payload's ACK. Retries
+        # are whole payloads too, including every CHUNK and optional SEAL.
         with self.group_lock:
             state = self.retry
-            if state["key"] is None:
-                assert kind == 2 and offset == 0
-                state["key"] = key
-            if key != state["key"]:
+            if state is None:
                 return False
-            dropped = state["drop"]
-            if kind == 3:
-                state["sealed"] = True
+            items = [f for f in parsed if f['token'] == state['token'] and
+                     f['kind'] in (2, 3) and
+                     (f['artifact'].startswith('ps_result_') if state['result']
+                      else f['artifact'].endswith('.undo'))]
+            if not items:
                 return False
-            if dropped and sequence == dropped["sequence"]:
-                assert raw == dropped["raw"] and connection != dropped["connection"]
-                assert not state["replayed"]
-                state["replayed"] = True
-            else:
-                assert offset == state["end"], (offset, state)
+            first = items[0]
+            key = (first['epoch'], first['nonce'], first['token'], first['artifact'])
+            if state['key'] is None:
+                assert first['kind'] == 2 and first['offset'] == 0
+                state['key'] = key
+            if key != state['key']:
+                return False
+            chunks = [f for f in items if f['kind'] == 2]
+            dropped = state['drop']
+            sequence = parsed[-1]['sequence']
+            if dropped and sequence == dropped['sequence']:
+                assert raw == dropped['raw'] and connection != dropped['connection']
+                assert not state['replayed']
+                state['replayed'] = True
+            elif chunks:
+                offset = chunks[0]['offset']
+                assert offset == state['end'], (offset, state)
                 if dropped:
-                    assert state["replayed"] and offset > dropped["offset"]
-                    state["continued"] = True
+                    assert state['replayed'] and offset > dropped['offset']
+                    state['continued'] = True
                 elif offset > 0:
-                    assert connection == state["connection"]
-                    state["drop"] = dict(raw=raw, sequence=sequence, offset=offset,
-                                         connection=connection)
-                    return True  # Close both sockets without forwarding this ACK.
-            state["end"] = offset + length
-            state["connection"] = connection
+                    assert connection == state['connection']
+                    state['drop'] = dict(raw=raw, sequence=sequence, offset=offset,
+                                         connection=connection, chunks=len(chunks))
+                    return True  # Lose this entire real ACK, then require exact retry.
+            for f in chunks:
+                assert f['offset'] == state['end'], (f, state)
+                state['end'] += len(f['chunk'])
+                state['lengths'].append(len(f['chunk']))
+            state['connection'] = connection
+            state['sealed'] |= any(f['kind'] == 3 for f in items)
         return False
+
+    def verify_temp_batches(self):
+        with self.group_lock:
+            requests, frames = dict(self.temp_requests), dict(self.temp_frames)
+            families = set(self.temp_multi_kinds)
+            sequences = dict(self.tracked_sequences)
+        assert families == {'data', 'undo'}, families
+        epochs = {}
+        for epoch, nonce, sequence in sequences:
+            epochs.setdefault((epoch, nonce), []).append(sequence)
+        for sequence in epochs.values():
+            ordered = sorted(sequence)
+            assert ordered == list(range(1, ordered[-1] + 1)), ordered
+        chunks = sum(f['kind'] == 2 for f in frames.values())
+        assert requests and max(requests.values()) >= 2, 'TEMP multi-CHUNK batch absent'
+        assert len(requests) < chunks, (len(requests), chunks)
+        offsets = {}
+        for _, f in sorted(frames.items()):
+            key = (f['epoch'], f['nonce'], f['token'], f['artifact'])
+            if f['kind'] == 9:
+                offsets[key] = 0
+            elif f['kind'] == 2:
+                assert f['offset'] == offsets[key], (f, offsets[key])
+                offsets[key] += f['length']
+        if os.environ.get('MYSQLTEST_VARDIR'):
+            (Path(os.environ['MYSQLTEST_VARDIR']) / 'log' / 'temp-batches.txt').write_text(
+                str(dict(requests=len(requests), chunks=chunks, max_chunks=max(requests.values()))))
 
     def verify_retry(self):
         state = self.retry
@@ -224,65 +265,82 @@ class SealAckBarrier:
             self.errors.append(repr(exc))
 
     def forward(self, client, connection):
+        # Imported at runtime: the observer reuses this class as its base.
+        from preserve_trx_pipeline_observer import frames, ack
         try:
             with client, socket.create_connection(("127.0.0.1", self.target), timeout=5) as backend:
                 client.settimeout(5)
-                pending = False
-                pending_retry = None
+                pending = None
                 while not self.stopped.is_set():
                     readable, _, _ = select.select([client, backend], [], [], 0.1)
                     for sender in readable:
                         seq, payload = AckRelay.packet(sender)
-                        if sender is client and seq == 0 and payload[:9] == b"\x21PTRXOFR1":
-                            raw = payload[1:]
-                            kind = struct.unpack_from("<H", raw, 10)[0]
-                            pos = 20
-                            identity = []
-                            for _ in range(2):  # epoch and receiver nonce
-                                size = struct.unpack_from("<I", raw, pos)[0]
-                                identity.append(raw[pos + 4:pos + 4 + size].decode())
-                                pos += 4 + size
-                            token = struct.unpack_from("<Q", raw, pos)[0]
-                            size = struct.unpack_from("<I", raw, pos + 8)[0]
-                            name = raw[pos + 12:pos + 12 + size]
-                            if self.retry and token == self.retry["token"] and kind in (2, 3) and name.endswith(b".undo"):
-                                name_end = pos + 12 + size
-                                offset = struct.unpack_from("<Q", raw, name_end)[0]
-                                length = 0
-                                if kind == 2:
-                                    assert struct.unpack_from("<H", raw, 8)[0] == 2
-                                    body = name_end + 116
-                                    manifest_size = struct.unpack_from("<I", raw, body)[0]
-                                    length = struct.unpack_from("<I", raw, body + 4 + manifest_size)[0]
-                                pending_retry = (raw, (*identity, token, name), kind, offset, length)
-                            pending = (kind == 3 and token == self.token and
-                                       self.match in name and not self.held.is_set())
-                            with self.group_lock:
-                                gate = self.group
-                                if gate and kind == 3 and token in gate["tokens"] and (
-                                        name.endswith(gate["match"]) if gate["suffix"] else gate["match"] in name):
-                                    pending = (gate, token)
-                        if sender is backend and pending_retry:
-                            if self.retry_ack(pending_retry, payload, connection):
-                                return
-                            pending_retry = None
-                        if sender is backend and pending:
-                            assert payload[0] == 0, payload
-                            if isinstance(pending, tuple):
-                                gate, owner = pending
+                        if sender is client and seq == 0 and payload[:1] == b'\x21':
+                            assert pending is None
+                            parsed = frames(payload[1:])
+                            if len(parsed) > 1:
+                                first = parsed[0]
+                                assert all(f['epoch'] == first['epoch'] and f['nonce'] == first['nonce'] and
+                                           f['sequence'] == first['sequence'] + i for i, f in enumerate(parsed))
+                            pending = (payload[1:], parsed)
+                        if sender is backend and pending is not None:
+                            raw, parsed = pending
+                            status = -1 if payload[0] == 255 else ack(payload, raw, parsed[-1])
+                            if self.drop_query_ack and parsed[-1]['kind'] == 13:
                                 with self.group_lock:
-                                    first = owner not in gate["seen"]
-                                    gate["seen"].add(owner)
-                                    hold = first and gate["seen"] == gate["tokens"]
-                                if hold:
-                                    gate["last"] = owner
-                                    gate["held"].set()
-                                    assert gate["release"].wait(30), "owner SEAL ACK barrier timed out"
-                            else:
-                                release = self.release
-                                self.held.set()
-                                assert release.wait(30), "SEAL ACK barrier timed out"
-                            pending = False
+                                    drop = not self.query_dropped
+                                    self.query_dropped = True
+                                if drop:
+                                    assert payload[0] == 0, payload
+                                    return
+                            if status == 0:
+                                if self.retry_ack(raw, parsed, connection):
+                                    return
+                                request_digest = hashlib.sha256(raw).hexdigest()
+                                temp_chunks = sum(f['kind'] == 2 and '.tempts.' in f['artifact'] for f in parsed)
+                                with self.group_lock:
+                                    for family in ('data', 'undo'):
+                                        if sum(f['kind'] == 2 and '.tempts.' in f['artifact'] and
+                                               ('.undo' in f['artifact']) == (family == 'undo') for f in parsed) >= 2:
+                                            self.temp_multi_kinds.add(family)
+                                for item in parsed:
+                                    kind, token = item['kind'], item['token']
+                                    name = item['artifact'].encode()
+                                    key = (item['epoch'], item['nonce'], token, name)
+                                    with self.group_lock:
+                                        if kind in (1, 2, 3, 4, 5, 8, 9):
+                                            sequence_key = (item['epoch'], item['nonce'], item['sequence'])
+                                            assert self.tracked_sequences.setdefault(sequence_key, item['frame_sha']) == item['frame_sha']
+                                        if '.tempts.' in item['artifact'] and kind in (2, 3, 9):
+                                            identity = (item['epoch'], item['nonce'], item['sequence'])
+                                            value = dict(item, length=len(item['chunk']))
+                                            value.pop('chunk')
+                                            prior = self.temp_frames.setdefault(identity, value)
+                                            assert prior == value
+                                            self.temp_requests[request_digest] = temp_chunks
+                                        if name.startswith(b'ps_result_'):
+                                            if kind == 2:
+                                                self.observed_chunks.append((key, item['offset'], item['chunk']))
+                                            elif kind == 3:
+                                                self.observed_seals.append(key)
+                                        gate = self.group
+                                        group_match = gate and kind == 3 and token in gate['tokens'] and (
+                                            name.endswith(gate['match']) if gate['suffix'] else gate['match'] in name)
+                                        if group_match:
+                                            first = token not in gate['seen']
+                                            gate['seen'].add(token)
+                                            hold = first and gate['seen'] == gate['tokens']
+                                        else:
+                                            hold = False
+                                    if hold:
+                                        gate['last'] = token
+                                        gate['held'].set()
+                                        assert gate['release'].wait(30), 'owner SEAL ACK barrier timed out'
+                                    elif not group_match and kind == 3 and token == self.token and self.match in name and not self.held.is_set():
+                                        release = self.release
+                                        self.held.set()
+                                        assert release.wait(30), 'SEAL ACK barrier timed out'
+                            pending = None
                         AckRelay.send(backend if sender is client else client, seq, payload)
         except (EOFError, ConnectionResetError, BrokenPipeError):
             pass
@@ -308,11 +366,11 @@ def string(value):
 
 
 def frame(epoch, version=3, contract=CONTRACT, kind=11, nonce="", sequence=0,
-          token=17, terminal_digest=bytes(32)):
+          token=17, terminal_digest=bytes(32), object_id=""):
     payload = bytes(12)  # Three empty length-prefixed strings.
     header = b"PTRXOFR1" + struct.pack("<HHQ", version, kind, sequence)
     header += string(epoch) + string(nonce)
-    header += struct.pack("<Q", 0 if kind == 11 else token) + string("")
+    header += struct.pack("<Q", 0 if kind == 11 else token) + string(object_id)
     header += struct.pack("<QQQQQ", 0, 0, 0, 0, 60000000 if kind == 11 else 0)
     assert len(terminal_digest) == 32
     header += terminal_digest
@@ -334,7 +392,7 @@ def exchange(client, payload):
     return bytes.fromhex(packet[pos:].decode())
 
 
-def check_ack(raw, payload, epoch, version, sequence=0, nonce=None):
+def check_ack(raw, payload, epoch, version, sequence=0, nonce=None, expected_status=0):
     assert raw[:8] == b"PTRXOAK1", raw
     assert zlib.crc32(raw[:-4]) == struct.unpack("<I", raw[-4:])[0]
     assert struct.unpack_from("<H", raw, 8)[0] == version
@@ -354,7 +412,7 @@ def check_ack(raw, payload, epoch, version, sequence=0, nonce=None):
     pos += 32
     status, retention = struct.unpack_from("<HQ", raw, pos)
     pos += 10
-    assert status == 0 and retention == (60000000 if sequence == 0 else 0)
+    assert status == expected_status and retention == (60000000 if sequence == 0 else 0)
     if version == 3:
         assert struct.unpack_from("<HHQQQ", raw, pos) == CONTRACT
         pos += 28
@@ -377,6 +435,29 @@ def check_batch_identity(connect):
         header = (b"PTRXOBT1" + struct.pack("<HIQ", 2, len(frames), len(payload))
                   + hashlib.sha256(payload).digest())
         return header + struct.pack("<I", zlib.crc32(header)) + payload
+
+    # A progress query is authenticated but does not consume data admission.
+    wire = connect()
+    epoch = "resource-progress-read-only"
+    opened = frame(epoch)
+    nonce = check_ack(exchange(wire, opened), opened, epoch, 3)
+    query = frame(epoch, version=2, kind=13, nonce=nonce, sequence=1,
+                  object_id="pending_candidate")
+    check_ack(exchange(wire, query), query, epoch, 2, 1, nonce, expected_status=13)
+    rejected(wire, batch([query]), 4019)
+    rejected(wire, frame(epoch, version=2, kind=13, nonce=nonce, sequence=0,
+                         object_id="pending_candidate"), 4019)
+    rejected(wire, frame(epoch, version=2, kind=13, nonce="0" * 32, sequence=1,
+                         object_id="pending_candidate"), 4019)
+    rejected(wire, batch([query, query]), 4019)
+    for changes in ({"token": 0}, {"object_id": ""}, {"object_id": "../bad"},
+                    {"version": 3}):
+        fields = dict(epoch=epoch, version=2, kind=13, nonce=nonce,
+                      sequence=1, object_id="pending_candidate")
+        fields.update(changes)
+        rejected(wire, frame(**fields), 4019)
+    valid = frame(epoch, version=2, kind=8, nonce=nonce, sequence=1)
+    check_ack(exchange(wire, valid), valid, epoch, 2, 1, nonce)
 
     # Every bad request is followed by valid sequence 1: rejection must not
     # consume admission state. Repeated valid ACKs must bind the complete batch.
@@ -495,24 +576,120 @@ def run(port, enabled):
     print("temporary allocator contract: namespace=" + str(enabled) + " passed")
 
 
+def read_temp_image(path):
+    data = path.read_bytes()
+    if not path.name.endswith('.image.sparse.part'):
+        return data
+    assert data[:8] == b'PTRISPR1' and data[20:60] == bytes(40)
+    assert struct.unpack_from('<I', data, 100)[0] == 4096
+    token, space = struct.unpack_from('<QI', data, 8)
+    assert path.name == f'{token}.tempts.{space}.image.sparse.part'
+    size = struct.unpack_from('<Q', data, 60)[0]
+    assert len(data) < size <= 128*1024*1024
+    result = bytearray(size)
+    pos, previous = 104, 0
+    while True:
+        at, length = struct.unpack_from('<QI', data, pos)
+        pos += 12
+        if at == 2**64-1:
+            assert length == 0 and pos == len(data)
+            break
+        assert at >= previous and at % 4096 == 0 and at < size
+        assert length == min(4096, size-at) and pos+length <= len(data)
+        result[at:at+length] = data[pos:pos+length]
+        pos += length
+        previous = at+length
+    assert hashlib.sha256(result).digest() == data[68:100]
+    return bytes(result)
+
+
+def first_cursor_stream(connect, port, control, receiver_dir, barrier, worker):
+    """New Phase1 session, no user TEMP/transaction/previous cursor or token."""
+    app = connect(port)
+    gate = "first_cursor_" + str(app.id)
+    ids = " UNION ALL ".join("SELECT %d AS id" % n for n in range(1, 129))
+    sql = ("SELECT CAST(id AS SIGNED),IF(id%3=0,NULL,"
+           "LEFT(REPEAT(_binary 0x00ff,32768),IF(id%3=1,0,4096))) FROM (" + ids +
+           ") d WHERE IF(id=9,IF(GET_LOCK('" + gate +
+           "',120)=1,RELEASE_LOCK('" + gate + "'),0),1)")
+    statement = app.prepare(sql)
+    assert control.query("SELECT GET_LOCK('" + gate + "',0)") == [["1"]]
+    outcome = []
+    def execute():
+        try:
+            outcome.append(app.execute(statement, [], cursor=True))
+        except BaseException as exc:
+            outcome.append(exc)
+    producer = threading.Thread(target=execute, daemon=True)
+    producer.start()
+    deadline = time.monotonic() + 15
+    matches = []
+    try:
+        while not matches:
+            assert producer.is_alive() and worker.is_alive() and time.monotonic() < deadline, outcome
+            with barrier.group_lock:
+                matches = [c for c in barrier.observed_chunks if c[0][2] == app.id
+                           and c[0][3].startswith(("ps_result_" + str(statement) + "_").encode())
+                           and b'\x00\xff' * 128 in c[2]]
+            time.sleep(.005)
+        assert control.query("SELECT LOCK_STATUS FROM performance_schema.metadata_locks l "
+            "JOIN performance_schema.threads t ON l.OWNER_THREAD_ID=t.THREAD_ID WHERE t.PROCESSLIST_ID=" +
+            str(app.id) + " AND l.OBJECT_TYPE='USER LEVEL LOCK' AND l.OBJECT_NAME='" + gate +
+            "' AND l.LOCK_STATUS='PENDING'") == [["PENDING"]]
+        keys = {c[0] for c in matches}
+        assert len(keys) == 1
+        for key, offset, data in matches:
+            part = receiver_dir / '.transfer' / key[0] / str(app.id) / (key[3].decode() + '.part')
+            with part.open('rb') as f:
+                f.seek(offset)
+                assert f.read(len(data)) == data
+    finally:
+        assert control.query("SELECT RELEASE_LOCK('" + gate + "')") == [["1"]]
+        producer.join(30)
+    assert not producer.is_alive() and len(outcome) == 1 and not isinstance(outcome[0], BaseException), outcome
+    # A native BLOB column exercises null, zero-length and embedded zero bytes.
+    assert outcome[0][0][1][-6] == 252, outcome[0][0][1]
+    while True:
+        with barrier.group_lock:
+            if keys <= set(barrier.observed_seals):
+                break
+        assert worker.is_alive() and time.monotonic() < deadline, 'first cursor did not seal'
+        time.sleep(.005)
+    rows = app.fetch_rows(statement, 129)
+    assert len(rows) == 128 and app.last_row_status & 128
+    for n, row in enumerate(rows, 1):
+        assert row[0] == 0 and int.from_bytes(row[2:10], 'little') == n
+        if n % 3 == 0:
+            assert row[1] == 8 and len(row) == 10
+        else:
+            length, pos = length_encoded(row, 10)
+            value = b'' if n % 3 == 1 else b'\x00\xff' * 2048
+            assert row[1] == 0 and length == len(value) and row[pos:] == value
+    app.close_statement(statement)
+    app.query("DO 0")
+    app.close()
+
+
 def run_source(port, receiver_port, enabled, relay_port=None, mutation=None,
                temporary=None, ready=False, resume=None, engine="mixed", isolation="rc", transaction="explicit",
                large_undo=False, autoincrement=False, temp_history=None,
                column_shapes=None, commit_resume=False, lob_fault=None, lob_trace=None,
                dependency_free_ps=False, virtual_fault=None, prebuild_workers=None,
                gc_probe=False, no_response_tail=False, continuous_capture=False,
-               ps_capture_disabled=False, stage_metrics=False,
+               ps_temp_disabled=False, stage_metrics=False,
                early_results=None, independent_undo=False,
                savepoint_reuse=False, expect_early_undo=False,
                early_undo_supersede=False, early_undo_abandon=False,
                undo_page_cache=False, undo_cache_invalidate=False, undo_delta=False,
                undo_delta_fault=None, native_early=False, native_rollback=False, undo_owner_case=None,
-               close_partial=False, close_replay=False, native_spill=False):
+               close_partial=False, close_replay=False, native_spill=False, query_ack_loss=False,
+               expect_sparse=False, native_final_tail=False, require_temp_batches=False, temp_batch_retry=False):
     """Use production transport and optionally the actual receiver READY worker."""
     drain_sql = "DRAIN TRANSACTIONS PRESERVE"
     with ExitStack() as stack:
         quiet_undo_tail = savepoint_reuse or expect_early_undo or native_early
         capture_window = native_early or bool(early_results)
+        execute_stream = (early_results or "").startswith("execute-stream")
         assert not early_undo_supersede or expect_early_undo
         assert not undo_page_cache or early_undo_supersede
         assert not undo_cache_invalidate or undo_page_cache
@@ -534,6 +711,7 @@ def run_source(port, receiver_port, enabled, relay_port=None, mutation=None,
         barrier = None
         if undo_delta or capture_window or undo_owner_case:
             barrier = SealAckBarrier(relay_port, receiver_port)
+            barrier.drop_query_ack = query_ack_loss
             stack.callback(barrier.close)
         accepted = enabled and relay is None
         def connect(server, user="root", password=""):
@@ -551,35 +729,39 @@ def run_source(port, receiver_port, enabled, relay_port=None, mutation=None,
         app = connect(port, "temp_contract_app")
         receiver = (connect(receiver_port, "preserve_trx_ha_admin", "temp-contract-secret")
                     if ready else connect(receiver_port))
+        prepared_query = "SHOW GLOBAL STATUS LIKE 'Preserve_trx_temp_stage_receiver_prepared_calls'"
+        prepared_before = int(receiver.query(prepared_query)[0][1])
+
+        def wait_receiver_completion():
+            # READY permits a TEMP tail; retiring staging alone is not success.
+            deadline = time.monotonic() + 20
+            query = "SHOW GLOBAL STATUS LIKE 'Preserve_trx_transfer_receiver_inflight_tokens'"
+            while int(receiver.query(query)[0][1]):
+                assert time.monotonic() < deadline, receiver.query(
+                    "SHOW GLOBAL STATUS LIKE 'Preserve_trx_transfer_receiver%'")
+                time.sleep(.01)
+            if temporary and temporary != "begin-only":
+                assert int(receiver.query(prepared_query)[0][1]) == prepared_before + 1, \
+                    "READY resource candidate did not complete successfully"
+
         def resource_stages(client):
             prefix = "Preserve_trx_temp_stage_"
             values = {name[len(prefix):]: int(value) for name, value in
                       client.query("SHOW GLOBAL STATUS LIKE '" + prefix + "%'")}
             assert "receiver_image_read_bytes" in values, "resource stage counters missing"
             return values
-        def final_samples():
-            samples = {}
-            for path in (Path(os.environ["MYSQLTEST_VARDIR"]) / "log").glob("mysqld*.err"):
-                for line in path.read_text(errors="replace").splitlines():
-                    if "PRESERVE_TEMP_FINAL_V1 " in line:
-                        sample = dict(part.split("=", 1) for part in line.split() if "=" in part)
-                        samples[sample["epoch_id"]] = sample
-            return samples
         if stage_metrics:
             assert prebuild_workers and ready and resume == "success" and large_undo
             stages_source_before = resource_stages(ha)
             stages_receiver_before = resource_stages(receiver)
             assert "first_dml_calls" in stages_source_before, "W11 first DML instrumentation missing"
-            prior_final_epochs = set(final_samples())
             if stage_metrics == "success":
                 admin.query("CREATE PROCEDURE test.p_w11_metrics() SQL SECURITY INVOKER UPDATE test.t_contract_source SET v=v+13 WHERE id=63")
                 admin.query("GRANT EXECUTE ON PROCEDURE test.p_w11_metrics TO preserve_trx_ha_admin@localhost")
-        if negative_delta:
-            failure_stages_before = resource_stages(receiver)
         assert admin.query("SELECT @@global.rds_preserve_trx_temp_id_namespace") == [["1"]]
         assert receiver.query("SELECT @@global.rds_preserve_trx_temp_id_namespace") == [[str(enabled)]]
         receiver.query("SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=ON")
-        if undo_delta_fault == "retry":
+        if undo_delta_fault == "retry" or temp_batch_retry:
             barrier.arm_retry(app.id)
         if native_early:
             native_id_trace = Path(os.environ["MYSQLTEST_VARDIR"]) / "log" / "native-generation-ids.trace"
@@ -589,7 +771,7 @@ def run_source(port, receiver_port, enabled, relay_port=None, mutation=None,
             receiver.query("SET GLOBAL debug='+d,preserve_temp_delta_validation:O," + str(delta_trace) + "'")
         if undo_owner_case:
             from preserve_trx_temp_owners_e2e import run_owners
-            run_owners(undo_owner_case, connect, port, admin, ha, app, receiver, barrier)
+            run_owners(undo_owner_case, connect, port, admin, ha, app, receiver, barrier, read_temp_image)
             return
         if expect_early_undo:
             def undo_status(name):
@@ -607,7 +789,8 @@ def run_source(port, receiver_port, enabled, relay_port=None, mutation=None,
             if early_undo_abandon:
                 receiver.query("SET GLOBAL debug='+d,preserve_temp_undo_early_abandon_after_batch'")
         if early_results:
-            assert continuous_capture and ready and resume == "success"
+            assert continuous_capture and ready and (resume == "success" or
+                (execute_stream and port != receiver_port))
             receiver.query("SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=OFF")
             def result_status(client, name):
                 return int(client.query("SHOW GLOBAL STATUS LIKE 'Preserve_trx_result_" + name + "'")[0][1])
@@ -618,7 +801,7 @@ def run_source(port, receiver_port, enabled, relay_port=None, mutation=None,
             def preflight_rows():
                 return int(receiver.query("SHOW GLOBAL STATUS LIKE 'Preserve_trx_cursor_preflight_rows'")[0][1])
             preflight_before = preflight_rows()
-            large_result = early_results in ("large", "abandon")
+            large_result = execute_stream or early_results in ("large", "abandon", "multi-generation")
             if early_results == "abandon":
                 receiver.query("SET GLOBAL debug='+d,preserve_cursor_early_abandon_after_batch'")
         receiver.query("CREATE TEMPORARY TABLE tmp_contract_reader(id INT PRIMARY KEY,v INT) ENGINE=InnoDB")
@@ -635,7 +818,7 @@ def run_source(port, receiver_port, enabled, relay_port=None, mutation=None,
         admin.query("INSERT INTO t_contract_source WITH RECURSIVE s(n) AS "
                     "(SELECT 1 UNION ALL SELECT n+1 FROM s WHERE n<64) "
                     "SELECT n,n*10,REPEAT('x',512) FROM s")
-        has_user_temp = temporary and temporary not in ("cursor-only", "ps-only")
+        has_user_temp = temporary and temporary not in ("cursor-only", "ps-only", "begin-only")
         if has_user_temp:
             assert accepted
             auto_clause = " AUTO_INCREMENT" if autoincrement else ""
@@ -836,15 +1019,33 @@ def run_source(port, receiver_port, enabled, relay_port=None, mutation=None,
             app.execute(statement, [], cursor=True)
             assert fetch_cursor(app, statement, 10) == list(range(1, 11))
         if early_results and large_result:
-            large_statement = app.prepare("SELECT id,pad FROM tmp_stream ORDER BY id")
+            stream_proof = None
+            large_row_count = 128 if execute_stream else 4096
+            large_pad = b'a'
+            large_sql = "SELECT id,pad FROM tmp_stream ORDER BY id"
+            if execute_stream:
+                stream_gate = "cursor_producer_" + str(app.id)
+                value = ("IF(id=9,REPEAT(LEFT(pad,1),1048576),pad)" if early_results == "execute-stream-oversize" else "pad")
+                large_sql = ("SELECT id," + value + " AS pad FROM tmp_stream FORCE INDEX(PRIMARY) "
+                             "WHERE id<=128 AND IF(id=9,IF(GET_LOCK('" + stream_gate +
+                             "',120)=1,RELEASE_LOCK('" + stream_gate + "'),0),1) ORDER BY id")
+                assert all("filesort" not in (row[-1] or "").lower() for row in app.query("EXPLAIN " + large_sql))
+            killer = connect(port) if early_results == "execute-stream-error" else None
+            if early_results == "execute-stream-spill":
+                app.query("SET SESSION internal_tmp_mem_storage_engine=MEMORY,tmp_table_size=16384,max_heap_table_size=16384")
+            large_statement = app.prepare(large_sql)
             app.execute(large_statement, [], cursor=True)
             def fetch_large(client, count):
                 rows = client.fetch_rows(large_statement, count)
                 for row in rows:
-                    assert row[:2] == b'\0\0' and row[6:9] == b'\xfc\x00\x10', row[:16]
-                    assert row[9:] == b'a' * 4096, "result was rebuilt from changed TEMP data"
+                    assert row[:2] == b'\0\0', row[:16]
+                    row_id = int.from_bytes(row[2:6], 'little')
+                    length, pos = length_encoded(row, 6)
+                    wanted = 1048576 if early_results == "execute-stream-oversize" and row_id == 9 else 4096
+                    assert length == wanted and row[pos:] == large_pad * wanted, "result was rebuilt from changed TEMP data"
                 return [int.from_bytes(row[2:6], 'little') for row in rows]
             assert fetch_large(app, 1) == [1]
+            large_fetched = 1
         if temporary == "ps-only":
             assert engine == "resources" and ready and resume in ("success", "result-stage")
             # No TEMP table, active transaction or cursor may hide this PS.
@@ -860,7 +1061,8 @@ def run_source(port, receiver_port, enabled, relay_port=None, mutation=None,
         if transaction == "empty":
             assert engine == "resources"
             app.query("START TRANSACTION")
-            app.query("SAVEPOINT before_drain")
+            if temporary != "begin-only":
+                app.query("SAVEPOINT before_drain")
         if no_response_tail:
             assert has_cursor and ready and resume == "success"
         if close_partial:
@@ -876,13 +1078,13 @@ def run_source(port, receiver_port, enabled, relay_port=None, mutation=None,
             from preserve_trx_close_replay_e2e import CloseReplay
             close_replay_fixture = CloseReplay(app, statement, cursor_sql)
         assert ha.query("SELECT COUNT(*),SUM(id),SUM(v) FROM t_contract_source") == [["64", "2080", "20800"]]
-        if ps_capture_disabled:
+        if ps_temp_disabled:
             assert temporary == "ps-only"
             admin.query("SET GLOBAL rds_preserve_trx_temp_table_enable=OFF")
         if accepted:
             if prebuild_workers is not None:
                 assert admin.query("SELECT @@GLOBAL.rds_preserve_trx_phase1_pipeline_workers") == [[str(prebuild_workers)]]
-                assert admin.query("SELECT @@GLOBAL.rds_preserve_trx_phase1_pipeline_copy_chunk_bytes") == [["4096"]]
+                assert admin.query("SELECT @@GLOBAL.rds_preserve_trx_phase1_pipeline_copy_chunk_bytes") == [["131072" if temp_batch_retry else "1048576" if require_temp_batches else "4096"]]
                 def prebuild_status(name):
                     return int(ha.query("SHOW GLOBAL STATUS LIKE 'Preserve_trx_temp_prebuild_" + name + "'")[0][1])
                 before_steps = prebuild_status("steps")
@@ -905,6 +1107,8 @@ def run_source(port, receiver_port, enabled, relay_port=None, mutation=None,
                 before_fallback = prebuild_status("final_fallback")
                 before_round_pages = prebuild_status("round_pages")
                 original_bytes = int(ha.query("SELECT SIZE FROM information_schema.INNODB_SESSION_TEMP_TABLESPACES WHERE ID=" + str(app.id) + " AND PURPOSE='USER'")[0][0])
+                if expect_sparse:
+                    copy_written_before = resource_stages(ha)["source_copy_written_bytes"]
                 drain_rows, drain_errors = [], []
                 def drain():
                     try:
@@ -921,6 +1125,8 @@ def run_source(port, receiver_port, enabled, relay_port=None, mutation=None,
                     window_helper.query("INSERT INTO tmp_window VALUES(1,10)")
                     window_helper.query("START TRANSACTION")
                     window_helper.query("UPDATE tmp_window SET v=v+1")
+                    if expect_sparse:
+                        helper_bytes = int(ha.query("SELECT SIZE FROM information_schema.INNODB_SESSION_TEMP_TABLESPACES WHERE ID=" + str(window_helper.id) + " AND PURPOSE='USER'")[0][0])
                     main_gate = "temp_main_window_" + str(app.id)
                     helper_gate = "temp_helper_window_" + str(window_helper.id)
                     def wait_user_lock(client):
@@ -962,6 +1168,7 @@ def run_source(port, receiver_port, enabled, relay_port=None, mutation=None,
                     native_reused_before = native_status("reused")
                     stats_before = receiver_stage("stats_read_bytes")
                     dd_before = receiver_stage("dd_calls")
+                    image_written_before = receiver_stage("image_written_bytes")
                     def image_delta_reads():
                         return int(ha.query("SHOW GLOBAL STATUS LIKE 'Preserve_trx_temp_stage_source_image_delta_read_bytes'")[0][1])
                     image_reads_before = image_delta_reads()
@@ -999,6 +1206,11 @@ def run_source(port, receiver_port, enabled, relay_port=None, mutation=None,
                         "INSERT INTO tmp_stream SELECT 4096+(a.id-1)*64+b.id,REPEAT('g',4096) FROM t_contract_source a CROSS JOIN t_contract_source b",
                         "UPDATE tmp_stream SET pad=REPEAT('c',4096) WHERE id<=128",
                         "UPDATE tmp_stream SET pad=REPEAT('d',4096) WHERE id<=128"]
+                    if execute_stream and port != receiver_port:
+                        # This local cross-node test has no physical copy of
+                        # persistent tables. Keep its grow DML TEMP-only.
+                        commands[1] = "INSERT INTO tmp_stream VALUES" + ",".join(
+                            "(%d,REPEAT('g',4096))" % n for n in range(4097, 8193))
                     app.begin(";".join(commands))
                     for _ in commands:
                         assert app.result() == []
@@ -1012,8 +1224,12 @@ def run_source(port, receiver_port, enabled, relay_port=None, mutation=None,
                             time.sleep(0.001)
                         # FETCH advances only the final position, not immutable bytes.
                         sent = result_status(ha, "pretransfer_bytes")
+                        assert fetch_cursor(app, statement, 0) == []
                         assert fetch_cursor(app, statement, 7) == list(range(11, 18))
                         assert result_status(ha, "pretransfer_bytes") == sent
+                        result_pattern = ".transfer/*/" + str(app.id) + "/ps_result_" + str(statement) + "_*.part"
+                        previous = set(receiver_dir.glob(result_pattern))
+                        assert len(previous) == 1, previous
                         # The same statement now owns a new immutable generation.
                         app.execute(statement, [], cursor=True)
                         assert fetch_cursor(app, statement, 10) == list(range(1, 11))
@@ -1021,16 +1237,131 @@ def run_source(port, receiver_port, enabled, relay_port=None, mutation=None,
                         while result_status(receiver, "early_ready") < expected_ready:
                             assert worker.is_alive() and time.monotonic() < deadline, drain_errors
                             time.sleep(0.001)
-                        generations = list(receiver_dir.glob(".transfer/*/" + str(app.id) + "/ps_result_" + str(statement) + "_*.part"))
-                        assert len(generations) == 2, generations
+                        while True:
+                            generations = set(receiver_dir.glob(result_pattern))
+                            if len(generations) == 1 and not (generations & previous):
+                                break
+                            assert worker.is_alive() and time.monotonic() < deadline, (generations, drain_errors)
+                            time.sleep(0.001)
                         if early_results == "close":
                             app.close_statement(statement)
                             has_cursor = False
+                            while list(receiver_dir.glob(result_pattern)):
+                                assert worker.is_alive() and time.monotonic() < deadline, drain_errors
+                                time.sleep(0.001)
                     else:
                         expected_ready = early_before + (1 if early_results == "abandon" else 2)
-                        while (result_status(receiver, "early_ready") < expected_ready or
+                        while (large_fetched == 1 or
+                               result_status(receiver, "early_ready") < expected_ready or
                                (early_results == "abandon" and result_status(receiver, "early_abandoned") < abandoned_before + 1)):
                             assert worker.is_alive() and time.monotonic() < deadline, drain_errors
+                            # Exercise real FETCH during Phase1, at least once.
+                            # Receiver readiness alone does not prove the source
+                            # is still scanning when these commands execute.
+                            assert fetch_large(app, 0) == []
+                            if large_fetched < min(129, large_row_count):
+                                assert fetch_large(app, 1) == [large_fetched + 1]
+                                large_fetched += 1
+                            time.sleep(0.001)
+                    if execute_stream:
+                        if early_results == "execute-stream-first":
+                            first_cursor_stream(connect, port, ha, receiver_dir, barrier, worker)
+                            early_before += 1
+                            early_rows_before += 128
+                            preflight_before += 128
+                        assert ha.query("SELECT GET_LOCK('" + stream_gate + "',0)") == [["1"]]
+                        outcome = []
+                        def produce_cursor():
+                            try:
+                                app.execute(large_statement, [], cursor=True)
+                                outcome.append(None)
+                            except BaseException as exc:
+                                outcome.append(exc)
+                        with barrier.group_lock:
+                            first_chunk = len(barrier.observed_chunks)
+                            old_keys = {c[0] for c in barrier.observed_chunks}
+                        def disk_tables():
+                            return int(ha.query("SELECT s.VARIABLE_VALUE FROM performance_schema.status_by_thread s "
+                                "JOIN performance_schema.threads t ON s.THREAD_ID=t.THREAD_ID WHERE t.PROCESSLIST_ID=" +
+                                str(app.id) + " AND s.VARIABLE_NAME='Created_tmp_disk_tables'")[0][0])
+                        disk_before = disk_tables() if early_results == "execute-stream-spill" else 0
+                        producer = threading.Thread(target=produce_cursor, daemon=True)
+                        producer.start()
+                        wait_user_lock(app)
+                        def waiting():
+                            return ha.query("SELECT LOCK_STATUS FROM performance_schema.metadata_locks l JOIN "
+                                            "performance_schema.threads t ON l.OWNER_THREAD_ID=t.THREAD_ID "
+                                            "WHERE t.PROCESSLIST_ID=" + str(app.id) +
+                                            " AND l.OBJECT_TYPE='USER LEVEL LOCK' AND l.OBJECT_NAME='" +
+                                            stream_gate + "' AND l.LOCK_STATUS='PENDING'") == [["PENDING"]]
+                        proof_deadline = time.monotonic() + 8
+                        matches = []
+                        try:
+                            while time.monotonic() < proof_deadline:
+                                assert producer.is_alive() and waiting() and worker.is_alive(), (outcome, drain_errors)
+                                with barrier.group_lock:
+                                    matches = [c for c in barrier.observed_chunks[first_chunk:]
+                                               if c[0] not in old_keys and c[0][2] == app.id and c[0][3].startswith(
+                                                   ("ps_result_" + str(large_statement) + "_").encode())
+                                               and b'd' * 1024 in c[2]]
+                                if matches:
+                                    break
+                                time.sleep(0.01)
+                            stream_proof = dict(execute_pending=producer.is_alive(), lock_pending=waiting(),
+                                                acked_row_chunks=len(matches), checked_bytes=0)
+                            assert len({c[0] for c in matches}) <= 1, "mixed result generations"
+                            stream_proof["chunks"] = []
+                            for key, offset, data in matches:
+                                part = receiver_dir / '.transfer' / key[0] / str(key[2]) / (key[3].decode() + '.part')
+                                with part.open('rb') as f:
+                                    f.seek(offset)
+                                    assert f.read(len(data)) == data, 'ACKed result bytes differ from receiver file'
+                                stream_proof['checked_bytes'] += len(data)
+                                stream_proof['chunks'].append(dict(epoch=key[0], nonce=key[1], token=key[2],
+                                    object=key[3].decode(), offset=offset, length=len(data),
+                                    sha256=hashlib.sha256(data).hexdigest()))
+                            (Path(os.environ['MYSQLTEST_VARDIR']) / 'log' / 'cursor-execute-stream-proof.txt').write_text(str(stream_proof))
+                            if killer:
+                                killer.query("KILL QUERY " + str(app.id))
+                                producer.join(20)
+                                assert not producer.is_alive() and len(outcome) == 1 and isinstance(outcome[0], SqlError) and outcome[0].args[0] == 1317, outcome
+                        finally:
+                            assert ha.query("SELECT RELEASE_LOCK('" + stream_gate + "')") == [["1"]]
+                            producer.join(30)
+                        if killer:
+                            app.execute(large_statement, [], cursor=True)
+                        else:
+                            assert not producer.is_alive() and outcome == [None], outcome
+                        if early_results == "execute-stream-spill":
+                            assert disk_tables() > disk_before
+                        large_pad = b'd'
+                        assert fetch_large(app, 0) == []
+                        assert fetch_large(app, 7) == list(range(1, 8))
+                        large_fetched = 7
+                        deadline = time.monotonic() + 20
+                        while result_status(receiver, "early_ready") < early_before + 3:
+                            assert worker.is_alive() and time.monotonic() < deadline, drain_errors
+                            time.sleep(0.001)
+                        observed_keys = {c[0] for c in matches}
+                        with barrier.group_lock:
+                            sealed_keys = set(barrier.observed_seals)
+                        if early_results not in ("execute-stream-error", "execute-stream-oversize"):
+                            assert observed_keys and observed_keys <= sealed_keys, "stream prefix was abandoned instead of reused"
+                        else:
+                            assert not observed_keys & sealed_keys, "failed producer reached SEAL"
+                        # Change the live table after materialization. Re-running
+                        # SELECT could no longer reconstruct the frozen values.
+                        app.query("UPDATE tmp_stream SET pad=REPEAT('q',4096) WHERE id<=128")
+                    if early_results == "multi-generation":
+                        # Two builders established the owner lease high-water
+                        # mark. A later round must reuse that capacity for one
+                        # new generation, not reject a smaller grow request.
+                        app.execute(statement, [], cursor=True)
+                        assert fetch_cursor(app, statement, 10) == list(range(1, 11))
+                        deadline = time.monotonic() + 20
+                        while result_status(receiver, "early_ready") < early_before + 3:
+                            assert worker.is_alive() and time.monotonic() < deadline, (
+                                "replacement cursor not prepared in Phase1", drain_errors)
                             time.sleep(0.001)
                     close_capture_window()
                 if native_early:
@@ -1053,6 +1384,17 @@ def run_source(port, receiver_port, enabled, relay_port=None, mutation=None,
                                 receiver.query("SHOW GLOBAL STATUS LIKE 'Preserve_trx_transfer_receiver_worker%'"))
                             time.sleep(0.001)
                         assert not list(source_dir.glob(str(app.id) + ".tempts.*.image"))
+                        # Private receiver paths are stable across generations;
+                        # final sealing must not require an intermediate name.
+                        private_images = list(receiver_dir.glob(
+                            f".temp_receiver/*/temp-import-*/**/{app.id}.tempts.*"))
+                        assert private_images and all(
+                            path.suffix == ".image" and path.parent.name == "install"
+                            for path in private_images), (
+                                "receiver retained redundant ORIGINAL image", private_images)
+                        assert len({(path.stat().st_dev, path.stat().st_ino)
+                                    for path in private_images}) == len(private_images), \
+                            "receiver installation images must own separate inodes"
                         generation_files.append(int(receiver.query("SHOW GLOBAL STATUS LIKE 'Created_tmp_files'")[0][1]))
                         if receiver_port != port and generation in (1, 2):
                             if native_spill:
@@ -1064,6 +1406,33 @@ def run_source(port, receiver_port, enabled, relay_port=None, mutation=None,
                                 assert receiver_stage("source_written_bytes") == derived_before
                         derived_before = receiver_stage("source_written_bytes")
                         written = receiver_stage("image_written_bytes")
+                        if expect_sparse and generation == 0:
+                            bases = list(receiver_dir.glob(
+                                f".transfer/*/{app.id}/*.image.sparse.part"))
+                            assert len(bases) == 1, bases
+                            logical = read_temp_image(bases[0])
+                            page_bytes = int(ha.query("SELECT @@innodb_page_size")[0][0])
+                            zero_bytes = sum(page_bytes for offset in
+                                range(0, len(logical) - page_bytes, page_bytes)
+                                if not any(logical[offset:offset + page_bytes]))
+                            assert zero_bytes > 0, "fixture has no full zero DATA pages"
+                            assert len(logical) == original_bytes and zero_bytes > helper_bytes, (
+                                "sparse source fixture lacks a decisive zero-page margin",
+                                len(logical), original_bytes, zero_bytes, helper_bytes)
+                            assert 1 <= prebuild_status("baselines") - before_copy <= 2
+                            copied = resource_stages(ha)["source_copy_written_bytes"] - copy_written_before
+                            # The helper may still be copying; allow its whole
+                            # image without relying on file/stat counter timing.
+                            assert 0 < copied <= original_bytes - zero_bytes + helper_bytes, (
+                                "source wrote fresh zero DATA pages", copied,
+                                original_bytes, zero_bytes, helper_bytes)
+                            assert not any(logical[-page_bytes:]), "fixture tail is not a zero page"
+                            (Path(os.environ["MYSQLTEST_VARDIR"]) / "log" / "source-sparse-base.txt").write_text(
+                                str(dict(copied=copied, logical=original_bytes,
+                                         internal_zero=zero_bytes, helper_limit=helper_bytes)))
+                            assert written - image_written_before <= len(logical) - zero_bytes, (
+                                "receiver wrote fresh zero DATA pages", written - image_written_before,
+                                len(logical), zero_bytes)
                         generation_writes.append(written)
                         mappings = {}
                         for values in re.findall(
@@ -1117,10 +1486,43 @@ def run_source(port, receiver_port, enabled, relay_port=None, mutation=None,
                             native_written = int(receiver.query("SHOW GLOBAL STATUS LIKE 'Preserve_trx_temp_stage_receiver_image_written_bytes'")[0][1])
                             native_stats = receiver_stage("stats_read_bytes")
                             native_dd = receiver_stage("dd_calls")
+                            if native_final_tail:
+                                # The last authenticated candidate is prepared,
+                                # but its SEAL ACK still holds the source job.
+                                # Closing must validate and reuse this small tail.
+                                final_delta_before = set(receiver_dir.glob(
+                                    f".transfer/*/{app.id}/*.image.delta.*.part"))
+                                app.query("UPDATE tmp_stream SET pad=REPEAT('h',4096) WHERE id=1")
                             assert native_stats > stats_before, "ordinary candidate did not prepare statistics"
                             assert native_dd > dd_before, "ordinary candidate did not decode SQL definitions"
+                            if receiver_port != port and not native_final_tail:
+                                # Source DATA is already synced. Receiver
+                                # INSTALL still flushes in its background tail.
+                                ha.query("SET GLOBAL debug='+d,preserve_temp_image_writer_sync_failure'")
+                                stack.callback(lambda: ha.query(
+                                    "SET GLOBAL debug='-d,preserve_temp_image_writer_sync_failure'"))
+                            if native_final_tail:
+                                final_manifest_gate = barrier.arm_all({app.id}, b".tempts.manifest.")
                             close_capture_window()
                             barrier.release.set()
+                            if native_final_tail:
+                                deadline = time.monotonic() + 25
+                                while not final_manifest_gate["held"].wait(0.01):
+                                    assert worker.is_alive() and not drain_errors and time.monotonic() < deadline, (
+                                        "final TEMP dependencies arrived without their candidate manifest", drain_rows, drain_errors)
+                                assert source_final_io()["us"] > final_before["us"], "candidate was an ordinary refresh"
+                                receiver.query("SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=OFF")
+                                while native_status("ready") < native_before + rounds + 1:
+                                    assert time.monotonic() < deadline and not barrier.errors, (
+                                        "final candidate did not prepare before FINAL metadata", barrier.errors)
+                                    time.sleep(0.001)
+                                receiver.query("SET GLOBAL rds_preserve_trx_transfer_prewarm_paused=ON")
+                                while receiver_status("worker_active"):
+                                    assert time.monotonic() < deadline
+                                    time.sleep(0.001)
+                                final_native_prepared = (receiver_stage("image_written_bytes"),
+                                                         receiver_stage("stats_read_bytes"), receiver_stage("dd_calls"))
+                                final_manifest_gate["release"].set()
                 elif quiet_undo_tail:
                     # Wait until this session's immutable undo exists, so the
                     # marker tests reuse of an installed earlier generation.
@@ -1272,9 +1674,17 @@ def run_source(port, receiver_port, enabled, relay_port=None, mutation=None,
                     grow_during_capture()
                 worker.join(60)
                 assert not worker.is_alive() and not drain_errors, drain_errors
-                if undo_delta_fault == "retry":
+                if undo_delta_fault == "retry" or temp_batch_retry:
                     barrier.verify_retry()
+                    if temp_batch_retry:
+                        assert barrier.retry['drop']['chunks'] >= 2, 'lost ACK was not a multi-CHUNK batch'
                 rows = drain_rows
+                if early_results in ("execute-stream-error", "execute-stream-oversize"):
+                    for key in observed_keys:
+                        retired = receiver_dir / '.transfer' / key[0] / str(key[2]) / (key[3].decode() + '.part')
+                        assert not retired.exists(), "final retained abandoned producer prefix"
+                if query_ack_loss:
+                    assert barrier.query_dropped and not barrier.errors, barrier.errors
                 if native_early:
                     image_bytes = int(ha.query("SHOW GLOBAL STATUS LIKE 'Preserve_trx_temp_image_delta_bytes'")[0][1]) - image_delta_before
                     assert 0 < image_bytes < original_bytes, ("DATA delta not efficient", image_bytes, original_bytes)
@@ -1316,10 +1726,26 @@ def run_source(port, receiver_port, enabled, relay_port=None, mutation=None,
                 assert 1 + helper_copies <= copies <= (2 if port == receiver_port else 1) + helper_copies, ("unexpected baseline count", copies)
                 source_images = list(source_dir.glob(str(app.id) + ".tempts.*.image"))
                 assert len(source_images) == 1
+                if native_final_tail:
+                    final_deltas = set(receiver_dir.glob(
+                        f".transfer/*/{app.id}/*.image.delta.*.part")) - final_delta_before
+                    assert len(final_deltas) == 1, (
+                        "final DATA tail did not reuse the transferred BASE", final_deltas)
+                    patch = final_deltas.pop().read_bytes()
+                    assert patch[:8] == b"PTRIDLT1" and len(patch) < original_bytes // 8
+                    final_image = source_images[0].read_bytes()
+                    assert int.from_bytes(patch[60:68], "little") == len(final_image)
+                    assert patch[68:100] == hashlib.sha256(final_image).digest(), (
+                        "final DELTA does not describe the frozen DATA")
                 final_stat = source_images[0].stat()
-                assert (final_stat.st_dev, final_stat.st_ino) == source_data_identity, "DML replaced the warm DATA baseline"
-                assert prebuild_status("final_reused") == before_reuse + 1, "final did not reuse warm data"
-                assert prebuild_status("final_fallback") == before_fallback, "final made a full copy"
+                if early_results == "execute-stream-error":
+                    # Native statement rollback invalidates the old TEMP
+                    # prebuild even when KILL interrupted a read-only SELECT.
+                    assert (final_stat.st_dev, final_stat.st_ino) != source_data_identity, "rollback retained invalid warm DATA"
+                else:
+                    assert (final_stat.st_dev, final_stat.st_ino) == source_data_identity, "DML replaced the warm DATA baseline"
+                    assert prebuild_status("final_reused") == before_reuse + 1, "final did not reuse warm data"
+                    assert prebuild_status("final_fallback") == before_fallback, "final made a full copy"
                 if quiet_undo_tail and not early_undo_supersede and not native_early:
                     assert prebuild_status("undo_scans") <= scans_before_marker + 1, ("SAVEPOINT restarted undo scan beyond the in-flight candidate", scans_before_marker, prebuild_status("undo_scans"))
                     assert prebuild_status("undo_claim_reused") > before_undo_claim_reused, ("SAVEPOINT forced a final undo rebuild", {n: prebuild_status(n) for n in ("undo_scans", "undo_pages", "undo_claim_reused", "installed", "stale", "final_fallback")})
@@ -1359,11 +1785,12 @@ def run_source(port, receiver_port, enabled, relay_port=None, mutation=None,
                 if large_undo:
                     assert prebuild_status("undo_scans") > before_undo_scans, "undo baseline did not complete on worker"
                     assert prebuild_status("undo_pages") > before_undo_pages + 4, "undo scan did not visit multiple body pages"
-                    assert prebuild_status("undo_write_steps") > before_undo_write_steps + 4, "undo encoding did not yield to the shared worker"
+                    assert prebuild_status("undo_write_steps") > before_undo_write_steps + (0 if require_temp_batches else 4), "undo encoding did not yield to the shared worker"
                     assert prebuild_status("undo_claim_pages") > before_undo_claim_pages + 4, "ordinary worker did not hash undo ownership pages"
-                    assert prebuild_status("undo_claim_reused") > before_undo_claim_reused, (
-                        "final did not reuse certified undo ownership proofs",
-                        ha.query("SHOW GLOBAL STATUS LIKE 'Preserve_trx_temp_undo_shared%'") )
+                    if not native_final_tail:
+                        assert prebuild_status("undo_claim_reused") > before_undo_claim_reused, (
+                            "final did not reuse certified undo ownership proofs",
+                            ha.query("SHOW GLOBAL STATUS LIKE 'Preserve_trx_temp_undo_shared%'") )
             if temporary == "ps-only":
                 assert len(rows) == 1 and rows[0][1] == "NO_PRESERVABLE_TOKENS", rows
                 app.freeze_replay(ha)
@@ -1383,17 +1810,33 @@ def run_source(port, receiver_port, enabled, relay_port=None, mutation=None,
                 assert not list(receiver_dir.glob(".transfer/*/*/prepared_statements*"))
                 assert not list(receiver_dir.glob(".transfer/*/*/ps_result_*.part"))
                 print("ordinary PS uses session-only handoff; external replay needs no cursor artifact")
-                if ps_capture_disabled:
-                    print("ordinary PS handoff is independent of the cursor capture gate")
+                if ps_temp_disabled:
+                    print("ordinary PS handoff is independent of TEMP support")
                 return
             assert len(rows) == 1, rows
             assert rows[0][1:5] == ["SUCCESS", str(app.id), "SURVIVOR", "NONE"], rows
+            if stage_metrics:
+                # This fixture prepares one fresh image after final. Count
+                # real source pages before RESUME removes the artifacts;
+                # zero holes are skipped, except the page establishing EOF.
+                source_images = list(source_dir.glob(str(app.id) + ".tempts.*.image"))
+                assert len(source_images) == 1
+                page_size = int(ha.query("SELECT @@innodb_page_size")[0][0])
+                expected_image_written = 0
+                for path in source_images:
+                    data = path.read_bytes()
+                    assert data and len(data) % page_size == 0
+                    expected_image_written += sum(
+                        page_size for offset in range(0, len(data), page_size)
+                        if any(data[offset:offset + page_size]) or
+                        offset + page_size == len(data))
             if resume:
                 app.freeze_replay(ha)
             if close_replay_fixture:
                 close_replay_fixture.after_freeze()
             try:
-                app.query("SELECT 1")
+                app.query("UPDATE t_contract_source SET v=v+99 WHERE id=64"
+                          if temporary == "begin-only" else "SELECT 1")
             except SqlError as exc:
                 assert exc.args[0] == 4020, exc.args
             else:
@@ -1417,14 +1860,20 @@ def run_source(port, receiver_port, enabled, relay_port=None, mutation=None,
                 # This checks real transport, not physical promotion or READY.
                 token_dirs = [path for path in receiver_dir.glob(".transfer/*/*")
                               if path.is_dir() and path not in old_token_dirs]
-                if not early_results:
+                if temporary == "begin-only":
+                    assert not token_dirs, "empty BEGIN transferred resource artifacts"
+                elif not early_results:
                     assert len(token_dirs) == 1, token_dirs
                     token_dir = token_dirs[0]
                     images = list(token_dir.glob("*.tempts.*.image.part"))
+                    sparse_images = list(token_dir.glob("*.tempts.*.image.sparse.part"))
+                    images += sparse_images
+                    if expect_sparse:
+                        assert sparse_images, 'no compact BASE selected by real DRAIN'
                     undos = list(token_dir.glob("*.tempts.*.undo.part"))
                     assert bool(images) == bool(has_user_temp), "temporary image set does not match source tables"
                     assert bool(undos) == ((has_temp_undo and temp_history != "pre-engine") or temp_history == "first-error"), undos
-                    if independent_undo:
+                    if independent_undo and not native_final_tail:
                         assert len(undos) == 1, undos
                         undo_space = undos[0].name.split(".tempts.")[1].split(".")[0]
                         assert all(undo_space != p.name.split(".tempts.")[1].split(".")[0]
@@ -1475,15 +1924,16 @@ def run_source(port, receiver_port, enabled, relay_port=None, mutation=None,
                     if continuous_capture:
                         assert len(images) == 1, images
                         if not quiet_undo_tail:
-                            assert images[0].stat().st_size > original_bytes, "fixture did not extend the source space"
+                            assert len(read_temp_image(images[0])) > original_bytes, "fixture did not extend the source space"
                     for path in images + undos:
                         if early_undo_supersede and patches and path in undos:
                             continue  # The selected target, including injected faults, was checked above.
                         # Ordinary continuous capture can select UNDO BASE+DELTA too.
-                        image_patches = list(token_dir.glob(path.name.removesuffix(".part") + ".delta.*.part"))
+                        logical_name = path.name.removesuffix('.part').removesuffix('.sparse')
+                        image_patches = list(token_dir.glob(logical_name + ".delta.*.part"))
                         if image_patches:
                             assert len(image_patches) == 1
-                            base, patch = path.read_bytes(), image_patches[0].read_bytes()
+                            base, patch = read_temp_image(path), image_patches[0].read_bytes()
                             assert patch[:8] == (b"PTRIDLT1" if path in images else b"PTRUDLT1")
                             assert image_patches[0].name.split(".delta.")[1].removesuffix(".part") == hashlib.sha256(patch).hexdigest()
                             assert struct.unpack_from("<Q", patch, 20)[0] == len(base)
@@ -1503,11 +1953,12 @@ def run_source(port, receiver_port, enabled, relay_port=None, mutation=None,
                                 merged[at:at+length] = patch[offset:offset+length]
                                 offset += length
                             assert hashlib.sha256(merged).digest() == patch[68:100]
-                            assert bytes(merged) == (source_dir / path.name.removesuffix(".part")).read_bytes()
+                            assert bytes(merged) == (source_dir / logical_name).read_bytes()
                             continue
-                        source_path = source_dir / path.name.removesuffix(".part")
-                        assert path.stat().st_size == source_path.stat().st_size > 0
-                        assert hashlib.sha256(path.read_bytes()).digest() == hashlib.sha256(source_path.read_bytes()).digest(), path.name
+                        source_path = source_dir / logical_name
+                        decoded = read_temp_image(path)
+                        assert len(decoded) == source_path.stat().st_size > 0
+                        assert hashlib.sha256(decoded).digest() == hashlib.sha256(source_path.read_bytes()).digest(), path.name
                     if has_cursor:
                         assert list(token_dir.glob("ps_result_*.part")), "retained cursor was not transferred"
                 if ready:
@@ -1530,27 +1981,39 @@ def run_source(port, receiver_port, enabled, relay_port=None, mutation=None,
                     prepare_fault = virtual_fault or lob_fault
                     fault_label = "virtual undo" if virtual_fault else "LOB"
                     fault_marker = "temporary " + fault_label + " fault applied=" + str(prepare_fault)
+                    # Undo decode faults remain before publication. LOB page
+                    # checks now belong to the per-session completion barrier.
+                    late_prepare_fault = lob_fault in (
+                        "range", "type", "cross", "cycle", "undo", "memory",
+                        "validate", "retire", "json_entries", "json_version")
+                    def verify_prepare_rejection(boundary):
+                        trace = Path(lob_trace).read_text()
+                        assert fault_marker in trace, "fault did not run"
+                        reason = ("temporary LOB preparation exhausted memory" if lob_fault in ("memory", "validate", "retire")
+                                  else "temporary undo fields rejected corruption" if virtual_fault or lob_fault in ("json_count", "json_range")
+                                  else "temporary LOB validation rejected corruption")
+                        assert reason in trace, "not the expected preparation rejection"
+                        rejection_at = trace.index(reason)
+                        cleanup_deadline = time.monotonic() + 20
+                        while "temporary receiver cleanup complete page_import_bytes=0" not in Path(lob_trace).read_text()[rejection_at:]:
+                            assert time.monotonic() < cleanup_deadline, "receiver did not retire import memory"
+                            time.sleep(0.05)
+                        receiver.query("ROLLBACK")
+                        assert receiver.query("SELECT * FROM tmp_contract_reader ORDER BY id") == [["1", "10"], ["2", "20"]]
+                        receiver.query("INSERT INTO tmp_contract_reader VALUES(3,30)")
+                        assert receiver.query("SELECT SUM(v) FROM tmp_contract_reader") == [["60"]]
+                        receiver.query("DROP TEMPORARY TABLE tmp_contract_reader")
+                        print("receiver rejected corrupt " + fault_label + " before " + boundary + ": " + prepare_fault)
                     deadline = time.monotonic() + 20
                     while True:
                         count = receiver.query("SHOW GLOBAL STATUS LIKE 'Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens'")
                         if count == [["Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens", "1"]]:
                             assert not negative_delta, "invalid undo delta dependency reached READY"
-                            if prepare_fault:
-                                assert fault_marker in Path(lob_trace).read_text(), "fault did not run"
-                            assert not prepare_fault, "corrupt " + fault_label + " reached receiver READY: " + str(prepare_fault)
+                            assert not prepare_fault or late_prepare_fault, "corrupt " + fault_label + " reached receiver READY: " + str(prepare_fault)
                             break
                         if negative_delta:
                             rejected = receiver.query("SHOW GLOBAL STATUS LIKE 'Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens'")
                             if rejected == [["Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens", "1"]]:
-                                rejected_metrics = resource_stages(receiver)
-                                while rejected_metrics["final_active_epochs"]:
-                                    assert time.monotonic() < deadline, "failed final observation remained active"
-                                    time.sleep(0.01)
-                                    rejected_metrics = resource_stages(receiver)
-                                assert rejected_metrics["final_tokens"] == failure_stages_before["final_tokens"] + 1
-                                assert rejected_metrics["final_ready_epochs"] == failure_stages_before["final_ready_epochs"]
-                                assert rejected_metrics["final_partial_epochs"] == failure_stages_before["final_partial_epochs"] + 1
-                                assert rejected_metrics["final_dropped_observations"] == failure_stages_before["final_dropped_observations"]
                                 if undo_delta_fault != "base-missing":
                                     assert int(receiver.query("SHOW GLOBAL STATUS LIKE 'Preserve_trx_temp_undo_delta_assembled'")[0][1]) == delta_assembled_before
                                     if undo_delta_fault in ("order", "duplicate"):
@@ -1568,48 +2031,69 @@ def run_source(port, receiver_port, enabled, relay_port=None, mutation=None,
                         if prepare_fault:
                             rejected = receiver.query("SHOW GLOBAL STATUS LIKE 'Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens'")
                             if rejected == [["Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens", "1"]]:
-                                trace = Path(lob_trace).read_text()
-                                assert fault_marker in trace, "fault did not run"
-                                reason = ("temporary LOB preparation exhausted memory" if lob_fault in ("memory", "validate", "retire")
-                                          else "temporary undo fields rejected corruption" if virtual_fault or lob_fault in ("json_count", "json_range")
-                                          else "temporary LOB validation rejected corruption")
-                                assert reason in trace, "not the expected preparation rejection"
-                                rejection_at = trace.index(reason)
-                                cleanup_deadline = time.monotonic() + 20
-                                while "temporary receiver cleanup complete page_import_bytes=0" not in Path(lob_trace).read_text()[rejection_at:]:
-                                    assert time.monotonic() < cleanup_deadline, "receiver did not retire import memory"
-                                    time.sleep(0.05)
-                                receiver.query("ROLLBACK")
-                                assert receiver.query("SELECT * FROM tmp_contract_reader ORDER BY id") == [["1", "10"], ["2", "20"]]
-                                receiver.query("INSERT INTO tmp_contract_reader VALUES(3,30)")
-                                assert receiver.query("SELECT SUM(v) FROM tmp_contract_reader") == [["60"]]
-                                receiver.query("DROP TEMPORARY TABLE tmp_contract_reader")
-                                print("receiver rejected corrupt " + fault_label + " before READY: " + prepare_fault)
+                                assert not late_prepare_fault, "late fault unexpectedly rejected publication"
+                                verify_prepare_rejection("READY")
                                 return
                         assert time.monotonic() < deadline, (count, receiver.query("SHOW GLOBAL STATUS LIKE 'Preserve_trx_transfer_receiver%'") )
                         time.sleep(0.05)
-                    if column_shapes == "lob-old":
-                        assert "temporary LOB old chain validated" in Path(lob_trace).read_text(), "old-format graph not validated"
-                    if column_shapes == "json":
-                        trace = Path(lob_trace).read_text()
-                        for marker in ("temporary JSON undo diff entries=2", "zero=1", "advanced=1",
-                                       "temporary JSON LOB diff graph validated"):
-                            assert marker in trace, "missing JSON path: " + marker
-                        assert trace.count("temporary JSON LOB diff graph validated") > trace.count("temporary LOB version geometry prepared") + 100, "repeated small updates did not reuse version geometry"
+                    if late_prepare_fault:
+                        assert port == receiver_port, "negative RESUME fixture needs loopback bridge"
+                        source_id = app.id
+                        app.close()
+                        deadline = time.monotonic() + 20
+                        while ha.query(f"SELECT ID FROM information_schema.PROCESSLIST WHERE ID={source_id}"):
+                            assert time.monotonic() < deadline, "source backend did not exit"
+                            time.sleep(.01)
+                        target = connect(port, "preserve_trx_ha_admin", "temp-contract-secret")
+                        target.query("SET SESSION debug='+d,preserve_trx_strict_sql_loopback_bridge'")
+                        metric = "SHOW GLOBAL STATUS LIKE 'Preserve_trx_promotion_resume_failure_count'"
+                        before_failure = int(ha.query(metric)[0][1])
+                        try:
+                            target.query(f"RESUME PRESERVED TRANSACTION '{source_id}'")
+                        except SqlError as exc:
+                            assert exc.args[0] == 4013, exc.args
+                        else:
+                            raise AssertionError("corrupt TEMP completion allowed RESUME")
+                        target.close()
+                        assert int(ha.query(metric)[0][1]) == before_failure + 1
+                        while ha.query(f"SELECT ID FROM information_schema.PROCESSLIST WHERE ID={target.id}"):
+                            assert time.monotonic() < deadline, "failed target remained alive"
+                            time.sleep(.01)
+                        assert ha.query(f"SELECT trx_id FROM information_schema.innodb_trx WHERE trx_mysql_thread_id={target.id}") == []
+                        verify_prepare_rejection("SQL RESUME")
+                        return
+                    if port != receiver_port:
+                        wait_receiver_completion()
                     if native_early:
                         final_io = {k: v - final_before[k] for k, v in source_final_io().items()}
                         assert final_io["read_bytes"] >= 32768, ("final shared undo page reads were not counted", final_io)
                         assert native_status("reused") == native_reused_before + 1
                         written = int(receiver.query("SHOW GLOBAL STATUS LIKE 'Preserve_trx_temp_stage_receiver_image_written_bytes'")[0][1])
-                        assert written == native_written, "final rewrote prepared DATA"
-                        assert receiver_stage("stats_read_bytes") == native_stats, "final rescanned prepared statistics"
-                        assert receiver_stage("dd_calls") == native_dd, "final decoded prepared SQL definitions"
+                        if native_final_tail:
+                            assert (written, receiver_stage("stats_read_bytes"), receiver_stage("dd_calls")) == final_native_prepared, \
+                                "FINAL repeated its already prepared candidate work"
+                            assert 0 < written - native_written < generation_writes[0] // 4, (
+                                "small final tail rebuilt prepared DATA", written - native_written, generation_writes[0])
+                            final_ids = {}
+                            for values in re.findall(r"temporary mapping source=(\d+) index=(\d+) target_space=(\d+) target_table=(\d+) target_index=(\d+) reused=(\d+)", native_id_trace.read_text()):
+                                source_table, source_index, space, table, index, reused = map(int, values)
+                                final_ids[(source_table, source_index)] = (space, table, index, reused)
+                            assert final_ids.keys() == generation_ids[-1].keys()
+                            assert all(value[:3] == generation_ids[-1][key][:3] and value[3] == 1
+                                       for key, value in final_ids.items()), ('final lost native identities', final_ids)
+                        else:
+                            assert written == native_written, "final rewrote prepared DATA"
+                        if not native_final_tail:
+                            assert receiver_stage("stats_read_bytes") == native_stats, "final rescanned prepared statistics"
+                            assert receiver_stage("dd_calls") == native_dd, "final decoded prepared SQL definitions"
                         if os.environ.get("MYSQLTEST_VARDIR"):
                             (Path(os.environ["MYSQLTEST_VARDIR"]) / "log" / ("native-early-" + ("loopback" if port == receiver_port else "cross") + ".txt")).write_text(
                                 f"source_final={final_io}\nsource_image_bytes={original_bytes}\nimage_delta_bytes={image_bytes}\nimage_delta_read_bytes={image_read_bytes}\ngeneration_written_bytes={generation_writes}\nnative_candidates={native_status('ready') - native_before}\nnative_reused={native_status('reused') - native_reused_before}\nfinal_data_written={written-native_written}\nearly_stats_read_bytes={native_stats-stats_before}\nearly_dd_batches={native_dd-dd_before}\nfinal_stats_read_bytes={receiver_stage('stats_read_bytes')-native_stats}\nfinal_dd_batches={receiver_stage('dd_calls')-native_dd}\n")
-                        print("ordinary native candidate and DATA delta reused without final DATA writes")
+                        print("small final tail reused prepared native resources" if native_final_tail else
+                              "ordinary native candidate and DATA delta reused without final DATA writes")
                     if gc_probe:
                         assert ready and resume == "success"
+                        wait_receiver_completion()
                         root = Path(receiver.query("SELECT @@datadir")[0][0]) / "preserve" / ".temp_receiver"
                         live = [p for p in root.iterdir() if p.is_dir() and len(p.name) == 32]
                         assert live, "receiver did not use its process directory"
@@ -1673,6 +2157,14 @@ def run_source(port, receiver_port, enabled, relay_port=None, mutation=None,
                             assert resume in faults and exc.args[0] == expected_error, (resume, exc.args)
                             if close_replay_fixture:
                                 close_replay_fixture.assert_pending()
+                        if column_shapes == "lob-old":
+                            assert "temporary LOB old chain validated" in Path(lob_trace).read_text(), "old-format graph not validated"
+                        if column_shapes == "json":
+                            trace = Path(lob_trace).read_text()
+                            for marker in ("temporary JSON undo diff entries=2", "zero=1", "advanced=1",
+                                           "temporary JSON LOB diff graph validated"):
+                                assert marker in trace, "missing JSON path: " + marker
+                            assert trace.count("temporary JSON LOB diff graph validated") > trace.count("temporary LOB version geometry prepared") + 100, "repeated small updates did not reuse version geometry"
                         after = ha.query("SHOW GLOBAL STATUS LIKE '" + metric + "'")
                         assert len(before) == len(after) == 1 and int(after[0][1]) == int(before[0][1]) + 1, (before, after)
                         if close_replay_fixture and resume in faults:
@@ -1681,7 +2173,7 @@ def run_source(port, receiver_port, enabled, relay_port=None, mutation=None,
                             assert receiver.query("SELECT * FROM tmp_contract_reader ORDER BY id") == [["1", "10"], ["2", "20"]]
                             receiver.query("DROP TEMPORARY TABLE tmp_contract_reader")
                             assert ha.query("SELECT COUNT(*),SUM(id),SUM(v) FROM t_contract_source") == [["64", "2080", "20800"]]
-                            print("loopback receiver prepared temporary resources before READY")
+                            print("loopback receiver published temporary resources; SQL RESUME gates installation")
                             print("strict SQL RESUME failure disconnect passed")
                             return
                         def replay_dropped_statement(query):
@@ -1752,10 +2244,12 @@ def run_source(port, receiver_port, enabled, relay_port=None, mutation=None,
                             assert target.query("SELECT @@autocommit") == [["0" if transaction == "implicit" else "1"]]
                             if continuous_capture:
                                 if quiet_undo_tail:
-                                    assert target.query("SELECT COUNT(*),SUM(id),SUM(pad=REPEAT('a',4096)) FROM tmp_stream") == [["4096", "8390656", "4096"]]
+                                    assert target.query("SELECT COUNT(*),SUM(id),SUM(pad=REPEAT('a',4096)) FROM tmp_stream") == [["4096", "8390656", "4095" if native_final_tail else "4096"]]
+                                    if native_final_tail:
+                                        assert target.query("SELECT pad=REPEAT('h',4096) FROM tmp_stream WHERE id=1") == [["1"]]
 
                                 else:
-                                    assert target.query("SELECT COUNT(*),SUM(id),SUM(pad=REPEAT('d',4096)),SUM(pad=REPEAT('g',4096)) FROM tmp_stream") == [["8192", "33558528", "128", "4096"]]
+                                    assert target.query("SELECT COUNT(*),SUM(id),SUM(pad=REPEAT('d',4096)),SUM(pad=REPEAT('g',4096)) FROM tmp_stream") == [["8192", "33558528", "0" if execute_stream else "128", "4096"]]
                             if expect_early_undo:
                                 if early_undo_supersede:
                                     assert undo_status("superseded") > undo_superseded_before, "receiver kept the obsolete decoder"
@@ -1771,17 +2265,17 @@ def run_source(port, receiver_port, enabled, relay_port=None, mutation=None,
                                     assert undo_status("reused") == undo_reused_before + int(not early_undo_abandon), "incorrect final undo candidate selection"
                                     assert undo_status("read_bytes") == undo_prepared_read, "final reran the optional undo job"
                             if early_results:
-                                assert result_status(receiver, "early_ready") == early_before + (1 if early_results == "abandon" else 2)
-                                assert result_status(receiver, "early_reused") == reuse_before + (2 if early_results == "large" else int(early_results != "close"))
-                                expected_rows = 64 if early_results == "abandon" else (4160 if large_result else 128)
+                                assert result_status(receiver, "early_ready") == early_before + (1 if early_results == "abandon" else 3 if execute_stream or early_results == "multi-generation" else 2)
+                                assert result_status(receiver, "early_reused") == reuse_before + (2 if execute_stream or early_results in ("large", "multi-generation") else int(early_results != "close"))
+                                expected_rows = 320 if execute_stream else 64 if early_results == "abandon" else (4224 if early_results == "multi-generation" else 4160 if large_result else 128)
                                 assert result_status(receiver, "early_rows") == early_rows_before + expected_rows
                                 if early_results != "abandon":
                                     assert preflight_rows() == preflight_before + expected_rows, "final rescanned an already validated result"
                                 else:
                                     assert preflight_before + 4160 < preflight_rows() < preflight_before + 8256, "final did not revalidate abandoned result from row zero"
                                 if large_result:
-                                    for first in range(2, 4097, 511):
-                                        last = min(first + 511, 4097)
+                                    for first in range(large_fetched + 1, large_row_count + 1, 511):
+                                        last = min(first + 511, large_row_count + 1)
                                         assert fetch_large(target, last-first) == list(range(first, last))
                                     assert fetch_large(target, 1) == []
                                     assert target.last_row_status & 128
@@ -1888,6 +2382,11 @@ def run_source(port, receiver_port, enabled, relay_port=None, mutation=None,
                                     assert target.query("SELECT COUNT(*) FROM tmp_source WHERE payload=REPEAT('w',512)") == [["64"]]
                             if engine == "resources" and transaction != "empty":
                                 target.query("START TRANSACTION")
+                            if temporary == "begin-only":
+                                target.send(b"\x0e")
+                                seq, response = target.packet()
+                                assert seq == 1 and response[:3] == b"\0\0\0"
+                                assert int.from_bytes(response[3:5], "little") & 1, "RESUME lost the empty BEGIN"
                             if has_user_temp:
                                 if stage_metrics:
                                     initial_dml = resource_stages(ha)
@@ -1940,11 +2439,20 @@ def run_source(port, receiver_port, enabled, relay_port=None, mutation=None,
                                     raise AssertionError("RESUME lost READ ONLY mode")
                             else:
                                 target.query("UPDATE t_contract_source SET v=v+7 WHERE id=64")
-                            if transaction in ("implicit", "empty"):
+                            if temporary == "begin-only":
+                                assert target.query("SELECT v FROM t_contract_source WHERE id=64") == [["647"]]
+                                assert ha.query("SELECT v FROM t_contract_source WHERE id=64") == [["640"]], "first resumed UPDATE committed implicitly"
+                            if transaction in ("implicit", "empty") and temporary != "begin-only":
                                 target.query("ROLLBACK TO SAVEPOINT before_drain")
                                 if has_user_temp:
                                     assert target.query("SELECT COUNT(*),SUM(id),SUM(v) FROM tmp_source") == [["64", "2080", "20800"]]
                             target.query("COMMIT" if commit_resume else "ROLLBACK")
+                            if temporary == "begin-only":
+                                target.send(b"\x0e")
+                                seq, response = target.packet()
+                                assert seq == 1 and response[:3] == b"\0\0\0"
+                                assert not int.from_bytes(response[3:5], "little") & 1, "ROLLBACK left the transaction active"
+                                assert target.query("SELECT v FROM t_contract_source WHERE id=64") == [["640"]]
                             if temp_history == "ddl-copy":
                                 assert {row[2] for row in target.query("SHOW INDEX FROM tmp_source")} == {"PRIMARY", "ix_v"}
                                 assert target.query("SELECT id,v FROM tmp_source FORCE INDEX(ix_v) WHERE v=20") == [["2", "20"]]
@@ -1983,6 +2491,7 @@ def run_source(port, receiver_port, enabled, relay_port=None, mutation=None,
                                       "ordinary undo pretransfer reached receiver" if expect_early_undo else
                                       "savepoint-only tail reused certified undo" if savepoint_reuse else
                                       "continuous DATA and undo checkpoints reused" if native_early else
+                                      "statement rollback replaced invalid TEMP baseline" if early_results == "execute-stream-error" else
                                       "continuous data capture reused source baseline including space growth")
                             if shapes:
                                 if commit_resume:
@@ -2049,6 +2558,10 @@ def run_source(port, receiver_port, enabled, relay_port=None, mutation=None,
             app.query("UPDATE t_contract_source SET v=v+7 WHERE id=64")
             app.query("COMMIT")
             assert ha.query("SELECT SUM(v) FROM t_contract_source") == [["24327"]]
+        if require_temp_batches:
+            barrier.verify_temp_batches()
+        if accepted and ready:
+            wait_receiver_completion()
         receiver.query("ROLLBACK")
         assert receiver.query("SELECT * FROM tmp_contract_reader ORDER BY id") == [["1", "10"], ["2", "20"]]
         receiver.query("DROP TEMPORARY TABLE tmp_contract_reader")
@@ -2071,7 +2584,8 @@ def run_source(port, receiver_port, enabled, relay_port=None, mutation=None,
             assert source_delta["source_undo_write_written_bytes"] > 4 * 16384
             assert receiver_delta["receiver_source_read_bytes"] > 0
             assert receiver_delta["receiver_image_read_bytes"] > 0
-            assert receiver_delta["receiver_image_written_bytes"] == 2 * receiver_delta["receiver_image_read_bytes"]
+            assert receiver_delta["receiver_image_written_bytes"] == expected_image_written, (
+                receiver_delta["receiver_image_written_bytes"], expected_image_written)
             assert receiver_delta["receiver_result_read_bytes"] > 0
             assert receiver_delta["receiver_prepared_calls"] == 1, receiver_delta
             assert receiver_delta["receiver_prepared_us"] >= receiver_delta["receiver_image_us"]
@@ -2085,27 +2599,7 @@ def run_source(port, receiver_port, enabled, relay_port=None, mutation=None,
             assert source_delta["first_dml_unclassified_calls"] == 0
             for stage in ("physical_prepare", "physical_resurrect", "physical_adopt"):
                 assert source_delta[stage + "_calls"] == 0, "loopback bridge is not physical promotion"
-            assert receiver_delta["final_tokens"] == 1
-            assert receiver_delta["final_ready_epochs"] == 1
-            assert receiver_after["final_active_epochs"] == 0
-            assert receiver_delta["final_dropped_observations"] == 0
-            assert receiver_delta["final_input_objects"] > 0
-            assert 0 <= receiver_delta["final_pending_input_objects"] <= receiver_delta["final_input_objects"]
-            assert (receiver_delta["final_pending_input_bytes"] > 0) == (receiver_delta["final_pending_input_objects"] > 0)
-            assert receiver_delta["final_observed_staged_tokens"] == 1
-            assert receiver_delta["final_pending_temp_plans"] == 1
-            assert receiver_delta["final_pending_result_plans"] == 1
-            assert receiver_delta["final_ready_temp_plans"] == 0
-            assert receiver_delta["final_batches"] > 0
-            assert receiver_delta["final_processed_bytes"] > 0
-            samples = [sample for epoch, sample in final_samples().items() if epoch not in prior_final_epochs]
-            assert len(samples) == 1, "current epoch final sample missing or duplicated"
-            sample = samples[0]
-            assert sample["outcome"] == "READY"
-            wall_parts = ("prepare_only_us", "bind_only_us", "overlap_us", "other_us")
-            assert int(sample["wall_us"]) == sum(int(sample[k]) for k in wall_parts)
-            assert int(sample["end_us"]) - int(sample["begin_us"]) == int(sample["wall_us"])
-            print("TEMP metrics cover final debt/wall, first DML outcome and FETCH; bridge excludes physical stages")
+            print("TEMP metrics cover resource preparation, first DML outcome and FETCH; bridge excludes physical stages")
         for name in ("active_epochs", "inflight_tokens"):
             rows = receiver.query("SELECT VARIABLE_VALUE FROM performance_schema.global_status "
                                   "WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_" + name + "'")
@@ -2114,7 +2608,7 @@ def run_source(port, receiver_port, enabled, relay_port=None, mutation=None,
     if temporary:
         print("production " + engine.upper().replace("-", "_") + " temporary transfer: " + temporary + " passed")
         if ready:
-            print(("loopback" if port == receiver_port else "standby") + " receiver prepared temporary resources before READY")
+            print(("loopback" if port == receiver_port else "standby") + " receiver published temporary resources; SQL RESUME gates installation")
         if resume:
             print("strict SQL RESUME integration: " + resume + " passed")
     elif mutation:
@@ -2122,16 +2616,21 @@ def run_source(port, receiver_port, enabled, relay_port=None, mutation=None,
     else:
         print("production source contract: receiver_namespace=" + str(enabled) + " passed")
 
+    if execute_stream:
+        assert stream_proof and stream_proof['execute_pending'] and stream_proof['lock_pending'] and stream_proof['checked_bytes'] > 0, (
+            "EXECUTE remained pending after producing rows, but receiver had no ACKed row bytes", stream_proof)
+        print("receiver ACKed and stored row bytes before EXECUTE completed")
 
-if __name__ == "__main__":
+
+def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--namespace", type=int, choices=(0, 1), required=True)
     parser.add_argument("--receiver-port", type=int)
     parser.add_argument("--relay-port", type=int)
     parser.add_argument("--mutate-ack", choices=("v2", "contract"))
-    parser.add_argument("--temporary", choices=("undo", "no-undo", "cursor", "cursor-no-undo", "cursor-only", "ps-only"))
-    parser.add_argument("--ps-capture-disabled", action="store_true")
+    parser.add_argument("--temporary", choices=("undo", "no-undo", "cursor", "cursor-no-undo", "cursor-only", "ps-only", "begin-only"))
+    parser.add_argument("--ps-temp-disabled", action="store_true")
     parser.add_argument("--stage-metrics", nargs="?", const="success", choices=("success", "first-error", "ps-reprepare"))
     parser.add_argument("--ready", action="store_true")
     parser.add_argument("--resume", choices=("success", "binlog", "activate", "not-ready", "result-stage"))
@@ -2146,7 +2645,7 @@ if __name__ == "__main__":
     parser.add_argument("--lob-trace")
     parser.add_argument("--virtual-fault", choices=("length", "index", "old", "new"))
     parser.add_argument("--continuous-capture", action="store_true")
-    parser.add_argument("--early-results", choices=("supersede", "close", "large", "abandon"))
+    parser.add_argument("--early-results", choices=("supersede", "close", "large", "abandon", "multi-generation", "execute-stream", "execute-stream-oversize", "execute-stream-error", "execute-stream-spill", "execute-stream-first"))
     parser.add_argument("--independent-undo", action="store_true")
     parser.add_argument("--savepoint-reuse", action="store_true")
     parser.add_argument("--expect-early-undo", action="store_true")
@@ -2154,8 +2653,13 @@ if __name__ == "__main__":
     parser.add_argument("--early-undo-abandon", action="store_true")
     parser.add_argument("--undo-page-cache", action="store_true")
     parser.add_argument("--undo-cache-invalidate", action="store_true")
-    parser.add_argument("--undo-owner-case", choices=("shared", "cancel", "quota"))
+    parser.add_argument("--undo-owner-case", choices=("shared", "cancel", "quota", "commit", "initial-commit", "initial-commit-resource", "result-final-chunk", "result-phase1-timeout"))
     parser.add_argument("--native-early", action="store_true")
+    parser.add_argument("--query-ack-loss", action="store_true")
+    parser.add_argument("--expect-sparse", action="store_true")
+    parser.add_argument("--native-final-tail", action="store_true")
+    parser.add_argument("--require-temp-batches", action="store_true")
+    parser.add_argument("--temp-batch-retry", action="store_true")
     parser.add_argument("--native-spill", action="store_true")
     parser.add_argument("--native-rollback", action="store_true")
     parser.add_argument("--undo-delta", action="store_true")
@@ -2171,4 +2675,8 @@ if __name__ == "__main__":
     if args.receiver_port is None:
         run(args.port, args.namespace)
     else:
-        run_source(args.port, args.receiver_port, args.namespace, args.relay_port, args.mutate_ack, args.temporary, args.ready, args.resume, args.engine, args.isolation, args.transaction, args.large_undo, args.autoincrement, args.temp_history, args.column_shapes, args.commit_resume, args.lob_fault, args.lob_trace, args.dependency_free_ps, args.virtual_fault, args.prebuild_workers, args.gc_probe, args.no_response_tail, args.continuous_capture, args.ps_capture_disabled, args.stage_metrics, args.early_results, args.independent_undo, args.savepoint_reuse, args.expect_early_undo, args.early_undo_supersede, args.early_undo_abandon, args.undo_page_cache, args.undo_cache_invalidate, args.undo_delta, args.undo_delta_fault, args.native_early, args.native_rollback, args.undo_owner_case, args.close_partial, args.close_replay, args.native_spill)
+        run_source(args.port, args.receiver_port, args.namespace, args.relay_port, args.mutate_ack, args.temporary, args.ready, args.resume, args.engine, args.isolation, args.transaction, args.large_undo, args.autoincrement, args.temp_history, args.column_shapes, args.commit_resume, args.lob_fault, args.lob_trace, args.dependency_free_ps, args.virtual_fault, args.prebuild_workers, args.gc_probe, args.no_response_tail, args.continuous_capture, args.ps_temp_disabled, args.stage_metrics, args.early_results, args.independent_undo, args.savepoint_reuse, args.expect_early_undo, args.early_undo_supersede, args.early_undo_abandon, args.undo_page_cache, args.undo_cache_invalidate, args.undo_delta, args.undo_delta_fault, args.native_early, args.native_rollback, args.undo_owner_case, args.close_partial, args.close_replay, args.native_spill, args.query_ack_loss, args.expect_sparse, args.native_final_tail, args.require_temp_batches, args.temp_batch_retry)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,20 +1,132 @@
 # 临时表与待 FETCH 结果 Preserve/Resume 任务跟踪
 
-更新日期：2026-10-05；当前实现 E62、最新压力矩阵 E69–E72、LOCKSET 复测与零 survivor 核对 E73、两批函数归位 E65/E67、最新全量 MTR E68（含 big-test）。目录 `/Users/a1234/project/mysql-server-8022-preserve-port`，分支 `ha_preserve_trx`；本轮验证使用 `9a439e9ac544` 加 E65/E67 两批函数迁移，哈希指本次 amend 前的验证基线。
+**当前 E141（2026-10-10，原有五模型当前Release复测）：** 5/5各一轮完整执行，三项sysbench通过原验收；mixed-transfer与continuous-no-commit本地功能成功、性能及部分覆盖未通过。strict分别为274.449／713.687／193.030／38062.816／1304.387ms，EXACT分别179.481／224.912／176.011／1897.200／1286.199ms；适用的receiver ACK→READY均低于500ms。mixed 914/914、no-commit 1071/1071 SUCCESS/READY；自动提交0 survivor为正常session-only，1000连接HOLD。保持原规模、各2GiB预算及判据，2,648项输入无漂移，无内核修改或提交/push。详见本页E141及[完整报告](../../../build-release/original-pressure-e141/README.md)。
+
+**当前 E139–E140（2026-10-10，TPC-C128及全量MTR含big test）：** 当前Release原300仓库／128连接／300秒持续业务模型，独立18项验收全部通过：strict **352.572ms**、有效EXACT **75.744ms**、receiver同钟ACK→READY **0.462ms**，79/79 survivor READY、128原连接/HOLD，无FATAL、重连或DRAIN新增1205。随后当前Debug完整no-bin/log-bin MTR分别 **605通过／316条件跳过／0失败**、**631通过／290条件跳过／0失败**，shutdown分别通过，两轮退出0；921个不同用例及18个big test全部在适用模式通过。没有修改内核、共享驱动、测试或golden，未提交/push。详见本页E139–E140及[TPC-C独立验收](../../../build-release/tpcc-128-e139/c128/independent-validation.json)、[MTR逐项结果](../../../build-debug/preserve-full-big-e140/results.tsv)。
+
+**当前 E138（2026-10-10，500连接持续业务两轮复测）：** 按要求重新构建Release后，沿用TEMP50／FETCH50／BOTH50／RW350和300秒业务窗口，业务在DRAIN期间继续到命令边界4020；原1GiB预算、BALANCED及6个既有worker不变。两轮本地功能通过，严格Phase2为 **689.872／737.450ms**，receiver同钟ACK→READY为 **120.499／31.154ms**，两项关键指标均达标。原综合验收仍未通过：第一轮EXACT尾部689.406ms超过500ms，第二轮NO_ELIGIBLE_BODY且coverage完整，无有效EXACT起点，不计0或通过。详见本页E138明细及[核验汇总](../../../build-release/continuous-resource/e138-matrix-fix-review/summary.json)。
+
+**当前 E137（2026-10-10，M矩阵失败修复）：** 按E136确认的根因收敛结果代生命周期和Phase1调度，10个内核文件+241/-154（净增87行），无新增内核文件、线程池、协议种类或升主阶段。保持原预算、协议上限、命令边界、final精确身份校验。最终Release完整M1–M12 **62/62通过原模型验收**，包含56个成功迁移配置、3个无DRAIN对照和3个预期拒绝配置；334个token READY，捕获失败总数0，4个NOT_READY仅来自预期deadline负例。56个成功迁移配置的strict和receiver同钟ACK→READY均有样本，最大分别为 **1350.485ms／14.529ms**，通过原2s／500ms门槛。独立EXACT仅1个有效样本63.734ms，其余55项为NO_ELIGIBLE_BODY且coverage完整，不计通过。
+
+29个不同定向MTR业务用例在适用配置通过，覆盖换代/CLOSE退役、流式结果、恢复后FETCH内容与位置、receiver清理、undo换代、ACK丢失和OFF路径。不是本轮全量MTR，也不把单轮矩阵外推为长期稳定性或真实物理升主验收。三方独立只读审查未发现本次差分的新阻断问题，未提交/push。详见本页E137明细、[62项结果](../../../build-release/temp-fetch-pressure-e137/RESULTS.md)、[完整指标](../../../build-release/temp-fetch-pressure-e137/metrics.json)。
+
+**当前 E134（2026-10-10，TPC-C-like 64 并发）：** 沿用E133同一Release和原300仓库／9表／RR模型，包装仅将业务并发128改为64；双端Preserve各2GiB、buffer pool各2GiB、PROMOTION_PREPARE及原验收门槛不变。连接就绪后业务实际运行300.021229秒再DRAIN，并持续至HOLD/READY。独立18项校验全部通过：strict **377.124ms**、有效EXACT **58.655ms**、receiver同钟ACK→READY **0.225ms**；39/39 survivor SUCCESS/READY、64原连接/HOLD、NOT_READY=0，DRAIN新增1205=0，无FATAL/重连/未决ownership。
+
+59个完整5秒窗口平均 **791.233 TPS／22464.841 QPS**，原p95=0.00无效。60个资源样本全部在DRAIN前，不能称DRAIN峰值；与E133为单轮对照，不据此声称稳定扩展性收益。2,563项冻结输入保持不变；未改内核、共享测试驱动或预算，自有克隆已回收并校验归档种子。范围仍为本地DRAIN→transfer→READY，未执行物理升主/RESUME，未提交/push。[完整报告](../../../build-release/tpcc-64-e134/README.md)。
+
+**当前 E133（2026-10-10，TPC-C-like 128 并发）：** 当前 Release 原 300 仓库／9 表／128 并发／RR 模型单轮完成，实际业务运行300.021464秒后DRAIN，持续至HOLD/READY；双端Preserve各2GiB、buffer pool各2GiB、PROMOTION_PREPARE与原门槛不变。仅在本轮启动包装删除废弃result-capture-enable参数，未改内核、共享驱动或测试。原18项独立校验全部通过：strict **693.563ms**、有效EXACT **203.845ms**、receiver同钟ACK→READY **0.477ms**；82/82 survivor SUCCESS/READY、128原连接/HOLD、NOT_READY=0，DRAIN新增1205=0、无FATAL/重连/未决ownership。
+
+59个完整5秒窗口平均 **750.346 TPS／21346.142 QPS**；原驱动p95=0.00无效。60次资源样本全部在DRAIN前，不能当作DRAIN峰值或精确阶段吞吐。2,563项冻结输入无漂移，Release重建哈希不变，独立只读复核原日志与报告一致；源端按原驱动取证后退休，receiver正常退出，自有克隆回收并校验归档种子。压测前对10份历史归档的33,180份重复std_data素材去重，净减15.265GiB，保留内容逐文件哈希复核；未删除失败证据或编译产物。结论限本地DRAIN→transfer→READY，不替代真实升主/RESUME；未提交/push。[完整报告与清理记录](../../../build-release/tpcc-128-e133/README.md)。
+
+**当前 E132（2026-10-10，全量 MTR 含 big test）：** 当前 Debug 重新构建后顺序执行 no-bin/log-bin 全套，`parallel=4、big-test、retry=0、force、max-test-fail=0`，保留原 check-testcases。**no-bin 605通过／316条件跳过／0失败；log-bin 631通过／290条件跳过／0失败**，shutdown 两轮单列通过，退出码均0。921个不同用例全部在适用模式通过（885运行时＋36源码lint），18个big test全覆盖；条件跳过仅为对应binlog模式不适用。当前不存在独立 transfer_stby 套件。25,702项输入及两份二进制指纹无漂移，独立只读复核原日志、库存和结束标记一致；未改内核／测试／golden，未提交或push。两轮日志与自有测试目录完整归档；不由此宣称 Release 性能或真实物理升主集成完成。[完整报告与逐项证据](../../../build-debug/preserve-full-big-e132/README.md)。
+
+**E131（2026-10-10，sysbench读写1000并发）：** 当前Release原`oltp_read_write / skip-trx=off`单轮完成，128表×20000行、1153000条PS、两端Preserve各2GiB，profile与E103逐字段一致。仅在新证据目录的启动包装过滤已删除的result-capture-enable参数；未改内核、预算、驱动门槛。原验收通过：strict **938.344ms**、有效EXACT **381.123ms**、receiver同钟ACK→READY **0.571ms**；90/90 survivor READY、NOT_READY=0，1000原连接/HOLD核验通过。
+
+全部连接就绪后实际运行309.618832秒才DRAIN，业务保持至READY；30个完整10秒报告平均 **896.114 TPS／17926.579 QPS**，稳态err/reconn均0，后段吞吐下降仍记录。业务session实测1000个均RR；历史E103文档RC表述不照搬。报告到达跨度299.977069秒不代表业务不足300秒。38项冻结输入未变、原runner退出0、自有实例/目录清理完成；资源采样缺项单列，不称采样零错误。不替代实际升主、SQL RESUME或PS回放，未提交/push。[完整报告与证据](../../../build-release/sysbench-rw-e131/README.md)。
+
+**E130（2026-10-10，清理后两轮Release压测）：** 使用E129清理后同一Release二进制，串行运行原500连接/300秒模型（TEMP50/FETCH50/BOTH50/RW350，双端1GiB预算、BALANCED、不限速）。两轮本地功能及两项关键指标均通过：strict Phase2 **831.075/837.178ms**，receiver同钟ACK→READY **165.041/182.622ms**。原综合验收仍0/2，唯一失败项均为有效EXACT尾部 **828.572/836.064ms** 超过独立500ms门槛，未改判据。
+
+两轮451+49、448+52覆盖全部500连接，无未分类或worker错误；关闭前receiver后台任务归零、无晚期TEMP完成错误，原有TEMP隔离与已提交RW核账通过。prepared阶段计量各150次（通用分类success=0/unclassified=150，不称150条显式SUCCESS）。控制端READY观察→后台归零观察间隔617.221/2541.291ms，不是实际I/O尾部或RESUME等待，不能据此证明自然2秒窗口足够。binary/driver/10项依赖两轮一致；source清理关机仍为用户已排除的purge stop计数断言。未改内核或驱动、未提交/push，不替代物理升主/SQL RESUME/proxy集成或全量MTR。[两轮报告与原始证据](../../../build-release/continuous-resource/e130-cleanup-review/README.md)。
+
+**E129（2026-10-09，三方独立复核后的清理）：** 三个独立上下文的只读 sub agent 各自核对完整九项清单，主会话复核后实施，并复审实际差分。8个内核文件+36/-61，净减25行：删除 strict 内部未使用的同步 TEMP 回退、合并封存 writer 回收与重复 seal OOM 探针、归并重复扫描/判断、简化结果预传输私有状态与包装函数，并更正指标注释。保留正式同步安装 probe 入口、故障注入、身份/预算/生命周期保护；E128 异步完成与 session RESUME 等待合同不变。删除重复用例三文件80行，共享 E2E 脚本+22/-12。
+
+最终121项定向 MTR 在适用 no-bin/log-bin 模式全部通过（120运行时＋1源码lint）：no-bin42通过/79跳过，log-bin86通过/35跳过，零失败，shutdown另计均通过。首轮log-bin的两个失败原样保留：旧脚本在READY后立即断言后台归零，以及正常receiver路径残留“不得再次flush”的故障注入；核实后改为有界等待并校验成功准备次数，保留专门的后台I/O失败验证。两个原失败项及等待/flush失败用例各重复两次，8次通过。Debug和Release构建均通过；不是全量MTR或新的性能验收，未提交/push。[清理差分与完整记录](../../../build-debug/preserve-cleanup-e129/README.md)。
+
+**E128（2026-10-09，定向回归与五轮关键指标通过）：** 按用户确认将 TEMP 最终 pwrite/flush/close 与依赖它们的准备链放到原 receiver worker 后台续作，READY 不等待；SQL RESUME 仅等待本 session 完成。最终输入、目标 ID/undo 在 READY 前准备，结果 cursor 保持原完整准备。删除 E126 seal_private，保留真实 flush/close 的失败检查，不新增线程池或升主阶段。70个不同相关 MTR 已在适用 no-bin/log-bin 模式通过（69运行时＋1源码lint，非全量）；新增6项覆盖等待、独立session、KILL及write/flush/close失败。
+
+原500连接/300秒/1GiB预算的Release五轮本地功能及两项关键指标均5/5通过，strict664.380–841.780ms，receiver同钟ACK→READY73.883–130.816ms；每轮150个资源owner完成、无晚期完成错误。二进制/脚本/依赖SHA一致；r5首次端口预检退出后仅更换本地端口。原综合验收仍0/5：r1–r4缺EXACT样本，r5EXACT840.008ms超过独立500ms门槛。不把controller归零观察间隔当作真实READY→TEMP完成时间或RESUME等待。E127独立分类遗漏及外部物理集成仍未关闭。未提交/push。[合同与实施](async-temp-resume-barrier.md)、[验证记录](../../../build-debug/preserve-temp-async-e128/README.md)、[五轮证据](../../../build-debug/preserve-temp-async-e128/release-results.md)。
+
+**E127定位补充（2026-10-09）：** 两轮原500连接/300秒Release诊断的strict为794.735/986.890ms，ACK→READY为1167.847/911.698ms。r1 token23的my_pwrite878.839ms覆盖ACK窗75.25%，其返回后2.323ms即READY；r2进一步确认token14实际pwrite系统调用701.486ms，另25.114ms，两者覆盖ACK窗约79.70%。两轮ifstream close最大8/12us，不构成本轮长尾。原E126 r2缺少逐调用时刻，不能将本次分解倒填过去，也未唯一确定OS内部等待原因。r1还发现conn89在FETCH EOF后COMMIT被4020拒绝，未进入450survivors＋49session-only，功能判失败；有吻合的只读事务无更新undo筛选路径，具体分支仍待服务端事实确认。r2功能通过不关闭该遗漏。用户确认保留实际pwrite写法，未改READY合同；9文件临时诊断已撤除并强制重建，未增加生产修复或提交。[E127完整记录](../../../build-debug/preserve-receiver-adopt-e127/README.md)。
+
+**E126最新复验补充（2026-10-09）：** Release原500连接模型前两轮功能均通过、worker_errors为零；strict为785.756/1966.749ms，ACK→READY为352.361/1193.991ms，尚未稳定达标。第三轮端口占用导致业务前预检退出，无有效样本；尚未完成五轮。新增两个首次业务触碰MTR（Debug、log-bin、同进程）通过：READY观察后至少2秒才下发首条业务，TEMP UPDATE为1.986ms、FETCH为0.872ms，原数据/回滚/游标断言保留。该小规模结果支持继续评估业务影响，不能替代Release并发恢复或真实物理升主验收。[最新证据](../../../build-debug/preserve-receiver-private-seal-e126/README.md)。
+
+**历史优化（E124–E126，2026-10-09）：** E124只取消private DATA fsync、仍同步close的试验已回撤；正式两轮ACK→READY 2770.548/3235.993ms均失败。E125r2确认close系统调用覆盖ACK窗95.36%；恢复fsync后r4 strict710.169ms、ACK1789.575ms，三条final增量SYNC同时占槽884.925ms。11个文件的诊断已全部移除。E126仅为receiver私有DATA新增seal_private：写入/转换/摘要及身份校验完成后可接管，fd和额度仍由原owner持有，退休时由既有reaper关闭；不新增线程/队列，不改变warm/UNDO/epoch同步。35个不同定向MTR在适用双模式全通过（nobin14通过/21跳过，logbin22/13，零失败；shutdown另计），Release原模型复测进行中，性能尚未宣布闭环。用户确认READY→首条业务下发自然间隔至少2秒，并非要求额外sleep；Linux O_DIRECT首次访问仍需真实物理工程核验。[E124证据](../../../build-debug/preserve-receiver-writeonly-e124/README.md)、[E125定位](../../../build-debug/preserve-receiver-native-e125/README.md)、[E126实施](../../../build-debug/preserve-receiver-private-seal-e126/README.md)。
+
+**最新优化（E122–E123，2026-10-09）：** E123首次COPY跳过新文件内部全零页，writer实写由约1000MiB降至264–267MiB，3个内核文件+17/-3，无新线程/预算。29项定向MTR适用双模式通过。冻结Release五轮功能全部通过，strict 639–877ms（原2秒线5/5）；ACK→READY 415–1902ms（500ms线仅2/5），目标尚未闭环，原综合性能0/5。第4轮中断后主机重启，后两轮环境差异单列，不能把跨重启变化全归因于优化；不替代全量回归及外部物理集成。未提交/push。[E123证据](../../../build-debug/preserve-source-sparse-e123/README.md)。
+
+**最新定位（E115，2026-10-09，无生产修复）：** E114五轮正式binary/参数相同。追加四轮相同500连接/300秒/1GiB/BALANCED的Release诊断，功能均通过；strict为952.176/1845.931/2898.961/826.739ms，ACK为545.730/915.758/859.375/618.039ms，原性能验收均未通过。已复现source超限：纯TEMP token24的stream占strict92.23%，但原ACK3754.712ms未重现。窄诊断直接证明100个TEMP/BOTH stream累计71.56%的时间在获取共享session锁，锁跨同步帧发送/ACK持有；这是并发累计量，不能当strict占比或套回R3。另有source pwrite322ms/sync357ms、receiver sync1016ms及三个准备槽同时阻塞。候选复用不代表最终版本在ACK前已准备完成。临时诊断代码全部撤除并重建原Release，未改预算、线程池或TEMP持久化语义，未提交/push。[完整定位与证据边界](../../../build-debug/preserve-r3-diagnosis-e115/README.md)。
+
+**当前实施（E114，2026-10-09，全量回归通过、五轮Release性能未通过）：** Phase1新cursor结果已接入有界producer流，既有worker在EXECUTE未结束时传输完整行前缀，receiver结果接收不fsync；没有新增线程池或升主阶段。最终Debug全量含big-test：no-bin606通过／306跳过，log-bin621通过／291跳过，零失败，shutdown分别通过；912不同用例及18个big-test全部在适用模式通过。连续5轮 Release 本地 transfer→READY 功能均通过，worker_errors 为0；strict≤2.2s为4/5，原strict≤2s为3/5，ACK<500ms为0/5。最大strict=2850.872ms、ACK→READY=3754.712ms，未稳定达到用户所举的前R2水平，性能仍未关闭。 DRAIN前小规模OFF/ON配对捕获及预传输计数始终为零，未观察到持续EXECUTE p99劣化。未提交／push。
+
+**历史定位（E113，2026-10-09，尚未形成新修复）：** 固定500连接/300秒/1GiB/BALANCED，两轮诊断功能通过；strict分别3201.950/864.264ms，ACK→READY分别1540.495/845.245ms，均未完成整体性能验收。R1源端最终image link单次2044.040ms，receiver长fsync和R2的pwrite已分离出实际调用区间且thread CPU很低；3个准备槽被长I/O同时占用。普通SEAL等的是admission ACK，不能把2.047秒等待当作SEAL文件校验；R2进一步看到普通chunk/ranges的OS close堆积，但逐请求因果仍待核定。E112 R1/R2仍是同源码/二进制/参数，不能归因为两轮之间改了代码。12个临时诊断源码已撤回，Release SHA恢复原值；未改预算、语义或新增生产机制，未提交/push。[E113完整定位](../../../build-debug/preserve-io-diagnosis-e113/README.md)。
+
+**此前实施（E112，2026-10-09，定向功能通过，性能未通过）：** receiver 私有双镜像改为 O_EXCL 直接创建 `.image`，删除 `tmp→warm→image` 发布和 private writer 目录同步；保留 DATA flush/close 错误、双副本、摘要、sealed/READY 及同 boot 门禁。38个定向业务用例全部在适用 binlog 模式通过；未重跑本轮全量。原500连接/300秒/1GiB/BALANCED两轮功能均通过，R1 strict=1674.221ms、ACK→READY=1325.679ms；R2 strict=4247.612ms、ACK→READY=2559.615ms，**两轮之间无代码/参数修改，二进制与脚本及依赖SHA均相同**。R3诊断仍看到DATA sync437.096ms和my_close包装层486.046ms，文件调用窗口并集占ACK尾部75.26%；不将诊断样本当正式验收或倒推R2的精确归因。诊断代码已撤回，重建Release SHA恢复为 `af51a7f5e5203f4c3ffc82255ecda4fe9c6819b1fe27736150d1e8f1b23ba9b9`，与R1/R2一致。I/O收敛改动暂保留，尚无稳定整体收益结论；未提交/push。[E112记录](../../../build-debug/preserve-receiver-io-e112/README.md)。
+
+**此前实施（E111，内核与 MTR 已完成，性能验收继续）：** 结果捕获已延后至 DRAIN Phase1，删除独立 capture_enable 参数；DRAIN 前仅维护轻量身份和安全读等待事实。新增专属借用模块，复用既有 worker、编码、传输和 receiver 准备，final 在 freeze/detach 前补齐尾部。Debug/Release 构建成功；最终 MTR no-bin 606通过/300跳过、log-bin 615通过/291跳过，均零失败，18个big-test全部覆盖。独立审查发现的 pin 分配异常和多 cursor 换代租约高水位问题已修复，后者保留明确 RED。最新原配置无采样R12：500连接全部完成场景检查，strict Phase2=1626.577ms，但 ACK→READY=2534.139ms 仍未达标。未证实收益的receiver缓冲实验已撤回，不能用 MTR 或旧性能成绩替代性能验收。
+
+**此前全量回归（E110，2026-10-08，含 big test）：** 当前 E107／E109 版本 Debug 构建成功，顺序完成 no-bin／log-bin 全量，4 workers、零重试。no-bin **604 通过／295 条件跳过／0 失败**；log-bin **608 通过／291 条件跳过／0 失败**，shutdown 两轮单列通过。899 个业务用例全部至少通过一种适用模式，18 个不同 big test 全部通过。首轮 19 个失败全部串行复现，原因分别为 12 项旧模式配置前提和 7 项 profile 清理硬编码；只适配 26 个测试文件，内核和二进制未改。后 7 项仅修改 binlog 守卫之后的代码，最终树另验 no-bin 7 项跳过，未再重跑 no-bin 全量。未提交／push，不新增性能或外部集成结论。[完整报告](../../../build-debug/preserve-full-big-e110/README.md)、[逐项矩阵](../../../build-debug/preserve-full-big-e110/matrix.tsv)。
+
+**此前普通全量回归（E108，2026-10-08）：** 基于 `f540116c322ec6477279288204094c762bd3f30e` 加 E107 未提交改动，Debug构建通过；按本轮约定不含big test，顺序完成preserve_trx no-bin/log-bin全量，均8 workers、零重试。no-bin **587通过／312跳过／0失败**；log-bin **606通过／293跳过／0失败**，shutdown两轮单列通过。899个不同业务用例各有两模式结果，**881个普通用例全部在至少一种适用模式通过**，仅18个big test两模式均跳过。新控制session关联用例两模式通过；39278项输入、二进制、Git HEAD及运行前后工作树差异一致。本轮未改内核/测试、未提交/push，不新增压力或外部集成结论。[完整报告](../../../build-debug/preserve-full-e108/README.md)、[逐项矩阵](../../../build-debug/preserve-full-e108/matrix.tsv)。
+
+**最新接口修正（E107，2026-10-07）：** 按用户明确的控制连接合同，`preserve_trx_attach_cursor_after_ps_replay(target_thd, source_id, target_ps)` 已支持 `current_thd` 为新主控制 session、`target_thd` 为业务 session，不切换 TLS；目标存活与独占沿用外部已有接管机制。生产路径仅修正 THD 检查和已关闭原生 cursor 的重复 close。两项根因先复现再修复；Debug/Release 构建通过，16 项定向 MTR：no-bin **6 通过／10 条件跳过／0 失败**，log-bin **16 通过／0 跳过／0 失败**，shutdown 均通过。新增跨 session 用例覆盖归属、状态、OOM、重复关联和原 FETCH 位置；独立 review 发现的负例假绿也已修正并实跑验证。本轮未全量 MTR、未重跑压力、未提交／push，不关闭外部 V04–V06。见 [E107 证据](../../../build-debug/preserve-control-attach-e107/README.md)。
+
+**最新清理后压测（E102–E106，2026-10-07）：** 使用同一 E101 清理后 Release 二进制，按各模型原规模、预算及门槛分别运行一次；下面的功能结论限定为本地 DRAIN→standby transfer→receiver READY。未执行外部物理备机在线升主、SQL RESUME、PS 回放或迁移后 FETCH，不关闭 V04–V06，也不以单轮结果宣布性能稳定改善。
+
+| 记录与模型 | 功能／场景断言 | 严格 Phase2 ms | EXACT 末命令→FINAL ACK ms | receiver ACK→READY ms | 原综合验收 |
+| --- | --- | ---: | ---: | ---: | --- |
+| E102 TPC-C-like 128 并发 | 93/93 survivor READY | 483.618 | 162.641 | 1.132 | 通过 |
+| E103 sysbench 读写 1000 并发 | 131/131 survivor READY；1000 原连接 HOLD | 469.983 | 256.298 | 1.042 | 通过 |
+| E104 M1–M12，62 配置 | 原场景断言 62/62；56 个成功 READY 配置 | 最大 1436.208 | 仅 2 个有效样本：39.674／82.785 | 最大 66.391 | 原场景断言通过；54 个 READY 配置无 EXACT 样本 |
+| E104 持续混合 500 连接 | 437 READY＋63 session-only 完整覆盖 | 1750.630 | N/A：NO_ELIGIBLE_BODY | 124.664 | 未通过：缺少 EXACT 证据，不是该尾部超时 |
+| E105 continuous-no-commit，1000＋100 连接 | 1072/1072 READY；1000 大事务 COMMIT=0 | 1112.186 | 1097.932 | 18.434 | 未通过：尾部／响应超限、覆盖不足及吞吐证据无效 |
+| E106 mixed-transfer，1000 连接 | 938/938 survivor READY | 18650.718 | 1634.143 | 10.746 | 未通过：原旧尾部 1131.837ms 超限；独立 EXACT 复核亦超限 |
+
+表内 strict 一律为 T0→Phase2 end，不用旧 warmcopy／收尾计时替代；ACK→READY 使用 receiver 同 epoch、本端单调时钟。E106 原 profile 没有 strict 2 秒硬门槛，其实测同时超过另行报告的 2 秒目标和 2.2 秒容忍线；其余列出的成功 READY 配置这两项 strict 目标及 ACK→READY<500ms 均满足。E104 另有 2 个 ACK 丢失取消恢复用例通过，负例不混入成功 READY 性能样本。E105 的锁／BODY 最低数量是压测覆盖门槛，不是 DRAIN 成功条件。每轮失败、N/A 与统计边界见文末 E102–E106；当前仅补齐记录，未提交／push。
+
+**最新清理与回归（E101，2026-10-07）：** 已实施清单 A01–A21、B01–B06、C01/C03–C05，保留 C02 与 D 组，内核净减 423 行。三组只读 review 无剩余确认缺陷；Debug/Release 构建通过。全量 big-test 双模式：no-bin 603 通过／295 跳过／0 失败，log-bin 607 通过／291 跳过／0 失败，898 项并集和 18 个 big test 全覆盖，shutdown 均通过。全量后收尾删除两行无消费者计量，最终版本另通过 14 项双模式定向复测；版本边界见 [E101 报告](../../../build-debug/preserve-cleanup-e101/README.md)。未提交／push，不宣称压力性能变化。
+
+
+**此前 parser 清理（E96，2026-10-07）：** 在已提交的 `290e94a156c1` 上，删除旧 PS/SP 重建遗留的九处 parser 文本保留条件及多余头文件；`sql_yacc.yy` 与该特性加入前逐字节一致。Debug 构建通过；定向 MTR no-bin 8 通过／6 条件跳过／0 失败，log-bin 14 通过／0 跳过／0 失败，两轮 shutdown 分列通过。包含源码约束 RED→GREEN、SP 的 ON/OFF 行为及既有 cursor 捕获、传输、关联和 RESUME。该轮为定向验证，不代替 E95 全量或 E94 压测；本轮清理未提交／push。[详细证据](../../../build-debug/preserve-parser-cleanup-e96/README.md)。
+
+**最新 MTR 修复闭环（E95，2026-10-07）：** E94 的 42 个不同失败用例已修复并经完整双模式复验。先保持旧判断串行复现：39 个临时资源用例准确退出于完整镜像写量等式，2 个退出于 seal-OOM 写量等式；根因是零页跳写后 Debug 探针仍要求两份完整逻辑镜像的物理写量。现按两份“非零页＋必写末页”精确核算，保留 SHA、双份逐页内容、故障和清理检查。另修复同一 lint 的两处过期形状约束（摘要 timer、预算拒绝诊断日志）。最终全量含 big-test、零重试：**no-bin 603 通过／295 条件跳过／0 失败；log-bin 606 通过／292 条件跳过／0 失败**，shutdown 两轮通过；898 个不同用例均在适用模式通过，18 个不同 big test 全部通过。修改仅 Debug 探针和 lint，生产路径未改、Release 指纹保持 E94；原压力未通过项不由本轮关闭。未提交／push。[修复与完整证据](../../../build-debug/preserve-fix-e95/README.md)。
+
+**修复前完整复测（E94，2026-10-06—07，MTR 后续修复见 E95）：** 保持当前R44对应内核／Release指纹，完成no-bin与log-bin全量MTR（含big-test），以及原压力12项、临时资源62配置、持续混合500连接各一次，共75个压力配置。MTR：no-bin561通过／295条件跳过／42失败，log-bin605通过／292条件跳过／1失败；18个不同big-test在适用模式全部通过，失败项串行复现。41项共享Debug探针与零页跳写后的物理写量断言有静态冲突，逐项准确退出点未全部动态确认；另1项lint已核实是旧正则不接受计时语句。原压力完整验收4/12通过，TPC-C1000在DRAIN前后sysbench用户1205增加5次；其它业务延迟／尾部及测量有效性失败保留。临时矩阵独立验收62/62，56个READY场景的strict与ACK→READY均达标，分别最大1606.950／66.352ms；EXACT仅3个有效样本，不能把其它N/A计为通过。持续500功能通过442 READY＋58 session-only，strict **1642.997ms**、ACK→READY **148.325ms**，两项关键目标通过；但无合格EXACT起点，原脚本完整性能验收仍失败。本轮未改内核／正式驱动、预算或门槛；运行后输入hash一致，未提交／push，不能凭这一轮关闭历史长尾。[完整报告与逐项指标](../../../build-release/preserve-complete-e94/README.md)。
+
+**最新五轮与R44回撤核验（E93）：** 原500连接/300秒/双端1GiB预算/不限速完成R50–R54，功能5/5；strict分别2589.884/4255.485/1874.739/4186.949/1769.103ms，ACK→READY分别178.003/234.984/203.941/517.753/253.080ms。原2000ms及用户2200ms的strict+ACK共同门槛均2/5通过，ACK单项4/5；五轮EXACT有效且均超500ms，原脚本整体0/5。直接核查R44原始binary/脚本指纹一致；用R44批次输入patch和同HEAD重建62个文件，46个内核文件逐字节一致，唯一tracked差异为本任务文档。独立审核确认E91探针及E92试验已撤回，历史未跟踪代码/测试亦一致。**截至E93，内核与驱动已恢复R44对应版本，但同版本性能仍不稳定；不能把文档/报告变化称为代码回撤失败。** 后续E95仅修正Debug探针和lint，生产路径与Release指纹仍保持。 五轮期间未修改代码或配置，未提交/push。[五轮及逐文件证据](../../../build-release/continuous-resource/r29-restored-r50-r54/README.md)。
+
+**历史回撤记录（E92已撤回，恢复R29）：** 对TEMP/RESULT实施过对象内data/ranges FD复用，保留pwrite、原重传/覆盖/SHA校验，使用既有FD额度与退休ticket，不新增线程池。原500连接/300秒/预算/不限速R48功能262 READY＋238 session-only通过，strict **3358.394ms** 未通过2.2秒，ACK→READY **496.767ms** 刚在500ms内，EXACT **3171.358ms** 未通过；source worker墙钟2941.140ms。未证明整体收益，不能仅凭open/close减少宣称优化，也不能用一轮数据证明全部退化由该改动引起。用户要求回退后已精确撤回本轮5个内核文件的增量及4个试验专用测试文件；R49在业务约85秒时中断、未进入DRAIN，不计验收。Release重建SHA恢复为`61b78ba69ad2ceea19c60fdaf2665da634901ede52fb643b80f922c6bbd3ec41`，与R29完全相同，benchmark及10个依赖SHA也相同。Debug/Release重建和回退后的cursor_final_transfer_chunks通过。R29五轮R40–R44仍是3/5双指标通过，回退不等于长尾已解决。未提交或push。[试验与回退证据](../../../build-release/continuous-resource/file-reuse-e92/README.md)。
+
+**最新长尾诊断（E91）：** 对E90的source worker/staging窗口增加临时分段计时，按原500连接/300秒/预算/不限速完成R45–R47诊断，三轮功能通过。R45 worker3798.581ms中，协调器串行TEMP/RESULT/OTHER合计3747.862ms（98.665%），两处wave flush仅4.603ms；最慢source SEAL等447.659ms，对应同receiver后端前一CHUNK的ACK后apply447.635ms，而当前SEAL自身仅8.601ms。R46将长调用缩小到文件write/close；R47证明长close主要耗在OS调用，最慢848.919ms、MySQL登记处理仅3us。**R45已测worker窗口主要被最终当前代TEMP/RESULT的串行staging占据，并确认receiver文件处理反压下一请求；R47已测长close的文件登记开销不能解释其持续时间。** 不把不同轮次的细分耗时直接倒填给R41/R43。 OS内部具体I/O/调度原因尚未唯一归因；未实施修复。R45 final补传73份新结果代/164.2MB，不支持同代进度丢失后重复全传；仍需取证新代从产生到首次发送的时间线。三轮strict4013.580/2055.912/2033.606ms、ACK162.225/158.419/150.914ms；均带探针，R47另有低频栈采样，不并入八轮正式通过率。已撤回全部临时探针，强制重建Release与原R29 SHA完全相同；原EXACT失败及外部集成边界保留，未提交/push。[完整源码与逐帧证据](../../../build-release/continuous-resource/worker-window-e91/README.md)。
+
+**前次五轮复测（E90）：** 同R29版本/500连接/300秒/原预算/不限速新增R40–R44五轮全部完成，功能5/5通过；strict≤2200ms与ACK→READY<500ms双指标**3/5通过**，原strict≤2000ms双指标同为3/5。R41/R43 strict **2963.767/2957.639ms** 超限，source target-worker墙钟 **2789.278/2778.728ms**；ACK五轮 **151.931–362.277ms** 全通过。加上E89共八轮双指标6/8通过，**R29基线仍未稳定达标，不能靠回退或前三轮绿色关闭长尾**。具体源端窗口内部原因尚未拆清，不归咎receiver READY、TEMP累计或fsync；本轮无内核/驱动修改。原EXACT超限/NA与脚本FAIL保留，R41首次端口预检失败另列并已补足五轮正式运行。[完整五轮及八轮报告](../../../build-release/continuous-resource/r29-repeat-r40-r44/README.md)。
+
+**前次三轮复测（E89）：** 用户确认本轮 strict Phase2 **≤2200ms** 可接受，receiver 同钟 ACK→READY 仍须 **<500ms**；原≤2000ms与独立EXACT门槛保留。当前Release与R29逐字节相同，无需再回退。原500连接/300秒业务/预算/不限速连续三轮R37–R39：strict **1833.818 / 1694.442 / 1935.036ms**，ACK→READY **162.896 / 195.604 / 243.462ms**，两个关键指标按原2秒及本轮2.2秒均3/3通过；功能校验均通过。原脚本仍因R37/R38的EXACT超限、R39无合格EXACT证据而失败。保留R29基线、E85/E87继续撤回；历史同版本R30/R33长尾未据此关闭，三轮不代表长期稳定性或整体商用验收。[完整复测与指标](../../../build-release/continuous-resource/r29-repeat-r37-r39/README.md)。
+
+**此前核定（E88）：** R35正式strict4169.042ms仍失败，ACK→READY77.144ms通过，E87已撤回。R36的500/120秒诊断为1920.659ms/149.974ms；最终39份待发送RESULT全为当前选中代、87.7MB，没有旧代补传。已删除临时日志，维持E84；不以诊断通过替代300秒验收，不修改退休协议、摘要或持久化边界。源端fallback与长调用仍需逐token取证。
+
+**历史诊断与窄修改（E86/E87，未完成性能验收）：** R34的500/120秒分段诊断为strict2252.242ms、ACK→READY285.510ms；主要staging工作为RESULT1304.226ms、TEMP635.100ms，flush仅3.138ms。临时计时已删除。E87仅复用两处本次单帧decode，保留全部认证、路由和batch规则；Debug/Release构建及14个不同定向业务MTR通过，原500/300秒R35功能444 READY+56 session-only通过，但strict4169.042ms失败、ACK→READY77.144ms通过；E87未证明整体收益，已精确撤回并归档patch。E85仍撤回，不将局部复制减少称为整体收益。详见[实施记录](continuous-failure-fix-plan.md)。
+
+**历史实施记录 E82–E84（当轮性能复验）：** 修复首次 DATA baseline 跨 COMMIT 后被误认为完成 receiver checkpoint 的状态区分。R25 运行日志直接命中 4 个 token；新 MTR 在旧内核确定复现，8 个业务 MTR 通过，临时诊断日志已删除。原 500/300 秒 R26 完成 453 READY+47 session-only，strict **1611.498ms** 通过、ACK→READY **1532.279ms** 仍失败。随后复用已有 candidate 通道，在最终 DATA/UNDO 之后提前发送精确清单，保护忙旧 slot；13 个不同定向业务 MTR 通过，原配置 R27 完成 436 READY+64 session-only，ACK→READY **293.310ms** 通过，但 strict **3267.422ms** 失败；target worker 墙钟从 R26 的1453.053ms增至3044.310ms。两项没有同时通过，不称为优化成功；R28 120秒采样诊断确认串行 RESULT 小块发送是当前主要热点；E84仅让final利用协商分块、Phase1仍64KiB、额度不足退回原量子。有效RED为65个CHUNK，修复为5个；非零offset精确ACK重放、SQL RESUME/FETCH/回滚及相邻行为合计10个不同业务MTR通过，原配置R29功能434 READY+66 session-only通过，strict **1760.052ms**、ACK→READY **198.960ms** 同轮通过；独立EXACT尾部1756.549ms仍失败，R30同配置449 READY+51 session-only，strict **2270.173ms** 失败、ACK→READY **138.601ms** 通过，独立EXACT2269.235ms仍失败；整体性能仍未关闭。R30源端FINAL的CLOSE/SEAL累计耗时增大，R31采样未复现CLOSE/SEAL波动，不能归为durability根因；E85单帧直接执行试验11个定向业务MTR通过，但R32 strict4880.141ms失败、ACK28.911ms通过，未证明整体收益，已精确撤回该3行改动并恢复E84R33与R29/R30二进制SHA相同，仍为strict4077.194ms失败、ACK18.347ms通过，故不能将R32全部归因于E85；继续保持撤回，R34仅补临时分段计时诊断。R24 另有 binlog provider 失败待唯一分支定位，不能以重跑成功关闭。详见 [实施记录](continuous-failure-fix-plan.md)。
+
+**验收口径：原目标 strict Phase2 ≤2000ms；用户明确同意本轮复测容忍上限为≤2200ms。receiver 同钟 ACK→READY 仍严格 <500ms，两项必须同轮满足。** 原2秒结果独立保留，不覆盖历史判定或放宽其它模型；原驱动门槛未改。 保持原分组、业务时长、预算与不限速，同时记录 Phase1、业务吞吐/延迟及资源占用。局部计数减少、失败路径短耗时、NA 或只把工作移到另一阶段均不算达标；EXACT 末命令指标独立记录。
+
+更新日期：2026-10-08；最新含 big-test 全量回归为 E110；E109 是默认值调整后的定向回归，E108 是此前普通全量，接口合同与定向复现为 E107；E101 保留为此前含 big-test 全量记录；最新清理后压力结果为 E102–E106，覆盖范围见首页表，不称原压力全库存已重新运行。此前原压力 12 项、临时资源全矩阵及 mixed500 的完整批次为 E94。当前代码为已提交 `f540116c322ec6477279288204094c762bd3f30e` 加 E107 未提交接口修正与 E109 默认值调整，Release 指纹为 `9845dbf8e7a140c348f2e6abe07727877fe378fe398ce587326985a0d644b818`；E102–E106 的 `80337639e2753f21e12538eea32ebd332e5b60c57429ef88d234444b8e4258e7` 保留为当轮压力版本，不把旧性能结果推广为 E107 性能验收。历史实现 E62、双端不限速与READY定向优化 E74、持续负载同步与零页收敛 E81、持续负载扫描优化 E80、持续负载收口 E79、定位与窄修复 E78、容量与最终复用 E77、早失败修复 E76、历史压力矩阵 E69–E72、LOCKSET复测 E73、两批函数归位 E65/E67、历史全量MTR E68均保留原轮证据。目录 `/Users/a1234/project/mysql-server-8022-preserve-port`，分支 `ha_preserve_trx`；E94使用 `c9bc199a64d9` 加冻结的未提交改动。E68–E73的 `9a439e9ac544` 加E65/E67是当轮amend前验证基线，保留为历史证据。
 
 **当前职责：TEMP 与独立 cursor 结果由本工程保存；PS 本体、参数、历史依赖由外部回放承接。** SQL RESUME 只接管事务/临时表/结果 owner，随后外部 PS 回放→显式 cursor attach→CLOSE 补发→业务。旧 PS W07/W08、F09/F10 已删除，不计当前未完成代码；原生协议和命令边界保留。见[详细设计](detailed-design.md)及[接口文档](ps-transfer-removal-and-cursor-attach.md)。
 
-**本地实施与验证：** E62 已接通并纳入 `9a439e9ac544`；E65/E67 两批函数归位累计 49 个函数、931 行主体，定向构建与 MTR 通过。E68 已在第二批迁移后完成完整 no-bin/log-bin MTR，包含 big-test：598/596 项通过、285/287 项条件跳过、零失败；883 项通过并集完整，18 个不同 big-test 实际通过，shutdown 两轮均通过并单列。E63/E66 保留为历史全量证据。E69–E72 已补齐当前版本全部约定压力模型，E73 再复测 LOCKSET：原 11 模型按各自最新轮次 **3 通过/8 未通过**，资源 **62 通过各自断言**，另补 TPC-C 128 并发通过；E64 保留为迁移前比较。未通过项包含时延、receiver 业务保护、锁规模/证据有效性；LOCKSET 最新一轮功能交接通过但 strict Phase2 超限，上一轮零 survivor 的脚本断言不等同内核 DRAIN 失败，详见 E73。不能笼统归为一个性能根因。代码归位、MTR 和场景断言通过均不替代统一性能或外部集成验收。外部升主、真实回放/关联、proxy 及连续迁移仍归 V04–V06。两批迁移的代码范围与验证分别见 E65/E67 和 E68。
+**历史验证（E81，整体性能未通过）：** 最新原500/300秒R19功能通过439 READY+61 session-only，strict1959.247ms通过2s，但ACK→READY2970.222ms失败、EXACT无合格样本。随后R20诊断确认源端FINAL首次DATA fsync集中到16个worker，CLOSE累计15.696秒/100owner。现已在原prebuild worker轮次完成时前移flush，保留dirty尾部和目录持久化；另用immutable sparse零区间证明省掉receiver重复比较读，定向37,748,736B降至11,534,336B。两组各8个业务MTR通过，原配置R21已完成440 READY+60 session-only，strict1825.504ms通过，但ACK→READY2076.796ms仍失败；同二进制R22诊断完成，strict2698.015ms/ACK1955.400ms仍失败，不据局部RED/GREEN宣布性能闭环。E81当轮改动尚未全量MTR、未提交或push，详见[实施记录](continuous-failure-fix-plan.md)和[R20诊断](../../../build-release/continuous-resource/mixed500-profile-r20/README.md)。
 
-**最新 sysbench 读写 1000 并发（E69）：** 首次连接初始化失败，未进入 DRAIN；保持原配置重跑完成，115.3 万条 PS、1000 个原连接保留、23/23 survivor READY。strict Phase2 **687.044ms**、EXACT 尾部 **475.757ms**、receiver ACK→READY **0.500ms**，三项原门槛通过；尾部仅余 **24.243ms**。稳态平均 **551.504 TPS / 11033.168 QPS**，后半段吞吐下降且存在换页，具体根因未证实；首次 sysbench TLS/线程退出故障也未由一次重跑通过关闭。不覆盖 E64 其他模型或外部集成。
+**历史持续负载修复（E77）：** 稀疏BASE同时覆盖提前与最终传输，省略真实全零块并保留完整逻辑SHA；final清单变化也可将已准备的TEMP资源交给既有严格换代路径。原500/300秒`mixed500-r7`完成COMMITTED_HANDOFF、413/413 READY，无容量拒绝；strict **6360.715ms**、receiver ACK→READY **3411.420ms**仍超标，29个空BEGIN连接尚未分类，EXACT末命令证据不适用。定向一行final更新从75,497,472B整镜像重写降至32,768B；不等于500整体达标。继续核查COMMIT丢弃有效DATA及receiver全零页写入，相关新修复尚待原模型复测。详见[实施记录](continuous-failure-fix-plan.md)、[r7报告](../../../build-release/continuous-resource/mixed500-r7/README.md)。未提交或push。
 
-**最新 sysbench 只写 1000 并发（E70）：** 显式事务原模型一次完成，51.3 万条 PS、1000 个原连接保持至 READY，126/126 survivor READY；strict Phase2 **234.795ms**、EXACT 尾部 **149.403ms**、receiver ACK→READY **0.888ms**，完整原验收通过。稳态平均 **8028.948 TPS / 48178.079 QPS**，无重连/FATAL，区间报告估算约 3 次可重试错误。预算和门槛未改；本轮不等同历史长尾稳定消除或全部压力矩阵关闭。
+**历史持续负载修复（E76，当轮500成功迁移未通过）：** 复用既有认证ACK传回receiver已知apply失败；TEMP/RESULT在Phase1及时终止，首次准备门槛单向完成，保留既有worker/预算与final收尾。13个不同定向MTR实际通过。原500/300秒模型`mixed500-r4`在**17.332秒**于Phase1返回4013，无closing/COMMIT/READY；精确拒绝账目为live **1,070,831,687B** 加新增10MiB镜像后超过 **1GiB inflight**，cleanup debt=0。只有1次语义失败，末尾在途字节/队列/活跃worker均0，500份账本完整、业务异常0；不能把快速拒绝或strict原始值0当作性能通过。仍须解决当前工件容量与安全历史退役，未加预算。见[实施记录](continuous-failure-fix-plan.md)、[完整复测](../../../build-release/continuous-resource/mixed500-r4/README.md)。未提交或push。
 
-**最新 TPC-C 300 仓库 128/1000 并发（E71）：** 按顺序各运行一次、业务各 300 秒。128 并发通过原验收：strict **860.400ms**，80/80 READY。1000 并发未通过：strict **4162.976ms**、DRAIN 新增 4 次 1205；205/205 READY，EXACT 尾部 **290.846ms**、receiver ACK→READY **1.521ms** 均通过。strict 的 **93.01%** 位于 T0→HARD 的命令收敛段，具体阻塞根因尚未证实。仅参数化脚本并发数，预算/门槛/内核未改；详细结果见 E71。
+**历史定向优化（E74）：** 已删除发送/receiver限速及固定yield；在原Phase1期限内确认精确候选准备，final后续批次改为冻结身份校验，保留原预算/worker/并发与生命周期保护。Debug/Release构建、12个不同定向MTR通过；六个Release配置各一次，strict Phase2 **3.336–58.181ms**、receiver同钟ACK→READY **0.082–30.734ms**，均通过原2s/500ms门槛；双方节流时间增量全0。完整MTR、完整压力矩阵和外部集成未在本轮重验，E74不关闭E69–E73其他未通过项。详见[实施记录](receiver-ready-optimization-2026-10-06.md)。未提交或push。
 
-**剩余模型完整复测（E72）：** 8 个原有模型＋62 个资源配置各一次，70/70 已实际运行。autocommit 通过；其余 7 项原验收未通过，详见 E72。资源仍为56 READY、3预期负例、3无DRAIN，cursor捕获失败增量全0；M11两档限速strict为8.589/31.276秒，不能写统一2秒全部达标。保持原预算/门槛，未改内核；数据副本清理后约50.5GiB空闲。
+**自然持续业务模型早期验证（E75，当轮未通过）：** 500连接=50 TEMP、50 FETCH、50 BOTH、350普通短事务RW；业务300秒后自然DRAIN，不设ACK/helper屏障，FETCH逐批到EOF。首轮180秒客户端超时；修正终态收集期限、独立relay进程与分段诊断后，保持原预算/二进制复测`mixed500-r2`，**613.323秒收到服务端4013**，最终500个4020、worker异常0。Phase1到pre-closing为599.401秒，终态COMMIT_UNKNOWN，无FINAL ACK/READY；失败路径strict区间12.911秒不能当成功切换时延。已确认receiver先ACK后语义失败、准备查询失败未及时向源收口，以及重复捕获/历史对象累积；1GiB inflight接近耗尽，仍须区分当前集合容量与历史占用，未修改预算。详见[模型与源码定位](continuous-mixed-500-model.md)及[复测报告](../../../build-release/continuous-resource/mixed500-r2/README.md)。本轮仅改测试/文档；后续诊断收尾补强实跑20连接验证，原空BEGIN集合失败保留，不冒称500连接通过，未改内核或提交。
 
-**最新 LOCKSET 1000 并发（E73）：** 同配置再跑一次，DRAIN 返回 `SUCCESS`，1/1 survivor READY、NOT_READY=0，1000 原连接/HOLD 身份核验通过，业务错误与重连为 0。strict Phase2 **10011.701ms** 超过 2 秒，其中 T0→最后命令体退出 **9870.147ms（98.586%）**；EXACT 尾部 **141.034ms**、receiver 同钟 ACK→READY **0.016ms**。这是当前工程 transfer/READY 功能通过，整体性能仍未达标，未验证实际升主、SQL RESUME 或恢复后数据核账。另核实：全部事务自然提交且无最终排除/失败项时，0 survivor 的内核结果 `NO_PRESERVABLE_TOKENS / SUMMARY / NONE` 是正常 SQL 结果，E72 的失败来自 Python 至少一个 survivor 断言；该用例适配仍待实施，本次未修改原门槛。
+**历史本地实施与验证（E62–E73）：** E62 已接通并纳入 `9a439e9ac544`；E65/E67 两批函数归位累计 49 个函数、931 行主体，定向构建与 MTR 通过。E68 已在第二批迁移后完成完整 no-bin/log-bin MTR，包含 big-test：598/596 项通过、285/287 项条件跳过、零失败；883 项通过并集完整，18 个不同 big-test 实际通过，shutdown 两轮均通过并单列。E63/E66 保留为历史全量证据。E69–E72 已补齐当前版本全部约定压力模型，E73 再复测 LOCKSET：原 11 模型按各自最新轮次 **3 通过/8 未通过**，资源 **62 通过各自断言**，另补 TPC-C 128 并发通过；E64 保留为迁移前比较。未通过项包含时延、receiver 业务保护、锁规模/证据有效性；LOCKSET 最新一轮功能交接通过但 strict Phase2 超限，上一轮零 survivor 的脚本断言不等同内核 DRAIN 失败，详见 E73。不能笼统归为一个性能根因。代码归位、MTR 和场景断言通过均不替代统一性能或外部集成验收。外部升主、真实回放/关联、proxy 及连续迁移仍归 V04–V06。两批迁移的代码范围与验证分别见 E65/E67 和 E68。
+
+**历史 sysbench 读写 1000 并发（E69）：** 首次连接初始化失败，未进入 DRAIN；保持原配置重跑完成，115.3 万条 PS、1000 个原连接保留、23/23 survivor READY。strict Phase2 **687.044ms**、EXACT 尾部 **475.757ms**、receiver ACK→READY **0.500ms**，三项原门槛通过；尾部仅余 **24.243ms**。稳态平均 **551.504 TPS / 11033.168 QPS**，后半段吞吐下降且存在换页，具体根因未证实；首次 sysbench TLS/线程退出故障也未由一次重跑通过关闭。不覆盖 E64 其他模型或外部集成。
+
+**历史 sysbench 只写 1000 并发（E70）：** 显式事务原模型一次完成，51.3 万条 PS、1000 个原连接保持至 READY，126/126 survivor READY；strict Phase2 **234.795ms**、EXACT 尾部 **149.403ms**、receiver ACK→READY **0.888ms**，完整原验收通过。稳态平均 **8028.948 TPS / 48178.079 QPS**，无重连/FATAL，区间报告估算约 3 次可重试错误。预算和门槛未改；本轮不等同历史长尾稳定消除或全部压力矩阵关闭。
+
+**历史 TPC-C 300 仓库 128/1000 并发（E71）：** 按顺序各运行一次、业务各 300 秒。128 并发通过原验收：strict **860.400ms**，80/80 READY。1000 并发未通过：strict **4162.976ms**、DRAIN 新增 4 次 1205；205/205 READY，EXACT 尾部 **290.846ms**、receiver ACK→READY **1.521ms** 均通过。strict 的 **93.01%** 位于 T0→HARD 的命令收敛段，具体阻塞根因尚未证实。仅参数化脚本并发数，预算/门槛/内核未改；详细结果见 E71。
+
+**历史剩余模型完整复测（E72）：** 8 个原有模型＋62 个资源配置各一次，70/70 已实际运行。autocommit 通过；其余 7 项原验收未通过，详见 E72。资源仍为56 READY、3预期负例、3无DRAIN，cursor捕获失败增量全0；M11两档限速strict为8.589/31.276秒，不能写统一2秒全部达标。保持原预算/门槛，未改内核；数据副本清理后约50.5GiB空闲。
+
+**历史 LOCKSET 1000 并发（E73）：** 同配置再跑一次，DRAIN 返回 `SUCCESS`，1/1 survivor READY、NOT_READY=0，1000 原连接/HOLD 身份核验通过，业务错误与重连为 0。strict Phase2 **10011.701ms** 超过 2 秒，其中 T0→最后命令体退出 **9870.147ms（98.586%）**；EXACT 尾部 **141.034ms**、receiver 同钟 ACK→READY **0.016ms**。这是当前工程 transfer/READY 功能通过，整体性能仍未达标，未验证实际升主、SQL RESUME 或恢复后数据核账。另核实：全部事务自然提交且无最终排除/失败项时，0 survivor 的内核结果 `NO_PRESERVABLE_TOKENS / SUMMARY / NONE` 是正常 SQL 结果，E72 的失败来自 Python 至少一个 survivor 断言；该用例适配仍待实施，本次未修改原门槛。
+
+**历史持续500连接（E78）：** R10在原300秒业务、1GiB双端预算和不限速下377/377 survivor READY、业务错误0，DATA99复用/1回退；strict4049.492ms和receiver ACK→READY7783.881ms仍失败，47个空BEGIN连接保留未分类失败。R11调用栈确认final DATA fsync延后、最终wire DELTA缺口，不能据此认定外部session迁移缺失。已将必要同步移入receiver提前准备，12个定向行为用例通过；E78记录时原500模型R12正在复测，当轮版本尚未全量MTR；后续结果以E94/E95为准。
 
 ## 上一实现版本的历史摘要（E61）
 
@@ -57,7 +169,7 @@ V 表记录验收；不按文件数、代码行数或任务数计算完成百分
 | 既有 session 能力 | 物理复制工程已提供 session 上下文和 PS 回放。本工程不另建 THD/参数/历史解析迁移；外部源码不可访问不表示能力缺失 |
 | 结果语义 | 保留已经生成的内容、顺序、代次、原 statement ID、下一行与 EOF；不重新执行 SELECT 重建旧结果。已经交付的行不倒退重取 |
 | receiver 共存 | 保留接收端原有只读会话的临时表；导入空间、表、索引、undo 与后续分配保持隔离 |
-| 性能 | 数据量相关的复制、转换和准备在 READY 前完成，并尽量随普通轮提前推进；不转移到在线升主、SQL RESUME 或首次业务操作中 |
+| 性能 | 尽量在 Phase1 完成；E128 允许最终 TEMP I/O/依赖准备在 READY 后由原 worker 继续。固定升主阶段不等待；SQL RESUME 仅等待本 session 完成，不自行做批量页准备；首次业务不得读未完成资源 |
 | 固定接点 | 仅在 `preserved_trx_prepare_before_trx_sys_init_for_physical_promotion()`、`trx_lists_init_at_db_start()` 内原 Preserve hook、`preserved_trx_adopt_ready_epoch_for_physical_promotion()` 内扩展；SQL 入口为 `Sql_cmd_resume_preserved_transaction::execute()` |
 | 范围外 | PS 本体、参数和 LONG_DATA 状态由物理复制工程既有回放能力处理，本特性不再另设迁移/拒绝逻辑。原生无响应命令保护仍保留。不新增 local-startup 恢复、RESET DRAIN 行为或外部升主阶段；X Protocol、当前打开的 HANDLER 保留原有限制 |
 | 工程纪律 | 核心实现用 C++，新逻辑尽量放专属文件，共享路径保持薄且有开关隔离；新增测试用 MTR／Python E2E，不新增 UT/GUnit、不使用 DEBUG_SYNC；未经指令不提交或推送 |
@@ -115,7 +227,7 @@ flowchart LR
 | 编号／状态 | 当前源码事实与剩余边界 | 完成条件／验收 | 依赖／原编号 |
 | --- | --- | --- | --- |
 | W01 本地实现与多 owner 切片已完成 | 连续 undo cookie 路由、页 latch 下捕获、idle 冻结和新链校验沿 E20/E21。E24 补四个事务共享 undo space、逐 owner 路由、取消及真实额度拒绝；普通 DATA 队列资源失效仅退休可选候选，不污染事务 participant，最终安全回退。注销后仍释放私有脏页额度，不关闭同 space 的新 admission | shared/cancel/quota 均已有真实 SQL DML→传输→READY→内部 SQL RESUME→继续 DML→完整 ROLLBACK 证据；规模与竞争时延归 V03，不由四会话测试推断 | R1/R2；E20/E21/E24 |
-| W02 复用与 final 计量已实现 | final 复用已认证 DATA checkpoint、undo claims／快照与 receiver 候选。新增 SOURCE_FINAL 作用域实际 carrier 字节、原生页读取、脏页尾段计量；无变化尾段实测仍读共享 undo 两页，不能写成零 I/O。失效时 final 允许安全重捕，finish/close/fsync、元数据遍历及最终欠账有成本 | E24 的指标 RED→GREEN；目标侧数据准备仍须 READY 前完成。更大负载和回退时延归 V03/W11；本计数不覆盖原生 buffer-pool 刷盘或全部物理磁盘 I/O | R1/R2；E24 |
+| W02 复用与 final 计量已实现 | final 复用已认证 DATA checkpoint、undo claims／快照与 receiver 候选。新增 SOURCE_FINAL 作用域实际 carrier 字节、原生页读取、脏页尾段计量；无变化尾段实测仍读共享 undo 两页，不能写成零 I/O。失效时 final 允许安全重捕，finish/close/fsync、元数据遍历及最终欠账有成本 | E24 的指标 RED→GREEN；E128 将最终 TEMP 安装 I/O 及依赖准备改为后台续作，SQL RESUME 等待本 session 完成。更大负载和回退时延归 V03/W11；本计数不覆盖原生 buffer-pool 刷盘或全部物理磁盘 I/O | R1/R2；E24 |
 | W03 本地实现与增量验收已完成 | TEMP 固定 BASE＋累积 patch、版本索引及完整逻辑认证；结果工件累计责任与 final 选择分开，不含 PS 本体 | 原 E24 证据保留，E63/E64 补本轮回归；receiver 合并/全量 SHA 成本不冒充 O(delta) | F04/F15；不新增 wire 协议 |
 | W04 本地跨代复用与切片验收已完成 | 普通 worker 比较完整 INSERT／UPDATE undo 前缀及表结构，兼容时沿用目标 space/table/index ID、native undo 和私有 DATA writer，只写转换后变化页；新 INSERT 导致 UPDATE ordinal 移动也正确映射。回滚缩短 undo、结构不兼容则 READY 前 fresh。字典／统计／SQL DD 仍重新验证并提前准备；final 精确接管同一 owner | E24 三代少写、LOB、rowid、undo ordinal 移动及四代回滚回退；新增实际目标 ID 对比。全部校验仍有 O(data) 成本，不能把“少写”写成整个普通轮 O(delta)。外部 replay 下 ID 稳定仍归 V04 | R3；E21/E22/E24，保护 F05/F06 |
 | W05 本地实现与结果切片验收已完成 | 既有 TEMP/OBJECT worker 预传与分批校验结果；final 选定代次/位置，RESUME owner 等待外部回放后 attach | E62/E63 覆盖新 cursor_pretransfer_* 和回放关联；E64 M9/M10 覆盖当前压力 | F08/F15；无新线程池或升主阶段 |
@@ -136,7 +248,7 @@ flowchart LR
 | --- | --- | --- |
 | V01 E68核心快照全量通过；E71脚本专项通过 | 完整 preserve_trx no-bin/log-bin，含 big-test | E68 在驱动适配及两批函数迁移后运行：598通过/285跳过/0失败；596/287/0；shutdown 各另1。每轮883项恰好各一次、通过并集883，18个不同big-test实际通过；每轮通过数含36 lint。当前无独立 transfer_stby suite；45,667个tracked输入与三个Debug二进制在运行期间不变。E71之后仅TPC-C驱动新增并发参数并完成专项验证，未再次整套重跑 |
 | V02 本地当前回归与资源矩阵已跑 | TEMP/结果/关联/预算及失败所有权；不含已删除 PS 本体 | E68全量+E72资源62配置各一次；56READY、3预期负例、3无DRAIN。原158轮包含重复轮次，不要求把已删除PS能力算当前缺口；不能将场景通过等同外部或全部性能通过 |
-| V03 当前版本约定矩阵已复测，原验收未全通过 | Release 规模、业务开销、strict/精确尾/READY | E69–E73覆盖原11模型，最新轮次3通过/8未通过；E72补8模型1通过/7未通过、资源62配置各一次。TPC-C1000新增4次1205；RANGE/不提交尾部及部分锁规模不合格，Phase1 TPS INVALID；tiered receiver QPS/P99退化超限；LOCKSET E73功能1/1 READY、strict10.012秒失败，E72零survivor正常完成分支的压力用例断言仍待适配。M11限速8.589/31.276s。完整清单不代表缺口已修复，一次运行不替代多轮统计 |
+| V03 原完整矩阵验收未全通过，E74定向优化通过 | Release 规模、业务开销、strict/精确尾/READY | E69–E73覆盖原11模型，当轮3通过/8未通过；E72补8模型1通过/7未通过、资源62配置各一次。TPC-C1000新增4次1205；RANGE/不提交尾部及部分锁规模不合格，Phase1 TPS INVALID；tiered receiver QPS/P99退化超限；LOCKSET E73功能1/1 READY、strict10.012秒失败，E72零survivor正常完成分支的压力用例断言仍待适配。M11限速8.589/31.276s。E74取消双端限速后六个资源配置通过原场景断言与strict/ACK→READY门槛，不覆盖人工链路限速或其他原失败；完整矩阵未在E74上重跑，一次运行不替代多轮统计 |
 | V04 待外部环境 | 真实物理 replay → 在线升主 → SQL RESUME | 外部工程目前不可访问。仅使用三个已集成固定入口；验证 redo 下目标 ID 稳定、原有只读 TEMP 和未来分配隔离、TEMP_ONLY/MIXED/NONE 等实际语义，以及升主入口没有数据量级准备 |
 | V05 待外部环境 | 真实 proxy、session/PS 回放、显式 attach 和客户端不变 | 原ID和回放记录归属，成功RESUME→回放/关联→CLOSE→业务；CLOSE转发前留存并按生命周期消费；失败RESUME断前后端不重试/回池；关联或补发不确定不放行。LONG_DATA不另设本地参数限制；helper不代表生产集成 |
 | V06 待外部环境 | 导入资源再次迁移 | 在第一次真实升主后的新主继续 DML／FETCH，再次 Preserve、升主和 RESUME；不能使用 RESET DRAIN 或本地重启替代；检查原生资源寿命、ID 和多代结果 |
@@ -1307,3 +1419,478 @@ no-bin 完整运行在调度标记增加前完成；内核未再改动，且该�
 - 自有进程与重型数据目录已清理，保留完整成功/失败证据，空闲约56GiB。源端测量后按既有单向purge fence退役，非正常关机验收。E73不覆盖E72其他模型的失败，不关闭V03或V04–V06。
 
 证据：[本轮报告](../../../build-release/lockset-functional-retest-20261005-172549/README.md)、[原功能报告](../../../build-release/lockset-functional-retest-20261005-172549/runs/continuous-lockset/report.json)、[原runner结果](../../../build-release/lockset-functional-retest-20261005-172549/runs/continuous-lockset/result.json)、[独立功能校验](../../../build-release/lockset-functional-retest-20261005-172549/original-functional-validation.json)、[源端日志](../../../build-release/lockset-functional-retest-20261005-172549/runs/continuous-lockset/source-mysqld.err)、[指标分解](../../../build-release/lockset-functional-retest-20261005-172549/summary.json)、[post-FINAL观测](../../../build-release/lockset-functional-retest-20261005-172549/post-final-observations.jsonl)、[输入一致性](../../../build-release/lockset-functional-retest-20261005-172549/input-verification.json)。
+
+## E74：双端不限速与 receiver READY 定向优化（2026-10-06）
+
+- 基线为 `c9bc199a64d9` 加既有未提交收敛修改；本轮未提交或push。删除SOURCE_IO、receiver saved/prewarm速率限制及固定yield，保留原worker数、双方预算、队列/对象上限、credit和timeout。
+- TEMP/RESULT通过现有连接和worker查询精确候选准备状态，Phase1有界等待；查询不消费数据序号，不进入batch，不制造数据ACK不确定债。通信失败、pause或接近截止期走原final处理。final首次完整校验后pin已有不可变index，后续批次及发布前核验冻结身份，消除整record复制与历史遍历；未改物理升主接点。
+- Debug/Release mysqld构建通过，12个不同MTR实际通过，含协议身份/序号、缺BASE、delta重试、候选换代、取消/GC、OFF及新query丢ACK后DRAIN/READY/SQL RESUME。shutdown_report单列；不等同全量MTR。
+- 旧Release在修正后的双端节流/early-ready断言上RED；最终六个Release配置各一次，参数、双端1GiB Preserve预算、profile及worker数不变：
+
+| 配置 | strict Phase2 ms | receiver同钟ACK→READY旧/新 ms |
+| --- | ---: | ---: |
+| M4 sparse 128MiB | 3.336 | 927.101 / 4.901 |
+| M4 dense 128MiB | 14.128 | 1137.579 / 7.237 |
+| M5 31小owner+1大owner | 24.227 | 1336.313 / 19.060 |
+| M10 unheld，4 owner×16 cursor PS | 58.181 | 714.886 / 0.082 |
+| M11 BUSINESS_FIRST | 11.754 | 3974.033 / 11.623 |
+| M3 32会话 | 28.182 | 972.291 / 30.734 |
+
+- 6/6原场景断言通过，strict和ACK→READY分别低于原2s/500ms门槛。双端节流时间、cursor捕获失败增量均0；final processed_bytes均0，仍保留最终验证/绑定。M5 early-ready/final-reuse为32/32，M3为32/32。source/receiver账本峰值分别不超过292512680/435373297B，未加预算；DRAIN→观察到READY总耗时在六组样本也均缩短。
+- 旧样本来自前轮矩阵，不是同时随机交错统计A/B。M3历史native尖峰的具体存储/调度原因未证明消失，不删fsync。首轮观察relay不识别query新ACK产生的失败留痕并已修正，不计为有效性能样本；丢ACK与pause回退均有运行看护。
+- 未重跑完整矩阵、长期重复统计或外部物理升主/proxy，不关闭V03–V06其他缺口。人工8/2MiB/s链路限制仍是独立测试模型；不限速成绩不代表这些链路通过2s。源端按既有单向purge fence在测量后退役，不是正常关机验收。
+
+证据：[实施记录](receiver-ready-optimization-2026-10-06.md)、[完整报告](../../../build-release/receiver-ready-optimization-20261006/README.md)、[最终指标](../../../build-release/receiver-ready-optimization-20261006/metrics-v2.json)、[运行结果](../../../build-release/receiver-ready-optimization-20261006/validation-v2.json)、[输入指纹](../../../build-release/receiver-ready-optimization-20261006/identity-after.json)。
+
+## E76：持续TEMP/FETCH早失败修复、门槛收敛与容量实证（2026-10-06）
+
+- receiver继续异步admission，但复用既有epoch apply失败记录在后续认证ACK中反馈，保留exact retry、ABORT、nonce/摘要身份校验和缺序号失败退出。源TEMP/RESULT错误不再被可选UNAVAILABLE或BUSY/STALE吞掉；COMMIT仍须原QUERY/ABANDON可信终态，不改RESET DRAIN或升主接点。
+- RESULT初次完成单向；TEMP用一个bool记录首次checkpoint对应pending，查询结束才完成首次尝试，后续刷新不会重开门槛，已有complete()排空在途任务。没有新增线程池或扩大预算。
+- Debug/Release构建通过。13个不同定向MTR业务用例通过，含认证失败、retry/gap/ABORT、原身份校验、真实source TEMP/RESULT DRAIN负例、持续捕获/换代/CLOSE/ACK丢失、binlog SEAL损坏恢复。旧source仅检查15秒内4013会误通过，增加closing阶段与本轮特定receiver首错断言后取得有效RED；新实现GREEN。最终账目格式也有额外RED/GREEN。MTR与shutdown分开，未运行本轮全量。
+- 500连接原配置再次运行两轮：r3为14.422秒Phase1拒绝，但日志格式和已关闭诊断socket打断报告；保留不完整证据。修复诊断后，r4业务300.016秒、DRAIN17.332秒返回4013，first_failure_stage=phase1_pipeline_baseline_failed，未进入purge-stop/T0/closing/COMMIT，READY为空。原生RUNNING字符串是早失败路径未改写的字段，不能当作DRAIN仍运行；strict=0不计达标。
+- r4首错在receiver同锁账目明确为quota：live=1,070,831,687，old_record=49,565，new_charge=10,535,581（新增镜像10,485,760+256），debt=0；预计1,081,317,703，比1GiB超7,575,879B。receiver内存峰值198,982,721B，不能解释为RAM不足。语义错误只有1次RESOURCE_EXHAUSTED；末尾inflight/queued/worker active=0，source commit_unknown=0。active_epochs只覆盖accepted epochs，未宣称全部OPEN/sequence元数据清零。
+- r4保存500份owner账本，停止时100个cursor开放，业务异常0、4020=0；TEMP baseline启动119/安装172，累计复制1,247,805,440B，TEMP/RESULT预传850,217,471/202,899,892B。early-ready78/90为累计事件，非独立owner数。由于早失败，不能把较低累计量归为成功迁移性能提升，原500初次准备正常收口仍未验收。
+- 诊断改用独立连接并先保存业务账本；20连接故意使两端诊断超时后，原连接、RW数据、receiver TEMP和指标保存通过，原空BEGIN分类缺项仍失败。r4一个receiver诊断样本超时留痕，末尾指标完整、relay错误空/退出0，seed/source/receiver退出均0。
+- 当前唯一集合按100TEMP×10MiB+100结果约2.145MiB估算约1.186GiB，未计UNDO；不是首错时精确活集合。现有DELTA依赖完整BASE，FSP_SIZE要求完整空间范围，不能简单截断尾页或对仍被使用的工件减账。后续必须分别核算当前集合与旧代并缩减实际表示/安全退役，不能仅调预算或延长Phase1。本轮未实现该容量修复，未覆盖成功切换和外部物理升主/SQL RESUME。
+
+证据：[原模型与定位](continuous-mixed-500-model.md)、[修复与RED/GREEN记录](continuous-failure-fix-plan.md)、[r4报告](../../../build-release/continuous-resource/mixed500-r4/README.md)、[精确指标](../../../build-release/continuous-resource/mixed500-r4/analysis-summary.json)、[MTR归档](../../../build-debug/semantic-fix/reports/)。未提交或push。
+
+## E77：持续负载稀疏BASE、最终准备复用与剩余尾部（2026-10-06）
+
+- PTRISPR1复用既有DELTA记录/4KiB块，manifest v13显式标识；只省略真实零字节，保留逻辑长度与SHA。提前和final回退均覆盖，final对象全部SEAL后原子更新metadata与权威TEMP TLV。原逻辑源文件、取消/期限、双端1GiB预算不变。
+- final清单不同时，独占提取ready且preprepared的TEMP donor，经过既有lineage/事务/undo/结构/未发布校验；没有把旧候选直接授权为final。新final-tail定向MTR旧代码重写75,497,472B，新代码32,768B；ID、数据、FETCH、回滚通过。精确候选、跨代、取消、digest等定向回归通过，不等于当前全量MTR。
+- 原500配置r6/r7均无容量拒绝且完成COMMITTED_HANDOFF。r7为413 survivor、58 session-only、29未分类空BEGIN；500原连接、业务错误0、已提交RW核账与receiver背景TEMP保护通过。strict 6,360,715us、ACK→READY 3,411,420us仍失败，末命令EXACT为NO_ELIGIBLE_BODY而不是零。
+- r7 final准备窗口3,453,985us，prepare-only3,395,729us；源DATA53复用/47回退，最终读取2,174,614,397B、写638,892,925B。普通COMMIT清理有效DATA是可达源码事实，尚不能把47次全部归因于此。后续R9诊断调用栈支持源端fsync/pwrite和receiver双份pwrite热点；采样次数不是CPU占比或墙钟。
+- 当前继续实施跨显式成功COMMIT的纯DATA保留和新目标真实零页跳写；旧undo/候选必须失效，完整回滚/DDL/旧串行模式不放宽。新代码性能与并发验证另记，不混入r7基线。未新增线程池、预算、RESET DRAIN或升主接点。
+
+证据：[r6](../../../build-release/continuous-resource/mixed500-r6/README.md)、[r7](../../../build-release/continuous-resource/mixed500-r7/README.md)、[实施记录](continuous-failure-fix-plan.md)、[定向日志](../../../build-debug/sparse-fix/reports/)。未提交或push。
+
+
+## E78：持续业务的COMMIT保留、零页跳写与receiver同步定位（2026-10-06）
+
+- COMMIT只保留同DATA注册的连续镜像，事务undo/history及时释放；generation约束阻止旧job回存旧事务状态。四owner跨COMMIT MTR旧RED→新GREEN；完整ROLLBACK、DDL、取消、OFF仍走原失效保护。专门resource-only ABA运行覆盖尚未补齐，不宣称已测。
+- receiver新私有文件只跳过实际全零非末页，末页保持EOF，摘要/校验/双份预算不降。独立源页oracle旧RED→新GREEN；三个W11用例更新为严格的实际非零页+末页写入字节，保留首次脚本放置错误的记录。
+- 原R10：500原连接、377READY/76session-only/47空BEGIN未分类；strict4049.492ms、EXACT4048.488ms（1合格命令）、ACK→READY7783.881ms，均未过原门槛。source FINAL读取1,001,961,423B/写22,050,767B；receiver NATIVE累计12.451秒，不能直接当墙钟。
+- R11仅诊断：500/120秒、DATA100复用/0回退；receiver prepare的1798叶子样本中DATA fsync1319，定位到final seal/close。未采到该分支fil/dict锁等待；清理样本缺少逐条时间戳，不归并为ACK→READY。R10/R11未单独冻结完整dirty kernel patch；R12已保存输入快照，不夸大历史可重建性。
+- receiver DATA flush移入preprepared；实际写/改长置dirty，成功sync清dirty，final未变化可跳过重复DATA sync。目录持久化、授权和完整摘要不变。有效RED后9 log-bin+3 no-bin定向业务用例通过，shutdown单列；独立只读review未发现确定缺陷，部分写故障和第二份单独同步失败仍是静态覆盖边界。
+- 最终DATA仍可能因为checkpoint SHA改变而重传完整sparse BASE。固定BASE owner传入bundle、最终复用现有DELTA编码/SEAL的窄修复已完成设计核查，待RED→实现→GREEN。它减少写和传输，不承诺免除全量读取。不增预算、线程池、RESET DRAIN或外部阶段。
+
+证据：[R10](../../../build-release/continuous-resource/mixed500-r10/README.md)、[R11](../../../build-release/continuous-resource/mixed500-profile-r11/README.md)、[实施记录](continuous-failure-fix-plan.md)、[定向日志](../../../build-debug/sparse-fix/reports/)。未提交或push。
+
+## E79：最终DATA增量、跨事务私有DATA复用与空BEGIN（2026-10-06）
+
+- 最终bundle预算内持有immutable BASE owner，复用已有DELTA编码，全部SEAL后原子更新清单/TLV；active和resource-only均接线。旧RED为final无新增DELTA；新final-tail及跨COMMIT、双实例、回滚、LOB、sparse fallback等11个业务用例通过。保留完整摘要和全量比较，不声称只做脏页工作。
+- R12（只有提前同步）strict8857.465ms、ACK→READY3905.222ms；R13加最终DELTA后strict2598.142ms、EXACT2593.758ms、ACK→READY2819.190ms。不同命令切点和survivor，不能把变化当严格配对因果。均未通过完整验收。
+- 跨COMMIT DATA-only保留目标文件和IDs，新undo完整重建，旧undo留原owner退役，每页仍按新映射重新转换后比较。旧无undo→新active及最终resource-only均有真实DML/回滚覆盖。
+- 运行trace确认3个候选final take时work=0、previous=1却丢弃donor。修复register连续替换及take对尚未开始的previous交接，返回ABSENT继续独立认证final；不抽取已启动work内部资源、不扩张历史链。旧RED 3个DATA ID改变，新GREEN四owner全部保持ID且数据/回滚通过。临时诊断输出已删除。
+- 空显式BEGIN复用既有NONE合同，门控在standby/native namespace，附着时再次证明NO_ENGINE；健康ACTIVE只读旧分类和普通session-only不变。新用例旧NO_PRESERVABLE_TOKENS→新READY/RESUME/首DML未提交/ROLLBACK通过，旧端首UPDATE严格4020。
+- `mtr-data-owner-empty-green3` 17业务通过；no-bin旧namespace-OFF分类另1业务通过，shutdown单列。Debug/Release构建通过。新分支partial MOVE中途取消和连续多次pending替换尚无专门运行证据；全量MTR和外部物理升主仍未重验。
+- R14原500/300秒输入完整diff、未跟踪文件及binary SHA已冻结，运行期间无构建/MTR/采样。结果见本节末尾。
+
+证据：[实施记录](continuous-failure-fix-plan.md)、[R12](../../../build-release/continuous-resource/mixed500-r12/README.md)、[R13](../../../build-release/continuous-resource/mixed500-r13/README.md)、[MTR日志](../../../build-debug/sparse-fix/reports/)。未提交或push。
+
+R14原500/300秒复测：443READY+57session-only，未分类/业务错误均0，本地功能首次完整通过。strict889.592ms通过2s；ACK→READY1277.689ms仍超500ms，EXACT无合格样本而非通过。输入已冻结，无并行重任务。继续用同二进制R15短稳态诊断定位receiver尾部；不将其视作正式性能验收。详见[完整R14报告](../../../build-release/continuous-resource/mixed500-r14/README.md)。
+
+
+## E80：receiver重复扫描与比较读（2026-10-06）
+
+- R15调用栈定位SHA与旧目标pread；8线程已有但BALANCED每epoch active上限3。未切换同时改变其它限额的PROMOTION_PREPARE；预算、批次和线程池保持。
+- 比较读按批最多64KiB合并，保留逐页语义与旧页回退；旧2304次16KiB RED→8业务GREEN。R16原500功能通过442READY+58session-only，strict4133.502ms/ACK→READY1876.840ms仍失败；不可宣称局部优化等于整体性能成功。
+- 同一不可变sparse BASE的已验证view从exclusive donor按批借用、shared_ptr自持；当前header/manifest仍验证，新DELTA/UNDO/graph/目标转换不跳过。物理owner不同、非overlay、错space均完整重扫，不增缓存或历史链。
+- 旧SOURCE扫描84,084,704B→新46,319,120B，逻辑扫描减少44.9%。首次2倍总长阈值旧代码也通过，不计有效RED；修订阈值与四owner sparse条件后有有效数量RED，9个业务MTR GREEN，shutdown单列。Debug/Release通过，独立只读review无阻断；完整MTR未重跑。
+- R17原500/300秒复测已启动；不混跑其它重任务，不改任何原验收门槛。外部物理升主仍不在本地证据范围。
+
+证据：[实施记录](continuous-failure-fix-plan.md)、[R16](../../../build-release/continuous-resource/mixed500-r16/README.md)、[MTR日志](../../../build-debug/sparse-fix/reports/)。未提交或push。
+
+
+R17原500/300秒结果：453READY+47session-only，业务/未分类错误0，功能通过；strict7558.368ms、ACK→READY4388.992ms仍失败，EXACT无合格样本。SOURCE累计扫描已降至2.218GB/1.061秒，但NATIVE累计18.953秒、IMAGE15.685秒；不同命令切点不可当等工作量对照。已暂停叠加并发修改，清理结束MTR的可再生std_data副本（保留证据）后可用空间恢复41GiB，以同二进制R18诊断定位等待。并未确认磁盘空间是因果，也不把局部扫描下降当整体闭环。详见[R17报告](../../../build-release/continuous-resource/mixed500-r17/README.md)。
+
+
+### R19及诊断隔离核实（功能通过，性能仍开放）
+
+原500/300秒R19完成439 READY+61 session-only，业务/未分类错误0。strict1959.247ms通过2s，仅40.753ms余量；ACK→READY2970.222ms未达500ms，EXACT无合格命令，整体仍失败。不能把无样本作为零延迟，也不以单轮strict通过关闭性能项。
+
+诊断status原每端525行触发1074次socket recv，与500业务线程同进程形成可确认的调用放大；仅专用诊断wrapper加64KiB缓冲后，20连接实验降为2次、R19为1次，SQL/采样频率/绝对deadline不变。极短deadline独立实跑中两端在首个recv之前诊断失败，但19 READY+1 session-only、业务错误0，最终报告完整；此项不覆盖收到部分响应后超时；不归为内核功能失败。未证明该诊断放大就是ACK→READY根因。
+
+R19最终prepare-only2966.036ms；整轮NATIVE13.105秒中11.457秒早在Phase1诊断已发生，不能归入最终窗口。后期IMAGE单批最大1981.933ms，正式staged job最大1981.938ms；源端/目标端时间必须用同阶段计量。SOURCE_FINAL现沿原RAII/TLS补TAIL、CLOSE、DIGEST、SEAL及其子项VALIDATE，非final不取时钟/更新计数；VALIDATE不能与SEAL重复相加。早期池实际16个worker，旧日志按普通路径误报10，现取成功join后的实际vector size，只修正报告，不修改建池行为。
+
+这些新增计时经过6个业务MTR（含跨COMMIT四owner、final-tail、OFF、取消、physical metrics）验证；SOURCE_FINAL子计数不得在Phase1提前增加，每个owner final各计一次，已验证BASE复用时不再重新验全镜像摘要。Debug/Release构建成功。R20按500/120秒诊断（非300秒验收）进一步定位，不提高预算或盲目增加epoch并发。详见[R19报告](../../../build-release/continuous-resource/mixed500-r19/README.md)。
+
+
+### E81：R20确诊首次同步后移及零页比较冗余
+
+R20保持原500分组/预算/不限速，120秒为诊断而非正式验收；319 READY+181 session-only，strict3799.350ms、EXACT3692.706ms、ACK→READY1813.542ms。SOURCE_FINAL累计20.027932秒，CLOSE15.695548秒；16个worker采样同时等待DATA/UNDO文件fsync。连续DATA prebuild之前从未调用flush，checkpoint_result只缓存摘要，final close承担首次同步，根因已由源码与栈共同确认。SOURCE_FINAL剩余3.583626秒含UNDO同步，不称为metadata。
+
+仅在既有ROUND无checkpoint完成和CHECKPOINT_EXTEND完成处调用writer.flush；后续write/实际resize自动置dirty，final仍同步最后变化，目录安装同步不删。沿原fail/retire处理同步错误。有效RED为mtr-source-flush-red：稳定checkpoint后注入writer sync failure，旧source返回4013；修复后同用例及cross-spill/final-tail/COMMIT/rollback/worker/sparse/OFF共8业务MTR通过。全部是本地行为验证，不宣称外部物理集成。
+
+receiver只增加sealed_file::known_zero_range（无IO/无分配），用已验证sparse索引证明旧区间全零，任何patch重叠/普通FD都返回未知；当前页正常转换后也全零才省比较读。保留UNDO/分配/LOB验证、全SHA与原写/同步过程。Image保活本次donor source至checkpoint/取消；只一个旧代，不加cache/bitmap/worker，sizeof(Image)走原预算。有效RED为READY之后37,748,736B完整旧DATA比较，GREEN11,534,336B，减少69.4%。首次断言放在receiver仍paused时得到0，已纠正，不计RED。8个业务MTR覆盖跨COMMIT、final小尾部、spill、rollback、undo取消、sparse/OFF；shutdown单列。独立只读review未发现零页误跳写或owner泄漏。
+
+新增SOURCE_FINAL的verify字段采用短名，避免MySQL 64字节变量名称缓冲截断最长unclassified_calls；语义是SEAL的全文件摘要验证子项。R21采用原500/300秒、相同1GiB预算、BALANCED，输入patch/未跟踪文件/SHA已冻结，运行期间不构建/MTR/采样。两项局部收益尚不能代替原性能验收。详见[R20](../../../build-release/continuous-resource/mixed500-profile-r20/README.md)。
+
+
+R21原500/300秒完成：440 READY+60 session-only、业务/未分类错误0，strict1825.504ms通过≤2s，但ACK→READY2076.796ms仍未通过严格<500ms，EXACT无合格样本。SOURCE_FINAL_CLOSE累计46.420ms、FINAL总656.398ms、ROUND2297.452ms；源端首次同步后移已缓解，receiver整体尾部尚未闭环。用户明确禁止以局部收益代替整体指标、不得越优化越劣化；保持规模/预算/业务不停/功能断言，无效或退化改动需复核撤回。当前暂停叠加内核修改，以同二进制R22（120秒诊断）继续定位receiver FINAL。详见[R21](../../../build-release/continuous-resource/mixed500-r21/README.md)。
+
+
+## E95：Debug 探针与 lint 失败修复、全量双模式 MTR（2026-10-07）
+
+- **动态根因：** 42 个原失败用例串行复现；41 项临时资源 trace 均命中旧写量等式（39 complete／2 seal）。三组实际／旧预期写量为 163840／229376、262144／393216、360448／393216 字节。不是 41 个独立生产内核故障。
+- **精确修复：** `sql/preserve_trx_debug.cc` 在 native-owner 提前返回前只读源页，以两份非零页及每空间末页计算实际写量；seal-OOM 仅检查首空间。原 SHA、逐页比较、inode 隔离、故障粘滞和清理顺序不变。额外扫描仅属 Debug 内部验证，不进入 Release。
+- **lint：** 摘要契约容许 gate 内 timer，仍检查准确 descriptor、失败返回、唯一校验且先于安装。第一处修复后又动态暴露预算拒绝分支诊断日志引起的第二处形状失配；已限制在相同大括号分支内匹配首个 `RESOURCE_EXHAUSTED` 返回，不改变预算或错误处理语义。
+- **验证：** 首轮定向 41 个临时资源用例通过，保留该轮 lint 后续失败证据；修完第二条契约后完整 lint 通过。随后两轮完整 `--suite=preserve_trx --big-test --parallel=4 --retry=0 --force --max-test-fail=0` 顺序执行：no-bin 603／295／0，log-bin 606／292／0（通过／条件跳过／失败）；shutdown 两轮通过。898 项适用模式通过并集完整，18 个不同 big test 全部通过。无新增 UT/GUnit 或 DEBUG_SYNC。
+- **边界：** 相比 E94，1888 个已跟踪内核文件中只有 Debug 文件变化；Release SHA256 仍为 `61b78ba69ad2ceea19c60fdaf2665da634901ede52fb643b80f922c6bbd3ec41`。不修改 R44 生产路径，不借此宣布压力性能或外部物理升主验收完成；E94 压力失败项保留。未提交或 push。
+- **证据：** [E95 报告](../../../build-debug/preserve-fix-e95/README.md)、[逐项结果](../../../build-debug/preserve-fix-e95/mtr-results.tsv)、[全量汇总](../../../build-debug/preserve-fix-e95/final-summary.json)、[RED 准确分支](../../../build-debug/preserve-fix-e95/red-branch-evidence.json)、[本轮修复差异](../../../build-debug/preserve-fix-e95/fix-only.diff)。E94 原始日志与归档不覆盖。
+
+## E96：清除旧 PS/SP 重建的 parser 残留（2026-10-07）
+
+- **根因与范围：** 旧 `m_preserve_rebuild`／SP bindings/expression 已随 PS transfer 删除，但 `sql_yacc.yy` 九处条件仍在结果捕获开启时保存无元数据依赖的表达式文本。当前 cursor 结果恢复没有该消费者。本轮去掉额外条件及 `preserve_trx_cursor.h` include，恢复原生 `is_metadata_used()`；文件与 `c9bc199a64d9^` 逐字节一致。独立只读复核未发现直接配套的 SP/LEX/Item 或 CMake 残留；DRAIN 用户变量语法、Classic cursor 捕获和关联接点保留。
+- **看护：** 既有 lint 增加禁止旧 parser 依赖的约束，旧代码准确报错，修复后通过。新增 `cursor_native_sp_parser` 以启动 ON/OFF 两种模式覆盖 DECLARE 默认值、无表内部 cursor、RETURN、IF、两类 CASE/WHEN、WHILE、REPEAT，重复 CALL 后 ALTER 临时表再调用；审计结果 48／50／52，表内容最终 14／24。旧二进制和新二进制结果相同，不据此声称逐指令观测了重解析次数。
+- **验证：** Debug mysqld 重建成功，Bison 重新生成解析器。顺序运行 14 项定向 MTR：no-bin 8 通过／6 因需要 binlog 跳过／0 失败，log-bin 14 通过／0 失败；shutdown 两轮通过。覆盖已有捕获 OFF/模式隔离、结果解码恢复、PS 回放后 attach、session-only、TEMP＋cursor strict RESUME、换代和最终分块传输。没有新 UT/GUnit 或 DEBUG_SYNC。
+- **边界：** 当前仅修改一个内核源码文件；测试、删除设计和本记录同步更新。未重跑全量 MTR、Release 压测或外部物理复制集成，不宣称性能变化。本轮未提交／push。
+- **证据：** [E96 报告](../../../build-debug/preserve-parser-cleanup-e96/README.md)、[RED](../../../build-debug/preserve-parser-cleanup-e96/red-lint.log)、[构建](../../../build-debug/preserve-parser-cleanup-e96/build.log)、[no-bin](../../../build-debug/preserve-parser-cleanup-e96/green-nobin.log)、[log-bin](../../../build-debug/preserve-parser-cleanup-e96/green-logbin.log)。
+
+## E101：临时资源冗余与调优观测清理（2026-10-07）
+
+- **范围：** 按 [已审核清单](code-cleanup-review-2026-10-07.md) 完成 A01–A21、B01–B06、C01/C03–C05。C02 的顺序 marker 与 D01–D06 原逻辑保留。31 个内核文件增加 115 行、删除 538 行，净减 423 行，原有 E96 parser 变更另计且保留。
+- **关键边界：** owner、borrower、旧文件锁外释放顺序不变；普通 TEMP_STEP 慢 I/O 仍不触发取消。B03 将必要的默认 epoch 初始化明确放在首次 accepted publication 的既有锁内；ACK 只 find，诊断异常不跳过 terminal retention。保留 binding、selection、purge、shutdown swap、真实配额及实际准备。
+- **观测收敛：** FINAL 的 23 项状态、日志及专用消费者退役；两端 final_wall_us 不再输出假零。SOURCE_FINAL 子阶段和 cursor/undo 验证统计共 44 项转为统一 NDEBUG 条件，仅 Debug 保留。SOURCE_FINAL 总量、首次 DML/FETCH、物理阶段与严格 Phase2/ACK→READY 端点保留。
+- **复核：** 三个只读审查者完整核对实际补丁，未发现剩余确认缺陷。主审收尾补删失去消费者的 getter 及两行 TEMP 计量，保留成员和 RESULT 内部统计。未添加新机制、线程池或公开升主阶段。
+- **全量验证：** Debug no-bin 603 通过／295 条件跳过／0 失败，log-bin 607 通过／291 条件跳过／0 失败；shutdown 两轮通过。898 项在适用模式通过并集完整，18 个 big test 全部通过。两模式顺序执行、parallel=4、big-test、retry=0，没有自动重试掩盖失败。
+- **最终收尾验证：** 上述全量之后仅补删两行无副作用且无读者的 TEMP 计量。最终版本重新通过 Debug/Release 构建链接，14 项相关 MTR 双模式复测：no-bin 6 通过／8 跳过，log-bin 9 通过／5 跳过，零失败、shutdown 均通过，14 项并集完整。没有把此次定向复测记成第二次全量。
+- **边界与证据：** 未新增 UT/GUnit、DEBUG_SYNC；没有提交/push。E101 当轮尚未重跑压力性能或外部物理复制集成，不改变原预算和阈值；后续同一清理版本的压力结果见 E102–E106。见 [E101 报告](../../../build-debug/preserve-cleanup-e101/README.md)、[完整矩阵](../../../build-debug/preserve-cleanup-e101/mtr-results.tsv)、[最终定向结果](../../../build-debug/preserve-cleanup-e101/post-review-summary.json)、[review 记录](../../../build-debug/preserve-cleanup-e101/review.md)。
+
+## E102：清理后 TPC-C-like 128 并发单轮压测（2026-10-07）
+
+- **版本与配置：** `ha_preserve_trx`，HEAD `290e94a156c1511ea46a5dc57d70550ffec45b5b` 加 E96／E101 未提交清理。E102–E106 共用 Release mysqld SHA256 `80337639e2753f21e12538eea32ebd332e5b60c57429ef88d234444b8e4258e7`。300 仓、1 组 9 张 InnoDB 表、149814944 行种子，128 并发、RR、文本 SQL；两端 Preserve／buffer pool 各 2GiB，inflight 1GiB，Phase1 6 workers／60 秒。实际业务 300.026 秒后发起 DRAIN，保持到原连接 HOLD 和 receiver READY 后收尾。
+- **功能：** 独立验收 18/18；128 个原连接身份与 HOLD 一致、无重连或 FATAL；93 个 survivor 全部 SUCCESS／READY，NOT_READY=0。业务错误统计在 DRAIN 后仅增加 128 次预期 4020，1205 增量为 0；handoff_pending、commit_unknown、quarantine、restore guard reject 为 0，receiver queue／worker 归零。
+- **性能：** strict **483.618ms**、EXACT 尾部 **162.641ms**、receiver ACK→READY **1.132ms**，均通过原门槛；Phase1→T0 326.159ms、stop purge 0.084ms、客户端 DRAIN 869.581ms。367 个 eligible BODY，EXACT 完整、无 missing／fallback。59 个完整 5 秒窗口平均 **749.706 TPS／21325.992 QPS**；TPS 是 sysbench event，不是认证 tpmC。p95=0.00 不作有效延迟，DRAIN 不足一个采样窗口，不推算精确 TPS 降幅。
+- **证据边界与收尾：** 2549 项冻结输入、原 dirty diff 前后一致；本轮未改内核或已跟踪脚本。源按既有 purge fence 约定在测量后 SIGKILL，receiver 正常退出，不称正常源端 shutdown 验证；自有实例及数据已清理，种子逐文件校验并重新压缩。运行前为满足原空间门槛清理的历史数据／Debug 对象均有清单，未删源码或可执行文件。只验证本地 transfer→READY，未验证物理升主／SQL RESUME。
+- **证据：** [E102 报告](../../../build-release/tpcc-128-e102/README.md)、[原始报告](../../../build-release/tpcc-128-e102/c128/r01/report.json)、[独立验收](../../../build-release/tpcc-128-e102/c128/independent-validation.json)。
+
+## E103：清理后 sysbench 读写 1000 并发单轮压测（2026-10-07）
+
+- **配置与身份：** 沿用原 `oltp_read_write / skip-trx=off`，1000 并发、128 表×20000 行、READ-COMMITTED，原生 PS 路径，DRAIN 前 1153000 条 PS；300.069646 秒稳态窗口。两端 Preserve／buffer pool 各 2GiB、inflight 各 1GiB，Phase1 6 workers／60 秒；没有使用旧 4GiB 实验类。TEMP、ID namespace、result capture 开启；业务一直运行到 DRAIN、原连接 HOLD 和 READY 验证完成。
+- **功能与性能：** 1000 个原连接／HOLD 前后身份一致；131 个 survivor 全部 SUCCESS／READY，NOT_READY=0，receiver queue／worker／prewarm backlog 归零。strict **469.983ms**、EXACT **256.298ms**、ACK→READY **1.042ms**，原验收全部通过。Phase1→T0 3682.697ms，stop purge 416.586ms，DRAIN 客户端往返 5030.079ms；不能用旧 `source_phase2_total_us=256515` 代替 strict。502 个 eligible BODY，EXACT 完整、无 missing／fallback，scheduler fatal／invariant 为 0。
+- **吞吐及观测：** 30 个完整 10 秒稳态窗口平均 **845.265 TPS／16898.534 QPS**，err/s 与 reconnect/s 均 0、无 FATAL；没有单独的错误编号快照，不额外宣称 DRAIN 1205 增量已独立核零。测量后停止 sysbench 未输出最终总汇，`transactions/queries=0` 不代表业务量为零；稳态估算为 253579 个 event／5069560 条查询。p95=0.00 不作证据。PS main MEM_ROOT 逻辑分配采样约 22GiB，不是 Preserve 预算或进程 RSS，也不据本轮通过宣称原生 PS 内存问题已解决。
+- **边界与收尾：** 2554 项冻结输入、Git diff／状态一致。source／receiver SQL 观测分别有 25／9 次错误，host 有 8 次 ps 超时；核心端点不依赖这些缺样。receiver `failed_tokens=869` 为合并状态计数，不能当成 869 个业务失败或以最近原因代表每项原因。原 runner 退出 0、自有进程和数据均清理；source 测量后按既有约定 SIGKILL。不证明物理升主、SQL RESUME 或外部 PS 回放。
+- **证据：** [E103 报告](../../../build-release/sysbench-rw-e103/README.md)、[原始报告](../../../build-release/sysbench-rw-e103/runs/sysbench-read-write/report.json)、[独立核验](../../../build-release/sysbench-rw-e103/independent-validation.json)。
+
+## E104：清理后临时表与 FETCH 全模型各一轮（2026-10-07）
+
+- **执行覆盖：** 63 个压力配置各执行一次：M1–M12 共 62 项、持续混合 mixed500 一项，另补跑 2 个 ACK 丢失恢复场景，无失败重跑。2571 项输入与 Git diff／状态前后一致；只在忽略的 build 目录适配旧汇总脚本对退役字段的读取，未改内核或已跟踪测试源码，也没有用缺失指标填零。
+- **M1–M12：** 原场景断言 **62/62 通过**，涵盖稳态开销、TEMP 规模与增量、undo、多 owner、公平性、结果大小／FETCH 位置、PS 换代、receiver 资源压力和既有／未来 TEMP ID 隔离。56 个成功 READY 配置共 333 个 READY token，strict 最大 **1436.208ms**、ACK→READY 最大 **66.391ms**，均达原门槛；另有 3 个无 DRAIN 基线、2 个额度拒绝负例、1 个期限负例。期限负例的 4 个预期 NOT_READY 不计成功迁移样本。EXACT 仅 M2 两个有效样本 **39.674／82.785ms**；其余 54 个 READY 配置为 NO_ELIGIBLE_BODY，不能记为尾部零耗时或通过。
+- **限速与故障：** M11 的 8／2MiB/s 人工中继限速正例确实生效，strict **377.869／1436.208ms**，ACK→READY **6.169／2.488ms**；其余正向配置不设置链路限速。两个补充 CHUNK／DECLARE ACK 丢失场景各丢弃 2 次数据 ACK 及首次 CANCEL ACK，验证同一取消请求摘要重试、该 epoch 无 COMMIT、4/4 与 1/1 原 owner 后续 FETCH／DML／ROLLBACK 成功，receiver 六项在线资源账本归零；它们是取消恢复验收，不是成功迁移性能样本。
+- **mixed500：** 50 TEMP＋50 FETCH＋50 BOTH＋350 RW，4096 行、512B payload、FETCH 批次 64；两端 Preserve 各 1GiB、buffer pool 各 512MiB。持续业务 300.008161 秒，DRAIN 阶段仍完成 99842 条成功命令，500 个原连接均继续进展后收到 4020。**437 survivor READY＋63 session-only** 精确覆盖全体，无遗漏或交叉；已提交 RW 核账、业务期间 TEMP／FETCH 内容顺序、receiver 背景 TEMP 隔离通过。strict **1750.630ms**、ACK→READY **124.664ms**，满足 2 秒／2.2 秒及 500ms 目标；eligible=0、NO_ELIGIBLE_BODY，原综合性能验收唯一失败为 `missing_exact_last_command_evidence`，不是已测得尾部超限。DRAIN 墙钟 16024.927ms 不等于 strict。
+- **边界与收尾：** READY 时 receiver 仍保留待接管 epoch 和资源，queue／worker 归零不表示全部内存已释放。mixed500 测量完成后源 shutdown 触发既知 `purge_sys->n_stop == 0` 断言，按用户明确排除项保留日志，不计本轮功能失败、不称正常退出；自有进程及数据已清理。全部本地功能边界止于 READY 或取消后原连接恢复，未执行物理在线升主、SQL RESUME 或迁移后 FETCH。
+- **证据：** [E104 报告](../../../build-release/temp-fetch-pressure-e104/README.md)、[完整配置与结果](../../../build-release/temp-fetch-pressure-e104/RESULTS.md)、[逐项性能](../../../build-release/temp-fetch-pressure-e104/PERFORMANCE.md)、[最终审计](../../../build-release/temp-fetch-pressure-e104/final-audit.json)、[mixed500 原始报告](../../../build-release/continuous-resource/mixed500-e104/report.json)、[ACK 丢失结果](../../../build-release/temp-fault-e104/results.json)。
+
+## E105：continuous-no-commit 单轮与统计口径复核（2026-10-07）
+
+- **配置与不提交证据：** 1000 个不提交大事务＋100 个正常提交短事务连接，RR、300 秒业务，128 张主表、每个大事务 owner 100000 私有行；短事务 50 表×20000 行。大事务交替执行点 UPDATE 与最多 10 行范围 UPDATE，不是每条 SQL 扫 10 万行。两端 Preserve／buffer pool 各 2GiB、inflight 1GiB、Phase1 6 workers／60 秒；仅原轮数 5→1，规模和门槛与 E94 同模型一致。逐个确认大事务 BEGIN=1、COMMIT=0、完成事务数=0；全程累计 279180 次 UPDATE。
+- **功能及核心指标：** **1072/1072 READY**、NOT_READY=0，1100 个原连接收到 4020 后保持；业务错误、重连、连接错误和锁等待超时均 0。strict **1112.186ms**、ACK→READY **18.434ms** 达标，但 EXACT 尾部 **1097.932ms** 超过 500ms；Phase1 7192.905ms，客户端 DRAIN 13490.325ms。`report.success=true` 表示功能流程成功，`result.success=false` 表示原完整验收失败，不能混为一个结论。
+- **命令响应未达标及归因限制：** 7292555 次客户端端到端响应中 **1202 次超过 1 秒**，最大 **2390.572ms**；其中 1198 次成功命令、4 次预期 4020，不是 1202 次 SQL 超时错误。统计从 worker 启动累计到收尾，包含预热，没有正常业务／Phase1／Phase2 分桶或逐条起止时间；正式窗口开始前大事务已完成 203367 次 UPDATE。100 个短事务连接两两竞争各表同一 gate 行，但该类别仅有 78 次超限，且类别名称不证明实际等锁；不能把全部长尾归为业务固有特点，也没有证据全部归因于 DRAIN。
+- **覆盖不足与证据无效：** 最终记录锁 payload 的锁位数 **838299<5000000**；eligible BODY **19<900**，后者因前置验收已抛错未执行到原 runner 的检查，由本轮独立复核补列。这两个继承自原 RANGE 配置的值是压力覆盖门槛，不是 DRAIN 准入／成功条件，不代表丢锁或仅迁移 19 个事务。Phase1 吞吐影响为 **INVALID**：时钟映射区间 **4229534µs>1000000µs**，不能解释为已经测得下降超 20%，也不能填零算通过。常规快照窗口的大事务 244.914 UPDATE/s、短事务 3171.744 TPS 与该失效指标分开记录。
+- **边界与证据：** 2575 项冻结输入及 Git diff／状态前后一致，未改内核或原验收；尾部与命令长尾的具体根因仍未关闭。自有进程、数据及 socket 已清理；source 测量后按既有约定 SIGKILL，非正常 shutdown 验证。只完成本地 transfer→READY。见 [E105 报告](../../../build-release/continuous-no-commit-e105/README.md)、[独立核验](../../../build-release/continuous-no-commit-e105/independent-validation.json)、[原始报告](../../../build-release/continuous-no-commit-e105/runs/continuous-no-commit/report.json)、[原验收结果](../../../build-release/continuous-no-commit-e105/runs/continuous-no-commit/result.json)。
+
+## E106：mixed-transfer 1000 连接单轮压测（2026-10-07）
+
+- **配置：** 历史 `mixed-transfer` 实际使用 `--evidence=dependency-mixed-transfer --profile=full`，与 E94 生效配置逐字段一致。1000 连接、100 表×300000 行；10000／1000／100／10 条 SQL 的事务分别分配 100／200／300／400 个连接，至少 60 秒业务后独立控制连接触发 DRAIN。指定长 CALL 含 500000 次过程 UPDATE，本轮实测 106.780 秒，原模型要求长档≥10 秒，不适用 E105 的每命令 1 秒门槛。两端 Preserve／buffer pool 各 2GiB，inflight 各 1GiB，6 workers，业务未提前停下。
+- **功能：** DRAIN 前 1000 个连接启动、108066 条业务 SQL、15 类操作齐全；全程完成 142461 条 SQL。返回的 **938 个 survivor 全部 SUCCESS／READY**，NOT_READY=0，receiver seal／auto-prewarm 为 938/938，queue／worker／backlog 为 0；999 个 4020，unsupported handoff=0，receiver 背景读错误=0。EXACT coverage=1、eligible=20、missing／fallback=0，scheduler fatal／invariant=0。剩余 62 个连接没有逐连接终态核账，不直接断言全部已经提交。
+- **性能未通过：** 严格 Phase2 **18650.718ms**，超过额外报告的 2000／2200ms 目标。原 profile 的 strict limit=0，没有原生 2 秒断言；原 runner 唯一实际抛错是旧 `source_phase2_post_command_tail_us=1131.837ms` 超过 500ms。原 runner 尚未执行到后续 dependency 检查；独立运行原校验器，确认 EXACT 尾部 **1634.143ms** 也超 500ms。receiver 同 epoch ACK→READY **10.746ms** 达标。旧 `source_phase2_total_us=1636.145ms` 仅为窄区间，不能代替 strict 或宣称严格 Phase2 达标。
+- **分段事实与未解问题：** Phase1→T0 **43108.761ms**，其中 stop purge **31197.805ms**，不计入 strict；T0→HARD 命令退出收敛 **17014.332ms**，CLOSING→Phase2 end **1636.317ms**。源 target-worker wall **725.631ms**、COMMIT_EPOCH **166.122ms**、final metadata ACK **35.919ms** 属不同覆盖范围，不能无证明相加或把整段 EXACT 称为网络耗时。收尾开销的具体根因未定位关闭，未进行修复。receiver 基线／迁移 QPS **2030.360／3395.502**、p99 **22.361／10.341ms**，满足原下降／增长限制，但不同窗口的对比不证明迁移提升业务性能。
+- **核验、收尾与证据：** 2579 项冻结输入及原 Git 状态／diff 一致，主会话与独立 reviewer 复算端点和验收一致。SQL/PFS 观测错误均在初始化／冷复制重启期，业务开始至 READY 两端 status 各 121 条、PFS 各 8 条均成功，两端日志无 ERROR／assertion；不把全程采集说成零错误。source 测量后 SIGKILL、receiver SIGTERM，自有进程／work／socket 均清理，不称正常源 shutdown 验证。见 [E106 报告](../../../build-release/mixed-transfer-e106/README.md)、[独立复核](../../../build-release/mixed-transfer-e106/independent-validation.json)、[原始报告](../../../build-release/mixed-transfer-e106/runs/mixed-transfer/report.json)、[原验收结果](../../../build-release/mixed-transfer-e106/runs/mixed-transfer/result.json)。
+
+E102–E106 均为原预算下的单轮证据，不能替代多轮稳定性、未重跑的其它压力模型或 V04–V06 外部集成。压测原始产物保留在 Git 忽略的 build 目录；上述配置、数值、未通过项和证据边界保存在本受跟踪文档，随代码提交时不强行纳入二进制、数据库和日志。
+
+
+## E107：控制 session 关联目标业务 session 的 cursor（2026-10-07）
+
+- **合同与版本：** 基线 `f540116c322ec6477279288204094c762bd3f30e`，初始工作树干净。proxy 在新主使用独立控制连接，指定业务 session 完成 RESUME/PS 回放后立即调用三参关联接口。`current_thd` 保持控制 session，目标 PS、结果 owner、decoder 和后续 FETCH 协议绑定业务 THD；错误诊断归控制请求。调用方沿用已有机制保证目标 THD/PS/protocol 存活且独占，不增加锁体系、线程池或升主阶段。
+- **根因与窄修改：** 旧 `thd != current_thd` 检查直接拒绝合法控制调用；先跑旧实现，普通 PS 预期 NO_CURSOR 时实际 ERROR，取得 RED。仅修正该检查后，RESET 关闭的原生 cursor 被重复 close，目标阶段上下文发生变化，取得第二个 RED。现分别校验调用/目标 THD，且只关闭仍开放的原生 cursor；保留 m_original_cursor 的原生后续生命周期。生产 `.cc` 仅两处判断变化，头文件补合同。
+- **可验证测试：** 新 `cursor_replay_control_attach` 复用既有 Python E2E 和 Debug 命令桥，用两条真实连接、有界 park 及单 mutex 模拟外部目标接管。没有 DEBUG_SYNC 或新 UT。覆盖 owner 缺失、NO_CURSOR、同 ID 错 session、开放 cursor 冲突、绑定 OOM、RESET 后关联、重复 ALREADY_ATTACHED、不同旧消费位置、EOF/RESET/再次 EXECUTE 后不得复活，随后两连接独立查询/FETCH。桥接只在 Debug 编译，Release 测试字符串不存在。
+- **审核修正：** 独立 reviewer 指出桥接断言1815与预期API拒绝相同，且已有OOM5会吞掉后续断言，负例可能假绿。已把断言改为先清诊断再返回独立1105，OOM注入限定在API调用内；新增两条故意错误预期的反断言，证明普通状态不符及已有OOM均准确报1105，然后再核验正常拒绝1815和真实OOM5。最终复核无剩余确认阻断项。
+- **最终验证：** Debug/Release `mysqld` 构建通过。16项同集合、双模式定向MTR，均使用 `--big-test --parallel=2 --retry=0 --force --max-test-fail=0`；no-bin 6通过/10条件跳过/0失败，log-bin 16通过/0跳过/0失败，shutdown两轮通过并分列，16个不同业务用例均在适用模式通过。新控制关联及旧同session调用均通过；相邻strict RESUME桥、CLOSE补发和OFF隔离通过。Python AST及diff检查通过。本轮不是全量MTR，也不是全部big-test库存复验。
+- **证据与边界：** [E107报告](../../../build-debug/preserve-control-attach-e107/README.md)、[两模式逐项结果](../../../build-debug/preserve-control-attach-e107/mtr-results.tsv)、[审核处理](../../../build-debug/preserve-control-attach-e107/review.md)、[构建指纹](../../../build-debug/preserve-control-attach-e107/final-build-evidence.json)。旧实现RED、中间RED与最终GREEN分开保留；最初缺测试配置的export失败不计根因复现。外部实际session接管、控制连接SQL RESUME/PS回放和物理升主尚未在本轮运行，V04–V06不关闭；没有性能新结论，没有提交或push。
+
+
+## E108：E107修改后的普通全量 MTR（2026-10-08）
+
+- **范围与版本：** 本轮用户指定preserve_trx no-bin/log-bin普通全量，不含big test。HEAD `f540116c322ec6477279288204094c762bd3f30e` 加 E107 未提交修改，Debug mysqld增量构建成功；SHA256 `f6b796db4da0734775409ed727c90d16ed8c5dade5b5d583377e8a2878d90dce` 与 E107 一致。没有运行UT/GUnit或额外压力模型，MTR内的Python E2E正常执行。
+- **执行与结果：** 两模式顺序运行，独立vardir、MTR自动分配端口，均 `--parallel=8 --retry=0 --force --max-test-fail=0`。no-bin 587通过/312跳过/0失败；log-bin 606通过/293跳过/0失败；shutdown两轮通过，两个进程均exit0。MTR墙钟分别637/731秒，不作为性能压测指标。无失败，未启动串行复跑。
+- **覆盖与跳过：** 每模式899个唯一业务结果，无重复、遗漏或未知状态，另有shutdown。no-bin跳过294个需binlog及18个big；log-bin跳过275个需关闭binlog及18个big。两个模式的通过并集为881个普通用例，双skip集合恰好18个big，新control attach两模式均通过；E107原16项也全部纳入本轮。官方588/607成功数包含shutdown，不能当作业务数。
+- **版本保护与收尾：** 39278项内核/头文件/构建/MTR/脚本输入、mysqld二进制指纹、HEAD及完整运行前后的工作树差异/状态均一致。未改内核、测试、门槛或配置来取得通过；结束后只补E108记录。没有遗留测试进程，磁盘约48GiB空闲；没有提交/push。
+- **边界与证据：** [E108报告](../../../build-debug/preserve-full-e108/README.md)、[原始no-bin](../../../build-debug/preserve-full-e108/nobin.log)、[原始log-bin](../../../build-debug/preserve-full-e108/logbin.log)、[双模式矩阵](../../../build-debug/preserve-full-e108/matrix.tsv)、[汇总](../../../build-debug/preserve-full-e108/summary.json)、[输入复核](../../../build-debug/preserve-full-e108/inputs-after-validation.json)。最近包含big test的全量仍为E101；本轮不覆盖历史压力未通过项，不证明外部物理复制工程的控制session接管/实际PS回放/在线升主，不关闭V04–V06。
+
+
+## E109：采用压测配置的四项服务端默认值（2026-10-08）
+
+- **用户确认与修改：** `rds_preserve_trx_memory_budget_bytes` 256MiB→2GiB，`rds_preserve_trx_transfer_runtime_profile` BUSINESS_FIRST→PROMOTION_PREPARE，`rds_preserve_trx_temp_id_namespace`、`rds_preserve_trx_result_capture_enable` OFF→ON。五个内核文件共八处注册/全局初始化同步；不改既有 profile 策略、预算管理、只读属性、关闭条件、协议或升主接点。2GiB 是额度而非启动预分配；显式配置仍优先。
+- **RED 与测试适配：** 旧 Debug 上默认参数合同、默认 Classic cursor 捕获、默认 namespace 三项全部准确 RED。新默认首次 no-bin 暴露旧本地 TEMP 预算用例失败，串行复现的原因是 `temp_namespace_requires_standby_transfer`，并非预算不足。扩大核查留下 57 项旧本地场景失败证据。逐项源码复核后，74 个旧 LOCAL_CARRIER 保存/恢复或后置故障注入用例在各自 `-master.opt` 显式保留 namespace=OFF（69 新配置、5 追加），不修改业务断言或故障点，不在 suite 全局关 namespace，不扩展 local startup 支持。standby、默认 ON、Preserve OFF 和显式 OFF 覆盖均保留。
+- **最终验证：** Debug/Release mysqld 构建均 exit0。相同 150 项定向 MTR 顺序执行 no-bin/log-bin，均 `--big-test --parallel=4 --retry=0 --force --max-test-fail=0`。no-bin 125通过/25条件跳过/0失败，log-bin 65通过/85条件跳过/0失败；shutdown各另计通过。通过并集150，74个兼容配置用例全覆盖，3个big test实际通过；不是全量Preserve MTR。默认合同真实重启后查询四项默认并验证SET profile=DEFAULT，原生FETCH Python E2E、ID隔离、receiver binlog提前/连续准备均在集合内。86个相关源码/配置/二进制最终哈希复核一致，独立review和diff检查通过。
+- **文档与边界：** 同步当前HTML指南、详细设计、README和用户手册。未运行UT/GUnit、未新增DEBUG_SYNC；未重新压测或执行物理复制全链路，不把默认值变更当性能达标证据。原有未提交改动保留，本轮未提交/push。
+- **证据：** [E109报告](../../../build-debug/preserve-defaults-e109/README.md)、[双模式矩阵](../../../build-debug/preserve-defaults-e109/matrix.tsv)、[汇总](../../../build-debug/preserve-defaults-e109/summary.json)、[源码/配置/二进制指纹](../../../build-debug/preserve-defaults-e109/inputs.json)。Debug SHA256 `87706d338ca38012b924995856b3edafd10377a58dfde1576e840c31c92caf14`；Release SHA256 `9845dbf8e7a140c348f2e6abe07727877fe378fe398ce587326985a0d644b818`。
+
+## E110：新默认值下全量 MTR 与旧测试前提适配（2026-10-08）
+
+- **完整覆盖：** 当前 899 个 .test 与 golden 一一对应，唯一 suite 为 preserve_trx。两模式依次完整调度，均含 big-test、parallel=4、retry=0、force/max-test-fail=0，保留 check-testcase。最终 no-bin 604／295／0，log-bin 608／291／0（通过／条件跳过／失败）；shutdown 单列通过。通过并集 899，无双模式均跳过，18 个不同 big 全部通过。121 个名称含 transfer 的用例均在该并集。
+- **先复现再适配：** 首轮 no-bin 12 项失败原配置串行 12/12 RED。空 BEGIN 的既有 NONE 支持依赖 namespace ON；旧分类明确 OFF。9 个逐 SQL 边界旧例明确源端双 OFF，2 个旧 cursor 拒绝/CLOSE cleanup 例仅 capture OFF。分别受控对照 1／9／2 项通过，随后 no-bin 全量通过。保留新默认、完整命令包与新 cursor 测试；CLOSE 原 SIGABRT 是旧测试 debug_sync_abort_on_timeout 主动触发，原始栈保留。
+- **log-bin 清理：** 首轮 7 项状态检查失败均串行 RED，唯一变化是 profile PROMOTION_PREPARE→BUSINESS_FIRST。7 例改为保存并恢复原值，golden 仅删清理输出；默认及自定义 BUSINESS_FIRST 各 7/7 通过，再跑 log-bin 全量通过。7 例均要求 binlog 且修改位于第 2 行守卫之后，最终树定向证实 no-bin 仍 7 skip；不将此定向验证称为再次 no-bin 全量。
+- **收敛与版本：** 仅适配 19 个既有用例、26 个测试文件；本轮内核零修改，Debug SHA256 `87706d338ca38012b924995856b3edafd10377a58dfde1576e840c31c92caf14` 不变。45792 个输入按修正阶段冻结并核验，最终无未解释变化；独立只读 review 核对补丁和结果。未新增 UT/GUnit、DEBUG_SYNC、线程池、机制或门槛调整；未提交/push。不扩大本地 MTR 为 Release 性能或完整物理复制工程验收。
+- **证据：** [E110 报告](../../../build-debug/preserve-full-big-e110/README.md)、[双模式矩阵](../../../build-debug/preserve-full-big-e110/matrix.tsv)、[原始失败与修正](../../../build-debug/preserve-full-big-e110/failure-triage.md)。首轮、串行 RED、对照、最终全量日志和服务端错误日志分别保留。
+
+## E111：结果捕获延后至 DRAIN Phase1（2026-10-09，功能回归完成，性能尚未闭环）
+
+- 正常 EXECUTE 不再创建迁移结果副本、编码缓冲、摘要或文件；共享原生路径保持薄钩子。专属 `preserve_trx_cursor_capture.*` 负责安全读等待 CAS、THD pin、借用与诊断区隔离，分段核心复用现有结果编码／封存。
+- 每段恢复原生 handler 书签再归还业务；FETCH 0、前缀未取／部分／取尽未 EOF、TempTable／MEMORY／落盘结果表均有定向检查。同步书签探针与真实 Phase1 FETCH 分开记录，后者不凭 receiver 尚未准备好就声称源端一定正在扫描。
+- 末次有限采样放在 stop purge 后、T0 前，沿用原截止期和已有目标；final 补齐在事务 freeze/detach 前，包括仅资源会话。没有新线程池、PS 本体迁移、外部升主阶段、RESET DRAIN 或 local startup 扩展。
+- 旧多语句用例改为完整 COM_QUERY 合同；已开始的包完整执行，下一命令再 admission。已有 DEBUG_SYNC 用例只适配旧接点，新用例不使用 DEBUG_SYNC，未新增 UT/GUnit。
+- 独立审查修复：worker 取 THD pin 的分配异常先解锁再受控退出；尚未计数的空 pin 不得减去他人引用。多 builder 首轮的租约高水位不再被后续较小 grow 请求误判为不足；新增 `cursor_phase1_multi_generation` 先得到“replacement cursor not prepared in Phase1”的 RED，再修复验证。
+- 首次完整矩阵 no-bin 605通过/296跳过/1失败，log-bin 606通过/291跳过/5失败。CLOSE完整命令测试编排及额外全局ROW启动参数冲突均串行RED后修正；原失败保留。另有主动中止轮次，不计作完整通过。最终906项双模式均完整完成：no-bin 606通过/300跳过、log-bin 615通过/291跳过，零失败；两次shutdown通过；906项均至少在适用模式通过，18项big-test全部通过，源码与二进制验收前后SHA一致。
+- Release 无DRAIN的两组OFF/ON短时配对：四轮捕获/预传输均为零，ON吞吐与p99未见劣化；不外推为所有负载绝对零开销。
+- 500连接持续300秒模型按原1GiB/BALANCED运行。查明final TEMP delta在coordinator串行pread后，复用现有final worker处理；固定缓冲合读仍按原预算计费。R8功能通过、strict Phase2=995.265ms，ACK→READY=945.820ms未达500ms；末命令独立指标缺样本。R7曾出现7个receiver准备失败，清理空间后同binary未复现，根因证据仍有边界，保留原失败记录。
+- 全部本轮证据见 build-debug/preserve-cursor-phase1-e111/README.md；未提交或 push。
+- R9独立采样确认receiver尚在转换最终TEMP页面并读取donor比较；精确候选接管保留原进度，未发现FINAL重置或隐性串行化。仅扩大既有比较缓冲的R10实验未获整体收益，已撤回内核和测试改动；源码/测试/构建输入恢复到全量通过时的内容，Release SHA完全一致，重建后的7项定向业务用例又在适用双模式通过。R10和带采样的R9/R11均保留，不用它们宣布当前性能达标。最大native单步在Phase1已出现，不能用全程累计值推断ACK尾部根因。
+- R12无采样：460个survivor READY＋40个session-only，业务错误0；strict=1626.577ms、ACK→READY=2534.139ms，后者未通过；独立末命令指标缺样本。R13的post-ACK采样已错过STAGED准备，只看到等待和READY后清理，因此未据此实施新的页写合并。当前性能验收保持未关闭，不扩大原1GiB/BALANCED预算或配置，不将诊断轮作为正式性能成绩。
+- R14–R17定位（2026-10-09）：相同业务/原预算下，R15/R16最终100份TEMP截至ACK仅17/13份preprepared，ACK后仍遍历720/838MiB逻辑页；跨代复用减写但仍全页转换、比较和摘要。R17 ACK→READY=1666.220ms，文件发布link调用区间并集1007.622ms，三个tmp→warm调用曾同时占满3个既有槽400.894ms；不能将其归为close或全部归为fsync。全局READY绑定约0.8ms。报告位于build-debug/preserve-cursor-phase1-e111/ack-ready-root-cause.md，保留观测干扰和未分类范围，不伪造R12逐毫秒拆解。临时观测已全部撤回，Release重建SHA与原版一致，源码/测试/构建输入保持不变；本轮没有实施性能修复，性能验收继续未关闭。
+
+
+## E112：receiver 私有镜像 I/O 收敛（2026-10-09，性能未关闭）
+
+- **范围：** 仅 receiver 私有双副本改为固定 `.image` 路径，复用已有 writer；取消两阶段 link/unlink 与 private writer 目录 fsync。通用 source warm/undo writer不改，DATA flush、close错误、摘要/身份、sealed及原生安装次序均保留。无新增线程池、异步关闭队列、预算或升主接点。详细设计§4.4同步更新。
+- **准确同步合同：** 同进程正常读取不依赖fsync；保留DATA同步是为了READY前完成写回/错误检查，并维持两份独立文件的跨代比较可信性。当前boot之外不恢复这些native资源，故private目录发布无需持久化；已移交image owner的清理及失败重试仍可同步目录。不声称排除所有后续设备错误。
+- **回归：** 旧binary对新增稳定私有路径断言准确RED；新Debug/Release构建通过。no-bin 27通过/11跳过，log-bin 11通过/27跳过；38不同业务均至少通过一种适用模式，两轮shutdown单列通过。覆盖双副本、已有文件保护、abort/OOM/写失败/删除重试、early/final/cross/rollback/LOB/rowid及receiver已有TEMP隔离。没有新增UT或DEBUG_SYNC，本轮没有重跑全量；E111全量是前一版本证据。
+- **正式压测：** 原500持续300秒且DRAIN不停业务、1GiB/BALANCED、不限速；R1为438 READY+62 session-only，strict1674.221ms/ACK1325.679ms/EXACT1667.358ms；R2为449 READY+51 session-only，strict4247.612ms/ACK2559.615ms、EXACT缺样本。功能通过、完整性能均失败。R1/R2内核SHA、脚本及全部依赖SHA一致，配置仅run_id和实例路径/身份不同；不能把第二轮变慢说成轮间新代码造成，也不能未经证据简单归为环境。
+- **补充诊断：** R3为453 READY+47 session-only，strict897.009ms/ACK1351.226ms，非正式性能样本。10239条内存记录完整输出、无溢出；最终100份TEMP截至ACK仅51份preprepared。TEMP窗口并集1253.442ms（92.76%），其中IMAGE、flush和seal互相重叠；慢文件调用并集1016.972ms（75.26%）。最长DATA sync437.096ms、my_close包装层486.046ms、pwrite184.435ms；最终全局bind1.077ms。多个槽仍被同步调用占用；R3计时包含MySQL包装层，不能把my_close直接解释为OS close，注册表等待/系统调用/调度原因未唯一分离，不能把当前尾部全部称为fsync或安装锁竞争。
+- **收尾：** 临时诊断4个源码文件已逐字节恢复并强制重建，Release SHA与R1/R2完全相同。当前I/O收敛代码暂保留，整体收益及目标尚未闭环，未扩大预算/弱化验收/提交/push。原始报告、诊断补丁、分析结果、恢复指纹见[E112报告](../../../build-debug/preserve-receiver-io-e112/README.md)。
+
+
+## E113：同步 I/O 与准备流水线长尾定位（2026-10-09）
+
+- 固定原continuous500；E112原正式R1/R2二进制与脚本均一致。R2相比R1 strict增量99.59%落在source worker窗口；TEMP目标不变、最终I/O计数及传输总量减少，不能解释为规模等比例增长。
+- 诊断R1功能446 READY+54 session-only；strict3201.950ms，ACK1540.495ms，无eligible body。源token118 manifest2054.822ms中link2044.040ms/CPU0.452ms；token46 SEAL等待admission ACK2047.195ms，期间源session mutex持有。receiver同窗有约1.84–1.95秒sync，ACK后有3项约257–302ms的sync同时占槽。长sync正常一次返回，前后回调微秒级。
+- 诊断R2功能444 READY+56 session-only；strict864.264ms，ACK845.245ms，EXACT863.149ms。尾部两次sync与一次pwrite各持续约131–145ms，三者共同重叠130.886ms。Phase1有726ms SEAL等待，但SEAL apply分支仅约1.8ms，符合admission ACK先于apply的源码顺序；不能把两者混为同一耗时。
+- E112 R3原100个TEMP token都曾提前准备；最终换代只有51个ACK前完成。49个尾部工作自身步骤累计中位35.649ms、完成墙钟中位1429.615ms，多个慢文件操作占用既有3槽而放大等待。首轮gate完成不代表最终代已经完成。
+- 确认普通transfer的chunk/ranges路径每批写入存在同步close；OS采样命中该close syscall。精确请求关联、ACK前等待点及宿主FS内部原因尚未闭环，不宣称已找到并修复所有根因；R1错误VM采集不用于排除换页，R2系统观测也不能把主机内存活动直接归责于某个mysqld。
+- 临时12个源码文件逐字节恢复，Release重新构建并匹配原SHA。更正E112文档中“实际close”的过强说法为my_close包装层。本轮只更新定位记录；未重跑MTR、未更改生产算法、未提交/push。[报告/原始证据/恢复指纹](../../../build-debug/preserve-io-diagnosis-e113/README.md)。
+
+
+## E114：Phase1 新结果边生成边发送（2026-10-09，功能全量通过、五轮性能未通过）
+
+- **源码切片：** 新增 `preserve_trx_cursor_stream.*`；原生成功插入之后只向有界环发布完整行，原 TEMP worker 消费并复用原结果文件格式。DRAIN 前没有工件、环或迁移 I/O。源注册、cohort 补扫及发送前 token 宣告覆盖首次 cursor；stop purge 后、T0 前封住 producer admission，再完成原有限采样。
+- **协议和资源：** CURSOR_RESULT OPEN 复用 DECLARE/CHUNK/SEAL，无新帧种类。按接收字节增长同一额度和退役票据；final 描述原地固定，SEAL 检验完整范围／长度／摘要，OPEN 不可 READY。未选中半对象由原 final 清退。receiver 结果接收不 fsync；文件开关、ranges 和重传比较仍在，不扩大为所有 TEMP I/O 均已免同步。
+- **生命周期：** 原生错误／KILL／CLOSE／重执行取消相应代，超大行／环满回退至原扫描。原生成功 open 后才能发布 DONE；worker acquire DONE 后才释放环。取消不代替 join 和最后使用者退出。锁内强引用先于 guard 析构的局部重入风险以调整声明顺序消除；未声称生产已复现该死锁。
+- **先 RED 再 GREEN：** 旧 binary 的生产协议用例在 EXECUTE 等待命名锁时，准确得到 `acked_row_chunks=0`；仍完成其余恢复对照。新实现要求同 epoch/nonce/token/PS/generation 的行数据已收到认证 ACK，且与 receiver 文件逐字节相等；正例还要求同代最终 SEAL，避免回退扫描掩盖流失败。
+- **新增运行覆盖：** 普通流、真实双实例接收、超大单行回退、KILL QUERY 后半对象清退与重执行、MEMORY→磁盘结果表、Phase1 新会话首次 cursor 及 NULL／空 BLOB／零字节。loopback 用例继续执行严格 SQL RESUME／回放后 attach／余下 FETCH／EOF，改变原 TEMP 值后仍核对旧结果，防止偷偷重执行 SELECT。双实例只验证 transfer→READY，不冒充物理升主验收。
+- **测试修正及证据边界：** cross 的 INSERT…SELECT 曾携带未在本地物理复制的普通表共享记录锁，改成等值 INSERT…VALUES 保持 TEMP 规模。KILL QUERY 的 ERR 1317 会出现在 metadata 后，Classic 测试 client 需识别；语句 rollback 按原 TEMP 规则使旧 warm baseline 失效，因此错误场景检查重建而非强求同 inode。落盘探针改由控制连接读 status_by_thread，不在业务事务执行 SHOW。
+- **另案既存问题：** 原生允许普通用户 SHOW SESSION STATUS；在显式事务中留下 PFS 表 MDL 后，既有 Preserve 权限复查未考虑 PFS internal world ACL，可能误拒绝仅有 test.* 权限的用户。该函数与 E114 前基线相同；本轮未修改它，也不把避免测试探针干扰说成修复此缺口。
+- **当前结果：** Debug／Release 构建及六项定向检查通过；最终全量含big-test：no-bin606通过／306跳过，log-bin621通过／291跳过，均零失败，shutdown分别通过；各自36项lint计入通过数，两模式各完整调度912业务且无重复，912不同用例及18个big-test全部在适用模式通过。六项新增用例no-bin因需binlog跳过、log-bin全部通过。2710项输入指纹无漂移。Release 500连接两轮本地transfer→READY与模型资源检查通过，未测物理升主、SQL RESUME或真实proxy；不与定向loopback恢复证据混读，数据见首页。R1/R2的binary不同，唯一差异是unpublish最后强引用先解锁后析构的声明顺序修正；没有性能算法或参数修改。R2 strict-start→receiver READY为2266.098ms，比R1的2668.375ms缩短402.277ms，因此不能仅凭ACK→READY增长认定总处理退化。原脚本strict 2s／EXACT 500ms断言保留；另列用户允许的strict 2.2s判定。
+- **DRAIN前开销：** 最终Release OFF→ON、ON→OFF各20秒测量（另5秒预热），8连接／2048行／256字节／原1GiB BALANCED；EXECUTE p99依次1551、1446、1366、1318µs，吞吐7141.80、7090.55、7300.75、7263.35命令/秒。全部采样的捕获字节／完成／失败及预传输字节／结果为零。此为当前小规模配对证据，不宣称所有业务绝对零开销。
+- **尾部证据边界：** R2最后SEAL在ACK前4.205ms；普通object最后结束在ACK后520.569ms，该计时不覆盖cursor/TEMP resource任务，不能当成游标准备耗时。prepared累计39.116秒跨150个job并含排队，native/image/result的max也不能确定落在ACK窗口。尚缺ACK时未ready集合、各job起止／依赖等待以及最后token-ready→epoch-bind→READY归属；不在根因未明时添加性能机制。
+- **证据保存：** `build-debug/preserve-cursor-stream-e114/`保存旧binary准确RED、定向日志与完整失败数据压缩归档、源码切片与回归指纹、两轮性能及无DRAIN汇总。已清理完成测试的可再生vardir，未清理当前运行实例。
+
+- **用户追加稳定性要求：** 最终全量MTR完成后，同最终binary、原500连接/300秒/1GiB/BALANCED/无限速连续5轮；按用户认可的R2 strict1679.734ms/ACK587.126ms比较，保留每轮值、最大值和原门槛结果。没有自行改成新的精确ACK阈值。
+
+### E114 追加五轮 Release 稳定性结果
+
+连续5轮 Release 本地 transfer→READY 功能均通过，worker_errors 为0；strict≤2.2s为4/5，原strict≤2s为3/5，ACK<500ms为0/5。最大strict=2850.872ms、ACK→READY=3754.712ms，未稳定达到用户所举的前R2水平，性能仍未关闭。
+
+| 轮次 | survivor／session-only | strict Phase2，ms | ACK→READY，ms | EXACT尾部，ms | strict≤2.2s |
+|---|---:|---:|---:|---:|---|
+| R1 | 150／350 | 948.161 | 885.590 | 870.044 | 通过 |
+| R2 | 150／350 | 1779.312 | 759.529 | 1748.817 | 通过 |
+| R3 | 436／64 | 2850.872 | 3754.712 | 2850.079 | 未通过 |
+| R4 | 439／61 | 2132.780 | 933.156 | N/A | 通过 |
+| R5 | 415／85 | 1112.703 | 991.121 | N/A | 通过 |
+
+- 五轮均使用相同最终Release SHA `e87c9921dc9de3fd47c12c20438c3ea450d23b06c390e8bc4fa62a8c5c502e8b`；脚本与全部依赖指纹、业务参数、非实例身份变量一致。原500连接／300秒／1GiB／BALANCED／无限速，业务不中止至DRAIN边界；没有改内核或挑选快轮。前R2比较基线并非新的精确ACK门槛。
+- R4/R5 EXACT为NO_ELIGIBLE_BODY且coverage完整，单列N/A，strict与ACK证据仍有效；其余3轮EXACT全部超过原500ms。原完整验收0/5，全部workload返回1；wrapper返回0只表示收集完成。
+- R3源final worker2475.085ms，占strict约86.8%，HARD等待仅2.622ms。R3相对R4虽然survivor更少（436／439），结果预传输代数更多（207／164）、TEMP final回退更多（4／2）、final写入更多（112,720,765／63,912,986字节）。不能把token数或回退计数单独当作完整根因。
+- receiver最终100个结果及100个TEMP均复用早准备候选，但尚未定位ACK附近最后完成的token/资源任务；累计prepared和整个epoch的stage max不能解释ACK墙钟。本次未据不完整归因增加新机制。
+- R2额外启动预检失败发生在实例/业务启动之前，单独保留；驱动补充启动前有界端口可用等待，R5等20.020秒，不计入业务或DRAIN。5个有效轮次全部保留。
+- 功能仅本地transfer→READY及模型资源检查，不扩展为物理升主/SQL RESUME/真实proxy验收。完整数据见[五轮Release报告](../../../build-release/cursor-stream-e114/stability-five.md)及[独立核验汇总](../../../build-debug/preserve-cursor-stream-e114/stability-five-verified.json)。
+
+
+## E116–E121：批送、单份安装文件与同步策略复核（2026-10-09）
+
+- **保留 E116：** 同一读取片的 TEMP 64KiB CHUNK 复用已有 batch，末批可带 SEAL；整批认证 ACK 后才提交前缀，预算不足/单帧上限退回原路径，ACK_UNCERTAIN 和序号门禁保留。旧二进制在真实双端用例准确 RED 于缺少多 CHUNK batch；新矩阵覆盖批送及整批丢 ACK 重传。E116 两轮功能通过但 ACK 为1047.517/4310.077ms，不能单独宣布性能闭环。
+- **E118 已确认：** ACK 窗 ORIGINAL 重复副本 pwrite/close 区间并集510.601ms，最后两个token也等ORIGINAL close；这是观测量，不是预期收益。源码独立审核确认候选仍私有时可用 INSTALL 比较/统计，native接管后ORIGINAL无生产读取者。
+- **保留 E119：** receiver收敛为一个writer/owned文件，保留owner、root/install目录、DATA同步、摘要、final/native donor fences与失败取消；原生接管后不得删活文件。单份计费，完整转换/比较/摘要仍存在。E117曾增加的ORIGINAL专属check_writeback开关随冗余文件一并删除。89项业务MTR：no-bin42通过/47条件跳过，log-bin48通过/41跳过，零失败，shutdown分别通过。正式首轮440 READY+60 session-only，strict2314.537ms/ACK155.133ms；EXACT缺eligible body，不能计通过。
+- **撤回 E120：** 仅源在线prebuild DATA试验取消flush/close内部fsync，默认warm/UNDO/INSTALL不变；21项定向MTR通过。但正式首轮459 READY+41 session-only、strict5444.461ms/ACK2371.847ms。试验没有证明总体收益，后续全部撤回参数、字段、分支及probe，避免遗留无效策略。
+- **E121 因果核定范围：** 同配置诊断R1 strict4739.136ms/ACK1190.461ms，source75次my_close>1ms并集3798.772ms，最长3141.233ms；FILE记录包含MySQL包装层，尚未唯一分离OS close与filename registry。receiver ACK文件操作并集984.362ms，最后token55等INSTALL sync112.322ms，epoch绑定296µs。只恢复源同步的R2 strict684.819ms/ACK670.855ms，source窗口无DATA close>1ms。支持回撤，不代表单对轮次已证明稳定性能。
+- **指标边界：** native_early_reused不是ACK前preprepared数量；STAGED累计含排队，重复picked-enqueued是任务年龄。REAP仅覆盖prewarm worker调用，STAGE cpu_us=0表示未采集。E120系统swapout约18.7MiB发生在strict，不在ACK窗，不能据此解释全部退化。
+- **恢复验证：** 所有临时诊断撤除，E120三个文件与E119逐字节一致，仅修正receiver的一行文件lease注释；正式Release SHA恢复为97f794a3bbaaad70ee5b2c5d4b014543bbc9c4aef2f7a5bde03e6535115a43ac。上述MTR为定向，不替代新全量；未提交/push，所有失败轮次保留。
+
+## E122–E123：固定五轮复核及源 DATA 首次复制跳零（2026-10-09）
+
+E122未修改任何运行输入，五轮均功能通过、worker_errors=0；strict/ACK分别为865.993/526.639、4899.222/107.412、696.435/671.375、1506.857/1766.275、2419.519/167.329 ms。strict原2秒和用户2.2秒线均3/5通过，ACK500ms为2/5；没有达到连续稳定目标。EXACT第一、二轮865.244/4898.435ms，其余NO_ELIGIBLE_BODY且coverage完整，不能冒充零耗时或通过。r3首次端口占用在业务启动前失败，日志独立保留后才重跑。
+
+E123确认首次COPY始终是新O_EXCL writer：LIVE_BASELINE固定fstat长度后读取校验全部页，允许实际全零内部页形成文件空洞，末页仍write建立完整长度。已有writer从NEXT进入ROUND；fresh_copy_bytes只在本次COPY栈对象设定，ROUND默认0，FINAL未改，防止旧非零页清零时误跳。新增逻辑仅位于temp_prebuild与capture scan getter，无新缓存、线程、策略开关或DEBUG_SYNC。
+
+复用temp_capture_sparse_base真实旧码RED：主37748736B、内部零页11403264B、helper上界98304B，旧实写37847040B > 26443776B上界；新同用例实写26411008B且完整SQL恢复/回滚通过。29项定向矩阵no-bin 10通过/19条件跳过、log-bin 21通过/8跳过，零失败，两次shutdown_report单列通过；不等同新全量回归。Debug/Release均构建通过。
+
+尚需核定的独立成本：final_reused只是资源复用，脏tail可使checkpoint SHA失效并触发完整DATA摘要；之后DELTA还可能再比较target/base。现有零tail摘要快路径与seal预验证已在，不能直接删除校验。SOURCE_FINAL计逻辑读，也包含内存页，不是纯磁盘读；后续raw-fd final DELTA比较不在此计数中。可研究复用已有delta builder合并target扫描，但未实施，不新增另一套生命周期。E123正式Release五轮已完成。strict/ACK分别为753.554/695.057、639.244/1044.610、877.411/414.911、748.752/497.783、778.434/1902.418ms，功能均通过，strict5/5、ACK2/5通过；EXACT两轮NO_ELIGIBLE_BODY，三轮629.065/744.751/771.036ms，原综合0/5。第4轮首次在DRAIN前中断，保留残留日志；主机重启后完成第4、5轮，环境差异与可选采样缺失单列，五轮不能当作完全同环境稳定性证明。
+
+
+## E137：M矩阵根因修复与完整复验（2026-10-10）
+
+### 根因与修复范围
+
+E135的原六项失败及E136定位证据保留。M1历史结果代累计耗尽receiver暂存额度；M2持续RESULT工作抢占首次TEMP捕获和准备确认，并使首轮门槛随持续业务增长，四配置均曾180秒超时。清空业务增量的诊断轮还暴露历史manifest超过1MiB的后续门槛。M11 2MiB/s场景的旧stream被队列强持有，耗尽256份结果数量额度；该轮最终虽4/4 READY，仍因捕获失败数非零而未通过。详见[E136根因与原始失败](../../../build-release/preserve-root-cause-e136/README.md)。
+
+本轮修复只延伸既有生命周期和调度：
+
+1. 原生cursor拥有可选stream/工件，排队描述符使用弱引用，worker只强持有当前使用步骤；final image仍强持有精确选中的结果代。CLOSE、EOF或重新EXECUTE后失效代经现有BEGIN清单替换退役，认证ACK后才裁剪源端描述符。final不再补回历史结果。未提高数量、字节预算或协议上限。
+2. receiver在封存注册表锁内注册结果候选，BEGIN同时移除不再选择的候选。worker不再创建缺失槽，每个continuation复核当前sealed file，完成时仍按槽身份验证，防止迟到worker重建已退役代。复用retirement ticket/reaper；最后读者退出前不归还清理额度。结果不再保存重复的通用prewarm proof，精确结果候选和最终校验保留。
+3. 首次安全点冻结有限结果集合；新结果仍可边生成边发送，不扩大首轮完成门槛。cohort捕获先于重投worker，优先给尚未首次捕获的TEMP机会，发送与receiver准备查询交替推进。首轮仅收口已提交单步，stop purge之后、T0之前仍在原last_result_round位置关闭producer并排空尾轮。
+4. 最后stream引用在队列锁外释放；旧decoder也在registry锁外析构。取消不代表无人使用，不以最大generation替代final的精确选择。没有新增线程池、PS本体transfer、RESET DRAIN处理或外部升主阶段。
+
+相对于本轮开始保存的源码，10个内核文件+241/-154，净增87行；共享contract E2E脚本+12/-2。删除了历史结果补回分支、失去用途的result_sending状态及has_pending_transfer/settled接口。本轮未增加临时内核日志或验证探针。完整差分与逐文件计数：[源码切片](../../../build-release/preserve-matrix-fix-e137/final-slice.patch)、[计数](../../../build-release/preserve-matrix-fix-e137/slice-stat.json)。原有未提交修改保持保留。
+
+### 定向回归
+
+- 原六项失败先定向重跑6/6通过，再在最终完整矩阵全部通过；没有用定向结果替代完整矩阵。
+- Debug与Release构建成功。21项主要定向MTR全部通过，shutdown_report单列通过；另8项receiver/undo/OFF边界用例按各自原配置全部通过（其中5项cnf显式开启binlog），shutdown通过；显式skip-log-bin再跑8项，3通过/5条件跳过/0失败，shutdown通过。合计29个不同业务用例均在适用配置通过；这不是全量Preserve MTR。
+- 两项旧MTR在并行、串行均准确失败于“必须保留两代文件”。改为先确认旧代1份，重新EXECUTE后只剩不同身份的新代1份，CLOSE后0份；原deadline、worker存活、FETCH内容/位置/EOF、预传字节、恢复后内容和CLOSE错误码断言保留。该修改是退役合同适配，不通过放宽断言消除功能失败。
+- 三个独立只读review分别复核source生命周期、receiver并发和调度/测试。已收紧最后引用锁外释放、prepared-only CLOSE退役、sealed结果候选缺失的有限回退及首次TEMP公平性；最终未发现新增阻断问题。静态审查和有限测试不等于证明不存在所有竞态。
+
+证据：[MTR逐项汇总](../../../build-release/preserve-matrix-fix-e137/mtr-final-summary.json)、[主定向日志](../../../build-release/preserve-matrix-fix-e137/mtr-green.log)、[边界日志](../../../build-release/preserve-matrix-fix-e137/mtr-boundary-nobin.log)、[显式no-bin日志](../../../build-release/preserve-matrix-fix-e137/mtr-boundary-nobin-explicit.log)、[独立复核记录](../../../build-release/preserve-matrix-fix-e137/review.json)。边界日志中的nobin是启动时目录标签，该轮未传skip-log-bin；实际模式按用例cnf，不能用标签冒充全no-bin证据。
+
+### 完整Release M1–M12矩阵
+
+原62条配置的顺序、业务参数、预算、限速和验收条件与E135逐项一致，仅输出路径不同。最终Release SHA256为`320ec156949d9a16a8131ea7879ed14beaa0b3b637e6852b15ed5cf16b96d61a`；2,637项冻结输入在执行前、各用例之间、执行后均核对无漂移。全部串行完成，run_queue、独立验收和指标提取各自退出0，无缺报、跳过或替换失败轮。
+
+| 模型 | 配置数 | 原模型验收通过 |
+| --- | ---: | ---: |
+| M1 | 4 | 4 |
+| M2 | 4 | 4 |
+| M3 | 6 | 6 |
+| M4 | 6 | 6 |
+| M5 | 4 | 4 |
+| M6 | 3 | 3 |
+| M7 | 5 | 5 |
+| M8 | 4 | 4 |
+| M9 | 8 | 8 |
+| M10 | 4 | 4 |
+| M11 | 10 | 10 |
+| M12 | 4 | 4 |
+| 合计 | 62 | 62 |
+
+原六项失败的最终复验：
+
+| 配置 | DRAIN，ms | strict Phase2，ms | ACK→READY，ms | READY token | 捕获失败 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| M1持续业务ON | 674.369 | 43.214 | 8.372 | 8 | 0 |
+| M2 6会话 no-bin | 635.544 | 29.575 | 12.828 | 6 | 0 |
+| M2 6会话 log-bin | 855.136 | 35.170 | 12.771 | 6 | 0 |
+| M2 12会话 no-bin | 1646.317 | 51.669 | 14.205 | 12 | 0 |
+| M2 12会话 log-bin | 1896.291 | 64.119 | 8.200 | 10 | 0 |
+| M11 2MiB/s | 13940.855 | 1350.485 | 0.050 | 4 | 0 |
+
+DRAIN包含Phase1，不能与strict Phase2混读。持续业务M2允许事务在切换前提交；该轮12会话log-bin为10个事务survivor，不声称12个事务全部保留。
+
+完整矩阵中56项预期迁移全部成功，共334个READY token；3项M1无DRAIN对照和3项M11预期拒绝按原要求通过。4个NOT_READY仅来自M11 deadline负例；内存/暂存额度拒绝还验证了原连接的TEMP/FETCH/rollback继续正确。全部capture failure为0，所有自有实例数据已回收，receiver后置等待未发现晚期TEMP完成错误。M10验证的是结果换代，M12验证receiver自有及后续TEMP隔离。
+
+性能独立核算：56个成功迁移配置各有完整strict和receiver同钟ACK→READY样本，全部通过原2s和500ms门槛；最大strict1350.485ms（M11 net2），最大ACK→READY14.529ms（M11 profile）。独立EXACT尾部只有M2 12会话log-bin一个有效样本63.734ms；其余55项均为NO_ELIGIBLE_BODY且coverage完整，不是采集丢失，不算0或通过。总JSON的57个strict样本还包括1个预期deadline负例，不能作为成功迁移分母。
+
+这是一次完整本地transfer→READY矩阵及相邻MTR恢复验证，不代替物理复制、在线升主、生产PS回放/真实proxy集成，也不据此关闭历史500/1000并发模型或长期稳定性验收。旧harness复制的plan/adaptations文案仅保留原测试适配背景；本轮确有上述内核修复，未额外重跑四个原有压力模型，实际性能门槛结果以独立metrics为准。没有提交或push。
+
+完整证据：[62项逐项结果](../../../build-release/temp-fetch-pressure-e137/RESULTS.md)、[独立验收](../../../build-release/temp-fetch-pressure-e137/summary.json)、[完整性能及原始日志字段](../../../build-release/temp-fetch-pressure-e137/metrics.json)、[冻结输入](../../../build-release/temp-fetch-pressure-e137/frozen-inputs.json)、[执行总日志](../../../build-release/preserve-matrix-fix-e137/matrix-full.log)。
+
+## E138：500连接持续TEMP／FETCH业务两轮Release复测（2026-10-10）
+
+按用户要求先重新构建`build-release`的mysqld目标，确认Release、WITH_DEBUG=OFF、`-O3 -DNDEBUG`，再串行执行两轮。二进制SHA256仍为E137的`320ec156949d9a16a8131ea7879ed14beaa0b3b637e6852b15ed5cf16b96d61a`。2,638项冻结输入执行前、两轮之间和执行后均一致；两轮的二进制、驱动、依赖及非身份业务配置一致。没有修改内核、共享测试驱动或预算，没有提交/push。
+
+沿用原500连接模型：TEMP50、FETCH50、BOTH50、RW350；每份结果4096行、payload512字节、FETCH每批64行。所有连接进入持续业务后运行300秒，再由控制器发起DRAIN；业务不预先停止，持续至各连接收到4020。双端Preserve预算各1GiB、transfer inflight上限1GiB、buffer pool各512MiB，BALANCED及6个既有Phase1 worker不变；传输不限速。仅run-id及端口为每轮独立分配。工作负载驱动与E130相同；共享contract依赖已包含E137适配，不声称全部源码与E130相同。
+
+| 指标 | 第一轮 | 第二轮 |
+| --- | ---: | ---: |
+| DRAIN前持续业务，s | 300.012384 | 300.004009 |
+| DRAIN整体墙钟，ms | 12970.551 | 12069.228 |
+| 严格Phase2，ms | 689.872 | 737.450 |
+| receiver ACK→READY，ms | 120.499 | 31.154 |
+| EXACT最后合格命令→FINAL_ACK，ms | 689.406，超500ms | N/A，NO_ELIGIBLE_BODY |
+| survivor／session-only | 444／56 | 439／61 |
+| 原连接完整收口 | 500 | 500 |
+| worker／结果捕获错误 | 0／0 | 0／0 |
+| 本地功能验收 | 通过 | 通过 |
+| 严格Phase2≤2s、ACK→READY<500ms | 均通过 | 均通过 |
+| 原综合性能验收 | 未通过 | 未通过 |
+
+严格Phase2由源端`phase2_end_monotonic_us - pre_closing_policy_started_us`重算；ACK→READY只使用receiver自身的`ready_us - final_ack_us`，不跨进程相减。两轮源端与receiver epoch一致，原始终态日志与report逐项相符。第二轮EXACT记录为eligible_body_count=0、coverage=1、missing=1、tail_fallback=0；这是没有合格起点，不是采样丢失，原始尾部字段0不能当0ms测量。两轮驱动退出码均为1，原因分别为`last_command_to_final_ack`及`missing_exact_last_command_evidence`；没有因两项关键指标达标而覆盖原综合失败。
+
+功能核验包括500个原连接均收到4020、survivor与session-only完整且不交的分类、receiver自有TEMP隔离，以及receiver后台任务完成。关机前inflight_tokens、queued_bytes和worker_active均为0，完整receiver日志无ERROR或晚期TEMP完成失败。两轮seed/source/receiver退出码均为0/2/0；source唯一ERROR是SHUTDOWN后已由用户排除的purge停止计数断言，保留真实退出码，不称正常退出。观察进程退出0、无强制清理；自有数据/socket/pid目录已回收，实时PID检查确认自有实例与观察进程均退出，日志保留，磁盘剩余约28GiB。
+
+本轮仅验证本地transfer→READY、后台完成及模型内资源检查；未执行真实物理备机升主、SQL RESUME或proxy集成，不能外推为该链路的验收，也不能以两轮结果代替长期稳定性证明。
+
+证据：[Release构建日志](../../../build-release/continuous-resource/e138-matrix-fix-review/build-release.log)、[冻结输入](../../../build-release/continuous-resource/e138-matrix-fix-review/frozen-inputs.json)、[完整命令](../../../build-release/continuous-resource/e138-matrix-fix-review/commands.json)、[执行退出结果](../../../build-release/continuous-resource/e138-matrix-fix-review/runner-results.json)、[独立重算汇总](../../../build-release/continuous-resource/e138-matrix-fix-review/summary.json)、[第一轮完整报告](../../../build-release/continuous-resource/e138-matrix-fix-r1/report.json)、[第二轮完整报告](../../../build-release/continuous-resource/e138-matrix-fix-r2/report.json)、[分业务命令延迟](../../../build-release/continuous-resource/e138-matrix-fix-review/command-latencies.tsv)。延迟p50/p95/p99是原直方图区间上界，不是精确分位值。
+
+## E139–E140：TPC-C128及全量MTR含big test（2026-10-10）
+
+### E139：当前Release TPC-C-like 128连接
+
+按要求先构建Release mysqld，再执行原300仓库、9表、RR、128连接的单轮模型。二进制SHA256为`320ec156949d9a16a8131ea7879ed14beaa0b3b637e6852b15ed5cf16b96d61a`。双端Preserve各2GiB、buffer pool各2GiB、transfer inflight各1GiB、PROMOTION_PREPARE及6个既有Phase1 worker保持原值，真实standby transfer开启，rate=0。离线种子经SHA256/大小/mtime核验后建立两个独立APFS克隆，运行前仍满足原28GiB空间门槛；没有缩小业务或放宽预算、性能门槛。
+
+连接全部就绪后，业务实际持续300.025480秒再发起DRAIN，并继续至全部HOLD和receiver READY。独立18项检查全部通过，原始FINAL/SCHED日志由另一只读审查独立重算并与报告逐字段核对。
+
+| 指标 | 当前结果 |
+| --- | ---: |
+| strict Phase2 | 352.572ms，≤2s通过 |
+| EXACT最后合格BODY退出→FINAL_ACK | 75.744ms，<500ms通过 |
+| receiver同钟ACK→READY | 0.462ms，≤500ms通过 |
+| Phase1 | 271.204ms |
+| DRAIN客户端往返 | 682.828ms |
+| survivor SUCCESS／READY | 79／79，NOT_READY=0 |
+| 原连接／HOLD／RR | 128／128／128 |
+| 59个完整5秒窗口平均TPS／QPS | 738.778／20937.109 |
+
+581个eligible BODY，coverage=1、missing=0、fallback=0；源端HARD_QUIESCENT/COMMITTED_HANDOFF，无未决ownership，receiver queue/worker为0。DRAIN前PFS错误为空，之后仅128次4020；新增1205=0，无两端ERROR、FATAL或重连。sysbench err/s包含原模型预期的新订单回滚，不能写成全部业务错误数为0。60个资源样本均在DRAIN前，最低空闲15.432GiB；不能据此报告DRAIN峰值或精确DRAIN TPS。原驱动p95=0.00不是有效延迟证据；TPS为sysbench事件吞吐，不是认证tpmC。
+
+2,644项冻结输入无漂移，runner退出0；源端取证后按原模型SIGKILL退休（-9），receiver SIGTERM正常退出0。驱动没有保存sysbench自身退出码，不能声称全部进程exit0。自有克隆已清理；种子五个大表重新压缩并逐个核验解压SHA后回收原件。范围仍为本地DRAIN→transfer→READY，不含真实物理升主、SQL RESUME或proxy回放。
+
+证据：[完整报告](../../../build-release/tpcc-128-e139/c128/r01/report.json)、[18项独立验收](../../../build-release/tpcc-128-e139/c128/independent-validation.json)、[实际启动命令](../../../build-release/tpcc-128-e139/c128-commands.json)、[构建日志](../../../build-release/tpcc-128-e139/build-release.log)、[输入与清理核验](../../../build-release/tpcc-128-e139/completion.json)、[资源采样边界](../../../build-release/tpcc-128-e139/resource-summary.json)。
+
+### E140：完整Debug MTR，no-bin后log-bin
+
+Debug mysqld/mysqltest构建通过；mysqld SHA256为`c86c1d0ae16540a6243503c61d3b0f501d4268f5d65dd16d017e1273ee1684e3`。TPC-C结束后顺序执行两模式，每轮完整`--suite=preserve_trx --big-test --parallel=4 --retry=0 --force --max-test-fail=0`，独立vardir/tmpdir及原生auto端口，保留testcase检查。当前无独立`preserve_trx_transfer_stby`目录，standby transfer用例位于本套件中。
+
+| 模式 | 业务总数 | 通过 | 条件跳过 | 失败 | shutdown_report |
+| --- | ---: | ---: | ---: | ---: | --- |
+| no-bin | 921 | 605 | 316 | 0 | 单列通过 |
+| log-bin | 921 | 631 | 290 | 0 | 单列通过 |
+
+两轮退出码均0，完整结束标记分别为All606/All632（包含shutdown）。共1,842条业务结果，921个不同用例均至少在一种适用模式通过，无遗漏、额外或重复；18个不同big test全部通过（no-bin17项、log-bin2项，multi_session_100_resume两轮均通过）。36项源码lint在两模式均通过，运行时用例通过数分别为569/595；lint不代替运行时验收。no-bin316项跳过全部为需要binlog，log-bin290项全部为要求关闭binlog，无异常big-test跳过、告警失败或testcase检查失败。没有失败重试或更新golden。
+
+两种模式墙钟分别1272.399秒、1321.323秒，合计约43分14秒；不作为Release性能数据。25,713项输入及两份Debug二进制执行前后指纹相同；独立只读审核直接解析原始日志，核对退出码、库存、big清单、逐行TSV及结束标记，结论一致。归档逐文件校验后回收本次vardir/tmpdir；与仓库字节相同的std_data素材用路径/SHA清单引用，其他日志、配置和数据库文件均保留在归档中。
+
+空间准备还对历史E135/E136及其他已结束压力报告作无损压缩、归档E137自有MTR目录，并删除4,393个已匹配CMake清理规则的可重建`.o/.a`中间产物。运行二进制、插件、构建配置、源码、种子及失败证据保留；后续构建会重新生成中间产物。当前剩余约53GiB。历史压缩文件的恢复路径、SHA及归档清单见[E139空间记录](../../../build-release/tpcc-128-e139/evidence-compaction.json)、[其他报告压缩](../../../build-release/tpcc-128-e139/additional-evidence-compaction.json)、[重复素材归并](../../../build-release/tpcc-128-e139/fixture-compaction.json)、[可重建产物清理](../../../build-release/tpcc-128-e139/rebuildable-cleanup.json)。
+
+本轮运行期间内核、共享驱动、测试与golden均未改变；最终仅补本任务记录，没有提交/push。不用本轮TPC-C或MTR通过覆盖历史其他压力模型未通过项，也不将本地测试等同真实物理复制集成验收。
+
+证据：[逐项TSV](../../../build-debug/preserve-full-big-e140/results.tsv)、[汇总](../../../build-debug/preserve-full-big-e140/summary.json)、[no-bin完整日志](../../../build-debug/preserve-full-big-e140/nobin.log)、[log-bin完整日志](../../../build-debug/preserve-full-big-e140/logbin.log)、[退出码及完整命令](../../../build-debug/preserve-full-big-e140/exit-codes.json)、[构建日志](../../../build-debug/preserve-full-big-e140/build-debug.log)、[最终核验](../../../build-debug/preserve-full-big-e140/final-verification.json)、[归档清理](../../../build-debug/preserve-full-big-e140/archive-cleanup.json)。
+
+## E141：原有五模型当前Release各一轮（2026-10-10）
+
+用户指定sysbench读写、只写事务、只写自动提交、mixed-transfer、continuous-no-commit各一轮，全部串行执行完，队列5模型/5轮、原验收3通过2失败。使用E137–E139同一Release（SHA256 `320ec156949d9a16a8131ea7879ed14beaa0b3b637e6852b15ed5cf16b96d61a`），没有重新编译或修改内核。2,648项源码/驱动/二进制冻结输入在执行前、各模型之间、执行后均一致，补文档前git status/diff逐字节一致。新证据目录仅复用原wrapper、更新二进制身份和输出目录，没有实例化历史4GiB实验类；五个profile与E131/E135原值逐字段相同。
+
+双端Preserve各2GiB、buffer pool各2GiB、inflight各1GiB、PROMOTION_PREPARE、6既有worker、传输不限速。sysbench三项1000并发/128表×20000行、正式窗口300秒，业务运行到DRAIN、原连接HOLD和receiver核验完成才停压。mixed1000连接、100表×300000行、四档事务与长CALL、60秒后直接DRAIN；no-commit1000大事务+100短事务、300秒正式窗口。
+
+| 模型 | 本地功能 | survivor READY | strict Phase2 ms | EXACT ms | receiver同钟ACK→READY ms | 原验收 |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| sysbench读写 | 本地通过 | 98 | 274.449 | 179.481 | 0.672 | 通过 |
+| sysbench只写事务 | 本地通过 | 328 | 713.687 | 224.912 | 2.737 | 通过 |
+| sysbench只写自动提交 | 本地通过 | 0 | 193.030 | 176.011 | N/A | 通过 |
+| mixed-transfer | 本地通过 | 914 | 38,062.816 | 1,897.200 | 19.707 | 失败 |
+| continuous-no-commit | 本地通过 | 1071 | 1,304.387 | 1,286.199 | 15.226 | 失败 |
+
+自动提交为正常NO_PRESERVABLE_TOKENS、receiver控制epoch完成、1000原连接HOLD，ACK→READY不适用。其他四项全部survivor SUCCESS/READY、NOT_READY=0。五项source final/scheduler身份、终态完整性独立校验通过。EXACT各有有效BODY起点、无fallback；没有用旧尾部替代EXACT。
+
+三项sysbench业务运行309.756385／309.931653／300.584316秒，稳态吞吐860.205TPS／7470.886TPS／6339.029events/s，QPS17199.347／44824.112／25500.690。原PS分别1153000／513000／512000，全部1000原连接ID保留，无FATAL/重连。只写事务5窗口err/s0.1，具体码未单列；自动提交正式业务1062为14460，DRAIN到HOLD新增7。p95=0.00无效。
+
+mixed原失败为旧尾部1461948us>500000us；独立EXACT1897200us也失败，strict38062816us超过2s及2.2s容忍。Phase1 148529548us，stop purge109754508us；strict中T0→HARD36154348us、CLOSING→end1908412us。ACK19707us通过。已定位时间区间，具体命令/purge/尾部操作阻塞因果未完全确定，不能单轮断言E137导致回退。
+
+no-commit1071/1071 READY、strict1304387us和ACK15226us通过；EXACT1286199us失败。逐个核对1000大事务BEGIN各1/COMMIT各0/完成事务各0，399325次UPDATE、各owner163–746次；1100连接保持原连接且等待4020。原业务响应>1s有1103条（BEGIN1、large DML507、故意锁等待58、COMMIT55、4020响应482），最长2162716us；统计为全worker生命周期，不据此把初始化/业务长响应都归到DRAIN。锁样本1199438<5000000，eligible BODY22<900；属于未达到原压力覆盖，不能写成数据丢失。TPS时钟映射宽7094829us，原要求≤1000000us，证据INVALID；不声称TPS降幅。全部失败原记录保留，没有改原判据。
+
+五项原清理成功，自有source/receiver/work/socket和observer线程均结束，ps未发现残留进程；最低采样磁盘空闲约17.44GiB，完成后约51GiB。没有额外清理源码或失败证据。源端在取证后按原单向purge合同SIGKILL退休，不计业务崩溃或正常关机通过。观察中仍有准备/退出SQL/PFS采样缺项，明细保留；不能写成无采样错误。
+
+本轮为本地transfer→READY回归，不覆盖真实物理升主、SQL RESUME及PS回放。没有修改共享测试或golden、没有提交/push。
+
+证据：[完整报告](../../../build-release/original-pressure-e141/README.md)、[独立指标](../../../build-release/original-pressure-e141/metrics.json)、[逐模型原结果](../../../build-release/original-pressure-e141/results.json)、[no-commit逐owner核对](../../../build-release/original-pressure-e141/no-commit-verification.json)、[输入/差分核验](../../../build-release/original-pressure-e141/verification-before-doc.json)、[执行总日志](../../../build-release/original-pressure-e141/controller.log)。

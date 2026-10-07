@@ -5,9 +5,18 @@
 #define SQL_PRESERVE_TRX_TEMP_METRICS_INCLUDED
 
 #include <cstdint>
-#include <array>
-#include <string>
 #include "mysql/status_var.h"
+
+#ifndef NDEBUG
+#define PRESERVE_TRX_TEMP_FINAL_SUBSTAGES(X) \
+  X(SOURCE_FINAL_TAIL, source_final_tail) \
+  X(SOURCE_FINAL_CLOSE, source_final_close) \
+  X(SOURCE_FINAL_DIGEST, source_final_digest) \
+  X(SOURCE_FINAL_SEAL, source_final_seal) \
+  X(SOURCE_FINAL_VALIDATE, source_final_verify)
+#else
+#define PRESERVE_TRX_TEMP_FINAL_SUBSTAGES(X)
+#endif
 
 #define PRESERVE_TRX_TEMP_STAGES(X) \
   X(SOURCE_COPY, source_copy) \
@@ -16,6 +25,7 @@
   X(SOURCE_UNDO_SCAN, source_undo_scan) \
   X(SOURCE_UNDO_WRITE, source_undo_write) \
   X(SOURCE_FINAL, source_final) \
+  PRESERVE_TRX_TEMP_FINAL_SUBSTAGES(X) \
   X(RECEIVER_SOURCE, receiver_source) \
   X(RECEIVER_DICTIONARY, receiver_dictionary) \
   X(RECEIVER_UNDO, receiver_undo) \
@@ -45,11 +55,14 @@ enum class Preserve_trx_temp_stage {
 /** Cumulative worker/caller service time, including failed attempts. This is
 neither queue wait nor end-to-end READY latency. Reads count processed logical
 page/row bytes, including buffer hits, not physical disk traffic. Writes count
-completed file writes, including receiver installation and retry-image copies. */
+completed file writes in instrumented stages, including receiver installation. */
 class Preserve_trx_temp_stage_timer {
  public:
+  // final_only records a substage only inside this thread's SOURCE_FINAL scope.
+  // VALIDATE is nested inside SEAL; substage byte counts are not populated.
   explicit Preserve_trx_temp_stage_timer(Preserve_trx_temp_stage stage,
-                                        const bool *success = nullptr);
+                                        const bool *success = nullptr,
+                                        bool final_only = false);
   ~Preserve_trx_temp_stage_timer();
   Preserve_trx_temp_stage_timer(const Preserve_trx_temp_stage_timer &) = delete;
   Preserve_trx_temp_stage_timer &operator=(const Preserve_trx_temp_stage_timer &) = delete;
@@ -83,61 +96,10 @@ including retries and failures. Metadata I/O and fsync are not byte counts. */
 void preserve_trx_temp_final_read(uint64_t bytes);
 void preserve_trx_temp_final_write(uint64_t bytes);
 extern SHOW_VAR preserve_trx_temp_stage_status[];
-/** Resource candidate wall time from first enqueue to completed preparation,
-including intervening queue waits. Count once before strict READY publication,
-even if later publication fails. This is not epoch READY latency. */
+/** Resource candidate wall time from first enqueue to successful preparation,
+including intervening queue waits. Count once per candidate; asynchronous TEMP
+completion may follow strict READY publication. This is not epoch READY latency. */
 void preserve_trx_temp_prepared_job_note(uint64_t elapsed_us);
 
-// Input counts snapshot the authenticated final BEGIN, including retained
-// objects. Bytes are whole unsealed objects, never remaining native IO.
-// Plan counts snapshot the first STAGED preparation attempt, once per work.
-#define PRESERVE_TRX_TEMP_FINAL_FIELDS(X) \
-  X(TOKENS, tokens) \
-  X(INPUT_OBJECTS, input_objects) \
-  X(PENDING_OBJECTS, pending_input_objects) \
-  X(PENDING_BYTES, pending_input_bytes) \
-  X(STAGED_TOKENS, observed_staged_tokens) \
-  X(PENDING_TEMP, pending_temp_plans) \
-  X(PENDING_RESULT, pending_result_plans) \
-  X(READY_TEMP, ready_temp_plans) \
-  X(BATCHES, batches) \
-  X(PROCESSED_BYTES, processed_bytes) \
-  X(FAILED_BATCHES, failed_batches) \
-  X(COMPLETED_CANDIDATES, completed_candidates) \
-  X(RETRIES, retries) \
-  X(WAIT_BATCHES, wait_batches)
-enum class Preserve_trx_temp_final_field {
-#define PRESERVE_FINAL_ENUM(field, name) field,
-  PRESERVE_TRX_TEMP_FINAL_FIELDS(PRESERVE_FINAL_ENUM)
-#undef PRESERVE_FINAL_ENUM
-  COUNT
-};
-using Preserve_trx_temp_final_counts = std::array<uint64_t,
-    static_cast<size_t>(Preserve_trx_temp_final_field::COUNT)>;
-enum class Preserve_trx_temp_final_outcome { READY, PARTIAL, CANCELLED };
-struct Preserve_trx_temp_final_sample {
-  uint64_t started_us{0}, ended_us{0};
-  // Exclusive intervals: prepare only, bind only, both, neither.
-  std::array<uint64_t, 4> wall_us{};
-  Preserve_trx_temp_final_counts counts{};
-  Preserve_trx_temp_final_outcome outcome{Preserve_trx_temp_final_outcome::CANCELLED};
-};
-/** Embedded in the existing receiver epoch state; caller holds its mutex.
-No independent registry, thread, file IO or per-token diagnostic allocation. */
-class Preserve_trx_temp_final_timing {
- public:
-  void begin(uint64_t now, const Preserve_trx_temp_final_counts &counts);
-  void activity(uint64_t now, int prepare_delta, int bind_delta);
-  void note(Preserve_trx_temp_final_field field, uint64_t value = 1);
-  Preserve_trx_temp_final_sample finish(uint64_t now,
-                                      Preserve_trx_temp_final_outcome outcome);
- private:
-  void settle(uint64_t now);
-  Preserve_trx_temp_final_sample m_sample;
-  uint64_t m_last_us{0};
-  uint32_t m_prepare{0}, m_bind{0};
-};
-void preserve_trx_temp_final_log(const std::string &epoch,
-                                const Preserve_trx_temp_final_sample &sample);
-void preserve_trx_temp_final_observation_dropped();
+
 #endif

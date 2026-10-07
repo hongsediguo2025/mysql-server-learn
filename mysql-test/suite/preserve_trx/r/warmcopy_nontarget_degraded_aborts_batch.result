@@ -41,5 +41,4 @@ id	v	filler_len
 2	21	256
 DROP TABLE t_warmcopy_nontarget_degraded;
 SET GLOBAL rds_preserve_trx_enable=ON;
-SET GLOBAL rds_preserve_trx_transfer_runtime_profile=BUSINESS_FIRST;
 SET DEBUG_SYNC = 'RESET';

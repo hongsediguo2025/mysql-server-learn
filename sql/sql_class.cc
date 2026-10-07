@@ -80,7 +80,6 @@
 #include "sql/protocol.h"
 #include "sql/protocol_classic.h"
 #include "sql/preserve_trx.h"
-#include "sql/preserve_trx_cursor.h"
 #include "sql/preserve_trx_temp_table.h"
 #include "sql/psi_memory_key.h"
 #include "sql/query_result.h"
@@ -889,8 +888,6 @@ void THD::cleanup_connection(void) {
   user_vars.clear();
   sp_cache_clear(&sp_proc_cache);
   sp_cache_clear(&sp_func_cache);
-  preserve_trx_result_owner.reset();
-  preserve_trx_pending_cursor_count.store(0, std::memory_order_release);
 
   clear_error();
   // clear the warnings

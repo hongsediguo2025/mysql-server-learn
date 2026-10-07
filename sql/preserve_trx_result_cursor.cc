@@ -42,12 +42,7 @@ Status Preserve_trx_result_cursor::create(
       state.fetch_count > state.descriptor.rows ||
       state.fetch_count > std::numeric_limits<ulong>::max() ||
       state.fetch_limit > std::numeric_limits<ulong>::max()) return Status::CORRUPT;
-  const auto &d = decoder->descriptor();
-  const auto &s = state.descriptor;
-  if (d.statement_id != s.statement_id || d.generation != s.generation ||
-      d.rows != s.rows || d.rows_offset != s.rows_offset ||
-      d.index_offset != s.index_offset || d.size != s.size ||
-      d.digest != s.digest || d.schema_digest != s.schema_digest)
+  if (!decoder->descriptor().matches(state.descriptor))
     return Status::CORRUPT;
   try {
     const uint64_t arena_bytes = 8192 + decoder->items().size() * 16;
@@ -60,7 +55,6 @@ Status Preserve_trx_result_cursor::create(
     decoder->bind(thd);
     std::unique_ptr<Preserve_trx_result_cursor> c(new Preserve_trx_result_cursor(
         thd, std::move(state), std::move(decoder), std::move(memory)));
-    auto return_candidate = create_scope_guard([&] { decoder = std::move(c->m_decoder); });
     c->mem_root.set_max_capacity(arena_bytes);
     Query_arena backup;
     thd->swap_query_arena(c->m_arena, &backup);
@@ -72,7 +66,8 @@ Status Preserve_trx_result_cursor::create(
     if (!c->result) return Status::OUT_OF_MEMORY;
     thd->swap_query_arena(backup, &c->m_arena);
     restore.commit();
-    return_candidate.commit();
+    if (!preserve_trx_cursor_observe_generation(c->m_state.descriptor.generation))
+      return Status::CORRUPT;
     *output = std::move(c);
     ++restored_cursors;
     return Status::OK;

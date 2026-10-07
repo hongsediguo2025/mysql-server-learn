@@ -7,7 +7,6 @@
 #include "sql/preserve_trx_bundle.h"
 #include "sql/preserve_trx_result_restore.h"
 #include "sql/preserve_trx_temp_receiver.h"
-#include "sql/preserve_trx_temp_metrics.h"
 
 /** One staged-token job owns the semantic bundle and codec quota, whether or
 not it contains cursor results. Dependency waits retain the same owner; no worker THD or
@@ -23,11 +22,16 @@ class Preserve_trx_receiver_prepare_work {
   /** Retained buffers, not transient codec copies. True means invalid input. */
   static bool retained_bytes(const Preserved_trx_bundle &bundle,
                              uint64_t *bytes);
-  bool step(THD *worker);
+  bool step(THD *worker, bool prepare_for_publication = false);
   bool complete() const { return (!m_has_results || m_ready) && (!m_has_temp || (m_temp && m_temp->ready())); }
+  bool publication_prepared() const {
+    return (!m_has_results || m_ready) &&
+           (!m_has_temp || (m_temp && m_temp->promotion_safe()));
+  }
   bool has_results() const { return m_has_results; }
   bool needs_result_selection() const { return !m_results_selected; }
   bool has_temp() const { return m_has_temp; }
+  bool needs_temp_selection() const { return m_has_temp && !m_temp; }
   enum class Temp_start { READY, WAIT, ERROR };
   bool begin_results(const Preserve_trx_transfer_receiver_record &record);
   Temp_start begin_temp(const std::string &root,
@@ -38,10 +42,6 @@ class Preserve_trx_receiver_prepare_work {
   std::unique_ptr<Preserve_trx_result_restore::Ready> *ready() { return &m_ready; }
   Preserve_memory_lease *memory() { return &m_memory; }
   uint64_t batches() const { return m_batches; }
-  uint64_t scanned_bytes() const { return m_scanned_bytes; }
-  /** Once per final work, after its first TEMP claim attempt, before step().
-  Counts pending plans, not bytes or transport generations. */
-  Preserve_trx_temp_final_counts observe_final_debt();
 
  private:
   Preserve_memory_lease m_memory;
@@ -54,7 +54,6 @@ class Preserve_trx_receiver_prepare_work {
   bool m_has_results{false};
   bool m_results_selected{false};
   bool m_has_temp{false};
-  bool m_final_debt_observed{false};
 };
 
 #ifndef NDEBUG

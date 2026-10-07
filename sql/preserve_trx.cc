@@ -913,8 +913,6 @@ struct Preserve_trx_drain_attempt {
   uint64_t quarantine_started_monotonic_us{0};
   std::atomic<bool> handoff_resolution_ready{false};
   Preserve_trx_handoff_resolution_state handoff_resolution;
-  // Published/read/retired under g_active_drain_attempt_mutex. It contains no
-  // THD or source-session pointer and may outlive the active drain route.
 };
 
 struct Preserve_trx_phase2_final_record_context {
@@ -1659,7 +1657,7 @@ class Preserve_trx_external_thd_pin {
   static std::unique_ptr<Preserve_trx_external_thd_pin> acquire_locked(
       THD *thd) {
     std::unique_ptr<Preserve_trx_external_thd_pin> pin(
-        new Preserve_trx_external_thd_pin(thd));
+        new Preserve_trx_external_thd_pin(nullptr));
     {
       std::lock_guard<std::mutex> lock(g_preserved_trx_thd_pin_mutex);
       if (thd == nullptr || thd->release_resources_done() ||
@@ -1667,6 +1665,7 @@ class Preserve_trx_external_thd_pin {
         return nullptr;
       }
       ++g_preserved_trx_thd_pin_counts[thd];
+      pin->m_thd = thd;
     }
     DEBUG_SYNC(current_thd, "preserve_trx_external_thd_pin_acquired");
     return pin;
@@ -2175,14 +2174,6 @@ static void preserved_trx_add_resume_detach_failure_observable_record(
   g_preserved_trx_records.push_back(std::move(record));
 }
 
-#ifndef NDEBUG
-}  // namespace
-
-
-
-namespace {
-#endif
-
 static void preserved_trx_add_observable_error_record(
     const Preserve_snapshot_metadata &metadata,
     Preserved_trx_lifecycle_state state, const std::string &error) {
@@ -2469,7 +2460,6 @@ static bool preserve_trx_resurrection_metadata_is_strict(
       metadata.has_temp_engine_state && !metadata.temp_table_manifest_payload.empty() &&
       preserve_trx_temp_table_enable && preserve_trx_temp_id_namespace;
   return (persistent_only || mixed) && metadata.has_persistent_engine_state &&
-         (metadata.cursor_manifest_payload.empty() || preserve_trx_result_capture_enable) &&
          metadata.predicate_locks_payload.empty() &&
          preserve_snapshot_gtid_state_is_strict_transfer_safe(metadata);
 }
@@ -5649,7 +5639,7 @@ bool preserve_trx_phase2_existing_closing_gate_active_impl() {
 static bool preserve_trx_tracks_no_response_packet(
     enum enum_server_command command) {
   return (command == COM_STMT_CLOSE || command == COM_STMT_SEND_LONG_DATA) &&
-         preserve_trx_is_enabled() && preserve_trx_result_capture_enable &&
+         preserve_trx_is_enabled() &&
          preserve_trx_transfer_artifact_mode ==
              PRESERVE_TRX_TRANSFER_ARTIFACT_STANDBY_TRANSFER_SAVE;
 }
@@ -6261,8 +6251,7 @@ class Preserve_batch_phase1_transfer_target_scanner final : public Do_THD_Impl {
         (m_declared && m_declared->count(candidate->thread_id()))) return;
 
     mysql_mutex_lock(&candidate->LOCK_thd_data);
-    const bool ignored = candidate == m_owner ||
-                         candidate->release_resources_done() ||
+    const bool ignored = candidate->release_resources_done() ||
                          candidate->killed == THD::KILL_CONNECTION ||
                          candidate->is_system_thread();
     if (!ignored) {
@@ -11949,6 +11938,7 @@ void preserved_trx_classify_protocol_command(
 
 bool preserved_trx_end_command_read(THD *thd) {
   if (thd == nullptr) return false;
+  preserve_trx_cursor_end_read(thd);
   if (!preserve_trx_is_enabled()) {
     thd->m_server_idle = false;
     return true;
@@ -12889,7 +12879,8 @@ Preserve_snapshot_status preserved_trx_dry_validate_loaded_bundle(
 
   if (temp_ready != nullptr) {
     const auto *input = temp_ready->input();
-    if (!temp_ready->ready() || input == nullptr || input->token() != token ||
+    if ((!temp_ready->ready() && !temp_ready->promotion_safe()) ||
+        input == nullptr || input->token() != token ||
         input->manifest_payload() != metadata.temp_table_manifest_payload) {
       if (reason != nullptr) *reason = "temporary receiver ownership mismatch";
       return Preserve_snapshot_status::CORRUPT;
@@ -17515,7 +17506,11 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   if (reset_requested())
     return reject_after_binlog_export("batch_target_preserve_reset");
 
-  if (retained_standby_resources && preserve_trx_resource_session_has_no_engine(thd)) {
+  if (preserve_trx_cursor_capture_final(thd))
+    return reject_after_binlog_export("cursor_result_capture_failed");
+
+  if ((retained_standby_resources || preserve_trx_resource_session_has_explicit_begin(thd)) &&
+      preserve_trx_resource_session_has_no_engine(thd)) {
     if (has_logged_binlog_cache)
       return reject_after_binlog_export("resource_session_logged_cache");
     set_stage(Preserve_trx_preserve_stage::VALIDATION);
@@ -18648,9 +18643,10 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   }
 
   substep_started_us = preserve_trx_monotonic_us();
+  std::shared_ptr<const Preserve_trx_temp_source_images> source_temp_images;
   const Preserve_snapshot_status temp_manifest_status =
       preserve_trx_temp_table_build_preserve_manifest(
-          thd, trx, preserve_trx_default_dir(), token, &metadata);
+          thd, trx, preserve_trx_default_dir(), token, &metadata, &source_temp_images);
   add_result_elapsed_us(&Preserve_trx_preserve_result::
                             snapshot_write_temp_manifest_us,
                         substep_started_us);
@@ -18797,6 +18793,7 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   blob_descriptors = bundle.blob_descriptors;
 
   bundle.source_cursor_results = source_cursor_results;
+  bundle.source_temp_images = std::move(source_temp_images);
   if (result != nullptr) result->source_cursor_results = source_cursor_results;
 
   Preserve_trx_resurrection_index_entry transfer_resurrection_entry;
@@ -19955,9 +19952,15 @@ bool Preserve_trx_drain_service::execute(
     Preserve_batch_phase1_transfer_target_scanner scanner(
         thd, &batch_transfer_phase1_declared_tokens);
     Global_THD_manager::get_instance()->do_for_all_thd_copy(&scanner);
-    return declare_transfer_targets(
-        scanner.target_thread_ids(),
-        "standby_transfer_phase1_declare_failed");
+    auto targets = scanner.target_thread_ids();
+    const auto results = batch_transfer_source_session->result_source();
+    if (results)
+      for (const auto &owner : results->stream_owners())
+        if (!batch_transfer_phase1_declared_tokens.count(owner.first))
+          targets.push_back(static_cast<my_thread_id>(owner.first));
+    std::sort(targets.begin(), targets.end());
+    targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
+    return declare_transfer_targets(targets, "standby_transfer_phase1_declare_failed");
   };
   auto phase1_declared_target_ids = [&]() {
     std::vector<uint64_t> target_ids;
@@ -20328,12 +20331,12 @@ bool Preserve_trx_drain_service::execute(
     }
   }
 
-  auto wait_for_phase1_pipeline_baselines = [&](uint64_t deadline_us) {
+  auto wait_for_phase1_pipeline_baselines = [&](uint64_t deadline_us, bool results_only = false) {
     if (phase1_pipeline == nullptr || deadline_us == 0) return false;
     bool binlog_flushed = phase1_binlog_owner == nullptr ||
                           phase1_binlog_owner->baselines_complete();
     auto *temp_owner = temp_table_participant ? temp_table_participant->async_owner() : nullptr;
-    bool finishing_ordinary = false;
+    bool finishing_ordinary = results_only;
     bool ordinary_deadline_reached = false;
     bool ordinary_temp_sampled = false;
     const auto ordinary_baselines_complete = [&] {
@@ -20418,7 +20421,7 @@ bool Preserve_trx_drain_service::execute(
 #endif
     for (;;) {
       if (thd->killed || reset_requested()) return false;
-      if (!finishing_ordinary && preserve_trx_monotonic_us() >= deadline_us) {
+      if (!ordinary_deadline_reached && preserve_trx_monotonic_us() >= deadline_us) {
         finishing_ordinary = true;
         ordinary_deadline_reached = true;
         if (temp_owner) temp_owner->finish_submissions();
@@ -20429,15 +20432,14 @@ bool Preserve_trx_drain_service::execute(
       }
       bool progressed = false;
       if (!consume_phase1_batches(&progressed)) return false;
-      // Refill returned worker credits before deciding whether another
-      // native cohort scan is needed.
-      if (temp_owner && !temp_owner->submit()) return false;
+      // Give the native cohort a capture opportunity before refilling result work.
 
       // Initial TEMP completion includes its first checkpoint attempt. New DML
       // must not move that goalpost forever. Drain existing jobs before final.
       if (!finishing_ordinary && ordinary_temp_sampled &&
           ordinary_baselines_complete()) {
         finishing_ordinary = true;
+        if (temp_owner) temp_owner->seal_result_discovery();
         if (phase1_record_owner)
           phase1_record_owner->finish_ordinary_submissions();
         if (phase1_binlog_owner)
@@ -20445,24 +20447,20 @@ bool Preserve_trx_drain_service::execute(
       }
       if (!finishing_ordinary && temp_owner) {
         const auto pump = [&] {
-          if (thd->killed || reset_requested()) return false;
-          bool completed = false;
-          if (!consume_phase1_batches(&completed)) return false;
-          // A scan with no returned credits needs no second cohort walk.
-          // The outer loop still admits newly completed source captures.
-          if (!completed) return true;
-          progressed = true;
-          if (!temp_owner->submit()) return false;
-          return submit_phase1_record_binlog(&progressed);
+          // Only the outer loop consumes TEMP completions. Every owner gets
+          // one cohort capture attempt before its freed slot is resubmitted.
+          return !thd->killed && !reset_requested();
         };
         if (declare_phase1_transfer_targets() ||
             !temp_table_participant->prepare_late_phase1_idle_targets(pump))
           return false;
         ordinary_temp_sampled = true;
       }
-      if (temp_owner && !temp_owner->submit()) return false;
+      if (temp_owner && (!finishing_ordinary || results_only) &&
+          !temp_owner->submit()) return false;
       if (!finishing_ordinary && ordinary_baselines_complete()) {
         finishing_ordinary = true;
+        if (temp_owner) temp_owner->seal_result_discovery();
         if (phase1_record_owner != nullptr)
           phase1_record_owner->finish_ordinary_submissions();
         if (phase1_binlog_owner != nullptr)
@@ -20526,7 +20524,7 @@ bool Preserve_trx_drain_service::execute(
           phase1_binlog_owner == nullptr ||
           phase1_binlog_owner->baselines_complete();
       if (finishing_ordinary && record_complete && binlog_complete &&
-          (!temp_owner || temp_owner->complete())) {
+          (!temp_owner || temp_owner->complete(!results_only && !ordinary_deadline_reached))) {
         if (warmcopy_participant != nullptr &&
             !warmcopy_participant->provider()->finish_bounded_preparations(
                 phase1_pipeline_config.attempt_id)) {
@@ -20797,6 +20795,16 @@ bool Preserve_trx_drain_service::execute(
         abort_drain_participants("owner_killed_during_purge_stop");
         thd->send_kill_message();
         return true;
+      }
+    }
+    if (phase1_pipeline && temp_table_participant &&
+        temp_table_participant->async_owner()) {
+      temp_table_participant->async_owner()->last_result_round();
+      if (declare_phase1_transfer_targets()) return preserve_trx_reject_unsupported();
+      if (!wait_for_phase1_pipeline_baselines(phase1_readiness_deadline_us, true)) {
+        abort_batch_transfer_epoch("phase1_cursor_round_failed");
+        abort_drain_participants("phase1_cursor_round_failed");
+        return preserve_trx_reject_unsupported();
       }
     }
     if (dependency_phase2_scheduler_enabled &&
@@ -21724,6 +21732,7 @@ bool Preserve_trx_drain_service::execute(
       !counter.token_target_thread_ids().empty();
   const bool timeout_exclusion_enabled =
       standby_transfer_streaming_enabled;
+  uint early_preserve_worker_count = 0;
   if (early_pipeline_enabled) {
     const ulonglong token_selection_started_us = preserve_trx_monotonic_us();
     if (select_batch_tokens(counter.token_target_thread_ids())) {
@@ -21893,15 +21902,14 @@ bool Preserve_trx_drain_service::execute(
                 return true;
               };
               if (stop_for_reset()) break;
-              const ulonglong target_work_started_us =
-                  preserve_trx_monotonic_us();
-              uint64_t external_stage_us = 0;
               const auto target_it =
                   pinned_by_thread_id.find(execution.target_thread_id);
               THD *target = target_it == pinned_by_thread_id.end()
                                 ? nullptr
                                 : target_it->second;
-              if (target != nullptr && !preserve_trx_has_retained_standby_resources(target)) {
+              if (target != nullptr && !preserve_trx_has_retained_standby_resources(target) &&
+                  (!preserve_trx_resource_session_has_explicit_begin(target) ||
+                   trx_preserve_current_thd_has_read_context(target))) {
                 bool has_persistent_engine_state = false;
                 bool has_temp_engine_state = false;
                 trx_t *target_trx = trx_preserve_current_thd_trx(target);
@@ -22047,8 +22055,6 @@ bool Preserve_trx_drain_service::execute(
               if (!execution.error && execution.visited_target &&
                   execution.result.stage ==
                       Preserve_trx_preserve_stage::COMPLETE) {
-                const ulonglong external_stage_started_us =
-                    preserve_trx_monotonic_us();
                 execution.initial_lock_fence_valid = !execution.result.resource_only &&
                     trx_preserve_sample_lock_warmcopy_fence(
                         execution.result.preserved_trx,
@@ -22065,29 +22071,22 @@ bool Preserve_trx_drain_service::execute(
                   execution.result.failure_reason =
                       "early_transfer_candidate_bind_failed";
                 }
-                external_stage_us =
-                    elapsed_since(external_stage_started_us);
-              }
-              const uint64_t target_work_us =
-                  elapsed_since(target_work_started_us);
-              if (target_work_us >= 100000) {
-                LogErr(
-                    INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
-                    ("PRESERVE: early target slow path target=" +
-                     std::to_string(static_cast<unsigned long long>(
-                         execution.target_thread_id)) +
-                     " wall_us=" + std::to_string(target_work_us) +
-                     " external_stage_us=" +
-                     std::to_string(external_stage_us) +
-                     " lock_preflight_us=" +
-                     std::to_string(execution.result.lock_preflight_us) +
-                     " prepare_us=" +
-                     std::to_string(execution.result.prepare_us) +
-                     " snapshot_write_us=" +
-                     std::to_string(execution.result.snapshot_write_us) +
-                     " register_us=" +
-                     std::to_string(execution.result.record_register_us))
-                        .c_str());
+                // Each worker still owns its candidate here. Compare and send
+                // TEMP files before publication; the coordinator's existing
+                // staging skips these sealed objects. FINAL/binlog ordering
+                // remains in the coordinator after the worker handoff.
+                if (execution.early_candidate_ready &&
+                    preserve_trx_temp_transfer_stream(
+                        batch_transfer_source_session.get(),
+                        execution.deferred_candidate.transfer_token,
+                        preserve_trx_default_dir(),
+                        &execution.deferred_candidate.bundle) !=
+                        Preserve_trx_transfer_status::OK) {
+                  execution.early_candidate_ready = false;
+                  execution.error = true;
+                  execution.result.failure_reason =
+                      "early_temp_transfer_failed";
+                }
               }
               {
                 std::lock_guard<std::mutex> guard(queue_mutex);
@@ -22540,6 +22539,7 @@ bool Preserve_trx_drain_service::execute(
         worker_exception_failed.load(std::memory_order_relaxed);
     cancel_workers_before_join = prejoin_failure;
     join_workers.rollback();
+    early_preserve_worker_count = static_cast<uint>(workers.size());
     phase2_metrics.target_worker_wall_us += elapsed_since(worker_started_us);
     if (early_transport_cancelled &&
         batch_transfer_phase1_sender != nullptr) {
@@ -22607,19 +22607,10 @@ bool Preserve_trx_drain_service::execute(
       if (resource_target_ids.count(target_thread_id)) continue;
       early_lock_target_ids.push_back(static_cast<uint64_t>(target_thread_id));
     }
-    const ulonglong lock_completion_started_us = preserve_trx_monotonic_us();
     const bool lock_completion_failed =
         lock_warmcopy_participant != nullptr &&
         !lock_warmcopy_participant->complete_early_prepared_targets(
             early_lock_target_ids);
-    if (lock_warmcopy_participant != nullptr) {
-      LogErr(
-          INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
-          ("PRESERVE: lock warmcopy final survivor prune retained_targets=" +
-           std::to_string(early_lock_target_ids.size()) + " elapsed_us=" +
-           std::to_string(elapsed_since(lock_completion_started_us)))
-              .c_str());
-    }
     const bool all_early_objects_staged = std::all_of(
         target_results.begin(), target_results.end(),
         [](const Preserve_batch_target_execution &execution) {
@@ -23452,11 +23443,6 @@ bool Preserve_trx_drain_service::execute(
   }
 
   if (early_pipeline_enabled) {
-    const ulonglong final_candidate_pass_started_us =
-        preserve_trx_monotonic_us();
-    uint64_t final_candidate_finalize_us = 0;
-    uint64_t final_candidate_finalize_max_us = 0;
-    my_thread_id final_candidate_finalize_max_target = 0;
     bool dirty_injected = false;
     for (Preserve_batch_target_execution &execution : target_results) {
       const ulonglong stamp_started_us = preserve_trx_monotonic_us();
@@ -23465,7 +23451,6 @@ bool Preserve_trx_drain_service::execute(
           execution.result.preserved_trx == nullptr &&
           preserve_trx_resource_candidate_valid(execution.deferred_candidate);
       const bool stamp_valid = !execution.error && (resource_valid || (execution.initial_lock_fence_valid &&
-                               !execution.error &&
                                trx_preserve_sample_lock_warmcopy_fence(
                                    execution.result.preserved_trx,
                                    &current_fence)));
@@ -23525,7 +23510,6 @@ bool Preserve_trx_drain_service::execute(
     /* Replacements must precede sequence reservations for queued metadata. */
     for (Preserve_batch_target_execution &execution : target_results) {
       if (execution.error) continue;
-      const ulonglong finalize_started_us = preserve_trx_monotonic_us();
       const bool inject_finalize_failure =
           debug_fail_early_candidate_finalize;
       debug_fail_early_candidate_finalize = false;
@@ -23535,12 +23519,6 @@ bool Preserve_trx_drain_service::execute(
               : preserve_trx_transfer_finalize_deferred_candidate(
                     batch_transfer_source_session.get(),
                     &execution.deferred_candidate);
-      const uint64_t finalize_us = elapsed_since(finalize_started_us);
-      final_candidate_finalize_us += finalize_us;
-      if (finalize_us > final_candidate_finalize_max_us) {
-        final_candidate_finalize_max_us = finalize_us;
-        final_candidate_finalize_max_target = execution.target_thread_id;
-      }
       if (finalize_status != Preserve_trx_transfer_status::OK) {
         execution.error = true;
         execution.failure_reason = Preserve_batch_target_execution::
@@ -23548,19 +23526,6 @@ bool Preserve_trx_drain_service::execute(
         execution.result.failure_reason = "early_candidate_finalize_failed";
       }
     }
-    LogErr(
-        INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
-        ("PRESERVE: early final candidate pass target_count=" +
-         std::to_string(target_results.size()) +
-         " wall_us=" +
-         std::to_string(elapsed_since(final_candidate_pass_started_us)) +
-         " finalize_us=" + std::to_string(final_candidate_finalize_us) +
-         " finalize_max_us=" +
-         std::to_string(final_candidate_finalize_max_us) +
-         " finalize_max_target=" +
-         std::to_string(static_cast<unsigned long long>(
-             final_candidate_finalize_max_target)))
-            .c_str());
     const size_t token_local_failure_count = static_cast<size_t>(std::count_if(
         target_results.begin(), target_results.end(),
         [](const Preserve_batch_target_execution &execution) {
@@ -23723,10 +23688,13 @@ bool Preserve_trx_drain_service::execute(
         result.phase2_savepoint_live_export_target_count;
   };
   uint preserve_worker_count =
-      preserve_trx_effective_parallel_preserve_threads(
-          quiesced_target_thread_ids.size(), lock_warmcopy_batch);
+      early_pipeline_enabled
+          ? early_preserve_worker_count
+          : preserve_trx_effective_parallel_preserve_threads(
+                quiesced_target_thread_ids.size(), lock_warmcopy_batch);
   DEBUG_SYNC(thd, "preserve_trx_batch_before_target_preserve_pins");
-  if (debug_fail_after_one_target || debug_fail_after_detach_for_batch_reattach)
+  if (!early_pipeline_enabled &&
+      (debug_fail_after_one_target || debug_fail_after_detach_for_batch_reattach))
     preserve_worker_count = 1;
 
   if (!early_pipeline_enabled && preserve_worker_count <= 1) {
@@ -24702,6 +24670,13 @@ prepare_resume_on_current_thd_shared(
                 "invalid strict promotion resume inputs");
   }
 
+  if (strict && options.strict_attach_lease->wait_temp_ready(
+                    thd, options.deadline_monotonic_us) !=
+                    Preserve_trx_prepared_status::OK) {
+    return fail(Preserved_trx_resume_prepare_stage::TEMP_TABLE,
+                "temporary receiver completion failed, cancelled or timed out");
+  }
+
   bool debug_isolation_failure = false;
   if (!strict) {
     DBUG_EXECUTE_IF("preserve_trx_fail_resume_set_isolation",
@@ -24950,6 +24925,22 @@ static bool preserved_trx_debug_adopt_loopback_source(
       (temp_only ? temp_manifest.undo_images.empty()
                  : !temp_manifest.undo_images.empty()))
     return true;
+  const auto same_temp_manifest = [&](const std::string &payload) {
+    if (payload == preview->metadata.temp_table_manifest_payload) return true;
+    Preserved_temp_table_manifest source = temp_manifest, received;
+    if (!preserve_trx_decode_temp_table_manifest(payload, &received)) return false;
+    // Final streaming may compact only the portable DATA representation. The
+    // bridge must still compare every logical descriptor, owner and undo fact.
+    for (auto *manifest : {&source, &received})
+      for (auto &table : manifest->tables) {
+        table.image.base = {};
+        table.image.delta = {};
+      }
+    std::string source_payload, received_payload;
+    return preserve_trx_encode_temp_table_manifest(source, &source_payload) &&
+           preserve_trx_encode_temp_table_manifest(received, &received_payload) &&
+           source_payload == received_payload;
+  };
 
   auto &registry = preserved_trx_strict_prepared_token_registry();
   Preserve_trx_prepared_token_snapshot ready;
@@ -24957,7 +24948,7 @@ static bool preserved_trx_debug_adopt_loopback_source(
                                                token, &ready) !=
           Preserve_trx_prepared_status::OK ||
       ready.key.epoch_id != epoch_id ||
-      !ready.temp_resources_ready || !ready.semantic_bundle_owned)
+      !ready.temp_resources_promotion_safe || !ready.semantic_bundle_owned)
     return true;
   Preserved_trx_record reserved = *preview;
   reserved.resumable = false;
@@ -25008,7 +24999,7 @@ static bool preserved_trx_debug_adopt_loopback_source(
         !(bundle->metadata.recovery == reserved.metadata.recovery) ||
         bundle->metadata.owner_user != reserved.metadata.owner_user ||
         bundle->metadata.owner_host != reserved.metadata.owner_host ||
-        bundle->metadata.temp_table_manifest_payload != reserved.metadata.temp_table_manifest_payload ||
+        !same_temp_manifest(bundle->metadata.temp_table_manifest_payload) ||
         bundle->metadata.cursor_manifest_payload != reserved.metadata.cursor_manifest_payload ||
         bundle->metadata.read_view_payload != reserved.metadata.read_view_payload ||
         lease.restore_semantic_bundle(&bundle) != Preserve_trx_prepared_status::OK)
@@ -25057,7 +25048,7 @@ static bool preserved_trx_debug_adopt_loopback_source(
   const auto &metadata = bundle->metadata;
   if (metadata.token != token || metadata.owner_user != reserved.metadata.owner_user ||
       metadata.owner_host != reserved.metadata.owner_host ||
-      metadata.temp_table_manifest_payload != reserved.metadata.temp_table_manifest_payload ||
+      !same_temp_manifest(metadata.temp_table_manifest_payload) ||
       metadata.cursor_manifest_payload != reserved.metadata.cursor_manifest_payload)
     return true;
   // Keep the source record's exact lock/MDL/trx owner; consume receiver metadata.
@@ -25858,7 +25849,6 @@ preserved_trx_resume_adopted_for_promotion_on_current_thd(
   bool &binlog_attached = resume_runtime.strict_binlog_attached;
   bool &mdl_cloned = resume_runtime.mdl_transferred;
   bool &gtid_restored = resume_runtime.gtid_restored;
-  bool &temp_materialized = resume_runtime.temp_tables_materialized;
   bool &trx_attached = resume_runtime.trx_attached;
 
   auto taint_current_attempt = [&](const std::string &reason) {
@@ -25904,7 +25894,6 @@ preserved_trx_resume_adopted_for_promotion_on_current_thd(
       }
       trx_attached = false;
     }
-    temp_materialized = false;
     rollback_restored_logged_cache_gtid_next(target, &gtid_restored);
     if (mdl_cloned) target->mdl_context.release_transactional_locks();
     mdl_cloned = false;

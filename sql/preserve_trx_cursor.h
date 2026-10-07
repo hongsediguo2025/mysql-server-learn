@@ -5,8 +5,10 @@
 #define SQL_PRESERVE_TRX_CURSOR_INCLUDED
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 #include "my_inttypes.h"
 #include "mysql/status_var.h"
@@ -19,11 +21,27 @@ class Server_side_cursor;
 struct TABLE;
 struct evp_md_ctx_st;
 class Preserve_trx_sealed_file;
+class Preserve_trx_cursor_stream;
+using Preserve_trx_cursor_byte_sink = bool (*)(void *, const void *, size_t);
+bool preserve_trx_cursor_row_payload_size(TABLE *, unsigned char *, size_t, uint64_t *);
+bool preserve_trx_cursor_encode_row(TABLE *, uint64_t, unsigned char *, size_t,
+                                    Preserve_trx_cursor_byte_sink, void *);
 
-extern bool preserve_trx_result_capture_enable;
 extern ulonglong preserve_trx_result_capture_max_bytes;
 extern uint preserve_trx_result_capture_max_count;
 bool preserve_trx_cursor_capture_enabled(const THD *thd);
+bool preserve_trx_cursor_observe_generation(uint64_t generation);
+enum class Preserve_trx_cursor_capture_status { COMPLETE, MORE, DEFERRED, FAILED };
+class Preserve_trx_cursor_result;
+struct Preserve_trx_cursor_capture_input {
+  TABLE *table;
+  const mem_root_deque<Item *> *items;
+  uint64_t fetched;
+  uint32_t statement_id, result_charset;
+  bool *rnd_inited, *position_valid;
+  std::shared_ptr<Preserve_trx_cursor_result> *artifact;
+  std::shared_ptr<Preserve_trx_cursor_stream> *stream;
+};
 
 /** Immutable description of one complete result file. Offsets are absolute.
 Rows have an eight-byte payload length followed by nullable, length-coded cells.
@@ -39,9 +57,16 @@ struct Preserve_trx_cursor_descriptor {
   uint64_t size{0};
   std::array<unsigned char, 32> digest{};
   std::array<unsigned char, 32> schema_digest{};
+
+  bool matches(const Preserve_trx_cursor_descriptor &other) const {
+    return statement_id == other.statement_id && generation == other.generation &&
+           size == other.size && digest == other.digest && rows == other.rows &&
+           rows_offset == other.rows_offset && index_offset == other.index_offset &&
+           schema_digest == other.schema_digest;
+  }
 };
 
-/** Creation-time result artifact, owned by the native materialized cursor.
+/** Migration-time result artifact, owned by the native materialized cursor.
 Small results remain in bounded memory; larger results spill to an anonymous
 process-local file. This does not enable startup recovery
 or make a cursor eligible for transfer. Values contain no TABLE/BLOB pointers.
@@ -54,16 +79,21 @@ class Preserve_trx_cursor_result
  public:
   static std::shared_ptr<Preserve_trx_cursor_result> create(
       THD *thd, TABLE *table, uint32_t statement_id,
-      const mem_root_deque<Item *> &metadata);
+      const mem_root_deque<Item *> &metadata, uint32_t result_charset,
+      bool memory_only = false);
   ~Preserve_trx_cursor_result();
   Preserve_trx_cursor_result(const Preserve_trx_cursor_result &) = delete;
   Preserve_trx_cursor_result &operator=(const Preserve_trx_cursor_result &) = delete;
 
-  /** Scan before the native cursor opens. True only for engine/THD errors.
-  Optional artifact failure releases the owner and leaves native open/FETCH
-  in charge; it never retries the SELECT. */
-  static bool capture(THD *thd, TABLE *table,
-                      std::shared_ptr<Preserve_trx_cursor_result> *owner);
+  /** Caller exclusively owns the native cursor. Every exit restores its scan. */
+  Preserve_trx_cursor_capture_status capture_step(
+      THD *thd, TABLE *table, uint64_t fetched, uint64_t row_limit,
+      uint64_t byte_limit, bool *rnd_inited);
+  /** No native pointers are used by sealing; call after returning the owner. */
+  Preserve_trx_cursor_capture_status seal_step(uint64_t byte_limit);
+  bool scan_complete() const { return m_scan_complete; }
+  bool sealed() const { return m_sealed.load(std::memory_order_acquire); }
+  bool failed() const { return m_failed; }
 #ifndef NDEBUG
   bool read_at(uint64_t offset, unsigned char *bytes, size_t length) const;
 #endif
@@ -78,11 +108,14 @@ class Preserve_trx_cursor_result
   uint64_t rows() const { return m_rows; }
 
 #ifndef NDEBUG
+  bool verify_position(uint64_t row);
   bool verify_current_row(TABLE *table);
   uint64_t verified_offset() const { return m_verify_offset; }
 #endif
 
  private:
+  friend class Preserve_trx_cursor_stream;
+  bool m_memory_only{false};
   explicit Preserve_trx_cursor_result(Preserve_memory_lease lease);
   bool append(const void *bytes, size_t length);
   bool reserve_data(uint64_t length);
@@ -98,12 +131,11 @@ class Preserve_trx_cursor_result
   bool flush_index();
   bool number(uint64_t value, unsigned width);
   bool string(const char *value, size_t length);
-  bool metadata(THD *thd, TABLE *table,
-                const mem_root_deque<Item *> &items);
+  bool metadata(TABLE *table, const mem_root_deque<Item *> &items,
+                uint32_t result_charset);
   bool row(TABLE *table, bool verify);
-  bool row_length(TABLE *table, uint64_t *length);
   bool index_row();
-  bool finish_index();
+  bool finish_index(uint64_t byte_limit, bool *complete);
   bool cell_bytes(const void *bytes, size_t length, bool verify);
 
   Preserve_memory_lease m_memory;
@@ -126,7 +158,11 @@ class Preserve_trx_cursor_result
   size_t m_pending{0};
   size_t m_hashed_pending{0};
   size_t m_index_pending{0};
-  bool m_sealed{false};
+  std::atomic<bool> m_sealed{false};
+  bool m_failed{false};
+  bool m_scan_complete{false}, m_index_started{false};
+  uint64_t m_index_copied{0};
+  std::vector<unsigned char> m_bookmarks;
   std::array<unsigned char, 32> m_digest{};
   std::array<unsigned char, 32> m_schema_digest{};
   std::array<unsigned char, 65536> m_buffer;

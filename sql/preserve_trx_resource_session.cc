@@ -12,6 +12,15 @@
 #include "sql/sql_class.h"
 #include "storage/innobase/include/trx0preserve.h"
 
+bool preserve_trx_resource_session_has_explicit_begin(THD *thd) {
+  return preserve_trx_enable && preserve_trx_temp_table_enable &&
+      preserve_trx_temp_id_namespace && thd && thd->is_classic_protocol() &&
+      preserve_trx_transfer_artifact_decision() ==
+          Preserve_trx_transfer_artifact_decision::STANDBY_TRANSFER_SAVE &&
+      thd->in_active_multi_stmt_transaction() &&
+      (thd->variables.option_bits & OPTION_BEGIN);
+}
+
 bool preserve_trx_resource_session_has_no_engine(THD *thd) {
   if (!preserve_trx_enable || !preserve_trx_temp_id_namespace ||
       !preserve_trx_temp_table_enable || !thd || current_thd != thd ||
@@ -37,8 +46,9 @@ Preserve_snapshot_status preserve_trx_resource_session_capture(
   m.recovery.sql_transaction_active = thd->in_active_multi_stmt_transaction();
   m.recovery.explicit_begin = (thd->variables.option_bits & OPTION_BEGIN) != 0;
   m.recovery.owner_trx_id = m.recovery.freeze_lsn = 0;
+  std::shared_ptr<const Preserve_trx_temp_source_images> images;
   auto status = preserve_trx_temp_table_build_preserve_manifest(
-      thd, nullptr, dir, m.token, &m);
+      thd, nullptr, dir, m.token, &m, &images);
   if (status != Preserve_snapshot_status::OK) return status;
   std::shared_ptr<const Preserve_trx_result_image> wire;
   if (preserve_trx_cursor_capture_enabled(thd) &&
@@ -61,7 +71,10 @@ Preserve_snapshot_status preserve_trx_resource_session_capture(
   input.options.max_external_blob_bytes = preserve_trx_max_binlog_cache_bytes;
   input.emit_no_cache_binlog_mode_metadata = true;
   status = build_preserved_trx_bundle(input, bundle);
-  if (status == Preserve_snapshot_status::OK) bundle->source_cursor_results = std::move(wire);
+  if (status == Preserve_snapshot_status::OK) {
+    bundle->source_cursor_results = std::move(wire);
+    bundle->source_temp_images = std::move(images);
+  }
   return status;
 }
 

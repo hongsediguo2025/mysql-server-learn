@@ -24,5 +24,4 @@ payload_len
 60000
 DROP TABLE t_warmcopy_tail;
 SET GLOBAL rds_preserve_trx_enable=ON;
-SET GLOBAL rds_preserve_trx_transfer_runtime_profile=BUSINESS_FIRST;
 SET DEBUG_SYNC = 'RESET';

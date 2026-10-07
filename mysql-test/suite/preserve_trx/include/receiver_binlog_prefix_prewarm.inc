@@ -285,6 +285,8 @@ if ($prefix_seal_failure)
 {
   --let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_worker_active')=0 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_queued_bytes')=0
   --source include/wait_condition.inc
+  --let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')=0 AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_bytes')=0
+  --source include/wait_condition.inc
   SELECT VARIABLE_VALUE=0 AS corrupt_protocol_object_not_ready
    FROM performance_schema.global_status
    WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens';
@@ -294,7 +296,7 @@ if ($prefix_seal_failure)
   SELECT VARIABLE_VALUE=0 AS source_commit_unknown_not_entered
    FROM performance_schema.global_status
    WHERE VARIABLE_NAME='Preserve_trx_transfer_source_commit_unknown_epochs';
-  # Protocol SEAL corruption is confirmed NOT_COMMITTED_CLEAN, so source resumes.
+  # Rejected before COMMIT, or confirmed NOT_COMMITTED_CLEAN: source resumes.
   --connection prefix_app
   SELECT v=23 AND OCTET_LENGTH(payload)=1048593 AND LEFT(payload,1)='c'
    AS source_uncommitted_state_restored FROM t_binlog_prefix;

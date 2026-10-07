@@ -34,7 +34,6 @@ struct Preserve_trx_temp_capture_input {
   // Freeze with undo at the idle boundary; later commands queue the next round.
   std::unique_ptr<trx_preserve_temp_capture_round> frozen_round;
   uint64_t checkpoint_image_bytes{0};
-  Preserve_memory_lease undo_memory;
   std::shared_ptr<trx_preserve_temp_undo_capture::Batch> undo_batch;
   std::unique_ptr<trx_preserve_temp_undo_capture> retired_undo_owner;
   std::string undo_payload;
@@ -53,6 +52,7 @@ struct Preserve_trx_temp_manifest_capture {
 
 struct Preserve_trx_temp_prebuild_identity {
   uint64_t owner_cookie{0}, trx_cookie{0}, trx_version{0};
+  uint64_t transaction_generation{0};
   bool resource_only{false};
 };
 
@@ -62,7 +62,7 @@ TABLE or transaction. Serialize step/install/destruction and join the executor
 before discarding the job. */
 class Preserve_trx_temp_prebuild_job {
  public:
-  enum class Progress { MORE, DONE, STALE, FAILED };
+  enum class Progress { MORE, DONE, STALE, FAILED, TRANSFER_FAILED };
   Preserve_trx_temp_prebuild_job(
       const Preserve_trx_temp_prebuild_identity &identity,
       std::shared_ptr<Temp_table_warmcopy_participant> participant,
@@ -76,13 +76,13 @@ class Preserve_trx_temp_prebuild_job {
   Progress step(size_t byte_budget,
                 Preserve_trx_transfer_source_epoch_session *session,
                 uint64_t transfer_token);
-  enum class Install { INSTALLED, STALE, BUSY, FAILED };
+  enum class Install { INSTALLED, DATA_RETAINED, STALE, BUSY, FAILED };
   /** A busy owner keeps its completed candidate until another safe boundary;
   ordinary stage deadline still cancels optional work. */
   Install install(THD *target);
   bool initial_baseline_complete() const;
+  const std::string &receiver_candidate_id() const;
   const std::string &reason() const;
-  static void discard(std::vector<Preserve_trx_temp_capture_input> *captures);
 
  private:
   struct Impl;
@@ -112,12 +112,15 @@ class Preserve_trx_temp_prebuild_owner final
   std::map<uint64_t, uint64_t> deferred_capture_targets() const;
   bool submit();
   bool consume(const Preserve_trx_phase1_prepared_result &);
+  void seal_result_discovery();
+  void last_result_round();
   void finish_submissions();
-  bool complete() const;
+  bool complete(bool inflight_only = false) const;
   bool initial_baselines_complete(bool (*eligible_locked)(THD *));
   void discard_after_join(bool discard_results = false);
   Preserve_trx_phase1_pipeline_result_status step(
       const Preserve_trx_phase1_work_descriptor &, size_t byte_budget,
+      const Preserve_trx_phase1_record_adapter_control &,
       std::string *reason) override;
 
  private:

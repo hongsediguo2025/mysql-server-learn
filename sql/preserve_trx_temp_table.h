@@ -211,6 +211,12 @@ class Temp_table_warmcopy_participant {
   uint64_t data_generation() const {
     return m_data_generation.load(std::memory_order_acquire);
   }
+  uint64_t transaction_generation() const {
+    std::lock_guard<std::recursive_mutex> guard(m_state_mutex);
+    return m_transaction_generation;
+  }
+  /** Called by the command owner after successful COMMIT, while non-idle. */
+  bool commit_transaction_keep_data(THD *);
   /* True when any DDL-like or row-changing temp-table tail history exists. */
   bool has_row_history() const;
   /* True when supported phase-1 temp DML markers exist. */
@@ -353,6 +359,7 @@ class Temp_table_warmcopy_participant {
   std::vector<Temp_table_journal_record> m_journal;
   bool m_tracked_dml{false};
   uint64_t m_last_undo_mutation_sequence{0};
+  uint64_t m_transaction_generation{1};
   std::vector<std::unique_ptr<Prebuilt_sidecar>> m_prebuilt_sidecars;
   std::unique_ptr<trx_preserve_temp_undo_capture> m_undo_capture;
   std::atomic<uint64_t> m_mutation_generation{0};
@@ -383,6 +390,7 @@ Temp_table_warmcopy_participant *preserve_trx_temp_table_ensure_participant(
 void preserve_trx_temp_table_clear_participant(THD *thd);
 bool preserve_trx_temp_table_transaction_state_needs_clear(const THD *thd);
 void preserve_trx_temp_table_clear_transaction_state(THD *thd);
+void preserve_trx_temp_table_note_transaction_commit(THD *thd);
 
 bool preserve_trx_temp_table_note_table_create(THD *thd,
                                                uint32_t table_ordinal,
@@ -462,7 +470,8 @@ bool preserve_trx_temp_table_build_baseline_image(
 
 Preserve_snapshot_status preserve_trx_temp_table_build_preserve_manifest(
     THD *thd, trx_t *trx, const std::string &dir, const std::string &token,
-    Preserve_snapshot_metadata *metadata);
+    Preserve_snapshot_metadata *metadata,
+    std::shared_ptr<const Preserve_trx_temp_source_images> *source_images = nullptr);
 
 #ifndef NDEBUG
 /** Build source-only import resources from a codec-validated manifest. The

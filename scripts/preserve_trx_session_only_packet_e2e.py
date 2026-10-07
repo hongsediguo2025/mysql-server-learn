@@ -206,18 +206,23 @@ def cursor_close_case(source, receiver, ha, full, partial):
                  "SIGNAL cursor_closing WAIT_FOR cursor_targets_continue TIMEOUT 60'")
     source.query(f"SET DEBUG_SYNC='preserve_trx_cursor_eligibility_read_{partial.id} "
                  "SIGNAL cursor_read WAIT_FOR cursor_read_continue TIMEOUT 60 EXECUTE 1'")
-    source.begin("DRAIN TRANSACTIONS PRESERVE")
-
     def sync(action):
         ha.query("SET DEBUG_SYNC='now " + action + "'")
 
-    sync("WAIT_FOR cursor_closing TIMEOUT 30")
+    # CLOSE must enter BODY before DRAIN closes admission. Eligibility must
+    # wait for the complete command before reading its final cursor state.
     partial.send(b"\x19" + statement_id.to_bytes(4, "little"))
     sync("WAIT_FOR cursor_close_entered TIMEOUT 30")
+    assert ha.query("SELECT COUNT(*) FROM performance_schema.prepared_statements_instances "
+                    f"WHERE STATEMENT_ID={statement_id} AND OWNER_THREAD_ID IN "
+                    "(SELECT THREAD_ID FROM performance_schema.threads "
+                    f"WHERE PROCESSLIST_ID={partial.id})") == [["1"]]
+    source.begin("DRAIN TRANSACTIONS PRESERVE")
+    sync("WAIT_FOR cursor_closing TIMEOUT 30")
     sync("SIGNAL cursor_targets_continue")
-    sync("WAIT_FOR cursor_read TIMEOUT 30")
     sync("SIGNAL cursor_close_continue")
     sync("WAIT_FOR cursor_close_done TIMEOUT 30")
+    sync("WAIT_FOR cursor_read TIMEOUT 30")
     sync("SIGNAL cursor_read_continue")
     result = source.result()
     assert len(result) == 1 and result[0][1] == "NO_PRESERVABLE_TOKENS", result
@@ -232,6 +237,18 @@ def cursor_close_case(source, receiver, ha, full, partial):
         expect_error(4023, lambda: receiver.query(sql))
         expect_error(4020, lambda: client.query("COMMIT"))
         expect_error(4020, lambda: client.query("ROLLBACK"))
+    # An erroneous CLOSE response must not be hidden by the same error code
+    # expected for later commands. Exactly one final PING reply remains.
+    partial.send(b"\x0e")
+    partial.sock.shutdown(socket.SHUT_WR)
+    _, response = partial.packet()
+    assert response[:3] == b"\xff\xb4\x0f", response
+    try:
+        extra = partial.packet()
+    except EOFError:
+        pass
+    else:
+        raise AssertionError(("CLOSE emitted an extra response", extra))
     print("stmt_close_handoff_and_one_shot_resume_ok")
     print("hard_cutoff_and_committed_rows_unchanged")
 

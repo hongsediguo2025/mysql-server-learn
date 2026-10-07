@@ -4,14 +4,20 @@
 #include "sql/preserve_trx_transfer.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <limits>
 #include <new>
 #include "my_dbug.h"
+#include "mysql/components/services/log_builtins.h"
+#include "mysqld_error.h"
 #include "sql/preserve_trx_file.h"
 #include "sql/preserve_trx_receiver_candidates.h"
+#include "sql/preserve_trx_transfer_index.h"
 
 using Status = Preserve_trx_transfer_status;
 namespace {
+constexpr uint64_t kStagingReservationOverhead = 256;
+
 bool retained_resource(const Preserve_trx_transfer_object_descriptor &object) {
   return object.kind == Preserve_trx_transfer_object_kind::TEMP_TABLE_SIDECAR ||
          object.kind == Preserve_trx_transfer_object_kind::CURSOR_RESULT;
@@ -23,7 +29,7 @@ Status Preserve_trx_transfer_receiver_registry::prepare_staging_ticket_locked(
     uint64_t *id) {
   *id = 0;
   if (!retained_resource(object)) return Status::OK;
-  constexpr uint64_t overhead = 256;  // receiver_object_reserved_bytes contract.
+  constexpr uint64_t overhead = kStagingReservationOverhead;
   if (m_next_staging_retirement == UINT64_MAX ||
       object.total_size > UINT64_MAX - overhead)
     return Status::UNSUPPORTED;
@@ -221,7 +227,8 @@ void Preserve_trx_transfer_receiver_registry::subtract_cleanup_debt_bytes_locked
 Preserve_trx_transfer_status
 Preserve_trx_transfer_receiver_registry::check_reservation_locked(
     const std::string &epoch, uint64_t old_bytes, uint64_t new_bytes,
-    uint64_t limit) {
+    uint64_t limit, uint64_t token,
+    const Preserve_trx_transfer_object_descriptor *object) {
   const auto found = m_live_reserved_by_epoch.find(epoch);
   const uint64_t live = found == m_live_reserved_by_epoch.end() ? 0 : found->second;
   if (live < old_bytes) return Preserve_trx_transfer_status::CORRUPT;
@@ -232,8 +239,25 @@ Preserve_trx_transfer_receiver_registry::check_reservation_locked(
   other += m_cleanup_debt_bytes;
   if (new_bytes > std::numeric_limits<uint64_t>::max() - other)
     return Preserve_trx_transfer_status::UNSUPPORTED;
-  if (other + new_bytes > limit)
+  if (other + new_bytes > limit) {
+    // Report the exact ledger under its lock, only on the rejecting path.
+    char diagnostic[1024];
+    std::snprintf(diagnostic, sizeof(diagnostic),
+           "PRESERVE: receiver reservation rejected epoch=%s token=%llu "
+           "object=%s kind=%u size=%llu old_record_bytes=%llu "
+           "new_charge_bytes=%llu epoch_live_bytes=%llu cleanup_debt_bytes=%llu "
+           "limit_bytes=%llu",
+           epoch.c_str(), static_cast<ulonglong>(token),
+           object ? object->object_id.c_str() : "BEGIN",
+           object ? static_cast<unsigned>(object->kind) : 0,
+           static_cast<ulonglong>(object ? object->total_size : 0),
+           static_cast<ulonglong>(old_bytes), static_cast<ulonglong>(new_bytes),
+           static_cast<ulonglong>(live),
+           static_cast<ulonglong>(m_cleanup_debt_bytes),
+           static_cast<ulonglong>(limit));
+    LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG, diagnostic);
     return Preserve_trx_transfer_status::RESOURCE_EXHAUSTED;
+  }
   // Prepare the ledger node before mutating a record. A failed later allocation
   // leaves only an empty epoch node; its reservation is unchanged.
   try {
@@ -478,4 +502,46 @@ void Preserve_trx_transfer_receiver_registry::discard_records_for_process_shutdo
   }
   // Last references may call my_close(), which needs live mysys mutexes.
   // Release outside the registry lock, before static registry destruction.
+}
+
+Preserve_trx_transfer_status
+Preserve_trx_transfer_receiver_registry::grow_open_result(
+    const std::string &epoch_id, uint64_t token, const std::string &object_id,
+    uint64_t offset, uint64_t length, uint64_t *size) {
+  using Status = Preserve_trx_transfer_status;
+  using State = Preserve_trx_transfer_receiver_state;
+  std::lock_guard<std::mutex> guard(m_mutex);
+  auto at = m_records.find(Token_key(epoch_id, token));
+  if (at == m_records.end() || !size || !length) return Status::CORRUPT;
+  auto &record = at->second;
+  if ((record.state != State::DECLARED && record.state != State::RECEIVING) ||
+      record.staged_manifest_frozen || record.staging_resources_retired ||
+      !record.object_index) return Status::UNSUPPORTED;
+  const auto *object = record.object_index->find(record.objects, object_id);
+  if (!object || !preserve_trx_transfer_open_result(*object) ||
+      record.sealed_objects.count(object_id) || offset > object->total_size ||
+      length > UINT64_MAX - offset) return Status::CORRUPT;
+  const uint64_t next = std::max(object->total_size, offset + length);
+  const uint64_t delta = next - object->total_size;
+  const auto id = record.staging_tickets.find(object_id);
+  if (id == record.staging_tickets.end()) return Status::CORRUPT;
+  auto ticket = m_retired_staging.find(id->second);
+  if (ticket == m_retired_staging.end() || ticket->second.retired ||
+      ticket->second.bytes != object->total_size + kStagingReservationOverhead)
+    return Status::CORRUPT;
+  if (delta > UINT64_MAX - record.reserved_bytes ||
+      delta > UINT64_MAX - record.resource_reserved_bytes ||
+      delta > UINT64_MAX - ticket->second.bytes) return Status::UNSUPPORTED;
+  uint64_t limit = preserve_trx_transfer_max_inflight_bytes;
+  const auto epoch = m_online_epochs.find(epoch_id);
+  if (epoch != m_online_epochs.end()) limit = epoch->second.max_inflight_bytes;
+  const auto status = check_reservation_locked(epoch_id, record.reserved_bytes,
+      record.reserved_bytes + delta, limit, token, object);
+  if (status != Status::OK) return status;
+  record.objects[object - record.objects.data()].total_size = next;
+  record.resource_reserved_bytes += delta;
+  ticket->second.bytes += delta;
+  set_reservation_locked(record, record.reserved_bytes + delta);
+  *size = next;
+  return Status::OK;
 }

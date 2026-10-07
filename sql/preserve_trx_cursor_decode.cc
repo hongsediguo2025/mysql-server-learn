@@ -19,12 +19,15 @@
 
 namespace {
 using preserve_trx_cursor_detail::number;
+#ifndef NDEBUG
 std::atomic<uint64_t> decoded_rows{0};
 std::atomic<uint64_t> preflight_rows{0};
+#endif
 using Status = Preserve_trx_file_status;
 
 struct Column {
-  Send_field sent{};
+  const char *col_name{nullptr};
+  enum_field_types sent_type{};
   uint32_t type{0}, real_type{0}, length{0}, packed{0}, decimals{0}, flags{0};
   uint32_t charset{0}, protocol_charset{0}, nullable{0};
   uint32_t geometry{0};
@@ -78,11 +81,10 @@ void *allocate(MEM_ROOT *root, size_t bytes) {
 }
 
 bool parse_column(Bytes *b, Column *c, MEM_ROOT *root) {
-  for (const char **name : {&c->sent.db_name, &c->sent.table_name,
-                            &c->sent.org_table_name, &c->sent.col_name,
-                            &c->sent.org_col_name}) {
-    if (!b->string(root, name)) return false;
-  }
+  // FETCH does not resend metadata. Retain only the name used by make_field().
+  if (!b->string(nullptr, nullptr) || !b->string(nullptr, nullptr) ||
+      !b->string(nullptr, nullptr) || !b->string(root, &c->col_name) ||
+      !b->string(nullptr, nullptr)) return false;
   uint64_t sent_length;
   uint32_t sent_charset, sent_flags, sent_decimals, sent_type, sent_field;
   if (!b->integer(8, &sent_length) || !b->integer(4, &sent_charset) ||
@@ -94,12 +96,7 @@ bool parse_column(Bytes *b, Column *c, MEM_ROOT *root) {
       !b->integer(4, &c->decimals) || !b->integer(4, &c->flags) ||
       !b->integer(4, &c->charset) || !b->integer(4, &c->protocol_charset) ||
       !b->integer(1, &c->nullable) || c->nullable > 1) return false;
-  c->sent.length = sent_length;
-  c->sent.charsetnr = sent_charset;
-  c->sent.flags = sent_flags;
-  c->sent.decimals = sent_decimals;
-  c->sent.type = static_cast<enum_field_types>(sent_type);
-  c->sent.field = sent_field;
+  c->sent_type = static_cast<enum_field_types>(sent_type);
   if (c->real_type == MYSQL_TYPE_ENUM || c->real_type == MYSQL_TYPE_SET) {
     uint32_t count;
     if (!b->integer(4, &count) || count == 0 || count > 65535 ||
@@ -139,7 +136,7 @@ bool parse_column(Bytes *b, Column *c, MEM_ROOT *root) {
 }
 
 bool shape_valid(const Column &c) {
-  if (c.sent.type != c.type || c.packed > 65537 ||
+  if (c.sent_type != c.type || c.packed > 65537 ||
       get_charset(c.charset, MYF(0)) == nullptr ||
       get_charset(c.protocol_charset, MYF(0)) == nullptr) return false;
   switch (c.real_type) {
@@ -329,7 +326,7 @@ Status Preserve_trx_cursor_decoder::create(
     for (uint32_t i = 0; i < count; ++i) {
       Column &c = *new (&p->columns[i]) Column;
       if (!parse_column(&input, &c, &p->root)) return Status::CORRUPT;
-      p->types[i] = c.sent.type;
+      p->types[i] = c.sent_type;
       auto *record = static_cast<unsigned char *>(allocate(&p->root, c.packed + 16));
       auto storage_type = static_cast<enum_field_types>(c.real_type);
       if (storage_type == MYSQL_TYPE_BLOB) {
@@ -339,7 +336,7 @@ Status Preserve_trx_cursor_decoder::create(
       c.field = make_field(&p->root, &p->share, record + 1, c.length, record, 0,
           storage_type, get_charset(c.charset, MYF(0)),
           static_cast<Field::geometry_type>(c.geometry), Field::NONE, c.interval,
-          c.sent.col_name, c.nullable, c.flags & ZEROFILL_FLAG, c.flags & UNSIGNED_FLAG,
+          c.col_name, c.nullable, c.flags & ZEROFILL_FLAG, c.flags & UNSIGNED_FLAG,
           c.decimals, true, 0, c.srid, false);
       if (!c.field) return Status::OUT_OF_MEMORY;
       if (c.real_type == MYSQL_TYPE_BLOB) c.field->field_length = c.length;
@@ -449,7 +446,9 @@ Status Preserve_trx_cursor_decoder::read_row(bool publish_items) {
     if (!publish_items) {
       p.offset += length + 8;
       ++p.row;
+#ifndef NDEBUG
       ++preflight_rows;
+#endif
       return Status::OK;
     }
     at = 0;
@@ -470,7 +469,9 @@ Status Preserve_trx_cursor_decoder::read_row(bool publish_items) {
     }
     p.offset += length + 8;
     ++p.row;
+#ifndef NDEBUG
     ++decoded_rows;
+#endif
     return Status::OK;
   } catch (const std::bad_alloc &) {
     return p.status = Status::OUT_OF_MEMORY;
@@ -525,6 +526,7 @@ const Preserve_trx_cursor_descriptor &Preserve_trx_cursor_decoder::descriptor() 
 }
 
 
+#ifndef NDEBUG
 int show_preserve_trx_cursor_decoded_rows(THD *, SHOW_VAR *var, char *buffer) {
   var->type = SHOW_LONGLONG;
   var->value = buffer;
@@ -538,3 +540,4 @@ int show_preserve_trx_cursor_preflight_rows(THD *, SHOW_VAR *var, char *buffer) 
   *reinterpret_cast<long long *>(buffer) = preflight_rows.load();
   return 0;
 }
+#endif

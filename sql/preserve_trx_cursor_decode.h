@@ -45,7 +45,7 @@ class Preserve_trx_cursor_decoder {
 bool preserve_trx_cursor_decode_for_test(
     THD *thd, const Preserve_trx_cursor_result &artifact, uint64_t row,
     std::unique_ptr<Preserve_trx_cursor_decoder> *decoder);
-#endif
 int show_preserve_trx_cursor_decoded_rows(THD *, SHOW_VAR *, char *);
 int show_preserve_trx_cursor_preflight_rows(THD *, SHOW_VAR *, char *);
+#endif
 #endif

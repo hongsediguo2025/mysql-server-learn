@@ -1,1 +1,1 @@
-receiver rejected corrupt LOB before READY: retire
+receiver rejected corrupt LOB before SQL RESUME: retire

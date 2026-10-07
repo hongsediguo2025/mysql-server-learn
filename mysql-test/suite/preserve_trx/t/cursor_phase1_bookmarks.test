@@ -1,0 +1,4 @@
+--source include/have_debug.inc
+--source include/not_windows.inc
+--let $cursor_port= query_get_value(SHOW VARIABLES LIKE 'port', Value, 1)
+--exec python3 $MYSQL_TEST_DIR/../scripts/preserve_trx_cursor_phase1_e2e.py --port=$cursor_port --bookmarks

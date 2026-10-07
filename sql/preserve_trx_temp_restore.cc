@@ -234,7 +234,6 @@ dberr_t Preserve_trx_temp_sql_ready::step(
       if (!name || !*name) return s.error = DB_CORRUPTION;
       definition.key = name;
       definition.dd = std::move(decoded.table);
-      definition.manifest_index = ordinal;
       ++s.prepared;
       if (++s.table == source->size()) { ++s.space; s.table = 0; }
     }
@@ -332,7 +331,7 @@ bool Preserve_trx_temp_restore::stage(
     for (size_t i = 0; i < entries.size(); ++i) {
       auto &slot = s.slots[i];
       auto &definition = sql->m_impl->definitions[i];
-      if (!definition.dd || !definition.native || definition.manifest_index != i ||
+      if (!definition.dd || !definition.native ||
           trx_preserve_temp_register_handler(target, definition.key, definition.native) != DB_SUCCESS)
         return true;
       slot.registered = true;

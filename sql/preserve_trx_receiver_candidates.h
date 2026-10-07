@@ -17,18 +17,24 @@ struct Preserve_trx_transfer_object_descriptor;
 
 /** Token-owned optional preparation before the authenticated final selection.
 The existing OBJECT worker steps each generation exclusively. Final preparation
-claims only a matching validated decoder, or yields while its worker continues.
-Neither path waits with a mutex held. Cancellation forbids later publication. */
+claims a matching validated decoder, or yields while its worker continues.
+A different final TEMP input may borrow an unpublished prepared owner through
+the existing generation checks. Neither path waits with a mutex held.
+Cancellation forbids later publication. */
 class Preserve_trx_receiver_candidates {
  public:
   static std::shared_ptr<Preserve_trx_receiver_candidates> create(
       const std::string &token);
   ~Preserve_trx_receiver_candidates();
+  std::shared_ptr<const void> register_result(const std::string &id);
+  void retain_selected_results(const Preserve_trx_transfer_receiver_record &,
+                               std::vector<std::shared_ptr<const void>> *retired);
   bool step_result(const std::string &id,
                    std::shared_ptr<const Preserve_trx_sealed_file> file,
                    THD *worker, uint64_t row_budget, uint64_t byte_budget,
                    bool *complete, uint64_t *scanned_bytes);
   enum class Take { ABSENT, WAIT, READY, FAILED };
+  Take prepared(const std::string &id) const;
   void register_temp(const std::string &,
       std::shared_ptr<const Preserve_trx_sealed_file>);
   bool step_temp(const std::string &root, const std::string &id,
@@ -36,7 +42,8 @@ class Preserve_trx_receiver_candidates {
       bool *complete, uint64_t *scanned);
   Take take_temp(const Preserve_snapshot_metadata &,
       const Preserve_trx_transfer_receiver_record &,
-      Preserve_trx_temp_receiver_work::Owner *);
+      Preserve_trx_temp_receiver_work::Owner *,
+      Preserve_trx_temp_receiver_work::Owner *previous);
   /** Called at SEAL; replaces only the optional undo generation. No file IO. */
   void register_undo(const std::string &id,
       std::shared_ptr<const Preserve_trx_sealed_file> file,

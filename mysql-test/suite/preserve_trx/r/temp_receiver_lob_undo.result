@@ -1,1 +1,1 @@
-receiver rejected corrupt LOB before READY: undo
+receiver rejected corrupt LOB before SQL RESUME: undo

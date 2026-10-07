@@ -102,8 +102,8 @@ receiver READY 前完成结果文件校验、解码器、sender 和最终位置�
 当前源码已存在以下链路：
 
 1. [Prepared_statement](../../../sql/sql_prepare.h) 中有 `Server_side_cursor *cursor`。已知两个存活对象时，`ps->cursor == cursor` 判断当前关联；确认结果仍打开还须检查 `cursor != nullptr && cursor->is_open()`。读取发生在 owner 线程或既有保护下的稳定命令边界，不能拿裸指针与并发 CLOSE/RESET 竞争。
-2. [Prepared_statement::execute()](../../../sql/sql_prepare.cc) 在启用结果捕获的 Classic PS 路径中，把自身 `id` 随 `mysql_open_cursor(..., &cursor, id)` 传给结果物化过程。[sql_cursor.cc](../../../sql/sql_cursor.cc) 再将该 ID 交给 `Preserve_trx_cursor_result::create()`。
-3. [Preserve_trx_cursor_result](../../../sql/preserve_trx_cursor.cc) 在结果创建时保存 `m_statement_id` 和 `m_generation`，并通过结果描述符输出。源关联身份已经在结果产生时记录，不需要迁移时扫描 SQL 或读取结果行来辨认。
+2. [Prepared_statement::execute()](../../../sql/sql_prepare.cc) 在启用结果捕获的 Classic PS 路径中，把自身 `id` 随 `mysql_open_cursor(..., &cursor, id)` 传给结果物化过程。[sql_cursor.cc](../../../sql/sql_cursor.cc) 只记录该 ID 和原输出字符集；DRAIN Phase1 首次实际捕获时才经 `preserve_trx_cursor_capture.*` 调用 `Preserve_trx_cursor_result::create()`。
+3. [Preserve_trx_cursor_result](../../../sql/preserve_trx_cursor.cc) 在首次实际捕获时保存 `m_statement_id` 并分配 `m_generation`，并通过结果描述符输出。源 statement ID 已在原生结果产生时记录，迁移 generation 在首次捕获时确定，不需要迁移时扫描 SQL 或读取结果行来辨认。
 
 `cursor != nullptr && cursor->is_open()` 只证明原生游标仍打开，不代表结果已可迁移。当前 `Materialized_cursor::preserve_snapshot()` 还检查消费位置有效、保留结果存在及其描述符已封存；这些检查与最终结果完整性校验继续保留，失败不能被解释为该 PS 原本没有 cursor。
 
@@ -135,6 +135,8 @@ generation 仅标识结果代次，不证明 PS 生命周期，也不能代替�
 
 原 `preserve_trx_ps_*` 文件以及 `preserve_trx_sp_bindings`、`preserve_trx_sp_expression`、`preserve_trx_metadata_watch` 已删除。后者只服务原 PS 迁移依赖链，相应 SQL/SP/Item/parser 原生路径钩子和构建项一并删除。PS 描述符 wire kind 5、准备进度请求以及专用批次发送/查询接口不再接受或保留；独立 cursor 文件仍使用 kind 6 和 `ps_result_<id>_<generation>` 文件名，这个名字表示结果归属，不是 PS 本体工件。
 
+2026-10-07 复核补清理：此前 `sql_yacc.yy` 仍在九处 SP 表达式／内部游标解析中，以 `preserve_trx_cursor_capture_enabled()` 额外保留无元数据依赖的原始文本。其消费者是已删除的 SP 指令重建链；当前结果恢复不读取这些文本。本轮删除该条件及多余头文件，恢复原生 `is_metadata_used()` 判断。保留原生元数据失效后的重解析，以及 Classic PS cursor 捕获、回放后关联接口；不迁移存储程序调用栈。验证记录见任务跟踪 E96。
+
 通用 SHA256 已移到 [resource](../../../sql/preserve_trx_resource.cc) 的 `preserve_trx_digest()`，继续服务 TEMP 等独立消费者。Classic 测试客户端抽到 [preserve_trx_classic_client.py](../../../scripts/preserve_trx_classic_client.py)。旧 PS 专属测试删除，TEMP/cursor/CLOSE 测试改为显式回放和关联；不保留失效开关或返回恒定值的兼容接口。
 
 普通 PS 不产生资源工件，也不依赖结果捕获开关；其会话仍可按既有规则完成 session-only 身份转移和 SQL RESUME。空结果 owner 仅证明本次成功恢复确认无 cursor，不为各条普通 PS 分配记录。
@@ -162,11 +164,13 @@ preserve_trx_attach_cursor_after_ps_replay(
 
 ### 4.1 调用前提与身份校验
 
-调用位于成功 SQL RESUME 之后、该条 PS 回放完成之后、客户端业务放行之前，由目标 THD 的执行线程独占调用。目标 PS 已完成构造并进入该 THD 的 PS map。回放保持原 statement ID，不能依靠目标端新分配顺序推断源 ID。
+调用位于成功 SQL RESUME 之后、该条 PS 回放完成之后、客户端业务放行之前。2026-10-07 用户明确：proxy 通过新主上的独立控制连接指定业务 session，控制 session 在回放成功后立即调用接口。此时 `current_thd` 是控制 THD，参数 `target_thd` 是业务 THD，二者不同；接口不切换 TLS，也不要求控制请求转到业务连接执行。目标 PS 已完成构造并进入业务 THD 的 PS map。回放保持原 statement ID，不能依靠目标端新分配顺序推断源 ID。
+
+调用方沿用已有 session 接管机制，在整个调用期间保证目标 THD、PS 和协议对象存活且由本次恢复流程独占；不得并发执行业务、改动 PS map、替换协议或清理连接。`current_thd == target_thd` 不是互斥保证，接口不新增跨 session 调度或锁体系。既有同 session 内部调用仍可使用该接口。
 
 token、最终清单摘要、文件和值的一致性在 receiver 准备与 RESUME stage/commit 时已经认证；首次 attach 不重新读文件或计算摘要。接口当场按以下顺序核对：
 
-1. 目标 THD 是当前执行线程且未被 killed，存在结果 owner 且其 token 非空；不在该调用中重新证明外部回放记录的 token 或 SQL。
+1. 控制调用上下文有效且未被 killed；目标 THD 未被 killed，存在结果 owner 且其 token 非空。控制 THD 可以不同于目标 THD；不在该调用中重新证明外部回放记录的 token 或 SQL。
 2. `target_ps` 属于该 THD，且是 PS map 中对应 ID 的真实存活对象；源 ID 与已恢复的原 ID 一致。
 3. 用源 ID 查找**已认证最终清单**。有结果时，仅使用该条目选定的 generation、文件摘要和消费位置，不挑选其他历史候选。
 4. 最终清单无该 ID 时直接返回 NO_CURSOR，不检查目标 cursor 冲突；有条目时，首次挂接要求目标无冲突活 cursor/imported cursor，结果仍由待关联 owner 持有。重复挂接按 §4.2 单独检查。
@@ -212,7 +216,9 @@ RESUME 的准备阶段仍由 journal 管理结果集合；既有 activation 不�
 
 EOF 关闭 decoder/file，不保证立即销毁 PS 持有的 imported cursor/sender 小对象；它们可延续到 RESET、EXECUTE、CLOSE 或析构，额度跟随真实最后使用者。
 
-接口在同一 THD 的独占命令边界执行。外部不得把业务命令、PS CLOSE/RESET 或另一轮关联并发放进该 session。不新增线程池、后台自动关联、FETCH 时自动补挂，或新的升主阶段。
+接口在控制 session 上执行，对受既有接管机制独占保护的业务 THD 完成关联。owner、PS、cursor、decoder 和后续 FETCH 的协议缓冲均属于目标业务 session；返回状态及分配失败诊断属于控制请求。接口不发送业务结果，不改变 `current_thd`／`THR_MALLOC`。外部不得把业务命令、PS CLOSE/RESET 或另一轮关联并发放进目标 session，不得并发释放目标对象。不新增线程池、后台自动关联、FETCH 时自动补挂，或新的升主阶段。
+
+正式关联已拒绝目标上仍开放的旧 cursor，因此不再对已关闭的原生 cursor 重复执行 `close()`；避免其临时表清理误用控制线程的阶段统计上下文。保留内部 Debug 安装路径对开放旧 cursor 的正常关闭。
 
 全部回放与必要关联成功后才能继续业务；某个必要 cursor 尚未关联不能视为恢复完整。SQL RESUME 失败仍由 proxy 关闭前后端连接。回放或关联失败也必须停止业务放行并清理该恢复 session，避免使用部分恢复的会话。
 

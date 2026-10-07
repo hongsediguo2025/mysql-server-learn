@@ -1,4 +1,5 @@
 affected rows: 0
 info: Records: 0  Duplicates: 0  Warnings: 0
-ERROR HY000: Preserve drain is active; this command was not executed
-multi_statement_ddl_completed_and_next_update_cut_off
+affected rows: 1
+info: Rows matched: 1  Changed: 1  Warnings: 0
+multi_statement_ddl_and_packet_suffix_completed

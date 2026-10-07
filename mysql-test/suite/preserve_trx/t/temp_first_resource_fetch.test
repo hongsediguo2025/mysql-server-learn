@@ -1,0 +1,3 @@
+--let $contract_first_resource_touch= fetch
+--let $contract_large_undo= 1
+--source suite/preserve_trx/t/temp_capture_worker.test

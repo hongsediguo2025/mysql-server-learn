@@ -2,6 +2,8 @@
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0. */
 #include "sql/preserve_trx_cursor.h"
+#include "mysql/components/services/log_builtins.h"
+#include "mysqld_error.h"
 #include "sql/preserve_trx_cursor_file.h"
 
 #include <algorithm>
@@ -24,7 +26,6 @@
 #include "sql/table.h"
 #include "typelib.h"
 
-bool preserve_trx_result_capture_enable = false;
 ulonglong preserve_trx_result_capture_max_bytes = 1073741824;
 uint preserve_trx_result_capture_max_count = 256;
 
@@ -53,10 +54,19 @@ int show(uint64_t value, SHOW_VAR *var, char *buffer) {
 }  // namespace
 
 bool preserve_trx_cursor_capture_enabled(const THD *thd) {
-  return preserve_trx_is_enabled() && preserve_trx_result_capture_enable &&
+  return preserve_trx_is_enabled() &&
          preserve_trx_transfer_artifact_mode ==
              PRESERVE_TRX_TRANSFER_ARTIFACT_STANDBY_TRANSFER_SAVE &&
          thd != nullptr && thd->is_classic_protocol();
+}
+
+bool preserve_trx_cursor_observe_generation(uint64_t generation) {
+  if (!generation || generation == UINT64_MAX) return false;
+  auto next = next_generation.load(std::memory_order_relaxed);
+  while (next <= generation &&
+         !next_generation.compare_exchange_weak(next, generation + 1,
+                                               std::memory_order_relaxed)) {}
+  return true;
 }
 
 Preserve_trx_cursor_result::Preserve_trx_cursor_result(Preserve_memory_lease lease)
@@ -99,7 +109,7 @@ bool Preserve_trx_cursor_result::grow_buffer() {
   std::memcpy(storage.get(), buffer(), m_pending);
   m_storage = std::move(storage);
   m_capacity = capacity;
-  m_memory.shrink_to(sizeof(*this) + sizeof(Preserve_trx_sealed_file) + capacity);
+  m_memory.shrink_to(sizeof(*this) + sizeof(Preserve_trx_sealed_file) + m_bookmarks.capacity() + capacity);
   return true;
 }
 
@@ -123,7 +133,7 @@ bool Preserve_trx_cursor_result::flush() {
   m_hashed_pending = 0;
   m_storage.reset();
   m_capacity = 0;
-  m_memory.shrink_to(sizeof(*this) + sizeof(Preserve_trx_sealed_file));
+  m_memory.shrink_to(sizeof(*this) + sizeof(Preserve_trx_sealed_file) + m_bookmarks.capacity());
   return true;
 }
 
@@ -140,6 +150,7 @@ bool Preserve_trx_cursor_result::reserve_data(uint64_t length) {
 
 bool Preserve_trx_cursor_result::append(const void *bytes, size_t length) {
   DBUG_EXECUTE_IF("preserve_cursor_capture_write_failure", { return false; });
+  if (m_memory_only && length > buffer_size() - m_pending) return false;
   if (!reserve_data(length)) return false;
   m_size += length;
   auto ptr = static_cast<const unsigned char *>(bytes);
@@ -165,11 +176,10 @@ bool Preserve_trx_cursor_result::string(const char *value, size_t length) {
 }
 
 bool Preserve_trx_cursor_result::metadata(
-    THD *thd, TABLE *table, const mem_root_deque<Item *> &items) {
+    TABLE *table, const mem_root_deque<Item *> &items, uint32_t result_charset) {
   if (!append("MPCUR002", 8) || !number(m_statement_id, 4) ||
       !number(m_generation, 8) || !number(table->s->db_low_byte_first, 1) ||
-      !number(thd->variables.character_set_results == nullptr
-                  ? 0 : thd->variables.character_set_results->number, 4) ||
+      !number(result_charset, 4) ||
       !number(items.size(), 4)) return false;
   Field **field = table->visible_field_ptr();
   for (Item *item : items) {
@@ -221,7 +231,7 @@ bool Preserve_trx_cursor_result::metadata(
 
 std::shared_ptr<Preserve_trx_cursor_result> Preserve_trx_cursor_result::create(
     THD *thd, TABLE *table, uint32_t statement_id,
-    const mem_root_deque<Item *> &items) {
+    const mem_root_deque<Item *> &items, uint32_t result_charset, bool memory_only) {
   if (statement_id == 0 || !preserve_trx_cursor_capture_enabled(thd)) return {};
   if (!reserve(live_results, 1, preserve_trx_result_capture_max_count)) {
     ++failures;
@@ -232,13 +242,18 @@ std::shared_ptr<Preserve_trx_cursor_result> Preserve_trx_cursor_result::create(
     if (!owned) --live_results;
   });
   try {
-    const auto generation = next_generation.fetch_add(1);
+    auto generation = next_generation.load(std::memory_order_relaxed);
+    do {
+      if (!generation || generation == UINT64_MAX) { ++failures; return {}; }
+    } while (!next_generation.compare_exchange_weak(generation, generation + 1,
+                                                    std::memory_order_relaxed));
     const auto token = "cursor-" + std::to_string(thd->thread_id()) + "-" +
                        std::to_string(generation);
     auto memory = preserve_trx_acquire_memory_lease(
         token, Preserve_trx_memory_kind::CURSOR_RESULT_BUFFER,
-        sizeof(Preserve_trx_cursor_result) + sizeof(Preserve_trx_sealed_file));
-    if (generation == 0 || !memory.acquired()) {
+        sizeof(Preserve_trx_cursor_result) + sizeof(Preserve_trx_sealed_file) +
+            2 * table->file->ref_length);
+    if (!memory.acquired()) {
       ++failures;
       return {};
     }
@@ -246,12 +261,14 @@ std::shared_ptr<Preserve_trx_cursor_result> Preserve_trx_cursor_result::create(
     // shared_ptr deletes raw if its control block allocation fails.
     owned = true;
     std::shared_ptr<Preserve_trx_cursor_result> result(raw);
+    result->m_memory_only = memory_only;
     result->m_generation = generation;
     result->m_statement_id = statement_id;
+    result->m_bookmarks.resize(2 * table->file->ref_length);
     result->m_hash = EVP_MD_CTX_new();
     if (result->m_hash == nullptr ||
         EVP_DigestInit_ex(result->m_hash, EVP_sha256(), nullptr) != 1 ||
-        !result->metadata(thd, table, items)) {
+        !result->metadata(table, items, result_charset)) {
       ++failures;
       return {};
     }
@@ -286,18 +303,30 @@ bool Preserve_trx_cursor_result::cell_bytes(const void *bytes, size_t length,
 
 bool Preserve_trx_cursor_result::row(TABLE *table, bool verify) {
   uint64_t payload_length = 0;
-  if (!row_length(table, &payload_length)) return false;
+  if (!preserve_trx_cursor_row_payload_size(table, m_value.data(), m_value.size(),
+                                          &payload_length)) return false;
   // One exact reservation per row, instead of a global CAS for every field
   // length, NULL marker and value. A failed row releases unused credit too.
   if (!verify && (payload_length > UINT64_MAX - 8 ||
                   !reserve_data(payload_length + 8))) return false;
+  struct Context { Preserve_trx_cursor_result *result; bool verify; } context{this, verify};
+  return preserve_trx_cursor_encode_row(table, payload_length, m_value.data(), m_value.size(),
+      [](void *ptr, const void *bytes, size_t length) {
+        auto &ctx = *static_cast<Context *>(ptr);
+        return ctx.result->cell_bytes(bytes, length, ctx.verify);
+      }, &context);
+}
+
+bool preserve_trx_cursor_encode_row(TABLE *table, uint64_t payload_length,
+    unsigned char *scratch, size_t scratch_size,
+    Preserve_trx_cursor_byte_sink sink, void *context) {
   unsigned char row_size[8];
   for (unsigned i = 0; i < 8; ++i) row_size[i] = payload_length >> (8 * i);
-  if (!cell_bytes(row_size, sizeof(row_size), verify)) return false;
+  if (!sink(context, row_size, sizeof(row_size))) return false;
   for (Field **p = table->visible_field_ptr(); *p != nullptr; ++p) {
     Field *f = *p;
     const unsigned char null = f->is_null();
-    if (!cell_bytes(&null, 1, verify)) return false;
+    if (!sink(context, &null, 1)) return false;
     if (null) continue;
     const unsigned char *bytes;
     size_t length;
@@ -306,21 +335,22 @@ bool Preserve_trx_cursor_result::row(TABLE *table, bool verify) {
       bytes = blob->get_blob_data();
       length = blob->data_length();
     } else {
-      if (f->max_packed_col_length() > m_value.size()) return false;
-      bytes = m_value.data();
-      length = f->pack(m_value.data()) - m_value.data();
+      if (f->max_packed_col_length() > scratch_size) return false;
+      bytes = scratch;
+      length = f->pack(scratch) - scratch;
     }
     if (length > UINT32_MAX) return false;
     unsigned char size[4];
     for (unsigned i = 0; i < 4; ++i) size[i] = length >> (8 * i);
-    if (!cell_bytes(size, 4, verify) || !cell_bytes(bytes, length, verify)) {
+    if (!sink(context, size, 4) || !sink(context, bytes, length)) {
       return false;
     }
   }
   return true;
 }
 
-bool Preserve_trx_cursor_result::row_length(TABLE *table, uint64_t *length) {
+bool preserve_trx_cursor_row_payload_size(TABLE *table, unsigned char *scratch,
+                                          size_t scratch_size, uint64_t *length) {
   uint64_t bytes = 0;
   for (Field **p = table->visible_field_ptr(); *p != nullptr; ++p) {
     Field *field = *p;
@@ -329,8 +359,8 @@ bool Preserve_trx_cursor_result::row_length(TABLE *table, uint64_t *length) {
       if (field->is_flag_set(BLOB_FLAG)) {
         cell += 4 + uint64_t(down_cast<Field_blob *>(field)->data_length());
       } else {
-        if (field->max_packed_col_length() > m_value.size()) return false;
-        cell += 4 + (field->pack(m_value.data()) - m_value.data());
+        if (field->max_packed_col_length() > scratch_size) return false;
+        cell += 4 + (field->pack(scratch) - scratch);
       }
     }
     if (cell > UINT64_MAX - bytes) return false;
@@ -366,83 +396,121 @@ bool Preserve_trx_cursor_result::index_row() {
   return true;
 }
 
-bool Preserve_trx_cursor_result::finish_index() {
-  m_index_offset = m_size;
+bool Preserve_trx_cursor_result::finish_index(uint64_t byte_limit, bool *complete) {
+  *complete = false;
+  if (!m_index_started) { m_index_offset = m_size; m_index_started = true; }
   const uint64_t index_count = m_index_bytes / 8;
   // Only the fixed-buffer overflow is spooled. Keep both paths bounded even
   // for a result with millions of checkpoints.
   const auto written = m_index_bytes - m_index_pending;
-  for (uint64_t offset = 0; offset < written;) {
+  uint64_t copied = 0;
+  while (m_index_copied < written && copied < byte_limit) {
     const auto length = static_cast<size_t>(
-        std::min<uint64_t>(written - offset, m_value.size()));
+        std::min<uint64_t>(written - m_index_copied, m_value.size()));
     if (my_pread(m_index_file, m_value.data(), length,
-                  static_cast<my_off_t>(offset), MYF(0)) != length ||
+                  static_cast<my_off_t>(m_index_copied), MYF(0)) != length ||
         !append(m_value.data(), length)) return false;
-    offset += length;
+    m_index_copied += length;
+    copied += length;
   }
+  if (m_index_copied != written) return true;
   if (!append(m_index_buffer.data(), m_index_pending)) return false;
   if (m_index_file >= 0) my_close(m_index_file, MYF(0));
   m_index_file = -1;
   capture_bytes.fetch_sub(m_index_bytes, std::memory_order_relaxed);
   m_index_bytes = 0;
   m_index_pending = 0;
+  *complete = true;
   return append("MPCEND02", 8) && number(m_rows, 8) &&
          number(m_rows_offset, 8) && number(m_index_offset, 8) &&
          number(index_count, 8) && append(m_schema_digest.data(), 32);
 }
 
-bool Preserve_trx_cursor_result::capture(
-    THD *thd, TABLE *table,
-    std::shared_ptr<Preserve_trx_cursor_result> *owner) {
-  if (!*owner) return false;
-  int error = table->file->ha_rnd_init(true);
-  if (error != 0) {
-    table->file->print_error(error, MYF(0));
-    owner->reset();
-    return true;
+Preserve_trx_cursor_capture_status Preserve_trx_cursor_result::capture_step(
+    THD *thd, TABLE *table, uint64_t fetched, uint64_t row_limit,
+    uint64_t byte_limit, bool *rnd_inited) {
+  using State = Preserve_trx_cursor_capture_status;
+  if (m_scan_complete) return State::MORE;
+  auto *file = table->file;
+  const auto ref_length = file->ref_length;
+  if (!row_limit || !byte_limit || !*rnd_inited ||
+      file->inited != handler::RND || m_bookmarks.size() != 2 * ref_length)
+    return State::FAILED;
+  if (fetched) {
+    file->position(table->record[0]);
+    std::memcpy(m_bookmarks.data(), file->ref, ref_length);
   }
-  auto *result = owner->get();
+  int error = m_rows ? file->ha_rnd_pos(table->record[0],
+                                      m_bookmarks.data() + ref_length)
+                     : file->ha_rnd_init(true);
   bool artifact_ok = true;
-  while (!thd->killed &&
-         (error = table->file->ha_rnd_next(table->record[0])) == 0) {
-    if (!result->index_row() || !result->row(table, false)) {
+  const auto first_row = m_rows, first_byte = m_size;
+  while (!error && !thd->killed && m_rows - first_row < row_limit &&
+         (m_rows == first_row || m_size - first_byte < byte_limit)) {
+    error = file->ha_rnd_next(table->record[0]);
+    if (error) break;
+    if (!index_row() || !row(table, false)) {
       artifact_ok = false;
       break;
     }
-    ++result->m_rows;
+    ++m_rows;
   }
-  const int end_error = table->file->ha_rnd_end();
-  if (thd->killed || (error != 0 && error != HA_ERR_END_OF_FILE) || end_error) {
-    if (thd->killed) thd->send_kill_message();
-    else table->file->print_error(end_error ? end_error : error, MYF(0));
-    owner->reset();
-    return true;
+  if (!error && artifact_ok && m_rows != first_row) {
+    file->position(table->record[0]);
+    std::memcpy(m_bookmarks.data() + ref_length, file->ref, ref_length);
   }
-  unsigned int digest_length = 0;
-  if (!artifact_ok || !result->finish_index() ||
-      !(result->m_file < 0 ? result->hash_pending() : result->flush()) ||
-      EVP_DigestFinal_ex(result->m_hash, result->m_digest.data(),
-                         &digest_length) != 1 ||
-      digest_length != result->m_digest.size()) {
+  if (file->inited != handler::RND) (void)file->ha_rnd_init(true);
+  const int restored = file->inited != handler::RND ? HA_ERR_INTERNAL_ERROR
+      : fetched ? file->ha_rnd_pos(table->record[0], m_bookmarks.data())
+                : file->ha_rnd_init(true);
+  *rnd_inited = file->inited == handler::RND;
+  if (restored || (error && error != HA_ERR_END_OF_FILE)) {
+    LogErr(WARNING_LEVEL, ER_LOG_PRINTF_MSG,
+           "PRESERVE: cursor capture native read error=%d restore error=%d", error, restored);
     ++failures;
-    owner->reset();
-    return false;
+    return State::FAILED;
+  }
+  if (thd->killed || thd->is_fatal_error() || thd->transaction_rollback_request)
+    return State::FAILED;
+  if (!artifact_ok) {
+    ++failures;
+    return State::DEFERRED;
+  }
+  m_scan_complete = error == HA_ERR_END_OF_FILE;
+  return State::MORE;
+}
+
+Preserve_trx_cursor_capture_status Preserve_trx_cursor_result::seal_step(
+    uint64_t byte_limit) {
+  using State = Preserve_trx_cursor_capture_status;
+  if (m_sealed) return State::COMPLETE;
+  if (m_failed) return State::DEFERRED;
+  if (!m_scan_complete || !byte_limit) return State::FAILED;
+  bool index_complete = false;
+  if (!finish_index(byte_limit, &index_complete)) { ++failures; m_failed = true; return State::DEFERRED; }
+  if (!index_complete) return State::MORE;
+  unsigned int digest_length = 0;
+  if (!(m_file < 0 ? hash_pending() : flush()) ||
+      EVP_DigestFinal_ex(m_hash, m_digest.data(),
+                         &digest_length) != 1 ||
+      digest_length != m_digest.size()) {
+    ++failures;
+    m_failed = true;
+    return State::DEFERRED;
   }
   try {
-    result->m_sealed_file.reset(result->m_file < 0
-        ? new Preserve_trx_sealed_file(result->buffer(), result->m_size,
-                                       result->m_digest)
-        : new Preserve_trx_sealed_file(result->m_file, result->m_size,
-                                       result->m_digest));
-    result->m_file = -1;
+    m_sealed_file.reset(m_file < 0
+        ? new Preserve_trx_sealed_file(buffer(), m_size, m_digest)
+        : new Preserve_trx_sealed_file(m_file, m_size, m_digest));
+    m_file = -1;
   } catch (const std::bad_alloc &) {
     ++failures;
-    owner->reset();
-    return false;
+    m_failed = true;
+    return State::DEFERRED;
   }
-  result->m_sealed = true;
+  m_sealed = true;
   ++completed;
-  return false;
+  return State::COMPLETE;
 }
 
 #ifndef NDEBUG

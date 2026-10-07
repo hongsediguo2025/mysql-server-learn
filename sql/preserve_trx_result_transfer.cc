@@ -140,11 +140,7 @@ Status preserve_trx_result_transfer_validate(const std::string &token,
 }
 
 Status preserve_trx_result_transfer_validate_files(
-    const Preserve_trx_transfer_receiver_record &record,
-    const std::string &manifest) {
-  auto status = preserve_trx_result_transfer_validate(
-      std::to_string(record.token), record.objects, manifest);
-  if (status != Status::OK) return status;
+    const Preserve_trx_transfer_receiver_record &record) {
   for (const auto &object : record.objects) {
     if (object.kind != Kind::CURSOR_RESULT) continue;
     const auto file = record.sealed_files.find(object.object_id);
@@ -180,7 +176,7 @@ Status preserve_trx_result_transfer_stream(
       status = source->pin(token, objects[i], image->files[i]);
       if (status != Status::OK) return status;
     }
-    return source->finish(session, token);
+    return source->finish(session, token, objects);
   } catch (const std::bad_alloc &) { return Status::RESOURCE_EXHAUSTED; }
 }
 
@@ -190,7 +186,10 @@ Status preserve_trx_result_transfer_load(
     std::unique_ptr<Preserve_trx_result_restore::Snapshot> *output) {
   if (token.empty() || !output || *output) return Status::INVALID_ARGUMENT;
   try {
-    auto status = preserve_trx_result_transfer_validate_files(record, manifest);
+    auto status = preserve_trx_result_transfer_validate(
+        std::to_string(record.token), record.objects, manifest);
+    if (status != Status::OK) return status;
+    status = preserve_trx_result_transfer_validate_files(record);
     if (status != Status::OK) return status;
     Preserve_trx_result_manifest_view parsed;
     if (parsed.read(manifest)) return Status::CORRUPT;

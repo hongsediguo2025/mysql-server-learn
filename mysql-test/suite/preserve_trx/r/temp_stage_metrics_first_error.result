@@ -1,4 +1,4 @@
-TEMP metrics cover final debt/wall, first DML outcome and FETCH; bridge excludes physical stages
+TEMP metrics cover resource preparation, first DML outcome and FETCH; bridge excludes physical stages
 production TEMP_ONLY temporary transfer: cursor passed
-loopback receiver prepared temporary resources before READY
+loopback receiver published temporary resources; SQL RESUME gates installation
 strict SQL RESUME integration: success passed

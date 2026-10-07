@@ -31,9 +31,14 @@ uint64_t preserve_trx_temp_image_delta_bytes_status() { return image_delta_bytes
 struct Preserve_trx_temp_pretransfer_file::Impl {
   Preserve_trx_transfer_object_descriptor object;
   Preserve_file_resource_lease file_lease;
+  Preserve_file_resource_lease raw_lease;
   Preserve_memory_lease memory;
   int fd{-1};
+  int raw_fd{-1};
+  uint64_t token{0};
+  uint32_t space{0};
   bool prepared{false}, delta{false};
+  bool compacting{false};
   Preserved_temp_table_wire_file base, patch, logical;
   EVP_MD_CTX *copy_hash{nullptr};
   uint64_t copied{0};
@@ -49,6 +54,7 @@ struct Preserve_trx_temp_pretransfer_file::Impl {
   }
   ~Impl() {
     if (fd >= 0) my_close(fd, MYF(0));
+    if (raw_fd >= 0) my_close(raw_fd, MYF(0));
     EVP_MD_CTX_free(copy_hash);
   }
 };
@@ -70,6 +76,8 @@ bool Preserve_trx_temp_pretransfer_file::begin_image(
                         std::to_string(space) + ".image";
   s->object.kind = Preserve_trx_transfer_object_kind::TEMP_TABLE_SIDECAR;
   s->object.total_size = size;
+  s->token = token;
+  s->space = space;
   s->memory = preserve_trx_acquire_memory_lease(std::to_string(token),
       Preserve_trx_memory_kind::TEMP_IMAGE_STREAM_BUFFER, sizeof(Impl) + 8192);
   if (!s->memory.acquired()) return false;
@@ -77,7 +85,8 @@ bool Preserve_trx_temp_pretransfer_file::begin_image(
     const auto &b = *base->m_impl;
     s->base = {b.object.object_id, b.object.total_size, b.object.digest};
     s->builder.reset(new Preserve_trx_temp_delta_builder);
-    if (!s->builder->begin_image(token, space, b.fd, writer, s->base, size,
+    if (!s->builder->begin_image(token, space, b.raw_fd >= 0 ? b.raw_fd : b.fd,
+                                 writer, b.logical, size,
                                  capture, base_floor, clean_prefix_bytes))
       s->builder.reset();
   }
@@ -93,11 +102,33 @@ Preserve_trx_temp_pretransfer_file::copy_image(
     Preserved_temp_table_image_writer *writer, size_t budget) try {
   if (!writer || !budget) return Copy_result::ERROR;
   auto &s = *m_impl;
-  if (!s.logical.name.empty()) return Copy_result::READY;
+  if (s.prepared) return Copy_result::READY;
   if (s.builder) {
     const auto result = s.builder->step(budget);
     using Result = Preserve_trx_temp_delta_builder::Result;
     if (result == Result::MORE) return Copy_result::MORE;
+    if (s.compacting) {
+      if (result == Result::ERROR) return Copy_result::ERROR;
+      if (result == Result::READY) {
+        int compact_fd = -1;
+        Preserve_file_resource_lease lease;
+        Preserved_temp_table_wire_file wire;
+        if (!s.builder->take(&compact_fd, &lease, &wire)) return Copy_result::ERROR;
+        s.raw_fd = s.fd;
+        s.raw_lease = std::move(s.file_lease);
+        s.fd = compact_fd;
+        s.file_lease = std::move(lease);
+        s.object.object_id = std::move(wire.name);
+        s.object.total_size = wire.size;
+        s.object.digest = wire.digest;
+      }
+      // No compact object has been declared. The complete raw checkpoint is
+      // still available if encoding is unprofitable or loses its reservation.
+      s.builder.reset();
+      s.compacting = false;
+      s.prepared = true;
+      return Copy_result::READY;
+    }
     if (result == Result::READY) {
       s.logical = s.builder->logical();
       if (!s.builder->take(&s.fd, &s.file_lease, &s.patch)) return Copy_result::ERROR;
@@ -135,9 +166,15 @@ Preserve_trx_temp_pretransfer_file::copy_image(
     EVP_MD_CTX_free(s.copy_hash);
     s.copy_hash = nullptr;
     s.logical = {s.object.object_id, s.object.total_size, s.object.digest};
-    s.prepared = true;
     if (writer->checkpoint_result(s.logical.size, s.logical.digest) !=
         Preserved_trx_carrier_status::OK) return Copy_result::ERROR;
+    s.builder.reset(new Preserve_trx_temp_delta_builder);
+    if (s.builder->begin_sparse(s.token, s.space, s.fd, s.logical)) {
+      s.compacting = true;
+      return Copy_result::MORE;
+    }
+    s.builder.reset();
+    s.prepared = true;
     return Copy_result::READY;
   }
   return Copy_result::MORE;
@@ -148,13 +185,32 @@ Preserve_trx_temp_pretransfer_file::copy_image(
 const Preserved_temp_table_wire_file &
 Preserve_trx_temp_pretransfer_file::logical() const { return m_impl->logical; }
 
+bool Preserve_trx_temp_pretransfer_file::begin_final_delta(
+    Preserve_trx_transfer_source_epoch_session *session, uint64_t token,
+    uint32_t space, int target_fd, const Preserved_temp_table_wire_file &target,
+    Preserve_trx_temp_delta_builder *builder,
+    Preserved_temp_table_wire_file *base) const {
+  const auto &s = *m_impl;
+  if (!session || !builder || !base || !s.prepared || s.delta ||
+      s.token != token || s.space != space || s.logical.name != target.name ||
+      !session->object_presealed_for_token(token, s.object)) return false;
+  *base = {s.object.object_id, s.object.total_size, s.object.digest};
+  return builder->begin(token, space, s.raw_fd >= 0 ? s.raw_fd : s.fd,
+                        target_fd, s.logical, target);
+}
+
 void Preserve_trx_temp_pretransfer_file::select(
     Preserved_temp_table_image_descriptor *image) const {
   if (image && image->blob_name == m_impl->logical.name &&
-      image->size == m_impl->logical.size && image->sha256 == m_impl->logical.digest &&
-      m_impl->delta) {
-    image->base = m_impl->base;
-    image->delta = m_impl->patch;
+      image->size == m_impl->logical.size && image->sha256 == m_impl->logical.digest) {
+    if (m_impl->delta) {
+      image->base = m_impl->base;
+      image->delta = m_impl->patch;
+    } else if (m_impl->raw_fd >= 0) {
+      image->base = {m_impl->object.object_id, m_impl->object.total_size,
+                     m_impl->object.digest};
+      image->delta = {};
+    }
   }
 }
 
@@ -286,7 +342,7 @@ Status Preserve_trx_temp_pretransfer_file::step(
     return status;
   }
   const auto length = static_cast<size_t>(std::min<uint64_t>(
-      {uint64_t(budget), uint64_t(session->chunk_bytes()), uint64_t(65536),
+      {uint64_t(budget), uint64_t(session->chunk_bytes()),
        object.total_size - offset}));
   if (!length) return Status::INVALID_ARGUMENT;
   // The sole caller's job already reserves byte_budget of scratch for this
@@ -296,7 +352,9 @@ Status Preserve_trx_temp_pretransfer_file::step(
     if (my_pread(m_impl->fd, reinterpret_cast<unsigned char *>(&chunk[0]),
                  length, static_cast<my_off_t>(offset), MYF(0)) != length)
       return Status::IO_ERROR;
-    status = session->write_object_chunk(token, object.object_id, offset, chunk);
+    status = session->write_object_chunk(token, object.object_id, offset, chunk,
+                                         offset + length == object.total_size);
+    *complete = status == Status::OK && offset + length == object.total_size;
     if (status == Status::OK)
       transferred_bytes.fetch_add(length, std::memory_order_relaxed);
     if (status == Status::OK && m_impl->delta) {

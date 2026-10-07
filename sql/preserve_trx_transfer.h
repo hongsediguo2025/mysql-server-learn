@@ -111,15 +111,11 @@ struct Preserve_trx_transfer_runtime_policy {
   uint32_t sender_workers{3};
   uint32_t receiver_workers{3};
   uint32_t prewarm_workers{1};
-  uint64_t transfer_io_bytes_per_sec{32ULL * 1024ULL * 1024ULL};
-  uint64_t prewarm_io_bytes_per_sec{32ULL * 1024ULL * 1024ULL};
   uint64_t prewarm_max_bytes{256ULL * 1024ULL * 1024ULL};
   uint32_t transfer_chunk_bytes{1024U * 1024U};
   uint32_t warmcopy_chunk_bytes{1024U * 1024U};
   uint32_t warmcopy_tail_budget_bytes{1024U * 1024U};
   uint32_t warmcopy_min_open_ms{1000};
-  uint32_t commit_batch_tokens{8};
-  uint32_t worker_yield_us{1000};
   uint64_t phase1_batch_bytes{4ULL * 1024ULL * 1024ULL};
   uint32_t phase1_batch_linger_ms{20};
   uint32_t promotion_gate_workers{3};
@@ -282,7 +278,10 @@ enum class Preserve_trx_transfer_status {
   ACK_UNCERTAIN = 9,
   LOCK_PLAN_STALE = 10,
   NOT_COMMITTED = 11,
-  NOT_COMMITTED_CLEAN = 12
+  NOT_COMMITTED_CLEAN = 12,
+  RESOURCE_PREPARING = 13,
+  RESOURCE_PREPARED = 14,
+  RESOURCE_UNAVAILABLE = 15
 };
 
 struct Preserve_trx_transfer_resume_handoff {
@@ -484,6 +483,7 @@ enum class Preserve_trx_transfer_frame_type : uint16_t {
   DECLARE_OBJECT = 9,
   QUERY_EPOCH_STATUS = 10,
   ABANDON_EPOCH_IF_NOT_COMMITTED = 12,
+  QUERY_RESOURCE_PREPARED = 13,
 };
 
 struct Preserve_trx_transfer_lock_plan_contract {
@@ -504,6 +504,8 @@ struct Preserve_trx_transfer_lock_plan_contract {
   std::array<unsigned char, kPreservedTrxSha256Length> terminal_proof{};
 };
 
+constexpr uint32_t kPreserveTrxTransferCursorOpen = 1U;
+
 struct Preserve_trx_transfer_object_descriptor {
   /*
     Object identity is stable inside one transfer epoch. The receiver uses it
@@ -518,6 +520,12 @@ struct Preserve_trx_transfer_object_descriptor {
   std::array<unsigned char, kPreservedTrxSha256Length> digest{};
   Preserve_trx_transfer_lock_plan_contract lock_plan;
 };
+
+inline bool preserve_trx_transfer_open_result(
+    const Preserve_trx_transfer_object_descriptor &object) {
+  return object.kind == Preserve_trx_transfer_object_kind::CURSOR_RESULT &&
+         object.flags == kPreserveTrxTransferCursorOpen;
+}
 
 struct Preserve_trx_transfer_object_payload {
   /*
@@ -657,7 +665,6 @@ struct Preserve_trx_transfer_receiver_record {
   bool staged_manifest_frozen{false};
   bool has_resource_objects{false};
   bool has_snapshot_bundle{false};
-  bool resource_final_observed{false};
   bool staging_resources_retired{false};
   // Admission reserves the retirement owner, so cancellation never allocates it.
   std::map<std::string, uint64_t> staging_tickets;
@@ -804,14 +811,16 @@ class Preserve_trx_transfer_receiver_registry {
   Preserve_trx_transfer_status begin_receive(
       const Preserve_trx_transfer_manifest &manifest,
       uint64_t manifest_payload_bytes = 0,
-      std::vector<Staging_retirement> *retirements = nullptr,
-      bool *first_resource_final = nullptr);
+      std::vector<Staging_retirement> *retirements = nullptr);
   Preserve_trx_transfer_status freeze_staged_manifest(
       const Preserve_trx_transfer_manifest &manifest);
   Preserve_trx_transfer_status declare_object(
       const std::string &epoch_id, uint64_t token,
       const Preserve_trx_transfer_object_descriptor &descriptor,
       uint64_t *retirement_id = nullptr);
+  Preserve_trx_transfer_status grow_open_result(
+      const std::string &epoch_id, uint64_t token, const std::string &object_id,
+      uint64_t offset, uint64_t length, uint64_t *size);
   /** Wire deletion and last verified reader are separate release conditions. */
   void mark_staging_object_deleted(uint64_t retirement_id);
   size_t reap_retired_staging_once(size_t budget = 32);
@@ -1005,6 +1014,12 @@ class Preserve_trx_transfer_receiver_registry {
                     Preserve_trx_transfer_receiver_state *state,
                     Preserve_trx_temp_id_contract *contract = nullptr,
                     bool *has_resource_objects = nullptr) const;
+  // A frozen index pins the validated input across final preparation batches.
+  bool matches_frozen_input(const std::string &epoch_id, uint64_t token,
+      const std::shared_ptr<const Preserve_trx_transfer_object_index> &index,
+      const Preserve_trx_temp_id_contract &contract) const;
+  Preserve_trx_transfer_status query_resource_prepared(
+      const std::string &epoch_id, uint64_t token, const std::string &object_id) const;
   // Object operations take a token header and indexed descriptor. Binlog
   // prewarm may request its one companion; CHUNK never copies sealed owners.
   bool lookup_object(const std::string &epoch_id, uint64_t token,
@@ -1052,7 +1067,8 @@ class Preserve_trx_transfer_receiver_registry {
 
   Preserve_trx_transfer_status check_reservation_locked(
       const std::string &epoch, uint64_t old_bytes, uint64_t new_bytes,
-      uint64_t limit);
+      uint64_t limit, uint64_t token,
+      const Preserve_trx_transfer_object_descriptor *object = nullptr);
   void set_reservation_locked(Preserve_trx_transfer_receiver_record &record,
                               uint64_t bytes);
   void add_cleanup_debt_bytes_locked(uint64_t bytes);
@@ -1285,6 +1301,11 @@ class Preserve_trx_transfer_encoded_frame_sink {
     (void)session_index;
     return send_encoded_frame(encoded_frame);
   }
+  // Read-only progress never changes data ACK uncertainty or admission sequence.
+  virtual Preserve_trx_transfer_status query_resource_prepared(
+      const std::string &, uint64_t) {
+    return Preserve_trx_transfer_status::UNSUPPORTED;
+  }
   // Only for immutable batches made by the source encoder. Identity comes
   // from the same locked sequence allocation; the ACK still binds all bytes.
   virtual Preserve_trx_transfer_status open_epoch_transport(
@@ -1309,6 +1330,9 @@ class Preserve_trx_transfer_encoded_frame_sink {
     return {};
   }
   virtual void request_cancel() {}
+  virtual Preserve_trx_transfer_status source_work_status() const {
+    return Preserve_trx_transfer_status::OK;
+  }
   virtual Preserve_trx_transfer_status prepare_cancelled_epoch_cleanup() {
     return Preserve_trx_transfer_status::OK;
   }
@@ -1361,7 +1385,8 @@ class Preserve_trx_transfer_source_epoch_session {
       const Preserve_trx_transfer_manifest &manifest,
       bool queue_final_metadata = false);
   Preserve_trx_transfer_status begin_token_prewarm_manifest(
-      uint64_t transfer_token, uint64_t required_source_freeze_lsn = 0);
+      uint64_t transfer_token, uint64_t required_source_freeze_lsn = 0,
+      const std::set<std::string> &retired_results = {});
   Preserve_trx_transfer_status begin_token_prewarm_manifests_batch(
       const std::vector<uint64_t> &transfer_tokens);
   bool token_prewarm_lsn_fact(uint64_t transfer_token,
@@ -1372,9 +1397,13 @@ class Preserve_trx_transfer_source_epoch_session {
       const std::vector<Preserve_trx_transfer_phase1_blob_request> &requests);
   Preserve_trx_transfer_status write_object_chunk(
       uint64_t transfer_token, const std::string &object_id,
-      uint64_t chunk_offset, const std::string &chunk_payload);
+      uint64_t chunk_offset, const std::string &chunk_payload,
+      bool seal_temp_object = false);
   Preserve_trx_transfer_status seal_object(uint64_t transfer_token,
                                            const std::string &object_id);
+  Preserve_trx_transfer_status query_resource_prepared(
+      uint64_t transfer_token, const std::string &object_id,
+      uint64_t deadline_us);
   bool object_presealed_for_token(
       uint64_t transfer_token,
       const Preserve_trx_transfer_object_descriptor &descriptor) const;
@@ -1401,8 +1430,16 @@ class Preserve_trx_transfer_source_epoch_session {
   Preserve_trx_transfer_status commit_epoch();
   Preserve_trx_transfer_status commit_epoch(
       const std::vector<uint64_t> &session_only_tokens);
+  bool result_token_declared(uint64_t token) const {
+    std::lock_guard<std::mutex> guard(m_mutex);
+    return token_declared(token);
+  }
   std::string epoch_id() const { return m_epoch_id; }
   uint32_t chunk_bytes() const { return m_chunk_bytes; }
+  Preserve_trx_transfer_status source_work_status() const {
+    return m_sink ? m_sink->source_work_status()
+                  : Preserve_trx_transfer_status::INVALID_ARGUMENT;
+  }
   uint64_t max_inflight_bytes() const { return m_max_inflight_bytes; }
   uint64_t phase1_batch_bytes() const { return m_phase1_batch_bytes; }
   const Preserve_trx_transfer_runtime_policy &runtime_policy() const {
@@ -1452,7 +1489,7 @@ class Preserve_trx_transfer_source_epoch_session {
       Preserve_trx_transfer_frame *frame) const;
   Preserve_trx_transfer_status send_phase1_control_batches_locked(
       const std::vector<std::string> &encoded_frames,
-      size_t *acknowledged_frame_count);
+      size_t *acknowledged_frame_count, bool single_token = false);
   Preserve_trx_transfer_status abort_token_locked(uint64_t transfer_token,
                                                   const std::string &reason,
                                                   bool allow_finalized,
@@ -1695,7 +1732,6 @@ bool preserve_trx_transfer_receiver_residency_wait_for_unit_test(
     const std::vector<uint64_t> &monotonic_time_samples,
     size_t cancel_after_samples, uint64_t timeout_us,
     size_t *sample_count);
-void preserve_trx_transfer_reset_io_rate_limiters_for_unit_test();
 uint64_t
 preserve_trx_transfer_receiver_staged_token_file_read_bytes_for_unit_test(
     const Preserve_trx_transfer_manifest &manifest);
@@ -1703,9 +1739,6 @@ uint64_t
 preserve_trx_transfer_receiver_object_prewarm_file_read_bytes_for_unit_test(
     const Preserve_trx_transfer_manifest &manifest,
     const std::string &object_id);
-bool preserve_trx_transfer_receiver_prewarm_work_batch_should_yield_for_unit_test(
-    uint64_t job_elapsed_us, uint64_t yield_quantum_us,
-    uint64_t *active_work_us);
 size_t preserve_trx_transfer_receiver_active_jobs_for_unit_test(
     const Preserve_trx_transfer_receiver_registry *registry);
 Preserve_trx_transfer_status

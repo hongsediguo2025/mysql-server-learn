@@ -4,8 +4,6 @@
 #include "trx0temp_preserve_source.h"
 
 #include <limits>
-#include <system_error>
-#include <thread>
 #include <tuple>
 #include <utility>
 
@@ -14,8 +12,6 @@
 #include "fsp0fsp.h"
 #include "ha_innodb.h"
 #include "row0mysql.h"
-#include "my_thread.h"
-#include "scope_guard.h"
 #include "sess0sess.h"
 #include "sql/field.h"
 #include "sql/preserve_trx.h"

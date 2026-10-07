@@ -19,7 +19,7 @@
 
 bool Preserve_trx_receiver_prepare_work::retained_bytes(
     const Preserved_trx_bundle &bundle, uint64_t *bytes) {
-  if (!bytes || bundle.source_cursor_results) return true;
+  if (!bytes || bundle.source_cursor_results || bundle.source_temp_images) return true;
   uint64_t total = sizeof(Preserve_trx_receiver_prepare_work);
   const auto add = [&](uint64_t size) {
     if (size > std::numeric_limits<uint64_t>::max() - total) return false;
@@ -115,9 +115,11 @@ Preserve_trx_receiver_prepare_work::Temp_start
 Preserve_trx_receiver_prepare_work::begin_temp(
     const std::string &root, const Preserve_trx_transfer_receiver_record &record) {
   if (!m_has_temp || m_temp) return Temp_start::READY;
+  Preserve_trx_temp_receiver_work::Owner previous;
   if (record.resource_candidates) {
     using Take = Preserve_trx_receiver_candidates::Take;
-    const auto taken = record.resource_candidates->take_temp(m_bundle.metadata, record, &m_temp);
+    const auto taken = record.resource_candidates->take_temp(
+        m_bundle.metadata, record, &m_temp, &previous);
     if (taken == Take::WAIT) return Temp_start::WAIT;
     if (taken == Take::FAILED) return Temp_start::ERROR;
     if (taken == Take::READY) return Temp_start::READY;
@@ -126,7 +128,8 @@ Preserve_trx_receiver_prepare_work::begin_temp(
   return Preserve_trx_temp_transfer_input::load(
              m_bundle.metadata.token, m_bundle.metadata.temp_table_manifest_payload,
              record, &input, &m_bundle.metadata) != Preserve_trx_transfer_status::OK ||
-         Preserve_trx_temp_receiver_work::begin_import(root, &input, &m_temp) != DB_SUCCESS
+         Preserve_trx_temp_receiver_work::begin_import(
+             root, &input, &m_temp, &previous) != DB_SUCCESS
              ? Temp_start::ERROR : Temp_start::READY;
 }
 
@@ -136,33 +139,18 @@ bool Preserve_trx_receiver_prepare_work::temp_matches(
       m_temp->input()->matches(m_bundle.metadata.temp_table_manifest_payload, record));
 }
 
-Preserve_trx_temp_final_counts
-Preserve_trx_receiver_prepare_work::observe_final_debt() {
-  Preserve_trx_temp_final_counts counts{};
-  if (m_final_debt_observed || (!m_has_temp && !m_has_results)) return counts;
-  m_final_debt_observed = true;
-  using Field = Preserve_trx_temp_final_field;
-  counts[static_cast<size_t>(Field::STAGED_TOKENS)] = 1;
-  if (m_has_temp)
-    counts[static_cast<size_t>(m_temp && m_temp->ready()
-        ? Field::READY_TEMP : Field::PENDING_TEMP)] = 1;
-  if (m_has_results && !m_ready) counts[static_cast<size_t>(Field::PENDING_RESULT)] = 1;
-  return counts;
-}
-
-bool Preserve_trx_receiver_prepare_work::step(THD *worker) {
+bool Preserve_trx_receiver_prepare_work::step(THD *worker,
+                                             bool prepare_for_publication) {
   m_scanned_bytes = 0;
   if (m_has_temp && !m_temp) return true;
-  if (complete()) return false;
+  if (prepare_for_publication ? publication_prepared() : complete()) return false;
   if (!worker || worker != current_thd) return true;
   // Candidates own their arenas and items. A previous token's allocation
   // failure must not leave diagnostics on this reusable internal worker.
   worker->reset_for_next_command();
   worker->get_stmt_da()->reset_condition_info(worker);
-  if (m_temp && !m_temp->ready()) {
-    const auto before = m_temp->written_bytes();
+  if (m_temp && !(prepare_for_publication ? m_temp->promotion_safe() : m_temp->ready())) {
     const auto err = m_temp->prepare_step(worker, 128, 8ULL * 1024 * 1024, 128);
-    m_scanned_bytes = m_temp->scanned_bytes() + m_temp->written_bytes() - before;
     ++m_batches;
     if (err != DB_SUCCESS)
       LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,

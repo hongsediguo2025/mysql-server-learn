@@ -1,0 +1,2 @@
+--let $contract_native_final_tail= 1
+--source suite/preserve_trx/t/temp_capture_native_early.test

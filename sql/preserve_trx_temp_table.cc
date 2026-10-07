@@ -78,6 +78,7 @@
 #include "sql/preserve_trx_transfer.h"
 #include "sql/sql_base.h"
 #include "sql/sql_class.h"
+#include "sql/sql_lex.h"
 #include "sql/sql_table.h"
 #include "my_dbug.h"
 #include "sha2.h"
@@ -360,23 +361,12 @@ std::string temp_table_sealed_undo_filename(const std::string &token,
   return token + ".tempts." + std::to_string(source_space_id) + ".undo";
 }
 
-Preserved_temp_table_image_descriptor image_descriptor_from_exported_metadata(
-    const std::string &token, uint32_t table_ordinal,
-    uint64_t sealed_temp_op_seq,
-    const trx_preserve_temp_table_exported_metadata &source,
-    const trx_preserve_temp_space_image_descriptor &descriptor) {
+Preserved_temp_table_image_descriptor binding_preflight_image_descriptor(
+    const trx_preserve_temp_table_exported_metadata &source) {
   Preserved_temp_table_image_descriptor image;
-  image.table_ordinal = table_ordinal;
   image.source_space_id = source.source_space_id;
-  image.blob_name =
-      temp_table_sealed_image_filename(token, source.source_space_id);
-  image.size = descriptor.image_bytes;
-  std::copy(descriptor.image_digest, descriptor.image_digest + 32,
-            image.sha256.begin());
-  image.sealed_temp_op_seq = sealed_temp_op_seq;
   image.image_space_id = source.source_space_id;
   image.image_table_id = source.image_table_id;
-  image.image_format_version = 1;
   image.clustered_root_page_no = source.clustered_root_page_no;
   image.page_size = source.page_size;
   image.space_flags = source.space_flags;
@@ -390,7 +380,23 @@ Preserved_temp_table_image_descriptor image_descriptor_from_exported_metadata(
     index.name = source_index.name;
     image.indexes.push_back(std::move(index));
   }
-  (void)descriptor;
+  return image;
+}
+
+Preserved_temp_table_image_descriptor image_descriptor_from_exported_metadata(
+    const std::string &token, uint32_t table_ordinal,
+    uint64_t sealed_temp_op_seq,
+    const trx_preserve_temp_table_exported_metadata &source,
+    const trx_preserve_temp_space_image_descriptor &descriptor) {
+  auto image = binding_preflight_image_descriptor(source);
+  image.table_ordinal = table_ordinal;
+  image.blob_name =
+      temp_table_sealed_image_filename(token, source.source_space_id);
+  image.size = descriptor.image_bytes;
+  std::copy(descriptor.image_digest, descriptor.image_digest + 32,
+            image.sha256.begin());
+  image.sealed_temp_op_seq = sealed_temp_op_seq;
+  image.image_format_version = 1;
   return image;
 }
 
@@ -1000,28 +1006,6 @@ bool temp_table_dd_metadata_matches_manifest_binding(
   }
 
   return true;
-}
-
-Preserved_temp_table_image_descriptor binding_preflight_image_descriptor(
-    const trx_preserve_temp_table_exported_metadata &source) {
-  Preserved_temp_table_image_descriptor image;
-  image.source_space_id = source.source_space_id;
-  image.image_space_id = source.source_space_id;
-  image.image_table_id = source.image_table_id;
-  image.clustered_root_page_no = source.clustered_root_page_no;
-  image.page_size = source.page_size;
-  image.space_flags = source.space_flags;
-  image.table_flags = source.table_flags;
-  for (const trx_preserve_temp_table_exported_index_metadata &source_index :
-       source.indexes) {
-    Preserved_temp_table_image_descriptor::Index_descriptor index;
-    index.image_index_id = source_index.image_index_id;
-    index.root_page_no = source_index.root_page_no;
-    index.space_flags = source_index.space_flags;
-    index.name = source_index.name;
-    image.indexes.push_back(std::move(index));
-  }
-  return image;
 }
 
 bool temp_table_dd_column_is_supportable(const dd::Column &column,
@@ -1971,6 +1955,79 @@ bool preserve_trx_temp_table_transaction_state_needs_clear(const THD *thd) {
           thd->preserve_trx_temp_table_no_redo_baseline_valid);
 }
 
+bool Temp_table_warmcopy_participant::commit_transaction_keep_data(THD *thd) {
+  std::vector<Preserve_trx_temp_capture_input> retired;
+  std::unique_ptr<trx_preserve_temp_undo_capture> undo_capture;
+  Preserve_trx_temp_history history;
+  std::vector<Temp_table_journal_record> journal;
+  try {
+    // Epoch cancellation clears its marker under this same lock before
+    // retiring sidecars. Recheck here before mutating the retained owner.
+    mysql_mutex_lock(&thd->LOCK_thd_data);
+    const auto unlock = create_scope_guard(
+        [&] { mysql_mutex_unlock(&thd->LOCK_thd_data); });
+    if (thd->m_server_idle || thd->release_resources_done() ||
+        thd->preserve_trx_temp_table_participant.get() != this ||
+        !thd->preserve_trx_temp_table_batch_capture_epoch.load(
+            std::memory_order_acquire)) return false;
+    std::lock_guard<std::recursive_mutex> guard(m_state_mutex);
+    if (m_state == Temp_table_participant_state::DEGRADED ||
+        m_state == Temp_table_participant_state::ABANDONED ||
+        m_state == Temp_table_participant_state::FINALIZED ||
+        m_transaction_generation == UINT64_MAX || m_next_sequence == UINT64_MAX ||
+        mutation_generation() == UINT64_MAX) return false;
+    retired.reserve(m_prebuilt_sidecars.size());
+    for (auto &sidecar : m_prebuilt_sidecars) {
+      if (!sidecar) continue;
+      if (sidecar->continuous && !sidecar->descriptor.undo_only &&
+          !sidecar->tail_sealed && !sidecar->has_undo &&
+          !sidecar->undo_scan_pending &&
+          sidecar->data_generation == data_generation()) continue;
+      retired.emplace_back();
+      retired.back().retired_sidecar = std::move(sidecar);
+    }
+    m_prebuilt_sidecars.erase(std::remove(m_prebuilt_sidecars.begin(),
+        m_prebuilt_sidecars.end(), nullptr), m_prebuilt_sidecars.end());
+    undo_capture = std::move(m_undo_capture);
+    history = std::move(m_ddl_history);
+    m_ddl_history = Preserve_trx_temp_history{};
+    journal.swap(m_journal);
+    m_tail_bytes = 0;
+    m_history_started = m_untracked_change_before_history =
+        m_current_statement_touched = m_tracked_dml = false;
+    m_last_undo_mutation_sequence = m_next_sequence++;
+    ++m_transaction_generation;
+    m_mutation_generation.fetch_add(1, std::memory_order_release);
+    m_state = Temp_table_participant_state::DISCOVERED;
+    m_degraded_reason.clear();
+  } catch (const std::bad_alloc &) {
+    return false;
+  }
+  // No native stream or file cleanup while holding participant/THD locks.
+  return true;
+}
+
+void preserve_trx_temp_table_note_transaction_commit(THD *thd) {
+  // The command owner is non-idle, so phase1 cannot capture or install here.
+  // Implicit DDL commits and every other cleanup retain the full reset path.
+  const auto participant = preserve_trx_temp_table_pin_participant(thd);
+  if (!thd || !preserve_trx_enable || !preserve_trx_temp_table_enable ||
+      !standby_temp_native_history_enabled() || !thd->lex ||
+      preserve_trx_phase1_capture_mode !=
+          PRESERVE_TRX_PHASE1_BOUNDED_PIPELINE_V1 ||
+      thd->lex->sql_command != SQLCOM_COMMIT ||
+      !thd->preserve_trx_temp_table_batch_capture_epoch.load(
+          std::memory_order_acquire) || !participant ||
+      !participant->commit_transaction_keep_data(thd)) {
+    preserve_trx_temp_table_clear_transaction_state(thd);
+    return;
+  }
+  thd->preserve_trx_temp_table_untracked_change.store(false, std::memory_order_release);
+  thd->preserve_trx_temp_table_no_redo_baseline_valid = false;
+  thd->preserve_trx_temp_table_no_redo_baseline_present = false;
+  thd->preserve_trx_temp_table_no_redo_baseline_top = 0;
+}
+
 void preserve_trx_temp_table_clear_transaction_state(THD *thd) {
   if (thd == nullptr) return;
   preserve_trx_temp_table_clear_participant(thd);
@@ -2537,6 +2594,10 @@ bool preserve_trx_temp_table_build_baseline_image(
   }
   if (err == DB_SUCCESS && use_streaming_writer) {
     failure_step = "finish_streamed_sidecar";
+#ifndef NDEBUG
+    Preserve_trx_temp_stage_timer timer(
+        Preserve_trx_temp_stage::SOURCE_FINAL_TAIL, nullptr, true);
+#endif
     err = trx_preserve_temp_space_image_finish_streamed_sidecar(
         &local_descriptor, &writer_context, temp_table_image_stream_write_page);
   }
@@ -2547,6 +2608,10 @@ bool preserve_trx_temp_table_build_baseline_image(
   std::string local_image_payload;
   if (err == DB_SUCCESS && use_streaming_writer) {
     failure_step = "close_warm_image_writer";
+#ifndef NDEBUG
+    Preserve_trx_temp_stage_timer timer(
+        Preserve_trx_temp_stage::SOURCE_FINAL_CLOSE, nullptr, true);
+#endif
     Preserved_trx_carrier_status writer_status = image_writer->close();
     if (writer_status != Preserved_trx_carrier_status::OK) {
       preserve_trx_resource_note_spill_failure();
@@ -2556,6 +2621,10 @@ bool preserve_trx_temp_table_build_baseline_image(
   Preserved_temp_table_image_writer_result writer_result;
   if (err == DB_SUCCESS && use_streaming_writer) {
     failure_step = "digest_warm_image_writer";
+#ifndef NDEBUG
+    Preserve_trx_temp_stage_timer timer(
+        Preserve_trx_temp_stage::SOURCE_FINAL_DIGEST, nullptr, true);
+#endif
     Preserved_trx_carrier_status writer_status =
         image_writer->result(&writer_result);
     if (writer_status != Preserved_trx_carrier_status::OK) {
@@ -2652,6 +2721,7 @@ bool prepare_temp_table_phase1_prebuild_captures(
         !participant->begin_capture_epoch()) return false;
     trx_preserve_phase1_identity native;
     identity->owner_cookie = reinterpret_cast<uintptr_t>(thd);
+    identity->transaction_generation = participant->transaction_generation();
     if (trx_preserve_phase1_owner_identity_snapshot(thd, &native)) {
       identity->trx_cookie = native.raw_cookie;
       identity->trx_version = native.trx_version;
@@ -3348,9 +3418,16 @@ bool preserve_trx_temp_table_seal_phase1_tail_sidecar(
     Temp_table_image_stream_writer_context writer_context;
     writer_context.writer = sidecar->image_writer.get();
     writer_context.page_size = sidecar->descriptor.page_size;
-    dberr_t err = trx_preserve_temp_space_image_finish_streamed_sidecar(
-        &sidecar->descriptor, &writer_context,
-        temp_table_image_stream_write_page);
+    dberr_t err;
+    {
+#ifndef NDEBUG
+      Preserve_trx_temp_stage_timer timer(
+          Preserve_trx_temp_stage::SOURCE_FINAL_TAIL, nullptr, true);
+#endif
+      err = trx_preserve_temp_space_image_finish_streamed_sidecar(
+          &sidecar->descriptor, &writer_context,
+          temp_table_image_stream_write_page);
+    }
     if (err != DB_SUCCESS) {
       abandon_prebuilt();
       return false;
@@ -3364,8 +3441,14 @@ bool preserve_trx_temp_table_seal_phase1_tail_sidecar(
         return false;
       }
     }
-    Preserved_trx_carrier_status writer_status =
-        sidecar->image_writer->close();
+    Preserved_trx_carrier_status writer_status;
+    {
+#ifndef NDEBUG
+      Preserve_trx_temp_stage_timer timer(
+          Preserve_trx_temp_stage::SOURCE_FINAL_CLOSE, nullptr, true);
+#endif
+      writer_status = sidecar->image_writer->close();
+    }
     if (writer_status != Preserved_trx_carrier_status::OK) {
       preserve_trx_resource_note_spill_failure();
       abandon_prebuilt();
@@ -3373,7 +3456,13 @@ bool preserve_trx_temp_table_seal_phase1_tail_sidecar(
     }
 
     Preserved_temp_table_image_writer_result writer_result;
-    writer_status = sidecar->image_writer->result(&writer_result);
+    {
+#ifndef NDEBUG
+      Preserve_trx_temp_stage_timer timer(
+          Preserve_trx_temp_stage::SOURCE_FINAL_DIGEST, nullptr, true);
+#endif
+      writer_status = sidecar->image_writer->result(&writer_result);
+    }
     if (writer_status != Preserved_trx_carrier_status::OK) {
       preserve_trx_resource_note_spill_failure();
       abandon_prebuilt();
@@ -3435,7 +3524,8 @@ void preserve_trx_temp_table_discard_phase1_sidecars(THD *thd,
 
 Preserve_snapshot_status preserve_trx_temp_table_build_preserve_manifest(
     THD *thd, trx_t *trx, const std::string &dir, const std::string &token,
-    Preserve_snapshot_metadata *metadata) try {
+    Preserve_snapshot_metadata *metadata,
+    std::shared_ptr<const Preserve_trx_temp_source_images> *source_images) try {
   if (!preserve_trx_temp_table_enable) return Preserve_snapshot_status::OK;
   if (thd == nullptr || metadata == nullptr) {
     return Preserve_snapshot_status::INVALID_ARGUMENT;
@@ -3538,6 +3628,16 @@ Preserve_snapshot_status preserve_trx_temp_table_build_preserve_manifest(
   // Register a successful seal without allocating after ownership transfers.
   sealed_image_source_space_ids.reserve(table_count);
   sealed_undo_source_space_ids.reserve(table_count + 1);
+  std::shared_ptr<Preserve_trx_temp_source_images> images;
+  if (source_images && standby_temp_native_history_enabled() && table_count) {
+    auto memory = preserve_trx_acquire_memory_lease(token,
+        Preserve_trx_memory_kind::TEMP_IMAGE_STREAM_BUFFER,
+        sizeof(Preserve_trx_temp_source_images) + table_count * 128);
+    if (memory.acquired()) {
+      images = std::make_shared<Preserve_trx_temp_source_images>();
+      images->memory = std::move(memory);
+    }
+  }
 
   if (standby_temp_native_history_enabled() && !resource_only) {
     const auto adopted = preserve_trx_temp_undo_adopt(
@@ -3712,8 +3812,12 @@ Preserve_snapshot_status preserve_trx_temp_table_build_preserve_manifest(
     entry.dict_binding =
         dict_binding_from_exported_metadata(source_metadata, schema_name,
                                             table_name);
-    if (const auto *prebuilt = participant->find_prebuilt_sidecar(source_metadata.source_space_id))
+    if (const auto *prebuilt = participant->find_prebuilt_sidecar(source_metadata.source_space_id)) {
       if (prebuilt->image_checkpoint) prebuilt->image_checkpoint->select(&entry.image);
+      if (images && first_image_for_space && adopted_phase1_sidecar &&
+          entry.image.base.name.empty() && prebuilt->image_base)
+        images->bases.emplace(source_metadata.source_space_id, prebuilt->image_base);
+    }
 
     if (!remember_or_match_shared_image(entry.image, &shared)) {
       participant->mark_degraded("temp-table shared image sidecar mismatch");
@@ -3722,11 +3826,18 @@ Preserve_snapshot_status preserve_trx_temp_table_build_preserve_manifest(
     }
 
     if (first_image_for_space) {
-      const Preserved_trx_carrier_status image_seal_status =
-          adopted_phase1_sidecar
-              ? carrier.seal_prevalidated_warm_image(image_warmcopy_id, token,
-                                                     entry.image)
-              : carrier.seal_warm_image(image_warmcopy_id, token, entry.image);
+      Preserved_trx_carrier_status image_seal_status;
+      {
+#ifndef NDEBUG
+        Preserve_trx_temp_stage_timer timer(
+            Preserve_trx_temp_stage::SOURCE_FINAL_SEAL, nullptr, true);
+#endif
+        image_seal_status =
+            adopted_phase1_sidecar
+                ? carrier.seal_prevalidated_warm_image(image_warmcopy_id, token,
+                                                       entry.image)
+                : carrier.seal_warm_image(image_warmcopy_id, token, entry.image);
+      }
       if (image_seal_status != Preserved_trx_carrier_status::OK) {
         participant->mark_degraded("temp-table image sidecar seal failed");
         cleanup_sidecars();
@@ -3934,6 +4045,8 @@ Preserve_snapshot_status preserve_trx_temp_table_build_preserve_manifest(
                ("temporary image writer ownership checked"));
   });
   metadata->temp_table_manifest_payload = std::move(manifest_payload);
+  if (source_images && images && !images->bases.empty())
+    *source_images = std::move(images);
   rollback_files.commit();
   return Preserve_snapshot_status::OK;
 } catch (const std::bad_alloc &) {
@@ -4236,15 +4349,6 @@ bool preserve_trx_temp_table_debug_fail_after_one_open_before_next(
   return fail;
 }
 
-std::string preserve_trx_temp_table_resume_open_path(
-    const std::string &dir, const std::string &token,
-    const Preserved_temp_table_manifest_entry &entry) {
-  (void)dir;
-  (void)token;
-  return preserve_temp_dict_open_path(entry);
-}
-
-
 Preserve_snapshot_status preserve_trx_temp_table_deserialize_dd_table(
     THD *thd, const Preserved_temp_table_manifest_entry &entry,
     Preserve_trx_temp_table_deserialized_dd *out) {
@@ -4528,7 +4632,7 @@ Preserve_snapshot_status preserve_trx_temp_table_materialize_for_resume(
     }
 
     const std::string open_path =
-        preserve_trx_temp_table_resume_open_path(dir, token, entry);
+        preserve_temp_dict_open_path(entry);
     status = preserve_trx_temp_table_stage_open_for_resume(
         thd, open_path, entry, &deserialized_dd, &staged);
     if (status != Preserve_snapshot_status::OK) {

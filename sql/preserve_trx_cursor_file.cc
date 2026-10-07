@@ -96,7 +96,7 @@ class File_reader {
 bool validate_header(const Preserve_trx_sealed_file &file,
                      const Preserve_trx_cursor_descriptor &d,
                      File_reader *reader, uint64_t *column_count) {
-  if (!layout_valid(d) || !file.matches(d.size, d.digest)) return false;
+  if (!file.matches(d.size, d.digest)) return false;
   unsigned char header[header_size], footer[footer_size];
   if (!reader->bytes(0, header, sizeof(header)) ||
       !reader->bytes(d.size - footer_size, footer, sizeof(footer))) return false;

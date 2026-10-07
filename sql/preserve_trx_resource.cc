@@ -55,7 +55,7 @@
 #include "sql/preserve_trx_promotion_prepared.h"
 #include "sql/preserve_trx_transfer.h"
 
-ulonglong preserve_trx_memory_budget_bytes = 256ULL * 1024ULL * 1024ULL;
+ulonglong preserve_trx_memory_budget_bytes = 2ULL * 1024ULL * 1024ULL * 1024ULL;
 ulonglong preserve_trx_memory_per_token_bytes = 1024ULL * 1024ULL * 1024ULL;
 uint preserve_trx_spill_chunk_bytes = 4U * 1024U * 1024U;
 
@@ -83,11 +83,6 @@ uint64_t preserve_memory_kind_cap(Preserve_trx_memory_kind kind,
 struct Token_kind_key {
   std::string token;
   Preserve_trx_memory_kind kind{Preserve_trx_memory_kind::SNAPSHOT_CODEC_BUFFER};
-
-  bool operator<(const Token_kind_key &other) const {
-    if (token != other.token) return token < other.token;
-    return static_cast<int>(kind) < static_cast<int>(other.kind);
-  }
 };
 
 struct Token_kind_view {
@@ -795,10 +790,12 @@ DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_undo_watched_pages,
                              trx_preserve_temp_undo_watched_pages())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_undo_owners,
                              trx_preserve_temp_undo_capture_owners())
+#ifndef NDEBUG
 DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_undo_owner_pages_used,
                              trx_preserve_temp_undo_capture_pages_used())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_undo_owner_pages_routed,
                              trx_preserve_temp_undo_capture_pages_routed())
+#endif
 DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_undo_owner_quota_rejected,
                              trx_preserve_temp_undo_capture_quota_rejected())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_prebuild_undo_scans,

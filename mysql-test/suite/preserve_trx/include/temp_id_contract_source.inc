@@ -47,6 +47,10 @@ if ($contract_resume)
 {
   GRANT RESUME_ANY_PRESERVED_TRANSACTION ON *.* TO preserve_trx_ha_admin@localhost;
 }
+if ($contract_lob_fault)
+{
+  GRANT RESUME_ANY_PRESERVED_TRANSACTION ON *.* TO preserve_trx_ha_admin@localhost;
+}
 CREATE USER temp_contract_app@localhost;
 GRANT SELECT, INSERT, UPDATE, DELETE, CREATE TEMPORARY TABLES ON test.* TO temp_contract_app@localhost;
 --let $contract_target_port= $SERVER_MYPORT_2
@@ -155,9 +159,9 @@ if ($contract_dependency_free_ps)
 {
   --let $contract_extra_args= $contract_extra_args --dependency-free-ps
 }
-if ($contract_ps_capture_disabled)
+if ($contract_ps_temp_disabled)
 {
-  --let $contract_extra_args= $contract_extra_args --ps-capture-disabled
+  --let $contract_extra_args= $contract_extra_args --ps-temp-disabled
 }
 if ($contract_temp_history)
 {
@@ -179,6 +183,18 @@ if ($contract_undo_delta)
 if ($contract_native_spill)
 {
   --let $contract_extra_args= $contract_extra_args --native-spill
+}
+if ($contract_query_ack_loss)
+{
+  --let $contract_extra_args= $contract_extra_args --query-ack-loss
+}
+if ($contract_expect_sparse)
+{
+  --let $contract_extra_args= $contract_extra_args --expect-sparse
+}
+if ($contract_native_final_tail)
+{
+  --let $contract_extra_args= $contract_extra_args --native-final-tail
 }
 if ($contract_native_early)
 {
@@ -210,6 +226,20 @@ if ($contract_ack_mode)
 if ($contract_prebuild_workers)
 {
   --let $restart_parameters= $restart_parameters --rds-preserve-trx-phase1-pipeline-workers=$contract_prebuild_workers --rds-preserve-trx-phase1-pipeline-copy-chunk-bytes=4096
+}
+if ($contract_temp_batches)
+{
+  --let $contract_extra_args= $contract_extra_args --require-temp-batches
+  --let $restart_parameters= $restart_parameters --rds-preserve-trx-phase1-pipeline-copy-chunk-bytes=1048576
+}
+if ($contract_temp_batches == 2)
+{
+  --let $contract_extra_args= $contract_extra_args --temp-batch-retry
+  --let $restart_parameters= $restart_parameters --rds-preserve-trx-phase1-pipeline-copy-chunk-bytes=131072
+}
+if ($contract_final_sparse)
+{
+  --let $restart_parameters= $restart_parameters --rds-preserve-trx-phase1-capture-mode=LEGACY_SERIAL
 }
 if ($contract_undo_delta)
 {
@@ -265,6 +295,7 @@ if ($contract_lob_one_unit)
 }
 if ($contract_lob_fault)
 {
+  CALL mtr.add_suppression('PRESERVE: receiver temporary completion failed token=');
   --let $lob_trace= $MYSQLTEST_VARDIR/log/temp-lob-$contract_lob_fault.trace
   --eval SET GLOBAL debug='+d,preserve_temp_import,preserve_temp_lob_fault_$contract_lob_fault:O,$lob_trace'
   --let $contract_extra_args= $contract_extra_args --lob-fault=$contract_lob_fault --lob-trace=$lob_trace
@@ -304,7 +335,7 @@ my $r = decode_json(do {local $/; <$fh>});
 die "failed workload report lost metrics\n" if $r->{success} || $r->{error} !~ /1044/
   || !$r->{source_after} || !$r->{receiver_after} || $r->{metric_capture_errors};
 EOF
-  --exec python3 $MYSQL_TEST_DIR/../scripts/preserve_trx_temp_ready_benchmark.py --source-port=$contract_port --receiver-port=$SERVER_MYPORT_2 --sessions=3 --tables=2 --rows=128 --payload-bytes=512 --updates=3 --allow-debug --report=$MYSQLTEST_VARDIR/log/temp-ready-workload.json
+  --exec python3 $MYSQL_TEST_DIR/../scripts/preserve_trx_temp_ready_benchmark.py --source-port=$contract_port --receiver-port=$SERVER_MYPORT_2 --sessions=3 --tables=2 --rows=128 --payload-bytes=512 --updates=3 --allow-debug --require-unthrottled-transfer --require-phase1-native-ready --report=$MYSQLTEST_VARDIR/log/temp-ready-workload.json
   --exec python3 $MYSQL_TEST_DIR/../scripts/preserve_trx_temp_ready_benchmark.py --source-port=$contract_port --receiver-port=$SERVER_MYPORT_2 --collect-after --report=$MYSQLTEST_VARDIR/log/temp-ready-workload.json
   --copy_file $MYSQLTEST_VARDIR/log/temp-ready-workload.json $MYSQLTEST_VARDIR/log/temp-ready-collect-failed.json
   CREATE USER w11_metric_limit@localhost WITH MAX_QUERIES_PER_HOUR 1;
@@ -330,7 +361,23 @@ EOF
 }
 if (!$contract_ready_benchmark)
 {
-  --exec python3 $MYSQL_TEST_DIR/../scripts/preserve_trx_temp_contract_e2e.py --port=$contract_port --receiver-port=$SERVER_MYPORT_2 --namespace=$receiver_namespace $contract_extra_args
+  --let $contract_e2e_script= preserve_trx_temp_contract_e2e.py
+  if ($contract_async_temp)
+  {
+    --let $contract_e2e_script= preserve_trx_temp_async_resume_e2e.py
+    --let $contract_extra_args= $contract_extra_args --async-temp=$contract_async_temp
+  }
+  if ($contract_first_resource_touch)
+  {
+    --let $contract_e2e_script= preserve_trx_first_resource_touch_e2e.py
+    --let $contract_extra_args= $contract_extra_args --first-resource-touch=$contract_first_resource_touch
+  }
+  if ($contract_cursor_transport)
+  {
+    --let $contract_e2e_script= preserve_trx_cursor_phase1_network_e2e.py
+    --let $contract_extra_args= $contract_extra_args --cursor-transport=$contract_cursor_transport
+  }
+  --exec python3 $MYSQL_TEST_DIR/../scripts/$contract_e2e_script --port=$contract_port --receiver-port=$SERVER_MYPORT_2 --namespace=$receiver_namespace $contract_extra_args
 }
 
 # Teardown only: no RESET DRAIN or local-startup feature acceptance.

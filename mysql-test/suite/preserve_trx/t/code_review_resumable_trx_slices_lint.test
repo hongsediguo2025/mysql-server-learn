@@ -169,6 +169,9 @@ my $xa = read_source($xa_path);
 my $gunit = read_source($gunit_path);
 my $sql_parse = read_source($sql_parse_path);
 my $sql_yacc = read_source($sql_yacc_path);
+die "stored-program grammar must not retain removed PS migration hooks\n"
+  if $sql_yacc =~ /\bpreserve_trx_cursor_capture_enabled\s*\(/ ||
+     $sql_yacc =~ /#include\s+"sql\/preserve_trx_(?:cursor|ps_[^"]+|sp_[^"]+)\.h"/;
 my $sql_class = read_source($sql_class_path);
 my $sys_vars = read_source($sys_vars_path);
 my $transfer = read_source($transfer_path);
@@ -284,7 +287,7 @@ die "standby streaming transfer source epoch session must batch phase2 final tok
          $transfer =~ /Preserve_trx_transfer_source_epoch_session::send_token_objects_batch/s;
 die "standby streaming transfer source epoch session must expose chunk-level object streaming for phase1 builders\n"
   unless $transfer_header =~ /begin_token_objects\s*\(\s*const\s+Preserve_trx_transfer_manifest\s*&\s*manifest\s*(?:,\s*bool\s+queue_final_metadata\s*=\s*false)?\s*\)/s &&
-         $transfer_header =~ /write_object_chunk\s*\(\s*uint64_t\s+transfer_token\s*,\s*const\s+std::string\s*&\s*object_id\s*,\s*uint64_t\s+chunk_offset\s*,\s*const\s+std::string\s*&\s*chunk_payload\s*\)/s &&
+         $transfer_header =~ /write_object_chunk\s*\(\s*uint64_t\s+transfer_token\s*,\s*const\s+std::string\s*&\s*object_id\s*,\s*uint64_t\s+chunk_offset\s*,\s*const\s+std::string\s*&\s*chunk_payload\s*,\s*bool\s+seal_temp_object\s*=\s*false\s*\)/s &&
          $transfer_header =~ /seal_object\s*\(\s*uint64_t\s+transfer_token\s*,\s*const\s+std::string\s*&\s*object_id\s*\)/s &&
          $transfer_header =~ /finalize_token_manifest\s*\(\s*uint64_t\s+transfer_token\s*\)/s &&
          $transfer =~ /Preserve_trx_transfer_source_epoch_session::write_object_chunk/s;
@@ -1246,7 +1249,24 @@ $temp_table_carrier =~ /Preserved_trx_carrier_status fsync_directory_after_insta
 my $temp_fsync_after_install = $&;
 die "temp sidecar install/fsync failure must delete only the sidecar installed by this attempt\n"
   unless $temp_fsync_after_install =~ /my_delete\s*\(\s*installed_path\.c_str/s;
-$temp_table_carrier =~ /seal_warm_image[\s\S]*?install_temp_file[\s\S]*?fsync_directory_after_install\s*\(\s*m_dir\s*,\s*sealed_path\s*\)/m
+$temp_table_carrier =~ /::seal_warm_image\([^\{]+\) \{\s*return seal_warm_image\(warmcopy_id, token, descriptor, true\);/m
+  or die "ordinary temp image seal must request digest validation\n";
+$temp_table_carrier =~ /::seal_prevalidated_warm_image\([^\{]+\) \{[^}]*return seal_warm_image\(warmcopy_id, token, descriptor, false\);/m
+  or die "prevalidated temp image seal must skip whole-file hashing\n";
+$temp_table_carrier =~ /::seal_warm_image\([^\{]+bool verify_digest\) \{[\s\S]*?^}/m
+  or die "could not isolate common temp image seal\n";
+my $temp_image_seal = $&;
+$temp_image_seal =~ /if\s*\(\s*verify_digest\s*\)\s*\{([^{}]*)\}/s
+  or die "common temp image seal must gate digest validation\n";
+my $temp_image_digest_gate = $1;
+my $temp_image_digest_gate_end = $+[0];
+$temp_image_digest_gate =~ /const Preserved_trx_carrier_status digest_status =\s*validate_file_digest\(\s*warm_path,\s*descriptor\.size,\s*descriptor\.sha256\s*\);\s*if \(digest_status != Preserved_trx_carrier_status::OK\) return digest_status;/s
+  or die "temp image digest gate must validate the descriptor and reject errors\n";
+my $temp_image_digest_calls = () = $temp_image_seal =~ /\bvalidate_file_digest\s*\(/g;
+die "temp image digest validation must occur once and before install\n"
+  unless $temp_image_digest_calls == 1 &&
+         index($temp_image_seal, 'install_temp_file(') >= $temp_image_digest_gate_end;
+$temp_image_seal =~ /install_temp_file[\s\S]*?fsync_directory_after_install\s*\(\s*m_dir\s*,\s*sealed_path\s*\)/m
   or die "temp image seal must cleanup installed sidecar on post-install fsync failure\n";
 $temp_table_carrier =~ /seal_warm_undo[\s\S]*?install_temp_file[\s\S]*?fsync_directory_after_install\s*\(\s*m_dir\s*,\s*sealed_path\s*\)/m
   or die "temp undo seal must cleanup installed sidecar on post-install fsync failure\n";
@@ -3123,9 +3143,8 @@ die "receiver prewarm pause must be a dynamic default-OFF governor with an updat
          /preserve_trx_transfer_prewarm_paused[\s\S]{0,700}DEFAULT\(false\)[\s\S]{0,240}ON_UPDATE\(update_preserve_trx_transfer_prewarm_paused\)/s &&
          $transfer =~
          /g_receiver_prewarm_paused\.load[\s\S]{0,800}g_receiver_prewarm_cv\.wait[\s\S]{0,800}PREWARM_PAUSED/s;
-die "receiver saved-artifact IO must remain independent from the opportunistic prewarm pause\n"
-  if $transfer =~
-     /throttle_receiver_saved_io[\s\S]{0,500}g_receiver_prewarm_paused/s;
+die "transfer IO must not add source/receiver rate or fixed-yield sleeps\n"
+  if $transfer =~ /throttle_(?:receiver|source)_|preserve_trx_transfer_worker_yield|class Transfer_io_rate_limiter/s;
 die "process-local transfer receiver artifacts must not execute file or directory fsync\n"
   if $transfer =~ /\bmy_sync\s*\(|\bfsync_directory\s*\(/s;
 die "process-local promotion markers must defer file and directory fsync\n"
@@ -3264,7 +3283,7 @@ die "inflight budget pressure must be retryable resource exhaustion\n"
   unless $transfer =~
          /inflight_bytes\s*>\s*preserve_trx_transfer_max_inflight_bytes[\s\S]{0,120}RESOURCE_EXHAUSTED/s &&
          $receiver_reservation =~
-         /if\s*\(other\s*\+\s*new_bytes\s*>\s*limit\)\s*return\s+Preserve_trx_transfer_status::RESOURCE_EXHAUSTED/s;
+         /if\s*\(other\s*\+\s*new_bytes\s*>\s*limit\)\s*\{(?:(?!\breturn\b)[^{}])*\breturn\s+Preserve_trx_transfer_status::RESOURCE_EXHAUSTED;\s*\}/s;
 die "receiver reservation must account replacements and retained cleanup debt without overflow\n"
   unless $receiver_reservation =~ /if\s*\(live\s*<\s*old_bytes\)\s*return\s+Preserve_trx_transfer_status::CORRUPT/s &&
          $receiver_reservation =~ /other\s*=\s*live\s*-\s*old_bytes/s &&
@@ -3495,7 +3514,6 @@ my @rds_preserve_parameters = qw(
   rds_preserve_trx_enable
   rds_preserve_trx_temp_table_enable
   rds_preserve_trx_temp_id_namespace
-  rds_preserve_trx_result_capture_enable
   rds_preserve_trx_result_capture_max_bytes
   rds_preserve_trx_result_capture_max_count
   rds_preserve_trx_memory_budget_bytes
@@ -3532,7 +3550,7 @@ for my $parameter (@rds_preserve_parameters) {
 my @registered_rds_parameters =
   $sys_vars =~
     /static\s+Sys_var_[A-Za-z0-9_]+\s+Sys_[A-Za-z0-9_]+\s*\(\s*"(rds_preserve_trx_[a-z0-9_]+)"/sg;
-die "Preserve product parameter surface must contain exactly 31 rds_ names\n"
+die "Preserve product parameter surface must contain exactly 30 rds_ names\n"
   unless @registered_rds_parameters == @rds_preserve_parameters;
 die "legacy Preserve sysvar registrations must be removed\n"
   if $sys_vars =~

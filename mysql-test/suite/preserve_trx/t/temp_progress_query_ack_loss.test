@@ -1,0 +1,5 @@
+--disable_query_log
+CALL mtr.add_suppression('MY-001158 - Got an error reading communication packets');
+--enable_query_log
+--let $contract_query_ack_loss= 1
+--source suite/preserve_trx/t/temp_capture_native_early.test

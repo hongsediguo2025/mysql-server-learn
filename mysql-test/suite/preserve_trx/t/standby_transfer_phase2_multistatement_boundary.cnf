@@ -1,4 +1,6 @@
 [mysqld.1]
+# Shared cross-transaction fixture sets its namespace explicitly.
+rds-preserve-trx-temp-id-namespace=OFF
 server_id=1
 
 [mysqld.2]

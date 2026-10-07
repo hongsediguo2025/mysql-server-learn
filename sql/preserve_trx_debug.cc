@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <fcntl.h>
 #include <iterator>
@@ -24,6 +25,7 @@
 #include "scope_guard.h"
 #include "sql/item.h"
 #include "sql/mysqld.h"
+#include "sql/protocol_classic.h"
 #include "sql/sql_class.h"
 #include "sql/sql_cursor.h"
 #include "sql/sql_prepare.h"
@@ -74,17 +76,93 @@ bool preserve_trx_cursor_test_command(THD *thd, const char *query, size_t length
   const std::string command(query, length);
   if (command.rfind("DO /* preserve_cursor_", 0) != 0) return false;
   static std::mutex mutex;
+  static std::condition_variable control_cv;
+  static THD *control_target = nullptr;
   static std::unique_ptr<Preserve_trx_result_restore::Snapshot> exported;
-  std::lock_guard<std::mutex> guard(mutex);
+  std::unique_lock<std::mutex> guard(mutex);
   thd->reset_for_next_command();
   using Status = Preserve_trx_transfer_status;
   const std::string token = "cursor-attach-probe";
-  if (command == "DO /* preserve_cursor_export */ 0") {
+  const auto control_failure = [&](const char *message) {
+    // A bridge assertion must not match an expected API rejection or OOM.
+    thd->clear_error();
+    my_printf_error(ER_UNKNOWN_ERROR, "%s", MYF(0), message);
+    return true;
+  };
+  if (command == "DO /* preserve_cursor_control_park */ 0") {
+    if (control_target) return control_failure("cursor target already parked");
+    // This test rendezvous supplies the external session takeover guarantee.
+    // Timeout and release retire the pointer under the same lock as attachment.
+    control_target = thd;
+    control_cv.notify_all();
+    if (!control_cv.wait_for(guard, std::chrono::seconds(30),
+                            [&] { return control_target != thd; })) {
+      control_target = nullptr;
+      return control_failure("cursor target park timed out");
+    }
+  } else if (command.rfind("DO /* preserve_cursor_control_", 0) == 0) {
+    unsigned target_id = 0, id = 0, expected = 0;
+    int used = 0;
+    const bool release =
+        std::sscanf(command.c_str(), "DO /* preserve_cursor_control_release:%u */ 0%n",
+                    &target_id, &used) == 1 && used == static_cast<int>(command.size());
+    if (!release &&
+        (std::sscanf(command.c_str(), "DO /* preserve_cursor_control_attach:%u:%u:%u */ 0%n",
+                     &target_id, &id, &expected, &used) != 3 || expected > 3 ||
+         used != static_cast<int>(command.size())))
+      return control_failure("invalid cursor control command");
+    if (!control_cv.wait_for(guard, std::chrono::seconds(10), [&] {
+          return control_target && control_target->thread_id() == target_id;
+        }) || control_target == thd || current_thd != thd)
+      return control_failure("cursor control target unavailable");
+    if (release) {
+      control_target = nullptr;
+      control_cv.notify_all();
+    } else {
+      auto *target = control_target;
+      auto *ps = target->stmt_map.find(id);
+      DBUG_EXECUTE_IF("preserve_cursor_control_wrong_ps", {
+        ps = thd->stmt_map.find(id);
+      });
+      bool oom = false;
+      DBUG_EXECUTE_IF("preserve_cursor_control_bind_oom", {
+        target->get_protocol_classic()->get_output_packet()->mem_free();
+        oom = true;
+      });
+      auto *malloc_root = THR_MALLOC;
+      const auto *target_stage = target->get_proc_info();
+      const auto pending = target->preserve_trx_pending_cursor_count.load();
+      const auto status = [&] {
+        if (oom) DBUG_SET("+d,simulate_out_of_memory");
+        const auto clear_oom = create_scope_guard([&] {
+          if (oom) DBUG_SET("-d,simulate_out_of_memory");
+        });
+        return preserve_trx_attach_cursor_after_ps_replay(target, id, ps);
+      }();
+      if (current_thd != thd || THR_MALLOC != malloc_root || target->is_error() ||
+          target->get_proc_info() != target_stage)
+        return control_failure("cursor control changed session context");
+      if (static_cast<unsigned>(status) != expected ||
+          target->preserve_trx_pending_cursor_count.load() !=
+              pending - (status == Preserve_cursor_attach_status::ATTACHED ? 1 : 0))
+        return control_failure("unexpected cursor control attachment outcome");
+      if (status == Preserve_cursor_attach_status::ERROR) {
+        if (!thd->is_error()) invalid_state("cursor control attachment failed");
+        return true;
+      }
+    }
+  } else if (command == "DO /* preserve_cursor_capture */ 0") {
+    if (preserve_trx_cursor_capture_final(thd)) {
+      invalid_state("cursor capture failed");
+      return true;
+    }
+  } else if (command == "DO /* preserve_cursor_export */ 0") {
     std::string manifest;
     std::shared_ptr<const Preserve_trx_result_image> image;
     Preserve_memory_lease descriptors_memory;
     Preserve_trx_transfer_receiver_record record;
-    if (exported || preserve_trx_result_transfer_capture(thd, token, &manifest, &image) ||
+    if (exported || preserve_trx_cursor_capture_final(thd) ||
+        preserve_trx_result_transfer_capture(thd, token, &manifest, &image) ||
         manifest.empty() || !image ||
         preserve_trx_result_transfer_descriptors(token, manifest, &record.objects,
                                                 &descriptors_memory) != Status::OK) {
@@ -137,7 +215,7 @@ bool preserve_trx_cursor_test_command(THD *thd, const char *query, size_t length
   return true;
 }
 
-void preserve_trx_cursor_verify_file(const Preserve_trx_cursor_result &artifact) {
+static void preserve_trx_cursor_verify_file(const Preserve_trx_cursor_result &artifact) {
   Preserve_trx_cursor_descriptor original;
   DBUG_ASSERT(artifact.describe(&original));
   // Each modified copy is rehashed: failure must be in structure validation,
@@ -280,12 +358,17 @@ void preserve_trx_cursor_verify_file(const Preserve_trx_cursor_result &artifact)
   }
 }
 
+bool Preserve_trx_cursor_result::verify_position(uint64_t row_number) {
+  return locate_row(row_number, &m_verify_offset);
+}
+
 bool Preserve_trx_cursor_result::verify_current_row(TABLE *table) {
   return row(table, true);
 }
 
 void preserve_trx_cursor_verify_snapshot(const Server_side_cursor *cursor) {
-  if (cursor == nullptr || !cursor->is_open() || cursor->preserved_result() == nullptr)
+  if (cursor == nullptr || !cursor->is_open() || cursor->preserved_result() == nullptr ||
+      !cursor->preserved_result()->sealed())
     return;
   Preserve_trx_cursor_snapshot snapshot;
   DBUG_ASSERT(preserve_trx_cursor_snapshot(cursor, &snapshot));
@@ -399,7 +482,6 @@ dberr_t preserve_trx_temp_receiver_probe(
       work->installation_path(0) != nullptr) return DB_ERROR;
   bool cancel_early = false, write_fault = false, seal_oom = false, sync_fault = false;
   bool installation_probe = false, installation_write_fault = false;
-  bool installation_seal_oom = false;
   bool fil_probe = false, fil_failures = false;
   bool dictionary_publish_probe = false, dictionary_publish_failures = false;
   bool dictionary_native_probe = false;
@@ -412,7 +494,6 @@ dberr_t preserve_trx_temp_receiver_probe(
   DBUG_EXECUTE_IF("preserve_temp_receiver_cleanup_probe", sync_fault = true;);
   DBUG_EXECUTE_IF("preserve_temp_receiver_installation_probe", installation_probe = true;);
   DBUG_EXECUTE_IF("preserve_temp_receiver_installation_write_probe", installation_write_fault = true;);
-  DBUG_EXECUTE_IF("preserve_temp_receiver_installation_seal_probe", installation_seal_oom = true;);
   DBUG_EXECUTE_IF("preserve_temp_receiver_fil_attach_probe", fil_probe = true;);
   DBUG_EXECUTE_IF("preserve_temp_receiver_fil_attach_failure_probe", {
     fil_probe = fil_failures = true;
@@ -439,9 +520,25 @@ dberr_t preserve_trx_temp_receiver_probe(
   DBUG_EXECUTE_IF("preserve_temp_receiver_target_dictionary_failure_probe", {
     dictionary_failure = true;
   });
-  uint64_t bytes = 0;
-  for (size_t n = 0; n < original->space_count(); ++n)
-    bytes += original->source_space(n)->image_bytes;
+  uint64_t bytes = 0, expected_written = 0, first_image_written = 0;
+  for (size_t n = 0; n < original->space_count(); ++n) {
+    const auto *from = original->source_space(n);
+    bytes += from->image_bytes;
+    // This probe creates fresh files. Zero pages remain zero after conversion;
+    // only nonzero pages and the page establishing EOF require physical writes.
+    // Count the installation file before the native-owner probe consumes it.
+    std::vector<unsigned char> page(from->page_size);
+    const auto pages = from->image_bytes / from->page_size;
+    for (uint32_t p = 0; p < pages; ++p) {
+      err = original->read_source_page(n, p, page.data(), page.size());
+      if (err != DB_SUCCESS) return err;
+      if (p + 1 == pages ||
+          std::any_of(page.begin(), page.end(),
+                      [](unsigned char byte) { return byte != 0; }))
+        expected_written += page.size();
+    }
+    if (n == 0) first_image_written = expected_written;
+  }
   // A one-unit LOB proof can revisit historical chains for multiple undo
   // references. Page/record counts do not bound its number of worker steps.
   // Keep this internal probe bounded independently of production scheduling.
@@ -451,7 +548,6 @@ dberr_t preserve_trx_temp_receiver_probe(
   bool saw_seal_oom = false;
   bool saw_dictionary_failure = false;
   std::string sealed_probe_path;
-  std::string installation_probe_path;
   while (!work->images_complete()) {
     ++steps;
     if (monotonic_us() >= probe_deadline) {
@@ -483,16 +579,13 @@ dberr_t preserve_trx_temp_receiver_probe(
       saw_dictionary_failure = true;
       break;
     }
-    if ((seal_oom || installation_seal_oom) && err == DB_OUT_OF_MEMORY) {
+    if (seal_oom && err == DB_OUT_OF_MEMORY) {
       const auto *target = original->target_space(0);
       if (target == nullptr) return DB_ERROR;
-      sealed_probe_path = work->directory() + "/" + token + ".tempts." +
+      sealed_probe_path = work->directory() + "/install/" + token + ".tempts." +
                           std::to_string(target->source_space_id) + ".image";
-      installation_probe_path = work->directory() + "/install/" + token + ".tempts." +
-                                std::to_string(target->source_space_id) + ".image";
-      if (work->written_bytes() != 2 * original->source_space(0)->image_bytes ||
+      if (work->written_bytes() != first_image_written ||
           access(sealed_probe_path.c_str(), F_OK) != 0 ||
-          (installation_seal_oom && access(installation_probe_path.c_str(), F_OK) != 0) ||
           target->sealed || work->image(0) != nullptr ||
           work->installation_path(0) != nullptr || work->images_complete() ||
           work->step(1, 7, 2048, 2) != DB_OUT_OF_MEMORY)
@@ -513,12 +606,12 @@ dberr_t preserve_trx_temp_receiver_probe(
           prepared || work->step(0, 7, 2048, 2) != DB_ERROR) return DB_ERROR;
     });
     if (work->written_bytes() < before ||
-        work->written_bytes() - before > 4 * page_size) return DB_ERROR;
+        work->written_bytes() - before > 2 * page_size) return DB_ERROR;
     if ((cancel_early || write_fault || installation_write_fault) &&
         work->written_bytes() != 0) break;
   }
   if (dictionary_failure && !saw_dictionary_failure) return DB_ERROR;
-  if ((seal_oom || installation_seal_oom) && !saw_seal_oom) return DB_ERROR;
+  if (seal_oom && !saw_seal_oom) return DB_ERROR;
   if (write_fault || installation_write_fault) {
     const auto before = work->written_bytes();
     DBUG_PUSH(installation_write_fault
@@ -531,12 +624,12 @@ dberr_t preserve_trx_temp_receiver_probe(
     if (err != DB_IO_ERROR || work->step(1, 7, 2048, 2) != DB_IO_ERROR ||
         work->images_complete() || work->image(0) != nullptr ||
         work->installation_path(0) != nullptr ||
-        work->written_bytes() != before + (installation_write_fault ? page_size : 0))
+        work->written_bytes() != before)
       return DB_ERROR;
   }
   if (!cancel_early && !write_fault && !seal_oom && !dictionary_failure &&
-      !installation_write_fault && !installation_seal_oom) {
-    if (steps < 2 || work->written_bytes() != 2 * bytes) return DB_ERROR;
+      !installation_write_fault) {
+    if (steps < 2 || work->written_bytes() != expected_written) return DB_ERROR;
     err = original->probe_target_dictionary(token, dictionary_batches);
     if (err != DB_SUCCESS) return err;
     DBUG_EXECUTE_IF("preserve_temp_receiver_native_owner_probe", {
@@ -553,18 +646,11 @@ dberr_t preserve_trx_temp_receiver_probe(
           image->size != from->image_bytes ||
           !std::equal(image->sha256.begin(), image->sha256.end(), target->image_digest))
         return DB_ERROR;
-      std::shared_ptr<const Preserve_trx_sealed_file> file, installation_file;
-      const auto image_path = work->directory() + "/" + image->blob_name;
-      struct stat original_stat, installation_stat;
-      if (stat(image_path.c_str(), &original_stat) != 0 ||
-          stat(installation_path->c_str(), &installation_stat) != 0 ||
-          (original_stat.st_dev == installation_stat.st_dev &&
-           original_stat.st_ino == installation_stat.st_ino)) return DB_ERROR;
-      if (Preserve_trx_sealed_file::open_verified(
-              image_path, image->size, image->sha256, &file) != Preserve_trx_file_status::OK ||
+      std::shared_ptr<const Preserve_trx_sealed_file> file;
+      if (access((work->directory() + "/" + image->blob_name).c_str(), F_OK) == 0 ||
           Preserve_trx_sealed_file::open_verified(
               *installation_path, image->size, image->sha256,
-              &installation_file) != Preserve_trx_file_status::OK) return DB_ERROR;
+              &file) != Preserve_trx_file_status::OK) return DB_ERROR;
       std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> hash(
           EVP_MD_CTX_new(), EVP_MD_CTX_free);
       if (hash == nullptr || EVP_DigestInit_ex(hash.get(), EVP_sha256(), nullptr) != 1)
@@ -587,9 +673,6 @@ dberr_t preserve_trx_temp_receiver_probe(
         if (err != DB_SUCCESS) return err;
         if (!file->read_at(uint64_t{p} * from->page_size, actual.data(), actual.size()) ||
             actual != expected) return DB_ERROR;
-        if (!installation_file->read_at(uint64_t{p} * from->page_size,
-                                       actual.data(), actual.size()) ||
-            actual != expected) return DB_ERROR;
       }
       std::array<unsigned char, 32> source_digest;
       unsigned size = 0;
@@ -610,12 +693,17 @@ dberr_t preserve_trx_temp_receiver_probe(
         File writable = my_open(installation_path->c_str(), O_RDWR | O_NOFOLLOW, MYF(0));
         if (writable < 0) return DB_ERROR;
         const auto close = create_scope_guard([&]() { my_close(writable, MYF(0)); });
-        // A future native write must never modify the immutable retry image.
+        // The one installation file is the checked input to native adoption.
         if (pwrite(writable, &changed, 1, 0) != 1 ||
-            !installation_file->read_at(0, &after, 1) || after != changed ||
-            !file->read_at(0, &after, 1) || after != before ||
-            pwrite(writable, &before, 1, 0) != 1 || my_sync(writable, MYF(0)) != 0)
-          return DB_ERROR;
+            !file->read_at(0, &after, 1) || after != changed) return DB_ERROR;
+        std::shared_ptr<const Preserve_trx_sealed_file> rejected;
+        if (Preserve_trx_sealed_file::open_verified(
+                *installation_path, image->size, image->sha256, &rejected) ==
+                Preserve_trx_file_status::OK ||
+            pwrite(writable, &before, 1, 0) != 1 || my_sync(writable, MYF(0)) != 0 ||
+            Preserve_trx_sealed_file::open_verified(
+                *installation_path, image->size, image->sha256, &rejected) !=
+                Preserve_trx_file_status::OK) return DB_ERROR;
       }
       if (fil_probe || dictionary_publish_probe || dictionary_native_probe || table_drop_probe) {
         const auto err = original->probe_target_fil_space(n, *installation_path, fil_failures);
@@ -656,7 +744,6 @@ dberr_t preserve_trx_temp_receiver_probe(
   bool complete = false;
   if (dictionary_publish_probe) {
     const auto *target = original->target_space(0);
-    const auto original_path = candidate_dir + "/" + work->image(0)->blob_name;
     const auto installation_path = *work->installation_path(0);
     const auto tables = target->bound_dict_tables.size();
     if (tables == 0) return DB_ERROR;
@@ -665,13 +752,11 @@ dberr_t preserve_trx_temp_receiver_probe(
       const auto restore = create_scope_guard([]() { DBUG_POP(); });
       if (work->cancel_step(&complete) != DB_TABLE_IS_BEING_USED || complete ||
           target->bound_dict_tables.size() != tables || !target->fil_space_adopted ||
-          access(original_path.c_str(), F_OK) != 0 ||
           access(installation_path.c_str(), F_OK) != 0) return DB_ERROR;
     }
     for (size_t left = tables; left != 0; --left) {
       if (work->cancel_step(&complete) != DB_SUCCESS || complete ||
           target->bound_dict_tables.size() != left - 1 || !target->fil_space_adopted ||
-          access(original_path.c_str(), F_OK) != 0 ||
           access(installation_path.c_str(), F_OK) != 0) return DB_ERROR;
     }
     if (work->cancel_step(&complete) != DB_SUCCESS || complete ||
@@ -679,8 +764,6 @@ dberr_t preserve_trx_temp_receiver_probe(
       return DB_ERROR;
   }
   if (fil_probe && !dictionary_publish_probe) {
-    const auto *first = work->image(0);
-    const auto original_path = candidate_dir + "/" + first->blob_name;
     const auto installation_path = *work->installation_path(0);
     if (fil_failures) {
       for (const char *fault : {"+d,preserve_temp_fil_forget_failure",
@@ -691,41 +774,26 @@ dberr_t preserve_trx_temp_receiver_probe(
             !original->target_space(0)->fil_space_adopted ||
             !trx_preserve_temp_space_image_fil_space_adopted_by_space_id(
                 original->target_space(0)->source_space_id) ||
-            access(original_path.c_str(), F_OK) != 0 ||
-            access(installation_path.c_str(), F_OK) != 0) return DB_ERROR;
+              access(installation_path.c_str(), F_OK) != 0) return DB_ERROR;
       }
     }
     if (work->cancel_step(&complete) != DB_SUCCESS || complete ||
         original->target_space(0)->fil_space_adopted ||
-        access(original_path.c_str(), F_OK) != 0 ||
         access(installation_path.c_str(), F_OK) != 0) return DB_ERROR;
   }
-  if (seal_oom || installation_seal_oom) {
-    // Cancel each copy's writer before removing that copy's sealed image.
-    for (size_t copy = 0; copy < 2; ++copy) {
-      if (work->cancel_step(&complete) != DB_SUCCESS || complete ||
-          (access(sealed_probe_path.c_str(), F_OK) == 0) != (copy == 0) ||
-          (access(installation_probe_path.c_str(), F_OK) == 0) !=
-              installation_seal_oom) return DB_ERROR;
-      if (work->cancel_step(&complete) != DB_SUCCESS || complete ||
-          access(sealed_probe_path.c_str(), F_OK) == 0 ||
-          (access(installation_probe_path.c_str(), F_OK) == 0) !=
-              (installation_seal_oom && copy == 0)) return DB_ERROR;
-    }
+  if (seal_oom) {
+    // Close succeeded before the fault; the image owner must remove the file.
+    if (work->cancel_step(&complete) != DB_SUCCESS || complete ||
+        access(sealed_probe_path.c_str(), F_OK) == 0) return DB_ERROR;
     DBUG_PRINT("preserve_temp_import",
-               ("temporary receiver writer then sealed image cancellation checked"));
+               ("temporary receiver sealed image ownership cancellation checked"));
   }
   if (installation_probe) {
     const auto *first = work->image(0);
     const auto *path = work->installation_path(0);
     if (first == nullptr || path == nullptr) return DB_ERROR;
-    const auto original_path = candidate_dir + "/" + first->blob_name;
     const auto installation_path = *path;
-    // Advance past the original, then fail deletion and fsync in the second
-    // directory. Its owner/cursor must survive without revisiting the first.
-    if (work->cancel_step(&complete) != DB_SUCCESS || complete ||
-        access(original_path.c_str(), F_OK) == 0 ||
-        access(installation_path.c_str(), F_OK) != 0) return DB_ERROR;
+    // Failed deletion and directory sync retain the one image owner for retry.
     DBUG_PUSH("+d,preserve_temp_image_cleanup_oom");
     {
       const auto restore = create_scope_guard([]() { DBUG_POP(); });
@@ -746,13 +814,12 @@ dberr_t preserve_trx_temp_receiver_probe(
         return DB_ERROR;
     }
     if (work->cancel_step(&complete) != DB_SUCCESS || complete ||
-        access(original_path.c_str(), F_OK) == 0 ||
         access(installation_path.c_str(), F_OK) == 0) return DB_ERROR;
   }
   if (sync_fault) {
     const auto *first = work->image(0);
     if (first == nullptr) return DB_ERROR;
-    const auto image_path = candidate_dir + "/" + first->blob_name;
+    const auto image_path = *work->installation_path(0);
     DBUG_PUSH("+d,preserve_temp_image_cleanup_oom");
     {
       const auto restore = create_scope_guard([]() { DBUG_POP(); });
@@ -798,8 +865,6 @@ dberr_t preserve_trx_temp_receiver_probe(
     DBUG_PRINT("preserve_temp_import", ("temporary receiver independent installation checked"));
   if (installation_write_fault)
     DBUG_PRINT("preserve_temp_import", ("temporary receiver installation write failure checked"));
-  if (installation_seal_oom)
-    DBUG_PRINT("preserve_temp_import", ("temporary receiver installation seal failure checked"));
   if (fil_probe)
     DBUG_PRINT("preserve_temp_import", ("temporary receiver reversible fil attachment checked"));
   if (fil_failures)

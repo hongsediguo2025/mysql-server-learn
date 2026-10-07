@@ -1,0 +1,12 @@
+--source include/have_debug.inc
+--source include/have_log_bin.inc
+--disable_query_log
+--enable_query_log
+--let $contract_prebuild_workers= 1
+--let $receiver_namespace= 1
+--let $contract_temporary= undo
+--let $contract_loopback= 1
+--let $contract_engine= temp-only
+--let $contract_resume= success
+--let $contract_undo_owner_case= result-phase1-timeout
+--source suite/preserve_trx/include/temp_id_contract_source.inc

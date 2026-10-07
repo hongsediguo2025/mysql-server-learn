@@ -61,6 +61,9 @@ def storage_boundaries(port, restore_verify=False):
         stack.callback(app.close)
         stack.callback(observer.close)
         app.query("USE test")
+        app.query("SET SESSION debug='+d,preserve_cursor_test_command'")
+        def capture():
+            app.query("DO /* preserve_cursor_capture */ 0")
         if restore_verify:
             app.query("SET SESSION debug='+d,preserve_cursor_restore_verify'")
         def status(name):
@@ -94,6 +97,7 @@ def storage_boundaries(port, restore_verify=False):
                 before = status("Created_tmp_files")
                 failures = status("Preserve_trx_cursor_capture_failures")
                 app.execute_rows(ps, True)
+                capture()
                 created = status("Created_tmp_files") - before
                 assert created == files, ("capture file amplification", query, created, files)
                 assert status("Preserve_trx_cursor_capture_failures") == failures
@@ -120,6 +124,7 @@ def storage_boundaries(port, restore_verify=False):
         small = app.prepare("SELECT 1")
         before = status("Preserve_trx_memory_current_bytes")
         app.execute_rows(small, True)
+        capture()
         inline_cost = status("Preserve_trx_memory_current_bytes") - before
         assert inline_cost > 65536
         app.close_statement(small)
@@ -137,6 +142,7 @@ def storage_boundaries(port, restore_verify=False):
                 before = status("Created_tmp_files")
                 failures = status("Preserve_trx_cursor_capture_failures")
                 app.execute_rows(ps, True)
+                capture()
                 assert status("Created_tmp_files") == before + 1
                 assert status("Preserve_trx_cursor_capture_failures") == failures
                 assert status("Preserve_trx_memory_current_bytes") <= limit
@@ -178,12 +184,19 @@ def main():
         app.query("USE test")
         observer.query("USE test")
         gate = app.query("SELECT @@rds_preserve_trx_enable,"
-                         "@@rds_preserve_trx_result_capture_enable,"
                          "@@rds_preserve_trx_transfer_artifact_mode")
-        expected_gate = ["0" if args.mode == "off" else "1", "1",
+        expected_gate = ["0" if args.mode == "off" else "1",
                          "LOCAL_CARRIER" if args.mode == "local" else "STANDBY_TRANSFER_SAVE"]
         assert gate == [expected_gate], ("unexpected capture gate", args.mode, gate)
         enabled = args.mode == "on"
+        if enabled:
+            app.query("SET SESSION debug='+d,preserve_cursor_test_command'")
+        def capture(fails=False):
+            if enabled:
+                if fails:
+                    expect_error(1815, lambda: app.query("DO /* preserve_cursor_capture */ 0"))
+                else:
+                    app.query("DO /* preserve_cursor_capture */ 0")
         if args.verify:
             app.query("SET SESSION debug='+d,preserve_cursor_capture_verify'")
         if args.snapshot_verify:
@@ -222,6 +235,7 @@ def main():
         app.query("INSERT INTO t_cursor_capture VALUES(1,10),(2,20),(3,30),(4,40),(5,50),(6,60)")
         stmt = app.prepare("SELECT id FROM t_cursor_capture ORDER BY id")
         app.execute_int(stmt)
+        capture()
         live(1)
         if args.restore_verify:
             app.query("SET SESSION debug='-d,preserve_cursor_restore_verify'")
@@ -239,21 +253,28 @@ def main():
         live(0)
         expect_error(1421, lambda: app.fetch_int(stmt, 1))
         app.execute_int(stmt)
+        capture()
         assert app.fetch_int(stmt, 2) == [1, 2]
         app.execute_int(stmt)  # Replace an open result under the same PS id.
+        capture()
         live(1)
         assert app.fetch_int(stmt, 10) == [1, 2, 103, 104, 105, 106]
         live(0)
         app.execute_int(stmt)
+        capture()
         app.reset_statement(stmt)
         live(0)
         app.execute_int(stmt)
+        capture()
         second = app.prepare("SELECT id FROM t_cursor_capture ORDER BY id")
         third = app.prepare("SELECT id FROM t_cursor_capture ORDER BY id")
         app.execute_int(second)
+        capture()
         live(2)
         before = status("capture_failures")
-        app.execute_int(third)  # max_count=2: artifact refusal must not lose rows.
+        app.execute_int(third)  # Native execution succeeds before capture admission.
+        assert status("capture_failures") == before
+        capture(fails=True)
         live(2)
         assert app.fetch_int(third, 10) == [1, 2, 103, 104, 105, 106]
         assert status("capture_failures") == before + int(enabled)
@@ -263,6 +284,7 @@ def main():
         ps = app.prepare("SELECT id FROM t_cursor_capture ORDER BY id")
         _, expected = app.execute_rows(ps, False)
         app.execute_rows(ps, True)
+        capture()
         assert app.fetch_rows(ps, 2) == expected[:2]
         completed_before = status("capture_completed")
         _, actual = app.execute_rows(ps, False)  # Same PS, cursor flag removed.
@@ -270,18 +292,21 @@ def main():
         live(0)
         assert status("capture_completed") == completed_before
         app.execute_rows(ps, True)
+        capture()
         assert app.fetch_rows(ps, 2) == expected[:2]
         observer.query("ALTER TABLE t_cursor_capture ADD COLUMN extra INT DEFAULT 0")
         _, actual = app.execute_rows(ps, False)  # Server reprepare keeps the PS id.
         assert actual == expected
         live(0)
         app.execute_rows(ps, True)
+        capture()
         assert app.fetch_rows(ps, 10) == expected
         live(0)
         app.reset_statement(ps)
         app.close_statement(ps)
         empty = app.prepare("SELECT id FROM t_cursor_capture WHERE id < 0")
         app.execute_int(empty)
+        capture()
         live(1)
         assert app.fetch_int(empty, 0) == []
         live(1)
@@ -293,6 +318,7 @@ def main():
         app.query("CREATE TABLE t_cursor_gone AS SELECT * FROM t_cursor_capture")
         gone = app.prepare("SELECT id FROM t_cursor_gone ORDER BY id")
         app.execute_int(gone)
+        capture()
         if args.restore_verify:
             app.query("SET SESSION debug='-d,preserve_cursor_restore_verify'")
         assert app.fetch_int(gone, 1) == [1]
@@ -335,6 +361,7 @@ def main():
         _, context_expected = app.execute_rows(baseline_ps, False)
         app.close_statement(baseline_ps)
         app.query("SET character_set_results=latin1")
+        capture()
         assert app.fetch_rows(context_ps, 3) == context_expected
         app.close_statement(context_ps)
         app.query("SET time_zone='+00:00', character_set_results=utf8mb4")
@@ -358,7 +385,7 @@ def main():
             cursor_columns, _ = app.execute_rows(ps, True)
             if compare_metadata:
                 assert list(map(result_column, cursor_columns)) == list(map(result_column, original_columns)), (query, cursor_columns, original_columns)
-            live(1)
+            live(0)
             if expected_location:
                 trace_row = app.query("SELECT TRACE,MISSING_BYTES_BEYOND_MAX_MEM_SIZE "
                                       "FROM information_schema.optimizer_trace")[0]
@@ -382,6 +409,8 @@ def main():
                                cursor_table(event.get("tmp_table_info", {}), "disk (InnoDB)")
                                for event in trace_events(trace, "converting_tmp_table_to_ondisk")), trace
             app.query("SET optimizer_trace='enabled=off'")
+            capture()
+            live(1)
 
             def fetch_all():
                 actual = []
@@ -403,24 +432,43 @@ def main():
             fetch_all()
             if reuse:
                 app.execute_rows(ps, True)
+                capture()
                 assert app.fetch_rows(ps, 2) == expected[:2]
                 _, actual = app.execute_rows(ps, False)
                 assert actual == expected
                 live(0)
                 app.execute_rows(ps, True)  # Reopen after direct execution.
+                capture()
                 assert app.fetch_rows(ps, 2) == expected[:2]
                 app.execute_rows(ps, True)  # Replace a partially fetched disk cursor.
+                capture()
                 live(1)
                 fetch_all()
                 app.execute_rows(ps, True)
+                capture()
                 app.reset_statement(ps)
                 live(0)
                 app.execute_rows(ps, True)
+                capture()
                 assert app.fetch_rows(ps, 2) == expected[:2]
             app.close_statement(ps)
             live(0)
 
         app.query("SET internal_tmp_mem_storage_engine=MEMORY, big_tables=OFF")
+        # Long original and alias names exercise the saved schema strings even
+        # though resumed FETCH sends only rows, not another metadata packet.
+        long_db, long_table, long_column = 'd' * 64, 't' * 64, 'c' * 64
+        long_alias, long_result = 'a' * 64, 'r' * 255
+        app.query(f"CREATE DATABASE `{long_db}`")
+        app.query(f"CREATE TABLE `{long_db}`.`{long_table}` "
+                  f"(`{long_column}` INT PRIMARY KEY) ENGINE=InnoDB")
+        app.query(f"INSERT INTO `{long_db}`.`{long_table}` VALUES (11),(22),(33),(44)")
+        # Native materialization uses the result alias as org_col_name; compare
+        # binary rows across FETCH batches, not native-vs-direct name metadata.
+        compare(f"SELECT `{long_alias}`.`{long_column}` AS `{long_result}` "
+                f"FROM `{long_db}`.`{long_table}` AS `{long_alias}` "
+                f"ORDER BY `{long_column}`", compare_metadata=False)
+        app.query(f"DROP DATABASE `{long_db}`")
         compare("SELECT NULL,CAST(NULL AS CHAR(7)),CAST('' AS CHAR(0)),"
                 "CAST(0 AS DECIMAL(65,30))", compare_metadata=False)
         compare("SELECT id,u,d,f,x,dt,tm,ts,stamp,bits,c,v,b,e,s,n FROM t_cursor_values ORDER BY id",
@@ -456,6 +504,8 @@ def main():
         before = status("capture_failures")
         _, expected = app.execute_rows(ps, False)
         app.execute_rows(ps, True)
+        assert status("capture_failures") == before
+        capture(fails=True)
         live(0)
         assert app.fetch_rows(ps, 2) == expected
         assert status("capture_failures") == before + int(enabled)
@@ -466,6 +516,8 @@ def main():
                 ps = app.prepare("SELECT id FROM t_cursor_capture ORDER BY id")
                 before = status("capture_failures")
                 app.execute_int(ps)
+                assert status("capture_failures") == before
+                capture(fails=True)
                 live(0)
                 assert app.fetch_int(ps, 10) == [1, 2, 103, 104, 105, 106]
                 assert status("capture_failures") == before + int(enabled)
@@ -477,6 +529,8 @@ def main():
             before = status("capture_failures")
             app.query("SET SESSION debug='+d,preserve_cursor_capture_after_write_failure'")
             app.execute_rows(ps, True)
+            assert status("capture_failures") == before
+            capture(fails=True)
             live(0)
             assert app.fetch_rows(ps, 3) == expected
             assert status("capture_failures") == before + int(enabled)
@@ -489,6 +543,7 @@ def main():
                           "preserve_cursor_decode_row_memory_failure"):
                 ps = app.prepare("SELECT CAST('valid' AS CHAR(7))")
                 app.execute_rows(ps, True)
+                capture()
                 app.query("SET SESSION debug='+d," + fault + "'")
                 error = 1041 if fault.endswith("row_memory_failure") else 1815
                 expect_error(error, lambda: app.fetch_rows(ps, 1))

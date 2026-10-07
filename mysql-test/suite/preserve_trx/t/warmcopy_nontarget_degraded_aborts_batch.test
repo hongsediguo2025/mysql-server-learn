@@ -6,6 +6,7 @@ DROP TABLE IF EXISTS t_warmcopy_nontarget_degraded;
 --enable_warnings
 
 SET GLOBAL rds_preserve_trx_enable=ON;
+--let $old_transfer_runtime_profile= `SELECT @@GLOBAL.rds_preserve_trx_transfer_runtime_profile`
 SET GLOBAL rds_preserve_trx_transfer_runtime_profile=PROMOTION_PREPARE;
 
 CREATE TABLE t_warmcopy_nontarget_degraded(
@@ -68,5 +69,7 @@ SELECT id, v, OCTET_LENGTH(filler) AS filler_len
 
 DROP TABLE t_warmcopy_nontarget_degraded;
 SET GLOBAL rds_preserve_trx_enable=ON;
-SET GLOBAL rds_preserve_trx_transfer_runtime_profile=BUSINESS_FIRST;
+--disable_query_log
+--eval SET GLOBAL rds_preserve_trx_transfer_runtime_profile='$old_transfer_runtime_profile'
+--enable_query_log
 SET DEBUG_SYNC = 'RESET';

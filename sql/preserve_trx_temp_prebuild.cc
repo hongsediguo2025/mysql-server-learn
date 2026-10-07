@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -19,6 +20,7 @@
 #include "sql/preserve_trx.h"
 #include "sql/preserve_trx_resource.h"
 #include "sql/preserve_trx_result_pretransfer.h"
+#include "sql/preserve_trx_cursor_stream.h"
 #include "sql/preserve_trx_result_manifest.h"
 #include "sql/preserve_trx_temp_transfer.h"
 #include "sql/dd/types/table.h"
@@ -30,6 +32,11 @@
 #include "storage/innobase/include/trx0temp_preserve_output.h"
 
 namespace {
+uint64_t receiver_probe_now() {
+  return std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 std::atomic<ulonglong> temp_prebuild_steps{0};
 std::atomic<ulonglong> temp_prebuild_installed{0};
 std::atomic<ulonglong> temp_prebuild_active{0};
@@ -161,11 +168,11 @@ struct Preserve_trx_temp_prebuild_job::Impl {
     undo_claims.reset();
     undo_writer.reset();
     image_transfer.reset();  // End descriptor/writer borrowing before discard.
-    Preserve_trx_temp_prebuild_job::discard(&captures);
+    captures.clear();
   }
-  Progress fail(const char *message) {
+  Progress fail(const char *message, Progress failure = Progress::FAILED) {
     LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG, message);
-    progress = Progress::FAILED;
+    progress = failure;
     try {
       reason = message;
     } catch (const std::bad_alloc &) {
@@ -257,22 +264,11 @@ Preserve_trx_temp_prebuild_job::Progress Preserve_trx_temp_prebuild_job::Impl::f
     manifest_object.object_id = preserve_trx_temp_candidate_name(token, manifest_object.digest);
   }
   using Status = Preserve_trx_transfer_status;
-  if (session->declare_object(token, manifest_object) != Status::OK)
-    return fail("temporary manifest declare");
-  bool declared = false, sealed = false;
-  uint64_t offset = 0;
-  if (session->result_object_progress(token, manifest_object, &declared, &sealed, &offset) != Status::OK ||
-      !declared) return fail("temporary manifest progress");
-  if (sealed) return progress = Progress::DONE;
-  if (offset == manifest_payload.size()) {
-    if (session->seal_object(token, manifest_object.object_id) != Status::OK)
-      return fail("temporary manifest seal");
-    return progress = Progress::DONE;
-  }
-  const auto count = std::min<uint64_t>({bytes, session->chunk_bytes(), manifest_payload.size() - offset});
-  if (!count || session->write_object_chunk(token, manifest_object.object_id, offset,
-          manifest_payload.substr(offset, count)) != Status::OK) return fail("temporary manifest send");
-  return Progress::MORE;
+  bool complete = false;
+  if (preserve_trx_temp_candidate_send_step(session, token, manifest_object,
+          manifest_payload, bytes, &complete) != Status::OK)
+    return fail("temporary manifest transfer", Progress::TRANSFER_FAILED);
+  return complete ? progress = Progress::DONE : Progress::MORE;
 }
 
 Preserve_trx_temp_capture_input::Preserve_trx_temp_capture_input() = default;
@@ -307,11 +303,6 @@ Preserve_trx_temp_capture_input::~Preserve_trx_temp_capture_input() {
   retire(retired_sidecar);
 }
 
-void Preserve_trx_temp_prebuild_job::discard(
-    std::vector<Preserve_trx_temp_capture_input> *captures) {
-  captures->clear();
-}
-
 Preserve_trx_temp_prebuild_job::Progress Preserve_trx_temp_prebuild_job::step(
     size_t byte_budget, Preserve_trx_transfer_source_epoch_session *session,
     uint64_t transfer_token) {
@@ -344,13 +335,20 @@ Preserve_trx_temp_prebuild_job::Progress Preserve_trx_temp_prebuild_job::step(
   struct Sink {
     Temp_table_warmcopy_participant::Prebuilt_sidecar *sidecar;
     uint64_t written{0};
+    uint64_t fresh_copy_bytes{0};
   } output{&sidecar};
   const auto sink = [](void *arg, uint32_t page_no, const unsigned char *page,
                        size_t bytes) {
     auto &out = *static_cast<Sink *>(arg);
-    if (bytes != out.sidecar->descriptor.page_size ||
-        out.sidecar->image_writer->write_at(uint64_t(page_no) * bytes,
-                                           page, bytes) != Status::OK)
+    if (bytes != out.sidecar->descriptor.page_size) return DB_IO_ERROR;
+    const uint64_t offset = uint64_t(page_no) * bytes;
+    // Only a fresh COPY has zero-filled holes. Write the last page to set EOF;
+    // subsequent rounds must overwrite any old nonzero content normally.
+    if (out.fresh_copy_bytes && offset + bytes < out.fresh_copy_bytes &&
+        std::all_of(page, page + bytes,
+                    [](unsigned char byte) { return byte == 0; }))
+      return DB_SUCCESS;
+    if (out.sidecar->image_writer->write_at(offset, page, bytes) != Status::OK)
       return DB_IO_ERROR;
     out.written += bytes;
     return DB_SUCCESS;
@@ -418,6 +416,7 @@ Preserve_trx_temp_prebuild_job::Progress Preserve_trx_temp_prebuild_job::step(
         Preserve_trx_temp_stage_timer timer(Preserve_trx_temp_stage::SOURCE_COPY);
         const auto buffer_before = s.scan->buffer_pages_read();
         const auto file_before = s.scan->file_pages_read();
+        output.fresh_copy_bytes = s.scan->image_bytes();
         const auto error = s.scan->step(pages, &output, sink, &done);
         timer.write(output.written);
         temp_prebuild_buffer_pages += s.scan->buffer_pages_read() - buffer_before;
@@ -594,7 +593,7 @@ Preserve_trx_temp_prebuild_job::Progress Preserve_trx_temp_prebuild_job::step(
         bool sent = false;
         if (s.undo_transfer->step(session, transfer_token, byte_budget,
                                   &sent) != Preserve_trx_transfer_status::OK)
-          return s.fail("temporary prebuild undo transfer failed");
+          return s.fail("temporary prebuild undo transfer failed", Progress::TRANSFER_FAILED);
         if (sent) {
           s.undo_transfer->select(&sidecar.undo);
           if (!s.undo_transfer->is_delta()) sidecar.undo_base = s.undo_transfer;
@@ -645,6 +644,8 @@ Preserve_trx_temp_prebuild_job::Progress Preserve_trx_temp_prebuild_job::step(
             s.stage = Impl::Stage::CHECKPOINT_EXTEND;
             break;
           }
+          if (sidecar.image_writer->flush() != Status::OK)
+            return s.fail("temporary prebuild DATA sync failed");
           ++s.next;
           s.stage = Impl::Stage::NEXT;
 
@@ -662,6 +663,10 @@ Preserve_trx_temp_prebuild_job::Progress Preserve_trx_temp_prebuild_job::step(
         timer.write(written);
         if (error != Status::OK) return s.fail("temporary checkpoint length failed");
         if (done) {
+          // Settle this round's DATA before handing off the checkpoint. Later
+          // writes mark the writer dirty again; final still syncs its tail.
+          if (sidecar.image_writer->flush() != Status::OK)
+            return s.fail("temporary checkpoint DATA sync failed");
           if (session && transfer_token) {
             s.stage = Impl::Stage::IMAGE_COPY;
             break;
@@ -701,12 +706,9 @@ Preserve_trx_temp_prebuild_job::Progress Preserve_trx_temp_prebuild_job::step(
         break;
       }
       case Impl::Stage::IMAGE_TRANSFER:
-        if (!s.image_transfer->prepare(sidecar.image_base, transfer_token,
-              sidecar.source_space_id, byte_budget, &done))
-          return s.fail("temporary image delta encode");
-        if (!done) break;
         if (s.image_transfer->step(session, transfer_token, byte_budget, &done) !=
-            Preserve_trx_transfer_status::OK) return s.fail("temporary image transfer");
+            Preserve_trx_transfer_status::OK)
+          return s.fail("temporary image transfer", Progress::TRANSFER_FAILED);
         if (done) {
           if (!s.image_transfer->is_delta()) {
             sidecar.image_base = s.image_transfer;
@@ -721,10 +723,6 @@ Preserve_trx_temp_prebuild_job::Progress Preserve_trx_temp_prebuild_job::step(
         }
         break;
     }
-    DBUG_PRINT("preserve_temp_import",
-               ("temporary phase1 worker step stage=%u space=%u complete=%u",
-                static_cast<unsigned>(s.stage), sidecar.source_space_id,
-                s.progress == Progress::DONE));
     return s.progress;
   } catch (const std::bad_alloc &) {
     return s.stale();
@@ -744,6 +742,33 @@ Preserve_trx_temp_prebuild_job::Install Preserve_trx_temp_prebuild_job::install(
         target->preserve_trx_temp_table_participant != s.participant)
       return Install::STALE;
     if (!target->m_server_idle) return Install::BUSY;
+    if (s.identity.transaction_generation !=
+        s.participant->transaction_generation()) {
+      // COMMIT may retain the registration, but never the transaction's undo
+      // or candidate. A completed job can return only its still-current DATA.
+      if (s.progress != Progress::DONE) return Install::STALE;
+      for (const auto &capture : s.captures) {
+        const auto &sidecar = capture.sidecar;
+        if (!sidecar || sidecar->descriptor.undo_only) continue;
+        if (!sidecar->continuous || sidecar->tail_sealed ||
+            sidecar->has_undo || sidecar->undo_scan_pending || !sidecar->image_writer ||
+            sidecar->data_generation != s.participant->data_generation() ||
+            s.participant->find_prebuilt_sidecar(sidecar->source_space_id) ||
+            !trx_preserve_temp_capture_stream_current(&sidecar->descriptor,
+                sidecar->descriptor.dirty_page_capture_floor)) return Install::STALE;
+      }
+      if (!s.participant->reserve_prebuilt_sidecars(s.captures.size()))
+        return Install::STALE;
+      bool data_retained = false;
+      for (auto &capture : s.captures) {
+        if (capture.sidecar && !capture.sidecar->descriptor.undo_only) {
+          if (!s.participant->remember_prebuilt_sidecar(std::move(capture.sidecar)))
+            return Install::FAILED;
+          data_retained = true;
+        }
+      }
+      return data_retained ? Install::DATA_RETAINED : Install::STALE;
+    }
     if (s.identity.resource_only) {
       if (!trx_preserve_idle_thd_has_no_engine(target)) return Install::STALE;
     } else {
@@ -800,12 +825,19 @@ bool Preserve_trx_temp_prebuild_job::initial_baseline_complete() const {
   return true;
 }
 
+const std::string &Preserve_trx_temp_prebuild_job::receiver_candidate_id() const {
+  return m_impl->manifest_object.object_id;
+}
+
 struct Preserve_trx_temp_prebuild_owner::Impl {
   struct Entry {
     std::shared_ptr<Preserve_trx_temp_prebuild_job> job;
     uint64_t owner_cookie{0}, generation{0};
     bool inflight{false};
-    bool result_pending{false}, prefer_result{true}, result_failed{false};
+    std::string receiver_pending;
+    bool receiver_initial_pending{false};
+    uint64_t next_probe_us{0};
+    bool result_pending{false}, prefer_result{true}, transfer_failed{false};
     bool initial_temp_done{false}, initial_result_done{false};
   };
   mutable std::mutex mutex;
@@ -814,12 +846,11 @@ struct Preserve_trx_temp_prebuild_owner::Impl {
   Preserve_trx_phase1_pipeline *pipeline{nullptr};
   Preserve_trx_transfer_source_epoch_session *session{nullptr};
   std::shared_ptr<Preserve_trx_result_pretransfer> results;
-  // Only the drain owner changes these predicates. Workers mutate job contents,
-  // prefer_result and result_failed, none of which changes the statistics.
-  static bool active(const Entry &e) { return e.job || e.result_pending; }
+  // Workers may settle the initial receiver attempt while inflight is true.
+  // consume() invalidates the statistics before clearing inflight.
+  static bool active(const Entry &e) { return bool(e.job); }
   static bool waiting(const Entry &e) {
-    return (!e.initial_temp_done || !e.initial_result_done) &&
-           !e.job && !e.inflight && !e.result_pending;
+    return !e.initial_temp_done && !e.job && e.receiver_pending.empty();
   }
   void rebuild_statistics() {
     active_count = waiting_count = 0;
@@ -839,7 +870,9 @@ struct Preserve_trx_temp_prebuild_owner::Impl {
 
 Preserve_trx_temp_prebuild_owner::Preserve_trx_temp_prebuild_owner()
     : m_impl(new Impl) {}
-Preserve_trx_temp_prebuild_owner::~Preserve_trx_temp_prebuild_owner() = default;
+Preserve_trx_temp_prebuild_owner::~Preserve_trx_temp_prebuild_owner() {
+  if (m_impl->results) m_impl->results->close_capture();
+}
 
 void Preserve_trx_temp_prebuild_owner::attach(
     const Preserve_trx_phase1_pipeline_config &config,
@@ -861,6 +894,7 @@ void Preserve_trx_temp_prebuild_owner::attach(
                       m_impl->step_bytes > config.credit_bytes -
                                                config.record_reserve_bytes -
                                                config.binlog_reserve_bytes;
+  if (!m_impl->finishing && m_impl->results) preserve_trx_cursor_stream_publish(m_impl->results);
 }
 
 std::map<uint64_t, uint64_t>
@@ -870,8 +904,7 @@ Preserve_trx_temp_prebuild_owner::deferred_capture_targets() const {
   bool pending = false;
   for (const auto &entry : m_impl->entries) {
     const auto &state = entry.second;
-    if ((!state.initial_temp_done || !state.initial_result_done) &&
-        !state.job && !state.inflight && !state.result_pending) {
+    if (Impl::waiting(state)) {
       pending = true;
       break;
     }
@@ -918,25 +951,25 @@ bool Preserve_trx_temp_prebuild_owner::capture(THD *target,
       if (!current.owner_cookie) current.owner_cookie = cookie;
       const size_t others = s.active_count - prior_active;
       const bool initial_pending = s.waiting_count > size_t(prior_waiting);
-      if (initial_pending && current.initial_temp_done &&
-          current.initial_result_done) return true;
+      if (initial_pending && current.initial_temp_done) return true;
       if (others >= std::min(s.config.worker_count, s.config.result_slots))
         return true;
       // A result batch accompanies a capture round, not each worker step.
       // Keep sending the pinned batch while DATA/undo makes bounded progress.
       if (current.owner_cookie == cookie &&
-          (current.job || current.inflight)) return true;
+          (current.job || current.inflight || !current.receiver_pending.empty())) return true;
     }
     if (s.results) {
       using Result_state = Preserve_trx_result_pretransfer::State;
-      const auto state = s.results->capture(target);
+      s.results->request_next_round(id);
+      const auto state = s.results->state(id);
       if (state == Result_state::FAILED) return false;
       std::lock_guard<std::mutex> lock(s.mutex);
       auto &entry = s.entries[id];
       // An incomplete sample needs another source safe point. It must not
       // consume a worker slot, credit or another owner's capture opportunity.
       entry.result_pending = state == Result_state::RUNNABLE;
-      entry.initial_result_done |= state == Result_state::COMPLETE;
+      entry.initial_result_done |= s.results->initial_complete(id);
       if (entry.result_pending) {
         if (!entry.generation) entry.generation = ++s.next_generation;
         entry.owner_cookie = cookie;
@@ -977,19 +1010,24 @@ bool Preserve_trx_temp_prebuild_owner::capture(THD *target,
 bool Preserve_trx_temp_prebuild_owner::submit() {
   auto &s = *m_impl;
   if (!s.pipeline || s.finishing) return true;
+  const auto streams = s.results ? s.results->stream_owners() : std::map<uint64_t, uint64_t>{};
   std::unique_lock<std::mutex> lock(s.mutex);
+  for (const auto &stream : streams) {
+    if (!s.session->result_token_declared(stream.first)) continue;
+    auto &entry = s.entries[stream.first];
+    if (!entry.owner_cookie) entry.owner_cookie = stream.second;
+  }
   s.active_count = s.waiting_count = 0;
   for (auto &item : s.entries) {
     auto &entry = item.second;
-    if (s.results && !entry.inflight &&
-        (!entry.initial_result_done || !entry.initial_temp_done)) {
+    if (s.results && !entry.inflight) {
       bool initial_temp_absent = false;
       const auto state = s.results->state(item.first, &initial_temp_absent);
       // The command owner observed this at a complete boundary. It settles
       // only the initial attempt; later TEMP changes still reach final capture.
       entry.initial_temp_done |= initial_temp_absent;
       entry.result_pending = state == Preserve_trx_result_pretransfer::State::RUNNABLE;
-      entry.initial_result_done = state == Preserve_trx_result_pretransfer::State::COMPLETE;
+      entry.initial_result_done |= s.results->initial_complete(item.first);
       if (entry.result_pending && !entry.generation) entry.generation = ++s.next_generation;
     }
     s.active_count += Impl::active(entry);
@@ -1004,7 +1042,12 @@ bool Preserve_trx_temp_prebuild_owner::submit() {
     auto &item = *next++;
     auto &entry = item.second;
     s.next_submit_token = next == s.entries.end() ? 0 : next->first;
-    if ((!entry.job && !entry.result_pending) || entry.inflight) continue;
+    if (s.session && !s.session->result_token_declared(item.first)) continue;
+    if ((!entry.job && !entry.result_pending && entry.receiver_pending.empty()) ||
+        entry.inflight) continue;
+    if (!entry.job &&
+        (!entry.result_pending || !s.results->runnable_now(item.first)) &&
+        (entry.receiver_pending.empty() || receiver_probe_now() < entry.next_probe_us)) continue;
     Preserve_trx_phase1_work_descriptor work;
     work.attempt_id = s.config.attempt_id;
     work.drain_generation = s.config.drain_generation;
@@ -1016,8 +1059,9 @@ bool Preserve_trx_temp_prebuild_owner::submit() {
     work.estimated_credit_bytes = s.step_bytes;
     const auto status = s.pipeline->try_submit(work);
     using Status = Preserve_trx_phase1_pipeline_submit_status;
-    if (status == Status::ADMITTED)
+    if (status == Status::ADMITTED) {
       entry.inflight = true;
+    }
     else if (status == Status::NO_SLOT || status == Status::NO_CREDIT) {
       s.next_submit_token = item.first;
       break;
@@ -1037,10 +1081,12 @@ bool Preserve_trx_temp_prebuild_owner::submit() {
 Preserve_trx_phase1_pipeline_result_status
 Preserve_trx_temp_prebuild_owner::step(
     const Preserve_trx_phase1_work_descriptor &work, size_t bytes,
+    const Preserve_trx_phase1_record_adapter_control &control,
     std::string *reason) {
   using Status = Preserve_trx_phase1_pipeline_result_status;
   std::shared_ptr<Preserve_trx_temp_prebuild_job> job;
   bool send_result = false;
+  std::string receiver_pending;
   {
     std::lock_guard<std::mutex> lock(m_impl->mutex);
     const auto it = m_impl->entries.find(work.target_thread_id);
@@ -1049,16 +1095,55 @@ Preserve_trx_temp_prebuild_owner::step(
         it->second.generation != work.family_version)
       return Status::IDENTITY_STALE;
     job = it->second.job;
-    send_result = it->second.result_pending && (it->second.prefer_result || !job);
+    send_result = it->second.result_pending &&
+        m_impl->results->runnable_now(work.target_thread_id) &&
+        (it->second.prefer_result || (!job &&
+         (it->second.receiver_pending.empty() || receiver_probe_now() < it->second.next_probe_us)));
     it->second.prefer_result = !send_result;
+    if (!job && !send_result) receiver_pending = it->second.receiver_pending;
   }
   if (send_result) {
+    if (m_impl->results->needs_capture(work.target_thread_id)) {
+      Find_thd_with_id finder(static_cast<my_thread_id>(work.target_thread_id));
+      THD *target = Global_THD_manager::get_instance()->find_thd(&finder);
+      if (!target) {
+        m_impl->results->abandon_capture(work.target_thread_id);
+        return Status::NO_PROGRESS;
+      }
+      const bool same =
+          reinterpret_cast<uintptr_t>(target) == work.target_incarnation;
+      Preserve_trx_external_thd_pin_handle pin;
+      try {
+        const auto unlock = create_scope_guard(
+            [&] { mysql_mutex_unlock(&target->LOCK_thd_data); });
+        if (same) pin = preserve_trx_acquire_external_thd_pin_locked(target);
+      } catch (const std::bad_alloc &) {
+        m_impl->results->abandon_capture(work.target_thread_id);
+        return Status::RESOURCE_EXHAUSTED;
+      }
+      if (!same || !pin) {
+        m_impl->results->abandon_capture(work.target_thread_id);
+        return Status::NO_PROGRESS;
+      }
+      if (receiver_probe_now() >= m_impl->config.stage_deadline_us)
+        return Status::NO_PROGRESS;
+      const auto captured = m_impl->results->capture(pin.thd(), bytes,
+          work.target_incarnation, control);
+      if (captured == Preserve_trx_result_pretransfer::State::FAILED) {
+        std::lock_guard<std::mutex> lock(m_impl->mutex);
+        m_impl->entries.at(work.target_thread_id).transfer_failed = true;
+        *reason = "cursor_capture_identity_failed";
+        return Status::CONSISTENCY_CONFLICT;
+      }
+      return Status::NO_PROGRESS;
+    }
     bool complete = false;
     const auto status = m_impl->results->step(m_impl->session,
-        work.target_thread_id, bytes, &complete);
+        work.target_thread_id, std::min<size_t>(bytes, 65536), &complete,
+        m_impl->config.stage_deadline_us);
     if (status != Preserve_trx_transfer_status::OK) {
       std::lock_guard<std::mutex> lock(m_impl->mutex);
-      m_impl->entries.at(work.target_thread_id).result_failed = true;
+      m_impl->entries.at(work.target_thread_id).transfer_failed = true;
       LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
              ("PRESERVE: result pretransfer failed status=" +
               std::to_string(static_cast<unsigned>(status))).c_str());
@@ -1067,7 +1152,31 @@ Preserve_trx_temp_prebuild_owner::step(
     }
     return Status::NO_PROGRESS;
   }
-  if (!job) return Status::IDENTITY_STALE;
+  if (!receiver_pending.empty()) {
+    const auto progress = m_impl->session->query_resource_prepared(
+        work.target_thread_id, receiver_pending, m_impl->config.stage_deadline_us);
+    std::lock_guard<std::mutex> lock(m_impl->mutex);
+    auto &entry = m_impl->entries.at(work.target_thread_id);
+    if (progress != Preserve_trx_transfer_status::RESOURCE_PREPARING &&
+        progress != Preserve_trx_transfer_status::RESOURCE_PREPARED &&
+        progress != Preserve_trx_transfer_status::RESOURCE_UNAVAILABLE) {
+      entry.transfer_failed = true;
+      *reason = "temp_receiver_apply_failed";
+      return Status::CONSISTENCY_CONFLICT;
+    }
+    if (entry.receiver_pending == receiver_pending) {
+      if (progress != Preserve_trx_transfer_status::RESOURCE_PREPARING) {
+        // PREPARED or optional unavailable settles this first checkpoint
+        // attempt. Later refreshes must not reopen the initial gate.
+        entry.initial_temp_done |= entry.receiver_initial_pending;
+        entry.receiver_initial_pending = false;
+        entry.receiver_pending.clear();  // Final still validates/claims.
+      }
+      entry.next_probe_us = receiver_probe_now() + 5000;
+    }
+    return Status::NO_PROGRESS;
+  }
+  if (!job) return Status::NO_PROGRESS;
   using Progress = Preserve_trx_temp_prebuild_job::Progress;
   switch (job->step(bytes, m_impl->session, work.target_thread_id)) {
     case Progress::MORE:
@@ -1076,6 +1185,14 @@ Preserve_trx_temp_prebuild_owner::step(
       return Status::PREPARED;
     case Progress::STALE:
       return Status::IDENTITY_STALE;
+    case Progress::TRANSFER_FAILED: {
+      // Receiver rejection remains fatal even if the business owner has
+      // committed or replaced its resources before this result is consumed.
+      std::lock_guard<std::mutex> lock(m_impl->mutex);
+      m_impl->entries.at(work.target_thread_id).transfer_failed = true;
+      *reason = "temp_pretransfer_failed";
+      return Status::CONSISTENCY_CONFLICT;
+    }
     case Progress::FAILED:
       try {
         *reason = job->reason();
@@ -1105,12 +1222,13 @@ bool Preserve_trx_temp_prebuild_owner::consume(
       return false;
     s.statistics_valid = false;
     it->second.inflight = false;
-    if (it->second.result_failed) return false;
+    if (it->second.transfer_failed) return false;
     using Result_state = Preserve_trx_result_pretransfer::State;
     const auto state = s.results ? s.results->state(result.target_thread_id)
                                 : Result_state::COMPLETE;
     it->second.result_pending = !s.finishing && state == Result_state::RUNNABLE;
-    if (state == Result_state::COMPLETE) it->second.initial_result_done = true;
+    if (!s.results || s.results->initial_complete(result.target_thread_id))
+      it->second.initial_result_done = true;
     if (result.status == Status::IDENTITY_STALE)
       it->second.initial_temp_done = true;  // Optional attempt deferred to final.
     if (result.status != Status::NO_PROGRESS || s.finishing)
@@ -1139,17 +1257,34 @@ bool Preserve_trx_temp_prebuild_owner::consume(
     return true;
   }
   const bool initial_done = job->initial_baseline_complete();
+  const auto candidate_id = job->receiver_candidate_id();
   const auto installed = job->install(pin.thd());
+  std::lock_guard<std::mutex> lock(s.mutex);
+  auto &entry = s.entries.at(result.target_thread_id);
   if (installed == Preserve_trx_temp_prebuild_job::Install::BUSY) {
-    std::lock_guard<std::mutex> lock(s.mutex);
-    s.entries[result.target_thread_id].job = std::move(job);
+    entry.job = std::move(job);
+  } else if (installed == Preserve_trx_temp_prebuild_job::Install::INSTALLED &&
+             !candidate_id.empty()) {
+    entry.receiver_pending = candidate_id;
+    entry.receiver_initial_pending = initial_done && !entry.initial_temp_done;
   } else if (installed == Preserve_trx_temp_prebuild_job::Install::STALE ||
-             (installed == Preserve_trx_temp_prebuild_job::Install::INSTALLED &&
+             ((installed == Preserve_trx_temp_prebuild_job::Install::INSTALLED ||
+               installed == Preserve_trx_temp_prebuild_job::Install::DATA_RETAINED) &&
               initial_done)) {
-    std::lock_guard<std::mutex> lock(s.mutex);
-    s.entries[result.target_thread_id].initial_temp_done = true;
+    entry.initial_temp_done = true;
   }
+  // COMMIT can return a valid first DATA baseline before any checkpoint was
+  // attempted. Keep that initial gate open for the next idle capture. Never
+  // reopen a completed gate or retry unrelated optional resource failures.
   return installed != Preserve_trx_temp_prebuild_job::Install::FAILED;
+}
+
+void Preserve_trx_temp_prebuild_owner::seal_result_discovery() {
+  if (m_impl->results) m_impl->results->seal_discovery();
+}
+
+void Preserve_trx_temp_prebuild_owner::last_result_round() {
+  if (!m_impl->finishing && m_impl->results) m_impl->results->last_capture_round();
 }
 
 void Preserve_trx_temp_prebuild_owner::finish_submissions() {
@@ -1167,15 +1302,18 @@ void Preserve_trx_temp_prebuild_owner::finish_submissions() {
       s.statistics_valid = false;
       if (!entry.second.inflight) discard = std::move(entry.second.job);
       entry.second.result_pending = false;
+      entry.second.receiver_pending.clear();
+      entry.second.receiver_initial_pending = false;
     }
   }
   if (s.pipeline) s.pipeline->clear_temp_demand();
 }
 
-bool Preserve_trx_temp_prebuild_owner::complete() const {
+bool Preserve_trx_temp_prebuild_owner::complete(bool inflight_only) const {
   std::lock_guard<std::mutex> lock(m_impl->mutex);
   for (const auto &entry : m_impl->entries)
-    if (entry.second.job || entry.second.inflight || entry.second.result_pending) return false;
+    if (entry.second.inflight || (!inflight_only && (entry.second.job ||
+        entry.second.result_pending || !entry.second.receiver_pending.empty()))) return false;
   return true;
 }
 
@@ -1188,8 +1326,9 @@ bool Preserve_trx_temp_prebuild_owner::initial_baselines_complete(
   for (auto &entry : m_impl->entries) {
     {
       std::lock_guard<std::mutex> lock(m_impl->mutex);
-      if (entry.second.initial_temp_done && entry.second.initial_result_done) continue;
-      if (entry.second.job || entry.second.inflight) {
+      if (entry.second.initial_temp_done && entry.second.initial_result_done)
+        continue;
+      if (entry.second.job || entry.second.inflight || !entry.second.receiver_pending.empty()) {
         complete = false;
         continue;
       }
@@ -1221,8 +1360,11 @@ bool Preserve_trx_temp_prebuild_owner::initial_baselines_complete(
 
 void Preserve_trx_temp_prebuild_owner::discard_after_join(bool discard_results) {
   m_impl->statistics_valid = false;
+  if (m_impl->results) m_impl->results->close_capture();
   for (auto &entry : m_impl->entries) {
     entry.second.job.reset();
+    entry.second.receiver_pending.clear();
+    entry.second.receiver_initial_pending = false;
     entry.second.inflight = entry.second.result_pending = false;
   }
   // Cancelling the pipeline can still lead to final preserve. Keep only the

@@ -1,0 +1,5 @@
+dependency-free PS EXECUTE after strict SQL RESUME passed
+production RESOURCES temporary transfer: cursor-only passed
+loopback receiver published temporary resources; SQL RESUME gates installation
+strict SQL RESUME integration: success passed
+cursor_phase1_network_tls-compressed_ok

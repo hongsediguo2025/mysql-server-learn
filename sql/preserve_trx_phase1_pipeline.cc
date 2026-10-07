@@ -734,9 +734,6 @@ class Preserve_trx_phase1_pipeline::Impl {
     result.credit_in_use_bytes = m_credit_in_use_bytes;
     result.record_credit_in_use_bytes = m_family_credit_in_use_bytes[0];
     result.binlog_credit_in_use_bytes = m_family_credit_in_use_bytes[1];
-    result.temp_credit_in_use_bytes = m_family_credit_in_use_bytes[2];
-    result.temp_steps = m_temp_steps;
-    result.ordinary_temp_slow_operations = m_ordinary_temp_slow_operations;
     result.tail_record_credit_consumed_bytes = m_tail_credit_consumed_bytes[0];
     result.cancel_revision = m_cancel_revision;
     result.operation_cutoff_us = m_operation_cutoff_us;
@@ -1348,9 +1345,7 @@ class Preserve_trx_phase1_pipeline::Impl {
                           NATIVE_WAIT_CAPABLE &&
               (stage == Phase1_pipeline_operation_stage::BINLOG_PREPARE ||
                stage == Phase1_pipeline_operation_stage::TEMP_STEP)) {
-            if (stage == Phase1_pipeline_operation_stage::TEMP_STEP)
-              ++m_ordinary_temp_slow_operations;
-            else
+            if (stage == Phase1_pipeline_operation_stage::BINLOG_PREPARE)
               ++m_ordinary_binlog_slow_operations;
           } else {
             ++m_operation_budget_overruns;
@@ -1672,7 +1667,6 @@ class Preserve_trx_phase1_pipeline::Impl {
       uint64_t operation_deadline_us = 0;
       bool final_generation = false;
       bool debug_prepare = false;
-      bool temp_step_executed = false;
       Preserve_trx_phase1_pipeline_family family =
           Preserve_trx_phase1_pipeline_family::RECORD_LOCK;
       Preserve_trx_phase1_work_descriptor descriptor;
@@ -1789,9 +1783,17 @@ class Preserve_trx_phase1_pipeline::Impl {
             if (m_temp_provider == nullptr) {
               prepare_outcome.status = Preserve_trx_phase1_pipeline_result_status::ADAPTER_NOT_INSTALLED;
             } else {
-              temp_step_executed = true;
+              Adapter_control_context context;
+              context.pipeline = this;
+              context.admission_id = token;
+              context.cancel_revision = revision;
+              Preserve_trx_phase1_record_adapter_control control;
+              control.deadline_us = operation_deadline_us;
+              control.cancel_probe = &Impl::adapter_cancel_probe;
+              control.cancel_context = &context;
               prepare_outcome.status = m_temp_provider->step(
-                  descriptor, descriptor.capture_byte_limit, &prepare_outcome.reason);
+                  descriptor, descriptor.capture_byte_limit, control,
+                  &prepare_outcome.reason);
             }
           } else {
             Adapter_control_context context;
@@ -1849,7 +1851,6 @@ class Preserve_trx_phase1_pipeline::Impl {
           fail_invariant_locked();
         } else {
           finish_executor_locked(slot);
-          if (temp_step_executed) ++m_temp_steps;
           slot->record_capture_payload.reset();
           if (operation_status == Phase1_pipeline_operation_status::GRANTED &&
               work_still_valid_locked(*slot)) {
@@ -2654,9 +2655,6 @@ class Preserve_trx_phase1_pipeline::Impl {
             << current.effective_record_reserve_bytes
             << " effective_binlog_reserve_bytes="
             << current.effective_binlog_reserve_bytes
-            << " temp_steps=" << current.temp_steps
-            << " temp_credit_in_use_bytes=" << current.temp_credit_in_use_bytes
-            << " ordinary_temp_slow_operations=" << current.ordinary_temp_slow_operations
             << " publication_failures=" << current.publication_failures
             << " publication_ack_uncertain="
             << current.publication_ack_uncertain
@@ -2681,8 +2679,6 @@ class Preserve_trx_phase1_pipeline::Impl {
   const Preserve_trx_phase1_pipeline_config m_config;
   Preserve_trx_phase1_binlog_provider_port *m_binlog_provider{nullptr};
   Preserve_trx_phase1_temp_provider_port *m_temp_provider{nullptr};
-  uint64_t m_temp_steps{0};
-  uint64_t m_ordinary_temp_slow_operations{0};
   mutable std::mutex m_mutex;
   std::condition_variable m_condition;
   std::mutex m_join_mutex;

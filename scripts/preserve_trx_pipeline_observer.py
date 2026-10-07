@@ -11,6 +11,7 @@ import socket
 import struct
 import threading
 import time
+import traceback
 import zlib
 
 from preserve_trx_temp_contract_e2e import AckRelay, SealAckBarrier
@@ -41,12 +42,19 @@ def frame(raw):
     chunk, pos = string_at(raw, pos)
     reason, pos = string_at(raw, pos)
     assert pos == len(raw)
+    session_only = None
+    if kind == 4 and manifest.startswith(b'PTRX_SSET_V1'):
+        start = len(b'PTRX_SSET_V1')
+        count = struct.unpack_from('<I', manifest, start)[0]
+        assert len(manifest) == start + 4 + count * 8
+        session_only = list(struct.unpack_from('<' + 'Q' * count, manifest, start + 4))
+        assert session_only == sorted(set(session_only)) and all(session_only)
     return dict(version=version, kind=kind, sequence=sequence, epoch=epoch.decode(),
                 nonce=nonce.decode(), token=token, artifact=name.decode(),
                 offset=offset, retention=struct.unpack_from('<Q', raw, end + 32)[0],
                 contract=raw[end + 72:end + 100].hex() if version == 3 else '',
                 chunk=chunk, manifest_sha=hashlib.sha256(manifest).hexdigest(), reason=reason.decode(),
-                frame_sha=hashlib.sha256(raw).hexdigest())
+                frame_sha=hashlib.sha256(raw).hexdigest(), session_only_tokens=session_only)
 
 
 def frames(raw):
@@ -85,7 +93,7 @@ def ack(packet, request, last):
     assert struct.unpack_from('<Q', raw, pos)[0] == last['sequence']
     assert raw[pos + 8:pos + 40] == hashlib.sha256(request).digest()
     status = struct.unpack_from('<H', raw, pos + 40)[0]
-    assert 0 <= status <= 12
+    assert ((1 <= status <= 5) or (13 <= status <= 15)) if last["kind"] == 13 else (0 <= status <= 12)
     assert version == last['version'] and len(nonce) == 32
     assert len(raw) == pos + (82 if version == 3 else 54)
     retention = struct.unpack_from('<Q', raw, pos + 42)[0]
@@ -96,7 +104,9 @@ def ack(packet, request, last):
 
 
 class ObservationRelay(SealAckBarrier):
-    def __init__(self, port, target, request_bytes_per_second=0, drop_reply=None):
+    def __init__(self, port, target, request_bytes_per_second=0, drop_reply=None,
+                 measure_timing=False):
+        self.measure_timing = measure_timing
         self.drop_reply = drop_reply
         self.forwarded_fault_replies = []
         self.rate = request_bytes_per_second
@@ -133,7 +143,9 @@ class ObservationRelay(SealAckBarrier):
                     readable, _, _ = select.select([client, backend], [], [], .1)
                     for sender in readable:
                         reply_event = None
+                        packet_started = time.monotonic_ns() if self.measure_timing else 0
                         seq, packet = AckRelay.packet(sender)
+                        packet_received = time.monotonic_ns() if self.measure_timing else 0
                         assert len(packet) < 0xffffff, 'fragmented Classic packet outside this benchmark'
                         request = sender is client and seq == 0 and packet[:1] == b'\x21'
                         if request:
@@ -141,11 +153,19 @@ class ObservationRelay(SealAckBarrier):
                             raw = packet[1:]
                             parsed = frames(raw)
                             pending = (raw, parsed)
+                            if self.measure_timing:
+                                timing = dict(request_started_ns=packet_started,
+                                              request_received_ns=packet_received,
+                                              request_parsed_ns=time.monotonic_ns())
                         gate = None
+                        completed_exchange = sender is backend and pending is not None
                         if sender is backend and pending:
                             raw, parsed = pending
-                            # Capacity refusal is a native Classic ERR, not an
-                            # authenticated transfer ACK. Forward it unchanged.
+                            if self.measure_timing:
+                                timing.update(response_started_ns=packet_started,
+                                              response_received_ns=packet_received)
+                            # Pre-admission failures may be Classic ERRs;
+                            # authenticated semantic failures use ACK statuses.
                             ack_status = (-int.from_bytes(packet[1:3], 'little')
                                           if packet[0] == 255 else
                                           ack(packet, raw, parsed[-1]))
@@ -177,6 +197,7 @@ class ObservationRelay(SealAckBarrier):
                                 assert gate['release'].wait(60), 'benchmark SEAL gate timed out'
                                 self.holds.append(dict(begin_ns=began, end_ns=time.monotonic_ns(), tokens=sorted(gate['tokens'])))
                             pending = None
+                        forwarding_started = time.monotonic_ns() if self.measure_timing else 0
                         if request and self.rate:
                             wire = len(packet).to_bytes(3, 'little') + bytes([seq]) + packet
                             # One aggregate rate across transfer connections. Small
@@ -196,6 +217,15 @@ class ObservationRelay(SealAckBarrier):
                                 backend.sendall(part)
                         else:
                             AckRelay.send(backend if sender is client else client, seq, packet)
+                        if self.measure_timing:
+                            sent = time.monotonic_ns()
+                            if request:
+                                timing.update(request_forwarding_ns=forwarding_started,
+                                              request_sent_ns=sent)
+                            elif completed_exchange:
+                                timing.update(response_forwarding_ns=forwarding_started,
+                                              response_sent_ns=sent)
+                                self.observe_exchange(parsed, timing, connection)
                         with self.mutex:
                             self.forwarded_bytes += len(packet) + 4
                             if reply_event is not None:
@@ -204,7 +234,11 @@ class ObservationRelay(SealAckBarrier):
         except (EOFError, ConnectionResetError, BrokenPipeError):
             pass
         except Exception as exc:
-            self.errors.append(repr(exc))
+            self.errors.append(traceback.format_exc())
+
+    def observe_exchange(self, parsed, timing, connection):
+        """Optional bounded diagnostics; one observation per request, including batches."""
+        pass
 
     def observe(self, item, now, connection):
         key = (item['epoch'], item['nonce'], item['sequence'])

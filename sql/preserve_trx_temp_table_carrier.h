@@ -79,6 +79,7 @@ struct Preserved_temp_table_image_descriptor {
   uint32_t table_flags{0};
   std::vector<Index_descriptor> indexes;
   // v12: immutable wire base and cumulative patch; logical identity stays above.
+  // v13: base may be a sparse image, with or without a cumulative patch.
   Preserved_temp_table_wire_file base, delta;
 };
 
@@ -337,6 +338,13 @@ class Local_file_preserved_temp_table_image_carrier final
  public:
   explicit Local_file_preserved_temp_table_image_carrier(std::string dir);
 
+  /** Receiver-only output in an exclusively owned, boot-scoped directory.
+  Native adoption follows successful close/result, never discovery by pathname.
+  These files have no restart recovery contract. */
+  Preserved_trx_carrier_status create_private_image_writer(
+      const std::string &token, uint32_t source_space_id,
+      std::unique_ptr<Preserved_temp_table_image_writer> *writer);
+
   /** Sequential undo output hashes bytes as they are written. Random writes
   and truncate are rejected; close/result use the same ownership checks as an
   image writer without rereading the completed file. */
@@ -415,6 +423,10 @@ class Local_file_preserved_temp_table_image_carrier final
       const std::string &token, uint32_t source_space_id) override;
 
  private:
+  Preserved_trx_carrier_status seal_warm_image(
+      const std::string &warmcopy_id, const std::string &token,
+      const Preserved_temp_table_image_descriptor &descriptor,
+      bool verify_digest);
   std::string m_dir;
 };
 

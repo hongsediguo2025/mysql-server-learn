@@ -66,6 +66,7 @@ static void net_before_header_psi(NET *net MY_ATTRIBUTE((unused)),
     */
     MYSQL_SOCKET_SET_STATE(net->vio->mysql_socket, PSI_SOCKET_STATE_IDLE);
     MYSQL_START_IDLE_WAIT(thd->m_idle_psi, &thd->m_idle_state);
+    preserve_trx_cursor_begin_read(thd);
   }
 }
 
@@ -76,6 +77,7 @@ static void net_after_header_psi(NET *net MY_ATTRIBUTE((unused)),
   thd = static_cast<THD *>(user_data);
   DBUG_ASSERT(thd != nullptr);
 
+  preserve_trx_cursor_end_read(thd);
   if (preserved_trx_end_idle_for_command_packet(thd)) {
     /*
       The server just got data for a network packet header,

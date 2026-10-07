@@ -42,7 +42,10 @@ constexpr size_t slots = 1024;
 std::array<std::shared_ptr<trx_preserve_temp_undo_capture::Impl>, slots> owners;
 std::mutex registration_mutex;
 uint64_t last_cookie{0};
-std::atomic<uint64_t> owner_count{0}, routed{0}, used{0}, quota_rejected{0};
+std::atomic<uint64_t> owner_count{0}, quota_rejected{0};
+#ifndef NDEBUG
+std::atomic<uint64_t> routed{0}, used{0};
+#endif
 
 std::shared_ptr<trx_preserve_temp_undo_capture::Impl> pin(uint64_t cookie) {
   if (!cookie || cookie == UINT64_MAX) return {};
@@ -154,7 +157,9 @@ void trx_preserve_temp_undo_capture_page(uint64_t cookie, uint32_t space,
     }
     std::memcpy(found->second.bytes.data(), bytes, size);
     found->second.watch.remember();
+#ifndef NDEBUG
     ++routed;
+#endif
   } catch (const std::bad_alloc &) {
     owner->closed.store(true, std::memory_order_release);
   }
@@ -170,7 +175,9 @@ bool trx_preserve_temp_undo_capture::take(Batch *batch, uint32_t space,
   *watch = std::move(entry->second.watch);
   // The scan's baseline reservation now pays for the moved page bytes.
   batch->pages.erase(entry);
+#ifndef NDEBUG
   ++used;
+#endif
   return true;
 }
 
@@ -179,7 +186,9 @@ void trx_preserve_temp_undo_capture_close(uint64_t cookie) noexcept {
   if (owner) owner->closed.store(true, std::memory_order_release);
 }
 uint64_t trx_preserve_temp_undo_capture_owners() { return owner_count.load(); }
+#ifndef NDEBUG
 uint64_t trx_preserve_temp_undo_capture_pages_used() { return used.load(); }
 uint64_t trx_preserve_temp_undo_capture_pages_routed() { return routed.load(); }
+#endif
 
 uint64_t trx_preserve_temp_undo_capture_quota_rejected() { return quota_rejected.load(); }

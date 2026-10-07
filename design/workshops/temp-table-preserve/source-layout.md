@@ -12,6 +12,7 @@
 | `sql/preserve_trx_temp_import.*`、`temp_restore.*`、`temp_id_contract.*` | SQL/引擎桥接、安装和临时身份合同 |
 | `storage/innobase/trx/trx0temp_preserve_*` | 原生空间/表/undo/行/LOB/字典/ID 的捕获、转换、准备和寿命 |
 | `sql/preserve_trx_cursor.*`、`cursor_file.*`、`cursor_decode.*`、`result_cursor.*` | 结果物化、封存文件、值校验及恢复后的 FETCH |
+| `sql/preserve_trx_cursor_stream.*`、`cursor_capture.*` | Phase1 新结果的有界 producer 流、存量／回退结果的安全借用扫描；共用原 worker |
 | `sql/preserve_trx_result_manifest.*` | 独立最终结果清单，只保存结果身份和位置 |
 | `sql/preserve_trx_result_pretransfer.*`、`result_transfer.*` | 现有 worker 内结果预传、final 捕获/发送/校验 |
 | `sql/preserve_trx_result_restore.*` | receiver Ready、RESUME journal、THD owner、显式 cursor attach |
@@ -36,10 +37,13 @@
 | 位置 | 当前必要接点 |
 | --- | --- |
 | `sql_prepare.*` | 将源 ID 传给结果创建；保留 cursor 成员接口和 FETCH/EOF/RESET/EXECUTE/CLOSE/析构生命周期；附着成员的定义归 `result_restore.cc` |
-| `sql_cursor.*` | 在物化时生成封存结果，稳定 snapshot 不推进原 cursor |
-| `sql_class.*` | open/pending 计数、待关联结果 owner，以及 reset/cleanup |
+| `sql_cursor.*` | 物化时记录轻量身份；Phase1 通过捕获输入和 snapshot 接口复用结果，不推进业务 cursor |
+| `sql_class.*` | open/pending 计数、待关联结果 owner、轻量读入交接状态，以及原生命周期清理 |
+| 网络首包头／`sql_thd_internal_api.*` | 发布和撤销安全读等待资格；字节、错误和命令读结束时等实际借用归还 |
 | `protocol_classic.*` | 保留原生协议与成员接口；恢复结果专用 metadata/bind 的定义归 `result_cursor.cc`；不为 CLOSE 发响应包 |
 | InnoDB 原路径 | 原有捕获、ID/FSP/undo/锁接点保持 gate；大量逻辑继续放专属文件 |
+
+`preserve_trx_cursor_capture.*` 集中处理 Phase1 短时借用、诊断区隔离和 final 共同捕获；分段扫描与封存在既有 `preserve_trx_cursor.*` 中实现。
 
 无 cursor 时使用会话计数避免扫描普通 PS；有 cursor 时 final/预传仍可能遍历 PS map。删除迁移成本不等于删除源端正常 PS 内存或原生解析成本。
 

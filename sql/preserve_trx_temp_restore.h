@@ -23,7 +23,6 @@ and native plan, but retains no worker THD, handler or session table list. */
 class Preserve_trx_temp_sql_ready {
  public:
   struct Definition {
-    size_t manifest_index{0};
     std::unique_ptr<dd::Table> dd;
     std::string key;
     const dict_table_t *native{nullptr};

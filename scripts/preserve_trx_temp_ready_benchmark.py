@@ -221,13 +221,14 @@ def capture_metrics(report, side, client):
                  if key.startswith(prefix) and isinstance(value, int)
                  and not key.endswith(("_max_us", "_active_epochs"))}
         report[side + "_stage_delta"] = delta
-        report[side + "_final_wall_us"] = sum(delta.get(prefix + "final_" + part + "_us", 0)
-                                                 for part in ("prepare_only", "bind_only", "overlap", "other"))
         report[side + "_metrics_captured_ns"] = time.monotonic_ns()
     except Exception as exc:
         report.setdefault("metric_capture_errors", {})[side] = str(exc)
+        # A partially consumed Classic response cannot be reused.
+        client.close()
     finally:
-        client.sock.settimeout(old_timeout)
+        if client.sock.fileno() >= 0:
+            client.sock.settimeout(old_timeout)
 
 
 def collect_after(args):
@@ -305,15 +306,10 @@ def run(args):
                       "result_engine", "payload_type", "tmp_table_size", "dml_rows")},
         "counter_semantics": {
             "temp_stage_us": "cumulative service time, including failed batches; not wall latency",
-            "receiver_prepared_us": "enqueue to resource preparation completion once per candidate; includes queue waits; before strict READY publication",
+            "receiver_prepared_us": "enqueue to successful resource preparation once per candidate; includes queue waits and TEMP completion after READY",
             "read_bytes": "processed logical bytes, including cache hits; not disk IO",
-            "receiver_image_written_bytes": "successful writes of both target copies",
+            "receiver_image_written_bytes": "successful target installation writes and any source merge fallback",
             "ready_after_drain_observed_us": "polling observation includes status query and scheduling delay; 10ms sleep is not an error bound",
-            "final_pending_input_bytes": "whole resource objects not yet sealed at first accepted final BEGIN; not remaining native IO",
-            "final_pending_plans": "one TEMP/result collection plan per token at first STAGED work observation; after TEMP claim (including WAIT/error), before step; not remaining bytes at BEGIN",
-            "final_observed_staged_tokens": "coverage of resource tokens with constructed final work; retries do not repeat observation",
-            "final_processed_bytes": "logical read/write work of batches completing after final BEGIN, including failures; not disk IO",
-            "final_wall_us": "sum of completed epoch samples: prepare-only + bind-only + overlap + other; other includes network/dependency/queue waits",
             "stage_outcomes": "success/failure only where classified; unclassified_calls keeps existing component-service samples explicit",
             "first_dml": "first top-level write-DML execution after strict resource RESUME, including its triggers/functions and PS reprepare/retry; CALL/SELECT nested writes and parse/protocol rejection do not consume the flag",
             "physical_resurrect": "complete trx_lists_init_at_db_start during online promotion, including native rseg resurrection; never a startup sample",
@@ -340,7 +336,7 @@ def run(args):
                 }
                 if debug and not args.allow_debug:
                     raise RuntimeError("Release build required for performance evidence")
-                for flag in ("enable", "temp_table_enable", "temp_id_namespace", "result_capture_enable"):
+                for flag in ("enable", "temp_table_enable", "temp_id_namespace"):
                     if setting(client, "rds_preserve_trx_" + flag) != "ON":
                         raise RuntimeError(name + " does not enable " + flag)
             if report["servers"]["source"]["server_uuid"] == report["servers"]["receiver"]["server_uuid"]:
@@ -442,6 +438,16 @@ def run(args):
                     raise TimeoutError("receiver READY deadline exceeded")
                 time.sleep(0.01)
             report["ready_after_drain_observed_us"] = (time.monotonic_ns() - drained) // 1000
+            deadline = time.monotonic() + args.timeout
+            while True:
+                observed = status(receiver)
+                if all(observed.get("Preserve_trx_transfer_receiver_" + name, -1) == 0
+                       for name in ("inflight_tokens", "queued_bytes", "worker_active")):
+                    break
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("receiver TEMP completion deadline exceeded")
+                time.sleep(.01)
+            report["completion_after_drain_observed_us"] = (time.monotonic_ns() - drained) // 1000
             if receiver.query("SELECT * FROM tmp_ready ORDER BY id") != [["1", "110"], ["2", "120"]]:
                 raise RuntimeError("receiver existing TEMP changed during preparation")
             receiver.query("ROLLBACK")
@@ -459,19 +465,28 @@ def run(args):
             if report["receiver_stage_delta"].get("Preserve_trx_temp_stage_receiver_image_written_bytes", 0) <= 0:
                 raise RuntimeError("receiver did not convert TEMP images")
             if report["receiver_stage_delta"].get("Preserve_trx_temp_stage_receiver_prepared_calls", 0) != args.sessions:
-                raise RuntimeError("resource preparation must be counted once per owner before READY")
+                raise RuntimeError("resource preparation must be counted once per completed owner")
             measured = report["receiver_stage_delta"]
-            if measured.get("Preserve_trx_temp_stage_final_tokens") != args.sessions:
-                raise RuntimeError("final manifest observations must cover each owner exactly once")
-            if measured.get("Preserve_trx_temp_stage_final_ready_epochs") != 1:
-                raise RuntimeError("missing epoch FINAL to READY sample")
-            if (measured.get("Preserve_trx_temp_stage_final_observed_staged_tokens") != args.sessions
-                    or measured.get("Preserve_trx_temp_stage_final_dropped_observations") != 0
-                    or report["receiver_after"].get("Preserve_trx_temp_stage_final_active_epochs") != 0):
-                raise RuntimeError("final metrics coverage incomplete")
             for stage in ("physical_prepare", "physical_resurrect", "physical_adopt", "first_dml"):
                 if measured.get("Preserve_trx_temp_stage_" + stage + "_calls", 0):
                     raise RuntimeError("READY-only workload unexpectedly entered " + stage)
+            contract_errors = []
+            resource_delta = {key: value - report["receiver_before"].get(key, 0)
+                              for key, value in report["receiver_after"].items()
+                              if isinstance(value, int)}
+            if args.require_unthrottled_transfer:
+                key = "Preserve_trx_transfer_throttled_milliseconds"
+                for side in ("source", "receiver"):
+                    if key not in report[side + "_after"]:
+                        raise RuntimeError("missing throttle metric: " + side)
+                    if report[side + "_after"][key] != report[side + "_before"][key]:
+                        contract_errors.append(side + " performed rate/yield sleeps")
+            if args.require_phase1_native_ready and resource_delta.get(
+                    "Preserve_trx_temp_native_early_ready", 0) < args.sessions:
+                contract_errors.append("native candidates did not finish before final selection")
+            report["optimization_contract_errors"] = contract_errors
+            if contract_errors:
+                raise RuntimeError("; ".join(contract_errors))
             report["success"] = True
             print("standby TEMP workload reached READY; receiver existing and future TEMP remained isolated")
     except BaseException as exc:
@@ -499,6 +514,8 @@ if __name__ == "__main__":
                         help="limit UPDATE/rollback background to a fixed prefix; default all rows")
     parser.add_argument("--timeout", type=int, default=120)
     parser.add_argument("--allow-debug", action="store_true")
+    parser.add_argument("--require-unthrottled-transfer", action="store_true")
+    parser.add_argument("--require-phase1-native-ready", action="store_true")
     parser.add_argument("--report", required=True)
     parser.add_argument("--collect-after", action="store_true",
                         help="append current receiver metrics after external promotion/RESUME; no workload")

@@ -51,10 +51,6 @@ if ($packet_case == error)
 {
   --let $packet_error= 1
 }
-if ($packet_case == off)
-{
-  --let $packet_error= 2
-}
 
 # A real application transaction holds the first row until T0 is observable.
 # The observer is an HA connection; it never owns the business lock.
@@ -208,7 +204,7 @@ if ($packet_case == error)
 }
 if ($packet_case == off)
 {
-  --let $data_ok= `SELECT (SELECT v=0 FROM t_phase2_multi WHERE id=2) AND (SELECT COUNT(*)=4 FROM t_phase2_multi)`
+  --let $data_ok= `SELECT (SELECT v=20 FROM t_phase2_multi WHERE id=2) AND (SELECT COUNT(*)=4 FROM t_phase2_multi)`
 }
 if (!$data_ok)
 {

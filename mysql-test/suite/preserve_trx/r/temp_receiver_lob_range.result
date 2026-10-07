@@ -1,1 +1,1 @@
-receiver rejected corrupt LOB before READY: range
+receiver rejected corrupt LOB before SQL RESUME: range

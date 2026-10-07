@@ -223,6 +223,10 @@ void trx_preserve_temp_capture_scan::cancel() {
 }
 #endif
 
+uint64_t trx_preserve_temp_capture_scan::image_bytes() const {
+  return m_impl ? m_impl->pages * m_impl->page_size : 0;
+}
+
 uint64_t trx_preserve_temp_capture_scan::pages_visited() const {
   return m_impl ? m_impl->next : 0;
 }

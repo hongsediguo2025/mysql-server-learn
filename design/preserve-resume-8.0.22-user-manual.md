@@ -268,7 +268,7 @@ batch max 或容量不足 fail closed。
 
 | 参数 | 默认值 | 范围/单位 | 作用域 | 含义 |
 |---|---:|---|---|---|
-| `preserve_trx_memory_budget_bytes` | `268435456` | `4096..ULLONG_MAX` 字节 | global | Preserve/Resume 通用 heap lease 总预算，默认 256 MiB。 |
+| `rds_preserve_trx_memory_budget_bytes` | `2147483648` | `4096..ULLONG_MAX` 字节 | global | Preserve/Resume 通用 heap lease 总预算，默认 2 GiB（2026-10-08 调整）。 |
 | `preserve_trx_memory_per_token_bytes` | `67108864` | `4096..ULLONG_MAX` 字节 | global | 单个 token 的通用 heap lease 预算，默认 64 MiB。 |
 | `preserve_trx_spill_chunk_bytes` | `4194304` | `4096..67108864` 字节 | global | 大 artifact 流式写入 spill/backend 时的 scratch chunk，默认 4 MiB。 |
 

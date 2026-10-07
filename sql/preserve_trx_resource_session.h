@@ -14,6 +14,9 @@ struct Preserve_trx_deferred_transfer_candidate;
 current_thd. Does not create a native session or transaction. */
 bool preserve_trx_resource_session_has_no_engine(THD *thd);
 
+/** Defer an explicit SQL boundary's engine classification until owner attach. */
+bool preserve_trx_resource_session_has_explicit_begin(THD *thd);
+
 /** Freeze retained TABLE/cursor resources under an authenticated NONE contract.
 The caller provides session metadata and owns the THD until capture finishes.
 No native detach, rollback, SELECT execution or transaction ID allocation. */

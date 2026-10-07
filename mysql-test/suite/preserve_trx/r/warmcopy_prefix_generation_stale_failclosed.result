@@ -36,6 +36,5 @@ ORDER BY id;
 id	v	payload_len	payload_ok
 1	11	1024	1
 DROP TABLE t_warmcopy_prefix_stale;
-SET GLOBAL rds_preserve_trx_transfer_runtime_profile=BUSINESS_FIRST;
 SET GLOBAL rds_preserve_trx_enable=ON;
 SET DEBUG_SYNC = 'RESET';

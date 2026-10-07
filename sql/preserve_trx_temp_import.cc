@@ -53,7 +53,7 @@ bool preserve_trx_temp_table_apply_manifest_undo_identity_for_resume(
 
 struct Preserve_trx_temp_import_work::Impl {
   enum class Phase {
-    GROUPS, SPACE_BEGIN, SPACE_MERGE, SPACE_BIND, SPACE, DICTIONARY, UNDO_BEGIN, UNDO_MERGE, UNDO_READ, GRAPH,
+    GROUPS, SPACE_BEGIN, SPACE_BASE, SPACE_MERGE, SPACE_BIND, SPACE, DICTIONARY, UNDO_BEGIN, UNDO_MERGE, UNDO_READ, GRAPH,
     RETIRE_GROUPS, DONE, TAKEN, CANCELLED
   };
   struct Group {
@@ -133,7 +133,8 @@ dberr_t Preserve_trx_temp_import_work::begin(
 }
 
 dberr_t Preserve_trx_temp_import_work::step(
-    size_t work_budget, size_t byte_budget, size_t page_budget) {
+    size_t work_budget, size_t byte_budget, size_t page_budget,
+    const trx_preserve_temp_import_plan *previous) {
   auto &s = *m_impl;
   s.scanned = 0;
   s.written = 0;
@@ -165,7 +166,24 @@ dberr_t Preserve_trx_temp_import_work::step(
         break;
       case Phase::SPACE_BEGIN: {
         const auto &image = s.next->second.first->image;
-        if (!image.delta.name.empty()) {
+        if (preserve_trx_temp_image_sparse_id(image.base.name, nullptr)) {
+          const auto base = s.input->files().find(image.base.name);
+          if (base == s.input->files().end()) return s.error = DB_CORRUPTION;
+          // Borrow only during this call. A matching immutable view retains
+          // its own file and budget leases after the donor is retired.
+          std::shared_ptr<const Preserve_trx_sealed_file> previous_file;
+          const auto n = s.plan->space_count();
+          const auto *old = previous ? previous->source_space(n) : nullptr;
+          if (old && old->source_space_id == image.source_space_id)
+            previous_file = previous->source_file(n);
+          s.delta.reset(new Preserve_trx_temp_delta_reader);
+          if (!s.delta->begin(token, image.base.name, nullptr, base->second,
+                              nullptr, std::move(previous_file)) ||
+              (image.delta.name.empty() && !s.delta->matches(image)))
+            return s.error = DB_CORRUPTION;
+          s.scanned = s.delta->read_bytes();
+          s.phase = Phase::SPACE_BASE;
+        } else if (!image.delta.name.empty()) {
           const auto base = s.input->files().find(image.base.name);
           const auto patch = s.input->files().find(image.delta.name);
           if (base == s.input->files().end() || patch == s.input->files().end())
@@ -184,6 +202,7 @@ dberr_t Preserve_trx_temp_import_work::step(
         }
         break;
       }
+      case Phase::SPACE_BASE:
       case Phase::SPACE_MERGE: {
         const auto before = s.delta->read_bytes();
         const auto writes = s.delta->written_bytes();
@@ -194,6 +213,21 @@ dberr_t Preserve_trx_temp_import_work::step(
         if (done) {
           s.image_file = s.delta->file();
           s.delta.reset();
+          const auto &image = s.next->second.first->image;
+          if (s.phase == Phase::SPACE_BASE && !image.delta.name.empty()) {
+            const auto base = s.input->files().find(image.base.name);
+            const auto patch = s.input->files().find(image.delta.name);
+            if (base == s.input->files().end() || patch == s.input->files().end())
+              return s.error = DB_CORRUPTION;
+            s.delta.reset(new Preserve_trx_temp_delta_reader);
+            if (!s.delta->begin(token, image.delta.name, s.image_file,
+                                patch->second, base->second) ||
+                !s.delta->matches(image)) return s.error = DB_CORRUPTION;
+            s.scanned += s.delta->read_bytes();
+            s.image_file.reset();
+            s.phase = Phase::SPACE_MERGE;
+            break;
+          }
           s.phase = Phase::SPACE_BIND;
         }
         break;

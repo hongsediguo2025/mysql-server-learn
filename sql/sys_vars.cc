@@ -1052,14 +1052,7 @@ static Sys_var_bool Sys_preserve_trx_temp_id_namespace(
     "table IDs to the low half of their range. Requires compatible physical "
     "writers; remains active even when Preserve is disabled.",
     READ_ONLY GLOBAL_VAR(preserve_trx_temp_id_namespace), CMD_LINE(OPT_ARG),
-    DEFAULT(false), NO_MUTEX_GUARD, NOT_IN_BINLOG);
-
-static Sys_var_bool Sys_preserve_trx_result_capture_enable(
-    "rds_preserve_trx_result_capture_enable",
-    "Capture materialized Classic cursor results at creation in standby "
-    "transfer mode. Does not by itself enable cursor transfer or RESUME.",
-    READ_ONLY GLOBAL_VAR(preserve_trx_result_capture_enable), CMD_LINE(OPT_ARG),
-    DEFAULT(false), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+    DEFAULT(true), NO_MUTEX_GUARD, NOT_IN_BINLOG);
 
 static Sys_var_ulonglong Sys_preserve_trx_result_capture_max_bytes(
     "rds_preserve_trx_result_capture_max_bytes",
@@ -1080,7 +1073,7 @@ static Sys_var_ulonglong Sys_preserve_trx_memory_budget_bytes(
     "Maximum Preserve/Resume heap bytes that may be leased across all active "
     "preserve operations before callers must spill or fail closed.",
     GLOBAL_VAR(preserve_trx_memory_budget_bytes), CMD_LINE(REQUIRED_ARG),
-    VALID_RANGE(4096, ULLONG_MAX), DEFAULT(268435456), BLOCK_SIZE(1),
+    VALID_RANGE(4096, ULLONG_MAX), DEFAULT(2147483648ULL), BLOCK_SIZE(1),
     NO_MUTEX_GUARD, NOT_IN_BINLOG);
 
 static Sys_var_uint Sys_preserve_trx_drain_phase1_timeout_ms(
@@ -1308,7 +1301,7 @@ static Sys_var_enum Sys_preserve_trx_transfer_runtime_profile(
     "artifact format, token identity, or trigger resume.",
     GLOBAL_VAR(preserve_trx_transfer_runtime_profile), CMD_LINE(REQUIRED_ARG),
     preserve_trx_transfer_runtime_profile_names,
-    DEFAULT(PRESERVE_TRX_TRANSFER_RUNTIME_BUSINESS_FIRST), NO_MUTEX_GUARD,
+    DEFAULT(PRESERVE_TRX_TRANSFER_RUNTIME_PROMOTION_PREPARE), NO_MUTEX_GUARD,
     NOT_IN_BINLOG);
 
 static Sys_var_bool Sys_preserve_trx_transfer_prewarm_paused(

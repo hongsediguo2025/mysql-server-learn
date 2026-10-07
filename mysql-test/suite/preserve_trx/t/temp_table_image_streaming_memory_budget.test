@@ -2,6 +2,8 @@
 --source include/not_log_bin.inc
 --source include/force_restart.inc
 
+# This legacy local-restart test uses the native ID policy. Namespaced TEMP
+# resources are preserved only through standby transfer.
 --let MYSQLD_DATADIR= `SELECT @@datadir`
 
 --disable_warnings

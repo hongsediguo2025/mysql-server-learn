@@ -56,14 +56,13 @@ struct trx_preserve_temp_undo_header {
 };
 
 /** One field in a row reference, update vector or ordering tail. Offsets are
-absolute within the source page. value_end excludes the optional LOB suffix;
-end includes it. NULL has no payload even for REDUNDANT tables. */
+absolute within the source page. value_end excludes the optional LOB suffix.
+NULL has no payload even for REDUNDANT tables. */
 struct trx_preserve_temp_undo_field {
   uint32_t field_number{0};
   uint32_t field_number_offset{0};  // Zero for implicit row-reference ordinals.
   uint32_t begin{0};
   uint32_t value_end{0};
-  uint32_t end{0};
   uint32_t data_offset{0};
   uint32_t data_length{0};
   uint32_t original_length{0};

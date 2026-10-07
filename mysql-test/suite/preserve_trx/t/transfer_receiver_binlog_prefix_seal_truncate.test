@@ -16,6 +16,9 @@ while (<$fh>) {
   if (/^CURRENT_TEST:/) { $corrupt = 0; $restored = 0; next; }
   ++$corrupt if /receiver semantic apply failed .*frame_type=3 .*object=binlog_cache status=CORRUPT/;
   ++$restored if /PRESERVE_PHASE2_FINAL_V1 .*source_terminal_status=SOURCE_RESTORED .*first_failure_stage=standby_transfer_receiver_not_committed_clean/;
+  # Authenticated failure may stop the target pipeline before COMMIT. The
+  # include above verifies receiver cleanup and live source transaction data.
+  ++$restored if /PRESERVE_PHASE2_FINAL_V1 .*final_ack_us=0 .*source_terminal_status=RUNNING .*first_failure_stage=early_target_pipeline_failed/;
 }
 die "truncated binlog did not fail protocol SEAL" unless $corrupt > 0;
 die "corrupt binlog did not confirm clean source restore" unless $restored > 0;

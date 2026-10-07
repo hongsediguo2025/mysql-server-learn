@@ -239,10 +239,12 @@ class trx_preserve_temp_import_plan {
   /** An exclusive, completed private donor can supply stable target identities
   and native undo. Validate both undo streams before transferring anything;
   incompatible generations return complete=true, reused=false for fresh import.
-  Both plans must remain exclusively owned until this bounded operation ends. */
+  data_only retains only DATA identities across transaction owners; callers
+  must rebuild undo and retranslate every source page. Both plans must remain
+  exclusively owned, with the same donor/mode, until this operation ends. */
   dberr_t reuse_private_batch(trx_preserve_temp_import_plan *previous,
                              size_t work_budget, size_t byte_budget,
-                             bool *complete, bool *reused);
+                             bool *complete, bool *reused, bool data_only = false);
   /** Exclusive final journal commit across all spaces and attached target
   undo. Caller has completed TABLE/handler/PS installation, owns trx execution,
   and never invokes legacy rollback after success. No data-sized work here. */
@@ -353,6 +355,7 @@ class trx_preserve_temp_import_plan {
   bool lob_complete() const { return !m_lob || m_lob_complete; }
   bool target_ids_allocated() const;
   const trx_preserve_temp_space_image_descriptor *source_space(size_t n) const;
+  std::shared_ptr<const Preserve_trx_sealed_file> source_file(size_t n) const;
   const trx_preserve_temp_space_image_descriptor *target_space(size_t n) const;
   /** Record a target image sealed by the exclusive candidate owner. This does
   not validate the complete reference graph or establish token READY. */
@@ -494,6 +497,12 @@ class trx_preserve_temp_import_plan {
   Preserve_memory_lease *m_pending_source_memory{nullptr};
 };
 
+/** Build all ownership slots in descriptor order. UINT32_MAX denotes an
+unreachable log page, which is not claimed. Each native chain is checked once. */
+dberr_t trx_preserve_temp_import_undo_claim_slots(
+    const trx_preserve_temp_space_image_descriptor &descriptor,
+    std::vector<uint32_t> *slots);
+
 /** Validate one captured undo page chain and return its native page order.
 Page identities and kinds must already have passed the sidecar page checks.
 The descriptor can contain other anchors and pages outside this chain.
@@ -504,12 +513,6 @@ to the caller; this validator does not access live engine state.
 @param[in] anchor present undo log anchor
 @param[out] pages ordered page references, replaced only on success
 @return DB_SUCCESS, DB_ERROR for a null output, DB_CORRUPTION, or DB_OUT_OF_MEMORY */
-/** Build all ownership slots in descriptor order. UINT32_MAX denotes an
-unreachable log page, which is not claimed. Each native chain is checked once. */
-dberr_t trx_preserve_temp_import_undo_claim_slots(
-    const trx_preserve_temp_space_image_descriptor &descriptor,
-    std::vector<uint32_t> *slots);
-
 dberr_t trx_preserve_temp_import_collect_undo_pages(
     const trx_preserve_temp_space_image_descriptor &descriptor,
     const trx_preserve_temp_no_redo_undo_log_anchor &anchor,

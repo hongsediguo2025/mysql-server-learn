@@ -473,6 +473,8 @@ SET(SQL_SHARED_SOURCES
   preserve_trx_file.cc
   preserve_trx_debug.cc
   preserve_trx_cursor.cc
+  preserve_trx_cursor_stream.cc
+  preserve_trx_cursor_capture.cc
   preserve_trx_cursor_file.cc
   preserve_trx_cursor_decode.cc
   preserve_trx_result_manifest.cc
