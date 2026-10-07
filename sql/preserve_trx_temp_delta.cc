@@ -13,6 +13,7 @@
 #include "my_sys.h"
 #include "my_dbug.h"
 #include "sql/mysqld.h"
+#include "sql/preserve_trx.h"
 #include "sql/preserve_trx_temp_metrics.h"
 #include "storage/innobase/include/trx0temp_preserve_capture.h"
 
@@ -116,9 +117,19 @@ bool preserve_trx_temp_undo_delta_id(const std::string &id, std::string *base) {
 bool preserve_trx_temp_image_delta_id(const std::string &id, std::string *base) {
   return delta_id(id, ".image", base);
 }
+bool preserve_trx_temp_image_sparse_id(const std::string &id, std::string *logical) {
+  constexpr size_t suffix = sizeof(".image.sparse") - 1;
+  if (id.size() <= suffix || id.compare(id.size() - suffix, suffix, ".image.sparse"))
+    return false;
+  if (logical) *logical = id.substr(0, id.size() - 7);
+  return true;
+}
 bool preserve_trx_temp_image_delta_refs_valid(
     const Preserved_temp_table_image_descriptor &d) {
   if (empty(d.base) && empty(d.delta)) return true;
+  if (valid(d.base) && d.base.name == d.blob_name + ".sparse")
+    return empty(d.delta) || (valid(d.delta) &&
+        d.delta.name == preserve_trx_temp_delta_name(d.blob_name, d.delta.digest));
   return valid(d.base) && valid(d.delta) && d.base.name == d.blob_name &&
       d.delta.name == preserve_trx_temp_delta_name(d.base.name, d.delta.digest);
 }
@@ -135,7 +146,8 @@ struct Preserve_trx_temp_delta_builder::Impl {
   int base_fd{-1}, target_fd{-1};
   Wire base, target, patch;
   uint64_t offset{0};
-  std::array<unsigned char, block> a{}, b{};
+  // Charged by sizeof(Impl); fd inputs are immutable for the builder lifetime.
+  std::array<unsigned char, 256 * 1024> a{}, b{};
   Result result{Result::MORE};
   Preserved_temp_table_image_writer *image{nullptr};
   const trx_preserve_temp_space_image_descriptor *capture{nullptr};
@@ -143,6 +155,7 @@ struct Preserve_trx_temp_delta_builder::Impl {
   uint64_t mask_first_page{UINT64_MAX};
   EVP_MD_CTX *target_hash{nullptr};
   bool rehash{false};
+  bool sparse{false};
   uint64_t hash_offset{0};
   ~Impl() { EVP_MD_CTX_free(target_hash); }
 };
@@ -169,6 +182,26 @@ bool Preserve_trx_temp_delta_builder::begin_image(
   return s.target_hash && EVP_DigestInit_ex(s.target_hash, EVP_sha256(), nullptr) == 1;
 }
 const Wire &Preserve_trx_temp_delta_builder::logical() const { return m_impl->target; }
+bool Preserve_trx_temp_delta_builder::begin_sparse(
+    uint64_t token, uint32_t space, int target_fd, const Wire &target) {
+  if (target.name != std::to_string(token) + ".tempts." +
+          std::to_string(space) + ".image" ||
+      !begin(token, space, target_fd, target_fd, target, target)) return false;
+  auto &s = *m_impl;
+  unsigned char h[header]{};
+  memcpy(h, "PTRISPR1", 8);
+  put(h + 8, token, 8);
+  put(h + 16, space, 4);
+  put(h + 60, target.size, 8);
+  memcpy(h + 68, target.digest.data(), 32);
+  put(h + 100, block, 4);
+  if (my_pwrite(s.out.fd, h, sizeof(h), 0, MYF(0)) != sizeof(h) ||
+      EVP_DigestInit_ex(s.out.hash, EVP_sha256(), nullptr) != 1 ||
+      EVP_DigestUpdate(s.out.hash, h, sizeof(h)) != 1) return false;
+  s.sparse = true;
+  s.target_hash = EVP_MD_CTX_new();
+  return s.target_hash && EVP_DigestInit_ex(s.target_hash, EVP_sha256(), nullptr) == 1;
+}
 bool Preserve_trx_temp_delta_builder::begin(
     uint64_t token, uint32_t space, int base_fd, int target_fd,
     const Wire &base, const Wire &target) {
@@ -207,18 +240,43 @@ Preserve_trx_temp_delta_builder::step(size_t bytes) {
   Preserve_trx_temp_stage_timer timer(s.image
       ? Preserve_trx_temp_stage::SOURCE_IMAGE_DELTA : Preserve_trx_temp_stage::NONE);
   DBUG_EXECUTE_IF("preserve_temp_undo_delta_encode_failure", {
-    return s.result = Result::ERROR;
+    if (!s.sparse) return s.result = Result::ERROR;
   });
   size_t consumed = 0;
+  size_t buffered = 0, used = 0;
   while (!s.rehash && s.offset < s.target.size && consumed < bytes) {
     const size_t n = std::min<uint64_t>(block, s.target.size - s.offset);
-    if (s.image ? s.image->read_at(s.offset, s.b.data(), n) != Preserved_trx_carrier_status::OK
-                : my_pread(s.target_fd, s.b.data(), n, s.offset, MYF(0)) != n)
+    if (s.image) {
+      if (s.image->read_at(s.offset, s.b.data(), n) != Preserved_trx_carrier_status::OK)
+        return s.result = Result::ERROR;
+      timer.read(n);
+    } else if (used == buffered) {
+      // Keep the existing soft step quota and 4 KiB wire records, but read
+      // adjacent immutable blocks together rather than issuing two syscalls
+      // per record. No input bytes remain buffered across step() calls.
+      const size_t quota = std::min(s.b.size(), (bytes - consumed) / 2);
+      buffered = std::min<uint64_t>(s.target.size - s.offset,
+          std::max(block, ((quota + block - 1) / block) * block));
+      used = 0;
+      if (my_pread(s.target_fd, s.b.data(), buffered, s.offset, MYF(0)) != buffered)
+        return s.result = Result::ERROR;
+      timer.read(buffered);
+      if (!s.sparse && s.offset < s.base.size) {
+        size_t base_bytes = std::min<uint64_t>(buffered, s.base.size - s.offset);
+        // A record crossing base EOF is new data and needs no comparison.
+        if (base_bytes < buffered) base_bytes -= base_bytes % block;
+        if (base_bytes && my_pread(s.base_fd, s.a.data(), base_bytes,
+                                  s.offset, MYF(0)) != base_bytes)
+          return s.result = Result::ERROR;
+        timer.read(base_bytes);
+      }
+    }
+    const unsigned char *target = s.b.data() + used;
+    if (s.target_hash && EVP_DigestUpdate(s.target_hash, target, n) != 1)
       return s.result = Result::ERROR;
-    timer.read(n);
-    if (s.target_hash && EVP_DigestUpdate(s.target_hash, s.b.data(), n) != 1)
-      return s.result = Result::ERROR;
-    bool changed = s.offset >= s.base.size || n > s.base.size - s.offset;
+    bool changed = s.sparse
+        ? std::any_of(target, target + n, [](unsigned char c) { return c != 0; })
+        : s.offset >= s.base.size || n > s.base.size - s.offset;
     bool unchanged = false;
     if (!changed && s.capture && s.offset < s.clean_prefix_bytes &&
         n <= s.clean_prefix_bytes - s.offset) {
@@ -236,11 +294,13 @@ Preserve_trx_temp_delta_builder::step(size_t bytes) {
       }
       unchanged = s.capture && !(s.dirty_mask & (uint64_t{1} << (page - first_page)));
     }
-    if (!changed && !unchanged) {
-      if (my_pread(s.base_fd, s.a.data(), n, s.offset, MYF(0)) != n)
-        return s.result = Result::ERROR;
-      timer.read(n);
-      changed = memcmp(s.a.data(), s.b.data(), n) != 0;
+    if (!s.sparse && !changed && !unchanged) {
+      if (s.image) {
+        if (my_pread(s.base_fd, s.a.data(), n, s.offset, MYF(0)) != n)
+          return s.result = Result::ERROR;
+        timer.read(n);
+      }
+      changed = memcmp(s.a.data() + used, target, n) != 0;
     }
     if (changed) {
       // Include the terminator; never grow scratch beyond the full alternative.
@@ -249,27 +309,35 @@ Preserve_trx_temp_delta_builder::step(size_t bytes) {
       unsigned char r[record];
       put(r, s.offset, 8);
       put(r + 8, n, 4);
-      if (!s.out.write(r, sizeof(r)) || !s.out.write(s.b.data(), n))
+      if (!s.out.write(r, sizeof(r)) || !s.out.write(target, n))
         return s.result = Result::ERROR;
       timer.write(sizeof(r) + n);
       DBUG_EXECUTE_IF("preserve_temp_undo_delta_duplicate", {
-        if (!s.image && s.out.written == header + record + n) {
-          if (!s.out.write(r, sizeof(r)) || !s.out.write(s.b.data(), n))
+        if (!s.image && !s.sparse && s.out.written == header + record + n) {
+          if (!s.out.write(r, sizeof(r)) || !s.out.write(target, n))
             return s.result = Result::ERROR;
         }
       });
     }
     s.offset += n;
     consumed += 2 * n;
+    if (!s.image) used += n;
   }
   if (s.offset != s.target.size) return Result::MORE;
   if (!s.rehash) {
+    if (s.sparse) {
+      std::array<unsigned char, 32> digest;
+      unsigned int n = 0;
+      if (EVP_DigestFinal_ex(s.target_hash, digest.data(), &n) != 1 ||
+          n != digest.size() || digest != s.target.digest)
+        return s.result = Result::ERROR;
+    }
     unsigned char r[record]{};
     put(r, end, 8);
     if (!s.out.write(r, sizeof(r))) return s.result = Result::ERROR;
     timer.write(sizeof(r));
     DBUG_EXECUTE_IF("preserve_temp_undo_delta_order", {
-      if (!s.image) {
+      if (!s.image && !s.sparse) {
         // Keep each complete record and the target bytes intact. Only record
         // order is invalid; recompute the physical digest for a real SEAL.
         Delta_record_buffer first{};
@@ -314,10 +382,13 @@ Preserve_trx_temp_delta_builder::step(size_t bytes) {
     if (s.hash_offset != s.out.written) return Result::MORE;
   }
   if (!s.out.finish(&s.patch.digest)) return s.result = Result::ERROR;
-  s.patch.name = preserve_trx_temp_delta_name(s.target.name, s.patch.digest);
+  s.patch.name = s.sparse ? s.target.name + ".sparse"
+                        : preserve_trx_temp_delta_name(s.target.name, s.patch.digest);
   s.patch.size = s.out.written;
-  if (s.target.name.find(".image") != std::string::npos) ++image_built;
-  else ++built;
+  if (!s.sparse) {
+    if (s.target.name.find(".image") != std::string::npos) ++image_built;
+    else ++built;
+  }
   return s.result = Result::READY;
 }
 bool Preserve_trx_temp_delta_builder::take(
@@ -335,12 +406,13 @@ bool Preserve_trx_temp_delta_builder::take(
 struct Preserve_trx_temp_delta_reader::Impl {
   Output out;
   std::unique_ptr<Preserve_trx_sealed_file::Overlay> view;
-  std::shared_ptr<const Preserve_trx_sealed_file> base, patch, result;
+  std::shared_ptr<const Preserve_trx_sealed_file> base, wire_base, patch, result;
   std::string logical, patch_id;
   uint64_t target_size{0}, patch_offset{header}, next_offset{0}, last_end{0};
   uint64_t scanned{0};
   uint32_t next_length{0};
   bool pending{false}, ended{false}, failed{false};
+  bool sparse{false};
   std::array<unsigned char, 32> digest{};
   std::array<unsigned char, block> buffer{};
   bool next() {
@@ -377,25 +449,54 @@ Preserve_trx_temp_delta_reader::~Preserve_trx_temp_delta_reader() = default;
 bool Preserve_trx_temp_delta_reader::begin(
     const std::string &token, const std::string &id,
     std::shared_ptr<const Preserve_trx_sealed_file> base,
-    std::shared_ptr<const Preserve_trx_sealed_file> delta) {
-  if (m_impl || !base || !delta) return false;
+    std::shared_ptr<const Preserve_trx_sealed_file> delta,
+    std::shared_ptr<const Preserve_trx_sealed_file> wire_base,
+    std::shared_ptr<const Preserve_trx_sealed_file> previous) {
+  if (m_impl || !delta) return false;
   auto s = std::make_unique<Impl>();
-  const bool image = preserve_trx_temp_image_delta_id(id, &s->logical);
-  if ((!image && !preserve_trx_temp_undo_delta_id(id, &s->logical)) ||
-      id != preserve_trx_temp_delta_name(s->logical, delta->digest())) return false;
+  s->sparse = preserve_trx_temp_image_sparse_id(id, &s->logical);
+  const bool image = s->sparse || preserve_trx_temp_image_delta_id(id, &s->logical);
+  if (s->sparse ? (base || wire_base) :
+      (!base || (!image && !preserve_trx_temp_undo_delta_id(id, &s->logical)) ||
+       id != preserve_trx_temp_delta_name(s->logical, delta->digest()))) return false;
   unsigned char h[header];
-  if (!delta->read_at(0, h, sizeof(h)) || memcmp(h, image ? "PTRIDLT1" : "PTRUDLT1", 8) ||
+  if (!delta->read_at(0, h, sizeof(h)) ||
+      memcmp(h, s->sparse ? "PTRISPR1" : image ? "PTRIDLT1" : "PTRUDLT1", 8) ||
       token != std::to_string(get(h + 8, 8)) || !get(h + 16, 4) ||
       s->logical != token + ".tempts." + std::to_string(get(h + 16, 4)) + (image ? ".image" : ".undo") ||
-      get(h + 100, 4) != block || get(h + 20, 8) != base->size() ||
-      memcmp(h + 28, base->digest().data(), 32)) return false;
+      get(h + 100, 4) != block) return false;
+  if (s->sparse ? std::any_of(h + 20, h + 60, [](unsigned char c) { return c != 0; }) :
+      (get(h + 20, 8) != base->size() || memcmp(h + 28, base->digest().data(), 32)))
+    return false;
   s->target_size = get(h + 60, 8);
   memcpy(s->digest.data(), h + 68, 32);
   if (!s->target_size || s->target_size > max_size || !nonzero(s->digest) ||
+      (s->sparse && s->target_size > preserve_trx_max_temp_sidecar_bytes) ||
       delta->size() >= s->target_size ||
       delta->size() < header + record ||
       !s->out.begin(token, s->target_size, sizeof(Impl) + id.size() * 2, false))
     return false;
+  // A published sparse view has already validated every record and its full
+  // logical digest. Reuse only that exact immutable physical BASE owner, not
+  // the predecessor's DELTA result or a pathname/digest lookalike.
+  if (s->sparse) {
+    while (previous && previous->m_overlay) {
+      const auto &view = *previous->m_overlay;
+      if (view.zero_default) {
+        if (view.patch.get() == delta.get() &&
+            previous->matches(s->target_size, s->digest)) {
+          s->result = std::move(previous);
+          s->patch = std::move(delta);
+          s->patch_id = id;
+          s->scanned = header;
+          m_impl = std::move(s);
+          return true;
+        }
+        break;
+      }
+      previous = view.base;
+    }
+  }
   // Valid patches have full blocks except for at most one final short block.
   // Bound and charge the index from wire bytes, never from the full image.
   using View = Preserve_trx_sealed_file::Overlay;
@@ -421,12 +522,14 @@ bool Preserve_trx_temp_delta_reader::begin(
           view->patch = delta;
           view->capacity = capacity;
           view->block_size = block;
+          view->zero_default = s->sparse;
           s->view = std::move(view);
         }
       }
     }
   }
   if (!s->view && !s->out.open_file(s->target_size)) return false;
+  s->wire_base = wire_base ? std::move(wire_base) : base;
   s->base = std::move(base);
   s->patch = std::move(delta);
   s->patch_id = id;
@@ -457,8 +560,10 @@ bool Preserve_trx_temp_delta_reader::step(size_t bytes, bool *complete) {
         file->m_derived_lease = std::move(s.out.lease);
       }
       s.result.reset(file);
-      if (s.logical.find(".image") != std::string::npos) ++image_assembled;
-      else ++assembled;
+      if (!s.sparse) {
+        if (s.logical.find(".image") != std::string::npos) ++image_assembled;
+        else ++assembled;
+      }
       *complete = true;
       return true;
     }
@@ -475,7 +580,8 @@ bool Preserve_trx_temp_delta_reader::step(size_t bytes, bool *complete) {
       const auto limit = s.pending ? s.next_offset : s.target_size;
       if (limit <= s.out.written) { s.failed = true; return false; }
       n = std::min<uint64_t>(block, limit - s.out.written);
-      if (!s.base->read_at(s.out.written, s.buffer.data(), n)) {
+      if (s.sparse) std::fill_n(s.buffer.data(), n, 0);
+      else if (!s.base->read_at(s.out.written, s.buffer.data(), n)) {
         s.failed = true;
         return false;
       }
@@ -495,10 +601,15 @@ bool Preserve_trx_temp_delta_reader::matches(
 }
 bool Preserve_trx_temp_delta_reader::matches(
     const Preserved_temp_table_image_descriptor &d) const {
+  if (m_impl && m_impl->sparse)
+    return preserve_trx_temp_image_delta_refs_valid(d) && d.delta.name.empty() &&
+        d.blob_name == m_impl->logical && d.size == m_impl->target_size &&
+        d.sha256 == m_impl->digest && d.base.name == m_impl->patch_id &&
+        m_impl->patch->matches(d.base.size, d.base.digest);
   return m_impl && preserve_trx_temp_image_delta_refs_valid(d) &&
       d.blob_name == m_impl->logical && d.size == m_impl->target_size &&
       d.sha256 == m_impl->digest && d.delta.name == m_impl->patch_id &&
-      m_impl->base->matches(d.base.size, d.base.digest) &&
+      m_impl->wire_base && m_impl->wire_base->matches(d.base.size, d.base.digest) &&
       m_impl->patch->matches(d.delta.size, d.delta.digest);
 }
 const std::string &Preserve_trx_temp_delta_reader::logical_name() const {

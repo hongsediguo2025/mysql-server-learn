@@ -14,7 +14,14 @@
 #include "storage/innobase/include/trx0temp_preserve_undo_scan.h"
 
 namespace {
-bool append_ownership_claims_from_descriptor_impl(
+std::atomic<uint64_t> shared_page_fallbacks{0};
+}
+
+uint64_t preserve_trx_temp_undo_shared_fallback_status() {
+  return shared_page_fallbacks.load(std::memory_order_relaxed);
+}
+
+bool preserve_trx_temp_table_append_ownership_claims_from_descriptor(
     const std::string &token, const Preserved_temp_table_undo_descriptor &undo,
     const trx_preserve_temp_space_image_descriptor &descriptor,
     Preserved_temp_table_manifest *manifest) {
@@ -30,21 +37,6 @@ bool append_ownership_claims_from_descriptor_impl(
   manifest->ownership_claims.insert(manifest->ownership_claims.end(),
       std::make_move_iterator(claims.begin()), std::make_move_iterator(claims.end()));
   return true;
-}
-
-std::atomic<uint64_t> shared_page_fallbacks{0};
-}
-
-uint64_t preserve_trx_temp_undo_shared_fallback_status() {
-  return shared_page_fallbacks.load(std::memory_order_relaxed);
-}
-
-bool preserve_trx_temp_table_append_ownership_claims_from_descriptor(
-    const std::string &token, const Preserved_temp_table_undo_descriptor &undo,
-    const trx_preserve_temp_space_image_descriptor &descriptor,
-    Preserved_temp_table_manifest *manifest) {
-  return append_ownership_claims_from_descriptor_impl(token, undo, descriptor,
-                                                      manifest);
 }
 
 bool Preserve_trx_temp_undo_claim_builder::begin(

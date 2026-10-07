@@ -33,6 +33,7 @@
 #include "sql/preserve_trx_temp_transfer.h"
 #include "sql/preserve_trx_temp_table_carrier.h"
 #include "sql/preserve_trx_xid.h"
+#include "sql/sql_class.h"
 #include "storage/innobase/include/trx0temp_preserve.h"
 #include "storage/innobase/include/trx0temp_preserve_import.h"
 #include "storage/innobase/include/trx0temp_preserve_native.h"
@@ -79,13 +80,13 @@ bool sync_directory(const std::string &dir) {
 }  // namespace
 
 struct Preserve_trx_temp_receiver_work::Impl {
-  enum Copy { ORIGINAL, INSTALLATION, COPIES };
   struct Image {
     Preserved_temp_table_image_descriptor descriptor;
     std::string installation_path;
-    std::array<bool, COPIES> owned{};
-    std::array<std::unique_ptr<Preserved_temp_table_image_writer>, COPIES> writers;
+    bool owned{false};
+    std::unique_ptr<Preserved_temp_table_image_writer> writer;
     uint64_t previous_bytes{0};
+    std::shared_ptr<const Preserve_trx_sealed_file> previous_source;
   };
   Preserve_memory_lease memory;
   Preserve_file_resource_lease files;
@@ -114,7 +115,6 @@ struct Preserve_trx_temp_receiver_work::Impl {
   size_t next_space{0};
   uint32_t next_page{0};
   size_t cleanup_space{0};
-  size_t cleanup_copy{0};
   uint64_t written{0};
   uint64_t scanned{0};
   uint64_t allocated_bytes{0};
@@ -132,10 +132,6 @@ struct Preserve_trx_temp_receiver_work::Impl {
   bool undo_complete{false};
   bool cancelling{false};
   bool cancelled{false};
-
-  const std::string &copy_directory(size_t copy) const {
-    return copy == ORIGINAL ? dir : installation_dir;
-  }
 
   dberr_t start_image() {
     const auto *target = plan->target_space(next_space);
@@ -164,11 +160,10 @@ struct Preserve_trx_temp_receiver_work::Impl {
     digest.reset(EVP_MD_CTX_new());
     if (digest == nullptr || EVP_DigestInit_ex(digest.get(), EVP_sha256(), nullptr) != 1)
       return DB_OUT_OF_MEMORY;
-    for (size_t copy = 0; copy < COPIES; ++copy) {
-      if (images[next_space].writers[copy]) continue;
-      Local_file_preserved_temp_table_image_carrier carrier(copy_directory(copy));
-      const auto status = carrier.create_warm_image_writer(
-          token, target->source_space_id, &images[next_space].writers[copy]);
+    if (!images[next_space].writer) {
+      Local_file_preserved_temp_table_image_carrier carrier(installation_dir);
+      const auto status = carrier.create_private_image_writer(
+          token, target->source_space_id, &images[next_space].writer);
       if (status != Preserved_trx_carrier_status::OK) return carrier_error(status);
     }
     return DB_SUCCESS;
@@ -180,15 +175,14 @@ struct Preserve_trx_temp_receiver_work::Impl {
     if (EVP_DigestFinal_ex(digest.get(), image.descriptor.sha256.data(),
                          &digest_bytes) != 1 ||
         digest_bytes != image.descriptor.sha256.size()) return DB_ERROR;
-    for (auto &writer : image.writers) {
-      auto status = writer->truncate(image.descriptor.size);
-      if (status != Preserved_trx_carrier_status::OK) return carrier_error(status);
-      status = writer->checkpoint_result(image.descriptor.size, image.descriptor.sha256);
-      if (status != Preserved_trx_carrier_status::OK) return carrier_error(status);
-    }
+    auto status = image.writer->truncate(image.descriptor.size);
+    if (status != Preserved_trx_carrier_status::OK) return carrier_error(status);
+    status = image.writer->checkpoint_result(image.descriptor.size, image.descriptor.sha256);
+    if (status != Preserved_trx_carrier_status::OK) return carrier_error(status);
     auto err = plan->mark_target_image_checkpoint(
         next_space, image.descriptor.size, image.descriptor.sha256.data());
     if (err != DB_SUCCESS) return err;
+    image.previous_source.reset();
     if (!pipeline) {
       err = seal_image(next_space);
       if (err != DB_SUCCESS) return err;
@@ -201,40 +195,21 @@ struct Preserve_trx_temp_receiver_work::Impl {
 
   dberr_t seal_image(size_t n) {
     auto &image = images[n];
-    for (auto &writer : image.writers) {
-      const auto status = writer->close();
-      if (status != Preserved_trx_carrier_status::OK) return carrier_error(status);
-    }
-    // Both independent writers received the same converted bytes. Publish
-    // each in its exclusive directory using the one incremental digest.
-    for (size_t copy = 0; copy < COPIES; ++copy) {
-      Local_file_preserved_temp_table_image_carrier carrier(copy_directory(copy));
-      // Retain responsibility if allocation throws after file installation.
-      image.owned[copy] = true;
-      const auto status =
-          carrier.seal_prevalidated_warm_image(token, token, image.descriptor);
-      if (status != Preserved_trx_carrier_status::OK &&
-          status != Preserved_trx_carrier_status::IO_ERROR_DURABLE_SNAPSHOT_MAY_EXIST)
-        image.owned[copy] = false;
-      if (status != Preserved_trx_carrier_status::OK) return carrier_error(status);
-      if (copy == ORIGINAL) {
-        DBUG_EXECUTE_IF("preserve_temp_receiver_seal_oom", {
-          DBUG_PRINT("preserve_temp_import", ("temporary receiver sealed image OOM fault"));
-          throw std::bad_alloc();
-        });
-      } else {
-        DBUG_EXECUTE_IF("preserve_temp_receiver_installation_seal_probe", {
-          DBUG_PRINT("preserve_temp_import", ("temporary receiver installation sealed OOM fault"));
-          throw std::bad_alloc();
-        });
-      }
-    }
-    // Seal removed the warm names; abort removes any leftover private links.
-    for (auto &writer : image.writers) {
-      const auto status = writer->abort();
-      if (status != Preserved_trx_carrier_status::OK) return carrier_error(status);
-      writer.reset();
-    }
+    // Background completion includes the actual flush and close, before fil
+    // opens the file. RESUME must not inherit a still-open writer descriptor.
+    Preserved_temp_table_image_writer_result result;
+    auto status = image.writer->close();
+    if (status == Preserved_trx_carrier_status::OK)
+      status = image.writer->result(&result);
+    if (status != Preserved_trx_carrier_status::OK) return carrier_error(status);
+    if (result.size != image.descriptor.size ||
+        result.sha256 != image.descriptor.sha256) return DB_CORRUPTION;
+    image.owned = true;
+    image.writer.reset();
+    DBUG_EXECUTE_IF("preserve_temp_receiver_seal_oom", {
+      DBUG_PRINT("preserve_temp_import", ("temporary receiver sealed image OOM fault"));
+      throw std::bad_alloc();
+    });
     const auto err = plan->mark_target_image_sealed(
         n, image.descriptor.size, image.descriptor.sha256.data());
     return err;
@@ -293,6 +268,105 @@ bool Preserve_trx_temp_receiver_work::ready() const {
       !m_impl->cancelling && m_impl->failure == DB_SUCCESS;
 }
 
+bool Preserve_trx_temp_receiver_work::promotion_safe() const {
+  const auto &s = *m_impl;
+  return s.pipeline && s.target_started && !s.source_import && !s.previous &&
+      !s.cancelling && !s.sql_bound && !s.native_committed &&
+      s.failure == DB_SUCCESS && s.input && s.input->final_authorized() &&
+      s.plan && s.plan->target_dictionary_prepared() && s.undo_complete;
+}
+
+std::shared_ptr<Preserve_trx_temp_completion>
+Preserve_trx_temp_completion::create(const Preserve_trx_temp_receiver_work &work) {
+  if (!work.promotion_safe()) return {};
+  auto memory = preserve_trx_acquire_memory_lease(
+      work.input()->token(), Preserve_trx_memory_kind::TEMP_IMAGE_STREAM_BUFFER,
+      sizeof(Preserve_trx_temp_completion) + work.input()->token().capacity() + 1);
+  if (!memory.acquired()) return {};
+  auto result = std::make_shared<Preserve_trx_temp_completion>();
+  result->m_memory = std::make_unique<Preserve_memory_lease>(std::move(memory));
+  result->m_token = work.input()->token();
+  const auto &payload = work.input()->manifest_payload();
+  result->m_digest = preserve_trx_digest(payload.data(), payload.size());
+  result->m_contract = work.input()->contract();
+  return result;
+}
+
+Preserve_trx_temp_completion::~Preserve_trx_temp_completion() = default;
+
+bool Preserve_trx_temp_completion::matches(const std::string &token,
+    const std::array<unsigned char, 32> &digest,
+    const Preserve_trx_temp_id_contract &contract) const {
+  return token == m_token && digest == m_digest && contract == m_contract;
+}
+
+bool Preserve_trx_temp_completion::pending() const {
+  std::lock_guard<std::mutex> guard(m_mutex);
+  return m_state == State::PENDING;
+}
+
+bool Preserve_trx_temp_completion::complete() const {
+  std::lock_guard<std::mutex> guard(m_mutex);
+  return m_state == State::COMPLETE && !m_cancelled;
+}
+
+bool Preserve_trx_temp_completion::cancelled() const {
+  std::lock_guard<std::mutex> guard(m_mutex);
+  return m_cancelled;
+}
+
+void Preserve_trx_temp_completion::cancel() {
+  std::lock_guard<std::mutex> guard(m_mutex);
+  m_cancelled = true;
+  // Cancellation does not mean the last pwrite has returned. Keep PENDING
+  // until the job relinquishes its owner; staging must remain pinned meanwhile.
+  m_cv.notify_all();
+}
+
+void Preserve_trx_temp_completion::finish(
+    Preserve_trx_temp_receiver_work::Owner *owner, dberr_t error) {
+  std::lock_guard<std::mutex> guard(m_mutex);
+  if (m_state != State::PENDING) return;
+  if (m_cancelled) m_state = State::CANCELLED;
+  else if (error != DB_SUCCESS || !owner || !*owner ||
+           !(*owner)->matches(m_token, m_digest, m_contract))
+    m_state = State::FAILED;
+  else {
+    m_owner = std::move(*owner);
+    m_state = State::COMPLETE;
+  }
+  m_cv.notify_all();
+}
+
+bool Preserve_trx_temp_completion::wait(THD *thd, uint64_t deadline_us) {
+  if (!thd || !deadline_us) return true;
+  static PSI_stage_info waiting{0, "Waiting for preserved temporary I/O", 0};
+  PSI_stage_info previous;
+  thd->enter_stage(&waiting, &previous, __func__, __FILE__, __LINE__);
+  const auto restore_stage = create_scope_guard([&] {
+    thd->enter_stage(&previous, nullptr, __func__, __FILE__, __LINE__);
+  });
+  std::unique_lock<std::mutex> lock(m_mutex);
+  while (m_state == State::PENDING && !m_cancelled) {
+    const auto now = monotonic_us();
+    if (thd->killed || now >= deadline_us) return true;
+    m_cv.wait_for(lock, std::chrono::microseconds(
+        std::min<uint64_t>(deadline_us - now, 10000)));
+  }
+  return thd->killed || monotonic_us() >= deadline_us ||
+         m_cancelled || m_state != State::COMPLETE;
+}
+
+bool Preserve_trx_temp_completion::take(
+    Preserve_trx_temp_receiver_work::Owner *output) {
+  std::lock_guard<std::mutex> guard(m_mutex);
+  if (!output || *output || m_state != State::COMPLETE || m_cancelled)
+    return true;
+  *output = std::move(m_owner);
+  m_state = State::TAKEN;
+  return false;
+}
+
 bool Preserve_trx_temp_receiver_work::matches(
     const std::string &token, const std::array<unsigned char, 32> &digest,
     const Preserve_trx_temp_id_contract &contract) const {
@@ -342,7 +416,13 @@ dberr_t Preserve_trx_temp_receiver_work::prepare_step(
   });
   if (s.source_import) {
     if (!s.source_import->complete()) {
-      s.failure = s.source_import->step(metadata_budget, byte_budget, page_budget);
+      const trx_preserve_temp_import_plan *previous = nullptr;
+      if (s.previous && s.previous->preprepared() &&
+          s.source_import->input()->same_lineage(*s.previous->input()) &&
+          !s.previous->input()->final_authorized())
+        previous = s.previous->plan();
+      s.failure = s.source_import->step(metadata_budget, byte_budget,
+                                        page_budget, previous);
       s.scanned = s.source_import->scanned_bytes();
       s.written += s.source_import->written_bytes();
       return s.failure;
@@ -356,7 +436,6 @@ dberr_t Preserve_trx_temp_receiver_work::prepare_step(
     if (s.previous) {
       auto &p = *s.previous->m_impl;
       if (!s.input->same_lineage(*p.input) || p.input->final_authorized() ||
-          s.input->manifest()->owner_trx_id != p.owner_trx_id ||
           s.plan->space_count() != p.images.size()) {
         s.previous.reset();
         return DB_SUCCESS;
@@ -367,26 +446,31 @@ dberr_t Preserve_trx_temp_receiver_work::prepare_step(
           const auto bytes = s.plan->source_space(i)->image_bytes;
           if (bytes > p.images[i].descriptor.size) {
             const auto delta = bytes - p.images[i].descriptor.size;
-            if (delta > UINT64_MAX / Impl::COPIES - growth)
+            if (delta > UINT64_MAX - growth)
               return s.failure = DB_OUT_OF_FILE_SPACE;
             growth += delta;
           }
         }
         if (growth != 0) {
           s.growth = preserve_trx_acquire_file_resource_lease(
-              p.dir, Impl::COPIES, growth * Impl::COPIES);
+              p.dir, 1, growth);
           if (!s.growth.acquired()) return s.failure = DB_OUT_OF_FILE_SPACE;
         }
         if (p.comparison.empty()) {
-          if (!p.memory.grow_to(p.memory.bytes() + p.page.size()))
-            return s.failure = DB_OUT_OF_MEMORY;
-          p.comparison.resize(p.page.size());
+          size_t bytes = std::max<size_t>(p.page.size(), 65536);
+          if (!p.memory.grow_to(p.memory.bytes() + bytes)) {
+            bytes = p.page.size();
+            if (!p.memory.grow_to(p.memory.bytes() + bytes))
+              return s.failure = DB_OUT_OF_MEMORY;
+          }
+          p.comparison.resize(bytes);
         }
         s.growth_prepared = true;
       }
       bool done = false, reused = false;
       s.failure = s.plan->reuse_private_batch(p.plan.get(), metadata_budget,
-                                            byte_budget, &done, &reused);
+          byte_budget, &done, &reused,
+          s.input->manifest()->owner_trx_id != p.owner_trx_id);
       if (s.failure != DB_SUCCESS || !done) return s.failure;
       if (!reused) {
         s.previous.reset();
@@ -397,12 +481,16 @@ dberr_t Preserve_trx_temp_receiver_work::prepare_step(
       // graph/dictionaries/SQL borrowers in the small source owner's shell.
       // All fallible work preceded the first native ownership transfer.
       Owner donor = std::move(s.previous);
+      for (size_t n = 0; n < p.images.size(); ++n) {
+        p.images[n].previous_bytes = p.images[n].descriptor.size;
+        p.images[n].previous_source = p.plan->source_file(n);
+      }
       p.plan.swap(s.plan);
       p.input.swap(s.input);
+      p.owner_trx_id = p.input->manifest()->owner_trx_id;
       p.sql_ready.swap(s.sql_ready);
       p.manifest_digest.swap(s.manifest_digest);
       p.growth = std::move(s.growth);
-      for (auto &image : p.images) image.previous_bytes = image.descriptor.size;
       p.next_space = p.next_page = p.seal_space = 0;
       p.written = s.written;
       p.allocated_bytes = p.scanned = 0;
@@ -435,9 +523,9 @@ dberr_t Preserve_trx_temp_receiver_work::prepare_step(
     DBUG_EXECUTE_IF("preserve_temp_stats_two_pages", { page_budget = 2; });
     DBUG_EXECUTE_IF("preserve_temp_stats_three_pages", { page_budget = 3; });
     s.failure = s.plan->prepare_target_stats_batch(
-        s.dir, page_budget, &s.stats_ready, &s.scanned,
+        s.installation_dir, page_budget, &s.stats_ready, &s.scanned,
         s.plan->target_stats_space() < s.images.size()
-            ? s.images[s.plan->target_stats_space()].writers[Impl::ORIGINAL].get()
+            ? s.images[s.plan->target_stats_space()].writer.get()
             : nullptr);
     DBUG_PRINT("preserve_temp_import",
                ("temporary receiver stats batch budget=%zu scanned=%llu",
@@ -723,8 +811,8 @@ dberr_t Preserve_trx_temp_receiver_work::begin(
     if (parent_dir.size() > UINT64_MAX / 16 - token.size() - 128)
       return DB_OUT_OF_MEMORY;
     const uint64_t path_bytes = parent_dir.size() + token.size() + 128;
-    // Two directory names, both writers' dir/warm/tmp strings, and transient
-    // carrier paths. Per-image installation paths are retained separately.
+    // Directory names, writer paths and transient carrier paths.
+    // Per-image installation paths are retained separately.
     if (!add(16 * path_bytes)) return DB_OUT_OF_MEMORY;
     uint64_t image_bytes = 0;
     for (size_t n = 0; n < (*plan)->space_count(); ++n) {
@@ -742,7 +830,6 @@ dberr_t Preserve_trx_temp_receiver_work::begin(
                  2 * index.name.size() + 64)) return DB_OUT_OF_MEMORY;
       }
     }
-    if (image_bytes > UINT64_MAX / Impl::COPIES) return DB_OUT_OF_FILE_SPACE;
     auto memory = preserve_trx_acquire_memory_lease(
         token, Preserve_trx_memory_kind::TEMP_IMAGE_STREAM_BUFFER, bytes);
     if (!memory.acquired()) return DB_OUT_OF_MEMORY;
@@ -771,9 +858,9 @@ dberr_t Preserve_trx_temp_receiver_work::begin(
     state.installation_dir = state.dir + "/install";
     if (my_mkdir(state.installation_dir.c_str(), 0700, MYF(0))) return DB_IO_ERROR;
     state.owns_installation_directory = true;
-    // close/abort closes that writer before opening its directory-sync FD.
+    // This file lease survives writer close until native ownership takes over.
     state.files = preserve_trx_acquire_file_resource_lease(
-        state.dir, Impl::COPIES, Impl::COPIES * image_bytes);
+        state.dir, 1, image_bytes);
     if (!state.files.acquired()) return DB_OUT_OF_FILE_SPACE;
     state.plan = std::move(*plan);
     *output = std::move(work);
@@ -826,6 +913,7 @@ dberr_t Preserve_trx_temp_receiver_work::step(
       if (s.failure != DB_SUCCESS) return s.failure;
     }
     const auto *source = s.plan->source_space(s.next_space);
+    uint64_t comparison_offset = 0, comparison_end = 0;
     for (size_t n = 0; n < page_budget &&
          s.next_page < source->image_bytes / source->page_size; ++n) {
       s.failure = s.plan->read_source_page(s.next_space, s.next_page,
@@ -843,20 +931,51 @@ dberr_t Preserve_trx_temp_receiver_work::step(
       auto &image = s.images[s.next_space];
       const auto offset = uint64_t{s.next_page} * source->page_size;
       bool changed = true;
-      if (offset < image.previous_bytes) {
-        s.failure = carrier_error(image.writers[Impl::ORIGINAL]->read_at(
-            offset, s.comparison.data(), s.comparison.size()));
-        if (s.failure != DB_SUCCESS) return s.failure;
-        s.scanned += s.comparison.size();
-        changed = s.comparison != s.page;
-      }
-      for (size_t copy = 0; changed && copy < Impl::COPIES; ++copy) {
-        if (copy == Impl::INSTALLATION) {
-          DBUG_EXECUTE_IF("preserve_temp_receiver_installation_write_failure", {
-            return s.failure = DB_IO_ERROR;
-          });
+      if (offset < image.previous_bytes && image.previous_source &&
+          image.previous_source->known_zero_range(offset, s.page.size()) &&
+          std::all_of(s.page.begin(), s.page.end(),
+                      [](unsigned char byte) { return byte == 0; })) {
+        // A fully prepared private donor leaves uninitialized zero pages zero.
+        // This proof survives owner/undo remapping; nonzero pages still compare
+        // after conversion. Keep the full target digest below.
+        changed = false;
+      } else if (offset < image.previous_bytes) {
+        if (offset >= comparison_end) {
+          // Read this batch's unmodified donor pages once. Never reuse a
+          // written page or retain the range beyond this step.
+          const auto pages = std::min<uint64_t>({
+              s.comparison.size() / source->page_size, page_budget - n,
+              (image.previous_bytes - offset) / source->page_size,
+              (source->image_bytes - offset) / source->page_size});
+          if (!pages) return s.failure = DB_ERROR;
+          const size_t bytes = pages * source->page_size;
+          DBUG_PRINT("preserve_temp_reuse_ids", ("temporary comparison read bytes=%zu page_size=%zu",
+              bytes, s.page.size()));
+          s.failure = carrier_error(image.writer->read_at(
+              offset, s.comparison.data(), bytes));
+          if (s.failure != DB_SUCCESS) return s.failure;
+          s.scanned += bytes;
+          comparison_offset = offset;
+          comparison_end = offset + bytes;
         }
-        s.failure = carrier_error(image.writers[copy]->write_at(
+        changed = memcmp(s.comparison.data() + (offset - comparison_offset),
+                         s.page.data(), s.page.size()) != 0;
+      } else if (image.previous_bytes == 0 &&
+                 offset + s.page.size() < source->image_bytes &&
+                 std::all_of(s.page.begin(), s.page.end(),
+                             [](unsigned char byte) { return byte == 0; })) {
+        // A fresh private file has zero-filled holes. Keep the last page write
+        // to establish the exact size without a later zero-filling truncate.
+        // Donor files must still overwrite old nonzero contents normally.
+        changed = false;
+      }
+      if (changed) {
+        DBUG_EXECUTE_IF("preserve_temp_receiver_installation_write_failure", {
+          DBUG_PRINT("preserve_temp_async_fault",
+                     ("temporary async write failure token=%s", s.token.c_str()));
+          return s.failure = DB_IO_ERROR;
+        });
+        s.failure = carrier_error(image.writer->write_at(
             offset, s.page.data(), s.page.size()));
         if (s.failure != DB_SUCCESS) return s.failure;
         s.written += s.page.size();
@@ -935,7 +1054,7 @@ dberr_t Preserve_trx_temp_receiver_work::commit_native_handoff(trx_t *trx) {
   if (!images_complete() || !m_impl->native_directory) return DB_ERROR;
   const auto err = m_impl->plan->commit_native_handoff(trx);
   if (err != DB_SUCCESS) return err;
-  for (auto &image : m_impl->images) image.owned[Impl::INSTALLATION] = false;
+  for (auto &image : m_impl->images) image.owned = false;
   m_impl->native_committed = true;
   return DB_SUCCESS;
 }
@@ -995,12 +1114,12 @@ dberr_t Preserve_trx_temp_receiver_work::cancel_step(bool *complete) {
       if (target != nullptr && !target->bound_dict_tables.empty())
         return s.plan->rollback_target_dictionary_publish(s.cleanup_space);
       if (target != nullptr && target->fil_space_adopted) {
-        // Keep both files and this cleanup cursor if native retirement fails.
+        // Keep the file and this cleanup cursor if native retirement fails.
         // A later dictionary/TABLE journal must revoke those references first.
         return s.plan->rollback_target_fil_space(s.cleanup_space);
       }
       auto &image = s.images[s.cleanup_space];
-      auto &writer = image.writers[s.cleanup_copy];
+      auto &writer = image.writer;
       if (writer) {
         const auto status = writer->abort();
         if (status != Preserved_trx_carrier_status::OK) return carrier_error(status);
@@ -1008,8 +1127,8 @@ dberr_t Preserve_trx_temp_receiver_work::cancel_step(bool *complete) {
         s.digest.reset();
         return DB_SUCCESS;
       }
-      auto &owned = image.owned[s.cleanup_copy];
-      const auto &dir = s.copy_directory(s.cleanup_copy);
+      auto &owned = image.owned;
+      const auto &dir = s.installation_dir;
       if (owned) {
         Local_file_preserved_temp_table_image_carrier carrier(dir);
         const auto status = carrier.remove_sealed_image(s.token, image.descriptor.source_space_id);
@@ -1021,10 +1140,7 @@ dberr_t Preserve_trx_temp_receiver_work::cancel_step(bool *complete) {
         s.cleanup_sync_pending = false;
         owned = false;
       }
-      if (++s.cleanup_copy == Impl::COPIES) {
-        s.cleanup_copy = 0;
-        ++s.cleanup_space;
-      }
+      ++s.cleanup_space;
       return DB_SUCCESS;
     }
     if (s.plan != nullptr && !s.plan->discard_target_undo_step()) return DB_SUCCESS;

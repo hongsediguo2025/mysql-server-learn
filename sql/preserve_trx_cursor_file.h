@@ -57,7 +57,7 @@ bool locate(const File &file, const Preserve_trx_cursor_descriptor &d,
 
 /** Receiver input undergoing bounded framing/index preflight. This does not
 certify Field/schema semantics or make a PS ready. A single worker owns each
-candidate and retains the input lease between batches; the final prepared-resource
+candidate and borrows its executor workspace; the final prepared-resource
 path/FD policy remains with its existing owner. */
 class Preserve_trx_cursor_file {
  public:
@@ -70,29 +70,32 @@ class Preserve_trx_cursor_file {
       const std::string &token,
       std::shared_ptr<const Preserve_trx_sealed_file> file,
       const Preserve_trx_cursor_descriptor &descriptor,
+      Preserve_trx_cursor_workspace &,
       std::unique_ptr<Preserve_trx_cursor_file> *output);
 #ifndef NDEBUG
   /** Check at most row_budget rows; worker code can yield between calls.
   No row-sized allocations or payload copies. A zero budget or invalid input
   poisons this candidate. A completed candidate needs no further validation. */
-  Preserve_trx_file_status validate_next(uint64_t row_budget);
+  Preserve_trx_file_status validate_next(uint64_t row_budget, Preserve_trx_cursor_workspace &);
 #endif
   bool framing_validated() const { return m_framing_validated; }
   bool locate_row(uint64_t row, uint64_t *offset,
-                  uint64_t *headers_read = nullptr) const;
+                  Preserve_trx_cursor_workspace &, uint64_t *headers_read = nullptr) const;
   bool read_at(uint64_t offset, unsigned char *bytes, size_t length) const;
+  bool owns_file(const std::shared_ptr<const Preserve_trx_sealed_file> &file) const {
+    return m_file == file;
+  }
   const Preserve_trx_cursor_descriptor &descriptor() const { return m_descriptor; }
 
  private:
   friend class Preserve_trx_cursor_decoder;
   /** Decoder has checked every row and sparse-index entry in one pass. */
   bool finish_decoding_preflight(uint64_t rows, uint64_t offset);
-  Preserve_trx_cursor_file(Preserve_memory_lease memory, Preserve_memory_lease work,
+  Preserve_trx_cursor_file(Preserve_memory_lease memory,
                            std::shared_ptr<const Preserve_trx_sealed_file> file,
                            const Preserve_trx_cursor_descriptor &descriptor,
                            uint64_t columns [[maybe_unused]])
       : m_memory(std::move(memory)),
-        m_work(std::move(work)),
         m_file(std::move(file)),
         m_descriptor(descriptor) {
 #ifndef NDEBUG
@@ -101,7 +104,6 @@ class Preserve_trx_cursor_file {
 #endif
   }
   Preserve_memory_lease m_memory;
-  Preserve_memory_lease m_work;
   std::shared_ptr<const Preserve_trx_sealed_file> m_file;
   Preserve_trx_cursor_descriptor m_descriptor;
 #ifndef NDEBUG
@@ -113,9 +115,6 @@ class Preserve_trx_cursor_file {
   Preserve_trx_file_status m_status{Preserve_trx_file_status::OK};
 };
 
-#ifndef NDEBUG
-void preserve_trx_cursor_verify_file(const Preserve_trx_cursor_result &artifact);
-#endif
 int show_preserve_trx_cursor_file_preflights(THD *, SHOW_VAR *, char *);
 int show_preserve_trx_cursor_file_rejections(THD *, SHOW_VAR *, char *);
 #endif

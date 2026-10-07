@@ -23,8 +23,7 @@ FROM performance_schema.global_status
 WHERE VARIABLE_NAME IN ('Preserve_trx_temp_stage_first_dml_calls',
 'Preserve_trx_temp_stage_physical_prepare_calls',
 'Preserve_trx_temp_stage_physical_resurrect_calls',
-'Preserve_trx_temp_stage_physical_adopt_calls',
-'Preserve_trx_temp_stage_final_tokens');
+'Preserve_trx_temp_stage_physical_adopt_calls');
 w11_off_calls
 0
 DROP TEMPORARY TABLE tmp_w11_off;

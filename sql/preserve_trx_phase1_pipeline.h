@@ -26,6 +26,7 @@ class THD;
 class Preserve_trx_phase1_binlog_provider_port;
 struct Preserve_trx_phase1_binlog_prepared_payload;
 struct Preserve_trx_phase1_record_capture_payload;
+struct Preserve_trx_phase1_record_adapter_control;
 struct Preserve_trx_phase1_record_prepared_payload;
 
 using Preserve_trx_phase1_binlog_prepared_handle =
@@ -186,9 +187,6 @@ struct Preserve_trx_phase1_pipeline_snapshot {
   uint64_t credit_in_use_bytes{0};
   uint64_t record_credit_in_use_bytes{0};
   uint64_t binlog_credit_in_use_bytes{0};
-  uint64_t temp_credit_in_use_bytes{0};
-  uint64_t temp_steps{0};
-  uint64_t ordinary_temp_slow_operations{0};
   uint64_t tail_record_credit_consumed_bytes{0};
   uint64_t cancel_revision{0};
   uint64_t operation_cutoff_us{0};
@@ -237,21 +235,26 @@ struct Preserve_trx_phase1_pipeline_snapshot {
 };
 
 /** The TEMP owner keeps native leases and private captures outside the value-only
-queue. One admission runs one bounded step; no live THD is used by this port. */
+queue. One admission runs one bounded step; cursor capture may borrow a pinned
+THD only under the existing operation permit. */
+class Preserve_trx_cursor_workspace;
 class Preserve_trx_phase1_temp_provider_port {
  public:
   virtual ~Preserve_trx_phase1_temp_provider_port() = default;
   virtual Preserve_trx_phase1_pipeline_result_status step(
       const Preserve_trx_phase1_work_descriptor &, size_t byte_budget,
-      std::string *reason) = 0;
+      const Preserve_trx_phase1_record_adapter_control &,
+      Preserve_trx_cursor_workspace &, std::string *reason) = 0;
 };
 
+class Preserve_trx_source_cursor_workspaces;
 class Preserve_trx_phase1_pipeline {
  public:
   explicit Preserve_trx_phase1_pipeline(
       const Preserve_trx_phase1_pipeline_config &config,
       Preserve_trx_phase1_binlog_provider_port *binlog_provider = nullptr,
-      Preserve_trx_phase1_temp_provider_port *temp_provider = nullptr);
+      Preserve_trx_phase1_temp_provider_port *temp_provider = nullptr,
+      std::shared_ptr<Preserve_trx_source_cursor_workspaces> cursor_workspaces = {});
   ~Preserve_trx_phase1_pipeline();
 
   Preserve_trx_phase1_pipeline(const Preserve_trx_phase1_pipeline &) = delete;

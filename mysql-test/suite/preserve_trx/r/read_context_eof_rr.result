@@ -1,0 +1,3 @@
+production resource-free transaction transfer: cursor-eof passed
+loopback receiver READ_CONTEXT and SQL RESUME visibility passed
+strict SQL RESUME integration: success passed

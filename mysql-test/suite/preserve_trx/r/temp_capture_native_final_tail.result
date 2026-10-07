@@ -1,0 +1,5 @@
+small final tail reused prepared native resources
+continuous DATA and undo checkpoints reused
+production TEMP_ONLY temporary transfer: cursor passed
+loopback receiver published temporary resources; SQL RESUME gates installation
+strict SQL RESUME integration: success passed

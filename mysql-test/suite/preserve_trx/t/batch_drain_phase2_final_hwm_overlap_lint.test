@@ -57,7 +57,7 @@ die "stale inline final HWM must not be excluded from async overlap\n"
     /final_hwm_async_capable[\s\S]{0,900}!pending\.remote_presealed/s;
 die "deferred staging must consume the exact pending final-HWM descriptor\n"
   unless $src =~
-    /preserve_trx_transfer_stage_deferred_candidate_external_objects[\s\S]{0,500}pending_final_binlog_descriptor/s;
+    /preserve_trx_transfer_stage_deferred_candidate_external_objects\(\s*batch_transfer_source_session\.get\(\),\s*preserve_trx_default_dir\(\),\s*&execution\.deferred_candidate,\s*batch_transfer_phase1_sender\.get\(\),\s*pending_descriptor,\s*&cursor_workspaces->sender\s*\)/s;
 die "Phase2 active-prefix progress must defer ACK convergence to the terminal sender barrier\n"
   unless $src =~
     /stream_active_transfer_binlog_cache_progress\([\s\S]{0,500}defer_ack_until_barrier/s;

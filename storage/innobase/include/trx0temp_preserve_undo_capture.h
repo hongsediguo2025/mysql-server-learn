@@ -41,7 +41,9 @@ void trx_preserve_temp_undo_capture_page(uint64_t cookie, uint32_t space,
     uint32_t page, const unsigned char *bytes, size_t size) noexcept;
 void trx_preserve_temp_undo_capture_close(uint64_t cookie) noexcept;
 uint64_t trx_preserve_temp_undo_capture_owners();
+#ifndef NDEBUG
 uint64_t trx_preserve_temp_undo_capture_pages_used();
 uint64_t trx_preserve_temp_undo_capture_pages_routed();
+#endif
 uint64_t trx_preserve_temp_undo_capture_quota_rejected();
 #endif

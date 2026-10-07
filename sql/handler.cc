@@ -1993,7 +1993,7 @@ err:
   if (!error) {
     if (all) {
       if (preserve_trx_temp_table_transaction_state_needs_clear(thd))
-        preserve_trx_temp_table_clear_transaction_state(thd);
+        preserve_trx_temp_table_note_transaction_commit(thd);
     } else {
       preserve_trx_temp_table_note_statement_commit(thd);
     }

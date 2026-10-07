@@ -17,6 +17,7 @@ bool preserve_trx_temp_undo_delta_refs_valid(
     const Preserved_temp_table_undo_descriptor &);
 bool preserve_trx_temp_undo_delta_id(const std::string &, std::string *base);
 bool preserve_trx_temp_image_delta_id(const std::string &, std::string *base);
+bool preserve_trx_temp_image_sparse_id(const std::string &, std::string *logical);
 bool preserve_trx_temp_image_delta_refs_valid(
     const Preserved_temp_table_image_descriptor &);
 
@@ -32,6 +33,8 @@ class Preserve_trx_temp_delta_builder {
   bool begin(uint64_t token, uint32_t space, int base_fd, int target_fd,
              const Preserved_temp_table_wire_file &base,
              const Preserved_temp_table_wire_file &target);
+  bool begin_sparse(uint64_t token, uint32_t space, int target_fd,
+                    const Preserved_temp_table_wire_file &target);
   bool begin_image(uint64_t token, uint32_t space, int base_fd,
       Preserved_temp_table_image_writer *, const Preserved_temp_table_wire_file &base,
       uint64_t size, const trx_preserve_temp_space_image_descriptor *capture,
@@ -54,7 +57,9 @@ class Preserve_trx_temp_delta_reader {
   ~Preserve_trx_temp_delta_reader();
   bool begin(const std::string &token, const std::string &delta_id,
              std::shared_ptr<const Preserve_trx_sealed_file> base,
-             std::shared_ptr<const Preserve_trx_sealed_file> delta);
+             std::shared_ptr<const Preserve_trx_sealed_file> delta,
+             std::shared_ptr<const Preserve_trx_sealed_file> wire_base = nullptr,
+             std::shared_ptr<const Preserve_trx_sealed_file> previous = nullptr);
   bool step(size_t bytes, bool *complete);
   bool matches(const Preserved_temp_table_undo_descriptor &) const;
   bool matches(const Preserved_temp_table_image_descriptor &) const;

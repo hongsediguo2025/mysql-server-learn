@@ -96,5 +96,4 @@ SET SESSION debug='';
 DROP USER phase1_readiness_app@localhost;
 SET GLOBAL rds_preserve_trx_drain_phase1_timeout_ms=600000;
 SET GLOBAL rds_preserve_trx_drain_phase2_timeout_ms=30000;
-SET GLOBAL rds_preserve_trx_transfer_runtime_profile=BUSINESS_FIRST;
 SET DEBUG_SYNC='RESET';

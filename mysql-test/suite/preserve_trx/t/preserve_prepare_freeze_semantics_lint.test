@@ -51,7 +51,9 @@ die "missing unified Preserve current-transaction freeze bridge\n"
 die "InnoDB Preserve handler must use the dedicated in-memory freeze\n"
   unless $handler_freeze =~ /trx_freeze_for_preserve\s*\(\s*trx\s*,\s*read_context\s*\)/s;
 die "read-context freeze must remain gated and validated at each boundary\n"
-  unless $sql =~ /read_context\s*=\s*retained_standby_resources\s*&&\s*trx_preserve_current_thd_has_read_context\s*\(\s*thd\s*\)/s &&
+  unless $sql =~ /standby_resource_recovery\s*=\s*preserve_trx_temp_id_namespace\s*&&\s*artifact_decision\s*==\s*Preserve_trx_transfer_artifact_decision::STANDBY_TRANSFER_SAVE/s &&
+         $sql =~ /read_context\s*=\s*standby_resource_recovery\s*&&\s*trx_preserve_current_thd_has_read_context\s*\(\s*thd\s*\)/s &&
+         $sql =~ /if\s*\(read_context\s*&&\s*!preserve_trx_temp_table_enable\)\s*\{\s*thaw_lock_warmcopy_conversion\(\);\s*set_failure_reason\("read_context_disabled"\);\s*return restore_unprepared_batch_prepare_failure_or_rollback\(\);/s &&
          $freeze_current =~ /read_context\s*\?\s*!trx_preserve_current_thd_has_read_context\s*\(\s*thd\s*\)\s*:\s*\(!redo_updated\s*&&\s*!temp_updated\)/s &&
          $freeze =~ /trx_preserve_is_read_context\s*\(\s*trx\s*\)/s;
 die "removed Preserve prepare entry must not return\n"

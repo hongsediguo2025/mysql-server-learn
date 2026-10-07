@@ -16,6 +16,7 @@ struct Preserved_temp_table_undo_descriptor;
 struct Preserved_temp_table_image_descriptor;
 struct Preserved_temp_table_wire_file;
 struct trx_preserve_temp_space_image_descriptor;
+class Preserve_trx_temp_delta_builder;
 
 uint64_t preserve_trx_temp_pretransfer_bytes_status();
 uint64_t preserve_trx_temp_undo_delta_bytes_status();
@@ -55,11 +56,23 @@ class Preserve_trx_temp_pretransfer_file {
   void select(Preserved_temp_table_undo_descriptor *undo);
   void select(Preserved_temp_table_image_descriptor *image) const;
   const Preserved_temp_table_wire_file &logical() const;
+  /** Borrow this immutable BASE until the caller's builder is destroyed.
+  Wire identity may be sparse; comparison always uses the raw logical image. */
+  bool begin_final_delta(Preserve_trx_transfer_source_epoch_session *,
+      uint64_t token, uint32_t space, int target_fd,
+      const Preserved_temp_table_wire_file &target,
+      Preserve_trx_temp_delta_builder *, Preserved_temp_table_wire_file *base) const;
 
  private:
   struct Impl;
   explicit Preserve_trx_temp_pretransfer_file(std::unique_ptr<Impl> impl);
   std::unique_ptr<Impl> m_impl;
+};
+
+/** Source-only attempt ownership, not a wire or receiver registry. */
+struct Preserve_trx_temp_source_images {
+  Preserve_memory_lease memory;
+  std::map<uint32_t, std::shared_ptr<const Preserve_trx_temp_pretransfer_file>> bases;
 };
 
 #endif

@@ -124,9 +124,6 @@ bool reserve_or_keep_preserved_space_id(space_id_t space_id, bool *created) {
   try {
     DBUG_EXECUTE_IF("preserve_temp_keep_space_id_oom", throw std::bad_alloc(););
     const auto result = preserved_space_id_reservations.insert(space_id);
-    if (!result.second)
-      preserved_space_id_reservation_active_count.fetch_sub(
-          1, std::memory_order_acq_rel);
     if (created != nullptr) *created = result.second;
   } catch (const std::bad_alloc &) {
     preserved_space_id_reservation_active_count.fetch_sub(

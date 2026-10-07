@@ -1,0 +1,5 @@
+--source include/have_debug.inc
+--source include/not_windows.inc
+--let $cursor_port= `SELECT @@port`
+--exec python3 $MYSQL_TEST_DIR/../scripts/preserve_trx_cursor_capacity_e2e.py --source-port=$cursor_port --bridge --sessions=32 --cursors=10 --distribution=skew --report=$MYSQLTEST_VARDIR/log/cursor-capacity.json
+--echo aggregate_cursor_capacity_all_payloads_and_fetch_positions_verified

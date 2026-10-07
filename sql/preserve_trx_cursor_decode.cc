@@ -2,6 +2,7 @@
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0. */
 #include "sql/preserve_trx_cursor_decode.h"
+#include "sql/preserve_trx_cursor_workspace.h"
 
 #include <algorithm>
 #include <atomic>
@@ -19,12 +20,15 @@
 
 namespace {
 using preserve_trx_cursor_detail::number;
+#ifndef NDEBUG
 std::atomic<uint64_t> decoded_rows{0};
 std::atomic<uint64_t> preflight_rows{0};
+#endif
 using Status = Preserve_trx_file_status;
 
 struct Column {
-  Send_field sent{};
+  const char *col_name{nullptr};
+  enum_field_types sent_type{};
   uint32_t type{0}, real_type{0}, length{0}, packed{0}, decimals{0}, flags{0};
   uint32_t charset{0}, protocol_charset{0}, nullable{0};
   uint32_t geometry{0};
@@ -78,11 +82,10 @@ void *allocate(MEM_ROOT *root, size_t bytes) {
 }
 
 bool parse_column(Bytes *b, Column *c, MEM_ROOT *root) {
-  for (const char **name : {&c->sent.db_name, &c->sent.table_name,
-                            &c->sent.org_table_name, &c->sent.col_name,
-                            &c->sent.org_col_name}) {
-    if (!b->string(root, name)) return false;
-  }
+  // FETCH does not resend metadata. Retain only the name used by make_field().
+  if (!b->string(nullptr, nullptr) || !b->string(nullptr, nullptr) ||
+      !b->string(nullptr, nullptr) || !b->string(root, &c->col_name) ||
+      !b->string(nullptr, nullptr)) return false;
   uint64_t sent_length;
   uint32_t sent_charset, sent_flags, sent_decimals, sent_type, sent_field;
   if (!b->integer(8, &sent_length) || !b->integer(4, &sent_charset) ||
@@ -94,12 +97,7 @@ bool parse_column(Bytes *b, Column *c, MEM_ROOT *root) {
       !b->integer(4, &c->decimals) || !b->integer(4, &c->flags) ||
       !b->integer(4, &c->charset) || !b->integer(4, &c->protocol_charset) ||
       !b->integer(1, &c->nullable) || c->nullable > 1) return false;
-  c->sent.length = sent_length;
-  c->sent.charsetnr = sent_charset;
-  c->sent.flags = sent_flags;
-  c->sent.decimals = sent_decimals;
-  c->sent.type = static_cast<enum_field_types>(sent_type);
-  c->sent.field = sent_field;
+  c->sent_type = static_cast<enum_field_types>(sent_type);
   if (c->real_type == MYSQL_TYPE_ENUM || c->real_type == MYSQL_TYPE_SET) {
     uint32_t count;
     if (!b->integer(4, &count) || count == 0 || count > 65535 ||
@@ -139,7 +137,7 @@ bool parse_column(Bytes *b, Column *c, MEM_ROOT *root) {
 }
 
 bool shape_valid(const Column &c) {
-  if (c.sent.type != c.type || c.packed > 65537 ||
+  if (c.sent_type != c.type || c.packed > 65537 ||
       get_charset(c.charset, MYF(0)) == nullptr ||
       get_charset(c.protocol_charset, MYF(0)) == nullptr) return false;
   switch (c.real_type) {
@@ -212,18 +210,15 @@ bool value_valid(Field *f, const unsigned char *value, uint32_t length) {
 }  // namespace
 
 struct Preserve_trx_cursor_decoder::Impl {
-  Preserve_memory_lease memory, schema_memory, row_memory;
+  Preserve_memory_lease memory, schema_memory;
   MEM_ROOT root{0, 1024};
   Query_arena arena{&root, Query_arena::STMT_INITIALIZED};
   TABLE_SHARE share{};
   TABLE table{};
   mem_root_deque<Item *> items{&root};
   std::unique_ptr<Preserve_trx_cursor_file> file;
-  std::unique_ptr<unsigned char[]> row_data;
-  std::array<unsigned char, 65536> input;
   uint64_t input_offset{0};
   size_t input_length{0};
-  size_t row_capacity{0};
   Column *columns{nullptr};
   enum_field_types *types{nullptr};
   const CHARSET_INFO *result_charset{nullptr};
@@ -231,26 +226,26 @@ struct Preserve_trx_cursor_decoder::Impl {
   uint64_t offset{0}, row{0};
   uint64_t checked_rows{0};
   bool values_validated{false};
-  std::string token;
   Status status{Status::OK};
 
-  bool read(uint64_t at, unsigned char *out, size_t length) {
+  bool read(uint64_t at, unsigned char *out, size_t length,
+            Preserve_trx_cursor_workspace &work) {
     while (length != 0) {
       if (at >= input_offset && at - input_offset < input_length) {
         const size_t n = std::min<size_t>(length, input_length - (at - input_offset));
-        std::memcpy(out, input.data() + (at - input_offset), n);
+        std::memcpy(out, work.scratch() + (at - input_offset), n);
         at += n;
         out += n;
         length -= n;
-      } else if (length >= input.size()) {
+      } else if (length >= Preserve_trx_cursor_workspace::data_size) {
         // Large BLOB rows go straight to the charged row buffer.
         return file->read_at(at, out, length);
       } else {
         if (at >= file->descriptor().index_offset) return false;
         input_offset = at;
-        input_length = std::min<uint64_t>(input.size(),
+        input_length = std::min<uint64_t>(Preserve_trx_cursor_workspace::data_size,
                                          file->descriptor().index_offset - at);
-        if (!file->read_at(at, input.data(), input_length)) {
+        if (!file->read_at(at, work.scratch(), input_length)) {
           input_length = 0;
           return false;
         }
@@ -304,7 +299,6 @@ Status Preserve_trx_cursor_decoder::create(
     p->memory = std::move(memory);
     p->schema_memory = std::move(schema_memory);
     p->root.set_max_capacity(root_bytes);
-    p->token = token;
     p->file = std::move(file);
     p->count = count;
     p->result_charset = result_charset ? get_charset(result_charset, MYF(0)) : nullptr;
@@ -329,7 +323,7 @@ Status Preserve_trx_cursor_decoder::create(
     for (uint32_t i = 0; i < count; ++i) {
       Column &c = *new (&p->columns[i]) Column;
       if (!parse_column(&input, &c, &p->root)) return Status::CORRUPT;
-      p->types[i] = c.sent.type;
+      p->types[i] = c.sent_type;
       auto *record = static_cast<unsigned char *>(allocate(&p->root, c.packed + 16));
       auto storage_type = static_cast<enum_field_types>(c.real_type);
       if (storage_type == MYSQL_TYPE_BLOB) {
@@ -339,7 +333,7 @@ Status Preserve_trx_cursor_decoder::create(
       c.field = make_field(&p->root, &p->share, record + 1, c.length, record, 0,
           storage_type, get_charset(c.charset, MYF(0)),
           static_cast<Field::geometry_type>(c.geometry), Field::NONE, c.interval,
-          c.sent.col_name, c.nullable, c.flags & ZEROFILL_FLAG, c.flags & UNSIGNED_FLAG,
+          c.col_name, c.nullable, c.flags & ZEROFILL_FLAG, c.flags & UNSIGNED_FLAG,
           c.decimals, true, 0, c.srid, false);
       if (!c.field) return Status::OUT_OF_MEMORY;
       if (c.real_type == MYSQL_TYPE_BLOB) c.field->field_length = c.length;
@@ -369,21 +363,23 @@ Status Preserve_trx_cursor_decoder::create(
   }
 }
 
-Status Preserve_trx_cursor_decoder::seek(uint64_t row) {
+Status Preserve_trx_cursor_decoder::seek(uint64_t row, Preserve_trx_cursor_workspace &work) {
+  release_work();
   DBUG_EXECUTE_IF("preserve_cursor_seek_failure", { return Status::IO_ERROR; });
   auto &p = *m_impl;
   if (p.status != Status::OK) return p.status;
-  if (!p.file->locate_row(row, &p.offset)) return Status::CORRUPT;
+  if (!p.file->locate_row(row, &p.offset, work)) return Status::CORRUPT;
   p.row = row;
   return Status::OK;
 }
 
-Status Preserve_trx_cursor_decoder::read_next() {
+Status Preserve_trx_cursor_decoder::read_next(Preserve_trx_cursor_workspace &work) {
   if (!m_impl->file->framing_validated()) return Status::CORRUPT;
-  return read_row(true);
+  return read_row(true, work);
 }
 
-Status Preserve_trx_cursor_decoder::read_row(bool publish_items) {
+Status Preserve_trx_cursor_decoder::read_row(bool publish_items,
+                                                   Preserve_trx_cursor_workspace &work) {
   auto &p = *m_impl;
   if (p.status != Status::OK) return p.status;
   const auto &d = p.file->descriptor();
@@ -395,53 +391,46 @@ Status Preserve_trx_cursor_decoder::read_row(bool publish_items) {
     if (number(index, 8) != p.offset) return p.status = Status::CORRUPT;
   }
   unsigned char size[8];
-  if (!p.read(p.offset, size, 8)) return p.status = Status::IO_ERROR;
+  if (!p.read(p.offset, size, 8, work)) return p.status = Status::IO_ERROR;
   const uint64_t length = number(size, 8);
   if (p.offset > d.index_offset || d.index_offset - p.offset < 8 ||
       length > d.index_offset - p.offset - 8) return p.status = Status::CORRUPT;
   try {
-    if (length > p.row_capacity) {
+    if (length > work.row_capacity()) {
       DBUG_EXECUTE_IF("preserve_cursor_decode_row_memory_failure", {
         throw std::bad_alloc();
       });
-      // Old row pointers are no longer usable once the next read begins.
-      p.row_data.reset();
-      p.row_memory.release();
-      p.row_capacity = 0;
-      p.row_memory = preserve_trx_acquire_memory_lease(
-          p.token, Preserve_trx_memory_kind::CURSOR_RESULT_BUFFER, length);
-      if (!p.row_memory.acquired()) return p.status = Status::OUT_OF_MEMORY;
-      p.row_data.reset(new unsigned char[length]);
-      p.row_capacity = length;
+      if (length > SIZE_MAX || !work.grow_row(static_cast<size_t>(length)))
+        return p.status = Status::OUT_OF_MEMORY;
     }
-    if (!p.read(p.offset + 8, p.row_data.get(), length))
+    if (!p.read(p.offset + 8, work.row(), length, work))
       return p.status = Status::IO_ERROR;
     DBUG_EXECUTE_IF("preserve_cursor_decode_null_failure", {
-      if (length != 0) p.row_data[0] = 2;
+      if (length != 0) work.row()[0] = 2;
     });
     DBUG_EXECUTE_IF("preserve_cursor_preflight_late_failure", {
-      if (!publish_items && p.row == 128 && length) p.row_data[0] = 2;
+      if (!publish_items && p.row == 128 && length) work.row()[0] = 2;
     });
     DBUG_EXECUTE_IF("preserve_cursor_decode_length_failure", {
-      if (length >= 6 && p.row_data[0] == 0) {
+      if (length >= 6 && work.row()[0] == 0) {
         auto *field = p.columns[0].field;
         if (field->real_type() == MYSQL_TYPE_STRING ||
-            field->real_type() == MYSQL_TYPE_VARCHAR) p.row_data[5] = 255;
+            field->real_type() == MYSQL_TYPE_VARCHAR) work.row()[5] = 255;
       }
     });
     uint64_t at = 0;
     // Validate every cell before calling any Field unpack on external bytes.
     for (uint32_t i = 0; i < p.count; ++i) {
       if (at == length) return p.status = Status::CORRUPT;
-      const auto null = p.row_data[at++];
+      const auto null = work.row()[at++];
       Field *f = p.columns[i].field;
       if (null > 1 || (null && !f->is_nullable())) return p.status = Status::CORRUPT;
       if (null) continue;
       if (f->real_type() == MYSQL_TYPE_NULL) return p.status = Status::CORRUPT;
       if (length - at < 4) return p.status = Status::CORRUPT;
-      const auto n = static_cast<uint32_t>(number(p.row_data.get() + at, 4));
+      const auto n = static_cast<uint32_t>(number(work.row() + at, 4));
       at += 4;
-      if (n > length - at || !value_valid(f, p.row_data.get() + at, n))
+      if (n > length - at || !value_valid(f, work.row() + at, n))
         return p.status = Status::CORRUPT;
       at += n;
     }
@@ -449,28 +438,32 @@ Status Preserve_trx_cursor_decoder::read_row(bool publish_items) {
     if (!publish_items) {
       p.offset += length + 8;
       ++p.row;
+#ifndef NDEBUG
       ++preflight_rows;
+#endif
       return Status::OK;
     }
     at = 0;
     for (uint32_t i = 0; i < p.count; ++i) {
       Field *f = p.columns[i].field;
-      if (p.row_data[at++]) {
+      if (work.row()[at++]) {
         // Field_null already reads a shared, permanently set dummy null bit.
         if (f->real_type() != MYSQL_TYPE_NULL) f->set_null();
         continue;
       }
       f->set_notnull();
-      const auto n = static_cast<uint32_t>(number(p.row_data.get() + at, 4));
+      const auto n = static_cast<uint32_t>(number(work.row() + at, 4));
       at += 4;
-      const auto *value = p.row_data.get() + at;
+      const auto *value = work.row() + at;
       if (f->is_flag_set(BLOB_FLAG)) down_cast<Field_blob *>(f)->set_ptr(n, value);
       else if (f->unpack(value) != value + n) return p.status = Status::CORRUPT;
       at += n;
     }
     p.offset += length + 8;
     ++p.row;
+#ifndef NDEBUG
     ++decoded_rows;
+#endif
     return Status::OK;
   } catch (const std::bad_alloc &) {
     return p.status = Status::OUT_OF_MEMORY;
@@ -479,7 +472,9 @@ Status Preserve_trx_cursor_decoder::read_row(bool publish_items) {
 
 Status Preserve_trx_cursor_decoder::preflight_next(uint64_t row_budget,
                                                    uint64_t byte_budget,
+                                                   Preserve_trx_cursor_workspace &work,
                                                    uint64_t *scanned_bytes) {
+  const auto release = create_scope_guard([&] { release_work(); });
   if (scanned_bytes) *scanned_bytes = 0;
   auto &p = *m_impl;
   if (p.status != Status::OK || p.values_validated) return p.status;
@@ -491,7 +486,7 @@ Status Preserve_trx_cursor_decoder::preflight_next(uint64_t row_budget,
   });
   while (p.row < p.file->descriptor().rows && row_budget-- &&
          p.offset - start < byte_budget) {
-    if (read_row(false) != Status::OK) return p.status;
+    if (read_row(false, work) != Status::OK) return p.status;
     p.checked_rows = p.row;
   }
   if (p.row == p.file->descriptor().rows) {
@@ -500,6 +495,14 @@ Status Preserve_trx_cursor_decoder::preflight_next(uint64_t row_budget,
     p.values_validated = true;
   }
   return Status::OK;
+}
+
+void Preserve_trx_cursor_decoder::release_work() noexcept {
+  auto &p = *m_impl;
+  p.input_length = 0;
+  for (uint32_t i = 0; i < p.initialized; ++i)
+    if (p.columns[i].field->is_flag_set(BLOB_FLAG))
+      down_cast<Field_blob *>(p.columns[i].field)->set_ptr(uint32{0}, nullptr);
 }
 
 bool Preserve_trx_cursor_decoder::values_validated() const {
@@ -524,7 +527,13 @@ const Preserve_trx_cursor_descriptor &Preserve_trx_cursor_decoder::descriptor() 
   return m_impl->file->descriptor();
 }
 
+bool Preserve_trx_cursor_decoder::owns_file(
+    const std::shared_ptr<const Preserve_trx_sealed_file> &file) const {
+  return m_impl->file->owns_file(file);
+}
 
+
+#ifndef NDEBUG
 int show_preserve_trx_cursor_decoded_rows(THD *, SHOW_VAR *var, char *buffer) {
   var->type = SHOW_LONGLONG;
   var->value = buffer;
@@ -538,3 +547,4 @@ int show_preserve_trx_cursor_preflight_rows(THD *, SHOW_VAR *var, char *buffer) 
   *reinterpret_cast<long long *>(buffer) = preflight_rows.load();
   return 0;
 }
+#endif

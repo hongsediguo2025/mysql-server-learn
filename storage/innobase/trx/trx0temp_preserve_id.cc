@@ -12,7 +12,7 @@ PARTICULAR PURPOSE. See the GNU General Public License for more details. */
 
 #include "my_dbug.h"
 
-bool preserve_trx_temp_id_namespace = false;
+bool preserve_trx_temp_id_namespace = true;
 
 namespace {
 

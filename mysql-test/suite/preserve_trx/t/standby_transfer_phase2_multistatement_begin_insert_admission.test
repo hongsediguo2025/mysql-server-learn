@@ -14,9 +14,8 @@ UPDATE t_phase2_multi SET v=100 WHERE id=4;
 --connect(multi_business,localhost,phase2_multi_app,,test)
 --disable_reconnect
 --let $business_id= `SELECT CONNECTION_ID()`
-# First hit is START admission; second is INSERT admission. Do not send any
-# business SQL between installing this action and the exact two-SQL packet.
-SET DEBUG_SYNC='phase2_sched_after_admission_published SIGNAL begin_insert_admission WAIT_FOR begin_insert_continue TIMEOUT 30 EXECUTE 2';
+# Fence the single admission for the complete START/INSERT command.
+SET DEBUG_SYNC='phase2_sched_after_admission_published SIGNAL begin_insert_admission WAIT_FOR begin_insert_continue TIMEOUT 30';
 --send START TRANSACTION; INSERT INTO t_phase2_multi VALUES(5,50,REPEAT('e',512))
 
 --connection default
@@ -24,14 +23,7 @@ SET DEBUG_SYNC='now WAIT_FOR begin_insert_admission TIMEOUT 5';
 --let $sync_warnings= `SELECT @@warning_count`
 if ($sync_warnings)
 {
-  --die START did not publish its admission
-}
-SET DEBUG_SYNC='now SIGNAL begin_insert_continue';
-SET DEBUG_SYNC='now WAIT_FOR begin_insert_admission TIMEOUT 5';
---let $sync_warnings= `SELECT @@warning_count`
-if ($sync_warnings)
-{
-  --die INSERT did not publish its own second admission
+  --die command did not publish its admission
 }
 SET DEBUG_SYNC='phase2_sched_after_hard_published SIGNAL begin_insert_hard';
 --send DRAIN TRANSACTIONS PRESERVE
@@ -41,7 +33,7 @@ SET DEBUG_SYNC='now WAIT_FOR begin_insert_hard TIMEOUT 10';
 --let $sync_warnings= `SELECT @@warning_count`
 if ($sync_warnings)
 {
-  --die HARD did not freeze the INSERT admission
+  --die HARD did not freeze the complete command admission
 }
 SET DEBUG_SYNC='now SIGNAL begin_insert_continue';
 --connection multi_business
@@ -59,7 +51,7 @@ SELECT 1;
 --let $data_ok= `SELECT COUNT(*)=0 FROM t_phase2_multi WHERE id=5`
 if (!$data_ok)
 {
-  --die INSERT crossed HARD using the START admission
+  --die INSERT crossed HARD after command admission was frozen
 }
 --let $still_connected= `SELECT COUNT(*)=1 FROM performance_schema.threads WHERE PROCESSLIST_ID=$business_id`
 if (!$still_connected)
@@ -83,4 +75,4 @@ if (!$one_pending_token)
 }
 --source suite/preserve_trx/include/phase2_multistatement_cleanup.inc
 --enable_result_log
---echo single_com_query_begin_ok_insert_cut_off_before_body
+--echo single_com_query_begin_insert_cut_off_before_body

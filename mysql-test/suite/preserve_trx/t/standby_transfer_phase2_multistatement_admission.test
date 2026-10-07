@@ -2,19 +2,15 @@
 --connect(multi_business,localhost,phase2_multi_app,,test)
 BEGIN;
 UPDATE t_phase2_multi SET v=10 WHERE id=1;
-# Installing the action in the first SQL pauses capture of the SECOND SQL,
-# not initial packet reception. Reuse the existing admission sync point.
-delimiter ||;
---send
+# The existing pre-BODY probe fences the complete command admission.
 SET DEBUG_SYNC='phase2_sched_after_admission_published SIGNAL multi_gap WAIT_FOR multi_gap_continue TIMEOUT 30';
-UPDATE t_phase2_multi SET v=900 WHERE id=3; COMMIT||
-delimiter ;||
+--send UPDATE t_phase2_multi SET v=900 WHERE id=3; COMMIT
 --connection default
 SET DEBUG_SYNC='now WAIT_FOR multi_gap TIMEOUT 5';
 --let $sync_warnings= `SELECT @@warning_count`
 if ($sync_warnings)
 {
-  --die second statement did not publish its own admission
+  --die command did not publish its admission
 }
 SET DEBUG_SYNC='phase2_sched_after_hard_published SIGNAL multi_gap_hard';
 --send DRAIN TRANSACTIONS PRESERVE
@@ -23,7 +19,7 @@ SET DEBUG_SYNC='now WAIT_FOR multi_gap_hard TIMEOUT 10';
 --let $sync_warnings= `SELECT @@warning_count`
 if ($sync_warnings)
 {
-  --die HARD could not freeze the inter-statement admission
+  --die HARD could not freeze the whole-command admission
 }
 SET DEBUG_SYNC='now SIGNAL multi_gap_continue';
 --connection multi_business
@@ -41,7 +37,7 @@ SELECT 1;
 --let $data_ok= `SELECT (SELECT v=0 FROM t_phase2_multi WHERE id=1) AND (SELECT v=0 FROM t_phase2_multi WHERE id=3)`
 if (!$data_ok)
 {
-  --die a statement crossed HARD using the preceding SQL admission
+  --die a statement crossed HARD using the preceding command admission
 }
 --source suite/preserve_trx/include/phase2_multistatement_cleanup.inc
 --enable_result_log

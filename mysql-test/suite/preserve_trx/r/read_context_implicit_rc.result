@@ -1,0 +1,3 @@
+production resource-free transaction transfer: no-resources passed
+loopback receiver READ_CONTEXT and SQL RESUME visibility passed
+strict SQL RESUME integration: success passed

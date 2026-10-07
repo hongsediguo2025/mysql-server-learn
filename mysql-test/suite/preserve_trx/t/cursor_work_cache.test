@@ -1,0 +1,4 @@
+--source include/have_debug.inc
+SET SESSION debug='+d,preserve_cursor_test_command';
+DO /* preserve_cursor_work_cache */ 0;
+SET SESSION debug='';

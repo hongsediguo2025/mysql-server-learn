@@ -21,12 +21,13 @@ Preserve_trx_transfer_status preserve_trx_result_transfer_descriptors(
 Preserve_trx_transfer_status preserve_trx_result_transfer_validate(
     const std::string &token, const std::vector<Preserve_trx_transfer_object_descriptor> &objects,
     const std::string &manifest);
+/** Check all declared cursor files after validate() accepted these same objects.
+The caller retains the stable record and its sealed-file owners. */
 Preserve_trx_transfer_status preserve_trx_result_transfer_validate_files(
-    const Preserve_trx_transfer_receiver_record &record,
-    const std::string &manifest);
+    const Preserve_trx_transfer_receiver_record &record);
 Preserve_trx_transfer_status preserve_trx_result_transfer_stream(
     Preserve_trx_transfer_source_epoch_session *session, uint64_t token,
-    const std::string &manifest, const Preserve_trx_result_image *image);
+    const std::string &manifest, const Preserve_trx_result_image *image, Preserve_trx_cursor_workspace *workspace = nullptr);
 /** Caller supplies an authenticated snapshot manifest and a stable receiver
 record. Decode reads only its verified descriptors; it never reopens a path. */
 Preserve_trx_transfer_status preserve_trx_result_transfer_load(

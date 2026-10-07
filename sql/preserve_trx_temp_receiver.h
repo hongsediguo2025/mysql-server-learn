@@ -8,6 +8,8 @@
 #include <cstdint>
 #include <array>
 #include <memory>
+#include <condition_variable>
+#include <mutex>
 #include <string>
 
 #include "storage/innobase/include/db0err.h"
@@ -64,6 +66,9 @@ class Preserve_trx_temp_receiver_work {
   size_t sql_table_count() const;
 #endif
   bool ready() const;
+  /** Frozen source input, reserved target IDs and private undo are prepared.
+  Target file work may continue on the receiver after epoch READY. */
+  bool promotion_safe() const;
   bool matches(const std::string &token,
                const std::array<unsigned char, 32> &manifest_digest,
                const Preserve_trx_temp_id_contract &contract) const;
@@ -87,15 +92,16 @@ class Preserve_trx_temp_receiver_work {
   ~Preserve_trx_temp_receiver_work();
 
   /** Perform one target dictionary batch, one undo batch, or at most
-  page_budget data pages. Ordinary generations checkpoint two exclusive warm
-  images; compatible generations retain native IDs/undo and write changed
-  target pages only. Final authorization closes and seals both copies.
+  page_budget data pages. Ordinary generations checkpoint one private installation
+  image; compatible generations retain native IDs/undo and write changed
+  target pages only. Final authorization flushes, closes and seals the file
+  before publishing this session's completion.
   A failed candidate must be cancelled; its digest is never replayed. */
   dberr_t step(size_t metadata_work_budget, size_t undo_record_budget,
               size_t undo_byte_budget, size_t page_budget);
   bool images_complete() const;
   /** Successful file writes in this generation: source merge fallback plus
-  both target copies, including first writes when the second write fails.
+  the target installation file.
   This is not an fsync fence. */
   uint64_t written_bytes() const;
   const trx_preserve_temp_import_plan *plan() const;
@@ -113,12 +119,12 @@ class Preserve_trx_temp_receiver_work {
   ownership. Cancellation withdraws tables before retiring their fil/file. */
   dberr_t publish_table(size_t space, size_t table);
   /** Preallocate stable native descriptors and shared directory ownership for
-  already published spaces. Called before receiver READY. */
+  already published spaces. Completed before this session's RESUME attach. */
 #ifndef NDEBUG
   dberr_t prepare_native_handoff();
 #endif
   /** Final journal boundary, after TABLE/handler/PS binding and undo attach.
-  On success native owns every installation file; cancel only removes originals.
+  On success native owns every installation file; cancellation retains those files.
   Caller retains exclusive session/transaction ownership and cannot roll back
   through legacy materialize cleanup after this returns success. */
   dberr_t commit_native_handoff(trx_t *trx);
@@ -142,6 +148,37 @@ class Preserve_trx_temp_receiver_work {
   friend class Preserve_trx_temp_restore;
   Preserve_trx_temp_receiver_work *m_retired_next{nullptr};
   uint64_t m_retry_after_us{0};
+};
+
+/** One final token's completion. The receiver job exclusively owns mutable
+work until finish(); RESUME never reads work concurrently with that job. */
+class Preserve_trx_temp_completion {
+ public:
+  ~Preserve_trx_temp_completion();
+  static std::shared_ptr<Preserve_trx_temp_completion> create(
+      const Preserve_trx_temp_receiver_work &work);
+  bool matches(const std::string &token,
+               const std::array<unsigned char, 32> &digest,
+               const Preserve_trx_temp_id_contract &contract) const;
+  bool pending() const;
+  bool complete() const;
+  bool cancelled() const;
+  void cancel();
+  void finish(Preserve_trx_temp_receiver_work::Owner *owner, dberr_t error);
+  bool wait(THD *thd, uint64_t deadline_us);
+  bool take(Preserve_trx_temp_receiver_work::Owner *output);
+
+ private:
+  enum class State { PENDING, COMPLETE, FAILED, CANCELLED, TAKEN };
+  mutable std::mutex m_mutex;
+  std::condition_variable m_cv;
+  State m_state{State::PENDING};
+  bool m_cancelled{false};
+  std::string m_token;
+  std::array<unsigned char, 32> m_digest{};
+  Preserve_trx_temp_id_contract m_contract;
+  std::unique_ptr<Preserve_memory_lease> m_memory;
+  Preserve_trx_temp_receiver_work::Owner m_owner;
 };
 
 #ifndef NDEBUG

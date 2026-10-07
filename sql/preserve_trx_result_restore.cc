@@ -1,6 +1,8 @@
 /* Copyright (c) 2026, Oracle and/or its affiliates.
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0. */
+#include "sql/preserve_trx_cursor_workspace.h"
+#include "scope_guard.h"
 #include "sql/preserve_trx_result_restore.h"
 
 #include <algorithm>
@@ -94,7 +96,8 @@ bool Preserve_trx_result_restore::begin_prepare(const std::string &token,
 }
 
 bool Preserve_trx_result_restore::Preparation::step(THD *worker,
-    uint64_t rows, uint64_t bytes, uint64_t *scanned) {
+    uint64_t rows, uint64_t bytes, Preserve_trx_cursor_workspace &work,
+    uint64_t *scanned) {
   if (scanned) *scanned = 0;
   auto &p = *impl;
   const auto fail = [&] {
@@ -119,22 +122,24 @@ bool Preserve_trx_result_restore::Preparation::step(THD *worker,
         if (taken == Take::FAILED) return fail();
         if (taken == Take::WAIT) return false;
       }
-      if (!p.decoder) {
+    }
+    if (!work.bind(r.token)) return fail();
+    const auto release = create_scope_guard([&] { work.unbind(); });
+    if (!p.decoder) {
         std::unique_ptr<Preserve_trx_cursor_file> file;
         if (Preserve_trx_cursor_file::open(r.token, source.file, source.descriptor,
-              &file) != Status::OK ||
+              work, &file) != Status::OK ||
             Preserve_trx_cursor_decoder::create(r.token, worker, std::move(file),
               &p.decoder) != Status::OK) return fail();
-      }
       p.decoder->bind(nullptr);
     }
-    if (p.decoder->preflight_next(rows, bytes, scanned) != Status::OK || worker->killed)
+    if (p.decoder->preflight_next(rows, bytes, work, scanned) != Status::OK || worker->killed)
       return fail();
     if (!p.decoder->values_validated()) return false;
     Ready::Impl::Entry entry;
     entry.descriptor = source.descriptor;
     if (Preserve_trx_result_cursor::create(r.token, worker, std::move(source),
-          std::move(p.decoder), &entry.cursor) != Status::OK ||
+          std::move(p.decoder), work, &entry.cursor) != Status::OK ||
         entry.cursor->bind(nullptr)) return fail();
     r.entries.push_back(std::move(entry));
     if (r.entries.size() == p.snapshot->entries.size()) {
@@ -193,7 +198,9 @@ bool Preserve_trx_result_restore::stage(THD *target, std::unique_ptr<Ready> *rea
 Preserve_cursor_attach_status Preserve_trx_result_restore::attach_cursor(
     THD *thd, uint32_t id, Prepared_statement *ps) {
   using Status = Preserve_cursor_attach_status;
-  if (!thd || thd != current_thd || thd->killed || !id || !ps ||
+  // The replay caller holds exclusive ownership of the target session.
+  // Its current_thd may be a separate control session.
+  if (!current_thd || current_thd->killed || !thd || thd->killed || !id || !ps ||
       ps->thd != thd || ps->id != id || thd->stmt_map.find(id) != ps ||
       !thd->preserve_trx_result_owner) return Status::ERROR;
   auto &owner = *thd->preserve_trx_result_owner->impl;
@@ -232,7 +239,9 @@ void Prepared_statement::attach_preserved_cursor(
     std::unique_ptr<Preserve_trx_result_cursor> restored) {
   DBUG_ASSERT(restored && !m_preserved_cursor && !restored->open(thd));
   m_original_cursor = cursor;
-  if (cursor != nullptr) cursor->close();
+  // Normal attachment rejects an open cursor. Do not repeat native cleanup
+  // under a separate control session; Debug installation may replace an open one.
+  if (cursor != nullptr && cursor->is_open()) cursor->close();
   m_preserved_cursor = std::move(restored);
   cursor = m_preserved_cursor.get();
   update_preserve_cursor_count();

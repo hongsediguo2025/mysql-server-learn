@@ -1,0 +1,14 @@
+[mysqld.1]
+debug=+d,preserve_temp_async_pause_after_finish
+server_id=1
+log_error_verbosity=3
+default_authentication_plugin=mysql_native_password
+log-bin=temp-strict-bin
+binlog-format=ROW
+gtid-mode=ON
+enforce-gtid-consistency=ON
+rds-preserve-trx-enable=ON
+rds-preserve-trx-temp-id-namespace=ON
+
+[ENV]
+SERVER_MYPORT_2=@mysqld.1.port

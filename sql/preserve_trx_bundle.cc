@@ -234,7 +234,6 @@ constexpr uint16_t kTlvBinlogNoCacheMetadata = 0x61;
 constexpr uint16_t kTlvAutoincState = 0x62;
 constexpr uint16_t kTlvBinlogCachePayload = 0x70;
 constexpr uint16_t kTlvBinlogWarmcopyMetadata = 0x71;
-constexpr uint16_t kTlvTempTableManifest = 0x80;
 constexpr uint16_t kTlvExternalBlobDescriptors = 0x81;
 constexpr uint16_t kTlvCursorManifest = 0x82;
 constexpr uint32_t kBinlogCacheFlagImmediate = 1U << 0;
@@ -2371,7 +2370,7 @@ bool apply_bundle_semantics(std::vector<Preserve_snapshot_tlv> *tlvs,
     return true;
 
   const Preserve_snapshot_tlv *temp_table_manifest =
-      find_tlv(*tlvs, kTlvTempTableManifest);
+      find_tlv(*tlvs, kPreservedTrxTempTableManifestTlv);
   metadata->temp_table_manifest_payload.clear();
   if (temp_table_manifest != nullptr) {
     Preserved_temp_table_manifest manifest;
@@ -2446,7 +2445,7 @@ bool append_temp_table_manifest_tlv(const Preserve_snapshot_metadata &metadata,
   }
 
   tlvs->push_back(
-      {kTlvTempTableManifest, metadata.temp_table_manifest_payload});
+      {kPreservedTrxTempTableManifestTlv, metadata.temp_table_manifest_payload});
   return false;
 }
 

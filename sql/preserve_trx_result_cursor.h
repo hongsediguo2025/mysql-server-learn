@@ -13,6 +13,7 @@ class Preserve_trx_result_cursor final : public Server_side_cursor {
   static Preserve_trx_file_status create(
       const std::string &token, THD *thd, Preserve_trx_cursor_snapshot state,
       std::unique_ptr<Preserve_trx_cursor_decoder> decoder,
+      Preserve_trx_cursor_workspace &,
       std::unique_ptr<Preserve_trx_result_cursor> *output);
   ~Preserve_trx_result_cursor() override;
   static void operator delete(void *p, size_t) { ::operator delete(p); }

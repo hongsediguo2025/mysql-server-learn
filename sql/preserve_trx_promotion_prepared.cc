@@ -48,6 +48,7 @@ class Preserve_trx_physical_fence_lease_factory {
 
 class Preserve_trx_prepared_token_resources::Impl {
  public:
+  ~Impl() { if (temp_completion) temp_completion->cancel(); }
   Preserve_memory_lease lock_plan_memory;
   Preserve_native_binlog_resource_lease native_binlog_resources;
   std::unique_ptr<lock_preserve_metadata_plan_t> record_lock_plan;
@@ -60,6 +61,7 @@ class Preserve_trx_prepared_token_resources::Impl {
   bool temp_required{false};
   std::array<unsigned char, 32> temp_manifest_digest{};
   Preserve_trx_temp_receiver_work::Owner temp_ready;
+  std::shared_ptr<Preserve_trx_temp_completion> temp_completion;
   bool results_required{false};
   std::array<unsigned char, 32> result_manifest_digest{};
   std::unique_ptr<Preserve_trx_result_restore::Ready> result_ready;
@@ -1008,10 +1010,21 @@ bool Preserve_trx_prepared_token_resources::result_resources_ready() const {
 bool Preserve_trx_prepared_token_resources::temp_resources_ready() const {
   return m_impl != nullptr &&
          (m_impl->temp_required
-              ? m_impl->temp_ready && m_impl->temp_ready->matches(
+              ? (m_impl->temp_ready && m_impl->temp_ready->matches(
                     m_impl->key.token, m_impl->temp_manifest_digest,
-                    m_impl->temp_id_contract)
-              : !m_impl->temp_ready);
+                    m_impl->temp_id_contract)) ||
+                    (m_impl->temp_completion && m_impl->temp_completion->complete())
+              : !m_impl->temp_ready && !m_impl->temp_completion);
+}
+
+bool Preserve_trx_prepared_token_resources::temp_resources_promotion_safe() const {
+  return temp_resources_ready() || (m_impl && m_impl->temp_required &&
+      m_impl->temp_completion && m_impl->temp_completion->matches(
+          m_impl->key.token, m_impl->temp_manifest_digest, m_impl->temp_id_contract));
+}
+
+bool Preserve_trx_prepared_token_resources::temp_preparation_pending() const {
+  return m_impl && m_impl->temp_completion && m_impl->temp_completion->pending();
 }
 
 bool Preserve_trx_prepared_token_resources::has_native_binlog_handle() const {
@@ -1132,6 +1145,19 @@ Preserve_trx_prepared_token_resources::install_temp_ready(
                          m_impl->temp_id_contract))
     return Preserve_trx_prepared_status::DIGEST_CONFLICT;
   m_impl->temp_ready = std::move(*ready);
+  return Preserve_trx_prepared_status::OK;
+}
+
+Preserve_trx_prepared_status
+Preserve_trx_prepared_token_resources::install_temp_completion(
+    std::shared_ptr<Preserve_trx_temp_completion> completion) {
+  if (!acquired() || !has_semantic_bundle() || !m_impl->temp_required ||
+      m_impl->temp_ready || m_impl->temp_completion || !completion)
+    return Preserve_trx_prepared_status::INVALID_ARGUMENT;
+  if (!completion->matches(m_impl->key.token, m_impl->temp_manifest_digest,
+                            m_impl->temp_id_contract))
+    return Preserve_trx_prepared_status::DIGEST_CONFLICT;
+  m_impl->temp_completion = std::move(completion);
   return Preserve_trx_prepared_status::OK;
 }
 
@@ -1377,6 +1403,37 @@ Preserve_trx_attach_lease &Preserve_trx_attach_lease::operator=(
 
 Preserve_trx_attach_lease::~Preserve_trx_attach_lease() { fail_closed(); }
 
+Preserve_trx_prepared_status Preserve_trx_attach_lease::wait_temp_ready(
+    THD *thd, uint64_t deadline_us) {
+  if (!m_active || !m_entry || m_activation_started || m_temp_taken)
+    return Preserve_trx_prepared_status::INVALID_ARGUMENT;
+  std::shared_ptr<Preserve_trx_temp_completion> completion;
+  {
+    std::lock_guard<std::mutex> guard(m_entry->mutex);
+    if (m_entry->state.load(std::memory_order_acquire) !=
+            Preserve_trx_prepared_token_state::ATTACHING)
+      return Preserve_trx_prepared_status::INVALID_STATE;
+    auto &resources = m_entry->resources;
+    if (resources.temp_resources_ready()) return Preserve_trx_prepared_status::OK;
+    if (!resources.m_impl || !resources.m_impl->temp_completion)
+      return Preserve_trx_prepared_status::INVALID_STATE;
+    completion = resources.m_impl->temp_completion;
+  }
+  // Never hold the entry lock while waiting for the receiver's last user.
+  if (completion->wait(thd, deadline_us)) {
+    completion->cancel();
+    return Preserve_trx_prepared_status::INVALID_STATE;
+  }
+  std::lock_guard<std::mutex> guard(m_entry->mutex);
+  auto &resources = m_entry->resources;
+  if (m_entry->state.load(std::memory_order_acquire) !=
+          Preserve_trx_prepared_token_state::ATTACHING ||
+      !resources.m_impl || resources.m_impl->temp_completion != completion)
+    return Preserve_trx_prepared_status::INVALID_STATE;
+  return resources.temp_resources_ready() ? Preserve_trx_prepared_status::OK
+                                        : Preserve_trx_prepared_status::INVALID_STATE;
+}
+
 Preserve_trx_prepared_status Preserve_trx_attach_lease::take_temp_ready(
     Preserve_trx_temp_receiver_work::Owner *out) {
   if (!m_active || !m_entry || m_activation_started || m_temp_taken || !out || *out)
@@ -1388,7 +1445,11 @@ Preserve_trx_prepared_status Preserve_trx_attach_lease::take_temp_ready(
       !resources.m_impl || !resources.m_impl->temp_required ||
       !resources.temp_resources_ready())
     return Preserve_trx_prepared_status::INVALID_STATE;
-  *out = std::move(resources.m_impl->temp_ready);
+  if (resources.m_impl->temp_ready)
+    *out = std::move(resources.m_impl->temp_ready);
+  else if (!resources.m_impl->temp_completion ||
+           resources.m_impl->temp_completion->take(out))
+    return Preserve_trx_prepared_status::INVALID_STATE;
   m_temp_taken = true;
   return Preserve_trx_prepared_status::OK;
 }
@@ -1675,7 +1736,7 @@ Preserve_trx_prepared_token_registry::publish_prewarmed(
   if (lease == nullptr || !lease->active() || lease->m_entry == nullptr ||
       !resources.acquired() || !resources.has_semantic_bundle() ||
       !resources.temp_id_contract_bound() ||
-      !resources.result_resources_ready() || !resources.temp_resources_ready() ||
+      !resources.result_resources_ready() || !resources.temp_resources_promotion_safe() ||
       !prepared_token_keys_match(resources.m_impl->key, lease->m_key) ||
       !digest_is_sha256_hex(prewarm_object_set_digest)) {
     return Preserve_trx_prepared_status::INVALID_ARGUMENT;
@@ -1764,7 +1825,7 @@ Preserve_trx_prepared_token_registry::bind_final_facts(
             Preserve_trx_prepared_token_state::
                 PREWARMED_PENDING_FINAL_FACT ||
         !entry->resources.acquired() ||
-        !entry->resources.result_resources_ready() || !entry->resources.temp_resources_ready() ||
+        !entry->resources.result_resources_ready() || !entry->resources.temp_resources_promotion_safe() ||
         entry->prewarm_object_set_digest !=
             facts.prewarm_object_set_digest) {
       return Preserve_trx_prepared_status::INVALID_STATE;
@@ -2215,7 +2276,7 @@ Preserve_trx_gate_adopt_lease::take_semantic_bundle(
   if (m_entry->resources.m_impl == nullptr ||
       m_entry->resources.m_impl->semantic_bundle == nullptr ||
       !m_entry->resources.result_resources_ready() ||
-      !m_entry->resources.temp_resources_ready()) {
+      !m_entry->resources.temp_resources_promotion_safe()) {
     return Preserve_trx_prepared_status::INVALID_STATE;
   }
   if (*out != nullptr) return Preserve_trx_prepared_status::INVALID_ARGUMENT;
@@ -2645,6 +2706,8 @@ Preserve_trx_prepared_status Preserve_trx_prepared_token_registry::snapshot(
       ? entry->resources.m_impl->recovery : Preserve_trx_recovery_contract{};
   snapshot->resource_temp_id_contract = entry->resources.temp_id_contract();
   snapshot->temp_resources_ready = entry->resources.temp_resources_ready();
+  snapshot->temp_resources_promotion_safe = entry->resources.temp_resources_promotion_safe();
+  snapshot->temp_preparation_pending = entry->resources.temp_preparation_pending();
   snapshot->resource_temp_id_contract_bound =
       entry->resources.temp_id_contract_bound();
   snapshot->prewarm_object_set_digest = entry->prewarm_object_set_digest;
@@ -2724,6 +2787,8 @@ Preserve_trx_prepared_token_registry::find_unique_adopted(
         ? entry->resources.m_impl->recovery : Preserve_trx_recovery_contract{};
     snapshot->resource_temp_id_contract = entry->resources.temp_id_contract();
     snapshot->temp_resources_ready = entry->resources.temp_resources_ready();
+  snapshot->temp_resources_promotion_safe = entry->resources.temp_resources_promotion_safe();
+  snapshot->temp_preparation_pending = entry->resources.temp_preparation_pending();
     snapshot->resource_temp_id_contract_bound =
         entry->resources.temp_id_contract_bound();
     snapshot->prewarm_object_set_digest = entry->prewarm_object_set_digest;

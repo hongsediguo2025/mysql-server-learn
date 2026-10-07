@@ -1,5 +1,7 @@
---echo # Preserve/Resume product parameter surface is exactly 31 rds_ names.
+--echo # Preserve/Resume product parameter surface is exactly 30 rds_ names.
 --source suite/preserve_trx/include/assert_standby_transfer_source.inc
+--source include/restart_mysqld.inc
+--source include/force_restart.inc
 
 SELECT COUNT(*) AS rds_parameter_count
   FROM performance_schema.global_variables
@@ -11,6 +13,7 @@ SELECT COUNT(*) AS legacy_parameter_count
 
 SELECT @@GLOBAL.rds_preserve_trx_enable AS preserve_enabled,
        @@GLOBAL.rds_preserve_trx_temp_table_enable AS temp_table_enabled,
+       @@GLOBAL.rds_preserve_trx_temp_id_namespace AS temp_id_namespace,
        @@GLOBAL.rds_preserve_trx_memory_budget_bytes AS memory_budget,
        @@GLOBAL.rds_preserve_trx_drain_phase1_timeout_ms AS phase1_timeout,
        @@GLOBAL.rds_preserve_trx_drain_phase2_timeout_ms AS phase2_timeout,
@@ -25,6 +28,8 @@ SELECT @@GLOBAL.rds_preserve_trx_transfer_runtime_profile AS runtime_profile;
 SET GLOBAL rds_preserve_trx_transfer_runtime_profile='PROMOTION_PREPARE';
 SELECT @@GLOBAL.rds_preserve_trx_transfer_runtime_profile AS runtime_profile;
 SET GLOBAL rds_preserve_trx_transfer_runtime_profile='BUSINESS_FIRST';
+SELECT @@GLOBAL.rds_preserve_trx_transfer_runtime_profile AS runtime_profile;
+SET GLOBAL rds_preserve_trx_transfer_runtime_profile=DEFAULT;
 SELECT @@GLOBAL.rds_preserve_trx_transfer_runtime_profile AS runtime_profile;
 
 --error ER_UNKNOWN_SYSTEM_VARIABLE

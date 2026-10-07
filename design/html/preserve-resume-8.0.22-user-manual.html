@@ -1432,7 +1432,7 @@ SHOW GLOBAL STATUS LIKE 'Preserve_trx_resume_physical_%';</code></pre>
       ["持久化与内存", "preserve_trx_max_snapshot_bytes", "16 MiB", "GLOBAL 动态；1..ULLONG_MAX", "单 token snapshot metadata 文件上限，不含 external blob。"],
       ["持久化与内存", "preserve_trx_max_binlog_cache_bytes", "1 GiB", "GLOBAL 动态；1..ULLONG_MAX", "单 token transaction binlog cache sidecar 上限。"],
       ["持久化与内存", "preserve_trx_max_temp_sidecar_bytes", "1 GiB", "GLOBAL 动态；1..ULLONG_MAX", "单个临时表 image 或 undo sidecar 文件上限。"],
-      ["持久化与内存", "preserve_trx_memory_budget_bytes", "256 MiB", "GLOBAL 动态；4 KiB..ULLONG_MAX", "所有活跃 Preserve 操作可租用的通用 heap 总预算；耗尽后调用方应 spill 或 fail closed。"],
+      ["持久化与内存", "rds_preserve_trx_memory_budget_bytes", "2 GiB", "GLOBAL 动态；4 KiB..ULLONG_MAX", "所有活跃 Preserve 操作可租用的通用 heap 总预算；2026-10-08 调整默认值，耗尽后调用方应 spill 或 fail closed。"],
       ["持久化与内存", "preserve_trx_memory_per_token_bytes", "64 MiB", "GLOBAL 动态；4 KiB..ULLONG_MAX", "单 token 通用 heap lease 上限。"],
       ["持久化与内存", "preserve_trx_spill_chunk_bytes", "4 MiB", "GLOBAL 动态；4 KiB..64 MiB", "大对象流式写 spill backend 时的 scratch chunk 大小。"],
 

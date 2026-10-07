@@ -308,6 +308,8 @@ class Preserve_trx_prepared_token_resources {
   Preserve_trx_temp_id_contract temp_id_contract() const;
   bool result_resources_ready() const;
   bool temp_resources_ready() const;
+  bool temp_resources_promotion_safe() const;
+  bool temp_preparation_pending() const;
   bool has_native_binlog_handle() const;
   bool native_binlog_file_backed() const;
   bool has_resurrection_entry() const;
@@ -326,6 +328,8 @@ class Preserve_trx_prepared_token_resources {
       std::unique_ptr<Preserve_trx_result_restore::Ready> *ready);
   Preserve_trx_prepared_status install_temp_ready(
       Preserve_trx_temp_receiver_work::Owner *ready);
+  Preserve_trx_prepared_status install_temp_completion(
+      std::shared_ptr<Preserve_trx_temp_completion> completion);
   Preserve_trx_prepared_status install_resurrection_entry(
       std::unique_ptr<Preserve_trx_resurrection_index_entry> entry);
   Mysql_binlog_preserve_cache_status prepare_native_binlog_handle(
@@ -448,6 +452,7 @@ class Preserve_trx_attach_lease {
       std::unique_ptr<Preserve_trx_result_restore::Ready> *inout);
   Preserve_trx_prepared_status take_temp_ready(
       Preserve_trx_temp_receiver_work::Owner *out);
+  Preserve_trx_prepared_status wait_temp_ready(THD *thd, uint64_t deadline_us);
   Preserve_trx_prepared_status restore_temp_ready(
       Preserve_trx_temp_receiver_work::Owner *inout);
 
@@ -492,6 +497,8 @@ struct Preserve_trx_prepared_token_snapshot {
   Preserve_trx_temp_id_contract resource_temp_id_contract;
   bool resource_temp_id_contract_bound{false};
   bool temp_resources_ready{false};
+  bool temp_resources_promotion_safe{false};
+  bool temp_preparation_pending{false};
   std::string prewarm_object_set_digest;
   Preserve_trx_prepared_token_state state{
       Preserve_trx_prepared_token_state::NOT_FOUND};

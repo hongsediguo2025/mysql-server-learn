@@ -2,6 +2,8 @@
 default-authentication-plugin=mysql_native_password
 
 [mysqld.1]
+rds-preserve-trx-temp-table-enable=OFF
+# Keep open-cursor rejection and native cursor-lifecycle coverage.
 server-id=1
 
 [mysqld.2]

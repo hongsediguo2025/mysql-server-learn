@@ -11,7 +11,6 @@
 
 bool preserve_trx_whole_query_packet(const THD *thd) {
   return preserve_trx_is_enabled() &&
-         (preserve_trx_temp_id_namespace || preserve_trx_result_capture_enable) &&
          preserve_trx_standby_phase2_source_capture_enabled() &&
          thd != nullptr && thd->is_classic_protocol() &&
          thd->get_command() == COM_QUERY;

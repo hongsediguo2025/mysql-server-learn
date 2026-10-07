@@ -1,0 +1,3 @@
+small final tail reused prepared native resources
+production TEMP_ONLY temporary transfer: cursor passed
+standby receiver published temporary resources; SQL RESUME gates installation

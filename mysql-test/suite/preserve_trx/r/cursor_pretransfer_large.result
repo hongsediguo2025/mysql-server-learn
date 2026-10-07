@@ -1,5 +1,5 @@
 early result generations: large; final reused only selected decoder
 continuous data capture reused source baseline including space growth
 production TEMP_ONLY temporary transfer: cursor passed
-loopback receiver prepared temporary resources before READY
+loopback receiver published temporary resources; SQL RESUME gates installation
 strict SQL RESUME integration: success passed

@@ -1,4 +1,6 @@
 [mysqld.1]
+# Exercise complete-command admission with temporary ID namespace OFF.
+rds-preserve-trx-temp-id-namespace=OFF
 server_id=1
 
 [mysqld.2]

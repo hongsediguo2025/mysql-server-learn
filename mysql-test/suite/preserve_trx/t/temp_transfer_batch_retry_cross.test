@@ -1,0 +1,6 @@
+# Drop one nonzero-offset multi-CHUNK batch ACK; require byte-exact retry.
+--disable_query_log
+CALL mtr.add_suppression('MY-001158 - Got an error reading communication packets');
+--enable_query_log
+--let $contract_temp_batches= 2
+--source suite/preserve_trx/t/temp_capture_native_cross.test

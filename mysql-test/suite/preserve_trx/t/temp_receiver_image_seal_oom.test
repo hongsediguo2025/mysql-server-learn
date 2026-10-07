@@ -2,5 +2,5 @@ SELECT @@global.rds_preserve_trx_temp_id_namespace AS namespace_enabled;
 --let $capture_case= temporary receiver image generation and owned cancellation
 --let $capture_trace_name= temp_receiver_image_seal_oom.trace
 --let $capture_fault= preserve_temp_import_source_undo_probe,preserve_temp_import_target_image_probe,preserve_temp_receiver_seal_oom
---let $capture_trace_pattern= (?s)temporary receiver sealed image OOM fault.*temporary receiver writer then sealed image cancellation checked.*temporary receiver images checked bytes=[1-9][0-9]* batches=[1-9][0-9]* cancel=0 fault=0 seal_oom=1 sync_fault=0.*temporary namespace requires standby transfer
+--let $capture_trace_pattern= (?s)temporary receiver sealed image OOM fault.*temporary receiver sealed image ownership cancellation checked.*temporary receiver images checked bytes=[1-9][0-9]* batches=[1-9][0-9]* cancel=0 fault=0 seal_oom=1 sync_fault=0.*temporary namespace requires standby transfer
 --source suite/preserve_trx/include/temp_table_capture_undo_failure.inc

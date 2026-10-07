@@ -1,1 +1,1 @@
-receiver rejected corrupt LOB before READY: type
+receiver rejected corrupt LOB before SQL RESUME: type

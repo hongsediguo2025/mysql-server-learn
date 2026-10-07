@@ -84,7 +84,7 @@ def run(port, report_path):
                         assert time.monotonic() < deadline, 'cancel did not finish'
                         time.sleep(.01)
                     retries = [future.result() for future in futures]
-                assert all(v in (0, 4013) for values in retries for v in values), retries
+                assert all(v in (0, 4, 4013) for values in retries for v in values), retries
                 # A lost CLEAN reply can be recovered by the exact same request.
                 assert send(control, cancel) == 12
                 query = frame(epoch, version=2, kind=10, nonce=nonce,
@@ -92,11 +92,12 @@ def run(port, report_path):
                 assert send(control, query) == 12
                 for peer in peers:
                     try:
-                        send(peer, declare)
+                        response = send(peer, declare)
                     except SqlError as exc:
                         assert exc.args[0] == 4013, exc.args
                     else:
-                        raise AssertionError('late DECLARE resurrected a clean epoch')
+                        assert response == 4, 'late DECLARE resurrected a clean epoch'
+                assert send(control, query) == 12
                 assert resident.query('SELECT * FROM abandon_resident ORDER BY id') == [
                     ['1', '110'], ['2', '120'], ['4', '140']]
                 report['cases'].append({'populated': populated,

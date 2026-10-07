@@ -1,0 +1,5 @@
+# No Phase1 worker checkpoint: exercise the final raw-image stream and its
+# portable metadata/TLV rewrite, including real RESUME and cursor FETCH.
+--let $contract_final_sparse= 1
+--let $contract_expect_sparse= 1
+--source suite/preserve_trx/t/temp_strict_sql_resume_resources.test

@@ -31,7 +31,8 @@ DROP TABLE IF EXISTS t_phase2_scheduler_protocol;
 CREATE USER preserve_trx_ha_admin@localhost
   IDENTIFIED BY 'phase2-scheduler-protocol-secret';
 GRANT SHUTDOWN, SYSTEM_VARIABLES_ADMIN,
-      PRESERVE_TRX_TRANSFER_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+      PRESERVE_TRX_TRANSFER_ADMIN, PROCESS
+  ON *.* TO preserve_trx_ha_admin@localhost;
 GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
 CREATE USER phase2_scheduler_protocol_app@localhost;
 GRANT SELECT, INSERT, UPDATE ON test.*
@@ -239,6 +240,25 @@ SET GLOBAL rds_preserve_trx_drain_phase1_timeout_ms=2000;
 --let $grep_pattern= raw_hard_cutoff_ready
 --let $wait_timeout= 10
 --source include/wait_for_pattern_in_file.inc
+
+# A no-change UPDATE still owns an active transaction and its record lock.
+# Capture this exact source identity before DRAIN, independently of row counts.
+--connection default
+--let $raw_hard_lock_count= `SELECT COUNT(*) FROM performance_schema.data_locks l JOIN performance_schema.threads t ON t.THREAD_ID=l.THREAD_ID WHERE l.ENGINE='INNODB' AND l.OBJECT_SCHEMA='test' AND l.OBJECT_NAME='t_phase2_scheduler_protocol' AND l.INDEX_NAME='PRIMARY' AND l.LOCK_TYPE='RECORD' AND l.LOCK_STATUS='GRANTED' AND l.LOCK_MODE='X,REC_NOT_GAP' AND l.LOCK_DATA='6'`
+if ($raw_hard_lock_count != 1)
+{
+  --die raw hard-cutoff owner must hold exactly one primary record lock on id=6
+}
+--let $raw_hard_id= `SELECT t.PROCESSLIST_ID FROM performance_schema.data_locks l JOIN performance_schema.threads t ON t.THREAD_ID=l.THREAD_ID WHERE l.ENGINE='INNODB' AND l.OBJECT_SCHEMA='test' AND l.OBJECT_NAME='t_phase2_scheduler_protocol' AND l.INDEX_NAME='PRIMARY' AND l.LOCK_TYPE='RECORD' AND l.LOCK_STATUS='GRANTED' AND l.LOCK_MODE='X,REC_NOT_GAP' AND l.LOCK_DATA='6'`
+--let $wait_timeout= 5
+--let $wait_condition= SELECT COUNT(*)=1 FROM information_schema.INNODB_TRX WHERE TRX_MYSQL_THREAD_ID=$raw_hard_id
+--source include/wait_condition.inc
+--let $raw_hard_no_undo= `SELECT COUNT(*)=1 AND MIN(TRX_ROWS_MODIFIED)=0 FROM information_schema.INNODB_TRX WHERE TRX_MYSQL_THREAD_ID=$raw_hard_id`
+if (!$raw_hard_no_undo)
+{
+  --die raw hard-cutoff transaction unexpectedly owns update undo
+}
+--connection protocol_ha
 
 --let $raw_ps_ready= $MYSQLTEST_VARDIR/tmp/phase2_protocol_raw_ps_ready
 --let $raw_ps_execute_go= $MYSQLTEST_VARDIR/tmp/phase2_protocol_raw_ps_execute_go
@@ -548,6 +568,9 @@ SELECT * FROM t_phase2_scheduler_protocol;
 --connection protocol_owner
 --replace_column 1 GENERATION 3 SOURCE_ID 6 CLOSING_STARTED_US 7 CLOSING_DEADLINE_US
 --reap
+
+--connection protocol_ha
+--eval SELECT COUNT(*)=1 AND MIN(MOD_TABLES_COUNT=0 AND LOCKS_COUNT>0 AND HAS_READ_VIEW='NO' AND RV_LOW_LIMIT_NO=0 AND TEMP_IMAGE_BYTES=0 AND TEMP_UNDO_BYTES=0) AS lock_only_transaction_preserved FROM performance_schema.preserved_transactions WHERE TOKEN='$raw_hard_id'
 
 --connection protocol_soft_a
 --error ER_PRESERVE_TRX_SESSION_DRAINED

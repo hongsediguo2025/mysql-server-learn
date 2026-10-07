@@ -93,7 +93,6 @@ uint32_t preserved_space_id_reservation_active_count_for_test();
 uint32_t min_temp_space_id_for_test();
 uint32_t max_temp_space_id_for_test();
 uint32_t allocate_temp_tablespace_object_for_test();
-bool is_preserved_space_id_reserved(uint32_t space_id);
 }  // namespace ibt
 
 dberr_t trx_preserve_temp_space_image_copy_initial_file_pages(

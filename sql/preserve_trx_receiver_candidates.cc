@@ -1,6 +1,7 @@
 /* Copyright (c) 2026, Oracle and/or its affiliates.
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0. */
+#include "sql/preserve_trx_cursor_workspace.h"
 #include "sql/preserve_trx_receiver_candidates.h"
 
 #include <atomic>
@@ -33,13 +34,6 @@ std::string name(const Preserve_trx_cursor_descriptor &d) {
   return preserve_trx_result_object_name(
       {d.statement_id, d.generation, d.size, d.digest});
 }
-bool matches(const Preserve_trx_cursor_descriptor &a,
-             const Preserve_trx_cursor_descriptor &b) {
-  return a.statement_id == b.statement_id && a.generation == b.generation &&
-         a.size == b.size && a.digest == b.digest && a.rows == b.rows &&
-         a.rows_offset == b.rows_offset && a.index_offset == b.index_offset &&
-         a.schema_digest == b.schema_digest;
-}
 int show(uint64_t value, SHOW_VAR *var, char *buffer) {
   var->type = SHOW_LONGLONG;
   var->value = buffer;
@@ -52,7 +46,6 @@ struct Preserve_trx_receiver_candidates::Impl {
   struct Result {
     Preserve_memory_lease memory;
     std::string id;
-    uint64_t generation{0};
     std::unique_ptr<Preserve_trx_cursor_decoder> decoder;
     bool working{false}, ready{false}, failed{false}, final_claimed{false};
   };
@@ -92,7 +85,6 @@ struct Preserve_trx_receiver_candidates::Impl {
     auto result = std::make_shared<Result>();
     result->memory = std::move(memory);
     result->id = id;
-    result->generation = identity.generation;
     if (it == results.end())
       results.emplace(identity.statement_id, result);
     else {
@@ -123,9 +115,73 @@ Preserve_trx_receiver_candidates::create(const std::string &token) {
   } catch (const std::bad_alloc &) { return {}; }
 }
 
+Preserve_trx_receiver_candidates::Take
+Preserve_trx_receiver_candidates::prepared(const std::string &id) const {
+  auto &s = *m_impl;
+  std::lock_guard<std::mutex> guard(s.mutex);
+  if (s.cancelled.load()) return Take::FAILED;
+  const auto state = [](const auto &slot) {
+    if (slot->failed || slot->final_claimed) return Take::FAILED;
+    return slot->ready ? Take::READY : Take::WAIT;
+  };
+  if (s.temp && s.temp->id == id) return state(s.temp);
+  Preserve_trx_result_manifest::Result identity;
+  if (preserve_trx_result_object_identity(id, &identity)) {
+    const auto found = s.results.find(identity.statement_id);
+    if (found == s.results.end()) return Take::ABSENT;
+    return found->second->id == id ? state(found->second) : Take::FAILED;
+  }
+  return s.temp ? Take::FAILED : Take::ABSENT;
+}
+
+std::shared_ptr<const void> Preserve_trx_receiver_candidates::register_result(
+    const std::string &id) {
+  std::shared_ptr<Impl::Result> retired;
+  Preserve_trx_result_manifest::Result identity;
+  if (!preserve_trx_result_object_identity(id, &identity)) return {};
+  try {
+    std::lock_guard<std::mutex> guard(m_impl->mutex);
+    if (!m_impl->cancelled.load()) m_impl->slot(id, identity, &retired);
+  } catch (const std::bad_alloc &) { /* Optional; final validates the file. */ }
+  return retired;
+}
+
+bool Preserve_trx_receiver_candidates::result_prepared(
+    const Preserve_trx_transfer_object_descriptor &object,
+    const std::shared_ptr<const Preserve_trx_sealed_file> &file) const {
+  Preserve_trx_result_manifest::Result identity;
+  if (object.kind != Preserve_trx_transfer_object_kind::CURSOR_RESULT ||
+      object.flags || !file || !file->matches(object.total_size, object.digest) ||
+      !preserve_trx_result_object_identity(object.object_id, &identity)) return false;
+  auto &s = *m_impl;
+  std::lock_guard<std::mutex> lock(s.mutex);
+  const auto at = s.results.find(identity.statement_id);
+  if (s.cancelled.load() || at == s.results.end()) return false;
+  const auto &result = *at->second;
+  if (result.id != object.object_id || !result.ready || result.working ||
+      result.failed || result.final_claimed || !result.decoder) return false;
+  const auto &d = result.decoder->descriptor();
+  return d.statement_id == identity.statement_id && d.generation == identity.generation &&
+         d.size == object.total_size && d.digest == object.digest &&
+         result.decoder->owns_file(file);
+}
+
+void Preserve_trx_receiver_candidates::retain_selected_results(
+    const Preserve_trx_transfer_receiver_record &record,
+    std::vector<std::shared_ptr<const void>> *retired) {
+  std::lock_guard<std::mutex> guard(m_impl->mutex);
+  for (auto it = m_impl->results.begin(); it != m_impl->results.end();) {
+    const auto *object = record.object_index
+        ? record.object_index->find(record.objects, it->second->id) : nullptr;
+    if (object && record.sealed_objects.count(it->second->id)) { ++it; continue; }
+    retired->push_back(std::move(it->second)); // Caller reserved before publishing BEGIN.
+    it = m_impl->results.erase(it);
+  }
+}
+
 bool Preserve_trx_receiver_candidates::step_result(
     const std::string &id, std::shared_ptr<const Preserve_trx_sealed_file> file,
-    THD *worker, uint64_t rows, uint64_t bytes, bool *complete,
+    THD *worker, uint64_t rows, uint64_t bytes, Preserve_trx_cursor_workspace &work, bool *complete,
     uint64_t *scanned_bytes) {
   if (!complete || !scanned_bytes) return true;
   *complete = true;
@@ -138,25 +194,17 @@ bool Preserve_trx_receiver_candidates::step_result(
   Preserve_trx_result_manifest::Result identity;
   if (!preserve_trx_result_object_identity(id, &identity)) return true;
   std::shared_ptr<Impl::Result> result;
-  std::shared_ptr<Impl::Result> retired;
   try {
     {
       std::lock_guard<std::mutex> lock(s.mutex);
       const auto current = s.results.find(identity.statement_id);
-      if (current != s.results.end()) {
-        if (current->second->final_claimed ||
-            current->second->generation > identity.generation) return false;
-        if (current->second->generation == identity.generation &&
-            current->second->id != id) return true;
-      }
-      result = s.slot(id, identity, &retired);
+      if (current == s.results.end() || current->second->id != id ||
+          current->second->final_claimed) return false;
+      result = current->second;
       if (!result || result->failed || result->working) return true;
-      if (result->ready || result->final_claimed) return false;
+      if (result->ready) return false;
       result->working = true;
     }
-    // A decoder can close files and release memory. Never retire it under the
-    // candidates mutex; a worker already using it retains its own shared pin.
-    retired.reset();
     bool failed = true;
     const auto finish = create_scope_guard([&] {
       std::lock_guard<std::mutex> lock(s.mutex);
@@ -171,6 +219,8 @@ bool Preserve_trx_receiver_candidates::step_result(
       }
       *complete = result->failed || result->ready;
     });
+    if (!work.bind(s.token)) return true;
+    const auto release = create_scope_guard([&] { work.unbind(); });
     worker->reset_for_next_command();
     worker->get_stmt_da()->reset_condition_info(worker);
     if (!result->decoder) {
@@ -178,7 +228,7 @@ bool Preserve_trx_receiver_candidates::step_result(
       std::unique_ptr<Preserve_trx_cursor_file> input;
       if (Preserve_trx_cursor_file::describe(*file, &descriptor) != Status::OK ||
           name(descriptor) != id ||
-          Preserve_trx_cursor_file::open(s.token, file, descriptor, &input) != Status::OK ||
+          Preserve_trx_cursor_file::open(s.token, file, descriptor, work, &input) != Status::OK ||
           Preserve_trx_cursor_decoder::create(s.token, worker, std::move(input),
                                               &result->decoder) != Status::OK)
         return true;
@@ -186,7 +236,7 @@ bool Preserve_trx_receiver_candidates::step_result(
     }
     if (!file->matches(result->decoder->descriptor().size,
                        result->decoder->descriptor().digest) ||
-        result->decoder->preflight_next(rows, bytes, scanned_bytes) != Status::OK ||
+        result->decoder->preflight_next(rows, bytes, work, scanned_bytes) != Status::OK ||
         worker->killed || s.cancelled.load()) return true;
     failed = false;
     return false;
@@ -208,10 +258,6 @@ Preserve_trx_receiver_candidates::take_result(
         descriptor.digest};
     std::lock_guard<std::mutex> lock(s.mutex);
     if (s.cancelled.load()) return Take::FAILED;
-    const auto current = s.results.find(identity.statement_id);
-    if (current != s.results.end() &&
-        current->second->generation == identity.generation &&
-        current->second->id != id) return Take::FAILED;
     // Final can select an earlier exact generation. Retire another optional
     // candidate and let the existing READY preparation validate the right file.
     auto result = s.slot(id, identity, &obsolete);
@@ -225,7 +271,7 @@ Preserve_trx_receiver_candidates::take_result(
     }
     if (result->working || (result->decoder && !result->ready)) return Take::WAIT;
     if (result->ready) {
-      if (!matches(result->decoder->descriptor(), descriptor)) return Take::FAILED;
+      if (!result->decoder->descriptor().matches(descriptor)) return Take::FAILED;
       *output = std::move(result->decoder);
       result->ready = false;
       result->final_claimed = true;
@@ -258,6 +304,11 @@ void Preserve_trx_receiver_candidates::register_temp(
   auto &s = *m_impl;
   if (s.cancelled || !file || (s.temp && s.temp->id == id &&
       same_file(s.temp->file, file))) return;
+  // Do not discard an in-progress private conversion for an optional refresh.
+  // Its donor may already be partly consumed. Final independently selects its
+  // exact input; a skipped refresh reports unavailable through prepared(id).
+  if (s.temp && !s.temp->failed && !s.temp->final_claimed &&
+      (s.temp->working || (s.temp->work && !s.temp->ready))) return;
   try {
     const auto overhead = sizeof(Impl::Temp) + id.size() * 2 + 512;
     if (file->size() > SIZE_MAX - overhead || file->size() > (UINT64_MAX - overhead) / 2) return;
@@ -270,9 +321,14 @@ void Preserve_trx_receiver_candidates::register_temp(
     slot->id = id;
     slot->file = std::move(file);
     retired = std::move(s.temp);
-    if (retired && !retired->working && retired->ready && !retired->failed &&
-        !retired->final_claimed && retired->work && retired->work->preprepared())
-      slot->previous = std::move(retired->work);
+    if (retired && !retired->working && !retired->failed &&
+        !retired->final_claimed) {
+      if (retired->ready && retired->work && retired->work->preprepared())
+        slot->previous = std::move(retired->work);
+      else if (!retired->work && retired->previous &&
+               retired->previous->preprepared())
+        slot->previous = std::move(retired->previous);
+    }
     s.temp = std::move(slot);
   } catch (const std::bad_alloc &) {}
 }
@@ -344,8 +400,9 @@ bool Preserve_trx_receiver_candidates::step_temp(
 Preserve_trx_receiver_candidates::Take Preserve_trx_receiver_candidates::take_temp(
     const Preserve_snapshot_metadata &metadata,
     const Preserve_trx_transfer_receiver_record &record,
-    Preserve_trx_temp_receiver_work::Owner *output) {
-  if (!output || *output) return Take::FAILED;
+    Preserve_trx_temp_receiver_work::Owner *output,
+    Preserve_trx_temp_receiver_work::Owner *previous) {
+  if (!output || *output || !previous || *previous) return Take::FAILED;
   auto &s = *m_impl;
   std::shared_ptr<Impl::Temp> slot;
   {
@@ -357,8 +414,21 @@ Preserve_trx_receiver_candidates::Take Preserve_trx_receiver_candidates::take_te
     slot->final_claimed = true;
     s.temp.reset();
   }
-  if (slot->failed || !slot->work ||
-      slot->payload != metadata.temp_table_manifest_payload) return Take::ABSENT;
+  if (slot->failed) return Take::ABSENT;
+  if (!slot->work) {
+    // An unstarted candidate has not consumed its donor. Final still loads
+    // and authenticates its own input before checking generation compatibility.
+    if (slot->previous && slot->previous->preprepared())
+      *previous = std::move(slot->previous);
+    return Take::ABSENT;
+  }
+  if (slot->payload != metadata.temp_table_manifest_payload) {
+    // The final input is authenticated separately. Offer only an unpublished
+    // donor to the existing generation checks; it grants no final authority.
+    if (slot->ready && slot->work->preprepared())
+      *previous = std::move(slot->work);
+    return Take::ABSENT;
+  }
   if (!slot->work->authorize_final(metadata, record)) return Take::FAILED;
   *output = std::move(slot->work);
   ++native_reused;

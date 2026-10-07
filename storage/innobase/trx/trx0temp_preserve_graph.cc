@@ -163,70 +163,61 @@ dberr_t trx_preserve_temp_undo_graph::append_record(
   const bool retired = plan.source_table_retired(header.table_id.value);
   if (retired && table != nullptr) return DB_CORRUPTION;
   if (!retired && table == nullptr) return DB_UNSUPPORTED;
-  if (retired) {
-    // Native rollback skips a removed table before decoding its row fields.
-    // Keep the slot/address for chain validation; never map it to a namesake.
-    trx_preserve_temp_import_undo_record record;
-    record.image = page;
-    record.header = header;
-    record.insert = insert;
-    record.retired = true;
-    const uint64_t address = (uint64_t{page->page_no} << 16) | header.origin;
-    if (!addresses.emplace(address, records.size()).second) return DB_CORRUPTION;
-    records.push_back(std::move(record));
-    ++header_next;
-    last_header = header;
-    last_record_page = page->page_no;
-    *bytes = header.next - header.origin;
-    return DB_SUCCESS;
-  }
-  trx_preserve_temp_undo_fields fields;
-  auto err = trx_preserve_temp_undo_decode_fields(
-      page->bytes.data(), page->bytes.size(), header, table->first_index(), &fields);
-  if (err != DB_SUCCESS) {
-    if (err == DB_CORRUPTION)
-      DBUG_PRINT("preserve_temp_import", ("temporary undo fields rejected corruption"));
-    return err;
-  }
-  size_t refs = 0;
-  for (const auto *values : {&fields.updated, &fields.ordering})
-    for (const auto &value : *values) refs += value.external;
-  const uint64_t extra = refs * 2 * sizeof(trx_preserve_temp_external_reference) +
-      fields.lob_diffs.capacity() * sizeof(trx_preserve_temp_lob_diff);
-  if (extra > UINT64_MAX - base_bytes - reference_bytes) return DB_OUT_OF_MEMORY;
-  const uint64_t desired = base_bytes + reference_bytes + extra;
-  if (desired > graph_memory.bytes()) {
-    const auto rounded = desired <= UINT64_MAX - kRefChunk ?
-        ((desired + kRefChunk - 1) / kRefChunk) * kRefChunk : desired;
-    if (!graph_memory.grow_to(rounded) && !graph_memory.grow_to(desired))
-      return DB_OUT_OF_MEMORY;
-    DBUG_PRINT("preserve_temp_import",
-               ("temporary source graph reference credit bytes=%llu",
-                static_cast<unsigned long long>(graph_memory.bytes() - base_bytes)));
-  }
   trx_preserve_temp_import_undo_record record;
   record.image = page;
   record.header = header;
   record.insert = insert;
-  record.lob_diffs = std::move(fields.lob_diffs);
-  if (dict_index_is_auto_gen_clust(table->first_index())) {
-    if (fields.row_reference.size() != 1 || fields.row_reference[0].is_null ||
-        fields.row_reference[0].external ||
-        fields.row_reference[0].data_length != DATA_ROW_ID_LEN)
-      return DB_CORRUPTION;
-    record.generated_row_id =
-        mach_read_from_6(page->bytes.data() + fields.row_reference[0].data_offset);
-    if (record.generated_row_id == 0) return DB_CORRUPTION;
+  record.retired = retired;
+  uint64_t extra = 0;
+  // Native rollback skips removed tables before decoding their row fields.
+  // Keep their addresses for chain validation, never map them to a namesake.
+  if (!retired) {
+    trx_preserve_temp_undo_fields fields;
+    auto err = trx_preserve_temp_undo_decode_fields(
+        page->bytes.data(), page->bytes.size(), header, table->first_index(), &fields);
+    if (err != DB_SUCCESS) {
+      if (err == DB_CORRUPTION)
+        DBUG_PRINT("preserve_temp_import", ("temporary undo fields rejected corruption"));
+      return err;
+    }
+    size_t refs = 0;
+    for (const auto *values : {&fields.updated, &fields.ordering})
+      for (const auto &value : *values) refs += value.external;
+    extra = refs * 2 * sizeof(trx_preserve_temp_external_reference) +
+        fields.lob_diffs.capacity() * sizeof(trx_preserve_temp_lob_diff);
+    if (extra > UINT64_MAX - base_bytes - reference_bytes) return DB_OUT_OF_MEMORY;
+    const uint64_t desired = base_bytes + reference_bytes + extra;
+    if (desired > graph_memory.bytes()) {
+      const auto rounded = desired <= UINT64_MAX - kRefChunk ?
+          ((desired + kRefChunk - 1) / kRefChunk) * kRefChunk : desired;
+      if (!graph_memory.grow_to(rounded) && !graph_memory.grow_to(desired))
+        return DB_OUT_OF_MEMORY;
+      DBUG_PRINT("preserve_temp_import",
+                 ("temporary source graph reference credit bytes=%llu",
+                  static_cast<unsigned long long>(graph_memory.bytes() - base_bytes)));
+    }
+    record.lob_diffs = std::move(fields.lob_diffs);
+    if (dict_index_is_auto_gen_clust(table->first_index())) {
+      if (fields.row_reference.size() != 1 || fields.row_reference[0].is_null ||
+          fields.row_reference[0].external ||
+          fields.row_reference[0].data_length != DATA_ROW_ID_LEN)
+        return DB_CORRUPTION;
+      record.generated_row_id =
+          mach_read_from_6(page->bytes.data() + fields.row_reference[0].data_offset);
+      if (record.generated_row_id == 0) return DB_CORRUPTION;
+    }
+    record.external_refs.reserve(refs);
+    for (const auto *values : {&fields.updated, &fields.ordering})
+      for (const auto &value : *values)
+        if (value.external) record.external_refs.push_back(value.external_reference);
   }
-  record.external_refs.reserve(refs);
-  for (const auto *values : {&fields.updated, &fields.ordering})
-    for (const auto &value : *values)
-      if (value.external) record.external_refs.push_back(value.external_reference);
   const uint64_t address = (uint64_t{page->page_no} << 16) | header.origin;
   if (!addresses.emplace(address, records.size()).second) return DB_CORRUPTION;
   records.push_back(std::move(record));
-  if (insert) ++surviving_insert; else ++surviving_update;
-  reference_bytes += extra;
+  if (!retired) {
+    if (insert) ++surviving_insert; else ++surviving_update;
+    reference_bytes += extra;
+  }
   ++header_next;
   last_header = header;
   last_record_page = page->page_no;

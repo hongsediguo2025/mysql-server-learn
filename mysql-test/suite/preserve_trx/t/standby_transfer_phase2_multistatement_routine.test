@@ -46,7 +46,6 @@ SET DEBUG_SYNC='now SIGNAL multi_call_continue';
 --connection multi_blocker
 --enable_result_log
 --enable_info
---error ER_PRESERVE_TRX_SESSION_DRAINED
 --reap
 --disable_info
 --disable_result_log
@@ -57,10 +56,10 @@ SELECT 1;
 --connection default
 --reap
 --connection multi_ha
---let $data_ok= `SELECT (SELECT v=10 FROM t_phase2_multi WHERE id=1) AND (SELECT v=1 FROM t_phase2_multi WHERE id=2) AND (SELECT v=0 FROM t_phase2_multi WHERE id=3)`
+--let $data_ok= `SELECT (SELECT v=10 FROM t_phase2_multi WHERE id=1) AND (SELECT v=1 FROM t_phase2_multi WHERE id=2) AND (SELECT v=900 FROM t_phase2_multi WHERE id=3)`
 if (!$data_ok)
 {
-  --die CALL results or outer statement cutoff was violated
+  --die CALL results or outer complete-command suffix was violated
 }
 --source suite/preserve_trx/include/phase2_multistatement_cleanup.inc
 DROP PROCEDURE p_phase2_same_tx;

@@ -347,7 +347,9 @@ def run(args):
             if args.expect_admission_rejection:
                 assert drain_errors and all('SqlError(4013,' in e for e in drain_errors),drain_errors
                 if not args.cancel_ack_loss:
-                    assert any(e['ack_status']==-4013 for e in relay.snapshot()['events']),'missing native transfer ERR'
+                    # The observer verifies the request digest and nonce for
+                    # positive ACK statuses. Keep native pre-admission ERRs too.
+                    assert any(e['ack_status'] in (-4013, 5) for e in relay.snapshot()['events']), 'missing receiver capacity rejection'
                 else:
                     assert fault['data_drops'] >= 2 and fault['cancel_drops'] == 1, fault
                     assert len(fault['cancel_digests']) >= 2 and len(set(fault['cancel_digests'])) == 1, fault
@@ -579,8 +581,6 @@ def run_mixed(args):
             report['drain_us']=report['drain_end_us']-report['drain_begin_us'];report['ready_tail_us']=report['ready_observed_us']-report['drain_end_us']
             metrics()
             assert not report.get('metric_capture_errors'),report.get('metric_capture_errors')
-            expected=sum(o['kind']!='ordinary' for o in owners)
-            assert report['receiver_after'][P+'temp_stage_final_tokens']==expected,(expected,report['receiver_after'][P+'temp_stage_final_tokens'])
             report['owners']=[{k:v for k,v in o.items() if k!='client'} for o in owners]
             report['success']=True
     except ExpectedAdmissionRejection:

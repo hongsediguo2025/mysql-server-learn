@@ -1,8 +1,14 @@
 # 临时表与待 FETCH 结果 Preserve/Resume
 
-更新：2026-10-04。当前目录 `/Users/a1234/project/mysql-server-8022-preserve-port`，分支 `ha_preserve_trx`；基线 `e6715a345881` 加未提交改动。当前范围与源码已按 PS transfer 删除重新核对，未经用户指令不提交或 push。
+更新：2026-10-09。当前目录 `/Users/a1234/project/mysql-server-8022-preserve-port`，分支 `ha_preserve_trx`；基线 `f540116c322e` 加 E107 接口修正、E109 默认值调整、E111 Phase1 捕获及 E112/E114 I/O与producer流改动。当前范围与源码已按 PS transfer 删除重新核对，未经用户指令不提交或 push。
 
 ## 当前设计入口
+
+E128 已实现 [TEMP 后台完成与 session RESUME 屏障](async-temp-resume-barrier.md)：READY 后复用原 worker 完成最终写入、flush、close，SQL RESUME 只等待自己的资源。此前 E126 `seal_private` 已撤除。70个相关MTR在适用模式通过；Release原500连接持续模型五轮本地功能、strict及ACK→READY均通过，独立EXACT门槛和外部物理工程验收仍未关闭。详情见[本轮证据](../../../build-debug/preserve-temp-async-e128/README.md)。
+
+新增正式图解入口：[用户临时表与待 FETCH 结果的跨主恢复（HTML）](../../html/preserve-resume-8.0.22-temp-table-fetch-guide.html)。2026-10-08 按当前源码与 E107／E108 核对，含背景知识、21 张分解图、控制 session 关联合同、性能口径和验证边界；本页下方 E63／E64 数据保留为历史记录。
+
+2026-10-08 按用户确认调整部署默认值：`rds_preserve_trx_memory_budget_bytes=2147483648`（2 GiB）、`rds_preserve_trx_transfer_runtime_profile=PROMOTION_PREPARE`、`rds_preserve_trx_temp_id_namespace=ON`。生效时点与兼容条件见[详细设计 §1.2](detailed-design.md#12-当前部署默认值2026-10-08)，默认值定向验证见任务跟踪 E109，随后全量含 big test 的验证见 E110；历史性能数据不改写。E111 将结果捕获统一移到 DRAIN Phase1，并删除独立 `result_capture_enable` 参数；DRAIN 前不生成捕获工件，详见详细设计 §6。E114 进一步让 Phase1 新结果边生成边发送；存量和可选流回退继续复用安全借用扫描。结果接收不 fsync，OPEN 前缀不能 READY；当前功能与性能证据见任务跟踪 E114。 最终全量含big test双模式零失败；追加同版Release五轮功能均通过，但strict≤2.2s为4/5、ACK<500ms为0/5，性能未关闭。
 
 本工程保存用户临时表和已物化的 Classic cursor 结果；物理复制工程已负责 session 上下文及 PS 回放。完整顺序为：
 
@@ -58,3 +64,5 @@ SQL RESUME 不创建 PS，不恢复其 SQL/参数/历史依赖；客户端不改
 | 原版本清理与收敛 | [M11 清理](m11-capacity-cleanup-fix-2026-10-01.md)、[流水线](pipeline-convergence-2026-10-01.md)、[内核](kernel-convergence-2026-10-02.md) |
 
 历史代码量不能与本次净删行数机械相减；历史“未完成”不直接转为当前待办。当前剩余项单列在 [remaining-work.md](remaining-work.md)。
+
+最新全量 MTR（E110，2026-10-08）：no-bin 604 通过／295 条件跳过，log-bin 608 通过／291 条件跳过，均零失败；899 个不同用例及 18 个 big test 全部在适用模式通过。只补齐 19 个旧用例的配置／清理前提，内核未改，原失败和串行复验记录保留。见 [E110 报告](../../../build-debug/preserve-full-big-e110/README.md)及任务跟踪 E110。

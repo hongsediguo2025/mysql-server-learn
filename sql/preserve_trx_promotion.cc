@@ -2953,7 +2953,7 @@ bool strict_prepared_snapshot_is_ready(
          snapshot.semantic_bundle_owned && facts.semantic_validated &&
          snapshot.resource_temp_id_contract_bound &&
          snapshot.resource_temp_id_contract == facts.temp_id_contract &&
-         snapshot.temp_resources_ready &&
+         snapshot.temp_resources_promotion_safe &&
          (snapshot.recovery.resource_only()
               ? !snapshot.resurrection_entry_owned && snapshot.recovery.owner_trx_id == 0 &&
                     snapshot.recovery.freeze_lsn == 0

@@ -37,6 +37,21 @@ bool Preserve_trx_sealed_file::matches(
   return size == m_size && digest == m_digest;
 }
 
+bool Preserve_trx_sealed_file::known_zero_range(uint64_t offset,
+                                               size_t length) const {
+  if (offset > m_size || length > m_size - offset || !m_overlay) return false;
+  if (!length) return true;
+  const auto &v = *m_overlay;
+  if (v.count) {
+    const auto end = v.blocks.get() + v.count;
+    const auto next = std::upper_bound(v.blocks.get(), end, offset,
+        [](uint64_t at, const Overlay::Block &b) { return at < b.offset; });
+    if ((next != v.blocks.get() && offset - (next - 1)->offset < v.block_size) ||
+        (next != end && next->offset < offset + length)) return false;
+  }
+  return v.zero_default || (v.base && v.base->known_zero_range(offset, length));
+}
+
 bool Preserve_trx_sealed_file::read_at(uint64_t offset, unsigned char *bytes,
                                       size_t length) const {
   if (offset > m_size || length > m_size - offset ||
@@ -44,7 +59,13 @@ bool Preserve_trx_sealed_file::read_at(uint64_t offset, unsigned char *bytes,
   if (length == 0) return true;
   if (m_overlay) {
     const auto &v = *m_overlay;
-    if (v.count == 0) return v.base->read_at(offset, bytes, length);
+    if (v.count == 0) {
+      if (v.zero_default) {
+        std::memset(bytes, 0, length);
+        return true;
+      }
+      return v.base && v.base->read_at(offset, bytes, length);
+    }
     const auto end = v.blocks.get() + v.count;
     auto next = std::upper_bound(v.blocks.get(), end, offset,
         [](uint64_t at, const Overlay::Block &b) { return at < b.offset; });
@@ -58,7 +79,9 @@ bool Preserve_trx_sealed_file::read_at(uint64_t offset, unsigned char *bytes,
       const auto n = static_cast<size_t>(std::min<uint64_t>(length, limit - offset));
       const auto &file = patched ? v.patch : v.base;
       const auto at = patched ? next->payload + offset - next->offset : offset;
-      if (n == 0 || !file->read_at(at, bytes, n)) return false;
+      if (n == 0) return false;
+      if (!patched && v.zero_default) std::memset(bytes, 0, n);
+      else if (!file || !file->read_at(at, bytes, n)) return false;
       offset += n;
       bytes += n;
       length -= n;
@@ -67,11 +90,10 @@ bool Preserve_trx_sealed_file::read_at(uint64_t offset, unsigned char *bytes,
     return true;
   }
   if (m_bytes != nullptr) {
-    if (length != 0) std::memcpy(bytes, m_bytes + offset, length);
+    std::memcpy(bytes, m_bytes + offset, length);
     return true;
   }
-  return length == 0 ||
-         my_pread(m_file, bytes, length, static_cast<my_off_t>(offset), MYF(0)) ==
+  return my_pread(m_file, bytes, length, static_cast<my_off_t>(offset), MYF(0)) ==
              length;
 }
 

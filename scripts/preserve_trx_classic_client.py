@@ -29,6 +29,7 @@ class ParameterClient(CursorClient):
         count, _ = length_encoded(packet)
         columns = [self.packet()[1] for _ in range(count)]
         _, eof = self.packet()
+        self.error(eof)
         assert eof[0] == 254, eof
         assert bool(int.from_bytes(eof[3:5], "little") & 64) == cursor, eof
         return columns, [] if cursor else self.binary_rows()

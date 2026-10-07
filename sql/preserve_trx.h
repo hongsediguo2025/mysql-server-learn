@@ -768,6 +768,7 @@ bool preserved_trx_expired_reaper_starting_for_unit_test();
 bool preserved_trx_shutdown_requested();
 void preserved_trx_begin_external_thd_teardown(THD *thd);
 void preserved_trx_end_external_thd_teardown(THD *thd);
+struct Preserve_trx_final_cursor_workspace;
 bool preserve_trx_preserve_attached_transaction(
     THD *target_thd, const Preserve_trx_options &options,
     ulonglong timeout_seconds, Preserve_trx_preserve_result *result,
@@ -783,7 +784,8 @@ bool preserve_trx_preserve_attached_transaction(
     bool defer_local_authority_commit = false,
     Preserve_trx_deferred_transfer_candidate *deferred_transfer_candidate =
         nullptr,
-    const Preserve_trx_drain_ownership_state *drain_ownership = nullptr);
+    const Preserve_trx_drain_ownership_state *drain_ownership = nullptr,
+    Preserve_trx_final_cursor_workspace *cursor_workspace = nullptr);
 
 /*
   SQL command for batch drain preserve.

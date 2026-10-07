@@ -17,7 +17,6 @@ if ($sync_warnings)
 --connect(multi_waiter,localhost,phase2_multi_app,,test)
 BEGIN;
 UPDATE t_phase2_multi SET v=20 WHERE id=2;
-SET DEBUG_SYNC='phase2_sched_after_command_held SIGNAL multi_waiter_next_held';
 SET DEBUG_SYNC='lock_wait_will_wait SIGNAL multi_packet_wait';
 delimiter ||;
 --send
@@ -43,19 +42,11 @@ if ($sync_warnings)
 --connection multi_blocker
 COMMIT;
 --connection multi_ha
-# The old lock wait has ended, but the next SQL has no support. The still
-# executing anchor prevents HARD, so this signal proves an actual SOFT HELD.
-SET DEBUG_SYNC='now WAIT_FOR multi_waiter_next_held TIMEOUT 5';
---let $sync_warnings= `SELECT @@warning_count`
-if ($sync_warnings)
-{
-  --die waiter next statement inherited its preceding BODY admission
-}
+# The resumed complete command may execute its remaining SQL and COMMIT.
 SET DEBUG_SYNC='now SIGNAL multi_anchor_continue';
 --connection multi_waiter
 --enable_result_log
 --enable_info
---error ER_PRESERVE_TRX_SESSION_DRAINED
 --reap
 --disable_info
 --disable_result_log
@@ -66,11 +57,11 @@ SELECT 1;
 --connection default
 --reap
 --connection multi_ha
---let $data_ok= `SELECT (SELECT v=10 FROM t_phase2_multi WHERE id=1) AND (SELECT v=0 FROM t_phase2_multi WHERE id=2) AND (SELECT v=0 FROM t_phase2_multi WHERE id=3)`
+--let $data_ok= `SELECT (SELECT v=11 FROM t_phase2_multi WHERE id=1) AND (SELECT v=20 FROM t_phase2_multi WHERE id=2) AND (SELECT v=900 FROM t_phase2_multi WHERE id=3)`
 if (!$data_ok)
 {
-  --die waiter executed or committed the rest of its multi-statement packet
+  --die waiter failed to execute and commit the complete packet
 }
 --source suite/preserve_trx/include/phase2_multistatement_cleanup.inc
 --enable_result_log
---echo multi_statement_waiter_next_sql_held_without_support
+--echo multi_statement_waiter_completes_packet_after_lock_release

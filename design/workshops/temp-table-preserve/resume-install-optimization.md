@@ -26,7 +26,7 @@ receiver 沿原 worker 和候选缓存提前准备 TEMP 与结果，不能只把
 
 ## 3. attach 的实际成本和并发条件
 
-`preserve_trx_attach_cursor_after_ps_replay()` 在目标 owner 线程执行，核对真实 THD、PS map 对象和源 ID；对按 ID 排序的结果集合二分查找。结果已准备好，首次挂接不全文件散列/扫描、不执行 SELECT。
+`preserve_trx_attach_cursor_after_ps_replay()` 由新主上的控制 session 调用，`current_thd` 保持控制 THD；参数指定受已有接管机制独占保护的目标业务 THD。接口核对目标 PS map 对象和源 ID，对按 ID 排序的结果集合二分查找。结果已准备好，首次挂接不全文件散列/扫描、不执行 SELECT，也不切换 TLS。错误归控制请求，cursor 和后续 FETCH 的协议缓冲归目标 session。
 
 bind 仍可能为协议 bitmap 分配内存，存在失败路径；成功后才移动 cursor。不能承诺零分配、零锁或固定微秒。已经关联且仍开放的同一 imported cursor 可返回 ALREADY_ATTACHED；关闭或替换后不得复活。
 

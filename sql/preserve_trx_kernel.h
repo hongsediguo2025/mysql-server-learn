@@ -50,6 +50,7 @@ struct Preserve_trx_kernel_request {
   Preserve_trx_deferred_transfer_candidate *deferred_transfer_candidate{
       nullptr};
   const Preserve_trx_drain_ownership_state *drain_ownership{nullptr};
+  Preserve_trx_final_cursor_workspace *cursor_workspace{nullptr};
 };
 
 struct Preserve_trx_kernel_result {

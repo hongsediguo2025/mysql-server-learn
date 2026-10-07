@@ -1,1 +1,2 @@
 --rds-preserve-trx-memory-budget-bytes=524288
+--rds-preserve-trx-temp-id-namespace=OFF

@@ -34,7 +34,7 @@ if ($packet_case == off)
 {
   --let $packet_features= OFF
 }
---let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-temp-id-namespace=$packet_features --rds-preserve-trx-result-capture-enable=$packet_features --rds-preserve-trx-standby-phase2-scheduler-mode=DEPENDENCY_CONVERGENCE_V1 --rds-preserve-trx-phase1-capture-mode=BOUNDED_PIPELINE_V1 --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$SERVER_MYPORT_2 --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=phase2_multistatement --rds-preserve-trx-transfer-credential-secret-file=$credential_file --rds-preserve-trx-drain-phase1-timeout-ms=30000 --rds-preserve-trx-drain-phase2-timeout-ms=30000 --log-error-verbosity=3
+--let $restart_parameters= restart: --rds-preserve-trx-enable=ON --rds-preserve-trx-temp-id-namespace=$packet_features --rds-preserve-trx-standby-phase2-scheduler-mode=DEPENDENCY_CONVERGENCE_V1 --rds-preserve-trx-phase1-capture-mode=BOUNDED_PIPELINE_V1 --rds-preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --rds-preserve-trx-transfer-target-host=127.0.0.1 --rds-preserve-trx-transfer-target-port=$SERVER_MYPORT_2 --rds-preserve-trx-transfer-target-user=preserve_trx_ha_admin --rds-preserve-trx-transfer-credential-name=phase2_multistatement --rds-preserve-trx-transfer-credential-secret-file=$credential_file --rds-preserve-trx-drain-phase1-timeout-ms=30000 --rds-preserve-trx-drain-phase2-timeout-ms=30000 --log-error-verbosity=3
 --source include/restart_mysqld.inc
 --source suite/preserve_trx/include/assert_standby_transfer_source.inc
 --let $restart_parameters=

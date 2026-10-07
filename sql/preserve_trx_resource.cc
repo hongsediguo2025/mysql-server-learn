@@ -55,7 +55,7 @@
 #include "sql/preserve_trx_promotion_prepared.h"
 #include "sql/preserve_trx_transfer.h"
 
-ulonglong preserve_trx_memory_budget_bytes = 256ULL * 1024ULL * 1024ULL;
+ulonglong preserve_trx_memory_budget_bytes = 2ULL * 1024ULL * 1024ULL * 1024ULL;
 ulonglong preserve_trx_memory_per_token_bytes = 1024ULL * 1024ULL * 1024ULL;
 uint preserve_trx_spill_chunk_bytes = 4U * 1024U * 1024U;
 
@@ -83,11 +83,6 @@ uint64_t preserve_memory_kind_cap(Preserve_trx_memory_kind kind,
 struct Token_kind_key {
   std::string token;
   Preserve_trx_memory_kind kind{Preserve_trx_memory_kind::SNAPSHOT_CODEC_BUFFER};
-
-  bool operator<(const Token_kind_key &other) const {
-    if (token != other.token) return token < other.token;
-    return static_cast<int>(kind) < static_cast<int>(other.kind);
-  }
 };
 
 struct Token_kind_view {
@@ -172,15 +167,79 @@ bool preserve_trx_capture_external_resource_limits(
 class Preserve_resource_manager {
  public:
   bool acquire(const std::string &token, Preserve_trx_memory_kind kind,
-               uint64_t bytes) {
+               uint64_t bytes, bool fixed_home = false) {
     std::lock_guard<std::mutex> guard(m_mutex);
-    return acquire_memory_locked(token, kind, bytes);
+    if (fixed_home && (!bytes || m_by_token.count(token))) return false;
+    if (!acquire_memory_locked(token, kind, bytes)) return false;
+    if (fixed_home) m_by_token.find(token)->second.fixed_home = true;
+    return true;
   }
 
   void release(const std::string &token, Preserve_trx_memory_kind kind,
-               uint64_t bytes) {
+               uint64_t bytes, bool fixed_home = false) {
     std::lock_guard<std::mutex> guard(m_mutex);
+    if (fixed_home) {
+      auto home = m_by_token.find(token);
+      DBUG_ASSERT(home != m_by_token.end() && home->second.fixed_home);
+      if (home != m_by_token.end()) home->second.fixed_home = false;
+    }
     release_memory_locked(token, kind, bytes);
+  }
+
+  bool rebind_memory(const std::string &from, const std::string &to,
+                     Preserve_trx_memory_kind kind, uint64_t bytes,
+                     bool returning = false) {
+    if (to.empty()) return false;
+    if (from == to) return true;
+    std::lock_guard<std::mutex> guard(m_mutex);
+    auto source = m_by_token.find(from);
+    auto source_kind = m_by_token_kind.find(Token_kind_view{from, kind});
+    auto target = m_by_token.find(to);
+    auto target_kind = m_by_token_kind.find(Token_kind_view{to, kind});
+    if (returning) {
+      // Dedicated home records survived the loan. No admission or allocation.
+      DBUG_ASSERT(bytes && source != m_by_token.end() &&
+                  source->second.bytes >= bytes &&
+                  source_kind != m_by_token_kind.end() && source_kind->second >= bytes &&
+                  target != m_by_token.end() && target->second.fixed_home &&
+                  target->second.bytes == 0 && target_kind != m_by_token_kind.end() &&
+                  target_kind->second == 0);
+    } else {
+      if (target != m_by_token.end() && target->second.fixed_home) return false;
+      if (!bytes) {
+        // acquire(0) may have left empty records; shrink_to(0) removed them.
+        release_memory_locked(from, kind, 0);
+        return true;
+      }
+      if (source == m_by_token.end() || source->second.bytes < bytes ||
+          source_kind == m_by_token_kind.end() || source_kind->second < bytes)
+        return false;
+      const auto used = target == m_by_token.end() ? 0 : target->second.bytes;
+      if (bytes > preserve_trx_memory_per_token_bytes ||
+          used > preserve_trx_memory_per_token_bytes - bytes) return false;
+      bool added_token = false;
+      auto rollback = create_scope_guard([&] {
+        if (added_token) m_by_token.erase(to);
+      });
+      if (target == m_by_token.end()) {
+        const auto inserted = m_by_token.emplace(to, Memory_account{});
+        target = inserted.first;
+        added_token = inserted.second;
+      }
+      DBUG_EXECUTE_IF("preserve_cursor_memory_rebind_failure", { throw std::bad_alloc(); });
+      if (target_kind == m_by_token_kind.end())
+        target_kind = m_by_token_kind.emplace(Token_kind_key{to, kind}, 0).first;
+      rollback.commit();
+    }
+    target->second.bytes += bytes;
+    target_kind->second += bytes;
+    source->second.bytes -= bytes;
+    source_kind->second -= bytes;
+    if (!source->second.fixed_home) {
+      if (!source->second.bytes) m_by_token.erase(source);
+      if (!source_kind->second) m_by_token_kind.erase(source_kind);
+    }
+    return true;
   }
 
   bool acquire_native_binlog(const std::string &token, uint64_t memory_bytes,
@@ -372,13 +431,14 @@ class Preserve_resource_manager {
     auto source_kind = m_by_token_kind.find(old_kind);
     auto source_fd = m_native_fd_by_token.find(from);
     auto source_tmp = m_native_tmpdir_by_token.find(from);
-    if (source == m_by_token.end() || source->second < memory ||
+    if (source == m_by_token.end() || source->second.bytes < memory ||
         source_kind == m_by_token_kind.end() || source_kind->second < memory ||
         source_fd == m_native_fd_by_token.end() || source_fd->second < fds ||
         source_tmp == m_native_tmpdir_by_token.end() || source_tmp->second < tmpdir)
       return false;
     const auto target = m_by_token.find(to);
-    const uint64_t used = target == m_by_token.end() ? 0 : target->second;
+    if (target != m_by_token.end() && target->second.fixed_home) return false;
+    const uint64_t used = target == m_by_token.end() ? 0 : target->second.bytes;
     if (memory > preserve_trx_memory_per_token_bytes ||
         used > preserve_trx_memory_per_token_bytes - memory) return false;
     /* Allocate all destination records before changing accounting. No global
@@ -393,7 +453,7 @@ class Preserve_resource_manager {
       if (new_fd) m_native_fd_by_token.erase(to);
       if (new_tmp) m_native_tmpdir_by_token.erase(to);
     });
-    const auto token_insert = m_by_token.emplace(to, 0);
+    const auto token_insert = m_by_token.emplace(to, Memory_account{});
     new_token = token_insert.second;
     const auto kind_insert = m_by_token_kind.emplace(new_kind, 0);
     new_kind_record = kind_insert.second;
@@ -406,15 +466,15 @@ class Preserve_resource_manager {
     auto dest_fd = fd_insert.first;
     auto dest_tmp = tmp_insert.first;
     changed = true;
-    dest->second += memory;
+    dest->second.bytes += memory;
     dest_kind->second += memory;
     dest_fd->second += fds;
     dest_tmp->second += tmpdir;
-    source->second -= memory;
+    source->second.bytes -= memory;
     source_kind->second -= memory;
     source_fd->second -= fds;
     source_tmp->second -= tmpdir;
-    if (source->second == 0) m_by_token.erase(source);
+    if (source->second.bytes == 0) m_by_token.erase(source);
     if (source_kind->second == 0) m_by_token_kind.erase(source_kind);
     if (source_fd->second == 0) {
       m_native_fd_by_token.erase(source_fd);
@@ -464,16 +524,18 @@ class Preserve_resource_manager {
     }
     const Token_kind_view token_kind{token, kind};
     auto existing_token = m_by_token.find(token);
+    if (existing_token != m_by_token.end() && existing_token->second.fixed_home)
+      return false;
     auto existing_kind = m_by_token_kind.find(token_kind);
     if (growing && (existing_token == m_by_token.end() ||
                     existing_kind == m_by_token_kind.end())) return false;
     const uint64_t token_bytes =
-        existing_token == m_by_token.end() ? 0 : existing_token->second;
+        existing_token == m_by_token.end() ? 0 : existing_token->second.bytes;
     if (token_bytes > per_token_budget - bytes) return false;
     if (!growing) {
       bool inserted_token = false;
       if (existing_token == m_by_token.end()) {
-        const auto inserted = m_by_token.emplace(token, 0);
+        const auto inserted = m_by_token.emplace(token, Memory_account{});
         existing_token = inserted.first;
         inserted_token = inserted.second;
       }
@@ -493,7 +555,7 @@ class Preserve_resource_manager {
     // All potentially allocating operations precede accounting publication.
     m_current_bytes += bytes;
     m_peak_bytes = std::max(m_peak_bytes, m_current_bytes);
-    existing_token->second += bytes;
+    existing_token->second.bytes += bytes;
     existing_kind->second += bytes;
     m_by_kind[kind_index] += bytes;
     return true;
@@ -514,16 +576,17 @@ class Preserve_resource_manager {
         std::min(m_by_kind[kind_index], released_bytes);
 
     auto token_it = m_by_token.find(token);
+    const bool fixed = token_it != m_by_token.end() && token_it->second.fixed_home;
     if (token_it != m_by_token.end()) {
-      if (released_bytes >= token_it->second) {
+      if (released_bytes >= token_it->second.bytes && !fixed) {
         m_by_token.erase(token_it);
       } else {
-        token_it->second -= released_bytes;
+        token_it->second.bytes -= std::min(token_it->second.bytes, released_bytes);
       }
     }
 
     if (kind_it != m_by_token_kind.end()) {
-      if (released_bytes >= kind_it->second) {
+      if (released_bytes >= kind_it->second && !fixed) {
         m_by_token_kind.erase(kind_it);
       } else {
         kind_it->second -= released_bytes;
@@ -667,7 +730,11 @@ class Preserve_resource_manager {
   uint64_t m_peak_bytes{0};
   uint64_t m_spill_bytes{0};
   uint64_t m_spill_failures{0};
-  std::map<std::string, uint64_t> m_by_token;
+  struct Memory_account {
+    uint64_t bytes{0};
+    bool fixed_home{false};
+  };
+  std::map<std::string, Memory_account> m_by_token;
   std::map<Token_kind_key, uint64_t, Token_kind_less> m_by_token_kind;
   std::array<uint64_t, kPreserveMemoryKindCount> m_by_kind{};
   uint64_t m_reserved_native_fds{0};
@@ -795,10 +862,12 @@ DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_undo_watched_pages,
                              trx_preserve_temp_undo_watched_pages())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_undo_owners,
                              trx_preserve_temp_undo_capture_owners())
+#ifndef NDEBUG
 DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_undo_owner_pages_used,
                              trx_preserve_temp_undo_capture_pages_used())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_undo_owner_pages_routed,
                              trx_preserve_temp_undo_capture_pages_routed())
+#endif
 DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_undo_owner_quota_rejected,
                              trx_preserve_temp_undo_capture_quota_rejected())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_temp_prebuild_undo_scans,
@@ -1556,9 +1625,12 @@ Preserve_memory_lease::Preserve_memory_lease(
     : m_token(std::move(other.m_token)),
       m_kind(other.m_kind),
       m_bytes(other.m_bytes),
-      m_acquired(other.m_acquired) {
+      m_acquired(other.m_acquired),
+      m_fixed_home(other.m_fixed_home),
+      m_return_token(std::move(other.m_return_token)) {
   other.m_bytes = 0;
   other.m_acquired = false;
+  other.m_fixed_home = false;
 }
 
 Preserve_memory_lease &Preserve_memory_lease::operator=(
@@ -1569,8 +1641,11 @@ Preserve_memory_lease &Preserve_memory_lease::operator=(
     m_kind = other.m_kind;
     m_bytes = other.m_bytes;
     m_acquired = other.m_acquired;
+    m_fixed_home = other.m_fixed_home;
+    m_return_token = std::move(other.m_return_token);
     other.m_bytes = 0;
     other.m_acquired = false;
+    other.m_fixed_home = false;
   }
   return *this;
 }
@@ -1580,6 +1655,7 @@ Preserve_memory_lease::~Preserve_memory_lease() { release(); }
 bool Preserve_memory_lease::grow_to(uint64_t bytes) {
   if (!m_acquired || bytes < m_bytes) return false;
   if (bytes == m_bytes) return true;
+  if (m_fixed_home) return false;
   try {
     if (!g_preserve_resource_manager.acquire(m_token, m_kind, bytes - m_bytes))
       return false;
@@ -1590,6 +1666,7 @@ bool Preserve_memory_lease::grow_to(uint64_t bytes) {
 
 bool Preserve_memory_lease::shrink_to(uint64_t bytes) {
   if (!m_acquired || bytes > m_bytes) return false;
+  if (m_fixed_home && bytes != m_bytes) return false;
   if (bytes != m_bytes) {
     g_preserve_resource_manager.release(m_token, m_kind, m_bytes - bytes);
     m_bytes = bytes;
@@ -1597,17 +1674,48 @@ bool Preserve_memory_lease::shrink_to(uint64_t bytes) {
   return true;
 }
 
+bool Preserve_memory_lease::rebind_token(const std::string &token) {
+  if (!m_acquired || token.empty()) return false;
+  if (token == m_token) return true;
+  if (m_fixed_home && !m_return_token.empty()) return false;
+  try {
+    std::string destination(token);
+    if (!g_preserve_resource_manager.rebind_memory(m_token, destination, m_kind, m_bytes))
+      return false;
+    m_token.swap(destination);
+    if (m_fixed_home) m_return_token.swap(destination);
+    return true;
+  } catch (const std::bad_alloc &) { return false; }
+}
+
+void Preserve_memory_lease::return_home() noexcept {
+  if (!m_acquired || !m_fixed_home || m_return_token.empty()) return;
+  g_preserve_resource_manager.rebind_memory(m_token, m_return_token, m_kind, m_bytes, true);
+  m_token.swap(m_return_token);
+  m_return_token.clear();
+}
+
 void Preserve_memory_lease::release() {
   if (!m_acquired) return;
-  g_preserve_resource_manager.release(m_token, m_kind, m_bytes);
+  return_home();
+  g_preserve_resource_manager.release(m_token, m_kind, m_bytes, m_fixed_home);
   m_bytes = 0;
   m_acquired = false;
+  m_fixed_home = false;
 }
 
 Preserve_memory_lease preserve_trx_acquire_memory_lease(
     const std::string &token, Preserve_trx_memory_kind kind, uint64_t bytes) {
   Preserve_memory_lease lease(token, kind, bytes, false);
   lease.m_acquired = g_preserve_resource_manager.acquire(token, kind, bytes);
+  return lease;
+}
+
+Preserve_memory_lease preserve_trx_acquire_fixed_memory_lease(
+    const std::string &home, Preserve_trx_memory_kind kind, uint64_t bytes) {
+  Preserve_memory_lease lease(home, kind, bytes, false);
+  lease.m_acquired = g_preserve_resource_manager.acquire(home, kind, bytes, true);
+  lease.m_fixed_home = lease.m_acquired;
   return lease;
 }
 

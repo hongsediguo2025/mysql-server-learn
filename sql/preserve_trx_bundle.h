@@ -35,6 +35,7 @@
 
 class THD;
 struct Preserve_trx_result_image;
+struct Preserve_trx_temp_source_images;
 
 static constexpr size_t kPreservedTrxSha256Length = 32;
 static constexpr uint16_t kPreservedTrxLockPlanContractVersion = 1;
@@ -436,6 +437,8 @@ class PreserveBinlogBlobProvider {
   On write failure those sidecars remain with the caller for metadata-aware
   undo reservation release and cleanup.
 */
+constexpr uint16_t kPreservedTrxTempTableManifestTlv = 0x80;
+
 struct Preserved_trx_bundle {
   Preserve_snapshot_metadata metadata;
   std::vector<Preserve_snapshot_tlv> tlvs;
@@ -448,6 +451,7 @@ struct Preserved_trx_bundle {
   std::vector<Preserved_trx_external_blob_descriptor> blob_descriptors;
   /* Source-only transport ownership; never serialized into snapshot bytes. */
   std::shared_ptr<const Preserve_trx_result_image> source_cursor_results;
+  std::shared_ptr<const Preserve_trx_temp_source_images> source_temp_images;
   bool owns_current_temp_sidecars{false};
 };
 

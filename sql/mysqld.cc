@@ -9066,10 +9066,12 @@ SHOW_VAR status_vars[] = {
      (char *)&show_preserve_trx_cursor_file_preflights, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"Preserve_trx_cursor_file_rejections",
      (char *)&show_preserve_trx_cursor_file_rejections, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+#ifndef NDEBUG
     {"Preserve_trx_cursor_decoded_rows",
      (char *)&show_preserve_trx_cursor_decoded_rows, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"Preserve_trx_cursor_preflight_rows",
      (char *)&show_preserve_trx_cursor_preflight_rows, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+#endif
     {"Preserve_trx_result_early_abandoned",
      (char *)&show_preserve_trx_result_early_abandoned, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"Preserve_trx_result_early_ready",
@@ -9224,12 +9226,14 @@ SHOW_VAR status_vars[] = {
      (char *)&show_preserve_trx_temp_undo_watched_pages, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"Preserve_trx_temp_undo_owners",
      (char *)&show_preserve_trx_temp_undo_owners, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+#ifndef NDEBUG
     {"Preserve_trx_temp_undo_owner_pages_used",
      (char *)&show_preserve_trx_temp_undo_owner_pages_used, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
-    {"Preserve_trx_temp_undo_owner_quota_rejected",
-     (char *)&show_preserve_trx_temp_undo_owner_quota_rejected, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"Preserve_trx_temp_undo_owner_pages_routed",
      (char *)&show_preserve_trx_temp_undo_owner_pages_routed, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+#endif
+    {"Preserve_trx_temp_undo_owner_quota_rejected",
+     (char *)&show_preserve_trx_temp_undo_owner_quota_rejected, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"Preserve_trx_temp_prebuild_undo_scans",
      (char *)&show_preserve_trx_temp_prebuild_undo_scans, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"Preserve_trx_temp_prebuild_undo_stale",

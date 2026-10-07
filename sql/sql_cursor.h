@@ -33,6 +33,7 @@ class Query_result;
 struct MEM_ROOT;
 class Preserve_trx_cursor_result;
 struct Preserve_trx_cursor_snapshot;
+struct Preserve_trx_cursor_capture_input;
 
 /**
   @file
@@ -78,6 +79,9 @@ class Server_side_cursor {
     return nullptr;
   }
   virtual bool preserve_snapshot(Preserve_trx_cursor_snapshot *) const {
+    return false;
+  }
+  virtual bool preserve_capture_input(Preserve_trx_cursor_capture_input *) {
     return false;
   }
   virtual ~Server_side_cursor() { free_root(&mem_root, MYF(0)); }

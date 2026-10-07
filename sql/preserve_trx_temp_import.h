@@ -26,7 +26,8 @@ class Preserve_trx_temp_import_work {
   /** Each call advances one phase. work_budget bounds metadata/DD/graph
   units (including metadata page reads); byte_budget additionally bounds graph
   decoding; page_budget bounds undo reader frames/chain checks. */
-  dberr_t step(size_t work_budget, size_t byte_budget, size_t page_budget);
+  dberr_t step(size_t work_budget, size_t byte_budget, size_t page_budget,
+              const trx_preserve_temp_import_plan *previous = nullptr);
   bool complete() const;
   const Preserve_trx_temp_transfer_input *input() const;
   /** Read bytes recorded in the most recent batch; validation-only batches

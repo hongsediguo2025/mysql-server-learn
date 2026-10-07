@@ -29,5 +29,4 @@ id	v
 1	11
 DROP TABLE t_warmcopy_savepoint_truncate;
 SET GLOBAL rds_preserve_trx_enable=ON;
-SET GLOBAL rds_preserve_trx_transfer_runtime_profile=BUSINESS_FIRST;
 SET DEBUG_SYNC = 'RESET';

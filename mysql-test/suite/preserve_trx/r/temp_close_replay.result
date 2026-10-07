@@ -1,4 +1,4 @@
 CLOSE replay after RESUME: silent duplicates, original IDs, survivor tail and ID reuse passed
 production TEMP_ONLY temporary transfer: cursor passed
-loopback receiver prepared temporary resources before READY
+loopback receiver published temporary resources; SQL RESUME gates installation
 strict SQL RESUME integration: success passed

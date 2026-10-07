@@ -1,9 +1,0 @@
-production MIXED temporary transfer: cursor passed
-SELECT VARIABLE_NAME,VARIABLE_VALUE FROM performance_schema.global_status
-WHERE VARIABLE_NAME IN ('Preserve_trx_temp_stage_final_tokens',
-'Preserve_trx_temp_stage_final_active_epochs',
-'Preserve_trx_temp_stage_final_ready_epochs') ORDER BY VARIABLE_NAME;
-VARIABLE_NAME	VARIABLE_VALUE
-Preserve_trx_temp_stage_final_active_epochs	1
-Preserve_trx_temp_stage_final_ready_epochs	0
-Preserve_trx_temp_stage_final_tokens	1

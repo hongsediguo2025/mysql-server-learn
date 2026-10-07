@@ -35,6 +35,9 @@ class Preserve_trx_sealed_file {
                const std::array<unsigned char, 32> &digest) const;
   /** True on success. Reads cannot escape the verified prefix. */
   bool read_at(uint64_t offset, unsigned char *bytes, size_t length) const;
+  /** Prove a zero range from immutable sparse indexes without IO. False means
+  unknown: raw files and any overlapping patch require normal reads. */
+  bool known_zero_range(uint64_t offset, size_t length) const;
 
  private:
   // The source producer has already hashed this exact immutable descriptor.
@@ -47,6 +50,7 @@ class Preserve_trx_sealed_file {
     std::unique_ptr<Block[]> blocks;
     size_t count{0}, capacity{0};
     uint64_t block_size{0};
+    bool zero_default{false};
   };
   Preserve_trx_sealed_file(std::unique_ptr<Overlay> overlay, uint64_t size,
                            const std::array<unsigned char, 32> &digest);

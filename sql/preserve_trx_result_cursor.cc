@@ -1,6 +1,7 @@
 /* Copyright (c) 2026, Oracle and/or its affiliates.
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0. */
+#include "sql/preserve_trx_cursor_workspace.h"
 #include "sql/preserve_trx_result_cursor.h"
 #include "sql/preserve_trx_temp_metrics.h"
 
@@ -36,18 +37,14 @@ Preserve_trx_result_cursor::~Preserve_trx_result_cursor() {
 Status Preserve_trx_result_cursor::create(
     const std::string &token, THD *thd, Preserve_trx_cursor_snapshot state,
     std::unique_ptr<Preserve_trx_cursor_decoder> decoder,
+    Preserve_trx_cursor_workspace &work,
     std::unique_ptr<Preserve_trx_result_cursor> *output) {
   if (!thd || !decoder || !output || !state.open || !state.file ||
       !state.file->matches(state.descriptor.size, state.descriptor.digest) ||
       state.fetch_count > state.descriptor.rows ||
       state.fetch_count > std::numeric_limits<ulong>::max() ||
       state.fetch_limit > std::numeric_limits<ulong>::max()) return Status::CORRUPT;
-  const auto &d = decoder->descriptor();
-  const auto &s = state.descriptor;
-  if (d.statement_id != s.statement_id || d.generation != s.generation ||
-      d.rows != s.rows || d.rows_offset != s.rows_offset ||
-      d.index_offset != s.index_offset || d.size != s.size ||
-      d.digest != s.digest || d.schema_digest != s.schema_digest)
+  if (!decoder->descriptor().matches(state.descriptor))
     return Status::CORRUPT;
   try {
     const uint64_t arena_bytes = 8192 + decoder->items().size() * 16;
@@ -55,12 +52,11 @@ Status Preserve_trx_result_cursor::create(
         token, Preserve_trx_memory_kind::CURSOR_RESULT_BUFFER,
         sizeof(Preserve_trx_result_cursor) + arena_bytes);
     if (!memory.acquired()) return Status::OUT_OF_MEMORY;
-    const auto status = decoder->seek(state.fetch_count);
+    const auto status = decoder->seek(state.fetch_count, work);
     if (status != Status::OK) return status;
     decoder->bind(thd);
     std::unique_ptr<Preserve_trx_result_cursor> c(new Preserve_trx_result_cursor(
         thd, std::move(state), std::move(decoder), std::move(memory)));
-    auto return_candidate = create_scope_guard([&] { decoder = std::move(c->m_decoder); });
     c->mem_root.set_max_capacity(arena_bytes);
     Query_arena backup;
     thd->swap_query_arena(c->m_arena, &backup);
@@ -72,7 +68,8 @@ Status Preserve_trx_result_cursor::create(
     if (!c->result) return Status::OUT_OF_MEMORY;
     thd->swap_query_arena(backup, &c->m_arena);
     restore.commit();
-    return_candidate.commit();
+    if (!preserve_trx_cursor_observe_generation(c->m_state.descriptor.generation))
+      return Status::CORRUPT;
     *output = std::move(c);
     ++restored_cursors;
     return Status::OK;
@@ -100,6 +97,11 @@ bool Preserve_trx_result_cursor::fetch(ulong count) {
   Preserve_trx_temp_stage_timer timer(m_first_fetch
       ? Preserve_trx_temp_stage::FIRST_FETCH : Preserve_trx_temp_stage::NONE, &success);
   m_first_fetch = false;
+  Preserve_trx_cursor_workspace work;
+  const auto release = create_scope_guard([&] {
+    if (m_decoder) m_decoder->release_work();
+    work.unbind();
+  });
   result->begin_dataset();
   m_state.fetch_limit = static_cast<ulong>(m_state.fetch_limit) + count;
   for (; m_state.fetch_count < m_state.fetch_limit; ++m_state.fetch_count) {
@@ -115,7 +117,8 @@ bool Preserve_trx_result_cursor::fetch(ulong count) {
       success = !m_thd->is_error();
       return false;
     }
-    const auto status = m_decoder->read_next();
+    const auto status = !work.bound() && !work.bind(m_memory.token())
+        ? Status::OUT_OF_MEMORY : m_decoder->read_next(work);
     if (status != Status::OK) {
       if (status == Status::OUT_OF_MEMORY) my_error(ER_OUT_OF_RESOURCES, MYF(0));
       else my_error(ER_INTERNAL_ERROR, MYF(0), "preserved cursor decode failed");

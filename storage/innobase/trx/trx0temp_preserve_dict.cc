@@ -8,6 +8,7 @@
 #include "btr0sea.h"
 #include "dict0dd.h"
 #include "dict0dict.h"
+#include "dict0priv.h"
 #include "fil0fil.h"
 #include "lock0lock.h"
 #include "my_dbug.h"
@@ -50,30 +51,6 @@ void trx_preserve_temp_dictionary_memory_free(
              ("temporary native dictionary memory released bytes=%llu",
               static_cast<unsigned long long>(memory->lease.bytes())));
   delete memory;
-}
-
-void trx_preserve_temp_import_dict_deleter::operator()(dict_table_t *table) const {
-  if (table == nullptr) return;
-  ut_ad(!table->cached && table->is_temporary() && !table->is_intrinsic());
-#ifndef DBUG_OFF
-  const auto count = UT_LIST_GET_LEN(table->indexes);
-#endif
-  {
-    IB_mutex_guard guard(&dict_sys->mutex);
-    while (auto *index = UT_LIST_GET_LAST(table->indexes)) {
-      // These indexes never reach a handler, buffer-pool page or AHI entry.
-      dict_index_remove_from_cache(table, index);
-    }
-  }
-  if (table->vc_templ != nullptr) {
-    dict_free_vc_templ(table->vc_templ);
-    UT_DELETE(table->vc_templ);
-    table->vc_templ = nullptr;
-  }
-  dict_mem_table_free(table);
-  DBUG_PRINT("preserve_temp_import",
-             ("temporary private dictionary released indexes=%zu",
-              static_cast<size_t>(count)));
 }
 
 namespace {
@@ -154,6 +131,26 @@ dberr_t dictionary_credit(const trx_preserve_temp_dict_table_binding &binding,
   return DB_SUCCESS;
 }
 }  // namespace
+
+void trx_preserve_temp_import_dict_deleter::operator()(dict_table_t *table) const {
+  if (table == nullptr) return;
+  ut_ad(!table->cached && table->is_temporary() && !table->is_intrinsic());
+#ifndef DBUG_OFF
+  const auto count = UT_LIST_GET_LEN(table->indexes);
+#endif
+  {
+    IB_mutex_guard guard(&dict_sys->mutex);
+    while (auto *index = UT_LIST_GET_LAST(table->indexes)) {
+      // These indexes never reach a handler, buffer-pool page or AHI entry.
+      dict_index_remove_from_cache(table, index);
+    }
+  }
+  free_virtual_template(table);
+  dict_mem_table_free(table);
+  DBUG_PRINT("preserve_temp_import",
+             ("temporary private dictionary released indexes=%zu",
+              static_cast<size_t>(count)));
+}
 
 dberr_t trx_preserve_temp_dictionary::begin(
     const std::string &token,
@@ -345,15 +342,6 @@ const dict_table_t *trx_preserve_temp_dictionary::table() const {
 }
 
 namespace {
-dict_table_t *cached_by_name(const dict_table_t *table) {
-  ut_ad(mutex_own(&dict_sys->mutex));
-  dict_table_t *found = nullptr;
-  HASH_SEARCH(name_hash, dict_sys->table_hash, ut_fold_string(table->name.m_name),
-              dict_table_t *, found, ut_ad(found->cached),
-              !strcmp(found->name.m_name, table->name.m_name));
-  return found;
-}
-
 dict_table_t *cached_by_id(const dict_table_t *table) {
   ut_ad(mutex_own(&dict_sys->mutex));
   dict_table_t *found = nullptr;
@@ -370,7 +358,7 @@ dberr_t trx_preserve_temp_dictionary::publish() {
       !m_descriptor->fil_space_adopted || value->space != m_descriptor->source_space_id ||
       fil_space_get(value->space) == nullptr) return DB_ERROR;
   IB_mutex_guard guard(&dict_sys->mutex);
-  auto *name = cached_by_name(value);
+  auto *name = dict_table_check_if_in_cache_low(value->name.m_name);
   auto *id = cached_by_id(value);
   if (m_published)
     return value->cached && name == value && id == value ? DB_SUCCESS : DB_ERROR;
@@ -386,7 +374,8 @@ dberr_t trx_preserve_temp_dictionary::unpublish() {
   if (value == nullptr) return m_published ? DB_ERROR : DB_SUCCESS;
   IB_mutex_guard guard(&dict_sys->mutex);
   if (!m_published) return value->cached ? DB_ERROR : DB_SUCCESS;
-  if (!value->cached || cached_by_name(value) != value || cached_by_id(value) != value ||
+  if (!value->cached || dict_table_check_if_in_cache_low(value->name.m_name) != value ||
+      cached_by_id(value) != value ||
       value->can_be_evicted || !value->is_temporary() || value->is_intrinsic()) return DB_ERROR;
   value->lock();
   const auto unlock = create_scope_guard([&]() { value->unlock(); });
@@ -454,7 +443,8 @@ bool trx_preserve_temp_dictionary::native_handoff_valid() const noexcept {
       m_error != DB_SUCCESS || m_phase != Phase::DONE || m_table == nullptr ||
       m_native_memory == nullptr || !m_native_memory->lease.acquired()) return false;
   auto *value = m_table.get();
-  return value->cached && cached_by_name(value) == value && cached_by_id(value) == value &&
+  return value->cached && dict_table_check_if_in_cache_low(value->name.m_name) == value &&
+         cached_by_id(value) == value &&
       value->preserve_memory == nullptr && value->is_temporary() && !value->is_intrinsic();
 }
 
@@ -585,7 +575,8 @@ dberr_t trx_preserve_temp_dictionary::probe_native_batch(
   {
     IB_mutex_guard guard(&dict_sys->mutex);
     for (size_t i = 0; i < tables.size(); ++i)
-      if (cached_by_name(tables[i]) != tables[i] || cached_by_id(tables[i]) != tables[i] ||
+      if (dict_table_check_if_in_cache_low(tables[i]->name.m_name) != tables[i] ||
+          cached_by_id(tables[i]) != tables[i] ||
           tables[i]->first_index() != indexes[i]) return DB_ERROR;
     for (auto *&table : tables) {
       dict_table_remove_from_cache(table);
@@ -649,7 +640,8 @@ dberr_t trx_preserve_temp_dictionary::probe_native_handoff(
   if (preserve_trx_memory_current_bytes_status() != baseline + credit) return DB_ERROR;
   {
     IB_mutex_guard guard(&dict_sys->mutex);
-    if (cached_by_name(native) != native || cached_by_id(native) != native ||
+    if (dict_table_check_if_in_cache_low(native->name.m_name) != native ||
+        cached_by_id(native) != native ||
         native->first_index() != first_index) return DB_ERROR;
   }
   // Native cleanup must return credit even if the feature is now disabled.

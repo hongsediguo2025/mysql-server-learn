@@ -1,0 +1,19 @@
+preserve_enabled	standby_mode
+1	1
+id	v
+1	48
+2	50
+3	52
+id	v	extra
+1	14	0
+2	24	0
+# restart: --rds-preserve-trx-enable=OFF
+preserve_enabled	standby_mode
+0	1
+id	v
+1	48
+2	50
+3	52
+id	v	extra
+1	14	0
+2	24	0

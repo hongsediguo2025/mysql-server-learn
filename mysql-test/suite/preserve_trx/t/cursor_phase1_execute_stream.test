@@ -1,0 +1,2 @@
+--let $contract_early_results= execute-stream
+--source suite/preserve_trx/t/temp_capture_continuous.test

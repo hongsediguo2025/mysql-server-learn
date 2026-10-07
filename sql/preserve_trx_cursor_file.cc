@@ -2,6 +2,7 @@
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0. */
 #include "sql/preserve_trx_cursor_file.h"
+#include "sql/preserve_trx_cursor_workspace.h"
 
 #include <algorithm>
 #include <atomic>
@@ -24,21 +25,38 @@ std::atomic<uint64_t> preflights{0}, rejections{0};
 
 class File_reader {
  public:
-  explicit File_reader(const Preserve_trx_sealed_file &file) : m_file(file) {}
+  File_reader(const Preserve_trx_sealed_file &file, Preserve_trx_cursor_workspace &work)
+      : m_file(file), m_buffer(work.scratch()) {}
+  bool read_at(uint64_t offset, unsigned char *output, size_t length) const {
+    if (offset > m_file.size() || length > m_file.size() - offset) return false;
+    if (offset >= m_start && offset - m_start < m_length &&
+        length <= m_length - (offset - m_start)) {
+      std::memcpy(output, m_buffer + (offset - m_start), length);
+      return true;
+    }
+    const bool nearby = offset >= m_last_end && offset - m_last_end < 4096;
+    m_last_end = offset + length;
+    if (!nearby) return m_file.read_at(offset, output, length);
+    m_start = offset;
+    m_length = std::min<uint64_t>(4096, m_file.size() - offset);
+    if (length > m_length || !m_file.read_at(offset, m_buffer, m_length)) return false;
+    std::memcpy(output, m_buffer, length);
+    return true;
+  }
   bool bytes(uint64_t offset, unsigned char *output, size_t length) {
     if (offset > m_file.size() || length > m_file.size() - offset) return false;
     while (length != 0) {
       if (offset < m_start || offset >= m_start + m_length) {
         m_start = offset;
         m_length = static_cast<size_t>(
-            std::min<uint64_t>(m_buffer.size(), m_file.size() - offset));
-        if (!m_file.read_at(m_start, m_buffer.data(), m_length)) {
+            std::min<uint64_t>(Preserve_trx_cursor_workspace::data_size, m_file.size() - offset));
+        if (!m_file.read_at(m_start, m_buffer, m_length)) {
           error = Preserve_trx_file_status::IO_ERROR;
           return false;
         }
       }
       const auto n = std::min<size_t>(length, m_start + m_length - offset);
-      std::memcpy(output, m_buffer.data() + (offset - m_start), n);
+      std::memcpy(output, m_buffer + (offset - m_start), n);
       offset += n;
       output += n;
       length -= n;
@@ -67,9 +85,9 @@ class File_reader {
     // Hash only the small header/schema prefix. Object SEAL owns full hashing.
     for (uint64_t offset = 0; offset < end;) {
       const auto length = static_cast<size_t>(
-          std::min<uint64_t>(m_buffer.size(), end - offset));
-      if (!m_file.read_at(offset, m_buffer.data(), length) ||
-          EVP_DigestUpdate(hash.get(), m_buffer.data(), length) != 1) {
+          std::min<uint64_t>(Preserve_trx_cursor_workspace::data_size, end - offset));
+      if (!m_file.read_at(offset, m_buffer, length) ||
+          EVP_DigestUpdate(hash.get(), m_buffer, length) != 1) {
         error = Preserve_trx_file_status::IO_ERROR;
         return false;
       }
@@ -88,15 +106,15 @@ class File_reader {
 
  private:
   const Preserve_trx_sealed_file &m_file;
-  std::array<unsigned char, 65536> m_buffer;
-  uint64_t m_start{0};
-  size_t m_length{0};
+  unsigned char *m_buffer;
+  mutable uint64_t m_start{0}, m_last_end{UINT64_MAX};
+  mutable size_t m_length{0};
 };
 
 bool validate_header(const Preserve_trx_sealed_file &file,
                      const Preserve_trx_cursor_descriptor &d,
                      File_reader *reader, uint64_t *column_count) {
-  if (!layout_valid(d) || !file.matches(d.size, d.digest)) return false;
+  if (!file.matches(d.size, d.digest)) return false;
   unsigned char header[header_size], footer[footer_size];
   if (!reader->bytes(0, header, sizeof(header)) ||
       !reader->bytes(d.size - footer_size, footer, sizeof(footer))) return false;
@@ -201,27 +219,26 @@ Preserve_trx_file_status Preserve_trx_cursor_file::open(
     const std::string &token,
     std::shared_ptr<const Preserve_trx_sealed_file> file,
     const Preserve_trx_cursor_descriptor &descriptor,
+    Preserve_trx_cursor_workspace &work,
     std::unique_ptr<Preserve_trx_cursor_file> *output) {
   if (!file || !output || !layout_valid(descriptor)) {
     ++rejections;
     return Preserve_trx_file_status::CORRUPT;
   }
   try {
-    auto work = preserve_trx_acquire_memory_lease(
-        token, Preserve_trx_memory_kind::CURSOR_RESULT_BUFFER, sizeof(File_reader));
     auto memory = preserve_trx_acquire_memory_lease(
         token, Preserve_trx_memory_kind::CURSOR_RESULT_BUFFER,
         sizeof(Preserve_trx_cursor_file));
-    if (!work.acquired() || !memory.acquired())
+    if (!memory.acquired())
       return Preserve_trx_file_status::OUT_OF_MEMORY;
-    File_reader reader(*file);
+    File_reader reader(*file, work);
     uint64_t columns = 0;
     if (!validate_header(*file, descriptor, &reader, &columns)) {
       ++rejections;
       return reader.error;
     }
     std::unique_ptr<Preserve_trx_cursor_file> result(new Preserve_trx_cursor_file(
-        std::move(memory), std::move(work), std::move(file), descriptor, columns));
+        std::move(memory), std::move(file), descriptor, columns));
     *output = std::move(result);
     return Preserve_trx_file_status::OK;
   } catch (const std::bad_alloc &) {
@@ -231,21 +248,19 @@ Preserve_trx_file_status Preserve_trx_cursor_file::open(
 
 #ifndef NDEBUG
 Preserve_trx_file_status Preserve_trx_cursor_file::validate_next(
-    uint64_t row_budget) {
+    uint64_t row_budget, Preserve_trx_cursor_workspace &work) {
   if (m_status != Preserve_trx_file_status::OK || m_framing_validated)
     return m_status;
-  File_reader reader(*m_file);
+  File_reader reader(*m_file, work);
   if (row_budget == 0 ||
       !validate_rows(*m_file, m_descriptor, &reader, m_columns, row_budget,
                      &m_checked_rows, &m_offset)) {
     m_status = reader.error;
-    m_work.release();
     ++rejections;
     return m_status;
   }
   if (m_checked_rows == m_descriptor.rows) {
     m_framing_validated = true;
-    m_work.release();
     ++preflights;
   }
   return Preserve_trx_file_status::OK;
@@ -253,9 +268,10 @@ Preserve_trx_file_status Preserve_trx_cursor_file::validate_next(
 #endif
 
 bool Preserve_trx_cursor_file::locate_row(uint64_t row, uint64_t *offset,
-                                        uint64_t *headers) const {
+                                        Preserve_trx_cursor_workspace &work, uint64_t *headers) const {
+  File_reader reader(*m_file, work);
   return m_framing_validated &&
-         preserve_trx_cursor_detail::locate(*m_file, m_descriptor, row, offset, headers);
+         preserve_trx_cursor_detail::locate(reader, m_descriptor, row, offset, headers);
 }
 
 bool Preserve_trx_cursor_file::finish_decoding_preflight(uint64_t rows,
@@ -264,7 +280,6 @@ bool Preserve_trx_cursor_file::finish_decoding_preflight(uint64_t rows,
       offset != m_descriptor.index_offset) return false;
   if (!m_framing_validated) {
     m_framing_validated = true;
-    m_work.release();
     ++preflights;
   }
   return true;

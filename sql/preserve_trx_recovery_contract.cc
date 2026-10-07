@@ -45,14 +45,14 @@ bool preserve_trx_recovery_payload_valid(const Preserve_snapshot_metadata &m) {
       // Exact undo presence and owner are checked against the decoded manifest.
       return !m.temp_table_manifest_payload.empty();
     case Preserve_trx_engine_recovery::READ_CONTEXT:
+      // RC can release its view at the command boundary while the active
+      // InnoDB participant still owns transaction and savepoint topology.
       return !m.read_view_payload.empty() || !m.record_locks_payload.empty() ||
              !m.table_locks_payload.empty() ||
-             ((!m.temp_table_manifest_payload.empty() ||
-               !m.cursor_manifest_payload.empty()) &&
-              std::find(m.session_participant_order.begin(),
-                        m.session_participant_order.end(),
-                        Preserve_savepoint_participant::INNODB) !=
-                  m.session_participant_order.end());
+             std::find(m.session_participant_order.begin(),
+                       m.session_participant_order.end(),
+                       Preserve_savepoint_participant::INNODB) !=
+                 m.session_participant_order.end();
     case Preserve_trx_engine_recovery::NONE:
       return m.read_view_payload.empty() && m.record_locks_payload.empty() &&
              m.table_locks_payload.empty() && m.predicate_locks_payload.empty() &&
@@ -62,7 +62,8 @@ bool preserve_trx_recovery_payload_valid(const Preserve_snapshot_metadata &m) {
              m.session_participant_order.empty() &&
              m.binlog_state != Preserve_snapshot_binlog_state::LOGGED_WITH_CACHE &&
              !m.has_logged_persistent_work &&
-             (!m.temp_table_manifest_payload.empty() || !m.cursor_manifest_payload.empty());
+             (!m.temp_table_manifest_payload.empty() || !m.cursor_manifest_payload.empty() ||
+              (m.recovery.explicit_begin && m.recovery.sql_transaction_active));
     default:
       return true;
   }

@@ -97,6 +97,10 @@ class Preserve_memory_lease {
   bool grow_to(uint64_t bytes);
   /** Return unused reservation without releasing the remaining ownership. */
   bool shrink_to(uint64_t bytes);
+  /** Transfer accounting, not storage. Failure leaves ownership unchanged. */
+  bool rebind_token(const std::string &token);
+  /** Return a fixed workspace to its preallocated home without allocation. */
+  void return_home() noexcept;
   void release();
 
  private:
@@ -108,9 +112,13 @@ class Preserve_memory_lease {
       Preserve_trx_memory_kind::SNAPSHOT_CODEC_BUFFER};
   uint64_t m_bytes{0};
   bool m_acquired{false};
+  bool m_fixed_home{false};
+  std::string m_return_token;
 
   friend Preserve_memory_lease preserve_trx_acquire_memory_lease(
       const std::string &token, Preserve_trx_memory_kind kind, uint64_t bytes);
+  friend Preserve_memory_lease preserve_trx_acquire_fixed_memory_lease(
+      const std::string &home, Preserve_trx_memory_kind kind, uint64_t bytes);
 };
 
 /*
@@ -119,6 +127,10 @@ class Preserve_memory_lease {
 */
 Preserve_memory_lease preserve_trx_acquire_memory_lease(
     const std::string &token, Preserve_trx_memory_kind kind, uint64_t bytes);
+
+/** Dedicated, fixed-capacity workspace. Its home cannot admit other leases. */
+Preserve_memory_lease preserve_trx_acquire_fixed_memory_lease(
+    const std::string &home, Preserve_trx_memory_kind kind, uint64_t bytes);
 
 /** Reservation for files written in one directory's filesystem. Shares FD
 headroom and pending disk bytes with native binlog preparation. Native caches
@@ -157,10 +169,6 @@ class Preserve_file_resource_lease {
 /** bytes == 0 reserves only descriptors for reading existing files. */
 Preserve_file_resource_lease preserve_trx_acquire_file_resource_lease(
     const std::string &directory, uint64_t fd_count, uint64_t bytes);
-
-#ifndef NDEBUG
-bool preserve_trx_file_resource_probe(const std::string &directory);
-#endif
 
 /*
   Atomic Preserve-owned reservation for a detached native binlog cache. The
@@ -315,8 +323,10 @@ ulonglong preserve_trx_temp_prebuild_undo_reused_pages_status();
 int show_preserve_trx_temp_prebuild_undo_reused_pages(THD *, SHOW_VAR *, char *);
 int show_preserve_trx_temp_undo_watched_pages(THD *, SHOW_VAR *, char *);
 int show_preserve_trx_temp_undo_owners(THD *, SHOW_VAR *, char *);
+#ifndef NDEBUG
 int show_preserve_trx_temp_undo_owner_pages_used(THD *, SHOW_VAR *, char *);
 int show_preserve_trx_temp_undo_owner_pages_routed(THD *, SHOW_VAR *, char *);
+#endif
 int show_preserve_trx_temp_undo_owner_quota_rejected(THD *, SHOW_VAR *, char *);
 ulonglong preserve_trx_temp_prebuild_undo_scans_status();
 int show_preserve_trx_temp_prebuild_undo_scans(THD *, SHOW_VAR *, char *);

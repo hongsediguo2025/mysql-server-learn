@@ -247,7 +247,7 @@ dberr_t decode_virtual_value(Undo_reader *reader, const dict_table_t *table,
   value->data_offset = reader->position();
   value->data_length = length;
   if (!reader->skip(length)) return DB_CORRUPTION;
-  value->end = value->value_end = reader->position();
+  value->value_end = reader->position();
   return DB_SUCCESS;
 }
 
@@ -292,7 +292,7 @@ dberr_t decode_field(Undo_reader *reader, const unsigned char *page,
   value->data_offset = reader->position();
   value->data_length = length;
   if (!reader->skip(length)) return DB_CORRUPTION;
-  value->value_end = value->end = reader->position();
+  value->value_end = reader->position();
   if (value->external) {
     auto &ref = value->external_reference;
     ref.field_number = value->field_number;
@@ -432,7 +432,6 @@ dberr_t trx_preserve_temp_undo_decode_fields(
           next.field_number = value.field_number;
           err = decode_virtual_value(&reader, index->table, &next, true);
           if (err != DB_SUCCESS) return err;
-          value.end = reader.position();
           fields.updated.push_back(value);
           continue;
         }
@@ -508,7 +507,6 @@ dberr_t trx_preserve_temp_undo_decode_fields(
                 fields.lob_diffs.push_back(diff);
               }
             }
-            value.end = reader.position();
           }
         }
         fields.updated.push_back(value);

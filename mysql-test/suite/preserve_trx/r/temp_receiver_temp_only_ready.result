@@ -1,2 +1,2 @@
 production TEMP_ONLY temporary transfer: undo passed
-loopback receiver prepared temporary resources before READY
+loopback receiver published temporary resources; SQL RESUME gates installation

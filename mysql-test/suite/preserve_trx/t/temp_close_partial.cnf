@@ -8,7 +8,6 @@ gtid-mode=ON
 enforce-gtid-consistency=ON
 rds-preserve-trx-enable=ON
 rds-preserve-trx-temp-id-namespace=ON
-rds-preserve-trx-result-capture-enable=ON
 # Enter Phase 2 while the test deliberately holds the CLOSE packet body.
 rds-preserve-trx-drain-phase1-timeout-ms=1000
 
