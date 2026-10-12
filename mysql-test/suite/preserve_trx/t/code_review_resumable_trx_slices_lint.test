@@ -574,7 +574,7 @@ die "standby streaming transfer must declare the authoritative CLOSING token set
   unless $preserve =~
      /Preserve_batch_target_counter[\s\S]*declare_transfer_targets\s*\(\s*counter\.token_target_thread_ids\s*\(\s*\)/s;
 die "CLOSING token classification must include gated retained resources\n"
-  unless $preserve =~ /has_token_contents\s*=\s*active_batch_transaction\s*\|\|\s*preserve_trx_has_retained_standby_resources\(candidate\)/s &&
+  unless $preserve =~ /has_token_contents\s*=\s*initializing\s*\|\|\s*active_batch_transaction\s*\|\|\s*\(!reset\s*&&\s*preserve_trx_has_retained_standby_resources\(candidate\)\)/s &&
          $preserve =~ /token_target_thread_ids\(\)\s*const\s*\{\s*return\s+m_token_target_thread_ids;/s &&
          $preserve =~ /if\s*\(has_token_contents\)\s*m_token_target_thread_ids\.push_back\(candidate->thread_id\(\)\)/s;
 die "record-lock final targets must remain limited to active transactions\n"

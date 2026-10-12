@@ -5,11 +5,11 @@ use File::Spec;
 
 sub extract_function_body {
   my ($src, $signature) = @_;
-  my $sig_pos = index($src, $signature);
-  die "could not find signature: $signature\n" if $sig_pos < 0;
-
-  my $brace_pos = index($src, '{', $sig_pos);
-  die "could not find function body start for: $signature\n" if $brace_pos < 0;
+  # Match the definition, not a forward declaration before another function.
+  $src =~ /\Q$signature\E[^;{}]*\{/s
+    or die "could not find function definition: $signature\n";
+  my $sig_pos = $-[0];
+  my $brace_pos = $+[0] - 1;
 
   my $depth = 0;
   for (my $i = $brace_pos; $i < length($src); ++$i) {

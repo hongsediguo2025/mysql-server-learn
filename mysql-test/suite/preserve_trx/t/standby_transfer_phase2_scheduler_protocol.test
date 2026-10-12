@@ -445,7 +445,9 @@ if ($sync_warning_count)
   --die late SOFT response did not pause before the successful route snapshot
 }
 SET DEBUG_SYNC='now SIGNAL protocol_begin_hard';
-SET DEBUG_SYNC='now WAIT_FOR protocol_hard_published TIMEOUT 10';
+# The policy itself waits 10s before deadline HARD. Give its observer scheduling
+# headroom; the unchanged final-record assertions still require HARD_DEADLINE.
+SET DEBUG_SYNC='now WAIT_FOR protocol_hard_published TIMEOUT 20';
 --let $sync_warning_count= `SELECT @@warning_count`
 if ($sync_warning_count)
 {

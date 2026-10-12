@@ -1,0 +1,14 @@
+[mysqld]
+default-authentication-plugin=mysql_native_password
+
+[mysqld.1]
+server-id=1
+
+[mysqld.2]
+server-id=2
+rds-preserve-trx-enable=ON
+rds-preserve-trx-transfer-prewarm-paused=ON
+
+[ENV]
+SERVER_MYPORT_1=@mysqld.1.port
+SERVER_MYPORT_2=@mysqld.2.port

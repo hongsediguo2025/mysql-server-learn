@@ -1,0 +1,5 @@
+--source include/have_debug.inc
+--source include/have_log_bin.inc
+--let $connection_loopback= 1
+--let $connection_scenario= quit-resources
+--source suite/preserve_trx/include/connection_handoff_case.inc

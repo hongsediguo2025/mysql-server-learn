@@ -99,6 +99,18 @@ SELECT VARIABLE_VALUE=1 AS epoch_retained
   FROM performance_schema.global_status
  WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs';
 
+if ($assert_partial_staging_cleanup)
+{
+  --let $wait_timeout= 15
+  --let $show_rpl_debug_info= 0
+  --let $wait_condition= SELECT VARIABLE_VALUE+0=2 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_saved_online_tokens'
+  --source include/wait_condition.inc
+  --let $show_rpl_debug_info= 1
+  SELECT VARIABLE_VALUE+0 AS successful_tokens_saved
+    FROM performance_schema.global_status
+   WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_saved_online_tokens';
+}
+
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --shutdown_server 0
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc

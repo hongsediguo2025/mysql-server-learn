@@ -33,6 +33,11 @@ GRANT SHUTDOWN, PROCESS, SYSTEM_VARIABLES_ADMIN, PRESERVE_TRX_TRANSFER_ADMIN
   ON *.* TO preserve_trx_ha_admin@localhost;
 GRANT SELECT ON test.* TO preserve_trx_ha_admin@localhost;
 GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+if ($contract_async_temp)
+{
+  GRANT ALTER ON test.* TO preserve_trx_ha_admin@localhost;
+  CALL mtr.add_suppression('PRESERVE: receiver temporary completion failed token=');
+}
 if ($contract_ready_benchmark)
 {
   --connection contract_receiver

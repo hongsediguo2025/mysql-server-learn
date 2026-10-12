@@ -1,0 +1,7 @@
+--let $pipeline_extra_debug= preserve_receiver_object_enqueue_oom_probe
+--source suite/preserve_trx/t/temp_receiver_pipeline.test
+--perl
+open my $fh, '<', "$ENV{MYSQLTEST_VARDIR}/log/temp_receiver_pipeline.trace" or die $!;
+local $/; my $trace=<$fh>;
+die "specific receiver fault was not exercised" unless $trace =~ /receiver object caught=1 aborted=0 remaining=0 attempted=0/;
+EOF

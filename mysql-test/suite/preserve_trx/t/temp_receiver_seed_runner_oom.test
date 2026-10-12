@@ -1,0 +1,7 @@
+--source suite/preserve_trx/t/temp_strict_sql_resume_success.test
+--perl
+open my $fh, '<', "$ENV{MYSQLTEST_VARDIR}/log/mysqld.1.err" or die $!;
+local $/; my $trace=<$fh>;
+die "seed runner allocation fault was not exercised" unless $trace =~ /injected seed runner allocation failure/;
+die "raw fallback was not exercised" unless $trace =~ /staged raw binlog file-read budget bytes=[1-9][0-9]*/;
+EOF

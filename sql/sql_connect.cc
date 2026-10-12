@@ -79,6 +79,7 @@
 #include "sql/item_func.h"       // mqh_used
 #include "sql/log.h"
 #include "sql/mysqld.h"  // LOCK_user_conn
+#include "sql/preserve_trx.h"
 #include "sql/protocol.h"
 #include "sql/protocol_classic.h"
 #include "sql/psi_memory_key.h"
@@ -693,7 +694,18 @@ static int check_connection(THD *thd) {
     1    error
 */
 
-static bool login_connection(THD *thd) {
+static Preserve_trx_connection_init::Decision init_connect_decision(
+    THD *thd, size_t length) {
+  using Decision = Preserve_trx_connection_init::Decision;
+  if (!length) return Decision::EMPTY;
+  Security_context *sctx = thd->security_context();
+  if (sctx->check_access(SUPER_ACL) ||
+      sctx->has_global_grant(STRING_WITH_LEN("CONNECTION_ADMIN")).first)
+    return Decision::SKIP_ADMIN;
+  return sctx->password_expired() ? Decision::SKIP_EXPIRED : Decision::EXECUTE;
+}
+
+static bool login_connection(THD *thd, Preserve_trx_connection_init &init) {
   int error;
   DBUG_TRACE;
   DBUG_PRINT("info",
@@ -704,6 +716,10 @@ static bool login_connection(THD *thd) {
   thd->get_protocol_classic()->set_write_timeout(connect_timeout);
 
   error = check_connection(thd);
+  if (!error && init.admit(init_connect_decision)) {
+    release_user_connection(thd);
+    error = 1;
+  }
   thd->send_statement_status();
 
   if (error) {  // Wrong permissions
@@ -769,7 +785,8 @@ void end_connection(THD *thd) {
   Initialize THD to handle queries
 */
 
-static void prepare_new_connection_state(THD *thd) {
+static void prepare_new_connection_state(THD *thd,
+                                         Preserve_trx_connection_init &init) {
   NET *net = thd->get_protocol_classic()->get_net();
   Security_context *sctx = thd->security_context();
 
@@ -808,10 +825,10 @@ static void prepare_new_connection_state(THD *thd) {
   thd->set_command(COM_SLEEP);
   thd->init_query_mem_roots();
 
-  if (opt_init_connect.length &&
-      !(sctx->check_access(SUPER_ACL) ||
-        sctx->has_global_grant(STRING_WITH_LEN("CONNECTION_ADMIN")).first)) {
-    if (sctx->password_expired()) {
+  const auto decision = init.decision(init_connect_decision);
+  if (decision == Preserve_trx_connection_init::Decision::EXECUTE ||
+      decision == Preserve_trx_connection_init::Decision::SKIP_EXPIRED) {
+    if (decision == Preserve_trx_connection_init::Decision::SKIP_EXPIRED) {
       LogErr(WARNING_LEVEL, ER_CONN_INIT_CONNECT_IGNORED, sctx->priv_user().str,
              sctx->priv_host().str);
       return;
@@ -875,12 +892,14 @@ static void prepare_new_connection_state(THD *thd) {
 
 bool thd_prepare_connection(THD *thd) {
   bool rc;
+  Preserve_trx_connection_init init(thd);
   lex_start(thd);
-  rc = login_connection(thd);
+  rc = login_connection(thd, init);
 
   if (rc) return rc;
 
-  prepare_new_connection_state(thd);
+  prepare_new_connection_state(thd, init);
+  init.complete();
   return false;
 }
 

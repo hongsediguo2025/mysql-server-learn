@@ -1,8 +1,16 @@
 # 临时表与待 FETCH 结果 Preserve/Resume
 
-更新：2026-10-09。当前目录 `/Users/a1234/project/mysql-server-8022-preserve-port`，分支 `ha_preserve_trx`；基线 `f540116c322e` 加 E107 接口修正、E109 默认值调整、E111 Phase1 捕获及 E112/E114 I/O与producer流改动。当前范围与源码已按 PS transfer 删除重新核对，未经用户指令不提交或 push。
+更新：2026-10-12。当前目录 `/Users/a1234/project/mysql-server-8022-preserve-port`，分支 `ha_preserve_trx`；本次Receiver TEMP／控制RESUME生命周期修复基于`75be6a9eab30`，实现与最新证据见下。此前连接管理交接基于`bc09a3e741ce`；旧记录按版本保留，不替代当前验收。未经用户指令不提交或push。
 
 ## 当前设计入口
+
+2026-10-12 已完成 [Receiver I/O生命周期修复 R1–R6](receiver-io-lifecycle-fix-plan.md#9-实施复核补充2026-10-12)：独立控制请求先挂载target再等TEMP，错误响应返回后服务端KILL目标，目标原线程回滚、原reaper收尾；partial入选尾部继续，真实使用者退出后退休输入／prepared owner，调度分配异常成对清理。物理工程需在原独占接管／TLS路由中登记`Preserve_trx_control_resume_request`，不改变三个升主接点或cursor关联接口，不扩展同会话／local／RESET DRAIN。
+
+最新全量Debug含big test：977个业务用例、18个big-test、21个新增用例均在适用模式通过，shutdown各通过。no-bin完整运行早于既有协议测试观察期限修改，最终版该例单独补跑；旧失败记录保留。同版Release的500连接两轮、TPC-C128、只写1000及M矩阵62/62本地功能通过；TPC-C／只写原验收通过，500缺EXACT样本，mixed-transfer strict25304.702ms／EXACT1738.488ms未达标，不能宣称性能全部闭合。还有10个原有配置未同版重跑，生产物理复制接线／升主／恢复后业务尚未验收。[最新MTR](../../../build-debug/preserve-receiver-lifecycle-20261012/README.md)、[任务跟踪E152](task-tracker.md#e152receiver-temp与控制-resume-生命周期修复2026-10-12)。
+
+下面保留连接管理、E128及此前各轮的历史实施与证据。
+
+2026-10-12 已实现 [连接管理跨主交接](connection-management-handoff-design.md)：standby transfer 下统一 QUIT／RESET／新连接最终准入与 CLOSING 的裁决，保留完整初始化及原生错误语义。新增 22 个 MTR；全量含 big test 加串行修正／补验后，956 个业务用例全部在适用模式通过，18 个 big test 全通过。原 no-bin 的 1 个 lint 失败及修正证据保留，见 [MTR 验证报告](../../../build-debug/preserve-connection-handoff-20261011/README.md)。随后同版 Release 的 500 连接持续 TEMP/FETCH、TPC-C128、sysbench 只写1000各运行一轮，本地交接功能均通过，strict Phase2／ACK→READY 均达标；500 模型 EXACT 无有效样本，原综合性能验收仍未通过。M1–M12 的62个配置各一轮，原场景验收62/62通过（含3个对照、3个预期拒绝）；56个成功迁移配置 strict／ACK→READY 均达标。真实 proxy／物理升主验收未覆盖。见 [Release 三模型](../../../build-release/preserve-connection-pressure-20261012/README.md)、[M 矩阵](../../../build-release/preserve-matrix-20261012/README.md)及[设计 §9.4](connection-management-handoff-design.md#94-release-压力回归)。
 
 E128 已实现 [TEMP 后台完成与 session RESUME 屏障](async-temp-resume-barrier.md)：READY 后复用原 worker 完成最终写入、flush、close，SQL RESUME 只等待自己的资源。此前 E126 `seal_private` 已撤除。70个相关MTR在适用模式通过；Release原500连接持续模型五轮本地功能、strict及ACK→READY均通过，独立EXACT门槛和外部物理工程验收仍未关闭。详情见[本轮证据](../../../build-debug/preserve-temp-async-e128/README.md)。
 
@@ -30,13 +38,15 @@ SQL RESUME 不创建 PS，不恢复其 SQL/参数/历史依赖；客户端不改
 | 用一张流程图理解功能 | [简明设计](design.md) |
 | 需求背景、结果形态及责任边界 | [需求与范围](requirements-and-scope.md) |
 | 捕获、传输、READY、升主、RESUME 和 attach 细则 | [详细设计](detailed-design.md) |
+| CLOSING 期间 QUIT/RESET、新连接准入及恢复后执行（已实施并完成 MTR 回归） | [连接管理命令跨主交接设计](connection-management-handoff-design.md) |
+| READY后TEMP I/O、partial尾部、控制RESUME失败及真实回滚／文件退休（R1–R6已实施） | [Receiver I/O生命周期修复设计](receiver-io-lifecycle-fix-plan.md) |
 | 删除哪些代码、关联 API、身份与失败语义 | [PS transfer 删除与 cursor 关联](ps-transfer-removal-and-cursor-attach.md) |
 | TEMP 增量与结果文件复用 | [增量捕获和传输](incremental-capture-and-transfer.md) |
 | 当前真实文件和共享薄接点 | [源码分工](source-layout.md) |
 | READY、RESUME、外部回放的成本边界 | [安装与关联开销](resume-install-optimization.md) |
 | 实施状态、证据与待办 | [任务跟踪](task-tracker.md)、[剩余工作](remaining-work.md) |
 
-## 当前验证状态
+## 历史验证状态（E62–E64）
 
 - E62：删除 PS 本体迁移，接通独立结果清单、receiver 提前准备、RESUME owner 和回放后显式 attach。相对基线内核净减少 **9437 行**，包括 8 个新增 result 文件；不是新的剩余工作估算。
 - E63：全量 `preserve_trx` MTR 含 big-test，no-bin **598 通过/285 跳过/0 失败**，log-bin **596/287/0**，shutdown 各另 1；两轮覆盖并集 883 项，18 个不同 big test 实际通过。通过数各包含 36 条 lint。

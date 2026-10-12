@@ -1,0 +1,2 @@
+--let $contract_async_temp= rollback-retire
+--source suite/preserve_trx/t/temp_strict_sql_resume_activate.test

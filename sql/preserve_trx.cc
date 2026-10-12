@@ -91,6 +91,7 @@
 #include "sql/mdl.h"
 #include "sql/nested_join.h"
 #include "sql/protocol.h"
+#include "sql/protocol_classic.h"
 #include "sql/query_options.h"
 #include "sql/rpl_group_replication.h"
 #include "sql/rpl_gtid.h"
@@ -5251,6 +5252,19 @@ bool preserve_trx_has_explicit_active_transaction(THD *thd) {
          (thd->variables.option_bits & OPTION_BEGIN);
 }
 
+static bool preserve_trx_connection_handoff_enabled() {
+  return preserve_trx_is_enabled() &&
+         preserve_trx_transfer_artifact_mode ==
+             PRESERVE_TRX_TRANSFER_ARTIFACT_STANDBY_TRANSFER_SAVE;
+}
+
+static bool preserve_trx_connection_is_ready_locked(THD *thd) {
+  return !preserve_trx_connection_handoff_enabled() ||
+         !thd->is_classic_protocol() ||
+         thd->preserve_trx_connection_state ==
+             THD::Preserve_connection_state::READY;
+}
+
 static bool preserve_trx_has_retained_standby_resources(THD *thd) {
   return preserve_trx_is_enabled() && preserve_trx_temp_id_namespace &&
       thd != nullptr && thd->is_classic_protocol() &&
@@ -5422,7 +5436,9 @@ static bool preserve_trx_session_only_candidate_is_eligible_locked(
         !candidate->preserve_trx_command_packet_before_closing.load(
             std::memory_order_acquire) &&
         (command_classified || allow_unclassified_post_closing)));
-  return candidate != nullptr && !candidate->release_resources_done() &&
+  return candidate != nullptr &&
+         preserve_trx_connection_is_ready_locked(candidate) &&
+         !candidate->release_resources_done() &&
          !candidate->is_system_thread() &&
          candidate->killed == THD::NOT_KILLED && logically_idle &&
          candidate->is_classic_protocol() &&
@@ -5608,10 +5624,10 @@ static bool preserve_trx_is_ha_control_connection(THD *thd) {
 }
 
 bool preserve_trx_phase2_scheduler_bypass_actor_impl(
-    THD *thd, my_thread_id owner_thread_id) {
+    THD *thd, my_thread_id owner_thread_id, bool admitted_reset) {
   if (thd == nullptr || thd->release_resources_done() ||
-      thd->killed == THD::KILL_CONNECTION || thd->is_system_thread() ||
-      preserve_trx_is_ha_control_connection(thd)) {
+      (thd->killed == THD::KILL_CONNECTION && !admitted_reset) ||
+      thd->is_system_thread() || preserve_trx_is_ha_control_connection(thd)) {
     return true;
   }
   if (owner_thread_id != 0 && thd->thread_id() == owner_thread_id) return true;
@@ -5631,6 +5647,58 @@ static bool preserve_trx_closing_command_gate_active(
   return attempt != nullptr &&
          attempt->closing_command_gate_published.load(
              std::memory_order_acquire);
+}
+
+enum class Connection_action { QUIT, RESET, CONNECT };
+
+bool preserve_trx_batch_state_blocks_target_owner(
+    Preserve_trx_batch_thd_state state);
+
+// Linearize only admission, never execution, against CLOSING's initial scan.
+static bool preserve_trx_admit_connection_action(
+    THD *thd, Connection_action action) {
+  std::lock_guard<std::mutex> classify(g_closing_target_classification_mutex);
+  mysql_mutex_lock(&thd->LOCK_thd_data);
+  const bool rejected =
+      preserve_trx_closing_command_gate_active(
+          preserve_trx_manager_state_owner_snapshot().state) ||
+      thd->preserve_trx_batch_state ==
+          Preserve_trx_batch_thd_state::PRESERVED_DRAINED ||
+      preserve_trx_batch_state_blocks_target_owner(
+          thd->preserve_trx_batch_state);
+  if (!rejected) {
+    if (action != Connection_action::QUIT &&
+        thd->preserve_trx_command_started_monotonic_us == 0) {
+      ++thd->preserve_trx_command_sequence;
+      thd->preserve_trx_command_started_monotonic_us =
+          preserve_trx_monotonic_us();
+    }
+    switch (action) {
+      case Connection_action::QUIT:
+        thd->preserve_trx_post_closing_cleanup_packet.store(
+            true, std::memory_order_release);
+        break;
+      case Connection_action::RESET:
+        ++thd->preserve_trx_inflight_risky_statement_depth;
+        break;
+      case Connection_action::CONNECT:
+        thd->preserve_trx_connection_state =
+            THD::Preserve_connection_state::INITIALIZING;
+        break;
+    }
+  }
+  mysql_mutex_unlock(&thd->LOCK_thd_data);
+  return !rejected;
+}
+
+static bool preserve_trx_init_connect_continuing(THD *thd) {
+  return thd != nullptr && thd->preserve_trx_connection_init_owner != nullptr &&
+         thd->preserve_trx_connection_init_owner->continuing();
+}
+
+static bool preserve_trx_init_connect_owns_dispatch(THD *thd) {
+  return thd != nullptr && thd->preserve_trx_connection_init_owner != nullptr &&
+         thd->preserve_trx_connection_init_owner->owns_dispatch();
 }
 
 bool preserve_trx_phase2_existing_closing_gate_active_impl() {
@@ -5683,11 +5751,12 @@ class Preserve_trx_phase1_readiness_collector final : public Do_THD_Impl {
     mysql_mutex_lock(&candidate->LOCK_thd_data);
     const ulonglong started_us =
         candidate->preserve_trx_command_started_monotonic_us;
-    const bool active = !candidate->release_resources_done() &&
-                        candidate->killed != THD::KILL_CONNECTION &&
-                        !candidate->is_system_thread() &&
-                        !preserve_trx_is_ha_control_connection(candidate) &&
-                        started_us != 0;
+    const bool active =
+        !candidate->release_resources_done() &&
+        (candidate->killed != THD::KILL_CONNECTION ||
+         preserved_trx_connection_reset_in_progress_locked(candidate)) &&
+        !candidate->is_system_thread() &&
+        !preserve_trx_is_ha_control_connection(candidate) && started_us != 0;
     if (!active) {
       mysql_mutex_unlock(&candidate->LOCK_thd_data);
       return;
@@ -5743,12 +5812,13 @@ static bool preserve_trx_phase1_command_still_active(
   if (candidate == nullptr) return false;
 
   mysql_mutex_lock(&candidate->LOCK_thd_data);
-  const bool active = candidate->thread_id() == identity.thread_id &&
-                      !candidate->release_resources_done() &&
-                      candidate->killed != THD::KILL_CONNECTION &&
-                      candidate->preserve_trx_command_sequence ==
-                          identity.sequence &&
-                      candidate->preserve_trx_command_started_monotonic_us != 0;
+  const bool active =
+      candidate->thread_id() == identity.thread_id &&
+      !candidate->release_resources_done() &&
+      (candidate->killed != THD::KILL_CONNECTION ||
+       preserved_trx_connection_reset_in_progress_locked(candidate)) &&
+      candidate->preserve_trx_command_sequence == identity.sequence &&
+      candidate->preserve_trx_command_started_monotonic_us != 0;
   mysql_mutex_unlock(&candidate->LOCK_thd_data);
   return active;
 }
@@ -6010,9 +6080,22 @@ class Preserve_batch_target_counter final : public Do_THD_Impl {
       own cleanup/rollback owns the transaction outcome while the batch drains
       still-live sessions.
     */
-    const bool ignored = candidate == m_owner ||
+    const bool reset =
+        preserved_trx_connection_reset_in_progress_locked(candidate);
+    const bool initializing = preserve_trx_connection_handoff_enabled() &&
+                              candidate->preserve_trx_connection_state ==
+                                  THD::Preserve_connection_state::INITIALIZING;
+    const bool not_admitted = preserve_trx_connection_handoff_enabled() &&
+                              candidate->is_classic_protocol() &&
+                              candidate->preserve_trx_connection_state ==
+                                  THD::Preserve_connection_state::NOT_ADMITTED;
+    const bool exiting =
+        preserve_trx_connection_handoff_enabled() &&
+        candidate->preserve_trx_post_closing_cleanup_packet.load(
+            std::memory_order_acquire);
+    const bool ignored = candidate == m_owner || not_admitted || exiting ||
                          candidate->release_resources_done() ||
-                         candidate->killed == THD::KILL_CONNECTION;
+                         (candidate->killed == THD::KILL_CONNECTION && !reset);
     if (!ignored) {
       if (candidate->is_system_thread()) {
         /*
@@ -6035,13 +6118,16 @@ class Preserve_batch_target_counter final : public Do_THD_Impl {
       }
 
       const bool active_batch_transaction =
+          !reset && !initializing &&
           preserve_trx_has_batch_active_transaction(candidate);
-      const bool has_token_contents = active_batch_transaction ||
-          preserve_trx_has_retained_standby_resources(candidate);
+      const bool has_token_contents =
+          initializing || active_batch_transaction ||
+          (!reset && preserve_trx_has_retained_standby_resources(candidate));
       const bool command_packet_before_closing =
           candidate->preserve_trx_command_packet_before_closing.load(
               std::memory_order_acquire);
       const bool batch_inflight_statement =
+          initializing ||
           candidate->preserve_trx_inflight_risky_statement_depth > 0 ||
           (candidate->preserve_trx_inflight_unknown_query_depth > 0 &&
            command_packet_before_closing);
@@ -6112,14 +6198,14 @@ class Preserve_batch_target_counter final : public Do_THD_Impl {
               Preserve_trx_batch_thd_state::NONE &&
           candidate->preserve_trx_batch_generation == m_generation;
       const bool unstable_unsupported =
-          stale_batch_state ||
-          candidate->killed != THD::NOT_KILLED;
+          stale_batch_state || (candidate->killed != THD::NOT_KILLED && !reset);
       const bool idle_unsupported =
           has_token_contents && !batch_inflight_statement &&
           preserve_trx_is_unsupported_common_context(candidate);
       const bool unsupported = unstable_unsupported || idle_unsupported;
       const bool idle_target =
-          !unsupported && !command_packet_before_closing &&
+          !unsupported && !initializing && !reset &&
+          !command_packet_before_closing &&
           preserve_trx_batch_candidate_is_idle_target(m_owner, candidate);
       const bool pending_target =
           !unsupported && !idle_target &&
@@ -6254,9 +6340,12 @@ class Preserve_batch_phase1_transfer_target_scanner final : public Do_THD_Impl {
         (m_declared && m_declared->count(candidate->thread_id()))) return;
 
     mysql_mutex_lock(&candidate->LOCK_thd_data);
-    const bool ignored = candidate->release_resources_done() ||
-                         candidate->killed == THD::KILL_CONNECTION ||
-                         candidate->is_system_thread();
+    const bool ignored =
+        !preserve_trx_connection_is_ready_locked(candidate) ||
+        preserved_trx_connection_reset_in_progress_locked(candidate) ||
+        candidate->release_resources_done() ||
+        candidate->killed == THD::KILL_CONNECTION ||
+        candidate->is_system_thread();
     if (!ignored) {
       const bool active_explicit_transaction =
           preserve_trx_has_explicit_active_transaction(candidate);
@@ -6316,10 +6405,13 @@ class Preserve_batch_phase1_declared_target_pin_collector final
       context here; eligibility is checked again after it reaches QUIESCED.
       This collector only pins the admitted THD's lifetime.
     */
-    const bool target = declared && !candidate->release_resources_done() &&
-                        !candidate->is_system_thread() &&
-                        candidate->killed == THD::NOT_KILLED;
-    const bool idle = target && candidate->m_server_idle;
+    const bool target =
+        declared && !candidate->release_resources_done() &&
+        !candidate->is_system_thread() &&
+        (candidate->killed == THD::NOT_KILLED ||
+         preserved_trx_connection_reset_in_progress_locked(candidate));
+    const bool idle = target && candidate->m_server_idle &&
+                      preserve_trx_connection_is_ready_locked(candidate);
     std::unique_ptr<Preserve_trx_external_thd_pin> pin;
     if (target) pin = Preserve_trx_external_thd_pin::acquire_locked(candidate);
     mysql_mutex_unlock(&candidate->LOCK_thd_data);
@@ -6349,7 +6441,7 @@ static bool preserve_trx_publish_pending_quiesce_at_idle_boundary(THD *thd) {
 
   if (thd->preserve_trx_batch_state !=
           Preserve_trx_batch_thd_state::PENDING_QUIESCE ||
-      !thd->m_server_idle)
+      !thd->m_server_idle || !preserve_trx_connection_is_ready_locked(thd))
     return false;
 
   /*
@@ -8436,14 +8528,15 @@ class Warmcopy_prepare_idle_participants final : public Do_THD_Impl {
     if (candidate == nullptr || candidate == m_owner) return;
 
     mysql_mutex_lock(&candidate->LOCK_thd_data);
-    const bool candidate_ready = !candidate->release_resources_done() &&
-                                 !candidate->is_system_thread() &&
-                                 candidate->killed == THD::NOT_KILLED &&
-                                 candidate->m_server_idle &&
-                                 candidate->preserve_trx_batch_state ==
-                                     Preserve_trx_batch_thd_state::NONE &&
-                                 preserve_trx_has_lock_warmcopy_phase1_candidate_transaction(
-                                     candidate);
+    const bool candidate_ready =
+        preserve_trx_connection_is_ready_locked(candidate) &&
+        !preserved_trx_connection_reset_in_progress_locked(candidate) &&
+        !candidate->release_resources_done() &&
+        !candidate->is_system_thread() &&
+        candidate->killed == THD::NOT_KILLED && candidate->m_server_idle &&
+        candidate->preserve_trx_batch_state ==
+            Preserve_trx_batch_thd_state::NONE &&
+        preserve_trx_has_lock_warmcopy_phase1_candidate_transaction(candidate);
     std::unique_ptr<Preserve_trx_external_thd_pin> pin;
     if (candidate_ready && !preserve_trx_is_unsupported_common_context(candidate))
       pin = Preserve_trx_external_thd_pin::acquire_locked(candidate);
@@ -8469,7 +8562,10 @@ class Warmcopy_prepare_active_participants final : public Do_THD_Impl {
 
     mysql_mutex_lock(&candidate->LOCK_thd_data);
     const bool candidate_ready =
-        !candidate->release_resources_done() && !candidate->is_system_thread() &&
+        preserve_trx_connection_is_ready_locked(candidate) &&
+        !preserved_trx_connection_reset_in_progress_locked(candidate) &&
+        !candidate->release_resources_done() &&
+        !candidate->is_system_thread() &&
         candidate->killed == THD::NOT_KILLED && !candidate->m_server_idle &&
         candidate->preserve_trx_batch_state ==
             Preserve_trx_batch_thd_state::NONE &&
@@ -9007,12 +9103,13 @@ static bool prepare_lock_warmcopy_idle_targets(
       &prepare_lock_warmcopy);
   for (const Preserve_trx_pinned_thd &target :
        prepare_lock_warmcopy.targets()) {
-    if (target.thd == nullptr ||
-        !preserve_trx_has_lock_warmcopy_phase1_candidate_transaction(
-            target.thd) ||
-        preserve_trx_is_unsupported_common_context(target.thd)) {
-      continue;
-    }
+    if (target.thd == nullptr) continue;
+    mysql_mutex_lock(&target.thd->LOCK_thd_data);
+    const bool eligible =
+        preserve_trx_phase1_record_candidate_eligible_locked(target.thd) &&
+        !preserve_trx_phase1_target_unsupported_locked(target.thd);
+    mysql_mutex_unlock(&target.thd->LOCK_thd_data);
+    if (!eligible) continue;
     if (!participant->prepare_phase1_record_scan_target(target.thd)) {
       return true;
     }
@@ -9029,12 +9126,13 @@ static bool prepare_lock_warmcopy_active_record_targets(
       &prepare_lock_warmcopy);
   for (const Preserve_trx_pinned_thd &target :
        prepare_lock_warmcopy.targets()) {
-    if (target.thd == nullptr ||
-        !preserve_trx_has_lock_warmcopy_phase1_candidate_transaction(
-            target.thd) ||
-        preserve_trx_is_unsupported_common_context(target.thd)) {
-      continue;
-    }
+    if (target.thd == nullptr) continue;
+    mysql_mutex_lock(&target.thd->LOCK_thd_data);
+    const bool eligible =
+        preserve_trx_phase1_record_candidate_eligible_locked(target.thd) &&
+        !preserve_trx_phase1_target_unsupported_locked(target.thd);
+    mysql_mutex_unlock(&target.thd->LOCK_thd_data);
+    if (!eligible) continue;
     if (!participant->prepare_phase1_record_scan_target(target.thd, true)) {
       return true;
     }
@@ -10175,14 +10273,15 @@ class Warmcopy_batch_drain_participant final
     if (targets.error()) return false;
 
     for (const auto &target : targets.targets()) {
-      const bool explicit_transaction =
-          target.thd != nullptr &&
-          preserve_trx_has_explicit_active_transaction(target.thd);
-      const bool unsupported =
-          target.thd != nullptr &&
-          preserve_trx_is_unsupported_common_context(target.thd, true);
-      if (target.thd == nullptr || target.idle || !explicit_transaction ||
-          unsupported) {
+      if (target.thd == nullptr || target.idle) continue;
+      mysql_mutex_lock(&target.thd->LOCK_thd_data);
+      const bool eligible =
+          preserve_trx_connection_is_ready_locked(target.thd) &&
+          !preserved_trx_connection_reset_in_progress_locked(target.thd) &&
+          preserve_trx_has_explicit_active_transaction(target.thd) &&
+          !preserve_trx_is_unsupported_common_context(target.thd, true);
+      mysql_mutex_unlock(&target.thd->LOCK_thd_data);
+      if (!eligible) {
         continue;
       }
       if (!m_provider->prepare_active_blob_for_thd(target.thd, m_generation) &&
@@ -10658,7 +10757,10 @@ bool preserve_trx_replace_early_record_lock_blob(
 // TEMP-only idle sessions have no record-lock candidate transaction. Collect
 // their resources independently; pins last only for the owner safe-point call.
 bool temp_phase1_target_eligible_locked(THD *candidate) {
-  return !candidate->release_resources_done() && !candidate->is_system_thread() &&
+  return preserve_trx_connection_is_ready_locked(candidate) &&
+         !preserved_trx_connection_reset_in_progress_locked(candidate) &&
+         !candidate->release_resources_done() &&
+         !candidate->is_system_thread() &&
          candidate->killed == THD::NOT_KILLED &&
          candidate->preserve_trx_batch_state == Preserve_trx_batch_thd_state::NONE &&
          preserve_trx_has_retained_standby_resources(candidate) &&
@@ -10919,13 +11021,17 @@ class Temp_table_phase1_drain_participant final
 bool preserve_trx_phase1_record_candidate_eligible_locked(THD *thd) {
   if (thd == nullptr) return false;
   mysql_mutex_assert_owner(&thd->LOCK_thd_data);
-  return preserve_trx_has_lock_warmcopy_phase1_candidate_transaction(thd);
+  return preserve_trx_connection_is_ready_locked(thd) &&
+         !preserved_trx_connection_reset_in_progress_locked(thd) &&
+         preserve_trx_has_lock_warmcopy_phase1_candidate_transaction(thd);
 }
 
 bool preserve_trx_phase1_target_unsupported_locked(THD *thd) {
   if (thd == nullptr) return true;
   mysql_mutex_assert_owner(&thd->LOCK_thd_data);
-  return preserve_trx_is_unsupported_common_context(thd, false);
+  return !preserve_trx_connection_is_ready_locked(thd) ||
+         preserved_trx_connection_reset_in_progress_locked(thd) ||
+         preserve_trx_is_unsupported_common_context(thd, false);
 }
 
 struct Preserve_trx_external_thd_pin_handle::Impl {
@@ -10977,10 +11083,27 @@ bool preserve_trx_external_thd_scheduler_teardown_started(THD *thd) {
   return g_preserved_trx_thd_scheduler_teardown.count(thd) != 0;
 }
 
-bool preserve_trx_phase2_scheduler_bypass_actor(
-    THD *thd, my_thread_id owner_thread_id) {
-  return preserve_trx_phase2_scheduler_bypass_actor_impl(thd,
-                                                          owner_thread_id);
+bool preserve_trx_phase2_scheduler_bypass_actor(THD *thd,
+                                                my_thread_id owner_thread_id,
+                                                bool admitted_reset) {
+  return preserve_trx_phase2_scheduler_bypass_actor_impl(thd, owner_thread_id,
+                                                         admitted_reset);
+}
+
+bool preserved_trx_connection_reset_in_progress_locked(THD *thd) {
+  mysql_mutex_assert_owner(&thd->LOCK_thd_data);
+  return preserve_trx_connection_handoff_enabled() &&
+         thd->preserve_trx_inflight_risky_statement_depth != 0 &&
+         thd->get_command() == COM_RESET_CONNECTION;
+}
+
+bool preserved_trx_admit_connection_reset(THD *thd, bool *marked) {
+  *marked = false;
+  if (!preserve_trx_connection_handoff_enabled() ||
+      preserve_trx_phase2_scheduler_bypass_actor(thd, 0))
+    return true;
+  *marked = preserve_trx_admit_connection_action(thd, Connection_action::RESET);
+  return *marked;
 }
 
 bool preserve_trx_phase2_existing_closing_gate_active() {
@@ -11908,7 +12031,11 @@ bool preserved_trx_end_idle_for_command_packet(THD *thd) {
     /* Publish once, under the same lock as the initial target scan. */
     if (!packet_marked) {
       thd->preserve_trx_command_packet_before_closing.store(
-          !allow_quiesced_read, std::memory_order_release);
+          !allow_quiesced_read &&
+              (!preserve_trx_connection_handoff_enabled() ||
+               thd->preserve_trx_connection_state !=
+                   THD::Preserve_connection_state::NOT_ADMITTED),
+          std::memory_order_release);
       packet_marked = true;
     }
     if (allow_quiesced_read &&
@@ -11936,7 +12063,8 @@ void preserved_trx_classify_protocol_command(
   if (thd == nullptr || !preserve_trx_is_enabled()) return;
 
   thd->preserve_trx_post_closing_cleanup_packet.store(
-      command == COM_QUIT, std::memory_order_relaxed);
+      command == COM_QUIT && !preserve_trx_connection_handoff_enabled(),
+      std::memory_order_relaxed);
   thd->preserve_trx_post_closing_command_classified.store(
       true, std::memory_order_release);
 }
@@ -12198,6 +12326,8 @@ preserved_trx_native_command_block_result(
     return Preserve_trx_command_block_result::ALLOW;
 
   if (preserve_trx_closing_command_gate_active(state)) {
+    if (preserve_trx_init_connect_continuing(thd))
+      return Preserve_trx_command_block_result::ALLOW;
     if (!thd->is_system_thread()) {
       return Preserve_trx_command_block_result::BLOCK_CLOSING_DRAINED;
     }
@@ -12246,7 +12376,8 @@ Preserve_trx_command_block_result preserved_trx_command_block_result(
   for (;;) {
     const Preserve_trx_command_block_result native_result =
         preserved_trx_native_command_block_result(thd, lex, sql_command);
-    if (native_result != Preserve_trx_command_block_result::ALLOW) {
+    if (native_result != Preserve_trx_command_block_result::ALLOW ||
+        preserve_trx_init_connect_continuing(thd)) {
       return native_result;
     }
 
@@ -12327,6 +12458,8 @@ preserved_trx_native_protocol_command_block_result(
     }
 
     if (closing_command_gate_active) {
+      if (preserve_trx_init_connect_continuing(thd))
+        return Preserve_trx_command_block_result::ALLOW;
       if (command_packet_before_closing && batch_inflight_statement &&
           batch_state == Preserve_trx_batch_thd_state::NONE &&
           !waited_for_initial_target_classification) {
@@ -12372,7 +12505,7 @@ Preserve_trx_command_block_result preserved_trx_protocol_command_block_result(
     preserve_trx_phase2_scheduler::Command_key phase2_command;
     if (!preserve_trx_phase2_scheduler::captured_command_key(
             thd, &phase2_command)) {
-      return Preserve_trx_command_block_result::ALLOW;
+      break;
     }
     Preserve_trx_phase2_sql_classification classification;
     const Preserve_trx_command_block_result scheduler_result =
@@ -12380,15 +12513,23 @@ Preserve_trx_command_block_result preserved_trx_protocol_command_block_result(
             thd, classification);
     if (scheduler_result !=
         Preserve_trx_command_block_result::RETRY_NATIVE_ADMISSION) {
-      return scheduler_result;
+      if (scheduler_result != Preserve_trx_command_block_result::ALLOW)
+        return scheduler_result;
+      break;
     }
   }
+  if (command == COM_QUIT && preserve_trx_connection_handoff_enabled() &&
+      !preserve_trx_phase2_scheduler_bypass_actor(thd, 0) &&
+      !preserve_trx_admit_connection_action(thd, Connection_action::QUIT))
+    return Preserve_trx_command_block_result::BLOCK_CLOSING_DRAINED;
+  return Preserve_trx_command_block_result::ALLOW;
 }
 
 Preserve_trx_command_block_result
 preserved_trx_protocol_command_body_block_result(
     THD *thd, enum enum_server_command command) {
-  if (thd == nullptr) return Preserve_trx_command_block_result::ALLOW;
+  if (thd == nullptr || preserve_trx_init_connect_continuing(thd))
+    return Preserve_trx_command_block_result::ALLOW;
   bool retry_native_admission = false;
   for (;;) {
     if (retry_native_admission) {
@@ -12519,6 +12660,7 @@ void preserved_trx_clear_inflight_unknown_query(THD *thd) {
 }
 
 void preserved_trx_phase2_finish_protocol_command(THD *thd) {
+  if (preserve_trx_init_connect_owns_dispatch(thd)) return;
   preserve_trx_phase2_scheduler::Command_key command;
   if (!preserve_trx_phase2_scheduler::captured_command_key(thd, &command)) {
     return;
@@ -12553,7 +12695,7 @@ void preserved_trx_phase2_finish_protocol_command(THD *thd) {
 }
 
 bool preserved_trx_phase2_defer_command_response(THD *thd) {
-  if (thd == nullptr ||
+  if (thd == nullptr || preserve_trx_init_connect_owns_dispatch(thd) ||
       !preserve_trx_phase2_scheduler::cutoff_response_handoff_pending()) {
     return false;
   }
@@ -12596,6 +12738,8 @@ bool preserved_trx_phase2_command_is_captured(THD *thd) {
 }
 
 bool preserved_trx_phase2_command_body_already_entered(THD *thd) {
+  // Initialization borrows scheduler admission, not the native SQL gate.
+  if (preserve_trx_init_connect_owns_dispatch(thd)) return false;
   return thd != nullptr &&
          (thd->get_command() == COM_STMT_EXECUTE ||
           preserve_trx_whole_query_packet(thd)) &&
@@ -12606,13 +12750,138 @@ bool preserved_trx_phase2_command_body_already_entered(THD *thd) {
 
 void preserved_trx_phase2_begin_synthetic_protocol_command(
     THD *thd, enum enum_server_command) {
-  if (thd == nullptr ||
+  if (thd == nullptr || preserve_trx_init_connect_owns_dispatch(thd) ||
       !preserve_trx_standby_phase2_source_capture_enabled() ||
       preserve_trx_phase2_scheduler_bypass_actor(thd, 0)) {
     return;
   }
   preserve_trx_phase2_scheduler::Command_key ignored;
   (void)preserve_trx_phase2_scheduler::capture_command(thd, &ignored);
+}
+
+Preserve_trx_connection_init::Preserve_trx_connection_init(THD *thd)
+    : m_thd(thd) {
+  m_active = preserve_trx_connection_handoff_enabled() &&
+             thd->is_classic_protocol() && !thd->is_system_thread();
+  if (m_active) thd->preserve_trx_connection_init_owner = this;
+}
+
+bool Preserve_trx_connection_init::admit(Decide decide) {
+  if (!m_active) return false;
+  if (preserve_trx_phase2_scheduler_bypass_actor(m_thd, 0)) {
+    m_active = false;
+    m_thd->preserve_trx_connection_init_owner = nullptr;
+    return false;
+  }
+
+  bool allocation_failed = false;
+  mysql_rwlock_rdlock(&LOCK_sys_init_connect);
+  const size_t length = opt_init_connect.length;
+  try {
+    if (length != 0) m_text.assign(opt_init_connect.str, length);
+  } catch (const std::bad_alloc &) {
+    allocation_failed = true;
+  }
+  mysql_rwlock_unlock(&LOCK_sys_init_connect);
+  m_decision = decide(m_thd, length);
+  uint error = 0;
+  const auto native =
+      preserved_trx_protocol_command_block_result(m_thd, COM_QUERY);
+  if (native != Preserve_trx_command_block_result::ALLOW)
+    error = native == Preserve_trx_command_block_result::BLOCK_DRAINING
+                ? ER_PRESERVE_TRX_UNSUPPORTED
+                : ER_PRESERVE_TRX_SESSION_DRAINED;
+  if (!error && m_decision == Decision::EXECUTE) {
+    if (allocation_failed) {
+      error = ER_OUT_OF_RESOURCES;
+    } else if (preserve_trx_standby_phase2_source_capture_enabled()) {
+      preserve_trx_phase2_scheduler::Command_key key;
+      if (!preserve_trx_phase2_scheduler::capture_command(m_thd, &key, true)) {
+        error = ER_PRESERVE_TRX_UNSUPPORTED;
+      } else {
+        m_incarnation = key.connection_incarnation;
+        m_sequence = key.sequence;
+        const auto body =
+            preserved_trx_protocol_command_body_block_result(m_thd, COM_QUERY);
+        if (body == Preserve_trx_command_block_result::NATIVE_PRE_BODY_EXIT) {
+          if (!m_thd->is_error()) {
+            m_thd->get_stmt_da()->reset_diagnostics_area();
+            if (m_thd->killed)
+              m_thd->send_kill_message();
+            else
+              my_error(ER_QUERY_INTERRUPTED, MYF(0));
+          }
+          return true;
+        }
+        if (body != Preserve_trx_command_block_result::ALLOW)
+          error = body == Preserve_trx_command_block_result::BLOCK_DRAINING
+                      ? ER_PRESERVE_TRX_UNSUPPORTED
+                      : ER_PRESERVE_TRX_SESSION_DRAINED;
+      }
+    }
+  }
+  if (!error &&
+      !preserve_trx_admit_connection_action(m_thd, Connection_action::CONNECT))
+    error = ER_PRESERVE_TRX_SESSION_DRAINED;
+  if (error) {
+    // Authentication may already have installed OK, but it is not sent yet.
+    m_thd->get_stmt_da()->reset_diagnostics_area();
+    my_error(error, MYF(0));
+    return true;
+  }
+  m_admitted = true;
+  return false;
+}
+
+Preserve_trx_connection_init::Decision Preserve_trx_connection_init::decision(
+    Decide decide) const {
+  return m_active ? m_decision : decide(m_thd, opt_init_connect.length);
+}
+
+bool Preserve_trx_connection_init::borrow(LEX_STRING *definition,
+                                        LEX_CSTRING *text) {
+  if (!m_admitted || definition != &opt_init_connect) return false;
+  *text = {m_text.data(), m_text.size()};
+  m_borrowed = true;
+  return true;
+}
+
+bool Preserve_trx_connection_init::continuing() const {
+  if (!m_admitted || !m_borrowed || m_thd->killed != THD::NOT_KILLED)
+    return false;
+  if (!m_incarnation)
+    return true;  // Legacy standby admission has no aggregate.
+  return m_thd->preserve_trx_phase2_connection_incarnation == m_incarnation &&
+         m_thd->preserve_trx_phase2_aggregate_sequence == m_sequence &&
+         m_thd->preserve_trx_phase2_command_stage.load(
+             std::memory_order_acquire) ==
+             Preserve_trx_phase2_command_stage::EXECUTING;
+}
+
+Preserve_trx_connection_init::~Preserve_trx_connection_init() {
+  if (!m_active) return;
+  m_borrowed = false;
+  if (m_incarnation) preserved_trx_phase2_finish_protocol_command(m_thd);
+  const bool success = m_admitted && m_complete && !m_thd->is_error() &&
+                       !m_thd->is_fatal_error() &&
+                       m_thd->killed == THD::NOT_KILLED &&
+                       !m_thd->get_protocol_classic()->get_net()->error;
+  mysql_mutex_lock(&m_thd->LOCK_thd_data);
+  m_thd->preserve_trx_connection_init_owner = nullptr;
+  m_thd->preserve_trx_command_started_monotonic_us = 0;
+  if (success) {
+    m_thd->preserve_trx_connection_state =
+        THD::Preserve_connection_state::READY;
+    // do_command still has native setup to perform before its existing
+    // begin_command_read boundary can publish idle and allow worker takeover.
+  }
+  mysql_mutex_unlock(&m_thd->LOCK_thd_data);
+}
+
+bool preserved_trx_borrow_init_connect(THD *thd, LEX_STRING *definition,
+                                     LEX_CSTRING *text) {
+  return thd->preserve_trx_connection_init_owner != nullptr &&
+         thd->preserve_trx_connection_init_owner->borrow(definition, text);
 }
 
 static bool preserved_trx_row_owned_by_account(
@@ -13632,12 +13901,18 @@ bool preserved_trx_expired_reaper_empty_claim_keeps_manager_idle_for_unit_test(
          !preserved_trx_observable_record_exists_for_unit_test(token);
 }
 
+static void control_resume_reap_once();
+static void control_resume_target_begin(THD *target);
+static void control_resume_target_end(THD *target);
+static void control_resume_release_after_response(THD *caller, bool teardown);
+
 static void preserved_trx_expired_reaper_scan_once() {
   trx_preserve_temp_native_reap_once();
   Preserve_trx_temp_receiver_work::reap_once();
   if (!preserve_trx_is_enabled()) return;
   DBUG_EXECUTE_IF("preserve_trx_expired_reaper_skip", return;);
 
+  control_resume_reap_once();
   preserve_trx_temp_gc_step();
 
   preserved_trx_cleanup_deferred_source_warm_blobs_once();
@@ -14909,6 +15184,7 @@ static bool reactivate_current_batch_prepared_failure_to_original_thd(
 
 void preserved_trx_begin_external_thd_teardown(THD *thd) {
   if (!preserve_trx_is_enabled() || thd == nullptr) return;
+  control_resume_release_after_response(thd, true);
   if (!preserve_trx_standby_phase2_source_capture_enabled()) {
     std::unique_lock<std::mutex> lock(g_preserved_trx_thd_pin_mutex);
     g_preserved_trx_thd_teardown.insert(thd);
@@ -14916,6 +15192,8 @@ void preserved_trx_begin_external_thd_teardown(THD *thd) {
       return g_preserved_trx_thd_pin_counts.find(thd) ==
              g_preserved_trx_thd_pin_counts.end();
     });
+    lock.unlock();
+    control_resume_target_begin(thd);
     return;
   }
   {
@@ -14936,10 +15214,13 @@ void preserved_trx_begin_external_thd_teardown(THD *thd) {
     return g_preserved_trx_thd_pin_counts.find(thd) ==
            g_preserved_trx_thd_pin_counts.end();
   });
+  lock.unlock();
+  control_resume_target_begin(thd);
 }
 
 void preserved_trx_end_external_thd_teardown(THD *thd) {
   if (!preserve_trx_is_enabled() || thd == nullptr) return;
+  control_resume_target_end(thd);
   if (!preserve_trx_standby_phase2_source_capture_enabled()) {
     {
       std::lock_guard<std::mutex> lock(g_preserved_trx_thd_pin_mutex);
@@ -24681,6 +24962,12 @@ enum class Preserved_trx_resume_prepare_stage {
   DEADLINE
 };
 
+struct Preserve_strict_attach_intent_write_context {
+  Preserve_trx_strict_attach_intent_state state{
+      Preserve_trx_strict_attach_intent_state::ATTACHING};
+  uint64_t target_connection_id{0};
+};
+
 struct Preserved_trx_resume_prepare_options {
   Preserved_trx_resume_source source{
       Preserved_trx_resume_source::LOCAL_DURABLE};
@@ -24689,9 +24976,11 @@ struct Preserved_trx_resume_prepare_options {
   Preserve_trx_attach_lease *strict_attach_lease{nullptr};
   const Preserve_trx_final_token_facts *strict_facts{nullptr};
   uint64_t deadline_monotonic_us{0};
+  Resume_thd_state_guard *control_state_guard{nullptr};
 };
 
 struct Preserved_trx_resume_runtime {
+  bool target_taken_over{false};
   bool local_binlog_imported{false};
   bool strict_binlog_attached{false};
   bool mdl_transferred{false};
@@ -24707,6 +24996,135 @@ struct Preserved_trx_resume_runtime {
   Preserve_trx_temp_receiver_work::Owner strict_temp_ready;
   std::unique_ptr<Preserve_trx_temp_restore::Attach> strict_temp_attach;
 };
+
+// One owner spans the controller response, native target teardown and reaper.
+// The existing pin mutex protects publication/indices, never journal or file
+// IO.
+struct Control_resume_attempt {
+  THD *caller{nullptr};
+  THD *target{nullptr};
+  query_id_t query_id{0};
+  uint64_t id{0}, caller_id{0}, target_id{0};
+  std::string token;
+  Preserve_trx_external_thd_pin_handle pin;
+  void (*release)(void *){nullptr};
+  void *cookie{nullptr};
+  Preserve_trx_prepared_token_key key;
+  Preserve_strict_attach_intent_write_context intent;
+  Preserved_trx_record record;
+  Preserved_trx_resume_runtime runtime;
+  Preserve_trx_attach_lease lease;
+  bool pending_kill{false}, target_started{false};
+  bool rollback_owned{false}, rollback_proven{false}, quarantined{false};
+  bool handoff_proven{false}, lease_finished{false}, inputs_proven{false},
+      files_removed{false};
+  bool target_done{false}, reaping{false};
+};
+static std::list<std::unique_ptr<Control_resume_attempt>> g_control_resumes;
+static std::map<THD *, Control_resume_attempt *> g_control_resume_callers;
+static std::map<THD *, Control_resume_attempt *> g_control_resume_targets;
+static uint64_t g_control_resume_sequence{0};
+
+static void control_resume_trace(const char *event, uint64_t id,
+                                 uint64_t caller, uint64_t target) {
+  DBUG_EXECUTE_IF("preserve_trx_control_resume_trace", {
+    char message[256];
+    snprintf(message, sizeof(message),
+             "PRESERVE: control RESUME %s attempt=%llu caller=%llu target=%llu",
+             event, static_cast<unsigned long long>(id),
+             static_cast<unsigned long long>(caller),
+             static_cast<unsigned long long>(target));
+    LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG, message);
+  });
+}
+
+static Control_resume_attempt *control_resume_target(THD *target) {
+  std::lock_guard<std::mutex> lock(g_preserved_trx_thd_pin_mutex);
+  const auto found = g_control_resume_targets.find(target);
+  return found == g_control_resume_targets.end() ? nullptr : found->second;
+}
+
+bool Preserve_trx_control_resume_request::begin(
+    THD *caller, THD *target, const LEX_CSTRING &token,
+    Preserve_trx_external_thd_pin_handle *pin, void (*release)(void *),
+    void *cookie) noexcept {
+  if (m_caller || !preserve_trx_is_enabled() || !caller || !target ||
+      caller == target || !pin || pin->thd() != target || !release ||
+      !token.str || !token.length)
+    return true;
+  try {
+    auto attempt = std::make_unique<Control_resume_attempt>();
+    attempt->caller = caller;
+    attempt->target = target;
+    attempt->query_id = caller->query_id;
+    attempt->caller_id = caller->thread_id();
+    attempt->target_id = target->thread_id();
+    attempt->token.assign(token.str, token.length);
+    auto *item = attempt.get();
+    std::lock_guard<std::mutex> lock(g_preserved_trx_thd_pin_mutex);
+    if (g_preserved_trx_thd_teardown.count(caller) ||
+        g_preserved_trx_thd_teardown.count(target) ||
+        g_control_resume_callers.count(caller) ||
+        g_control_resume_targets.count(caller) ||
+        g_control_resume_callers.count(target) ||
+        g_control_resume_targets.count(target))
+      return true;
+    g_control_resumes.push_back(std::move(attempt));
+    auto undo = create_scope_guard([&] {
+      g_control_resume_callers.erase(caller);
+      g_control_resume_targets.erase(target);
+      g_control_resumes.pop_back();
+    });
+    g_control_resume_callers.emplace(caller, item);
+    g_control_resume_targets.emplace(target, item);
+    item->id = ++g_control_resume_sequence;
+    item->pin = std::move(*pin);
+    item->release = release;
+    item->cookie = cookie;
+    m_caller = caller;
+    m_attempt = item->id;
+    undo.commit();
+    return false;
+  } catch (...) {
+    return true;
+  }
+}
+
+Preserve_trx_control_resume_request::~Preserve_trx_control_resume_request() {
+  std::unique_ptr<Control_resume_attempt> retired;
+  {
+    std::lock_guard<std::mutex> lock(g_preserved_trx_thd_pin_mutex);
+    const auto found = g_control_resume_callers.find(m_caller);
+    if (found == g_control_resume_callers.end() ||
+        found->second->id != m_attempt || found->second->pending_kill)
+      return;
+    auto *item = found->second;
+    g_control_resume_callers.erase(found);
+    g_control_resume_targets.erase(item->target);
+    for (auto it = g_control_resumes.begin(); it != g_control_resumes.end();
+         ++it)
+      if (it->get() == item) {
+        retired = std::move(*it);
+        g_control_resumes.erase(it);
+        break;
+      }
+  }
+  // No SQL-stack journal is allowed to outlive the external exclusive owner.
+  if (retired) {
+    retired->release(retired->cookie);
+    retired->pin = {};
+  }
+}
+
+static Preserved_trx_promotion_resume_status control_resume_fail(
+    Control_resume_attempt *attempt) {
+  attempt->lease.cancel_temp_completion();
+  {
+    std::lock_guard<std::mutex> lock(g_preserved_trx_thd_pin_mutex);
+    attempt->pending_kill = true;
+  }
+  return Preserved_trx_promotion_resume_status::STAGING_FAILED;
+}
 
 struct Preserved_trx_resume_prepare_result {
   bool ok{false};
@@ -24745,9 +25163,10 @@ prepare_resume_on_current_thd_shared(
                 "invalid strict promotion resume inputs");
   }
 
-  if (strict && options.strict_attach_lease->wait_temp_ready(
-                    thd, options.deadline_monotonic_us) !=
-                    Preserve_trx_prepared_status::OK) {
+  if (strict && !options.control_state_guard &&
+      options.strict_attach_lease->wait_temp_ready(
+          thd, options.deadline_monotonic_us) !=
+          Preserve_trx_prepared_status::OK) {
     return fail(Preserved_trx_resume_prepare_stage::TEMP_TABLE,
                 "temporary receiver completion failed, cancelled or timed out");
   }
@@ -24860,6 +25279,28 @@ prepare_resume_on_current_thd_shared(
     }
   }
 
+  const bool resource_only =
+      strict && record->trx == nullptr &&
+      record->metadata.recovery.resource_only() &&
+      preserve_trx_recovery_payload_valid(record->metadata);
+  if (options.control_state_guard) {
+    if (!resource_only &&
+        trx_preserve_attach_to_thd(record->trx, thd) != DB_SUCCESS)
+      return fail(Preserved_trx_resume_prepare_stage::TRX_ATTACH,
+                  "attach failure");
+    runtime->trx_attached = !resource_only;
+    runtime->target_taken_over = true;
+    options.control_state_guard->dismiss();
+    mark_preserved_transaction_attached(thd, record->metadata);
+    delete_detached_mdl_context(*options.token);
+    if (options.strict_attach_lease->wait_temp_ready(
+            thd, options.deadline_monotonic_us) !=
+        Preserve_trx_prepared_status::OK)
+      return fail(
+          Preserved_trx_resume_prepare_stage::TEMP_TABLE,
+          "temporary receiver completion failed, cancelled or timed out");
+  }
+
   std::string temp_reason;
   Preserve_snapshot_status temp_status;
   {
@@ -24893,8 +25334,6 @@ prepare_resume_on_current_thd_shared(
   runtime->temp_tables_materialized =
       !record->metadata.temp_table_manifest_payload.empty();
 
-  const bool resource_only = strict && record->trx == nullptr &&
-      record->metadata.recovery.resource_only() && preserve_trx_recovery_payload_valid(record->metadata);
   if (runtime->strict_temp_attach && [&] {
         Preserve_trx_temp_stage_timer timer(Preserve_trx_temp_stage::RESUME_UNDO);
         return resource_only ? runtime->strict_temp_attach->bind_resource_only()
@@ -24904,7 +25343,8 @@ prepare_resume_on_current_thd_shared(
     return fail(Preserved_trx_resume_prepare_stage::TEMP_TABLE,
                 "prepared temporary undo attach failed");
   }
-  if (!resource_only && trx_preserve_attach_to_thd(record->trx, thd) != DB_SUCCESS) {
+  if (!options.control_state_guard && !resource_only &&
+      trx_preserve_attach_to_thd(record->trx, thd) != DB_SUCCESS) {
     return fail(Preserved_trx_resume_prepare_stage::TRX_ATTACH,
                 "attach failure");
   }
@@ -25151,7 +25591,7 @@ static bool preserved_trx_debug_adopt_loopback_source(
 }
 #endif
 
-static bool preserved_trx_resume_record_on_current_thd(
+static bool preserved_trx_resume_record_on_current_thd_impl(
     THD *thd, const LEX_CSTRING &resume_token) {
   DBUG_TRACE;
   struct Resume_total_us_guard {
@@ -25365,6 +25805,8 @@ static bool preserved_trx_resume_record_on_current_thd(
     }
     return preserve_trx_reject_unsupported();
   }
+
+  if (control_resume_target(thd)) return preserve_trx_reject_unsupported();
 
   if (preserved_trx_record_resume_deadline_expired(record)) {
     if (!preserved_trx_take_record(token, &record)) {
@@ -25754,18 +26196,130 @@ static bool preserved_trx_resume_record_on_current_thd(
   return false;
 }
 
+static bool preserved_trx_resume_record_on_current_thd(
+    THD *target, const LEX_CSTRING &token) {
+  auto *control = control_resume_target(target);
+  if (!control)
+    return preserved_trx_resume_record_on_current_thd_impl(target, token);
+  try {
+    if (control->token.size() != token.length ||
+        memcmp(control->token.data(), token.str, token.length))
+      return preserve_trx_reject_unsupported();
+    return preserved_trx_resume_record_on_current_thd_impl(target, token);
+  } catch (...) {
+    // Covers pre-lease allocations as well as diagnostics after strict returns.
+    // Once target owns the transaction, only its native thread may roll it
+    // back.
+    if (control->runtime.target_taken_over) (void)control_resume_fail(control);
+    my_error(ER_OUT_OF_RESOURCES, MYF(0));
+    return true;
+  }
+}
+
+#ifndef DBUG_OFF
+// A real two-connection fixture. The parked target supplies exclusive access;
+// the pin alone does not. Production physical replication supplies this
+// handoff.
+static bool preserved_trx_control_resume_probe(
+    THD *caller, const LEX_CSTRING &resume_token) {
+  static std::mutex mutex;
+  static std::condition_variable cv;
+  static THD *parked = nullptr;
+  static bool claimed = false;
+  const std::string request(resume_token.str, resume_token.length);
+  std::unique_lock<std::mutex> lock(mutex);
+  const auto reject = [] {
+    my_error(ER_UNKNOWN_ERROR, MYF(0));
+    return true;
+  };
+  if (request == "park") {
+    if (parked) return reject();
+    parked = caller;
+    cv.notify_all();
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    while (parked == caller) {
+      if (!claimed &&
+          (caller->killed || std::chrono::steady_clock::now() >= deadline)) {
+        parked = nullptr;
+        return reject();
+      }
+      cv.wait_for(lock, std::chrono::milliseconds(50));
+    }
+    my_ok(caller);
+    return false;
+  }
+  const auto separator = request.find('/');
+  if (separator == std::string::npos) return reject();
+  const auto token = request.substr(0, separator);
+  const auto target_id = strtoull(request.c_str() + separator + 1, nullptr, 10);
+  if (!cv.wait_for(
+          lock, std::chrono::seconds(10),
+          [&] { return parked && parked->thread_id() == target_id; }) ||
+      claimed || parked == caller)
+    return reject();
+  THD *target = parked;
+  mysql_mutex_lock(&target->LOCK_thd_data);
+  auto pin = preserve_trx_acquire_external_thd_pin_locked(target);
+  mysql_mutex_unlock(&target->LOCK_thd_data);
+  if (!pin) return reject();
+  claimed = true;
+  lock.unlock();
+  const auto release = [](void *) {
+    std::lock_guard<std::mutex> guard(mutex);
+    claimed = false;
+    parked = nullptr;
+    cv.notify_all();
+  };
+  Preserve_trx_control_resume_request control_request;
+  const LEX_CSTRING source_token{token.data(), token.size()};
+  if (control_request.begin(caller, target, source_token, &pin, release,
+                            nullptr)) {
+    release(nullptr);
+    return reject();
+  }
+  const auto real_id = target->real_id;
+  const auto stack = target->thread_stack;
+  caller->restore_globals();
+  target->thread_stack = caller->thread_stack;
+  target->store_globals();
+  auto restore = create_scope_guard([&] {
+    target->restore_globals();
+    target->real_id = real_id;
+    target->thread_stack = stack;
+    caller->store_globals();
+  });
+  bool failed = true;
+  try {
+    failed = preserved_trx_resume_record_on_current_thd(target, source_token);
+  } catch (...) {
+    my_error(ER_UNKNOWN_ERROR, MYF(0));
+  }
+  const uint error = target->is_error() ? target->get_stmt_da()->mysql_errno()
+                                        : ER_UNKNOWN_ERROR;
+  char message[MYSQL_ERRMSG_SIZE];
+  snprintf(message, sizeof(message), "%s",
+           target->is_error() ? target->get_stmt_da()->message_text()
+                              : "control RESUME fixture failed");
+  target->get_stmt_da()->reset_diagnostics_area();
+  restore.rollback();
+  if (failed)
+    my_printf_error(error, "%s", MYF(0), message);
+  else
+    my_ok(caller);
+  return failed;
+}
+#endif
+
 bool Sql_cmd_resume_preserved_transaction::execute(THD *thd) {
   DBUG_TRACE;
+  DBUG_EXECUTE_IF("preserve_trx_control_resume_probe",
+                  { return preserved_trx_control_resume_probe(thd, m_token); });
   return preserved_trx_resume_record_on_current_thd(thd, m_token);
 }
 
 namespace {
 
-struct Preserve_strict_attach_intent_write_context {
-  Preserve_trx_strict_attach_intent_state state{
-      Preserve_trx_strict_attach_intent_state::ATTACHING};
-  uint64_t target_connection_id{0};
-};
 
 bool write_strict_attach_intent(
     const Preserve_trx_prepared_token_key &key, void *context) {
@@ -25793,16 +26347,105 @@ bool write_strict_attach_intent(
          Preserve_snapshot_status::OK;
 }
 
-void remove_strict_attach_intent(
-    const Preserve_trx_prepared_token_key &key) {
+bool remove_strict_attach_intent(const Preserve_trx_prepared_token_key &key) {
   const std::string journal_id =
       preserved_trx_strict_attach_intent_journal_id(key);
-  if (journal_id.empty()) return;
+  if (journal_id.empty()) return false;
   auto store = create_preserved_trx_process_local_store(key.preserve_dir);
-  (void)store->remove_promotion_intent_epoch(journal_id);
+  return store->remove_promotion_intent_epoch(journal_id) ==
+         Preserve_snapshot_status::OK;
 }
 
 }  // namespace
+
+static Preserved_trx_promotion_resume_status strict_resume_unwind(
+    THD *target, const Preserve_trx_prepared_token_key &key,
+    Preserved_trx_record &record, Preserved_trx_resume_runtime &resume_runtime,
+    Preserve_trx_attach_lease &attach_lease,
+    Preserve_strict_attach_intent_write_context &intent_context,
+    Resume_thd_state_guard &thd_state_guard, const std::string &reason) {
+  auto &registry = preserved_trx_strict_prepared_token_registry();
+  auto &binlog_attached = resume_runtime.strict_binlog_attached;
+  auto &mdl_cloned = resume_runtime.mdl_transferred;
+  auto &gtid_restored = resume_runtime.gtid_restored;
+  auto &trx_attached = resume_runtime.trx_attached;
+  auto taint_current_attempt = [&](const std::string &reason) {
+    // Never put a candidate still borrowing trx into an asynchronous deleter.
+    // Quarantine is allocation-free and precedes fallible diagnostics/IO.
+    if (resume_runtime.strict_temp_attach)
+      resume_runtime.strict_temp_attach->quarantine();
+    target->killed = THD::KILL_CONNECTION;
+    thd_state_guard.dismiss();
+    intent_context.state =
+        Preserve_trx_strict_attach_intent_state::ATTACH_TAINTED;
+    (void)write_strict_attach_intent(key, &intent_context);
+    if (attach_lease.active()) (void)registry.taint_attach(&attach_lease);
+    preserved_trx_add_resume_detach_failure_observable_record(record, reason);
+    return Preserved_trx_promotion_resume_status::ATTACH_TAINTED;
+  };
+
+  bool unwind_ok = true;
+  if (resume_runtime.strict_result_attach) {
+    if (resume_runtime.strict_result_attach->rollback(
+            &resume_runtime.strict_result_ready))
+      unwind_ok = false;
+    resume_runtime.strict_result_attach.reset();
+  }
+  if (resume_runtime.strict_result_ready &&
+      attach_lease.restore_result_ready(&resume_runtime.strict_result_ready) !=
+          Preserve_trx_prepared_status::OK)
+    unwind_ok = false;
+  if (resume_runtime.strict_temp_attach) {
+    if (resume_runtime.strict_temp_attach->rollback(
+            &resume_runtime.strict_temp_ready))
+      return taint_current_attempt("temporary attach rollback failed");
+    resume_runtime.strict_temp_attach.reset();
+  }
+  if (resume_runtime.strict_temp_ready &&
+      attach_lease.restore_temp_ready(&resume_runtime.strict_temp_ready) !=
+          Preserve_trx_prepared_status::OK)
+    unwind_ok = false;
+  if (trx_attached) {
+    if (trx_preserve_detach_resumed_from_thd(record.trx, target) !=
+            DB_SUCCESS &&
+        trx_preserve_detach_resumed_from_thd_for_cleanup(record.trx, target) !=
+            DB_SUCCESS) {
+      return taint_current_attempt("promoted transaction detach failed");
+    }
+    trx_attached = false;
+  }
+  rollback_restored_logged_cache_gtid_next(target, &gtid_restored);
+  if (mdl_cloned) target->mdl_context.release_transactional_locks();
+  mdl_cloned = false;
+  if (binlog_attached) {
+    if (mysql_binlog_preserve_abort_detached_cache_attach(
+            &resume_runtime.strict_binlog_journal,
+            &resume_runtime.strict_binlog_handle) !=
+        Mysql_binlog_preserve_cache_status::OK) {
+      unwind_ok = false;
+    }
+    binlog_attached = false;
+  }
+  if (resume_runtime.strict_binlog_handle != nullptr &&
+      attach_lease.restore_native_binlog_handle(
+          &resume_runtime.strict_binlog_handle) !=
+          Preserve_trx_prepared_status::OK) {
+    unwind_ok = false;
+  }
+  reset_thd_after_preserve_detach(target);
+  if (restore_record_after_resume_failure(record, reason)) unwind_ok = false;
+  intent_context.state =
+      unwind_ok ? Preserve_trx_strict_attach_intent_state::ATTACH_ROLLED_BACK
+                : Preserve_trx_strict_attach_intent_state::ATTACH_TAINTED;
+  if (!write_strict_attach_intent(key, &intent_context)) unwind_ok = false;
+  if (unwind_ok && registry.abort_attach_after_full_unwind(&attach_lease) ==
+                       Preserve_trx_prepared_status::OK) {
+    remove_strict_attach_intent(key);
+    return Preserved_trx_promotion_resume_status::STAGING_FAILED;
+  }
+  if (attach_lease.active()) (void)registry.taint_attach(&attach_lease);
+  return Preserved_trx_promotion_resume_status::ATTACH_TAINTED;
+}
 
 static Preserved_trx_promotion_resume_status
 preserved_trx_resume_adopted_for_promotion_on_current_thd(
@@ -25883,267 +26526,544 @@ preserved_trx_resume_adopted_for_promotion_on_current_thd(
       Preserve_trx_result_restore::empty_owner(key.token, &empty_results))
     return finish(Preserved_trx_promotion_resume_status::STAGING_FAILED);
 
-  Preserve_strict_attach_intent_write_context intent_context;
-  intent_context.state = Preserve_trx_strict_attach_intent_state::ATTACHING;
-  intent_context.target_connection_id = target->thread_id();
-  if (!write_strict_attach_intent(key, &intent_context)) {
-    return finish(
-        Preserved_trx_promotion_resume_status::ATTACH_INTENT_IO_ERROR);
-  }
-
-  Preserve_trx_attach_lease attach_lease;
-  if (registry.begin_attach(key, key.generation, &attach_lease) !=
-      Preserve_trx_prepared_status::OK) {
-    intent_context.state =
-        Preserve_trx_strict_attach_intent_state::ATTACH_ROLLED_BACK;
-    if (write_strict_attach_intent(key, &intent_context)) {
-      remove_strict_attach_intent(key);
-    }
-    return finish(Preserved_trx_promotion_resume_status::REGISTRY_NOT_ADOPTED);
-  }
-
-  Preserved_trx_record record;
-  if (!preserved_trx_take_promotion_adopted_record(key, &record)) {
-    intent_context.state =
-        Preserve_trx_strict_attach_intent_state::ATTACH_ROLLED_BACK;
-    const bool terminal_written =
-        write_strict_attach_intent(key, &intent_context);
-    if (terminal_written &&
-        registry.abort_attach_after_full_unwind(&attach_lease) ==
-            Preserve_trx_prepared_status::OK) {
-      remove_strict_attach_intent(key);
-      return finish(
-          Preserved_trx_promotion_resume_status::PROMOTION_RECORD_NOT_FOUND);
-    }
-    if (attach_lease.active()) (void)registry.taint_attach(&attach_lease);
-    return finish(Preserved_trx_promotion_resume_status::ATTACH_TAINTED);
-  }
-
+  auto *control = control_resume_target(target);
+  if (control && control->token != key.token)
+    return finish(Preserved_trx_promotion_resume_status::INVALID_ARGUMENT);
+  Preserve_strict_attach_intent_write_context local_intent;
+  Preserve_trx_attach_lease local_lease;
+  Preserved_trx_record local_record;
+  Preserved_trx_resume_runtime local_runtime;
+  auto &intent_context = control ? control->intent : local_intent;
+  auto &attach_lease = control ? control->lease : local_lease;
+  auto &record = control ? control->record : local_record;
+  auto &resume_runtime = control ? control->runtime : local_runtime;
+  if (control) control->key = key;
   Resume_thd_state_guard thd_state_guard(target);
-  Preserved_trx_resume_runtime resume_runtime;
-  bool &binlog_attached = resume_runtime.strict_binlog_attached;
-  bool &mdl_cloned = resume_runtime.mdl_transferred;
-  bool &gtid_restored = resume_runtime.gtid_restored;
-  bool &trx_attached = resume_runtime.trx_attached;
+  bool record_taken = false;
+  bool unwinding = false;
+  try {
+    intent_context.state = Preserve_trx_strict_attach_intent_state::ATTACHING;
+    intent_context.target_connection_id = target->thread_id();
+    if (!write_strict_attach_intent(key, &intent_context)) {
+      return finish(
+          Preserved_trx_promotion_resume_status::ATTACH_INTENT_IO_ERROR);
+    }
 
-  auto taint_current_attempt = [&](const std::string &reason) {
-    // Never put a candidate still borrowing trx into an asynchronous deleter.
-    // Quarantine is allocation-free and precedes fallible diagnostics/IO.
-    if (resume_runtime.strict_temp_attach)
-      resume_runtime.strict_temp_attach->quarantine();
-    target->killed = THD::KILL_CONNECTION;
-    thd_state_guard.dismiss();
-    intent_context.state = Preserve_trx_strict_attach_intent_state::ATTACH_TAINTED;
-    (void)write_strict_attach_intent(key, &intent_context);
-    if (attach_lease.active()) (void)registry.taint_attach(&attach_lease);
-    preserved_trx_add_resume_detach_failure_observable_record(record, reason);
-    return finish(Preserved_trx_promotion_resume_status::ATTACH_TAINTED);
-  };
-
-  auto pre_boundary_failure = [&](const std::string &reason) {
-    bool unwind_ok = true;
-    if (resume_runtime.strict_result_attach) {
-      if (resume_runtime.strict_result_attach->rollback(&resume_runtime.strict_result_ready))
-        unwind_ok = false;
-      resume_runtime.strict_result_attach.reset();
-    }
-    if (resume_runtime.strict_result_ready &&
-        attach_lease.restore_result_ready(&resume_runtime.strict_result_ready) !=
-            Preserve_trx_prepared_status::OK)
-      unwind_ok = false;
-    if (resume_runtime.strict_temp_attach) {
-      if (resume_runtime.strict_temp_attach->rollback(&resume_runtime.strict_temp_ready))
-        return taint_current_attempt("temporary attach rollback failed");
-      resume_runtime.strict_temp_attach.reset();
-    }
-    if (resume_runtime.strict_temp_ready &&
-        attach_lease.restore_temp_ready(&resume_runtime.strict_temp_ready) !=
-            Preserve_trx_prepared_status::OK) unwind_ok = false;
-    if (trx_attached) {
-      if (trx_preserve_detach_resumed_from_thd(record.trx, target) !=
-              DB_SUCCESS &&
-          trx_preserve_detach_resumed_from_thd_for_cleanup(record.trx,
-                                                            target) !=
-              DB_SUCCESS) {
-        return taint_current_attempt("promoted transaction detach failed");
-      }
-      trx_attached = false;
-    }
-    rollback_restored_logged_cache_gtid_next(target, &gtid_restored);
-    if (mdl_cloned) target->mdl_context.release_transactional_locks();
-    mdl_cloned = false;
-    if (binlog_attached) {
-      if (mysql_binlog_preserve_abort_detached_cache_attach(
-              &resume_runtime.strict_binlog_journal,
-              &resume_runtime.strict_binlog_handle) !=
-          Mysql_binlog_preserve_cache_status::OK) {
-        unwind_ok = false;
-      }
-      binlog_attached = false;
-    }
-    if (resume_runtime.strict_binlog_handle != nullptr &&
-        attach_lease.restore_native_binlog_handle(
-            &resume_runtime.strict_binlog_handle) !=
-            Preserve_trx_prepared_status::OK) {
-      unwind_ok = false;
-    }
-    reset_thd_after_preserve_detach(target);
-    if (restore_record_after_resume_failure(record, reason)) unwind_ok = false;
-    intent_context.state = unwind_ok
-                               ? Preserve_trx_strict_attach_intent_state::
-                                     ATTACH_ROLLED_BACK
-                               : Preserve_trx_strict_attach_intent_state::
-                                     ATTACH_TAINTED;
-    if (!write_strict_attach_intent(key, &intent_context)) unwind_ok = false;
-    if (unwind_ok &&
-        registry.abort_attach_after_full_unwind(&attach_lease) ==
-            Preserve_trx_prepared_status::OK) {
-      remove_strict_attach_intent(key);
-      return finish(Preserved_trx_promotion_resume_status::STAGING_FAILED);
-    }
-    if (attach_lease.active()) (void)registry.taint_attach(&attach_lease);
-    return finish(Preserved_trx_promotion_resume_status::ATTACH_TAINTED);
-  };
-  Preserved_trx_resume_prepare_options prepare_options;
-  prepare_options.source = Preserved_trx_resume_source::STRICT_PROMOTION;
-  prepare_options.dir = &key.preserve_dir;
-  prepare_options.token = &key.token;
-  prepare_options.strict_attach_lease = &attach_lease;
-  prepare_options.strict_facts = &snapshot.facts;
-  prepare_options.deadline_monotonic_us = effective_deadline_us;
-  const Preserved_trx_resume_prepare_result prepare_result =
-      prepare_resume_on_current_thd_shared(target, &record, prepare_options,
-                                           &resume_runtime);
-  if (!prepare_result.ok) {
-    return pre_boundary_failure(prepare_result.reason);
-  }
-
-  // RESUME has no statement DML to commit. Keep the SESSION participants for
-  // native rollback, but end its temporary engine statement registration.
-  reset_preserve_statement_transaction_scope(target);
-  intent_context.state = Preserve_trx_strict_attach_intent_state::ACTIVATING;
-  if (registry.begin_activation(&attach_lease, write_strict_attach_intent,
-                                &intent_context) !=
-      Preserve_trx_prepared_status::OK) {
-    return pre_boundary_failure("durable ACTIVATING intent failed");
-  }
-  auto post_boundary_failure = [&](bool ownership_tainted) {
-    if (resume_runtime.strict_temp_attach && !resume_runtime.strict_temp_attach->committed()) {
-      if (resume_runtime.strict_temp_attach->rollback(&resume_runtime.strict_temp_ready))
-        return taint_current_attempt("temporary activation rollback failed");
-      resume_runtime.strict_temp_attach.reset();
-      resume_runtime.strict_temp_ready.reset();
-    }
-    if (!ownership_tainted && !trans_rollback(target)) {
-      // Release this attempt's result owner before recording rollback. InnoDB
-      // rollback does not own statement maps, parameter buffers or cursors.
-      resume_runtime.strict_result_attach.reset();
-      resume_runtime.strict_result_ready.reset();
-      if (resume_runtime.strict_temp_attach &&
-          resume_runtime.strict_temp_attach->drop_after_rollback())
-        return taint_current_attempt("temporary activation table cleanup failed");
-      resume_runtime.strict_temp_attach.reset();
+    if (registry.begin_attach(key, key.generation, &attach_lease) !=
+        Preserve_trx_prepared_status::OK) {
       intent_context.state =
           Preserve_trx_strict_attach_intent_state::ATTACH_ROLLED_BACK;
-      if (registry.rollback_attach_after_activation(
-              &attach_lease, write_strict_attach_intent, &intent_context) ==
-          Preserve_trx_prepared_status::OK) {
-        delete_detached_mdl_context(key.token);
-        (void)delete_preserved_snapshot_files_and_sidecars_or_log(
-            key.preserve_dir, key.token, &record.metadata);
-        return finish(Preserved_trx_promotion_resume_status::
-                          ACTIVATION_FAILED_ROLLED_BACK);
+      if (write_strict_attach_intent(key, &intent_context)) {
+        remove_strict_attach_intent(key);
       }
+      return finish(
+          Preserved_trx_promotion_resume_status::REGISTRY_NOT_ADOPTED);
     }
-    return taint_current_attempt("promoted transaction activation ownership failed");
-  };
 
-  if (binlog_attached) {
-    const auto binlog_commit_status =
-        mysql_binlog_preserve_commit_detached_cache_attach(
-            &resume_runtime.strict_binlog_journal);
-    if (binlog_commit_status != Mysql_binlog_preserve_cache_status::OK) {
-      bool ownership_tainted =
-          binlog_commit_status ==
-          Mysql_binlog_preserve_cache_status::OWNERSHIP_TAINTED;
-      if (!ownership_tainted) {
-        auto *innodb_info = find_innodb_ha_info(target);
-        auto *innodb_hton = innodb_info ? innodb_info->ht() : nullptr;
-        const auto abort_status =
-            mysql_binlog_preserve_abort_detached_cache_attach(
-                &resume_runtime.strict_binlog_journal,
-                &resume_runtime.strict_binlog_handle);
-        if (abort_status == Mysql_binlog_preserve_cache_status::OK) {
-          binlog_attached = false;
-          resume_runtime.strict_binlog_handle.reset();
-          // Binlog abort clears the SQL participant lists. Restore the exact
-          // attached InnoDB participant before the full transaction rollback.
-          if (!innodb_hton || !trx_preserve_is_active_attached_to_thd(record.trx, target)) {
-            ownership_tainted = true;
-          } else {
-            innodb_info->reset();
-            trans_register_ha(target, true, innodb_hton, nullptr);
-            target->get_ha_data(innodb_hton->slot)->ha_info[Transaction_ctx::SESSION].set_trx_read_write();
-          }
-        } else {
-          ownership_tainted = true;
+    if (!preserved_trx_take_promotion_adopted_record(key, &record)) {
+      intent_context.state =
+          Preserve_trx_strict_attach_intent_state::ATTACH_ROLLED_BACK;
+      const bool terminal_written =
+          write_strict_attach_intent(key, &intent_context);
+      if (terminal_written &&
+          registry.abort_attach_after_full_unwind(&attach_lease) ==
+              Preserve_trx_prepared_status::OK) {
+        remove_strict_attach_intent(key);
+        return finish(
+            Preserved_trx_promotion_resume_status::PROMOTION_RECORD_NOT_FOUND);
+      }
+      if (attach_lease.active()) (void)registry.taint_attach(&attach_lease);
+      return finish(Preserved_trx_promotion_resume_status::ATTACH_TAINTED);
+    }
+
+    record_taken = true;
+    bool &binlog_attached = resume_runtime.strict_binlog_attached;
+
+    auto taint_current_attempt = [&](const std::string &reason) {
+      // Never put a candidate still borrowing trx into an asynchronous deleter.
+      // Quarantine is allocation-free and precedes fallible diagnostics/IO.
+      if (resume_runtime.strict_temp_attach)
+        resume_runtime.strict_temp_attach->quarantine();
+      target->killed = THD::KILL_CONNECTION;
+      thd_state_guard.dismiss();
+      intent_context.state =
+          Preserve_trx_strict_attach_intent_state::ATTACH_TAINTED;
+      (void)write_strict_attach_intent(key, &intent_context);
+      if (attach_lease.active()) (void)registry.taint_attach(&attach_lease);
+      preserved_trx_add_resume_detach_failure_observable_record(record, reason);
+      return finish(Preserved_trx_promotion_resume_status::ATTACH_TAINTED);
+    };
+
+    auto pre_boundary_failure = [&](const std::string &reason) {
+      if (control && resume_runtime.target_taken_over)
+        return finish(control_resume_fail(control));
+      unwinding = true;
+      const auto status = strict_resume_unwind(
+          target, key, record, resume_runtime, attach_lease, intent_context,
+          thd_state_guard, reason);
+      if (control &&
+          status == Preserved_trx_promotion_resume_status::ATTACH_TAINTED) {
+        control->quarantined = true;
+        return finish(control_resume_fail(control));
+      }
+      return finish(status);
+    };
+    Preserved_trx_resume_prepare_options prepare_options;
+    prepare_options.source = Preserved_trx_resume_source::STRICT_PROMOTION;
+    prepare_options.dir = &key.preserve_dir;
+    prepare_options.token = &key.token;
+    prepare_options.strict_attach_lease = &attach_lease;
+    prepare_options.strict_facts = &snapshot.facts;
+    prepare_options.deadline_monotonic_us = effective_deadline_us;
+    if (control) prepare_options.control_state_guard = &thd_state_guard;
+    const Preserved_trx_resume_prepare_result prepare_result =
+        prepare_resume_on_current_thd_shared(target, &record, prepare_options,
+                                             &resume_runtime);
+    if (!prepare_result.ok) {
+      if (control)
+        control_resume_trace(prepare_result.reason.c_str(), control->id,
+                             control->caller_id, control->target_id);
+      return pre_boundary_failure(prepare_result.reason);
+    }
+
+    // RESUME has no statement DML to commit. Keep the SESSION participants for
+    // native rollback, but end its temporary engine statement registration.
+    reset_preserve_statement_transaction_scope(target);
+    intent_context.state = Preserve_trx_strict_attach_intent_state::ACTIVATING;
+    if (registry.begin_activation(&attach_lease, write_strict_attach_intent,
+                                  &intent_context) !=
+        Preserve_trx_prepared_status::OK) {
+      return pre_boundary_failure("durable ACTIVATING intent failed");
+    }
+    auto post_boundary_failure = [&](bool ownership_tainted) {
+      if (control) {
+        control->quarantined = ownership_tainted;
+        return finish(control_resume_fail(control));
+      }
+      if (resume_runtime.strict_temp_attach &&
+          !resume_runtime.strict_temp_attach->committed()) {
+        if (resume_runtime.strict_temp_attach->rollback(
+                &resume_runtime.strict_temp_ready))
+          return taint_current_attempt("temporary activation rollback failed");
+        resume_runtime.strict_temp_attach.reset();
+        resume_runtime.strict_temp_ready.reset();
+      }
+      if (!ownership_tainted && !trans_rollback(target)) {
+        // Release this attempt's result owner before recording rollback. InnoDB
+        // rollback does not own statement maps, parameter buffers or cursors.
+        resume_runtime.strict_result_attach.reset();
+        resume_runtime.strict_result_ready.reset();
+        if (resume_runtime.strict_temp_attach &&
+            resume_runtime.strict_temp_attach->drop_after_rollback())
+          return taint_current_attempt(
+              "temporary activation table cleanup failed");
+        resume_runtime.strict_temp_attach.reset();
+        intent_context.state =
+            Preserve_trx_strict_attach_intent_state::ATTACH_ROLLED_BACK;
+        if (registry.finish_rolled_back_attach(
+                &attach_lease, write_strict_attach_intent, &intent_context) ==
+            Preserve_trx_prepared_status::OK) {
+          delete_detached_mdl_context(key.token);
+          (void)delete_preserved_snapshot_files_and_sidecars_or_log(
+              key.preserve_dir, key.token, &record.metadata);
+          return finish(Preserved_trx_promotion_resume_status::
+                            ACTIVATION_FAILED_ROLLED_BACK);
         }
       }
-      return post_boundary_failure(ownership_tainted);
+      return taint_current_attempt(
+          "promoted transaction activation ownership failed");
+    };
+
+    if (binlog_attached) {
+      const auto binlog_commit_status =
+          mysql_binlog_preserve_commit_detached_cache_attach(
+              &resume_runtime.strict_binlog_journal);
+      if (binlog_commit_status != Mysql_binlog_preserve_cache_status::OK) {
+        if (control)
+          return post_boundary_failure(
+              binlog_commit_status ==
+              Mysql_binlog_preserve_cache_status::OWNERSHIP_TAINTED);
+        bool ownership_tainted =
+            binlog_commit_status ==
+            Mysql_binlog_preserve_cache_status::OWNERSHIP_TAINTED;
+        if (!ownership_tainted) {
+          auto *innodb_info = find_innodb_ha_info(target);
+          auto *innodb_hton = innodb_info ? innodb_info->ht() : nullptr;
+          const auto abort_status =
+              mysql_binlog_preserve_abort_detached_cache_attach(
+                  &resume_runtime.strict_binlog_journal,
+                  &resume_runtime.strict_binlog_handle);
+          if (abort_status == Mysql_binlog_preserve_cache_status::OK) {
+            binlog_attached = false;
+            resume_runtime.strict_binlog_handle.reset();
+            // Binlog abort clears the SQL participant lists. Restore the exact
+            // attached InnoDB participant before the full transaction rollback.
+            if (!innodb_hton ||
+                !trx_preserve_is_active_attached_to_thd(record.trx, target)) {
+              ownership_tainted = true;
+            } else {
+              innodb_info->reset();
+              trans_register_ha(target, true, innodb_hton, nullptr);
+              target->get_ha_data(innodb_hton->slot)
+                  ->ha_info[Transaction_ctx::SESSION]
+                  .set_trx_read_write();
+            }
+          } else {
+            ownership_tainted = true;
+          }
+        }
+        return post_boundary_failure(ownership_tainted);
+      }
+    }
+    binlog_attached = false;
+    if (resume_runtime.strict_temp_attach &&
+        resume_runtime.strict_temp_attach->commit()) {
+      if (control)
+        control_resume_trace("temp-handoff-failed", control->id,
+                             control->caller_id, control->target_id);
+      return post_boundary_failure(false);
+    }
+    if (resume_runtime.strict_result_attach)
+      resume_runtime.strict_result_attach->commit();
+    if (activate_resumed_trx_shared(&record) != DB_SUCCESS) {
+      if (control)
+        control_resume_trace("activation-failed", control->id,
+                             control->caller_id, control->target_id);
+      return post_boundary_failure(false);
+    }
+    intent_context.state = Preserve_trx_strict_attach_intent_state::ACTIVE;
+    if (registry.commit_attach(&attach_lease, write_strict_attach_intent,
+                               &intent_context,
+                               resume_runtime.strict_result_attach.get(),
+                               resume_runtime.strict_temp_attach.get()) !=
+        Preserve_trx_prepared_status::OK) {
+      return post_boundary_failure(false);
+    }
+    if (control) control->handoff_proven = true;
+    if (!record.metadata.recovery.resource_only() &&
+        trx_preserve_finish_resumed_activation(record.trx, target) !=
+            DB_SUCCESS) {
+      if (control) return finish(control_resume_fail(control));
+      const std::string message =
+          redacted_preserved_trx_log_subject(key.token) +
+          " failed to clear promoted ACTIVE Undo runtime identity; killing "
+          "session";
+      LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG, message.c_str());
+      // ACTIVE cannot become retryable. Release the result owner before killing
+      // the backend; the transaction remains owned by its existing THD cleanup.
+      resume_runtime.strict_result_attach.reset();
+      target->killed = THD::KILL_CONNECTION;
+      thd_state_guard.dismiss();
+      return finish(Preserved_trx_promotion_resume_status::ATTACH_TAINTED);
+    }
+
+    const bool installed_resources = resume_runtime.strict_result_attach ||
+                                     resume_runtime.strict_temp_attach;
+    if (resume_runtime.strict_result_attach)
+      resume_runtime.strict_result_attach->finish();
+    if (control) resume_runtime.strict_result_attach.reset();
+    if (empty_results)
+      target->preserve_trx_result_owner = std::move(empty_results);
+    if (resume_runtime.strict_temp_attach)
+      resume_runtime.strict_temp_attach->finish();
+    if (control) resume_runtime.strict_temp_attach.reset();
+    DBUG_EXECUTE_IF("preserve_control_resume_post_handoff_bad_alloc", {
+      if (control) {
+        control_resume_trace("late-allocation-fault", control->id,
+                             control->caller_id, control->target_id);
+        throw std::bad_alloc();
+      }
+    });
+    delete_detached_mdl_context(key.token);
+    Preserve_snapshot_remove_options remove_options;
+    Preserve_snapshot_delete_status delete_status =
+        delete_snapshot_files_with_status(key.preserve_dir, key.token,
+                                          remove_options);
+    if (delete_status == Preserve_snapshot_delete_status::OK) {
+      remove_strict_attach_intent(key);
+    } else {
+      const std::string message =
+          redacted_preserved_trx_log_subject(key.token) +
+          " strict attach artifact cleanup remains pending";
+      LogErr(WARNING_LEVEL, ER_LOG_PRINTF_MSG, message.c_str());
+    }
+    if (metadata_has_binlog_cache) {
+      preserved_trx_promotion_prepared_note_resume_binlog_io(0, 0, 0);
+    }
+    thd_state_guard.dismiss();
+    audit_preserved_trx_event(target, key.token, "promotion-resume", "success");
+    target->preserve_trx_temp_first_dml_pending = installed_resources;
+    return finish(Preserved_trx_promotion_resume_status::OK);
+  } catch (...) {
+    if (!control) throw;
+    if (resume_runtime.target_taken_over)
+      return finish(control_resume_fail(control));
+    try {
+      if (unwinding) throw;
+      if (record_taken) {
+        const auto status = strict_resume_unwind(
+            target, key, record, resume_runtime, attach_lease, intent_context,
+            thd_state_guard, "control resume exception");
+        if (status == Preserved_trx_promotion_resume_status::ATTACH_TAINTED) {
+          control->quarantined = true;
+          return finish(control_resume_fail(control));
+        }
+        return finish(status);
+      }
+      if (attach_lease.active())
+        (void)registry.abort_attach_after_full_unwind(&attach_lease);
+    } catch (...) {
+      // Unknown pre-takeover ownership is quarantined, never silently
+      // destroyed.
+      control->quarantined = true;
+      thd_state_guard.dismiss();
+      return finish(control_resume_fail(control));
+    }
+    return finish(Preserved_trx_promotion_resume_status::STAGING_FAILED);
+  }
+}
+
+static void control_resume_release_after_response(THD *caller, bool teardown) {
+  Preserve_trx_external_thd_pin_handle pin;
+  void (*release)(void *) = nullptr;
+  void *cookie = nullptr;
+  THD *target = nullptr;
+  uint64_t id = 0, caller_id = 0, target_id = 0;
+  {
+    std::lock_guard<std::mutex> lock(g_preserved_trx_thd_pin_mutex);
+    const auto found = g_control_resume_callers.find(caller);
+    if (found == g_control_resume_callers.end() ||
+        !found->second->pending_kill ||
+        (!teardown && found->second->query_id != caller->query_id))
+      return;
+    auto &attempt = *found->second;
+    target = attempt.target;
+    id = attempt.id;
+    caller_id = attempt.caller_id;
+    target_id = attempt.target_id;
+    pin = std::move(attempt.pin);
+    release = attempt.release;
+    cookie = attempt.cookie;
+    attempt.release = nullptr;
+    attempt.cookie = nullptr;
+    attempt.caller = nullptr;
+    g_control_resume_callers.erase(found);
+  }
+  control_resume_trace(teardown ? "control-exit" : "response-return", id,
+                       caller_id, target_id);
+  mysql_mutex_lock(&target->LOCK_thd_data);
+  target->awake(THD::KILL_CONNECTION);
+  mysql_mutex_unlock(&target->LOCK_thd_data);
+  control_resume_trace("kill-issued", id, caller_id, target_id);
+  release(cookie);
+  // Last pin may let target teardown and the reaper destroy the attempt.
+  pin = {};
+}
+
+void preserved_trx_control_resume_after_error_response(THD *caller) {
+  control_resume_release_after_response(caller, false);
+}
+
+static void control_resume_target_begin(THD *target) {
+  auto *attempt = control_resume_target(target);
+  if (!attempt || !attempt->pending_kill || attempt->caller) return;
+  attempt->target_started = true;
+  auto &runtime = attempt->runtime;
+  const bool resource_only = attempt->record.trx == nullptr &&
+                             attempt->record.metadata.recovery.resource_only();
+  bool valid = runtime.target_taken_over &&
+               (resource_only || (trx_preserve_is_active_attached_to_thd(
+                                      attempt->record.trx, target) &&
+                                  find_innodb_ha_info(target) != nullptr));
+  try {
+    if (runtime.strict_temp_attach) {
+      if (runtime.strict_temp_attach->committed()) {
+        runtime.strict_temp_attach->finish();
+      } else if (runtime.strict_temp_attach->rollback(
+                     &runtime.strict_temp_ready)) {
+        runtime.strict_temp_attach->quarantine();
+        valid = false;
+      }
+      runtime.strict_temp_attach.reset();
+    }
+    runtime.strict_temp_ready.reset();
+    runtime.strict_result_attach.reset();
+    runtime.strict_result_ready.reset();
+    if (runtime.strict_binlog_journal.active()) {
+      auto *info = find_innodb_ha_info(target);
+      auto *hton = info ? info->ht() : nullptr;
+      if (mysql_binlog_preserve_abort_detached_cache_attach(
+              &runtime.strict_binlog_journal, &runtime.strict_binlog_handle) !=
+          Mysql_binlog_preserve_cache_status::OK) {
+        valid = false;
+      } else {
+        runtime.strict_binlog_attached = false;
+        runtime.strict_binlog_handle.reset();
+        if (!resource_only) {
+          if (!hton || !trx_preserve_is_active_attached_to_thd(
+                           attempt->record.trx, target)) {
+            valid = false;
+          } else {
+            info->reset();
+            trans_register_ha(target, true, hton, nullptr);
+            target->get_ha_data(hton->slot)
+                ->ha_info[Transaction_ctx::SESSION]
+                .set_trx_read_write();
+          }
+        }
+      }
+    }
+    reset_preserve_statement_transaction_scope(target);
+  } catch (...) {
+    valid = false;
+  }
+  attempt->rollback_owned = valid && !attempt->quarantined;
+  attempt->quarantined |= !valid;
+}
+
+void preserved_trx_control_resume_note_rollback(THD *target, bool failed) {
+  auto *attempt = control_resume_target(target);
+  if (!attempt || !attempt->target_started) return;
+  attempt->rollback_proven = attempt->rollback_owned && !failed;
+  attempt->quarantined |= !attempt->rollback_proven;
+  control_resume_trace(
+      attempt->rollback_proven ? "rollback-proven" : "rollback-unproven",
+      attempt->id, attempt->caller_id, attempt->target_id);
+}
+
+static void control_resume_target_end(THD *target) {
+  Control_resume_attempt *attempt = nullptr;
+  uint64_t quarantined_id = 0, caller_id = 0, target_id = 0;
+  {
+    std::lock_guard<std::mutex> lock(g_preserved_trx_thd_pin_mutex);
+    const auto found = g_control_resume_targets.find(target);
+    if (found == g_control_resume_targets.end() ||
+        !found->second->target_started)
+      return;
+    attempt = found->second;
+    g_control_resume_targets.erase(found);
+    attempt->record.trx = nullptr;
+    attempt->target = nullptr;
+    if (!attempt->quarantined && attempt->rollback_proven) {
+      attempt->target_done = true;
+    } else {
+      quarantined_id = attempt->id;
+      caller_id = attempt->caller_id;
+      target_id = attempt->target_id;
+      // Unknown journal ownership cannot be destroyed after its THD is gone.
+      // Preserve that same owner until process exit, without a second queue.
+      for (auto it = g_control_resumes.begin(); it != g_control_resumes.end();
+           ++it)
+        if (it->get() == attempt) {
+          (void)it->release();
+          g_control_resumes.erase(it);
+          break;
+        }
     }
   }
-  binlog_attached = false;
-  if (resume_runtime.strict_temp_attach && resume_runtime.strict_temp_attach->commit())
-    return post_boundary_failure(false);
-  if (resume_runtime.strict_result_attach) resume_runtime.strict_result_attach->commit();
-  if (activate_resumed_trx_shared(&record) != DB_SUCCESS) {
-    return post_boundary_failure(false);
+  if (quarantined_id) {
+    char message[256];
+    snprintf(message, sizeof(message),
+             "PRESERVE: control RESUME target cleanup quarantined attempt=%llu "
+             "caller=%llu target=%llu",
+             static_cast<unsigned long long>(quarantined_id),
+             static_cast<unsigned long long>(caller_id),
+             static_cast<unsigned long long>(target_id));
+    LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG, message);
   }
-  intent_context.state = Preserve_trx_strict_attach_intent_state::ACTIVE;
-  if (registry.commit_attach(&attach_lease, write_strict_attach_intent,
-                             &intent_context, resume_runtime.strict_result_attach.get(),
-                             resume_runtime.strict_temp_attach.get()) !=
-      Preserve_trx_prepared_status::OK) {
-    return post_boundary_failure(false);
-  }
-  if (!record.metadata.recovery.resource_only() && trx_preserve_finish_resumed_activation(record.trx, target) !=
-      DB_SUCCESS) {
-    const std::string message =
-        redacted_preserved_trx_log_subject(key.token) +
-        " failed to clear promoted ACTIVE Undo runtime identity; killing session";
-    LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG, message.c_str());
-    // ACTIVE cannot become retryable. Release the result owner before killing
-    // the backend; the transaction remains owned by its existing THD cleanup.
-    resume_runtime.strict_result_attach.reset();
-    target->killed = THD::KILL_CONNECTION;
-    thd_state_guard.dismiss();
-    return finish(Preserved_trx_promotion_resume_status::ATTACH_TAINTED);
-  }
+  // No attempt access after publishing target_done to the existing reaper.
+  preserved_trx_request_expired_reaper_scan();
+}
 
-  if (resume_runtime.strict_result_attach) resume_runtime.strict_result_attach->finish();
-  if (empty_results) target->preserve_trx_result_owner = std::move(empty_results);
-  if (resume_runtime.strict_temp_attach) resume_runtime.strict_temp_attach->finish();
-  delete_detached_mdl_context(key.token);
-  Preserve_snapshot_remove_options remove_options;
-  Preserve_snapshot_delete_status delete_status =
-      delete_snapshot_files_with_status(key.preserve_dir, key.token,
-                                        remove_options);
-  if (delete_status == Preserve_snapshot_delete_status::OK) {
-    remove_strict_attach_intent(key);
-  } else {
-    const std::string message =
-        redacted_preserved_trx_log_subject(key.token) +
-        " strict attach artifact cleanup remains pending";
-    LogErr(WARNING_LEVEL, ER_LOG_PRINTF_MSG, message.c_str());
+static void control_resume_reap_once() {
+  Control_resume_attempt *attempt = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_preserved_trx_thd_pin_mutex);
+    for (auto &entry : g_control_resumes)
+      if (entry->target_done && !entry->reaping) {
+        attempt = entry.get();
+        attempt->reaping = true;
+        break;
+      }
   }
-  if (metadata_has_binlog_cache) {
-    preserved_trx_promotion_prepared_note_resume_binlog_io(0, 0, 0);
+  if (!attempt) return;
+  bool complete = false;
+  try {
+    auto &registry = preserved_trx_strict_prepared_token_registry();
+    if (!attempt->inputs_proven)
+      attempt->inputs_proven = attempt->handoff_proven ||
+                               registry.staging_cleanup_proven(attempt->key);
+    if (attempt->inputs_proven) {
+      attempt->intent.state =
+          Preserve_trx_strict_attach_intent_state::ATTACH_ROLLED_BACK;
+      if (!attempt->handoff_proven && !attempt->lease_finished) {
+        bool injected = false;
+        DBUG_EXECUTE_IF("preserve_control_resume_cleanup_intent_failure",
+                        injected = true;);
+        const auto status =
+            injected ? Preserve_trx_prepared_status::INTENT_IO_ERROR
+                     : registry.finish_rolled_back_attach(
+                           &attempt->lease, write_strict_attach_intent,
+                           &attempt->intent);
+        attempt->lease_finished = status == Preserve_trx_prepared_status::OK;
+        attempt->quarantined =
+            status != Preserve_trx_prepared_status::OK &&
+            status != Preserve_trx_prepared_status::INTENT_IO_ERROR;
+      }
+      if (attempt->handoff_proven || attempt->lease_finished) {
+        if (!attempt->files_removed) {
+          Preserve_snapshot_remove_options options;
+          attempt->files_removed =
+              delete_snapshot_files_with_status(attempt->key.preserve_dir,
+                                                attempt->key.token, options) ==
+              Preserve_snapshot_delete_status::OK;
+        }
+        if (attempt->files_removed) {
+          bool injected = false;
+          DBUG_EXECUTE_IF("preserve_control_resume_cleanup_remove_failure",
+                          injected = true;);
+          complete = !injected && remove_strict_attach_intent(attempt->key);
+        }
+      }
+    }
+  } catch (...) {
+    // Retry only the unfinished stable file/lease step, never target rollback.
   }
-  thd_state_guard.dismiss();
-  audit_preserved_trx_event(target, key.token, "promotion-resume", "success");
-  target->preserve_trx_temp_first_dml_pending =
-      resume_runtime.strict_result_attach || resume_runtime.strict_temp_attach;
-  return finish(Preserved_trx_promotion_resume_status::OK);
+  control_resume_trace(complete                 ? "cleanup-complete"
+                       : !attempt->inputs_proven ? "cleanup-inputs-pending"
+                       : attempt->files_removed ? "cleanup-remove-retry"
+                       : attempt->lease_finished || attempt->handoff_proven
+                           ? "cleanup-files-retry"
+                           : "cleanup-intent-retry",
+                       attempt->id, attempt->caller_id, attempt->target_id);
+  if (attempt->quarantined)
+    LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+           "PRESERVE: control RESUME cleanup ownership quarantined");
+  std::unique_ptr<Control_resume_attempt> retired;
+  {
+    std::lock_guard<std::mutex> lock(g_preserved_trx_thd_pin_mutex);
+    if (complete || attempt->quarantined) {
+      for (auto it = g_control_resumes.begin(); it != g_control_resumes.end();
+           ++it)
+        if (it->get() == attempt) {
+          if (attempt->quarantined) {
+            (void)it->release();
+          } else
+            retired = std::move(*it);
+          g_control_resumes.erase(it);
+          break;
+        }
+    } else {
+      attempt->reaping = false;
+      for (auto it = g_control_resumes.begin(); it != g_control_resumes.end();
+           ++it)
+        if (it->get() == attempt) {
+          g_control_resumes.splice(g_control_resumes.end(), g_control_resumes,
+                                   it);
+          break;
+        }
+    }
+  }
 }
 
 bool Sql_cmd_show_preserved_transactions::execute(THD *thd) {

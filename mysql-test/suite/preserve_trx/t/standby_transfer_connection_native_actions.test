@@ -1,0 +1,5 @@
+--let $connection_scenario= native-actions
+--disable_query_log
+call mtr.add_suppression("Aborted connection .*connection_handoff_app.*init_connect command failed.*connection_init_missing");
+--enable_query_log
+--source suite/preserve_trx/include/connection_handoff_case.inc

@@ -1,0 +1,3 @@
+--let $connection_scenario= init-session
+--let $connection_scheduler= LEGACY_READINESS_THEN_CLOSING
+--source suite/preserve_trx/include/connection_handoff_case.inc

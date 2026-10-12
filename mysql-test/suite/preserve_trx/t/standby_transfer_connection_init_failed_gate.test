@@ -1,0 +1,8 @@
+--source include/have_debug.inc
+--disable_query_log
+call mtr.add_suppression("Aborted connection .*connection_handoff_app.*init_connect command failed.*MY-004013");
+call mtr.add_suppression("Preserved transaction .* recovery cleanup failed: failed to delete snapshot files");
+call mtr.add_suppression("Preserved transaction .* recovery forced rollback: preserved transaction snapshot tainted");
+--enable_query_log
+--let $connection_scenario= init-failed-gate
+--source suite/preserve_trx/include/connection_handoff_case.inc

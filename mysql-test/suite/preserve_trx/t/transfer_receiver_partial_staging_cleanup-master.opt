@@ -1,0 +1,1 @@
+--rds-preserve-trx-standby-phase2-scheduler-mode=DEPENDENCY_CONVERGENCE_V1

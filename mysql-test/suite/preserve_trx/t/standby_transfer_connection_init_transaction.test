@@ -1,0 +1,2 @@
+--let $connection_scenario= init-transaction
+--source suite/preserve_trx/include/connection_handoff_case.inc

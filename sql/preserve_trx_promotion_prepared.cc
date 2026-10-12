@@ -91,6 +91,7 @@ struct Preserve_trx_prepared_token_entry {
   std::string prewarm_object_set_digest;
   bool preparing{false};
   bool retired_from_registry{false};
+  bool staging_cleanup_owned{false};
   uint64_t preparing_generation{0};
   uint32_t physical_promotion_pins{0};
 };
@@ -1403,6 +1404,17 @@ Preserve_trx_attach_lease &Preserve_trx_attach_lease::operator=(
 
 Preserve_trx_attach_lease::~Preserve_trx_attach_lease() { fail_closed(); }
 
+void Preserve_trx_attach_lease::cancel_temp_completion() {
+  if (!m_active || !m_entry) return;
+  std::shared_ptr<Preserve_trx_temp_completion> completion;
+  {
+    std::lock_guard<std::mutex> guard(m_entry->mutex);
+    if (m_entry->resources.m_impl)
+      completion = m_entry->resources.m_impl->temp_completion;
+  }
+  if (completion) completion->cancel();
+}
+
 Preserve_trx_prepared_status Preserve_trx_attach_lease::wait_temp_ready(
     THD *thd, uint64_t deadline_us) {
   if (!m_active || !m_entry || m_activation_started || m_temp_taken)
@@ -1767,6 +1779,7 @@ Preserve_trx_prepared_token_registry::publish_prewarmed(
         }
       } else {
         lease->m_entry->resources = std::move(resources);
+        lease->m_entry->staging_cleanup_owned = false;
         lease->m_entry->key = lease->m_key;
         lease->m_entry->prewarm_object_set_digest = prewarm_object_set_digest;
         lease->m_entry->state.store(
@@ -2549,12 +2562,11 @@ Preserve_trx_prepared_token_registry::commit_attach(
 }
 
 Preserve_trx_prepared_status
-Preserve_trx_prepared_token_registry::rollback_attach_after_activation(
+Preserve_trx_prepared_token_registry::finish_rolled_back_attach(
     Preserve_trx_attach_lease *lease,
-    Preserve_trx_activation_intent_writer intent_writer,
-    void *intent_context) {
+    Preserve_trx_activation_intent_writer intent_writer, void *intent_context) {
   if (lease == nullptr || !lease->active() || lease->m_entry == nullptr ||
-      !lease->m_activation_started || intent_writer == nullptr) {
+      intent_writer == nullptr) {
     return Preserve_trx_prepared_status::INVALID_ARGUMENT;
   }
   Preserve_trx_prepared_token_key key;
@@ -2572,7 +2584,9 @@ Preserve_trx_prepared_token_registry::rollback_attach_after_activation(
   if (!intent_writer(key, intent_context)) {
     return Preserve_trx_prepared_status::INTENT_IO_ERROR;
   }
-  auto expected = Preserve_trx_prepared_token_state::ACTIVATING;
+  auto expected = lease->m_activation_started
+                      ? Preserve_trx_prepared_token_state::ACTIVATING
+                      : Preserve_trx_prepared_token_state::ATTACHING;
   if (!lease->m_entry->state.compare_exchange_strong(
           expected, Preserve_trx_prepared_token_state::ATTACH_ROLLED_BACK,
           std::memory_order_acq_rel, std::memory_order_acquire)) {
@@ -2691,6 +2705,63 @@ Preserve_trx_prepared_token_registry::commit_cleanup(
   lease->m_active = false;
   lease->m_entry.reset();
   return Preserve_trx_prepared_status::OK;
+}
+
+namespace {
+// Call with entry.mutex held. Heavy ACTIVE resources are still released at
+// activation; only this final identity waits for staging ownership transfer.
+bool prepared_terminal_can_retire(
+    const Preserve_trx_prepared_token_entry &entry) {
+  const auto state = entry.state.load(std::memory_order_acquire);
+  return (state != Preserve_trx_prepared_token_state::ATTACH_ROLLED_BACK &&
+          state !=
+              Preserve_trx_prepared_token_state::ACTIVE_ARTIFACTS_CLEANED) ||
+         (entry.staging_cleanup_owned &&
+          !entry.resources.temp_preparation_pending());
+}
+}  // namespace
+
+Preserve_trx_prepared_status
+Preserve_trx_prepared_token_registry::note_staging_cleanup_owned(
+    const Preserve_trx_prepared_token_key &key) {
+  std::shared_ptr<Preserve_trx_prepared_token_entry> entry;
+  {
+    std::lock_guard<std::mutex> guard(m_state->mutex);
+    const auto found = m_state->entries.find(key);
+    if (found == m_state->entries.end())
+      return Preserve_trx_prepared_status::NOT_FOUND;
+    entry = found->second;
+  }
+  std::lock_guard<std::mutex> guard(entry->mutex);
+  const auto publication =
+      std::atomic_load_explicit(&entry->publication, std::memory_order_acquire);
+  if (entry->retired_from_registry || !publication ||
+      !prepared_token_keys_match(entry->key, key) ||
+      !prepared_token_keys_match(publication->key, key))
+    return Preserve_trx_prepared_status::STALE_GENERATION;
+  if (entry->resources.temp_preparation_pending())
+    return Preserve_trx_prepared_status::INVALID_STATE;
+  entry->staging_cleanup_owned = true;
+  return Preserve_trx_prepared_status::OK;
+}
+
+bool Preserve_trx_prepared_token_registry::staging_cleanup_proven(
+    const Preserve_trx_prepared_token_key &key) const {
+  std::shared_ptr<Preserve_trx_prepared_token_entry> entry;
+  {
+    std::lock_guard<std::mutex> guard(m_state->mutex);
+    const auto found = m_state->entries.find(key);
+    if (found == m_state->entries.end()) return false;
+    entry = found->second;
+  }
+  std::lock_guard<std::mutex> guard(entry->mutex);
+  const auto publication =
+      std::atomic_load_explicit(&entry->publication, std::memory_order_acquire);
+  return !entry->retired_from_registry && publication &&
+         prepared_token_keys_match(entry->key, key) &&
+         prepared_token_keys_match(publication->key, key) &&
+         entry->staging_cleanup_owned &&
+         !entry->resources.temp_preparation_pending();
 }
 
 Preserve_trx_prepared_status Preserve_trx_prepared_token_registry::snapshot(
@@ -2983,9 +3054,10 @@ Preserve_trx_prepared_token_registry::expire_once(uint64_t now_us) {
 
     auto state = entry->state.load(std::memory_order_acquire);
     if (state == Preserve_trx_prepared_token_state::NOT_READY ||
-        state ==
-            Preserve_trx_prepared_token_state::ACTIVE_ARTIFACTS_CLEANED) {
-      terminal_entries.push_back(entry->key);
+        state == Preserve_trx_prepared_token_state::ATTACH_ROLLED_BACK ||
+        state == Preserve_trx_prepared_token_state::ACTIVE_ARTIFACTS_CLEANED) {
+      if (prepared_terminal_can_retire(*entry))
+        terminal_entries.push_back(entry->key);
       continue;
     }
     if ((state ==
@@ -3053,6 +3125,7 @@ Preserve_trx_prepared_token_registry::purge_token(
       return Preserve_trx_prepared_status::STALE_GENERATION;
     auto expected = found->second->state.load(std::memory_order_acquire);
     if (found->second->physical_promotion_pins != 0 ||
+        !prepared_terminal_can_retire(*found->second) ||
         prepared_state_has_live_or_ambiguous_owner(expected)) {
       return Preserve_trx_prepared_status::INVALID_STATE;
     }
@@ -3081,8 +3154,8 @@ void Preserve_trx_prepared_token_registry::purge_epoch(
         const auto entry_owner = it->second;
         std::lock_guard<std::mutex> entry_guard(entry_owner->mutex);
         auto expected = it->second->state.load(std::memory_order_acquire);
-        if (it->second->preparing ||
-            it->second->physical_promotion_pins != 0 ||
+        if (it->second->preparing || it->second->physical_promotion_pins != 0 ||
+            !prepared_terminal_can_retire(*it->second) ||
             prepared_state_has_live_or_ambiguous_owner(expected)) {
           ++it;
           continue;

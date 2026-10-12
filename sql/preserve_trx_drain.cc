@@ -25,6 +25,13 @@
 
 #include <cassert>
 
+bool Preserve_trx_inflight_statement_guard::admit_reset(THD *thd) {
+  assert(!m_active);
+  if (!preserved_trx_admit_connection_reset(thd, &m_active)) return false;
+  if (m_active) m_thd = thd;
+  return true;
+}
+
 Preserve_trx_inflight_statement_guard::~Preserve_trx_inflight_statement_guard() {
   if (!m_active) return;
   /*

@@ -3443,10 +3443,13 @@ Preserve_trx_physical_promotion_bootstrap_attempt::abort() {
     */
     m_impl->prepared_token_pin.release_for_abandon();
     trx_preserve_startup_resurrection_reset();
-    if (receiver_reaper_owns_cleanup &&
-        preserve_trx_transfer_destroy_abandoning_receiver_epoch_process_local(
-            m_impl->accepted_epoch) != Preserve_trx_transfer_status::OK) {
-      cleanup_tainted = true;
+    if (receiver_reaper_owns_cleanup) {
+      const auto status =
+          preserve_trx_transfer_destroy_abandoning_receiver_epoch_process_local(
+              m_impl->accepted_epoch);
+      cleanup_tainted |=
+          status != Preserve_trx_transfer_status::OK &&
+          status != Preserve_trx_transfer_status::RESOURCE_PREPARING;
     }
     if (!cleanup_tainted && abandon_reservations &&
         trx_preserve_abandon_active_undo_reservations(

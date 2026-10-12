@@ -945,7 +945,9 @@ void THD::cleanup(void) {
     transaction_cache_detach(trn_ctx);
   } else {
     xs->set_state(XID_STATE::XA_NOTR);
-    trans_rollback(this);
+    const bool rollback_failed = trans_rollback(this);
+    if (preserve_trx_is_enabled())
+      preserved_trx_control_resume_note_rollback(this, rollback_failed);
     transaction_cache_delete(trn_ctx);
   }
 
@@ -2568,6 +2570,8 @@ void THD::send_statement_status() {
       /* The query failed, send error to log and abort bootstrap. */
       error = m_protocol->send_error(da->mysql_errno(), da->message_text(),
                                      da->returned_sqlstate());
+      if (preserve_trx_is_enabled())
+        preserved_trx_control_resume_after_error_response(this);
       break;
     case Diagnostics_area::DA_EOF:
       error =

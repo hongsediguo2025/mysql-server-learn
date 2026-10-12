@@ -39,20 +39,24 @@ die "session-only source eligibility must not allocate or inspect another THD's 
   if $source_eligibility_body =~ /trx_preserve_thd_can_accept_preserved_trx/;
 die "session-only eligibility must retain the command packet CLOSING fence\n"
   unless $source_eligibility_body =~ /candidate->m_server_idle\s*\|\|[\s\S]{0,360}!candidate->preserve_trx_command_packet_before_closing\.load[\s\S]{0,180}command_classified/s;
-die "final S eligibility must exclude a decoded no-response cleanup packet\n"
+die "final S eligibility must exclude an admitted native teardown\n"
   unless $source_eligibility_body =~ /candidate->preserve_trx_post_closing_cleanup_packet\.load[\s\S]{0,400}!disconnecting/s;
 die "post-CLOSING command state must use classified and cleanup atomics\n"
   unless $sql_class =~ /std::atomic<bool>\s+preserve_trx_post_closing_command_classified\{false\}/s &&
          $sql_class =~ /std::atomic<bool>\s+preserve_trx_post_closing_cleanup_packet\{false\}/s &&
          $preserve_h =~ /void\s+preserved_trx_classify_protocol_command/s;
-die "protocol classification must exclude only a disconnecting COM_QUIT\n"
+die "protocol classification must leave standby QUIT to final admission\n"
   unless $drain =~ /void preserved_trx_classify_protocol_command[\s\S]{0,500}command\s*==\s*COM_QUIT/s &&
          $drain !~ /preserved_trx_classify_protocol_command[\s\S]{0,500}command\s*==\s*COM_STMT_CLOSE/s &&
          $drain =~ /preserved_trx_classify_protocol_command[\s\S]{0,500}preserve_trx_post_closing_command_classified\.store\(\s*true/s &&
          $drain =~ /preserved_trx_begin_command_read[\s\S]{0,900}preserve_trx_post_closing_command_classified\.store\(\s*false/s &&
          $drain =~ /preserved_trx_begin_command_read[\s\S]{0,900}preserve_trx_post_closing_cleanup_packet\.store\(\s*false/s;
-die "initial planning may retain an unclassified post-CLOSING packet but must ignore a classified COM_QUIT\n"
+die "initial planning may retain an unclassified post-CLOSING packet but must ignore an admitted teardown\n"
   unless $drain =~ /preserve_trx_session_only_candidate_is_eligible_locked\(\s*candidate,\s*true,\s*true\)[\s\S]{0,900}command_unclassified[\s\S]{0,600}context_unsupported/s;
+die "standby QUIT must not be marked exiting at decode time\n"
+  unless $drain =~ /preserved_trx_classify_protocol_command[\s\S]{0,500}command\s*==\s*COM_QUIT\s*&&\s*!preserve_trx_connection_handoff_enabled\(\)/s;
+die "QUIT must obtain final admission before native teardown\n"
+  unless $drain =~ /preserved_trx_protocol_command_block_result[\s\S]*preserve_trx_admit_connection_action\(thd, Connection_action::QUIT\)/s;
 my $get_command_pos =
   index($sql_parse, 'thd->get_protocol()->get_command(&com_data, &command)');
 my $classify_command_pos =

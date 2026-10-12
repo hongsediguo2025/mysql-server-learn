@@ -453,6 +453,7 @@ class Preserve_trx_attach_lease {
   Preserve_trx_prepared_status take_temp_ready(
       Preserve_trx_temp_receiver_work::Owner *out);
   Preserve_trx_prepared_status wait_temp_ready(THD *thd, uint64_t deadline_us);
+  void cancel_temp_completion();
   Preserve_trx_prepared_status restore_temp_ready(
       Preserve_trx_temp_receiver_work::Owner *inout);
 
@@ -616,7 +617,7 @@ class Preserve_trx_prepared_token_registry {
       void *intent_context,
       const Preserve_trx_result_restore::Attach *result_attach = nullptr,
       const Preserve_trx_temp_restore::Attach *temp_attach = nullptr);
-  Preserve_trx_prepared_status rollback_attach_after_activation(
+  Preserve_trx_prepared_status finish_rolled_back_attach(
       Preserve_trx_attach_lease *lease,
       Preserve_trx_activation_intent_writer intent_writer,
       void *intent_context);
@@ -634,6 +635,11 @@ class Preserve_trx_prepared_token_registry {
   Preserve_trx_prepared_status snapshot(
       const Preserve_trx_prepared_token_key &key,
       Preserve_trx_prepared_token_snapshot *snapshot) const;
+  // Exact-generation proof that the last staging reader is gone and the
+  // receiver owns deletion (including retryable cleanup debt). No allocation.
+  Preserve_trx_prepared_status note_staging_cleanup_owned(
+      const Preserve_trx_prepared_token_key &key);
+  bool staging_cleanup_proven(const Preserve_trx_prepared_token_key &key) const;
   Preserve_trx_prepared_status find_unique_adopted(
       const std::string &epoch_id, const std::string &token,
       Preserve_trx_prepared_token_snapshot *snapshot) const;

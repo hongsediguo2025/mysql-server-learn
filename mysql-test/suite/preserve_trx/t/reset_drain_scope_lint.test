@@ -285,9 +285,11 @@ die "RESET_REQUESTED must defer ordinary receiver ABORT to RESET cleanup\n"
 die "post-ACK RESET context must be published before terminal manager handoff\n"
   unless $preserve =~
          /quarantined_items\s*=\s*std::move\(preserved_batch_items\)[\s\S]{0,500}source_restore_context_ready\.store[\s\S]{0,1200}TRANSFER_HANDOFF_COMPLETE/s;
+my ($reaper_scan) = $preserve =~
+  /(static void preserved_trx_expired_reaper_scan_once\(\)\s*\{[\s\S]*?^\})/m
+  or die "could not isolate existing preserve reaper scan\n";
 die "RESET cleanup must use the existing reaper with bounded token work\n"
-  unless $preserve =~
-         /preserved_trx_expired_reaper_scan_once[\s\S]{0,300}preserved_trx_reset_attempt_reaper_scan_once/s &&
+  unless $reaper_scan =~ /preserved_trx_reset_attempt_reaper_scan_once\(\)/ &&
          $preserve =~
          /kMaxResetTokensPerPass\s*=\s*16[\s\S]*complete_source_restore\(\)[\s\S]*Preserve_trx_manager_state::IDLE/s;
 die "active local-carrier DRAIN without an attempt must remain unsupported, not fatal\n"

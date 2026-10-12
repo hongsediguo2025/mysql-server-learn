@@ -1450,7 +1450,7 @@ bool command_boundary_wait_active() {
          attempt->terminal == Terminal_result::RUNNING;
 }
 
-bool capture_command(THD *command_thd, Command_key *command) {
+bool capture_command(THD *command_thd, Command_key *command, bool compound) {
   if (command != nullptr) *command = {};
   if (command_thd == nullptr ||
       !preserve_trx_standby_phase2_source_capture_enabled()) {
@@ -1477,7 +1477,7 @@ bool capture_command(THD *command_thd, Command_key *command) {
       command_thd->preserve_trx_phase2_connection_incarnation,
       command_thd->preserve_trx_phase2_aggregate_sequence};
   command_thd->preserve_trx_phase2_outer_is_call = false;
-  command_thd->preserve_trx_phase2_outer_is_multi_statement = false;
+  command_thd->preserve_trx_phase2_outer_is_multi_statement = compound;
   command_thd->preserve_trx_phase2_command_stage.store(
       Preserve_trx_phase2_command_stage::ADMISSION_INFLIGHT,
       std::memory_order_release);
@@ -1549,8 +1549,10 @@ Attempt_handle publish_and_register_t0(THD *owner,
       }
 
       mysql_mutex_lock(&candidate->LOCK_thd_data);
+      const bool resetting =
+          preserved_trx_connection_reset_in_progress_locked(candidate);
       if (preserve_trx_phase2_scheduler_bypass_actor(
-              candidate, m_attempt->config.owner_thread_id)) {
+              candidate, m_attempt->config.owner_thread_id, resetting)) {
         mysql_mutex_unlock(&candidate->LOCK_thd_data);
         return;
       }
@@ -1558,11 +1560,11 @@ Attempt_handle publish_and_register_t0(THD *owner,
           candidate->preserve_trx_phase2_command_stage.load(
               std::memory_order_acquire);
       const bool sql_transaction_active =
-          dependency_transaction_is_active(candidate);
+          !resetting && dependency_transaction_is_active(candidate);
       const uint64_t thd_cookie = static_cast<uint64_t>(
           reinterpret_cast<uintptr_t>(candidate));
       const uint32_t isolation_level =
-          static_cast<uint32_t>(candidate->tx_isolation);
+          resetting ? 0 : static_cast<uint32_t>(candidate->tx_isolation);
       const uint64_t raw_engine_cookie =
           sql_transaction_active
               ? trx_preserve_phase2_peek_raw_cookie(candidate)

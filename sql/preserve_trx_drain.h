@@ -236,6 +236,7 @@ class Preserve_trx_inflight_statement_guard {
 
   void mark(THD *thd, enum_sql_command sql_command);
   void mark_unknown_query(THD *thd);
+  bool admit_reset(THD *thd);
 
  private:
   /*

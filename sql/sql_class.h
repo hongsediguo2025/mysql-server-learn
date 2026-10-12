@@ -151,6 +151,8 @@ struct YYLTYPE;
   registration, and also after unresolved detach/cleanup failures where
   ownership must remain visible instead of letting the session run again.
 */
+class Preserve_trx_connection_init;
+
 enum class Preserve_trx_batch_thd_state {
   NONE,
   PENDING_QUIESCE,
@@ -1364,8 +1366,8 @@ class THD : public MDL_context_owner,
     classic-protocol packet reached the server before the drain closing gate
     became visible. post_closing_command_classified distinguishes an ordinary
     rejected command from a packet whose command byte is not decoded yet.
-    post_closing_cleanup_packet then marks COM_QUIT so a final session-only
-    snapshot does not retain a connection committed to teardown.
+    post_closing_cleanup_packet marks admitted native teardown in standby
+    transfer (decoded COM_QUIT in other modes), excluding it from final S.
     COM_STMT_CLOSE remains a live session and therefore is not marked here.
     quiesce_boundary_monotonic_us freezes the completion boundary of the old
     command selected by one drain generation. batch_generation ties this THD to
@@ -1373,6 +1375,11 @@ class THD : public MDL_context_owner,
     batch.
   */
   uint preserve_trx_inflight_risky_statement_depth{0};
+  enum class Preserve_connection_state { NOT_ADMITTED, INITIALIZING, READY };
+  Preserve_connection_state preserve_trx_connection_state{
+      Preserve_connection_state::NOT_ADMITTED};
+  // Only the connection thread dereferences this short-lived stack owner.
+  Preserve_trx_connection_init *preserve_trx_connection_init_owner{nullptr};
   uint preserve_trx_inflight_unknown_query_depth{0};
   uint64 preserve_trx_command_sequence{0};
   ulonglong preserve_trx_command_started_monotonic_us{0};

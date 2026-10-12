@@ -154,6 +154,41 @@ void preserve_trx_set_enable_value(bool enabled);
 bool preserve_trx_magic_xid_should_be_protected(const XID &xid);
 bool preserve_trx_execute_command(THD *thd);
 
+/** One owner spans authentication admission and all native initialization. */
+class Preserve_trx_connection_init {
+ public:
+  enum class Decision { EMPTY, SKIP_ADMIN, SKIP_EXPIRED, EXECUTE };
+  using Decide = Decision (*)(THD *, size_t);
+  explicit Preserve_trx_connection_init(THD *thd);
+  ~Preserve_trx_connection_init();
+  Preserve_trx_connection_init(const Preserve_trx_connection_init &) = delete;
+  Preserve_trx_connection_init &operator=(
+      const Preserve_trx_connection_init &) = delete;
+  bool admit(Decide decide);
+  Decision decision(Decide decide) const;
+  void complete() { m_complete = true; }
+  bool borrow(LEX_STRING *definition, LEX_CSTRING *text);
+  bool continuing() const;
+  bool owns_dispatch() const { return m_borrowed; }
+
+ private:
+  THD *m_thd;
+  std::string m_text;
+  Decision m_decision{Decision::EMPTY};
+  bool m_active{false};
+  bool m_admitted{false};
+  bool m_borrowed{false};
+  bool m_complete{false};
+  uint64 m_incarnation{0};
+  uint64 m_sequence{0};
+};
+
+bool preserved_trx_borrow_init_connect(THD *thd, LEX_STRING *definition,
+                                     LEX_CSTRING *text);
+/** These scan predicates require LOCK_thd_data. */
+bool preserved_trx_connection_reset_in_progress_locked(THD *thd);
+bool preserved_trx_admit_connection_reset(THD *thd, bool *marked);
+
 ulonglong preserve_trx_warmcopy_prefix_bytes_status();
 ulonglong preserve_trx_warmcopy_digest_bytes_status();
 ulonglong preserve_trx_warmcopy_durable_bytes_status();
@@ -552,7 +587,8 @@ Preserve_trx_external_thd_pin_handle
 preserve_trx_acquire_external_thd_pin_locked(THD *thd);
 bool preserve_trx_external_thd_scheduler_teardown_started(THD *thd);
 bool preserve_trx_phase2_scheduler_bypass_actor(THD *thd,
-                                                my_thread_id owner_thread_id);
+                                                my_thread_id owner_thread_id,
+                                                bool admitted_reset = false);
 bool preserve_trx_phase2_existing_closing_gate_active();
 bool preserved_trx_ensure_snapshot_support();
 bool preserved_trx_validate_snapshot_support(bool allow_create_missing);
@@ -766,6 +802,32 @@ bool preserved_trx_expired_reaper_started_for_unit_test();
 void preserved_trx_set_expired_reaper_init_pause_for_unit_test(bool pause);
 bool preserved_trx_expired_reaper_starting_for_unit_test();
 bool preserved_trx_shutdown_requested();
+/** Register the physical-replication control request before entering target
+   TLS. Caller owns the target's exclusive takeover, independently of the
+   lifetime pin. On success this request consumes the pin and the release-only
+   cookie. release must not throw, block, or refer to SQL-stack storage. The
+   physical caller still restores its TLS and forwards target diagnostics.
+   Failed takeovers retain exclusivity until the caller error response has
+   finished. */
+class Preserve_trx_control_resume_request {
+ public:
+  Preserve_trx_control_resume_request() = default;
+  Preserve_trx_control_resume_request(
+      const Preserve_trx_control_resume_request &) = delete;
+  Preserve_trx_control_resume_request &operator=(
+      const Preserve_trx_control_resume_request &) = delete;
+  ~Preserve_trx_control_resume_request();
+  bool begin(THD *caller, THD *target, const LEX_CSTRING &token,
+             Preserve_trx_external_thd_pin_handle *pin, void (*release)(void *),
+             void *cookie) noexcept;
+
+ private:
+  THD *m_caller{nullptr};
+  uint64_t m_attempt{0};
+};
+void preserved_trx_control_resume_after_error_response(THD *caller);
+void preserved_trx_control_resume_note_rollback(THD *target, bool failed);
+
 void preserved_trx_begin_external_thd_teardown(THD *thd);
 void preserved_trx_end_external_thd_teardown(THD *thd);
 struct Preserve_trx_final_cursor_workspace;

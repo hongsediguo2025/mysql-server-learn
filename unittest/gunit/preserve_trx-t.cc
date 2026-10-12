@@ -1679,13 +1679,13 @@ TEST(PreservedTrxPreparedRegistry,
                                       &process_local_intent_write_succeeds));
   process_local_intent_write_succeeds = false;
   EXPECT_EQ(Preserve_trx_prepared_status::INTENT_IO_ERROR,
-            registry.rollback_attach_after_activation(
+            registry.finish_rolled_back_attach(
                 &attach, activation_intent_writer_for_test,
                 &process_local_intent_write_succeeds));
   EXPECT_TRUE(attach.active());
   process_local_intent_write_succeeds = true;
   ASSERT_EQ(Preserve_trx_prepared_status::OK,
-            registry.rollback_attach_after_activation(
+            registry.finish_rolled_back_attach(
                 &attach, activation_intent_writer_for_test,
                 &process_local_intent_write_succeeds));
   Preserve_trx_prepared_token_snapshot snapshot;

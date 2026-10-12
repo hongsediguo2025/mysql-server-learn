@@ -1,7 +1,7 @@
 # 用户临时表与待 FETCH 结果的跨主 Preserve/Resume 详细设计
 
-更新：2026-10-09。源码基线为 `ha_preserve_trx` 的 `f540116c322e` 加 E107 接口修正、E109 默认值调整、E111 Phase1 cursor 捕获及 E112 receiver 私有镜像 I/O 收敛改动。
-E128 当前实施将 TEMP 最终 I/O 完成屏障移至每个 session 的 SQL RESUME，详见[后台完成合同](async-temp-resume-barrier.md)。本节优先于旧版“全部准备必须在 READY 前完成”的描述，验证进展见任务跟踪。
+更新：2026-10-12。源码验证基线为 `ha_preserve_trx / 75be6a9eab30847dc5978d290b2d4d4314f9f0a5` 加本次 receiver TEMP／控制 RESUME 生命周期修复；实现与验证见[修复设计 §9](receiver-io-lifecycle-fix-plan.md#9-实施复核补充2026-10-12)和[任务跟踪 E152](task-tracker.md#e152receiver-temp与控制-resume-生命周期修复2026-10-12)。此前 E107–E151 为各自版本的历史记录，不以旧指纹或旧成绩替代本轮证据。
+E128 将 TEMP 最终 I/O 完成屏障移至每个 session 的 SQL RESUME，详见[后台完成合同](async-temp-resume-barrier.md)。该合同优先于旧版“全部准备必须在 READY 前完成”的描述。§7 已同步 R1–R6 修复后的正常、失败及线程退出流程；最新本地回归与性能边界见 §11。
 本文描述当前代码与集成合同；PS 本体迁移删除前的完整细则保存在[历史设计](detailed-design-before-ps-removal.md)，不再作为当前实施要求。
 
 ## 1. 目标、分工与边界
@@ -269,6 +269,8 @@ receiver 准备]
 
 ## 7. receiver READY 与 SQL RESUME
 
+> 2026-10-12 实施状态：partial 任务／staging、取消后 inflight、分配异常及 TEMP 等待失败后的事务归属六项修复 R1–R6 已在本工程完成，21 个新增 MTR 和含 big test 的全量回归已通过适用模式。RESUME 调序及失败移交仅用于显式登记的独立控制请求；同会话路径保持原行为。物理工程仍须接入登记与既有目标接管；本地 Debug bridge 不等于生产接线验收。实际实现及证据见 [Receiver I/O 生命周期修复设计 §9](receiver-io-lifecycle-fix-plan.md#9-实施复核补充2026-10-12)。
+
 ### 7.1 READY 前完成什么
 
 [result_transfer](../../../sql/preserve_trx_result_transfer.cc) 校验最终清单与对象的 ID/代次/大小/摘要；[result_restore::Preparation](../../../sql/preserve_trx_result_restore.cc) 通过原 receiver 候选和 worker 分批 preflight 值，准备 cursor、decoder、sender 和最终位置，并解绑 worker THD。
@@ -277,24 +279,90 @@ receiver 准备]
 
 结果 wire 保留 `CURSOR_RESULT = 6` 和 `ps_result_<id>_<generation>` 文件名；名字表达结果归属，不表示仍迁移 PS。旧 PS 描述符 kind 5 和 PS 准备进度协议已删除，不提供静默降级为空结果的兼容路径。
 
-### 7.2 RESUME 等本 session 完成后移交 owner
+### 7.2 控制 RESUME 先接管事务，再等本 session 的 TEMP
 
-`wait_temp_ready()` 在 entry 锁外等待本 token 的 completion，沿用原 deadline 和 kill。完成后才取走唯一 TEMP owner；其它 session 的未完成 TEMP 不构成该 session 的屏障。超时、取消或晚期准备失败不能返回 RESUME 成功。已有失败回退负责 journal 收尾，proxy 随后断开前后端；正在执行的后台写入仍持有缓冲区和 FD，最后执行者退出后交原 reaper。
+物理工程先独占并保活业务 target，在进入目标恢复上下文前调用 [preserve_trx.h](../../../sql/preserve_trx.h) 的 `Preserve_trx_control_resume_request::begin(caller, target, token, pin, release, cookie)`。caller 是独立控制 session；成功登记移交 target pin 和接管释放责任，`release(cookie)` 不得阻塞、抛异常或引用控制 SQL 栈。该登记不代替既有独占接管、TLS 恢复和诊断转发。
+
+已登记请求先完成 session／binlog／MDL／GTID 前置准备，将真实事务挂到业务 target 并登记 SESSION 参与者，立即禁用连接状态还原并删除 detached MDL backup，再调用 `wait_temp_ready()`。resource-only 不制造事务，但同样固定目标资源归属。等待在 entry 锁外，沿用原 deadline 和 kill；只等本 token。成功后取唯一 TEMP owner，stage、安装 undo，再恢复 savepoint／结果并通过原 activation 校验。其它 session 的未完成 TEMP 不阻塞本 session，超时、取消或晚期准备失败不能返回成功。
 
 ```mermaid
 flowchart LR
-    A[receiver Ready 资源] --> B[RESUME Attach journal]
-    B -->|activation 前失败，可归还| A
-    B -->|成功 finish| C[THD 待关联结果 owner]
-    C -->|外部回放后 ATTACHED| D[真实目标 PS 拥有 cursor]
-    D --> E[原生 FETCH / RESET / CLOSE 生命周期]
+    A[控制请求登记<br/>target 独占与保活] --> B[真实事务及 SESSION 挂到 target<br/>固定事务 / MDL 归属]
+    B --> C[等待本 token TEMP 完成<br/>stage / undo / savepoint / 结果]
+    C --> D[原 activation 与成功交接<br/>THD 持有待关联结果]
+    D --> E[PS 回放后显式关联<br/>原生 FETCH / RESET / CLOSE]
 ```
 
-[主流程](../../../sql/preserve_trx.cc) 与 [promotion_prepared](../../../sql/preserve_trx_promotion_prepared.cc) 在资源安装/最终发布前认证 prepared key、token 和清单摘要。`Preserve_trx_result_restore::stage()` 创建小型 journal；既有 activation 不可回退边界前可归还相同 Ready owner；`registry.begin_activation()` 成功进入 ACTIVATING 后，即使结果 journal 尚未 commit，也不能归还 lease 重试，按原整体失败裁决处理。
+[主流程](../../../sql/preserve_trx.cc) 与 [promotion_prepared](../../../sql/preserve_trx_promotion_prepared.cc) 在安装和发布前认证 key、token 与清单摘要。控制请求尚未跨 target 接管边界的失败沿原路径撤销；一旦接管，失败不再 detach 或归还同一事务重试。`registry.begin_activation()` 的成功门槛未放宽，进入 ACTIVATING 后也不能因局部 journal 未 commit 而归还 lease。未登记控制请求的旧调用保持原等待顺序和失败流程，不以临时 `current_thd != target` 判断启用修复。
+
+接管后的失败将 record／runtime／journal／lease 留在同一个 attempt：控制错误发送调用返回后，服务端 KILL 精确 target，释放接管与 pin；target 原连接线程撤销未完成的安装并执行原生 rollback，随后原 reaper 重试文件收尾。控制线程不等待回滚；控制提前断连走同一领取兜底。KILL 不是回滚成功凭证；原生 rollback 回报及输入不再被使用的证明齐备后才退休。不能证明所有权时保留隔离 owner，不伪装成完成。详见修复设计 §3、§9。
 
 `Attach::finish()` 把 owner 和待关联计数交给 THD，不在 PS map 插入对象、不修改 PS quota/编号、不安装参数，也不等待外部 PS 回放。无结果的成功恢复可以安装空 owner，用于后续合法的 NO_CURSOR 判断；未成功 RESUME、没有 owner 的调用应失败。
 
 结果全部关联后 pending 计数为零，但 owner 中 attached 描述记录仍保留，`Ready::empty()` 不因此变 true。reset/cleanup 清除 owner；不能承诺再次 RESUME 可在同一非空 owner 上覆盖。未关联结果仍存在时，当前源捕获/Preserve 准入拒绝再次迁移，不能丢掉 pending 资源。
+
+### 7.3 READY 后的 I/O：谁执行、谁等待
+
+**READY 不等于 TEMP 文件完成；这些动作由 receiver 原 worker 继续执行，成功 RESUME 必须等本 token 的真实完成。** 异步的是调用者与整个 TEMP 任务之间的关系；worker 内的 `my_pwrite`、`my_sync` 和 `my_close` 仍是同步调用，逐项检查返回结果。不新建每 session 的 I/O 线程，不把“提交写入请求”当成写入成功。
+
+```mermaid
+flowchart TD
+    A[最终输入已认证<br/>目标 ID / dictionary / 私有 undo<br/>事务与 cursor 已准备] --> B[发布 READY]
+    B --> C[三个既有在线升主接点]
+    B --> D[原 job 重新入队<br/>receiver prewarm worker 续作]
+    D --> E[剩余页转换 / pwrite / LOB<br/>统计与 SQL 元数据准备]
+    E --> F[flush / 实际 close / seal<br/>native fil / 字典接管准备]
+    F --> G[本 token completion 成功]
+    C --> H[已登记控制 SQL RESUME<br/>先接管 target，再等本 token]
+    G --> H
+    H --> I[取走并安装唯一 TEMP owner<br/>沿原回放 / 关联顺序恢复业务]
+```
+
+两条线在同一 receiver 进程并行。Phase1 已准备的工作尽量复用，图中是 final 仍需补齐的部分，并非每次都重新全量搬迁。READY 到业务恢复的自然时间窗口不是 I/O 成功凭证；RESUME 早到就等待，后台早完成就直接继续。结果 cursor 仍须在 READY 前完整准备，PS 回放及关联保持 §2 的顺序。
+
+| 工作 | 实际执行者 | 完成边界 |
+| --- | --- | --- |
+| 传输请求接收、源格式对象落地与冻结 | receiver 的 transfer 请求处理线程；批协议可用既有 receiver apply 并发 | 属于最终输入认证路径，不能以排队成功替代 READY 所需的完整输入 |
+| TEMP 目标页转换、`pwrite`、LOB 校验、统计、SQL 元数据，随后 flush/close/seal 和 native 准备 | `receiver_prewarm_worker_main()` 的内部 worker THD | 可以延续到 READY 后；完整成功才 `completion.finish()` |
+| 等待及安装本 session 的 TEMP | 直接操作 target 的控制线程 | 登记并挂载目标事务后，`wait_temp_ready()` 等完成再取 owner；不在此执行批量页转换或补写 |
+| 失败、取消及退休 owner 的回收 I/O | 原 prewarm worker 与既有 expired reaper | 最后使用者放弃 owner 后才执行；这是清理，不能计为成功准备 |
+
+生产 prewarm 池按需启动 8 个线程，epoch 的实际并发另受冻结的 runtime profile 限制：BALANCED 为 3，PROMOTION_PREPARE 为 8。并发额度大于 1 时，READY 后的 TEMP 续作保留一个执行机会给其它发布/依赖工作；同一 job 每批只由一个 worker 独占，批间可换 worker，不保留业务 THD。这里的“异步”没有增加另一套线程池。
+
+源码链为 [receiver_prepare](../../../sql/preserve_trx_receiver_prepare.cc) 的 `step(..., prepare_for_publication=true)` → [temp_receiver](../../../sql/preserve_trx_temp_receiver.cc) 的 `promotion_safe()`；[transfer](../../../sql/preserve_trx_transfer.cc) 在发布后保留 `published_temp_tail`，继续调用 `prepare_step()`。后者完成 `seal_image()` 中的真实 close（内部先 flush），再做 native 准备，最后由 `Preserve_trx_temp_completion::finish()` 发布成功和唯一 owner。文件调用见 [temp_table_carrier](../../../sql/preserve_trx_temp_table_carrier.cc) 的 `write_at()/flush()/close()`；RESUME 屏障见 [promotion_prepared](../../../sql/preserve_trx_promotion_prepared.cc) 的 `wait_temp_ready()` 与 [主流程](../../../sql/preserve_trx.cc) 的 `prepare_resume_on_current_thd_shared()`。
+
+取消只标记 completion，不能立即关闭正在执行 `pwrite` 的 FD 或释放页缓冲，也不能把 PENDING 提前改成“最后使用者已退出”。晚期错误阻止该 session 的 RESUME，不改写已冻结的 epoch 选择。partial 发布只淘汰未入选任务，入选的 `published_temp_tail` 继续由原 job 执行。`finalize_receiver_ready_token_staging()` 在 TEMP pending 时保留 staging；destroy 尚有 active 或 prepared 使用者时返回 `RESOURCE_PREPARING`，ABANDONING 由原 reaper 重试。staging 清理责任交出、真实使用者退出后，才通知同代 prepared entry 并退休资源。
+
+### 7.4 任务结束与线程退出是两件事
+
+```mermaid
+flowchart TD
+    A[按需启动原 prewarm 池] --> B[取一个任务批次<br/>在队列锁外执行]
+    B --> C{本任务准备完整?}
+    C -->|尚未完成| D[保留唯一 owner<br/>重新入队]
+    D --> B
+    C -->|成功或失败终态| E[发布 completion<br/>结束该任务]
+    E --> F{已请求停池<br/>且池内全部空闲?}
+    F -->|否| G[线程等待或处理其它任务]
+    G --> B
+    F -->|是| H[既有 reaper 设置 stop<br/>唤醒 worker]
+    H --> I[worker 销毁内部 THD<br/>my_thread_end / 线程返回]
+    I --> J[reaper 的 join 返回<br/>确认线程全部退出]
+```
+
+**READY、源端 DRAIN 返回、升主完成和单个 session RESUME 都不是停线程条件。** 源端 Phase1 pipeline 有自己的 final/cancel + join 边界，它的退出或老主被 kill 不会终止 receiver 的 TEMP 续作；READY 所用输入已在 receiver 固定并由本地 owner 保活。
+
+正常回收由任务终态/epoch 清理请求 `request_receiver_prewarm_idle_stop()`，既有 reaper 调用 `retire_receiver_prewarm_workers_if_idle()`。只有两类工作队列、inflight/deferred 集合、epoch 活跃记录和 registry 退休记录都为空，且没有正在执行的 worker 批次，才设置 `runtime_stop`、唤醒条件变量并在池锁外 join。仅 Phase1 暂时无任务时，worker 通常等待条件变量；有排队或运行中的 TEMP 续作时不能按空闲条件停池。池回收后有新工作可按原入口再次启动。
+
+| 退出情形 | 实际顺序 |
+| --- | --- |
+| 正常空闲停池 | 停池请求 + 全池空闲 → 设置 stop → 唤醒 → worker 退出 → reaper join 返回 |
+| mysqld 正常关闭 | 停止并 join expired reaper → 既有 promotion gate worker 收尾 → 停止并 join prewarm worker → 回收退休 owner → DD/InnoDB 关闭；运行中的同步 I/O 必须先返回，尚未执行完的任务走失败/清理，不保证全部准备成功 |
+| source 进程被 kill | source 线程由操作系统终止；不影响另一个 receiver 进程的 worker 和 completion |
+
+`Preserve_trx_transfer_receiver_worker_active=0` 只表示无正在执行批次，可能仍有排队任务或等待中的线程。`worker_count` 在 stop/join 路径中还会先置零，也不能单独证明线程已经退出。判断某 session 能否安装，必须用它的 completion；判断全部线程已退出，必须以 join 完成为准，不能把 READY、取消标记或观测计数混用。
+
+退出实现见 [transfer](../../../sql/preserve_trx_transfer.cc) 的 `receiver_prewarm_work_idle_locked()/retire_receiver_prewarm_workers_if_idle()/receiver_prewarm_worker_main()/preserve_trx_transfer_shutdown_receiver_prewarm_workers()`；reaper 驱动见 [preserve_trx.cc](../../../sql/preserve_trx.cc) 的 `preserved_trx_expired_reaper_thread()`；关机次序见 [mysqld::clean_up](../../../sql/mysqld.cc)。本工程的三个固定升主入口不停止该池；物理复制工程外围亦须保留这些执行者及其原生资源，实际外围代码当前不可访问。
 
 ## 8. 外部 PS 回放后的显式 cursor 关联
 
@@ -355,16 +423,20 @@ SQL RESUME 失败时 proxy 关闭前后端，丢弃该逻辑会话及 CLOSE 记�
 
 ## 11. 当前验证与后续退出条件
 
-| 项目 | 当前证据 | 尚待完成 |
-| --- | --- | --- |
-| 删除与显式接口 | E62；Debug/Release 构建、定向运行 | 外部真实回放调用方接入与验收 |
-| 全量 MTR 含 big-test | E95：no-bin 603/295/0，log-bin 606/292/0（通过/跳过/失败）；shutdown 两轮另列通过；898 个不同用例在适用模式通过，18 个不同 big test 全部通过 | 不等同于外部物理复制验收；lint 不算运行时行为 |
-| 临时资源 M1–M12 | E94：62 个配置各一次，独立场景验收全部通过；56 个 READY 场景的 strict 与 ACK→READY 均达标，ACK→READY 最大 66.352 ms | EXACT 只有 3 个有效样本；内部准备失败批次和历史偶发长尾仍需定位，单轮不代表稳定性关闭 |
-| 原有压力模型（含 TPC-C 两档，共 12 项） | E94：完整原验收 4 通过、8 未通过；1000 读写 strict 494.651 ms、EXACT 204.432 ms、ACK→READY 0.852 ms | 其余业务/尾部指标、TPC-C1000 的 1205 增量 5、部分测量有效性仍未闭合 |
-| 持续混合 500 连接 | E94：442 READY＋58 session-only，功能通过；strict 1642.997 ms、ACK→READY 148.325 ms 同轮达标 | 无合格 EXACT 起点，原脚本完整性能验收仍失败；E93 五轮双指标仅 2/5 通过，历史长尾保留 |
-| 升主、RESUME、FETCH 与 receiver 共存 | 本地接口及 bridge 有证据 | 外部 redo/allocator 保活、三固定接点、真实 proxy 回放/关联/CLOSE、连续迁移 |
+当前证据来自 `75be6a9eab30` 加本次 R1–R6 修复。下列压力均使用同一 Release、`WITH_DEBUG=OFF`，mysqld SHA256 为 `f10a6e27e8a6753f2970caef0bf2b5d567f3fcae7435ea6ec342cac7d6afdbe6`；保留原规模、预算、业务窗口和判据。单位 ms。
 
-上表为 E94/E95 历史快照，本轮 E111 已修改生产代码，不能沿用旧 Release 指纹或性能结论。E95 当轮修正 Debug 探针和 lint，以零重试完成双模式全量 MTR；当时生产实现保持 E93 核验的 R44 版本。E111 的构建、回归和性能另行记录，不用 MTR 全绿关闭压力性能或外部集成。见[任务跟踪](task-tracker.md)、[E95 修复验证](../../../build-debug/preserve-fix-e95/README.md)与[E94 完整复测](../../../build-release/preserve-complete-e94/README.md)。未经用户指令不提交或 push。
+| 项目 | 当前证据 | 未通过项及边界 |
+| --- | --- | --- |
+| 全量 Debug MTR 含 big-test | no-bin 634／343／0、log-bin 681／296／0（通过／跳过／失败），shutdown 各通过；977 个不同用例、18 个 big-test、21 个新增用例均在适用模式通过 | no-bin 完整运行早于旧协议测试观察等待调整，该测试最终版另补跑；原失败和修正证据保留，不等同于生产物理复制验收 |
+| 500 连接持续 TEMP／FETCH，两轮 | 原 500 ID 完整分类，本地功能均通过；strict 951.429／939.811，ACK→READY 15.714／37.851 | 两轮 NO_ELIGIBLE_BODY，EXACT 为 N/A；原综合性能验收因缺少证据返回 1，不改判通过 |
+| TPC-C-like 128、只写事务 1000，各一轮 | 原验收通过；89／319 survivor 全 READY；strict 532.219／368.215，EXACT 187.884／354.127，ACK→READY 0.555／2.001 | 单轮不能证明长期稳定；业务 err/s 与无效 p95、观察缺口按原报告保留 |
+| M1–M12，62 配置各一次 | 原场景及独立验收 62/62；56 个成功迁移共 336 READY，捕获失败增量 0；strict 最大 1336.417，ACK→READY 最大 22.203 | 另有 3 个无 DRAIN、3 个预期拒绝；EXACT 仅 1 个有效样本 43.032，其余 N/A；不以预期 NOT_READY 当功能失败 |
+| mixed-transfer 1000，一轮 | 本地功能通过，959／959 READY、NOT_READY=0；ACK→READY 11.613 | strict 25304.702、EXACT 1738.488 均未达标；原 runner 因旧尾部 1393.702 超限返回 1。93.119% 的严格区间在最后 BODY 退出前；完整代码根因未关闭，未归因于当前修复 |
+| 控制 RESUME 与真实跨工程恢复 | 11 个独立控制 MTR 检查事务／锁／数据与 response-return→KILL→rollback→cleanup 顺序 | Debug bridge 的 MIXED＋TEMP undo 限制保留；真实登记／接管、redo/allocator 保活、固定升主接点、PS 回放／attach／CLOSE、首次业务及回滚重叠仍需对应工程验收 |
+
+原有库存中还有 10 个配置未在本次修复版重跑：sysbench 读写1000、只写自动提交1000，continuous range 三档、no-commit、lockset、tiered，以及 TPC-C64／1000。旧版成绩不升级为当前验收；合计约10,000 cursor 的补充 Release 容量复测也未据 Debug MTR 宣告完成。
+
+证据：[全量 MTR](../../../build-debug/preserve-receiver-lifecycle-20261012/README.md)、[500 两轮](../../../build-release/continuous-resource/receiver-lifecycle-20261012/README.md)、[TPC-C与只写](../../../build-release/receiver-lifecycle-pressure-20261012/README.md)、[M矩阵](../../../build-release/temp-fetch-pressure-lifecycle-20261012/README.md)、[mixed-transfer](../../../build-release/mixed-transfer-lifecycle-20261012/README.md)。历史 E94/E95 及其后各轮保留在[任务跟踪](task-tracker.md)，不改写历史失败，不用 MTR 全绿关闭性能或外部集成。未经用户指令不提交或 push。
 
 后续测试使用 MTR 和 Python E2E，不新增 UT/GUnit 或 DEBUG_SYNC。验证需覆盖：源有/无结果、多 PS 同 SQL、换代/EOF/RESET/CLOSE、错误 session/对象/ID、重复 attach、RESUME 失败清理、receiver 原临时表隔离、OFF/非 standby 和真实外部 PS 回放。
 
@@ -376,6 +448,6 @@ SQL RESUME 失败时 proxy 关闭前后端，丢弃该逻辑会话及 CLOSE 记�
 
 控制器“DRAIN 返回→观察到 READY”包含轮询延迟，不等于 receiver 同钟时延。没有 eligible body 或未校准的跨进程时间必须写 N/A/INVALID，不能当零。并行累计服务时间不能相加成墙钟；closing→ACK 也不能全部称为网络等待。
 
-原 strict Phase 2 目标为 ≤2000 ms；用户仅对持续 500 连接复测接受 ≤2200 ms 的容忍上限，receiver 同钟 ACK→READY 仍须 <500 ms。两项须同轮满足，原 2 秒判定与独立 EXACT 结果继续保留，不修改其他模型门槛。一次运行通过不替代重复轮次统计或商用验收。最新完整压力数据见 [E94 报告](../../../build-release/preserve-complete-e94/README.md)，重复轮次及尚未闭合项见[任务跟踪 E93–E95](task-tracker.md)。
+原 strict Phase 2 目标为 ≤2000 ms；用户仅对持续 500 连接复测接受 ≤2200 ms 的容忍上限，receiver 同钟 ACK→READY 仍须 <500 ms。两项须同轮满足，原 2 秒判定与独立 EXACT 结果继续保留，不修改其他模型门槛。一次运行通过不替代重复轮次统计或商用验收。当前版本结果见 §11 和[任务跟踪 E152](task-tracker.md#e152receiver-temp与控制-resume-生命周期修复2026-10-12)；E94 及后续旧轮次仅作为各自版本的历史证据。
 
 本轮完整 COM_QUERY 边界不再由临时 ID namespace 或已删除的结果开关选择。已进入 BODY 的包按原生语义执行完毕（包括 COMMIT/BEGIN/DDL 之后的 SQL）；原生语句错误仍可中止余段，下一命令重新 admission。验证分别记录 DRAIN 前无捕获、同步核心三引擎书签、Phase1 真实 FETCH、receiver 准备和 loopback attach；本地证据不替代物理备机在线升主。

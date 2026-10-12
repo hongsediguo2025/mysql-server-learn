@@ -151,7 +151,8 @@ struct Owner_config {
 class Attempt;
 using Attempt_handle = std::shared_ptr<Attempt>;
 
-bool capture_command(THD *command_thd, Command_key *command);
+bool capture_command(THD *command_thd, Command_key *command,
+                     bool compound = false);
 bool captured_command_key(THD *command_thd, Command_key *command);
 /** Live observation: T0 registration is complete and convergence is running. */
 bool command_boundary_wait_active();

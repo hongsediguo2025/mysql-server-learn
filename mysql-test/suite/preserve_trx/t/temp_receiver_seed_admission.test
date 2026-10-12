@@ -1,0 +1,7 @@
+--let $pipeline_extra_debug= preserve_receiver_seed_admission_probe
+--source suite/preserve_trx/t/temp_receiver_pipeline.test
+--perl
+open my $fh, '<', "$ENV{MYSQLTEST_VARDIR}/log/temp_receiver_pipeline.trace" or die $!;
+local $/; my $trace=<$fh>;
+die "seed admission ownership was not checked" unless $trace =~ /seed admission retained borrower and retired failed owners/;
+EOF

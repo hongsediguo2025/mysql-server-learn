@@ -67,9 +67,8 @@ UPDATE t_resume_required_control_final SET v=11 WHERE id=1;
 SET DEBUG_SYNC=
   'preserve_trx_closing_command_blocked_before_response SIGNAL control_late_packet_parked WAIT_FOR control_late_packet_release';
 
-# A decoded COM_QUIT is an admitted no-response cleanup command, not a command
-# that will receive ER_PRESERVE_TRX_SESSION_DRAINED. Keep its THD alive across
-# the final snapshot and verify that the receiver does not publish its id.
+# Decoding QUIT does not admit teardown. Keep this frozen packet alive across
+# the final snapshot and verify its session-only identity is transferred.
 --connection control_final_source_ha
 --connect(control_final_source_quit,localhost,rr_ctrlfinal_app,,test)
 --let $quit_idle_id= query_get_value(SELECT CONNECTION_ID() AS id, id, 1)
@@ -126,6 +125,7 @@ SET DEBUG_SYNC='now SIGNAL control_final_snapshot_release';
 --eval RESUME PRESERVED TRANSACTION '$late_idle_id'
 --error ER_PRESERVE_TRX_HANDOFF_UNAVAILABLE
 --eval RESUME PRESERVED TRANSACTION '$late_idle_id'
+--eval RESUME PRESERVED TRANSACTION '$quit_idle_id'
 --error ER_PRESERVE_TRX_HANDOFF_UNAVAILABLE
 --eval RESUME PRESERVED TRANSACTION '$quit_idle_id'
 

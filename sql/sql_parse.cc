@@ -1119,20 +1119,29 @@ void execute_init_command(THD *thd, LEX_STRING *init_command,
   ulong save_client_capabilities;
   COM_DATA com_data;
 
-  mysql_rwlock_rdlock(var_lock);
-  if (!init_command->length) {
-    mysql_rwlock_unlock(var_lock);
-    return;
-  }
+  LEX_CSTRING snapshot;
+  size_t len;
+  const char *buf;
+  if (preserved_trx_borrow_init_connect(thd, init_command, &snapshot)) {
+    len = snapshot.length;
+    buf = snapshot.str;
+    if (!len) return;
+  } else {
+    mysql_rwlock_rdlock(var_lock);
+    if (!init_command->length) {
+      mysql_rwlock_unlock(var_lock);
+      return;
+    }
 
-  /*
-    copy the value under a lock, and release the lock.
-    init_command has to be executed without a lock held,
-    as it may try to change itself
-  */
-  size_t len = init_command->length;
-  char *buf = thd->strmake(init_command->str, len);
-  mysql_rwlock_unlock(var_lock);
+    /*
+      copy the value under a lock, and release the lock.
+      init_command has to be executed without a lock held,
+      as it may try to change itself
+    */
+    len = init_command->length;
+    buf = thd->strmake(init_command->str, len);
+    mysql_rwlock_unlock(var_lock);
+  }
 
 #if defined(ENABLED_PROFILING)
   thd->profiling->start_new_query();
@@ -1737,6 +1746,11 @@ bool dispatch_command(THD *thd, const COM_DATA *com_data,
       break;
     }
     case COM_RESET_CONNECTION: {
+      Preserve_trx_inflight_statement_guard reset_guard;
+      if (!reset_guard.admit_reset(thd)) {
+        my_error(ER_PRESERVE_TRX_SESSION_DRAINED, MYF(0));
+        break;
+      }
       thd->status_var.com_other++;
       thd->cleanup_connection();
       my_ok(thd);
